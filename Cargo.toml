@@ -44,7 +44,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"          # track installed stable (edition 2024 needs >=1.85)
 license = "MIT"
-repository = "https://github.com/earendil-works/cyrup"   # placeholder
+repository = "https://github.com/cyrup-ai/cyrup"
 authors = ["cyrup contributors"]
 
 # No-panic policy (arch-00 §8 / func-00 R-00-009). These are clippy tool lints:
