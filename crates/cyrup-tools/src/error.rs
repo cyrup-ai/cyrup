@@ -28,6 +28,13 @@ pub(crate) fn aborted() -> ToolError {
     ToolError::new("operation aborted")
 }
 
+/// Policy / isolation denial (arch-12 R-12-006/R-03-006). Surfaced as a normal `Err`, which the
+/// runtime maps to an `isError:true` tool result (R-03-038) — never a panic. Message kept stable so
+/// callers/tests can detect a blocked operation.
+pub(crate) fn denied(msg: impl Into<String>) -> ToolError {
+    ToolError::new(msg)
+}
+
 /// Display a path for messages (lossy, never panics).
 pub(crate) fn show(path: &Path) -> String {
     path.to_string_lossy().into_owned()

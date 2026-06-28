@@ -16,6 +16,7 @@
 pub mod config;
 pub mod details;
 pub(crate) mod error;
+pub mod isolation;
 pub mod lock;
 pub mod ops;
 pub mod output;
@@ -30,6 +31,10 @@ pub use cyrup_core::ToolError;
 
 pub use config::{
     BashOpts, EditOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, ToolsOptions, WriteOpts,
+};
+pub use isolation::{
+    protected_path_rule, OsSandbox, PermissionPolicy, PolicyDecision, ProtectedFs, ProtectedPaths,
+    Rule, SandboxKind, SandboxPolicy, TraversalFs,
 };
 pub use lock::FileMutationLocks;
 pub use ops::{
