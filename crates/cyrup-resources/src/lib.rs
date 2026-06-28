@@ -1,13 +1,85 @@
 //! cyrup-resources — skills, prompt templates, themes, packages (arch-09; conformance: func-09).
 //!
-//! Agent Skills (`SKILL.md`) discovery, prompt templates, themes (hot-reload), and the package
-//! model (`cyrup.toml` native manifest + git/registry install).
+//! The four non-executable resource kinds that shape agent behavior without being code
+//! extensions, plus the package model that bundles them:
 //!
-//! Scaffold stub.
+//! - **Skills** ([`Skill`]) — Agent Skills standard `SKILL.md` directories, lazy-bodied.
+//! - **Prompt templates** ([`PromptTemplate`]) — markdown expanded by `/name` with `{{placeholder}}`.
+//! - **Themes** ([`Theme`]) — JSON TUI color schemes, hot-reloadable ([`ThemeWatcher`]).
+//! - **Packages** ([`PackageManager`]) — manifest-declared bundles, git/local-path installs.
+//!
+//! [`discover`] runs one pass over all roots and returns a [`ResourceRegistry`] snapshot held
+//! behind [`ResourceHandle`] (lock-free reads, atomic `/reload` swap). Precedence is
+//! deterministic (built-in -> global -> project -> discovered -> cli, later wins; R-09-024).
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
-/// Resource/package error (arch-09 §8). Scaffold placeholder.
-#[derive(Debug, thiserror::Error)]
-pub enum ResourceError {
-    #[error("not yet implemented: {0}")]
-    Unimplemented(&'static str),
+pub mod discovery;
+pub mod error;
+pub mod key;
+pub mod package;
+pub mod prompt;
+pub mod scope;
+pub mod skill;
+pub mod theme;
+
+use std::sync::Arc;
+
+pub use cyrup_core::PackageId;
+
+pub use discovery::{
+    CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceRegistry,
+    ResourceSet, discover,
+};
+pub use error::{ResourceError, ResourceKind, ResourceWarning};
+pub use key::ResourceKey;
+pub use package::install::{PackageManager, security_notice_for};
+pub use package::source::{PackageSource, PinRef};
+pub use package::{
+    DisabledSet, InstalledPackage, InstalledPackages, ManifestResources, PackageStore,
+    ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice, UpdateReport,
+    UpdateTarget, resolve_manifest,
+};
+pub use prompt::{Expansion, PlaceholderArgs, PromptTemplate};
+pub use scope::{InstallScope, ResourceOrigin, ResourceScope};
+pub use skill::{Skill, SkillFrontMatter, SkillPointer};
+pub use theme::{
+    BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON, ColorSpec, ResolvedTheme, Theme, ThemeData,
+    ThemeWatcher, builtin_themes,
+};
+
+/// The lock-free, atomically-swappable holder of the active [`ResourceRegistry`].
+///
+/// Readers call [`ResourceHandle::load`] on the hot path; `/reload` builds a fresh registry off
+/// the loop and calls [`ResourceHandle::store`] (R-09-023) — a single pointer swap, no torn reads.
+pub struct ResourceHandle(arc_swap::ArcSwap<ResourceRegistry>);
+
+impl ResourceHandle {
+    pub fn new(registry: ResourceRegistry) -> Self {
+        Self(arc_swap::ArcSwap::from_pointee(registry))
+    }
+
+    /// Lock-free snapshot read.
+    pub fn load(&self) -> arc_swap::Guard<Arc<ResourceRegistry>> {
+        self.0.load()
+    }
+
+    /// Atomically install a freshly discovered registry (`/reload`).
+    pub fn store(&self, next: Arc<ResourceRegistry>) {
+        self.0.store(next);
+    }
+}
+
+impl Default for ResourceHandle {
+    fn default() -> Self {
+        Self::new(ResourceRegistry::default())
+    }
 }
