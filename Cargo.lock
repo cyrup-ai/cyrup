@@ -757,6 +757,7 @@ dependencies = [
 name = "cyrup-session-svc"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "cyrup-agent",
  "cyrup-config",
  "cyrup-core",
@@ -765,7 +766,14 @@ dependencies = [
  "cyrup-resources",
  "cyrup-session",
  "cyrup-tools",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

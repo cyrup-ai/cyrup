@@ -21,3 +21,25 @@ cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
 cyrup-ext = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+cyrup-core = { workspace = true }
+cyrup-agent = { workspace = true }
+cyrup-ext = { workspace = true }
+cyrup-session = { workspace = true }
+cyrup-config = { workspace = true }
+cyrup-tools = { workspace = true }
+# Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
+cyrup-provider = { workspace = true, features = ["faux"] }
