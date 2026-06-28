@@ -15,11 +15,32 @@ workspace = true
 name = "cyrup"
 path = "src/main.rs"
 
+[lib]
+name = "cyrup"
+path = "src/lib.rs"
+
 [dependencies]
+# Workspace seams (arch-11 §2.4): the SDK + facade + config + non-interactive adapters + TUI.
 cyrup-sdk = { workspace = true }
 cyrup-session-svc = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-modes = { workspace = true }
 cyrup-tui = { workspace = true }
-# The real entrypoint uses tokio (multi-thread) + clap + anyhow (arch-11 / arch-00 §5, §8);
-# added when arch-11 is implemented. The scaffold main below is intentionally runtime-free.
+# The provider seam — `faux` is the only runnable provider until real HTTP providers land, so the
+# bin enables it to be runnable end-to-end (a real-but-unimplemented model yields a clear error).
+cyrup-provider = { workspace = true, features = ["faux"] }
+
+# Async runtime + streams (arch-11 §5): multi-thread tokio with signal/io-util for modes & signals.
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Bin-only externals (arch-00 §7/§8): clap (CLI), anyhow (the anyhow boundary), tracing to stderr.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Dispatch integration tests build a real AgentSession over a scripted faux provider in a tempdir.
+tempfile = { workspace = true }
+serde_json = { workspace = true }
