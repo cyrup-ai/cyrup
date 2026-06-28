@@ -13,6 +13,9 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Concrete wire-protocol implementations (one `ApiImpl` per submodule).
+pub mod openai_completions;
+
 /// Producer side of the provider stream channel. `ApiImpl::run` pushes the EXISTING
 /// `cyrup_provider::StreamEvent` here; the receiver is wrapped as the returned `EventStream`.
 #[derive(Clone)]
@@ -98,6 +101,19 @@ impl ApiRegistry {
     pub fn contains(&self, api: &ApiId) -> bool {
         self.live.contains_key(api) || self.factories.contains_key(api)
     }
+}
+
+/// A registry pre-seeded with every built-in wire-protocol factory (lazy — nothing is constructed
+/// until a request uses an api id). Concrete providers share one such registry (R-01-007/010).
+pub fn builtin_registry() -> ApiRegistry {
+    let mut reg = ApiRegistry::new();
+    register_builtins(&mut reg);
+    reg
+}
+
+/// Register the built-in wire-protocol factories into `reg`.
+pub fn register_builtins(reg: &mut ApiRegistry) {
+    reg.register(ApiId::from(crate::known_api::OPENAI_COMPLETIONS), openai_completions::factory);
 }
 
 #[cfg(test)]

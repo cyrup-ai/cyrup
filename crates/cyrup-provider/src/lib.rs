@@ -19,6 +19,7 @@ pub mod context;
 pub mod error;
 pub mod model;
 pub mod provider;
+pub mod providers;
 pub mod stream;
 pub mod usage;
 pub mod validate;
@@ -27,7 +28,11 @@ pub mod wire;
 #[cfg(any(test, feature = "faux"))]
 pub mod faux;
 
-pub use api::{channel, ApiFactory, ApiImpl, ApiRegistry, EventSink};
+pub use api::openai_completions::OpenAiCompletionsApi;
+pub use api::{
+    builtin_registry, channel, register_builtins, ApiFactory, ApiImpl, ApiRegistry, EventSink,
+};
+pub use providers::{together_models, together_provider, together_provider_with, TOGETHER_BASE_URL};
 pub use auth::{
     env_key, keyless_local, resolve_provider_auth, ApiKeyAuth, AuthContext, AuthOverrides,
     AuthResult, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore, ModelAuth,
