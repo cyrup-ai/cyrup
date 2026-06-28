@@ -422,9 +422,13 @@ dependencies = [
 name = "cyrup-session"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-provider",
+ "cyrup-resources",
  "futures",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

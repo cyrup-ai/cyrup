@@ -12,12 +12,16 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = "1.9.1"
+cyrup-config.workspace = true
 # arch-04 (SESSIONS & BRANCHING) needs only cyrup-core + serde/time/uuid. cyrup-config and
 # cyrup-resources (which transitively pull cyrup-provider) are deferred to arch-05/06 and are
 # intentionally NOT depended on here so this layer builds in isolation.
 cyrup-core = { workspace = true }
 cyrup-provider.workspace = true
+cyrup-resources.workspace = true
 futures.workspace = true
+rustc-hash = "2.1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
