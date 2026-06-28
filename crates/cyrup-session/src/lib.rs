@@ -10,8 +10,8 @@
 //! The defining invariant (DI-9): the on-disk record is **lossless** — branch navigation and
 //! compaction prune only the *built context*, never the file.
 //!
-//! Compaction *generation* (arch-05) lives in [`compaction`]; system-prompt assembly (arch-06) is a
-//! deferred sibling.
+//! Compaction *generation* (arch-05) lives in [`compaction`]; system-prompt & context assembly
+//! (arch-06) lives in [`prompt`].
 #![forbid(unsafe_code)]
 
 pub mod compaction;
@@ -24,6 +24,7 @@ pub mod layout;
 pub mod listing;
 pub mod manager;
 pub mod migrate;
+pub mod prompt;
 pub mod store;
 
 pub use compaction::{
@@ -37,4 +38,10 @@ pub use header::{SessionHeader, CURRENT_VERSION};
 pub use layout::{encode_cwd, SessionLayout, SessionsRoot};
 pub use listing::{list, list_all, resolve, SessionInfo, SessionSelector};
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
+pub use prompt::{
+    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
+    ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope,
+    ContextSnapshot, ContextStore, DocsPointers, PromptContributor, PromptInputs, ResolvedOverride,
+    SkillPointer, SystemPromptBuilder, ToolPromptContribution, TrustQuery,
+};
 pub use store::{DiskStore, MemStore, SessionStore};
