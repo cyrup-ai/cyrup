@@ -234,23 +234,24 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let opts = StreamOptions { max_tokens: Some(16), ..Default::default() };
+        // Enough budget for a real answer. gpt-oss-120b is a reasoning model: it may finish with
+        // `Stop` (answer emitted) or, if it spends the budget reasoning, `Length` — both are
+        // successful round-trips. Only a transport/API failure yields `Error`.
+        let opts = StreamOptions { max_tokens: Some(256), ..Default::default() };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;
 
-        assert_eq!(
+        assert_ne!(
             msg.stop_reason,
-            StopReason::Stop,
-            "expected a clean Done terminal, got error: {:?}",
+            StopReason::Error,
+            "expected a successful terminal, got error: {:?}",
             msg.error_message
         );
-        let text: String = msg
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(!text.trim().is_empty(), "expected non-empty assistant text");
+        // Decoding produced real content — assistant text and/or reasoning.
+        let has_content = msg.content.iter().any(|c| match c {
+            Content::Text { text, .. } => !text.trim().is_empty(),
+            Content::Thinking { thinking, .. } => !thinking.trim().is_empty(),
+            _ => false,
+        });
+        assert!(has_content, "expected non-empty assistant content, got: {:?}", msg.content);
     }
 }
