@@ -1,7 +1,14 @@
 //! The streaming event model + per-request options (arch-01 §8 / func-01 §8).
 
-use cyrup_core::{AssistantMessage, CancelToken, EventStream, ProviderId, SessionId, StopReason, ToolCall};
+use cyrup_core::{
+    AssistantMessage, CancelToken, EventStream, ProviderId, SessionId, StopReason, ThinkingLevel,
+    ToolCall,
+};
 use futures::StreamExt;
+
+/// Direct-wire HTTP + SSE transport (arch-01 §7.1). Submodule of `stream` so the request side and
+/// the event side share one module root.
+pub mod sse;
 
 /// Prompt-cache retention preference (func-01 §11).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,6 +30,11 @@ pub struct StreamOptions {
     pub cache_retention: CacheRetention,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u64>,
+    /// Unified reasoning level (func-01 R-01-040). Additive, backward-compatible (defaulted to
+    /// `Off`); a non-reasoning model silently ignores it (R-01-041).
+    pub reasoning: ThinkingLevel,
+    /// Per-request header overlay; a `None` value suppresses a default header (func-01 §4.1).
+    pub headers: Option<crate::HeaderMap>,
 }
 
 /// One streaming event (func-01 §8.1).

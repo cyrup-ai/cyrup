@@ -1,0 +1,28 @@
+[
+  {
+    "id": "claude-sonnet-4-5",
+    "name": "Claude Sonnet 4.5",
+    "api": "anthropic-messages",
+    "provider": "anthropic",
+    "baseUrl": "https://api.anthropic.com/v1/messages",
+    "reasoning": true,
+    "input": ["text", "image"],
+    "output": ["text"],
+    "cost": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 },
+    "contextWindow": 200000,
+    "maxTokens": 64000
+  },
+  {
+    "id": "gpt-4o",
+    "name": "GPT-4o",
+    "api": "openai-completions",
+    "provider": "openai",
+    "baseUrl": "https://api.openai.com/v1/chat/completions",
+    "reasoning": false,
+    "input": ["text", "image"],
+    "output": ["text"],
+    "cost": { "input": 2.5, "output": 10.0, "cacheRead": 1.25, "cacheWrite": 0.0 },
+    "contextWindow": 128000,
+    "maxTokens": 16384
+  }
+]

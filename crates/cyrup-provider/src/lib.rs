@@ -4,25 +4,49 @@
 //! tool validation, cross-provider handoff, usage/cost, the faux provider, the compat matrix.
 //!
 //! This slice implements the core data model (`Model`/`Context`/`StreamEvent`/`StreamOptions`),
-//! the `Provider` trait, the `collect_message` helper, and the **faux provider** so the agent
-//! runtime (arch-02) and sessions (arch-04) can be built and tested with no network. The concrete
-//! vendor API implementations, auth, and handoff transforms land next.
+//! the `Provider` trait, the `collect_message` helper, and the **faux provider**, plus the base
+//! infrastructure real `ApiImpl`s sit on (arch-01 §7.1 direct-wire): the [`error`] taxonomy, the
+//! [`auth`] credential/resolution engine, the [`stream::sse`] HTTP+SSE transport, the [`api`]
+//! `ApiImpl` trait + lazy `ApiRegistry`, the reusable [`wire::WireProvider`], [`usage`] cost, and a
+//! static [`catalog`] seam. Concrete vendor `ApiImpl`s (anthropic-messages / openai-completions)
+//! and cross-provider handoff land next.
+#![forbid(unsafe_code)]
 
+pub mod api;
+pub mod auth;
+pub mod catalog;
 pub mod context;
+pub mod error;
 pub mod model;
 pub mod provider;
 pub mod stream;
+pub mod usage;
 pub mod validate;
+pub mod wire;
 
 #[cfg(any(test, feature = "faux"))]
 pub mod faux;
 
+pub use api::{channel, ApiFactory, ApiImpl, ApiRegistry, EventSink};
+pub use auth::{
+    env_key, keyless_local, resolve_provider_auth, ApiKeyAuth, AuthContext, AuthOverrides,
+    AuthResult, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore, ModelAuth,
+    ModifyFn, OAuthAuth, ProviderAuth, ProviderEnv,
+};
+pub use catalog::{load_catalog, seed_catalog};
 pub use context::{Context, ToolDef};
 pub use cyrup_core::ApiId;
+pub use error::{AuthError, BoxErr, ProviderError};
 pub use model::{Modality, Model, ModelCost};
 pub use provider::Provider;
+pub use stream::sse::{build_client, decode_sse_bytes, open_sse, OnRequest, OnResponse, SseFrame, SseRequest};
 pub use stream::{collect_message, CacheRetention, StreamEvent, StreamOptions};
+pub use usage::{apply_cost, compute_cost};
 pub use validate::{validate_named_tool_call, validate_tool_call, ToolValidationError};
+pub use wire::WireProvider;
+
+/// Header overlay: a `None` value suppresses a would-be default header (arch-01 §3.1).
+pub type HeaderMap = std::collections::BTreeMap<String, Option<String>>;
 
 /// Known wire-protocol ids (arch-01 §3.1). `ApiId` accepts custom strings too.
 pub mod known_api {
@@ -31,16 +55,4 @@ pub mod known_api {
     pub const OPENAI_RESPONSES: &str = "openai-responses";
     pub const GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
-}
-
-/// Auth/stream error taxonomy (arch-01 §3.7/§8). Scaffold placeholder; full taxonomy
-/// (`oauth`/`auth`/`provider`/`stream`/`model_source`) lands with the concrete providers.
-#[derive(Debug, thiserror::Error)]
-pub enum ProviderError {
-    #[error("provider not found: {0}")]
-    UnknownProvider(String),
-    #[error("no API implementation for {0}")]
-    NoApiImpl(String),
-    #[error("not yet implemented: {0}")]
-    Unimplemented(&'static str),
 }

@@ -22,6 +22,16 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
+futures-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true }

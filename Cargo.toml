@@ -100,6 +100,12 @@ tempfile             = { version = "3.27.0" }
 time                 = { version = "0.3", features = ["formatting", "parsing"] }
 uuid                 = { version = "1", features = ["v7"] }
 
+# arch-00 §7 / §7.1 — direct-wire HTTP + SSE stack, first used by cyrup-provider (arch-01).
+reqwest              = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2"] }
+eventsource-stream   = { version = "0.2.3" }
+bytes                = { version = "1" }
+base64               = { version = "0.22" }
+
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
 #   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
