@@ -16,10 +16,13 @@ workspace = true
 # cyrup-resources (which transitively pull cyrup-provider) are deferred to arch-05/06 and are
 # intentionally NOT depended on here so this layer builds in isolation.
 cyrup-core = { workspace = true }
+cyrup-provider.workspace = true
+futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+tokio.workspace = true
 uuid = { workspace = true }
 
 [dev-dependencies]

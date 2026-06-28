@@ -12,5 +12,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = "1.9.1"
 cyrup-core = { workspace = true }
+gix = "0.85.0"
+globset.workspace = true
+ignore.workspace = true
+notify = "8.2.0"
+serde.workspace = true
+serde_json.workspace = true
+serde_yml = "0.0.13"
 thiserror = { workspace = true }
+tokio.workspace = true
+toml = "1.1.2"
