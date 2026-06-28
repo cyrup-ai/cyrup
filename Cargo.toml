@@ -85,6 +85,19 @@ anyhow       = { version = "1" }
 serde        = { version = "1",   features = ["derive", "rc"] }
 serde_json   = { version = "1" }
 
+# arch-00 §7.1 ratified — first used by cyrup-tools (arch-03).
+ignore               = { version = "0.4.26" }
+globset              = { version = "0.4.18" }
+grep-matcher         = { version = "0.1.8" }
+grep-regex           = { version = "0.1.14" }
+grep-searcher        = { version = "0.1.16" }
+similar              = { version = "3.1.1" }
+dashmap              = { version = "6.2.1" }
+unicode-segmentation = { version = "1.13.3" }
+image                = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+libc                 = { version = "0.2.186" }
+tempfile             = { version = "3.27.0" }
+
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
 #   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,

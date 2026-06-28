@@ -14,3 +14,34 @@ workspace = true
 [dependencies]
 cyrup-core = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+futures-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+dashmap = { workspace = true }
+globset = { workspace = true }
+grep-matcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
+ignore = { workspace = true }
+similar = { workspace = true }
+unicode-segmentation = { workspace = true }
+image = { workspace = true, optional = true }
+
+[features]
+# Decode/resize images in `read` (arch-03 §6.3, R-03-012). Off by default to keep cold-start lean.
+inline-images = ["dep:image"]
+
+[target."cfg(unix)".dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "signal"] }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }

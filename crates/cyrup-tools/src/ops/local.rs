@@ -1,0 +1,307 @@
+//! The default local backend over `tokio::fs` / `tokio::process` (arch-03 §3.3, §6.5).
+//!
+//! `LocalFs` is an indirection over the real filesystem; `LocalProc` runs commands through the
+//! detected shell, streams combined stdout+stderr, and kills the whole process tree on
+//! cancel/timeout (R-03-024/027). The only `unsafe` in the crate lives here, isolated to the unix
+//! process-group calls (`setsid`/`killpg`) with safety comments.
+
+use super::{
+    Access, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig, Transport, WalkItem,
+    WalkOpts,
+};
+use crate::error;
+use cyrup_core::{CancelToken, EventStream, ToolError};
+use ignore::WalkBuilder;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+static UNIQUE: AtomicU64 = AtomicU64::new(0);
+
+/// Process-unique-ish suffix for temp files (no rng dependency).
+pub(crate) fn unique_suffix() -> String {
+    let pid = std::process::id();
+    let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid:x}-{nanos:x}-{n:x}")
+}
+
+/// Local filesystem operations.
+#[derive(Default, Clone)]
+pub struct LocalFs;
+
+#[async_trait::async_trait]
+impl FsOps for LocalFs {
+    async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
+        tokio::fs::read(path).await.map_err(|e| error::io(&error::show(path), &e))
+    }
+
+    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| error::io(&format!("create dir {}", error::show(parent)), &e))?;
+            }
+        }
+        let tmp = match path.file_name() {
+            Some(name) => {
+                let mut t = name.to_os_string();
+                t.push(format!(".cyrup-tmp-{}", unique_suffix()));
+                path.with_file_name(t)
+            }
+            None => return Err(error::invalid(format!("invalid path: {}", error::show(path)))),
+        };
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_err(|e| error::io(&format!("write {}", error::show(&tmp)), &e))?;
+        tokio::fs::rename(&tmp, path).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            error::io(&format!("rename to {}", error::show(path)), &e)
+        })?;
+        Ok(())
+    }
+
+    async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| error::io(&error::show(path), &e))?;
+        if mode == Access::ReadWrite && meta.permissions().readonly() {
+            return Err(error::invalid(format!("{} is not writable", error::show(path))));
+        }
+        Ok(())
+    }
+
+    async fn metadata(&self, path: &Path) -> Result<Meta, ToolError> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| error::io(&error::show(path), &e))?;
+        let canonical = tokio::fs::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
+        Ok(Meta {
+            is_dir: meta.is_dir(),
+            is_file: meta.is_file(),
+            len: meta.len(),
+            canonical,
+        })
+    }
+
+    async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError> {
+        let mut rd = tokio::fs::read_dir(path)
+            .await
+            .map_err(|e| error::io(&error::show(path), &e))?;
+        let mut out = Vec::new();
+        loop {
+            match rd.next_entry().await {
+                Ok(Some(entry)) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    out.push(DirEntry { name, path: entry.path() });
+                }
+                Ok(None) => break,
+                Err(e) => return Err(error::io(&error::show(path), &e)),
+            }
+        }
+        Ok(out)
+    }
+
+    fn walk(&self, root: &Path, opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<WalkItem, ToolError>>(256);
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let walker = WalkBuilder::new(&root)
+                .hidden(!opts.include_hidden)
+                .git_ignore(true)
+                .git_exclude(true)
+                .git_global(false)
+                .require_git(false)
+                .parents(true)
+                .build();
+            for result in walker {
+                let item = match result {
+                    Ok(entry) => {
+                        let path = entry.path().to_path_buf();
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        Ok(WalkItem { path, is_dir })
+                    }
+                    Err(e) => Err(ToolError::new(format!("walk: {e}"))),
+                };
+                if tx.blocking_send(item).is_err() {
+                    break;
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+/// Local process operations.
+pub struct LocalProc {
+    shell: ShellConfig,
+}
+
+impl LocalProc {
+    pub fn new(shell: ShellConfig) -> Self {
+        Self { shell }
+    }
+}
+
+/// Build the OS command for an [`ExecSpec`], installing the unix process-group setup.
+#[allow(unsafe_code)]
+fn build_command(spec: &ExecSpec) -> std::process::Command {
+    let mut std_cmd = std::process::Command::new(&spec.shell.program);
+    std_cmd.args(&spec.shell.args);
+    if spec.shell.transport == Transport::Argv {
+        std_cmd.arg(&spec.command);
+    }
+    std_cmd.current_dir(&spec.cwd);
+    for (k, v) in &spec.env {
+        std_cmd.env(k, v);
+    }
+    std_cmd.stdout(std::process::Stdio::piped());
+    std_cmd.stderr(std::process::Stdio::piped());
+    if spec.shell.transport == Transport::Stdin {
+        std_cmd.stdin(std::process::Stdio::piped());
+    } else {
+        std_cmd.stdin(std::process::Stdio::null());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` only detaches the child into its own session/process group before exec;
+        // it touches no parent memory and is async-signal-safe. This makes the child the group
+        // leader (pgid == pid) so the whole tree can be killed via `killpg` (R-03-027).
+        unsafe {
+            std_cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    std_cmd
+}
+
+/// Kill the child's whole process tree (R-03-024/027).
+#[allow(unsafe_code)]
+fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: send SIGKILL to the child's process group (created via `setsid`). A negative
+            // pid / killpg targets the group; harmless if the group is already gone (ESRCH).
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+    }
+    let _ = child.start_kill();
+}
+
+fn exit_from(status: std::process::ExitStatus) -> ExitStatus {
+    match status.code() {
+        Some(code) => ExitStatus::Exited(code),
+        None => ExitStatus::Killed,
+    }
+}
+
+/// Read one chunk; `None` on EOF/error (or never resolves when the reader is absent).
+async fn read_chunk<R: tokio::io::AsyncRead + Unpin>(reader: &mut Option<R>) -> Option<Vec<u8>> {
+    match reader {
+        Some(r) => {
+            let mut buf = [0u8; 8192];
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => None,
+                Ok(n) => Some(buf.get(..n).unwrap_or(&[]).to_vec()),
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcOps for LocalProc {
+    async fn exec(
+        &self,
+        mut spec: ExecSpec,
+        cancel: CancelToken,
+        timeout: Option<Duration>,
+        on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
+    ) -> Result<ExitStatus, ToolError> {
+        if spec.shell.program.as_os_str().is_empty() {
+            spec.shell = self.shell.clone();
+        }
+        let stdin_command =
+            if spec.shell.transport == Transport::Stdin { Some(spec.command.clone()) } else { None };
+
+        let std_cmd = build_command(&spec);
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            error::io(&format!("spawn {}", error::show(&spec.shell.program)), &e)
+        })?;
+
+        if let Some(command) = stdin_command {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(command.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            }
+        }
+
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+
+        let timeout_fut = async {
+            match timeout {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(timeout_fut);
+
+        let status = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    kill_tree(&mut child);
+                    let _ = child.wait().await;
+                    break ExitStatus::Killed;
+                }
+                _ = &mut timeout_fut => {
+                    kill_tree(&mut child);
+                    let _ = child.wait().await;
+                    break ExitStatus::TimedOut;
+                }
+                chunk = read_chunk(&mut stdout) => {
+                    match chunk {
+                        Some(data) => on_data(&data),
+                        None => stdout = None,
+                    }
+                }
+                chunk = read_chunk(&mut stderr) => {
+                    match chunk {
+                        Some(data) => on_data(&data),
+                        None => stderr = None,
+                    }
+                }
+                s = child.wait(), if stdout.is_none() && stderr.is_none() => {
+                    break match s {
+                        Ok(st) => exit_from(st),
+                        Err(_) => ExitStatus::Exited(-1),
+                    };
+                }
+            }
+        };
+        Ok(status)
+    }
+}
