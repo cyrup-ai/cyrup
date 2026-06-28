@@ -10,9 +10,11 @@
 //! The defining invariant (DI-9): the on-disk record is **lossless** — branch navigation and
 //! compaction prune only the *built context*, never the file.
 //!
-//! Compaction *generation* (arch-05) and system-prompt assembly (arch-06) are deferred siblings.
+//! Compaction *generation* (arch-05) lives in [`compaction`]; system-prompt assembly (arch-06) is a
+//! deferred sibling.
 #![forbid(unsafe_code)]
 
+pub mod compaction;
 pub mod context;
 pub mod entry;
 pub mod error;
@@ -24,6 +26,10 @@ pub mod manager;
 pub mod migrate;
 pub mod store;
 
+pub use compaction::{
+    serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionHooks,
+    CompactionReason, CompactionSettings, NoHooks, Summarizer,
+};
 pub use context::SessionContext;
 pub use entry::{Entry, EntryBase, KnownEntry};
 pub use error::SessionError;

@@ -27,3 +27,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Lock-neutral: cyrup-provider is already a dependency; the `faux` feature pulls no new crate.
+cyrup-provider = { workspace = true, features = ["faux"] }

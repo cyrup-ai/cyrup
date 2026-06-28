@@ -484,6 +484,26 @@ impl SessionManager {
         }))
     }
 
+    /// Append a `BranchSummary` at the current leaf with an explicit `from_id` (the entry navigated
+    /// *from*), per the corrected R-05-016. Unlike [`Self::branch_with_summary`], this does not move
+    /// the leaf — the caller navigates first so the summary is recorded at the navigation point. The
+    /// abandoned branch is never touched (R-05-017).
+    pub fn append_branch_summary(
+        &mut self,
+        from_id: EntryId,
+        summary: String,
+        details: Option<Value>,
+        from_hook: bool,
+    ) -> Result<EntryId, SessionError> {
+        self.push_entry(Entry::known(KnownEntry::BranchSummary {
+            base: self.make_base(),
+            from_id,
+            summary,
+            details,
+            from_hook: Some(from_hook),
+        }))
+    }
+
     // ------------------------------------------------------------- context (R-04-011/012/013) -
 
     pub fn build_context(&self) -> SessionContext {
