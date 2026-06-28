@@ -150,6 +150,8 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 100,
+            thinking_level_map: None,
+            compat: None,
         }
     }
 

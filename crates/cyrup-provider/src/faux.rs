@@ -69,6 +69,8 @@ impl FauxProvider {
             cost: ModelCost::default(),
             context_window: 200_000,
             max_tokens: 8192,
+            thinking_level_map: None,
+            compat: None,
         };
         Self {
             id,

@@ -19,6 +19,32 @@ pub enum CacheRetention {
     Long,
 }
 
+/// Caller-specified tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`:
+/// `"auto" | "none" | "required" | { type: "function"; function: { name } }`). When `None`, the
+/// wire impl omits `tool_choice` entirely (matching Pi's default — it never auto-injects `"auto"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Function { name: String },
+}
+
+impl ToolChoice {
+    /// The OpenAI `tool_choice` wire JSON for this choice.
+    pub fn to_wire(&self) -> serde_json::Value {
+        match self {
+            ToolChoice::Auto => serde_json::Value::String("auto".to_string()),
+            ToolChoice::None => serde_json::Value::String("none".to_string()),
+            ToolChoice::Required => serde_json::Value::String("required".to_string()),
+            ToolChoice::Function { name } => serde_json::json!({
+                "type": "function",
+                "function": { "name": name },
+            }),
+        }
+    }
+}
+
 /// Per-request options (func-01 §13). Errors never throw; cancellation is delivered as a terminal
 /// `StreamEvent::Error` with `stop_reason: Aborted` (func-01 R-01-044).
 #[derive(Clone, Default)]
@@ -27,7 +53,11 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     /// Forwarded for cache routing / session affinity (func-01 R-01-039).
     pub session_id: Option<SessionId>,
-    pub cache_retention: CacheRetention,
+    /// Caller-specified prompt-cache retention. `None` = unset: the encoder then consults the
+    /// `PI_CACHE_RETENTION` env var (Pi `resolveCacheRetention`, openai-completions.ts:141-149).
+    /// An explicit `Some(_)` always wins over the env. Additive, backward-compatible (defaults to
+    /// `None`, which resolves to `Short` unless the env promotes it to `Long`).
+    pub cache_retention: Option<CacheRetention>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u64>,
     /// Unified reasoning level (func-01 R-01-040). Additive, backward-compatible (defaulted to
@@ -35,6 +65,9 @@ pub struct StreamOptions {
     pub reasoning: ThinkingLevel,
     /// Per-request header overlay; a `None` value suppresses a default header (func-01 §4.1).
     pub headers: Option<crate::HeaderMap>,
+    /// Optional tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`). Additive,
+    /// backward-compatible (defaults to `None`, which omits the `tool_choice` field).
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// One streaming event (func-01 §8.1).

@@ -2,10 +2,11 @@
 //! wire protocol; differs from other OpenAI-compatible providers only in base URL, env key, and
 //! catalog. Mirrors Pi's `providers/together.ts` + `together.models.ts`.
 
+use crate::api::compat::{MaxTokensField, OpenAiCompletionsCompat, ThinkingFormat};
 use crate::api::{builtin_registry, ApiRegistry};
 use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
 use crate::known_api::OPENAI_COMPLETIONS;
-use crate::model::{Modality, Model, ModelCost};
+use crate::model::{Modality, Model, ModelCost, ThinkingLevelMap};
 use crate::wire::WireProvider;
 use std::sync::Arc;
 
@@ -18,7 +19,37 @@ pub const TOGETHER_PROVIDER_ID: &str = "together";
 /// The env var carrying the Together API key (func-01 R-01-063).
 pub const TOGETHER_API_KEY_ENV: &str = "TOGETHER_API_KEY";
 
+/// USD-per-1e6-token cost (Together never reports a separate cache-write price).
+fn cost(input: f64, output: f64, cache_read: f64) -> ModelCost {
+    ModelCost { input, output, cache_read, cache_write: 0.0 }
+}
+
+/// Build a `thinkingLevelMap` from `(level, Some(value) | None)` pairs (Pi `ThinkingLevelMap`).
+fn level_map(pairs: &[(&str, Option<&str>)]) -> ThinkingLevelMap {
+    pairs.iter().map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string()))).collect()
+}
+
+/// The Together compat block shared by every catalog entry (Pi `together.models.ts` `compat`):
+/// no `store`/`developer`/`strict`/long-cache, `max_tokens` field. The two varying knobs are
+/// `supports_reasoning_effort` and `thinking_format`.
+fn together_compat(
+    supports_reasoning_effort: bool,
+    thinking_format: Option<ThinkingFormat>,
+) -> OpenAiCompletionsCompat {
+    OpenAiCompletionsCompat {
+        supports_store: Some(false),
+        supports_developer_role: Some(false),
+        supports_reasoning_effort: Some(supports_reasoning_effort),
+        max_tokens_field: Some(MaxTokensField::MaxTokens),
+        thinking_format,
+        supports_strict_mode: Some(false),
+        supports_long_cache_retention: Some(false),
+        ..Default::default()
+    }
+}
+
 /// Build one Together catalog entry.
+#[allow(clippy::too_many_arguments)]
 fn model(
     id: &str,
     name: &str,
@@ -27,6 +58,8 @@ fn model(
     cost: ModelCost,
     context_window: u64,
     max_tokens: u64,
+    thinking_level_map: Option<ThinkingLevelMap>,
+    compat: OpenAiCompletionsCompat,
 ) -> Model {
     let mut input = vec![Modality::Text];
     if image {
@@ -44,53 +77,239 @@ fn model(
         cost,
         context_window,
         max_tokens,
+        thinking_level_map,
+        compat: Some(compat),
     }
 }
 
-/// A hand-seeded subset of current Together chat models (id/name/context/cost from Pi's
-/// `together.models.ts`). Full models.dev generation is DEFERRED (arch-01 §12).
+/// The full Together chat catalog — a verbatim 1:1 port of Pi's `together.models.ts`
+/// (every model id, name, cost, context window, max tokens, reasoning flag, modalities, the
+/// per-model `compat` block, and `thinkingLevelMap`).
 pub fn together_models() -> Vec<Model> {
-    let c = |input, output, cache_read| ModelCost { input, output, cache_read, cache_write: 0.0 };
+    // The default reasoning map shared by most Together reasoning models.
+    let m = || level_map(&[("minimal", None), ("low", None), ("medium", None)]);
     vec![
-        model("openai/gpt-oss-120b", "GPT OSS 120B", true, false, c(0.15, 0.6, 0.0), 131_072, 131_072),
-        model("openai/gpt-oss-20b", "GPT OSS 20B", true, false, c(0.05, 0.2, 0.0), 131_072, 131_072),
         model(
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "Llama 3.3 70B",
+            "MiniMaxAI/MiniMax-M2.7",
+            "MiniMax-M2.7",
+            true,
             false,
-            false,
-            c(0.88, 0.88, 0.0),
+            cost(0.3, 1.2, 0.06),
+            202_752,
             131_072,
-            131_072,
+            Some(level_map(&[
+                ("off", None),
+                ("minimal", None),
+                ("low", None),
+                ("medium", None),
+            ])),
+            // No `thinkingFormat` override => falls back to detected "together".
+            together_compat(false, None),
+        ),
+        model(
+            "MiniMaxAI/MiniMax-M3",
+            "MiniMax-M3",
+            true,
+            true,
+            cost(0.3, 1.2, 0.06),
+            524_288,
+            250_000,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
         ),
         model(
             "Qwen/Qwen2.5-7B-Instruct-Turbo",
             "Qwen 2.5 7B Instruct Turbo",
             false,
             false,
-            c(0.3, 0.3, 0.0),
+            cost(0.3, 0.3, 0.0),
             32_768,
             32_768,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "Qwen/Qwen3-235B-A22B-Instruct-2507-tput",
+            "Qwen3 235B A22B Instruct 2507 FP8",
+            false,
+            false,
+            cost(0.2, 0.6, 0.0),
+            262_144,
+            262_144,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "Qwen/Qwen3.5-397B-A17B",
+            "Qwen3.5 397B A17B",
+            true,
+            true,
+            cost(0.6, 3.6, 0.0),
+            262_144,
+            130_000,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "Qwen/Qwen3.5-9B",
+            "Qwen3.5 9B",
+            true,
+            true,
+            cost(0.17, 0.25, 0.0),
+            262_144,
+            65_536,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "Qwen/Qwen3.6-Plus",
+            "Qwen3.6 Plus",
+            true,
+            false,
+            cost(0.5, 3.0, 0.0),
+            1_000_000,
+            500_000,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "Qwen/Qwen3.7-Max",
+            "Qwen3.7 Max",
+            false,
+            false,
+            cost(1.25, 3.75, 0.0),
+            1_000_000,
+            500_000,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
         ),
         model(
             "deepseek-ai/DeepSeek-V4-Pro",
             "DeepSeek V4 Pro",
             true,
             false,
-            c(1.74, 3.48, 0.2),
+            cost(1.74, 3.48, 0.2),
             512_000,
             384_000,
+            Some(level_map(&[
+                ("minimal", None),
+                ("low", None),
+                ("medium", None),
+                ("high", Some("high")),
+                ("xhigh", None),
+            ])),
+            together_compat(true, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "essentialai/Rnj-1-Instruct",
+            "Rnj-1 Instruct",
+            false,
+            false,
+            cost(0.15, 0.15, 0.0),
+            32_768,
+            32_768,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "google/gemma-4-31B-it",
+            "Gemma 4 31B Instruct",
+            true,
+            true,
+            cost(0.39, 0.97, 0.0),
+            262_144,
+            131_072,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Llama 3.3 70B",
+            false,
+            false,
+            cost(0.88, 0.88, 0.0),
+            131_072,
+            131_072,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
         ),
         model(
             "moonshotai/Kimi-K2.6",
             "Kimi K2.6",
             true,
             true,
-            c(1.2, 4.5, 0.2),
+            cost(1.2, 4.5, 0.2),
             262_144,
             131_000,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
         ),
-        model("zai-org/GLM-5", "GLM-5", true, false, c(1.0, 3.2, 0.0), 202_752, 131_072),
+        model(
+            "moonshotai/Kimi-K2.7-Code",
+            "Kimi K2.7 Code",
+            true,
+            false,
+            cost(0.95, 4.0, 0.19),
+            262_144,
+            131_072,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "Nemotron 3 Ultra 550B A55B",
+            true,
+            false,
+            cost(0.6, 3.6, 0.2),
+            512_300,
+            512_300,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "openai/gpt-oss-120b",
+            "GPT OSS 120B",
+            true,
+            false,
+            cost(0.15, 0.6, 0.0),
+            131_072,
+            131_072,
+            Some(level_map(&[("off", None), ("minimal", None)])),
+            together_compat(true, Some(ThinkingFormat::Openai)),
+        ),
+        model(
+            "openai/gpt-oss-20b",
+            "GPT OSS 20B",
+            true,
+            false,
+            cost(0.05, 0.2, 0.0),
+            131_072,
+            131_072,
+            Some(level_map(&[("off", None), ("minimal", None)])),
+            together_compat(true, Some(ThinkingFormat::Openai)),
+        ),
+        model(
+            "zai-org/GLM-5",
+            "GLM-5",
+            true,
+            false,
+            cost(1.0, 3.2, 0.0),
+            202_752,
+            131_072,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
+        model(
+            "zai-org/GLM-5.1",
+            "GLM-5.1",
+            true,
+            false,
+            cost(1.4, 4.4, 0.0),
+            202_752,
+            131_072,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
     ]
 }
 
@@ -126,7 +345,7 @@ pub fn together_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
@@ -159,6 +378,85 @@ mod tests {
         assert!(models.iter().all(|m| m.provider.as_str() == "together"));
         assert!(models.iter().all(|m| m.base_url.as_deref() == Some(TOGETHER_BASE_URL)));
         assert!(p.get_model("openai/gpt-oss-120b").is_some());
+    }
+
+    #[test]
+    fn full_catalog_ported_verbatim_from_pi() {
+        let models = together_models();
+        // Every model id present in Pi's `together.models.ts` (19 entries).
+        assert_eq!(models.len(), 19);
+        let find = |id: &str| {
+            models.iter().find(|m| m.id.as_str() == id).unwrap_or_else(|| panic!("missing {id}"))
+        };
+
+        // gpt-oss: openai thinking format + reasoning_effort supported.
+        let gpt = find("openai/gpt-oss-120b");
+        let gc = gpt.compat.as_ref().unwrap();
+        assert_eq!(gc.thinking_format, Some(ThinkingFormat::Openai));
+        assert_eq!(gc.supports_reasoning_effort, Some(true));
+        assert_eq!(gc.max_tokens_field, Some(MaxTokensField::MaxTokens));
+        assert_eq!(gpt.cost.input, 0.15);
+
+        // DeepSeek: together format but reasoning_effort supported, high->"high" map.
+        let ds = find("deepseek-ai/DeepSeek-V4-Pro");
+        let dc = ds.compat.as_ref().unwrap();
+        assert_eq!(dc.thinking_format, Some(ThinkingFormat::Together));
+        assert_eq!(dc.supports_reasoning_effort, Some(true));
+        assert_eq!(ds.thinking_level_map.as_ref().unwrap().get("high"), Some(&Some("high".to_string())));
+        assert_eq!(ds.context_window, 512_000);
+        assert_eq!(ds.max_tokens, 384_000);
+
+        // MiniMax-M2.7 omits thinkingFormat (=> detected "together").
+        let m27 = find("MiniMaxAI/MiniMax-M2.7");
+        assert_eq!(m27.compat.as_ref().unwrap().thinking_format, None);
+
+        // MiniMax-M3 is vision-capable with the larger context window.
+        let m3 = find("MiniMaxAI/MiniMax-M3");
+        assert!(m3.supports_image_input());
+        assert_eq!(m3.context_window, 524_288);
+        assert_eq!(m3.max_tokens, 250_000);
+
+        // Standard together models: store/developer/strict/long-cache all off; max_tokens field.
+        for id in ["zai-org/GLM-5.1", "moonshotai/Kimi-K2.6", "Qwen/Qwen3.6-Plus"] {
+            let c = find(id).compat.as_ref().unwrap();
+            assert_eq!(c.supports_store, Some(false));
+            assert_eq!(c.supports_developer_role, Some(false));
+            assert_eq!(c.supports_strict_mode, Some(false));
+            assert_eq!(c.supports_long_cache_retention, Some(false));
+            assert_eq!(c.max_tokens_field, Some(MaxTokensField::MaxTokens));
+            assert_eq!(c.thinking_format, Some(ThinkingFormat::Together));
+        }
+    }
+
+    #[test]
+    fn catalog_models_encode_reasoning_per_pi() {
+        use crate::api::openai_completions::build_body;
+        use crate::context::Context;
+        use cyrup_core::ThinkingLevel;
+        let models = together_models();
+        let opts =
+            StreamOptions { reasoning: ThinkingLevel::High, max_tokens: Some(50), ..Default::default() };
+
+        // A `together` thinkingFormat model => reasoning: { enabled }, never reasoning_effort.
+        let glm = models.iter().find(|m| m.id.as_str() == "zai-org/GLM-5").unwrap();
+        let body = build_body(glm, &Context::default(), &opts);
+        assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["max_tokens"], 50);
+        assert!(body.get("max_completion_tokens").is_none());
+
+        // gpt-oss (openai format + reasoning_effort) => reasoning_effort, no reasoning object.
+        let gpt = models.iter().find(|m| m.id.as_str() == "openai/gpt-oss-120b").unwrap();
+        let body = build_body(gpt, &Context::default(), &opts);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none());
+
+        // DeepSeek (together format + reasoning_effort supported) => BOTH reasoning.enabled and
+        // reasoning_effort mapped via thinkingLevelMap (high -> "high").
+        let ds = models.iter().find(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro").unwrap();
+        let body = build_body(ds, &Context::default(), &opts);
+        assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[tokio::test]
@@ -236,8 +534,14 @@ mod tests {
         };
         // Enough budget for a real answer. gpt-oss-120b is a reasoning model: it may finish with
         // `Stop` (answer emitted) or, if it spends the budget reasoning, `Length` — both are
-        // successful round-trips. Only a transport/API failure yields `Error`.
-        let opts = StreamOptions { max_tokens: Some(256), ..Default::default() };
+        // successful round-trips. Only a transport/API failure yields `Error`. Sending reasoning
+        // `High` exercises the live reasoning encoding (openai format => `reasoning_effort`) and
+        // the full compat-driven body (`max_tokens`, no `store`) against the real API.
+        let opts = StreamOptions {
+            max_tokens: Some(256),
+            reasoning: cyrup_core::ThinkingLevel::High,
+            ..Default::default()
+        };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;
 
         assert_ne!(

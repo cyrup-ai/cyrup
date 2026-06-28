@@ -13,6 +13,9 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// OpenAI-completions compatibility matrix (shared by every OpenAI-compatible provider).
+pub mod compat;
+
 /// Concrete wire-protocol implementations (one `ApiImpl` per submodule).
 pub mod openai_completions;
 
