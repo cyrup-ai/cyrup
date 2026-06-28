@@ -41,13 +41,12 @@ impl FsOps for LocalFs {
     }
 
     async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| error::io(&format!("create dir {}", error::show(parent)), &e))?;
             }
-        }
         let tmp = match path.file_name() {
             Some(name) => {
                 let mut t = name.to_os_string();
@@ -251,12 +250,11 @@ impl ProcOps for LocalProc {
             error::io(&format!("spawn {}", error::show(&spec.shell.program)), &e)
         })?;
 
-        if let Some(command) = stdin_command {
-            if let Some(mut stdin) = child.stdin.take() {
+        if let Some(command) = stdin_command
+            && let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(command.as_bytes()).await;
                 let _ = stdin.shutdown().await;
             }
-        }
 
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();

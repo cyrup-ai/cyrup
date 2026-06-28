@@ -69,6 +69,10 @@ impl HostCtx {
     }
 }
 
+/// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, and
+/// registered `(name, descriptor)` commands.
+pub(crate) type InitParts = (Subscriptions, Vec<Arc<dyn Tool>>, Vec<(String, CommandDescriptor)>);
+
 /// What a native extension declares during [`NativeExtension::init`]: its subscriptions plus any
 /// tools/commands it registers (arch-08 §3.5). Mirrors the guest's registration imports.
 #[derive(Default)]
@@ -104,7 +108,7 @@ impl InitApi {
         self.subs
     }
 
-    pub(crate) fn into_parts(self) -> (Subscriptions, Vec<Arc<dyn Tool>>, Vec<(String, CommandDescriptor)>) {
+    pub(crate) fn into_parts(self) -> InitParts {
         (self.subs, self.tools, self.commands)
     }
 }

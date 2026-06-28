@@ -75,8 +75,9 @@ impl HostEvent {
 /// The reduced result of dispatching a `[block]`/`[mutate]` event (arch-08 §6.1).
 #[derive(Debug)]
 pub enum Reduced {
-    /// No block; the (possibly folded) event proceeds.
-    Pass(HostEvent),
+    /// No block; the (possibly folded) event proceeds. Boxed: `HostEvent` is much larger than the
+    /// other variants, so boxing keeps `Reduced` small (clippy::large_enum_variant).
+    Pass(Box<HostEvent>),
     /// First `Block` wins; carries the reason and the blocking extension id.
     Blocked { reason: Option<String>, by: cyrup_core::ExtensionId },
     /// An extension fully serviced the action.

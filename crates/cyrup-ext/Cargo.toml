@@ -18,8 +18,8 @@ cyrup-tools = { workspace = true }
 cyrup-provider = { workspace = true }
 cyrup-session = { workspace = true }
 thiserror = { workspace = true }
-wasmtime = { version = "34.0.2", features = ["component-model", "async", "pooling-allocator", "runtime", "cranelift", "wat"], optional = true }
-wasmtime-wasi = { version = "34.0.2", optional = true }
+wasmtime = { version = "46.0.1", features = ["component-model", "async", "pooling-allocator", "runtime", "cranelift", "wat"], optional = true }
+wasmtime-wasi = { version = "46.0.1", optional = true }
 blake3 = "1.8.5"
 tokio.workspace = true
 futures.workspace = true

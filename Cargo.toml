@@ -42,7 +42,7 @@ default-members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"          # edition 2024 baseline
+rust-version = "1.96"          # track installed stable (edition 2024 needs >=1.85)
 license = "MIT"
 repository = "https://github.com/earendil-works/cyrup"   # placeholder
 authors = ["cyrup contributors"]
@@ -70,7 +70,6 @@ cyrup-tui          = { path = "crates/cyrup-tui",          version = "0.0.0" }
 cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.0.0" }
 cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.0.0" }
 cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
-cyrup-test-support = { path = "crates/cyrup-test-support", version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---
@@ -81,7 +80,6 @@ futures      = { version = "0.3" }
 futures-core = { version = "0.3" }
 async-trait  = { version = "0.1" }
 thiserror    = { version = "2" }
-anyhow       = { version = "1" }
 serde        = { version = "1",   features = ["derive", "rc"] }
 serde_json   = { version = "1" }
 
@@ -94,7 +92,7 @@ grep-searcher        = { version = "0.1.16" }
 similar              = { version = "3.1.1" }
 dashmap              = { version = "6.2.1" }
 unicode-segmentation = { version = "1.13.3" }
-image                = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+image                = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc                 = { version = "0.2.186" }
 tempfile             = { version = "3.27.0" }
 

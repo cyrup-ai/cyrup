@@ -16,3 +16,7 @@ cyrup-core = { workspace = true }
 cyrup-session-svc = { workspace = true }
 cyrup-resources = { workspace = true }
 thiserror = { workspace = true }
+ratatui = "0.30.2"
+tokio.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true

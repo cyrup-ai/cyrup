@@ -313,9 +313,8 @@ fn reload(inner: &Arc<std::sync::Mutex<WatcherInner>>) {
     let path = guard.path.clone();
     let tx = guard.tx.clone();
     drop(guard);
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(data) = serde_json::from_str::<ThemeData>(&text) {
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(data) = serde_json::from_str::<ThemeData>(&text) {
             let _ = tx.send(Arc::new(data));
         }
-    }
 }

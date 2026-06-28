@@ -3,8 +3,7 @@
 //! `ResourceLimiter`. One `HostState` lives in each per-extension `Store<HostState>`.
 
 use crate::host::limits::StoreLimits;
-use wasmtime_wasi::ResourceTable;
-use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// State carried by each per-extension `Store`.
 pub struct HostState {
@@ -28,14 +27,8 @@ impl HostState {
     }
 }
 
-impl IoView for HostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
     }
 }

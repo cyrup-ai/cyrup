@@ -104,11 +104,10 @@ impl TokenCache {
     /// Estimate (chars/4) the messages an entry contributes, memoized by entry id.
     pub fn estimate_entry(&self, entry: &Entry) -> u32 {
         let id = entry.id();
-        if let Ok(map) = self.map.lock() {
-            if let Some(v) = map.get(&id) {
+        if let Ok(map) = self.map.lock()
+            && let Some(v) = map.get(&id) {
                 return *v;
             }
-        }
         let mut msgs = Vec::new();
         push_as_message(&mut msgs, entry);
         let est = msgs.iter().map(estimate_tokens).fold(0u32, |a, b| a.saturating_add(b));

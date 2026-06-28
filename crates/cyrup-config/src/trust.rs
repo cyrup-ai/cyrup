@@ -93,14 +93,13 @@ impl TrustStore {
         let cwd = canonicalize(cwd);
         let mut current: Option<&Path> = Some(cwd.as_path());
         while let Some(dir) = current {
-            if let Some(key) = dir.to_str() {
-                if let Some(Some(b)) = map.get(key) {
+            if let Some(key) = dir.to_str()
+                && let Some(Some(b)) = map.get(key) {
                     return Ok(Some(TrustEntry {
                         path: dir.to_path_buf(),
                         decision: TrustDecision::from_bool(*b),
                     }));
                 }
-            }
             current = dir.parent();
         }
         Ok(None)

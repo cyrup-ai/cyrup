@@ -31,7 +31,7 @@ pub fn cache_key(source_tree_hash: &[u8], toolchain_id: &str, world_version: &st
 /// its contents into one BLAKE3 digest. Hidden dirs (`target`, `.git`) are skipped.
 pub fn hash_source_tree(root: &Path) -> Result<[u8; 32], ExtError> {
     let mut entries: Vec<PathBuf> = Vec::new();
-    collect_files(root, root, &mut entries)?;
+    collect_files(root, &mut entries)?;
     entries.sort();
     let mut hasher = blake3::Hasher::new();
     for path in &entries {
@@ -45,7 +45,7 @@ pub fn hash_source_tree(root: &Path) -> Result<[u8; 32], ExtError> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ExtError> {
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ExtError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -56,7 +56,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
         }
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            collect_files(root, &path, out)?;
+            collect_files(&path, out)?;
         } else if ft.is_file() {
             out.push(path);
         }

@@ -105,11 +105,10 @@ impl PackageManager {
             if reg.remove(id) {
                 lock::save(&reg_path, &reg)?;
                 // Best-effort: drop the cloned working tree (not Path installs).
-                if let Some(dir) = self.store.package_dir(scope, id) {
-                    if dir.exists() {
+                if let Some(dir) = self.store.package_dir(scope, id)
+                    && dir.exists() {
                         let _ = std::fs::remove_dir_all(&dir);
                     }
-                }
                 removed = true;
             }
         }
@@ -124,11 +123,10 @@ impl PackageManager {
     pub fn list(&self) -> Vec<InstalledPackage> {
         let mut out = Vec::new();
         for scope in [InstallScope::Global, InstallScope::Project] {
-            if let Some(reg_path) = self.store.registry_path(scope) {
-                if let Ok(reg) = lock::load(&reg_path) {
+            if let Some(reg_path) = self.store.registry_path(scope)
+                && let Ok(reg) = lock::load(&reg_path) {
                     out.extend(reg.packages);
                 }
-            }
         }
         out
     }
@@ -203,11 +201,10 @@ fn refresh(
         PackageSource::Path { .. } => Ok(()),
         PackageSource::Oci { .. } => Err(ResourceError::Unsupported),
         PackageSource::Git { .. } => {
-            if let Some(dir) = store.package_dir(scope, &pkg.id) {
-                if let Ok(commit) = git_head(&dir) {
+            if let Some(dir) = store.package_dir(scope, &pkg.id)
+                && let Ok(commit) = git_head(&dir) {
                     pkg.resolved_commit = Some(commit);
                 }
-            }
             Ok(())
         }
     }

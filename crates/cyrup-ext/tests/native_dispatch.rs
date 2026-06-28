@@ -88,11 +88,10 @@ impl NativeExtension for BashGate {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if let HostEvent::ToolCall { name, .. } = ev {
-            if name == "bash" {
+        if let HostEvent::ToolCall { name, .. } = ev
+            && name == "bash" {
                 return HookOutcome::Block { reason: Some("bash is not allowed".into()) };
             }
-        }
         HookOutcome::Noop
     }
 }

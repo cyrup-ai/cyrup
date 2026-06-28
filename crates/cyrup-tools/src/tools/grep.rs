@@ -154,11 +154,10 @@ impl Tool for GrepTool {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| rel.clone());
-                                if let Some(g) = &glob {
-                                    if !g.is_match(&rel, &basename) {
+                                if let Some(g) = &glob
+                                    && !g.is_match(&rel, &basename) {
                                         continue;
                                     }
-                                }
                                 files.push((w.path, rel));
                             }
                             Some(Ok(_)) => {}

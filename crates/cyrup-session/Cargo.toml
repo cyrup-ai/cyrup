@@ -12,7 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-arc-swap = "1.9.1"
+arc-swap = "1.9.2"
 cyrup-config.workspace = true
 # arch-04 (SESSIONS & BRANCHING) needs only cyrup-core + serde/time/uuid. cyrup-config and
 # cyrup-resources (which transitively pull cyrup-provider) are deferred to arch-05/06 and are

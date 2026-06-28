@@ -145,14 +145,13 @@ fn coerce_object_schema(
     };
 
     // enum membership (checked after coercion).
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        if !allowed.iter().any(|a| a == &coerced) {
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.iter().any(|a| a == &coerced) {
             return Err(ToolValidationError::schema(
                 path,
                 format!("value {coerced} is not one of the permitted enum values"),
             ));
         }
-    }
     Ok(coerced)
 }
 

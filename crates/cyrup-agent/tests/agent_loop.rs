@@ -532,13 +532,11 @@ struct SteerOnToolStart {
 #[async_trait::async_trait]
 impl EventSubscriber for SteerOnToolStart {
     async fn on_event(&self, event: &AgentEvent) {
-        if let AgentEvent::ToolExecutionStart { .. } = event {
-            if let Some(a) = self.agent.upgrade() {
-                if let Some(m) = self.msg.lock().unwrap().take() {
+        if let AgentEvent::ToolExecutionStart { .. } = event
+            && let Some(a) = self.agent.upgrade()
+                && let Some(m) = self.msg.lock().unwrap().take() {
                     a.steer(m);
                 }
-            }
-        }
     }
 }
 

@@ -163,8 +163,8 @@ impl SessionManager {
         let retained_ids: std::collections::HashSet<EntryId> =
             retained.iter().map(Entry::id).collect();
         for e in &path_entries {
-            if let Entry::Known(KnownEntry::Label { target_id, label, .. }) = e {
-                if retained_ids.contains(target_id) {
+            if let Entry::Known(KnownEntry::Label { target_id, label, .. }) = e
+                && retained_ids.contains(target_id) {
                     let base = EntryBase {
                         id: gen_short_id(),
                         parent_id: prev.clone(),
@@ -178,7 +178,6 @@ impl SessionManager {
                     prev = Some(lbl.id());
                     retained.push(lbl);
                 }
-            }
         }
 
         let id = gen_session_id();

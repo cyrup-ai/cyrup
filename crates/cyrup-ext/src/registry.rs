@@ -197,11 +197,10 @@ impl ExtensionRegistry {
             }
         }
         for n in &g.tool_order {
-            if !seen.contains(n) {
-                if let Some(t) = g.tools.get(n) {
+            if !seen.contains(n)
+                && let Some(t) = g.tools.get(n) {
                     out.push(t.clone());
                 }
-            }
         }
         Ok(out)
     }

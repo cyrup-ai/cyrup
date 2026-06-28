@@ -93,12 +93,11 @@ impl EventSubscriber for SvcSubscriber {
     async fn on_event(&self, event: &AgentEvent) {
         // 1. Durable persistence: a finalized message lands in the session tree on `message_end`
         //    (arch-04 §6). User → assistant(toolCall) → toolResult → assistant, in event order.
-        if let AgentEvent::MessageEnd { message } = event {
-            if let Some(core) = agent_message_to_core(message) {
+        if let AgentEvent::MessageEnd { message } = event
+            && let Some(core) = agent_message_to_core(message) {
                 // Append the finalized message to the session tree (durable across the turn).
                 let _ = self.manager.lock().await.append_message(core);
             }
-        }
 
         // 2. Fan the event out to live subscriptions (awaited, in order).
         let svc_ev = AgentSessionEvent::from_agent(event);

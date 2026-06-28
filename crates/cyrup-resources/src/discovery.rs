@@ -279,8 +279,8 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     }
 
     // --- project loose resources (trust-gated, walked cwd->root) (R-09-002/003/008/012) ---
-    if let Some(project_root) = &cfg.project_root {
-        if cfg.trusted_project {
+    if let Some(project_root) = &cfg.project_root
+        && cfg.trusted_project {
             for base in walk_up(&cfg.cwd, project_root) {
                 if cfg.enable_skills {
                     for sub in [".cyrup/skills", ".agents/skills"] {
@@ -316,7 +316,6 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 }
             }
         }
-    }
 
     // --- resources_discover contributions (R-09-022) ---
     if cfg.enable_skills {

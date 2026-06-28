@@ -102,7 +102,7 @@ impl Dispatcher {
     ) -> Reduced {
         let kind = ev.kind();
         if self.no_subscribers(kind) {
-            return Reduced::Pass(ev);
+            return Reduced::Pass(Box::new(ev));
         }
         for ext in self.subscribers_for(kind) {
             let outcome = match self.invoke_contained(&ext, &ev, cancel).await {
@@ -125,7 +125,7 @@ impl Dispatcher {
                 HookOutcome::Noop => {}
             }
         }
-        Reduced::Pass(ev)
+        Reduced::Pass(Box::new(ev))
     }
 
     /// Wrap one guest call with the invocation budget. The `Extension` impl already contains panics

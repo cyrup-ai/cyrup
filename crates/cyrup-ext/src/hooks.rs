@@ -42,11 +42,13 @@ impl Hooks for ExtHooks {
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Blocked { reason, .. } => Ok(BeforeOutcome::Block { reason }),
-            Reduced::Pass(HostEvent::ToolCall { input, .. }) => {
-                *ctx.args = input; // mutated args execute as-is, WITHOUT re-validation (R-02-022)
+            Reduced::Pass(ev) => {
+                if let HostEvent::ToolCall { input, .. } = *ev {
+                    *ctx.args = input; // mutated args execute as-is, WITHOUT re-validation (R-02-022)
+                }
                 Ok(BeforeOutcome::Proceed)
             }
-            // Handled / shape-shift (shouldn't happen) => proceed unmodified.
+            // Handled (shouldn't happen) => proceed unmodified.
             _ => Ok(BeforeOutcome::Proceed),
         }
     }
@@ -69,7 +71,10 @@ impl Hooks for ExtHooks {
             is_error: orig_is_error,
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
-            Reduced::Pass(HostEvent::ToolResult { content, details, is_error, .. }) => {
+            Reduced::Pass(ev) => {
+                let HostEvent::ToolResult { content, details, is_error, .. } = *ev else {
+                    return Ok(None);
+                };
                 let mut over = AfterOverride::default();
                 let mut changed = false;
                 if content != orig_content {
@@ -99,7 +104,10 @@ impl Hooks for ExtHooks {
     ) -> Result<Vec<AgentMessage>, HookError> {
         let ev = HostEvent::Context { messages: msgs.clone() };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
-            Reduced::Pass(HostEvent::Context { messages }) => Ok(messages),
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::Context { messages } => Ok(messages),
+                _ => Ok(msgs),
+            },
             _ => Ok(msgs),
         }
     }

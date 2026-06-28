@@ -17,3 +17,7 @@ cyrup-session-svc = { workspace = true }
 cyrup-agent = { workspace = true }
 cyrup-provider = { workspace = true }
 cyrup-session = { workspace = true }
+tokio.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true

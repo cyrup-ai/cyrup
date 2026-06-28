@@ -79,12 +79,11 @@ pub fn reduce(st: &mut StateInner, ev: &AgentEvent) {
             st.pending_tool_calls.remove(tool_call_id);
         }
         AgentEvent::TurnEnd { message, .. } => {
-            if let AgentMessage::Assistant(a) = message {
-                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
+            if let AgentMessage::Assistant(a) = message
+                && matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
                     st.error_message =
                         a.error_message.clone().or_else(|| Some("turn ended with error".to_string()));
                 }
-            }
         }
         AgentEvent::AgentEnd { .. } => {
             st.streaming_message = None;

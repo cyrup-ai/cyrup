@@ -97,11 +97,9 @@ impl ContextFileLoader {
         // (a) GLOBAL — pre-trust (R-06-009).
         if let Some(cf) =
             first_context_file(&self.global_agent_dir, ContextScope::Global, &mut diags)
-        {
-            if seen.insert(cf.path.clone()) {
+            && seen.insert(cf.path.clone()) {
                 files.push(cf);
             }
-        }
 
         // (b) PROJECT (ancestors + cwd) — trust-gated (R-06-009).
         if self.project_trusted {
@@ -116,11 +114,10 @@ impl ContextFileLoader {
                 } else {
                     ContextScope::Ancestor
                 };
-                if let Some(cf) = first_context_file(&dir, scope, &mut diags) {
-                    if seen.insert(cf.path.clone()) {
+                if let Some(cf) = first_context_file(&dir, scope, &mut diags)
+                    && seen.insert(cf.path.clone()) {
                         ancestors.insert(0, cf);
                     }
-                }
                 match dir.parent() {
                     Some(p) if p != dir => dir = p.to_path_buf(),
                     _ => break,

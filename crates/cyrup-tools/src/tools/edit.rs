@@ -72,20 +72,18 @@ impl EditTool {
 fn normalize_args(mut raw: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = raw.as_object_mut() {
         // edits-as-string
-        if let Some(serde_json::Value::String(s)) = obj.get("edits") {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(serde_json::Value::String(s)) = obj.get("edits")
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
                 obj.insert("edits".to_string(), parsed);
             }
-        }
         // legacy single-edit
-        if !obj.contains_key("edits") {
-            if let (Some(old), Some(new)) = (obj.remove("oldText"), obj.remove("newText")) {
+        if !obj.contains_key("edits")
+            && let (Some(old), Some(new)) = (obj.remove("oldText"), obj.remove("newText")) {
                 obj.insert(
                     "edits".to_string(),
                     serde_json::json!([{ "oldText": old, "newText": new }]),
                 );
             }
-        }
     }
     raw
 }

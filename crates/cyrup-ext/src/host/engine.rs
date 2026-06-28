@@ -11,7 +11,8 @@ use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConf
 /// this — only the Tier-1 build loop needs `wasm32-wasip2` (arch-00 Appendix B).
 pub fn build_engine() -> Result<Engine, ExtError> {
     let mut config = Config::new();
-    config.async_support(true);
+    // Async support is always enabled when wasmtime's `async` feature is on (wasmtime 46:
+    // `Config::async_support` is a deprecated no-op); `instantiate_async`/`call_async` work directly.
     config.epoch_interruption(true);
     config.wasm_component_model(true);
 
@@ -29,7 +30,7 @@ pub fn build_engine() -> Result<Engine, ExtError> {
 /// allocator's fixed reservations are undesirable (e.g. constrained test environments).
 pub fn build_engine_on_demand() -> Result<Engine, ExtError> {
     let mut config = Config::new();
-    config.async_support(true);
+    // Async support is always enabled when wasmtime's `async` feature is on (wasmtime 46).
     config.epoch_interruption(true);
     config.wasm_component_model(true);
     Engine::new(&config).map_err(|e| ExtError::Engine(e.to_string()))

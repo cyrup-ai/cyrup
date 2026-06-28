@@ -63,16 +63,14 @@ impl TraversalFs {
         // Best-effort symlink-escape guard: if the target resolves on disk, its canonical form must
         // remain under the canonical root. A non-existent target (e.g. a fresh write) falls back to
         // the lexical check above.
-        if let Some(canon_root) = &self.canonical_root {
-            if let Ok(canon) = std::fs::canonicalize(&norm) {
-                if !canon.starts_with(canon_root) {
+        if let Some(canon_root) = &self.canonical_root
+            && let Ok(canon) = std::fs::canonicalize(&norm)
+                && !canon.starts_with(canon_root) {
                     return Err(error::denied(format!(
                         "path escapes traversal root via symlink: {}",
                         error::show(path)
                     )));
                 }
-            }
-        }
         Ok(norm)
     }
 }

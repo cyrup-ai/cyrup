@@ -38,11 +38,10 @@ pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec
     let mut out = Vec::new();
     let mut i = start;
     while i < end {
-        if let Some(e) = entries.get(i) {
-            if is_valid_cut_point(e) {
+        if let Some(e) = entries.get(i)
+            && is_valid_cut_point(e) {
                 out.push(i);
             }
-        }
         i += 1;
     }
     out
@@ -52,11 +51,10 @@ pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec
 pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<usize> {
     let mut i = idx.min(entries.len());
     loop {
-        if let Some(e) = entries.get(i) {
-            if is_user_entry(e) {
+        if let Some(e) = entries.get(i)
+            && is_user_entry(e) {
                 return Some(i);
             }
-        }
         if i <= start {
             return None;
         }
