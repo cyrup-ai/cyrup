@@ -17,4 +17,7 @@ workspace = true
 crate-type = ["rlib"]   # becomes ["cdylib"] for component builds during arch-08
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+wit-bindgen = "0.58.0"
 # wit-bindgen (+ the generated cyrup:ext bindings) added during arch-08 implementation.

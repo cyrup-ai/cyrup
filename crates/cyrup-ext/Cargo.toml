@@ -18,5 +18,22 @@ cyrup-tools = { workspace = true }
 cyrup-provider = { workspace = true }
 cyrup-session = { workspace = true }
 thiserror = { workspace = true }
+wasmtime = { version = "34.0.2", features = ["component-model", "async", "pooling-allocator", "runtime", "cranelift", "wat"], optional = true }
+wasmtime-wasi = { version = "34.0.2", optional = true }
+blake3 = "1.8.5"
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing = "0.1.44"
+dashmap.workspace = true
+
+[features]
+# The whole Wasmtime Component Model host is behind `wasm-host` (arch-08 §2) so the
+# native-builtin dispatch foundation (seams, registry, manifest, cache) builds without
+# pulling Wasmtime. Default-on here so `cargo check --workspace` exercises the host path.
+default = ["wasm-host"]
+wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # NOTE: does NOT depend on cyrup-tui — extension UI crosses as serializable commands
 # (arch-00 §2.1, ADR-0001 R-ARCH-TUI-014 / ADR-0002 R-ARCH-EXT-010).

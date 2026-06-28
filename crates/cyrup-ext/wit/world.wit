@@ -1,0 +1,160 @@
+// cyrup:ext@0.1.0 — the versioned WIT world (arch-08 §4.1).
+//
+// Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
+// and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
+// lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
+// values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
+package cyrup:ext@0.1.0;
+
+// ---------------------------------------------------------------------------
+// Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
+// ---------------------------------------------------------------------------
+interface types {
+  enum exec-mode { parallel, sequential }
+  enum ext-mode  { tui, rpc, json, print }
+
+  // What a single event handler contributes to the block/mutate/notify reduction
+  // (arch-08 §3.3). `mutate` and `handled` carry serde_json patch payloads as strings.
+  variant hook-outcome {
+    noop,
+    block(option<string>),
+    mutate(string),
+    handled(string),
+  }
+
+  // Guest -> host tool registration descriptor (arch-08 §3.5). `parameters-json` stays
+  // JSON-Schema (Pi-interop, R-ARCH-EXT-008).
+  record tool-descriptor {
+    name: string,
+    label: string,
+    description: string,
+    parameters-json: string,
+    exec-mode: option<exec-mode>,
+    prompt-snippet: option<string>,
+    prompt-guidelines: list<string>,
+    has-renderer: bool,
+  }
+
+  // Result of a capability-scoped exec (arch-08 caps/exec.rs).
+  record exec-result {
+    code: s32,
+    stdout: string,
+    stderr: string,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// host -> guest: the §5 event catalog (exports the guest may implement).
+// The host only calls events the guest subscribed to (subscription gate).
+// ---------------------------------------------------------------------------
+interface events {
+  use types.{hook-outcome};
+
+  // 5.4 tools — the mutating seams.
+  on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
+  on-tool-result:  func(call-id: string, name: string, content-json: string, is-error: bool) -> hook-outcome;
+
+  // 5.3 agent & turn / 5.6 provider — context + notify.
+  on-context:      func(messages-json: string) -> hook-outcome;
+  on-message-end:  func(message-json: string) -> hook-outcome;
+  on-before-agent-start: func(system-prompt: string, options-json: string) -> hook-outcome;
+
+  // notify-only (return ignored); high-frequency ones are subscription-gated.
+  on-agent-start:           func();
+  on-agent-end:             func(messages-json: string);
+  on-turn-start:            func(turn-index: u32);
+  on-turn-end:              func(turn-index: u32, message-json: string);
+  on-message-start:         func(role: string);
+  on-message-update:        func(delta-json: string);   // HIGH-FREQ, gated
+  on-tool-exec-start:       func(call-id: string, name: string);
+  on-tool-exec-update:      func(call-id: string, chunk-json: string); // HIGH-FREQ, gated
+  on-tool-exec-end:         func(call-id: string, result-json: string, is-error: bool);
+  on-session-start:         func(reason: string);
+  on-session-shutdown:      func(reason: string);
+  on-resources-discover:    func() -> hook-outcome;
+  on-project-trust:         func() -> hook-outcome;
+}
+
+// ---------------------------------------------------------------------------
+// guest -> host: registration imports (arch-08 §3.5).
+// ---------------------------------------------------------------------------
+interface registration {
+  use types.{tool-descriptor};
+  register-tool:             func(t: tool-descriptor);
+  register-command:          func(name: string, desc-json: string);
+  register-shortcut:         func(key: string, desc: string);
+  register-flag:             func(name: string, spec-json: string);
+  get-flag:                  func(name: string) -> option<string>;
+  register-provider:         func(id: string, config-json: string);
+  unregister-provider:       func(id: string);
+  register-message-renderer: func(custom-type: string);
+  add-autocomplete:          func();
+  // declares the subscription bitset: which §5 event kinds this guest handles.
+  subscribe:                 func(event-kinds: list<u8>);
+}
+
+// ---------------------------------------------------------------------------
+// guest -> host: capabilities (arch-08 §3.6, caps/*).
+// ---------------------------------------------------------------------------
+interface ui {
+  notify:     func(message: string);
+  set-status: func(message: string);
+  confirm:    func(prompt: string) -> bool;
+  input:      func(prompt: string) -> option<string>;
+}
+
+interface session {
+  // read-only session view (arch-04) over the boundary.
+  entries-json: func() -> string;
+  branch-json:  func() -> string;
+}
+
+interface models {
+  list:          func() -> string;          // json array of model refs
+  current:       func() -> option<string>;
+  set-model:     func(model-json: string);  // COMMAND-only at the host
+  context-usage: func() -> string;
+}
+
+interface exec {
+  use types.{exec-result};
+  run: func(cmd: string, args: list<string>, opts-json: string) -> result<exec-result, string>;
+}
+
+interface ext-fs {
+  // capability-scoped; preopened dirs via WASI p2 (no ambient authority).
+  read-file:  func(path: string) -> result<list<u8>, string>;
+  write-file: func(path: string, data: list<u8>) -> result<_, string>;
+}
+
+interface bus {
+  emit: func(topic: string, payload-json: string);
+}
+
+// COMMAND-ONLY (arch-08 §6.3, deadlock rule): session/runtime mutation. Calling any of
+// these from an event handler returns a host-side deadlock error (surfaced, never a hang).
+interface control {
+  new-session:   func() -> result<_, string>;
+  switch:        func(session-id: string) -> result<_, string>;
+  fork:          func(entry-id: string) -> result<_, string>;
+  navigate:      func(entry-id: string) -> result<_, string>;
+  reload:        func() -> result<_, string>;
+  compact:       func() -> result<_, string>;
+  wait-idle:     func() -> result<_, string>;
+  send-message:  func(message-json: string) -> result<_, string>;
+}
+
+world extension {
+  import registration;
+  import ui;
+  import session;
+  import models;
+  import exec;
+  import ext-fs;
+  import bus;
+  import control;
+
+  export events;
+  // async init unit, awaited before the loader continues (R-08-001).
+  export init: func() -> result<_, string>;
+}
