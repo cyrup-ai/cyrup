@@ -8,9 +8,12 @@
 // KNOWN GAPS (tracked):
 // - R-02-056: a low-level free-fn loop layer for embedders is not provided; the high-level `Agent`
 //   covers front-ends/extensions today. Revisit if an embedder needs the bare loop primitive.
-// - R-02-020: `prepare_arguments` + JSON-Schema argument validation are not implemented; blocked
-//   until arch-03 adds them to the `Tool` trait plus a validator. Args mutated by `before_tool_call`
-//   currently run as-is, without re-validation (see R-02-022).
+// - R-02-020: DONE — JSON-Schema argument validation + coercion now runs in preflight via
+//   `cyrup_provider::validate_tool_call` (func-01 R-01-034): args are validated/coerced before
+//   `before_tool_call`, and a validation failure yields an immediate isError tool-result (the model
+//   retries) without executing the tool. Args mutated by `before_tool_call` still run as-is, without
+//   re-validation (R-02-022). STILL DEFERRED: the optional `Tool::prepare_arguments` compat shim
+//   (an optional future cyrup-core `Tool` trait addition) is not implemented.
 // - R-02-055 (partial): `thinking_level` / `thinkingBudgets` are stored on state but not forwarded to
 //   the provider; blocked until `cyrup_provider::StreamOptions` gains thinking fields.
 // - A-02-10 (second half): no mutable-aliasing state getter is exposed (snapshots are copies and
@@ -29,7 +32,7 @@ use cyrup_core::{
     AssistantMessage, Content, ExecMode, ModelRef, RunCancel, SessionId, StopReason, ThinkingLevel,
     Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink, Usage,
 };
-use cyrup_provider::{Context, StreamEvent, StreamOptions};
+use cyrup_provider::{validate_tool_call, Context, StreamEvent, StreamOptions};
 use futures::future::FutureExt;
 use futures::StreamExt;
 use serde_json::Value;
@@ -479,8 +482,8 @@ impl RunCtx {
         }
     }
 
-    /// Preflight: locate tool → `before_tool_call`. Returns an immediate (finalized) error result
-    /// or a prepared executor (func-02 R-02-019/021/022).
+    /// Preflight: locate tool → validate/coerce arguments → `before_tool_call`. Returns an
+    /// immediate (finalized) error result or a prepared executor (func-02 R-02-019/020/021/022).
     async fn prepare(&self, call: &ToolCall) -> Prep {
         let tool = match self.find_tool(&call.name) {
             Some(t) => t,
@@ -490,10 +493,17 @@ impl RunCtx {
                 )
             }
         };
+        // Validate AND coerce the model-emitted arguments against the tool's JSON-Schema
+        // `parameters` (R-02-020 / func-01 R-01-034). On failure we surface an immediate isError
+        // tool-result so the model can retry on the next turn, and the tool is NOT executed.
+        // (`prepare_arguments` remains an optional future cyrup-core addition — still deferred.)
+        let mut args = match validate_tool_call(tool.parameters(), call.arguments.clone()) {
+            Ok(coerced) => coerced,
+            Err(e) => return Prep::Immediate(self.immediate_error(call, e.to_string())),
+        };
         if self.cancel.is_cancelled() {
             return Prep::Immediate(self.immediate_error(call, "Operation aborted"));
         }
-        let mut args = call.arguments.clone();
         let before = {
             let ctx = BeforeToolCall {
                 tool_name: &call.name,

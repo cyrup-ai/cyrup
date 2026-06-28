@@ -12,6 +12,7 @@ pub mod context;
 pub mod model;
 pub mod provider;
 pub mod stream;
+pub mod validate;
 
 #[cfg(any(test, feature = "faux"))]
 pub mod faux;
@@ -21,6 +22,7 @@ pub use cyrup_core::ApiId;
 pub use model::{Modality, Model, ModelCost};
 pub use provider::Provider;
 pub use stream::{collect_message, CacheRetention, StreamEvent, StreamOptions};
+pub use validate::{validate_named_tool_call, validate_tool_call, ToolValidationError};
 
 /// Known wire-protocol ids (arch-01 §3.1). `ApiId` accepts custom strings too.
 pub mod known_api {
