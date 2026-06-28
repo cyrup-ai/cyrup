@@ -16,3 +16,5 @@ cyrup-core = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }

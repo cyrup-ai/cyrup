@@ -98,6 +98,10 @@ image                = { version = "0.25.9", default-features = false, features 
 libc                 = { version = "0.2.186" }
 tempfile             = { version = "3.27.0" }
 
+# arch-00 §7 — first used by cyrup-session (arch-04).
+time                 = { version = "0.3", features = ["formatting", "parsing"] }
+uuid                 = { version = "1", features = ["v7"] }
+
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
 #   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
