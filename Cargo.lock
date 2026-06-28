@@ -228,9 +228,10 @@ dependencies = [
 name = "cyrup-session"
 version = "0.0.0"
 dependencies = [
- "cyrup-config",
  "cyrup-core",
- "cyrup-resources",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "time",
  "uuid",

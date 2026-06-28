@@ -1,13 +1,34 @@
-//! cyrup-session — sessions, compaction, context (arch-04/05/06; conformance: func-04/05/06).
+//! cyrup-session — sessions & branching (arch-04; conformance: func-04).
 //!
-//! Append-only JSONL session tree (entries/leaf, fork/clone/resume), compaction + branch
-//! summaries, and system-prompt/context assembly (AGENTS.md discovery, skills injection).
+//! An append-only JSONL session file whose entries form a tree (`id`/`parentId`); the current
+//! position is a **leaf** and the LLM context is built by walking leaf→root. This layer owns the
+//! file format + versioning/migration, the in-memory tree (id→entry / parent→children indexes),
+//! context building (including consuming a `CompactionEntry`), the session-manager operations
+//! (create/open/continue/fork/clone/ephemeral), atomic line-append + crash recovery, listing /
+//! selection, and JSONL export/import.
 //!
-//! Scaffold stub.
+//! The defining invariant (DI-9): the on-disk record is **lossless** — branch navigation and
+//! compaction prune only the *built context*, never the file.
+//!
+//! Compaction *generation* (arch-05) and system-prompt assembly (arch-06) are deferred siblings.
+#![forbid(unsafe_code)]
 
-/// Session/compaction/context error (arch-04/05/06 §8). Scaffold placeholder.
-#[derive(Debug, thiserror::Error)]
-pub enum SessionError {
-    #[error("not yet implemented: {0}")]
-    Unimplemented(&'static str),
-}
+pub mod context;
+pub mod entry;
+pub mod error;
+pub mod header;
+pub mod ids;
+pub mod layout;
+pub mod listing;
+pub mod manager;
+pub mod migrate;
+pub mod store;
+
+pub use context::SessionContext;
+pub use entry::{Entry, EntryBase, KnownEntry};
+pub use error::SessionError;
+pub use header::{SessionHeader, CURRENT_VERSION};
+pub use layout::{encode_cwd, SessionLayout, SessionsRoot};
+pub use listing::{list, list_all, resolve, SessionInfo, SessionSelector};
+pub use manager::{NewSessionOpts, SessionManager, TreeNode};
+pub use store::{DiskStore, MemStore, SessionStore};
