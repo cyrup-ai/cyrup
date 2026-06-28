@@ -1,13 +1,27 @@
-//! cyrup-modes — print / json / rpc adapters (arch-11; conformance: func-11).
+//! cyrup-modes — non-interactive runtime adapters (arch-11; conformance: func-11).
 //!
-//! Thin adapters over the `AgentSession` seam: print/JSON one-shot output and the RPC
-//! strict-LF-JSONL protocol (framing + command set + extension-UI requests).
+//! Thin front-end adapters that drive the one [`cyrup_session_svc::AgentSession`] seam headlessly.
+//! Every adapter writes to a caller-supplied sink and takes its input as a parameter, so the same
+//! logic is exercised by a `String`/`Vec<u8>` buffer in tests and by real stdio in the binary.
 //!
-//! Scaffold stub.
+//! - [`run_print`] — PRINT mode: run one prompt to completion, emit the final assistant text
+//!   (optionally tool activity) to the writer, exit. Human-oriented plain output (R-11-005).
+//! - [`run_json`] — JSON mode: serialize each [`cyrup_session_svc::AgentSessionEvent`] as one JSON
+//!   object per line (JSONL) — a stable machine-readable event stream (R-11-007).
+//! - [`run_rpc`] — RPC mode: a bidirectional strict-LF JSONL protocol over a reader + writer; parse
+//!   incoming [`SessionCommand`] requests, drive the session, and emit response/event lines
+//!   ([`RpcOut`]). The headless server other tools embed (R-11-011…016).
+//!
+//! All three are adapters over the same seam — no mode reaches behaviour the others structurally
+//! cannot (the "one seam" invariant).
+#![forbid(unsafe_code)]
 
-/// Runtime-mode error (arch-11 §8). Scaffold placeholder.
-#[derive(Debug, thiserror::Error)]
-pub enum ModeError {
-    #[error("not yet implemented: {0}")]
-    Unimplemented(&'static str),
-}
+mod error;
+mod json;
+mod print;
+mod rpc;
+
+pub use error::ModesError;
+pub use json::run_json;
+pub use print::{run_print, PrintOptions};
+pub use rpc::{run_rpc, command_catalog, RpcOut, RpcResponse, SessionCommand};
