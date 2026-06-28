@@ -21,3 +21,7 @@ tokio.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+cyrup-provider = { workspace = true, features = ["faux"] }
+tempfile.workspace = true

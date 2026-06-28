@@ -20,3 +20,7 @@ ratatui = "0.30.2"
 tokio.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
+
+[dev-dependencies]
+cyrup-provider = { workspace = true, features = ["faux"] }
+tempfile.workspace = true

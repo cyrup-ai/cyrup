@@ -803,10 +803,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "cyrup-core",
+ "cyrup-provider",
  "cyrup-session-svc",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -854,6 +856,7 @@ dependencies = [
  "cyrup-session",
  "cyrup-session-svc",
  "futures",
+ "tempfile",
  "tokio",
  "tokio-stream",
 ]
@@ -943,10 +946,12 @@ name = "cyrup-tui"
 version = "0.0.0"
 dependencies = [
  "cyrup-core",
+ "cyrup-provider",
  "cyrup-resources",
  "cyrup-session-svc",
  "futures",
  "ratatui",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
