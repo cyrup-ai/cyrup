@@ -1,0 +1,19 @@
+[package]
+name = "cyrup-test-support"
+description = "Shared test harness: faux provider, headless AgentSession harness, golden recorders (arch-00 §11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-provider = { workspace = true, features = ["faux"] }
+cyrup-agent = { workspace = true }
+cyrup-session-svc = { workspace = true }

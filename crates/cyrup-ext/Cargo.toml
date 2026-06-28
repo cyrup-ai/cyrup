@@ -1,0 +1,22 @@
+[package]
+name = "cyrup-ext"
+description = "WASM Component Model host (Wasmtime) + native built-in extensions (arch-08)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-agent = { workspace = true }
+cyrup-tools = { workspace = true }
+cyrup-provider = { workspace = true }
+cyrup-session = { workspace = true }
+thiserror = { workspace = true }
+# NOTE: does NOT depend on cyrup-tui — extension UI crosses as serializable commands
+# (arch-00 §2.1, ADR-0001 R-ARCH-TUI-014 / ADR-0002 R-ARCH-EXT-010).

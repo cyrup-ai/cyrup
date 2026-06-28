@@ -1,0 +1,23 @@
+[package]
+name = "cyrup-core"
+description = "cyrup shared substrate: ids, message model, EventStream, Tool trait, cancel, errors (arch-00 §3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-core = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

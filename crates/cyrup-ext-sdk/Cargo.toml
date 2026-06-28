@@ -1,0 +1,20 @@
+[package]
+name = "cyrup-ext-sdk"
+description = "Guest SDK for authoring cyrup extensions in Rust, compiled to wasm32-wasip2 (arch-08)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Guest crate. Built for wasm32-wasip2 (NOT the host target); excluded from the workspace
+# default-members. The real guest links wit-bindgen against the cyrup:ext WIT world (arch-08).
+[lib]
+crate-type = ["rlib"]   # becomes ["cdylib"] for component builds during arch-08
+
+[dependencies]
+# wit-bindgen (+ the generated cyrup:ext bindings) added during arch-08 implementation.

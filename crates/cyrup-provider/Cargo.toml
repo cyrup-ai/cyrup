@@ -1,0 +1,27 @@
+[package]
+name = "cyrup-provider"
+description = "Vendor-neutral LLM layer: providers, auth, streaming, handoff (arch-01)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The scripted faux provider for tests/demos (func-01 §15 / R-01-051..053). Always available to
+# this crate's own tests; gated for downstream consumers (e.g. cyrup-test-support enables it).
+faux = []
+
+[dependencies]
+cyrup-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

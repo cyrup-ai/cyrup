@@ -1,0 +1,105 @@
+# cyrup — Cargo workspace (realizes spec/architecture/arch-00-overview-and-workspace.md §2)
+# A from-scratch Rust port of the Pi agent harness. RUST ONLY (no JS/TS runtime).
+[workspace]
+resolver = "3"
+members = [
+    "crates/cyrup-core",
+    "crates/cyrup-provider",
+    "crates/cyrup-agent",
+    "crates/cyrup-tools",
+    "crates/cyrup-session",
+    "crates/cyrup-config",
+    "crates/cyrup-ext",
+    "crates/cyrup-resources",
+    "crates/cyrup-tui",
+    "crates/cyrup-modes",
+    "crates/cyrup-sdk",
+    "crates/cyrup-session-svc",
+    "crates/cyrup",
+    "crates/cyrup-test-support",
+    "crates/cyrup-ext-sdk",
+]
+# cyrup-ext-sdk is the GUEST sdk (compiled to wasm32-wasip2); it is NOT part of the
+# host binary build graph (arch-00 §2.2), so it is excluded from default-members.
+# Build it explicitly: `cargo build -p cyrup-ext-sdk --target wasm32-wasip2`.
+default-members = [
+    "crates/cyrup-core",
+    "crates/cyrup-provider",
+    "crates/cyrup-agent",
+    "crates/cyrup-tools",
+    "crates/cyrup-session",
+    "crates/cyrup-config",
+    "crates/cyrup-ext",
+    "crates/cyrup-resources",
+    "crates/cyrup-tui",
+    "crates/cyrup-modes",
+    "crates/cyrup-sdk",
+    "crates/cyrup-session-svc",
+    "crates/cyrup",
+    "crates/cyrup-test-support",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"          # edition 2024 baseline
+license = "MIT"
+repository = "https://github.com/earendil-works/cyrup"   # placeholder
+authors = ["cyrup contributors"]
+
+# No-panic policy (arch-00 §8 / func-00 R-00-009). These are clippy tool lints:
+# they only fire under `cargo clippy`, not `cargo build`/`cargo test`. Tests may
+# add per-item `#[allow(...)]` where unwrap/expect is acceptable.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[workspace.dependencies]
+# --- in-workspace crates (lockstep version) ---
+cyrup-core         = { path = "crates/cyrup-core",         version = "0.0.0" }
+cyrup-provider     = { path = "crates/cyrup-provider",     version = "0.0.0" }
+cyrup-agent        = { path = "crates/cyrup-agent",        version = "0.0.0" }
+cyrup-tools        = { path = "crates/cyrup-tools",        version = "0.0.0" }
+cyrup-session      = { path = "crates/cyrup-session",      version = "0.0.0" }
+cyrup-config       = { path = "crates/cyrup-config",       version = "0.0.0" }
+cyrup-ext          = { path = "crates/cyrup-ext",          version = "0.0.0" }
+cyrup-resources    = { path = "crates/cyrup-resources",    version = "0.0.0" }
+cyrup-tui          = { path = "crates/cyrup-tui",          version = "0.0.0" }
+cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.0.0" }
+cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.0.0" }
+cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
+cyrup-test-support = { path = "crates/cyrup-test-support", version = "0.0.0" }
+
+# --- standardized external deps (arch-00 §7). Versions are inert until a crate
+#     references them via `dep.workspace = true`; verify/bump on first use. ---
+tokio        = { version = "1",   features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "signal"] }
+tokio-util   = { version = "0.7" }
+tokio-stream = { version = "0.1" }
+futures      = { version = "0.3" }
+futures-core = { version = "0.3" }
+async-trait  = { version = "0.1" }
+thiserror    = { version = "2" }
+anyhow       = { version = "1" }
+serde        = { version = "1",   features = ["derive", "rc"] }
+serde_json   = { version = "1" }
+
+# Additional standardized externals (arch-00 §7 / §7.1) are added to this table
+# when first used, to avoid pinning versions ahead of need:
+#   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
+#   ratatui, crossterm, ratatui-image, unicode-width, unicode-segmentation, tui-textarea,
+#   wasmtime(component-model,async,epoch,pooling-allocator), wasmtime-wasi, wit-bindgen,
+#   ignore, globset, grep/grep-searcher/grep-regex, clap, tracing, tracing-subscriber,
+#   time, uuid, fs4, oauth2, sha2, base64, parking_lot, dashmap,
+#   arc-swap, indexmap, similar, image, smallvec, rustc-hash, directories, blake3,
+#   toml, serde_yml, gix, notify, slotmap, pulldown-cmark, syntect, camino, bytes, memchr,
+#   landlock, seccompiler.
+
+# Single static binary, lean + fast (arch-00 Appendix B / func-00 R-00-008).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = "z"     # revisit vs "3" per arch-00 §12 benchmark

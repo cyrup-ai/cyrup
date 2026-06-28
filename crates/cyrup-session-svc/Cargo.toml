@@ -1,0 +1,23 @@
+[package]
+name = "cyrup-session-svc"
+description = "The AgentSession facade wiring provider+agent+tools+session+config+ext (arch-11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-agent = { workspace = true }
+cyrup-provider = { workspace = true }
+cyrup-tools = { workspace = true }
+cyrup-session = { workspace = true }
+cyrup-config = { workspace = true }
+cyrup-resources = { workspace = true }
+cyrup-ext = { workspace = true }
+thiserror = { workspace = true }

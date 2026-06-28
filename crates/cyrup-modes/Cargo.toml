@@ -1,0 +1,17 @@
+[package]
+name = "cyrup-modes"
+description = "print / json / rpc adapters over the AgentSession seam (arch-11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-session-svc = { workspace = true }
+thiserror = { workspace = true }

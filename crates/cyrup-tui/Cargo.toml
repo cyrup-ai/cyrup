@@ -1,0 +1,18 @@
+[package]
+name = "cyrup-tui"
+description = "ratatui + crossterm front-end (arch-10; binds ADR-0001)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-session-svc = { workspace = true }
+cyrup-resources = { workspace = true }
+thiserror = { workspace = true }

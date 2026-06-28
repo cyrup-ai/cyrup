@@ -1,0 +1,16 @@
+[package]
+name = "cyrup-resources"
+description = "Skills, prompt templates, themes, packages (arch-09)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+thiserror = { workspace = true }

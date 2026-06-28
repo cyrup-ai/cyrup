@@ -1,0 +1,25 @@
+[package]
+name = "cyrup"
+description = "The cyrup CLI binary: arg parsing, mode selection, wiring (arch-11)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cyrup"
+path = "src/main.rs"
+
+[dependencies]
+cyrup-sdk = { workspace = true }
+cyrup-session-svc = { workspace = true }
+cyrup-config = { workspace = true }
+cyrup-modes = { workspace = true }
+cyrup-tui = { workspace = true }
+# The real entrypoint uses tokio (multi-thread) + clap + anyhow (arch-11 / arch-00 §5, §8);
+# added when arch-11 is implemented. The scaffold main below is intentionally runtime-free.

@@ -1,0 +1,7 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# wasm32-wasip2 is required only for the Tier-1 self-extension build loop and the
+# guest crate cyrup-ext-sdk (arch-00 Appendix B, ADR-0002 R-ARCH-EXT-015). It is
+# NOT needed to build the host binary, so it is intentionally not auto-installed
+# here. Add it when working on extensions: `rustup target add wasm32-wasip2`.
