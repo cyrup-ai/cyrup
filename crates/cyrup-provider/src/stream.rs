@@ -32,7 +32,12 @@ pub struct StreamOptions {
 ///
 /// Slice note: the per-event `partial` snapshot (func-01 R-01-022) is deferred — consumers
 /// reconstruct the message from deltas, and the terminal event carries the full `AssistantMessage`.
-#[derive(Clone, Debug, PartialEq)]
+// Serde added so `cyrup-agent`'s `AgentEvent::MessageUpdate` (which carries a `StreamEvent`
+// delta as `assistantMessageEvent`) can derive Serialize/Deserialize for the json/rpc wire
+// (func-02 R-02-009 / arch-02 §3.1). Additive, backward-compatible (no field/variant renames
+// beyond the camelCase tagging that matches arch-00 §4).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum StreamEvent {
     Start,
     TextStart { content_index: usize },
