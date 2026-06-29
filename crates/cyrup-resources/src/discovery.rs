@@ -36,7 +36,10 @@ pub struct ResourceSet<T: Named + Clone> {
 
 impl<T: Named + Clone> Default for ResourceSet<T> {
     fn default() -> Self {
-        Self { by_key: HashMap::new(), all: Vec::new() }
+        Self {
+            by_key: HashMap::new(),
+            all: Vec::new(),
+        }
     }
 }
 
@@ -224,9 +227,11 @@ pub async fn discover(
     let cfg = cfg.clone();
     let join = tokio::task::spawn_blocking(move || discover_blocking(&cfg));
     match cancel.run_until_cancelled(join).await {
-        Some(joined) => joined.map_err(|e| ResourceError::Core(cyrup_core::CoreError::Io(
-            std::io::Error::other(e.to_string()),
-        )))?,
+        Some(joined) => joined.map_err(|e| {
+            ResourceError::Core(cyrup_core::CoreError::Io(std::io::Error::other(
+                e.to_string(),
+            )))
+        })?,
         None => Err(ResourceError::Cancelled),
     }
 }
@@ -248,7 +253,10 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     // Settings override patterns (Pi `globalSettings.{skills,prompts,themes}`) selectively
     // enable/disable these auto-discovered loose resources (package-manager.ts:2271-2304).
     if cfg.enable_skills {
-        for root in [cfg.global_dir.join("skills"), cfg.global_agents_dir.join("skills")] {
+        for root in [
+            cfg.global_dir.join("skills"),
+            cfg.global_agents_dir.join("skills"),
+        ] {
             let mut buf = Vec::new();
             scan_skill_root(
                 &root,
@@ -340,11 +348,18 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         let manifest = match resolve_manifest(&dir) {
             Ok(m) => m,
             Err(e) => {
-                warnings.push(ResourceWarning::new(ResourceKind::Package, dir, e.to_string()));
+                warnings.push(ResourceWarning::new(
+                    ResourceKind::Package,
+                    dir,
+                    e.to_string(),
+                ));
                 continue;
             }
         };
-        let origin = ResourceOrigin::Package { id: pkg.id.clone(), scope: tier };
+        let origin = ResourceOrigin::Package {
+            id: pkg.id.clone(),
+            scope: tier,
+        };
         if cfg.enable_skills {
             for sdir in &manifest.skills {
                 let mut buf = Vec::new();
@@ -357,7 +372,8 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     scan_skill_root(sdir, tier, sdir, &mut buf, &mut warnings, &mut diagnostics);
                 }
                 buf.retain(|s| {
-                    !pkg.disabled.is_disabled(&ResourceSelector::Skill(s.name.clone()))
+                    !pkg.disabled
+                        .is_disabled(&ResourceSelector::Skill(s.name.clone()))
                 });
                 for s in &mut buf {
                     s.origin = origin.clone();
@@ -385,7 +401,8 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     scan_prompt_root(pdir, tier, pdir, &mut buf, &mut warnings);
                 }
                 buf.retain(|p| {
-                    !pkg.disabled.is_disabled(&ResourceSelector::Prompt(p.key.as_str().to_string()))
+                    !pkg.disabled
+                        .is_disabled(&ResourceSelector::Prompt(p.key.as_str().to_string()))
                 });
                 for p in &mut buf {
                     p.origin = origin.clone();
@@ -413,7 +430,8 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     scan_theme_root(tdir, tier, tdir, &mut buf, &mut warnings);
                 }
                 buf.retain(|t| {
-                    !pkg.disabled.is_disabled(&ResourceSelector::Theme(t.data.name.clone()))
+                    !pkg.disabled
+                        .is_disabled(&ResourceSelector::Theme(t.data.name.clone()))
                 });
                 for t in &mut buf {
                     t.origin = origin.clone();
@@ -422,69 +440,75 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             }
         }
         for ext in &manifest.extensions {
-            let name = ext.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let name = ext
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
             if !pkg.disabled.is_disabled(&ResourceSelector::Extension(name)) {
                 ext_paths.push(ext.clone());
             }
         }
     }
 
-    // --- project loose resources (trust-gated, walked cwd->root) (R-09-002/003/008/012) ---
-    if let Some(project_root) = &cfg.project_root
-        && cfg.trusted_project {
-            for base in walk_up(&cfg.cwd, project_root) {
-                if cfg.enable_skills {
-                    for sub in [".cyrup/skills", ".agents/skills"] {
-                        let root = base.join(sub);
-                        let mut buf = Vec::new();
-                        scan_skill_root(
-                            &root,
-                            ResourceScope::Project,
-                            &root,
-                            &mut buf,
-                            &mut warnings,
-                            &mut diagnostics,
-                        );
-                        buf.retain(|s| {
-                            override_enabled(&s.skill_md, &cfg.project_overrides.skills, &root)
-                        });
-                        skills.extend(buf);
-                    }
-                }
-                if cfg.enable_prompts {
-                    let root = base.join(".cyrup/prompts");
+    // --- project loose resources (trust-gated) (R-09-002/003/008/012) ---
+    // Pi loads loose project resources from a single project root only —
+    // `<cwd>/.cyrup/{skills,prompts,themes}` (skills.ts:432 `resolve(resolvedCwd, CONFIG_DIR_NAME,
+    // "skills")`; resource-loader.ts:764-768 `join(this.cwd, CONFIG_DIR_NAME, "skills")`) — never
+    // every ancestor between cwd and the project root. `cfg.cwd` is the direct analog of Pi's cwd.
+    if cfg.project_root.is_some() && cfg.trusted_project {
+        let base = &cfg.cwd;
+        {
+            if cfg.enable_skills {
+                for sub in [".cyrup/skills", ".agents/skills"] {
+                    let root = base.join(sub);
                     let mut buf = Vec::new();
-                    scan_prompt_root(
+                    scan_skill_root(
                         &root,
                         ResourceScope::Project,
                         &root,
                         &mut buf,
                         &mut warnings,
+                        &mut diagnostics,
                     );
-                    buf.retain(|p| {
-                        override_enabled(&p.path, &cfg.project_overrides.prompts, &root)
+                    buf.retain(|s| {
+                        override_enabled(&s.skill_md, &cfg.project_overrides.skills, &root)
                     });
-                    prompts.extend(buf);
-                }
-                if cfg.enable_themes {
-                    let root = base.join(".cyrup/themes");
-                    let mut buf = Vec::new();
-                    scan_theme_root(
-                        &root,
-                        ResourceScope::Project,
-                        &root,
-                        &mut buf,
-                        &mut warnings,
-                    );
-                    buf.retain(|t| {
-                        t.origin_path.as_deref().is_none_or(|p| {
-                            override_enabled(p, &cfg.project_overrides.themes, &root)
-                        })
-                    });
-                    themes.extend(buf);
+                    skills.extend(buf);
                 }
             }
+            if cfg.enable_prompts {
+                let root = base.join(".cyrup/prompts");
+                let mut buf = Vec::new();
+                scan_prompt_root(
+                    &root,
+                    ResourceScope::Project,
+                    &root,
+                    &mut buf,
+                    &mut warnings,
+                );
+                buf.retain(|p| override_enabled(&p.path, &cfg.project_overrides.prompts, &root));
+                prompts.extend(buf);
+            }
+            if cfg.enable_themes {
+                let root = base.join(".cyrup/themes");
+                let mut buf = Vec::new();
+                scan_theme_root(
+                    &root,
+                    ResourceScope::Project,
+                    &root,
+                    &mut buf,
+                    &mut warnings,
+                );
+                buf.retain(|t| {
+                    t.origin_path
+                        .as_deref()
+                        .is_none_or(|p| override_enabled(p, &cfg.project_overrides.themes, &root))
+                });
+                themes.extend(buf);
+            }
         }
+    }
 
     // --- resources_discover contributions (R-09-022) ---
     if cfg.enable_skills {
@@ -501,12 +525,24 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     }
     if cfg.enable_prompts {
         for p in &cfg.extra.prompt_paths {
-            add_prompt_path(p, ResourceScope::Discovered, ResourceOrigin::Builtin, &mut prompts, &mut warnings);
+            add_prompt_path(
+                p,
+                ResourceScope::Discovered,
+                ResourceOrigin::Builtin,
+                &mut prompts,
+                &mut warnings,
+            );
         }
     }
     if cfg.enable_themes {
         for p in &cfg.extra.theme_paths {
-            add_theme_path(p, ResourceScope::Discovered, ResourceOrigin::Builtin, &mut themes, &mut warnings);
+            add_theme_path(
+                p,
+                ResourceScope::Discovered,
+                ResourceOrigin::Builtin,
+                &mut themes,
+                &mut warnings,
+            );
         }
     }
 
@@ -564,8 +600,18 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
 
     // Same-name collision diagnostics (skills.ts:410-427; resource-loader.ts:913-964): each
     // shadowed candidate yields a `collision` diagnostic carrying winner/loser paths.
-    emit_collisions(&registry.skills, ResourceKind::Skill, |s| s.skill_md.clone(), &mut diagnostics);
-    emit_collisions(&registry.prompts, ResourceKind::Prompt, |p| p.path.clone(), &mut diagnostics);
+    emit_collisions(
+        &registry.skills,
+        ResourceKind::Skill,
+        |s| s.skill_md.clone(),
+        &mut diagnostics,
+    );
+    emit_collisions(
+        &registry.prompts,
+        ResourceKind::Prompt,
+        |p| p.path.clone(),
+        &mut diagnostics,
+    );
     emit_collisions(
         &registry.themes,
         ResourceKind::Theme,
@@ -573,7 +619,11 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         &mut diagnostics,
     );
 
-    Ok(DiscoveryReport { registry, warnings, diagnostics })
+    Ok(DiscoveryReport {
+        registry,
+        warnings,
+        diagnostics,
+    })
 }
 
 /// Emit a `collision` diagnostic for every shadowed same-name candidate in `set`.
@@ -583,13 +633,16 @@ fn emit_collisions<T: Named + Clone>(
     path_of: impl Fn(&T) -> PathBuf,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let mut seen: std::collections::HashSet<(ResourceKey, PathBuf)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(ResourceKey, PathBuf)> =
+        std::collections::HashSet::new();
     // Resolve symlinks before comparing so a duplicate reached via a symlink collapses onto the
     // real file rather than surfacing as a spurious collision (skills.ts:403-408 `canonicalizePath`
     // + `realPathSet`). Falls back to the raw path when the file cannot be canonicalized.
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     for candidate in set.all() {
-        let Some(winner) = set.get(candidate.key()) else { continue };
+        let Some(winner) = set.get(candidate.key()) else {
+            continue;
+        };
         let winner_path = path_of(winner);
         let loser_path = path_of(candidate);
         let winner_canon = canon(&winner_path);
@@ -627,7 +680,16 @@ fn scan_skill_root(
     warnings: &mut Vec<ResourceWarning>,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    scan_skill_dir(root, scope, origin_root, true, Vec::new(), out, warnings, diagnostics);
+    scan_skill_dir(
+        root,
+        scope,
+        origin_root,
+        true,
+        Vec::new(),
+        out,
+        warnings,
+        diagnostics,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -641,7 +703,9 @@ fn scan_skill_dir(
     warnings: &mut Vec<ResourceWarning>,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     children.sort();
 
@@ -650,7 +714,9 @@ fn scan_skill_dir(
     collect_ignore_patterns(dir, origin_root, &mut ignore_patterns);
     let matcher = build_ignore(origin_root, &ignore_patterns);
     let is_ignored = |path: &Path, is_dir: bool| -> bool {
-        let Ok(rel) = path.strip_prefix(origin_root) else { return false };
+        let Ok(rel) = path.strip_prefix(origin_root) else {
+            return false;
+        };
         let rel = to_posix(rel);
         if rel.is_empty() {
             return false;
@@ -667,7 +733,10 @@ fn scan_skill_dir(
 
     // Second pass: direct `.md` children + recurse subdirs (skills.ts:221-269).
     for path in children {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with('.') || name == "node_modules" {
             continue;
         }
@@ -712,7 +781,9 @@ fn collect_ignore_patterns(dir: &Path, root: &Path, patterns: &mut Vec<String>) 
         Err(_) => String::new(),
     };
     for filename in [".gitignore", ".ignore", ".fdignore"] {
-        let Ok(content) = std::fs::read_to_string(dir.join(filename)) else { continue };
+        let Ok(content) = std::fs::read_to_string(dir.join(filename)) else {
+            continue;
+        };
         for line in content.lines() {
             if let Some(pattern) = prefix_ignore_pattern(line, &prefix) {
                 patterns.push(pattern);
@@ -747,7 +818,11 @@ fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
     } else {
         format!("{prefix}{pattern}")
     };
-    Some(if negated { format!("!{prefixed}") } else { prefixed })
+    Some(if negated {
+        format!("!{prefixed}")
+    } else {
+        prefixed
+    })
 }
 
 /// Build a gitignore matcher rooted at the scan root from the accumulated prefixed patterns.
@@ -756,7 +831,9 @@ fn build_ignore(root: &Path, patterns: &[String]) -> ignore::gitignore::Gitignor
     for pattern in patterns {
         let _ = builder.add_line(None, pattern);
     }
-    builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+    builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
 }
 
 /// Load the plain-path positive listings from a settings `skills`/`prompts`/`themes` array at the
@@ -783,8 +860,10 @@ fn add_local_entries(
     }
     if cfg.enable_prompts {
         for p in resolve_local_entries(base, &overrides.prompts, ManifestResourceType::Prompts) {
-            let origin =
-                ResourceOrigin::LooseFile { scope, root: p.parent().unwrap_or(&p).to_path_buf() };
+            let origin = ResourceOrigin::LooseFile {
+                scope,
+                root: p.parent().unwrap_or(&p).to_path_buf(),
+            };
             match PromptTemplate::load(&p, scope, origin) {
                 Ok(t) => prompts.push(t),
                 Err(e) => {
@@ -795,11 +874,15 @@ fn add_local_entries(
     }
     if cfg.enable_themes {
         for t in resolve_local_entries(base, &overrides.themes, ManifestResourceType::Themes) {
-            let origin =
-                ResourceOrigin::LooseFile { scope, root: t.parent().unwrap_or(&t).to_path_buf() };
+            let origin = ResourceOrigin::LooseFile {
+                scope,
+                root: t.parent().unwrap_or(&t).to_path_buf(),
+            };
             match Theme::load(&t, scope, origin) {
                 Ok(th) => themes.push(th),
-                Err(e) => warnings.push(ResourceWarning::new(ResourceKind::Theme, t, e.to_string())),
+                Err(e) => {
+                    warnings.push(ResourceWarning::new(ResourceKind::Theme, t, e.to_string()))
+                }
             }
         }
     }
@@ -813,7 +896,10 @@ fn load_one_skill(
     warnings: &mut Vec<ResourceWarning>,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let origin = ResourceOrigin::LooseFile { scope, root: origin_root.to_path_buf() };
+    let origin = ResourceOrigin::LooseFile {
+        scope,
+        root: origin_root.to_path_buf(),
+    };
     match Skill::load_with_diagnostics(md, scope, origin) {
         Ok((skill, diags)) => {
             diagnostics.extend(diags);
@@ -834,10 +920,17 @@ fn scan_prompt_root(
     warnings: &mut Vec<ResourceWarning>,
 ) {
     for md in direct_children(root, "md") {
-        let origin = ResourceOrigin::LooseFile { scope, root: origin_root.to_path_buf() };
+        let origin = ResourceOrigin::LooseFile {
+            scope,
+            root: origin_root.to_path_buf(),
+        };
         match PromptTemplate::load(&md, scope, origin) {
             Ok(t) => out.push(t),
-            Err(e) => warnings.push(ResourceWarning::new(ResourceKind::Prompt, md, e.to_string())),
+            Err(e) => warnings.push(ResourceWarning::new(
+                ResourceKind::Prompt,
+                md,
+                e.to_string(),
+            )),
         }
     }
 }
@@ -851,17 +944,26 @@ fn scan_theme_root(
     warnings: &mut Vec<ResourceWarning>,
 ) {
     for json in direct_children(root, "json") {
-        let origin = ResourceOrigin::LooseFile { scope, root: origin_root.to_path_buf() };
+        let origin = ResourceOrigin::LooseFile {
+            scope,
+            root: origin_root.to_path_buf(),
+        };
         match Theme::load(&json, scope, origin) {
             Ok(t) => out.push(t),
-            Err(e) => warnings.push(ResourceWarning::new(ResourceKind::Theme, json, e.to_string())),
+            Err(e) => warnings.push(ResourceWarning::new(
+                ResourceKind::Theme,
+                json,
+                e.to_string(),
+            )),
         }
     }
 }
 
 /// Direct file children of `dir` with the given extension, sorted. Non-recursive.
 fn direct_children(dir: &Path, ext: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -932,7 +1034,11 @@ fn add_prompt_path(
     match PromptTemplate::load(path, scope, origin) {
         Ok(t) => out.push(t),
         Err(e) => {
-            warnings.push(ResourceWarning::new(ResourceKind::Prompt, path, e.to_string()));
+            warnings.push(ResourceWarning::new(
+                ResourceKind::Prompt,
+                path,
+                e.to_string(),
+            ));
         }
     }
 }
@@ -958,23 +1064,10 @@ fn add_theme_path(
     }
     match Theme::load(path, scope, origin) {
         Ok(t) => out.push(t),
-        Err(e) => warnings.push(ResourceWarning::new(ResourceKind::Theme, path, e.to_string())),
+        Err(e) => warnings.push(ResourceWarning::new(
+            ResourceKind::Theme,
+            path,
+            e.to_string(),
+        )),
     }
-}
-
-/// Dirs from `cwd` up to and including `project_root` (Agent Skills standard ascending walk).
-fn walk_up(cwd: &Path, project_root: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let mut cur = Some(cwd.to_path_buf());
-    while let Some(c) = cur {
-        dirs.push(c.clone());
-        if c == project_root {
-            break;
-        }
-        cur = c.parent().map(Path::to_path_buf);
-    }
-    if !dirs.iter().any(|d| d == project_root) {
-        dirs.push(project_root.to_path_buf());
-    }
-    dirs
 }

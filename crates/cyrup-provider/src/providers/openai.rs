@@ -2,8 +2,8 @@
 //! [`openai-responses`](crate::api::openai_responses) wire protocol. Mirrors Pi's
 //! `providers/openai.ts` + the generated `openai.models.ts` catalog.
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -34,24 +34,42 @@ pub fn openai_auth() -> ProviderAuth {
 
 /// Construct the OpenAI provider over the given credential store + shared api registry. The
 /// registry MUST provide the `openai-responses` impl (use [`builtin_registry`]).
-pub fn openai_provider_with(store: Arc<dyn CredentialStore>, registry: Arc<ApiRegistry>) -> WireProvider {
-    WireProvider::new(OPENAI_PROVIDER_ID, "OpenAI", openai_models(), openai_auth(), store, registry)
+pub fn openai_provider_with(
+    store: Arc<dyn CredentialStore>,
+    registry: Arc<ApiRegistry>,
+) -> WireProvider {
+    WireProvider::new(
+        OPENAI_PROVIDER_ID,
+        "OpenAI",
+        openai_models(),
+        openai_auth(),
+        store,
+        registry,
+    )
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.
 pub fn openai_provider() -> WireProvider {
-    openai_provider_with(Arc::new(InMemoryCredentialStore::new()), Arc::new(builtin_registry()))
+    openai_provider_with(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
     use crate::context::Context;
     use crate::known_api::OPENAI_RESPONSES;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::StopReason;
     use std::collections::BTreeMap;
 
@@ -93,14 +111,22 @@ mod tests {
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
         let model = provider.get_model("gpt-4").unwrap().clone();
-        let msg = collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("not configured"));
     }
 
     #[tokio::test]
     async fn resolves_auth_then_fails_at_transport() {
-        let env = MapEnv(BTreeMap::from([(OPENAI_API_KEY_ENV.to_string(), "sk-openai-test".to_string())]));
+        let env = MapEnv(BTreeMap::from([(
+            OPENAI_API_KEY_ENV.to_string(),
+            "sk-openai-test".to_string(),
+        )]));
         let provider = openai_provider_with(
             Arc::new(InMemoryCredentialStore::new()),
             Arc::new(builtin_registry()),
@@ -108,11 +134,22 @@ mod tests {
         .with_auth_context(Arc::new(env));
         let mut model = provider.get_model("gpt-4").unwrap().clone();
         model.base_url = "http://127.0.0.1:1/v1".to_string();
-        let msg = collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// Live smoke test against the real OpenAI Responses API. Ignored by default; run with
@@ -126,7 +163,11 @@ mod tests {
             return;
         }
         let provider = openai_provider();
-        let model = provider.get_model("gpt-5-mini").or_else(|| provider.get_model("gpt-5")).unwrap().clone();
+        let model = provider
+            .get_model("gpt-5-mini")
+            .or_else(|| provider.get_model("gpt-5"))
+            .unwrap()
+            .clone();
         let ctx = Context {
             system_prompt: None,
             messages: vec![Message::User {
@@ -135,14 +176,26 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let opts = StreamOptions { max_tokens: Some(256), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(256),
+            ..Default::default()
+        };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;
-        assert_ne!(msg.stop_reason, StopReason::Error, "got error: {:?}", msg.error_message);
+        assert_ne!(
+            msg.stop_reason,
+            StopReason::Error,
+            "got error: {:?}",
+            msg.error_message
+        );
         let has_content = msg.content.iter().any(|c| match c {
             Content::Text { text, .. } => !text.trim().is_empty(),
             Content::Thinking { thinking, .. } => !thinking.trim().is_empty(),
             _ => false,
         });
-        assert!(has_content, "expected non-empty content, got: {:?}", msg.content);
+        assert!(
+            has_content,
+            "expected non-empty content, got: {:?}",
+            msg.content
+        );
     }
 }

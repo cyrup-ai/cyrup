@@ -30,7 +30,10 @@ pub enum Credential {
 impl Credential {
     /// A bare API-key credential.
     pub fn api_key(key: impl Into<String>) -> Self {
-        Credential::ApiKey { key: Some(key.into()), env: None }
+        Credential::ApiKey {
+            key: Some(key.into()),
+            env: None,
+        }
     }
 
     /// The provider-scoped env overlay carried by this credential, if any (R-01-016).
@@ -64,7 +67,10 @@ pub struct AuthResult {
 impl AuthResult {
     pub fn from_key(key: impl Into<String>, source: impl Into<String>) -> Self {
         AuthResult {
-            auth: ModelAuth { api_key: Some(key.into()), ..Default::default() },
+            auth: ModelAuth {
+                api_key: Some(key.into()),
+                ..Default::default()
+            },
             env: None,
             source: Some(source.into()),
         }

@@ -49,13 +49,22 @@ impl AuthError {
     }
 
     pub fn oauth(provider: ProviderId, cause: impl Into<BoxErr>) -> Self {
-        AuthError::OAuth { provider, cause: cause.into() }
+        AuthError::OAuth {
+            provider,
+            cause: cause.into(),
+        }
     }
     pub fn store(provider: ProviderId, cause: impl Into<BoxErr>) -> Self {
-        AuthError::Store { provider, cause: cause.into() }
+        AuthError::Store {
+            provider,
+            cause: cause.into(),
+        }
     }
     pub fn api_key(provider: ProviderId, cause: impl Into<BoxErr>) -> Self {
-        AuthError::ApiKey { provider, cause: cause.into() }
+        AuthError::ApiKey {
+            provider,
+            cause: cause.into(),
+        }
     }
 }
 
@@ -129,9 +138,10 @@ impl ProviderError {
             ProviderError::UnknownProvider(p) => ProviderError::UnknownProvider(p.clone()),
             ProviderError::NoApiImpl(a) => ProviderError::NoApiImpl(a.clone()),
             ProviderError::ModelSource(e) => ProviderError::ModelSource(e.to_string().into()),
-            ProviderError::Http { status, message } => {
-                ProviderError::Http { status: *status, message: message.clone() }
-            }
+            ProviderError::Http { status, message } => ProviderError::Http {
+                status: *status,
+                message: message.clone(),
+            },
             ProviderError::Transport(e) => ProviderError::Transport(e.to_string().into()),
             ProviderError::Decode(s) => ProviderError::Decode(s.clone()),
             ProviderError::Aborted => ProviderError::Aborted,
@@ -150,7 +160,11 @@ impl ProviderError {
         model: &str,
         api: Option<ApiId>,
     ) -> AssistantMessage {
-        let stop = if self.is_aborted() { StopReason::Aborted } else { StopReason::Error };
+        let stop = if self.is_aborted() {
+            StopReason::Aborted
+        } else {
+            StopReason::Error
+        };
         AssistantMessage::errored(provider, model, api, stop, self.to_string())
     }
 
@@ -178,9 +192,19 @@ mod tests {
 
     #[test]
     fn taxonomy_codes() {
-        assert_eq!(ProviderError::UnknownProvider("x".into()).code(), "provider");
+        assert_eq!(
+            ProviderError::UnknownProvider("x".into()).code(),
+            "provider"
+        );
         assert_eq!(ProviderError::NoApiImpl("y".into()).code(), "stream");
-        assert_eq!(ProviderError::Http { status: 500, message: "boom".into() }.code(), "http");
+        assert_eq!(
+            ProviderError::Http {
+                status: 500,
+                message: "boom".into()
+            }
+            .code(),
+            "http"
+        );
         assert_eq!(ProviderError::Aborted.code(), "aborted");
         let ae = AuthError::oauth("p".into(), "nope");
         assert_eq!(ProviderError::from(ae).code(), "oauth");
@@ -202,11 +226,11 @@ mod tests {
 
     #[test]
     fn http_maps_to_error_terminal() {
-        let ev = ProviderError::Http { status: 503, message: "down".into() }.into_error_event(
-            "p".into(),
-            "m",
-            None,
-        );
+        let ev = ProviderError::Http {
+            status: 503,
+            message: "down".into(),
+        }
+        .into_error_event("p".into(), "m", None);
         match ev {
             StreamEvent::Error { reason, error } => {
                 assert_eq!(reason, ErrorReason::Error);

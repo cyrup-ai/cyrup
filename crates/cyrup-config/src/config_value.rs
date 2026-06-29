@@ -101,7 +101,9 @@ fn parse_template(config: &str) -> Vec<TemplatePart> {
         }
 
         if next_char == Some(b'{') {
-            let end = config[dollar_index + 2..].find('}').map(|i| dollar_index + 2 + i);
+            let end = config[dollar_index + 2..]
+                .find('}')
+                .map(|i| dollar_index + 2 + i);
             let Some(end_index) = end else {
                 append_literal(&mut parts, "$");
                 index = dollar_index + 1;
@@ -167,7 +169,10 @@ fn template_env_var_names(parts: &[TemplatePart]) -> Vec<String> {
 }
 
 /// Port of `resolveTemplate` (:101-113): any missing env var fails the whole template.
-fn resolve_template(parts: &[TemplatePart], env: Option<&HashMap<String, String>>) -> Option<String> {
+fn resolve_template(
+    parts: &[TemplatePart],
+    env: Option<&HashMap<String, String>>,
+) -> Option<String> {
     let mut resolved = String::new();
     for part in parts {
         match part {
@@ -231,7 +236,11 @@ pub fn is_config_value_configured(config: &str, env: Option<&HashMap<String, Str
 fn execute_shell(command: &str) -> Option<String> {
     if cfg!(windows) {
         let (executed, value) = execute_with_configured_shell(command);
-        if executed { value } else { execute_with_default_shell(command) }
+        if executed {
+            value
+        } else {
+            execute_with_default_shell(command)
+        }
     } else {
         execute_with_default_shell(command)
     }
@@ -324,7 +333,11 @@ fn run_with_timeout(
                 let output = child.wait_with_output()?;
                 let text = String::from_utf8_lossy(&output.stdout);
                 let trimmed = text.trim();
-                let value = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+                let value = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
                 return Ok((status.success(), value));
             }
             Ok(None) => {
@@ -366,14 +379,21 @@ fn is_legacy_wsl_bash_path(path: &str) -> bool {
     if !c.is_ascii_lowercase() {
         return false;
     }
-    matches!(rest, "\\windows\\system32\\bash.exe" | "\\windows\\sysnative\\bash.exe")
+    matches!(
+        rest,
+        "\\windows\\system32\\bash.exe" | "\\windows\\sysnative\\bash.exe"
+    )
 }
 
 /// Port of `getBashShellConfig` (utils/shell.ts:19-21): legacy WSL bash takes the command on stdin
 /// (`-s`); every other bash takes it as a `-c` argument.
 fn bash_shell_config(shell: &str) -> ShellConfig {
     if is_legacy_wsl_bash_path(shell) {
-        ShellConfig { shell: shell.to_string(), args: vec!["-s".to_string()], command_from_stdin: true }
+        ShellConfig {
+            shell: shell.to_string(),
+            args: vec!["-s".to_string()],
+            command_from_stdin: true,
+        }
     } else {
         ShellConfig {
             shell: shell.to_string(),
@@ -387,13 +407,21 @@ fn bash_shell_config(shell: &str) -> ShellConfig {
 /// an existence check since `where` can report stale paths) or `which bash` (unix, trusted). Pi
 /// caps the lookup at 5s; `Command::output` blocks, but `where`/`which` return promptly.
 fn find_bash_on_path() -> Option<String> {
-    let (program, arg) = if cfg!(windows) { ("where", "bash.exe") } else { ("which", "bash") };
+    let (program, arg) = if cfg!(windows) {
+        ("where", "bash.exe")
+    } else {
+        ("which", "bash")
+    };
     let output = Command::new(program).arg(arg).output().ok()?;
     if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let first = stdout.lines().next().map(str::trim).filter(|s| !s.is_empty())?;
+    let first = stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
     if cfg!(windows) && !Path::new(first).exists() {
         return None;
     }
@@ -426,7 +454,11 @@ fn get_shell_config() -> Option<ShellConfig> {
         if let Some(bash) = find_bash_on_path() {
             return Some(bash_shell_config(&bash));
         }
-        Some(ShellConfig { shell: "sh".to_string(), args: vec!["-c".to_string()], command_from_stdin: false })
+        Some(ShellConfig {
+            shell: "sh".to_string(),
+            args: vec!["-c".to_string()],
+            command_from_stdin: false,
+        })
     }
 }
 
@@ -517,7 +549,11 @@ pub fn resolve_headers(
             resolved.insert(key.clone(), v);
         }
     }
-    if resolved.is_empty() { None } else { Some(resolved) }
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    }
 }
 
 /// Port of `resolveHeadersOrThrow` (:271-282).
@@ -526,13 +562,20 @@ pub fn resolve_headers_or_throw(
     description: &str,
     env: Option<&HashMap<String, String>>,
 ) -> Result<Option<HashMap<String, String>>, String> {
-    let Some(headers) = headers else { return Ok(None) };
+    let Some(headers) = headers else {
+        return Ok(None);
+    };
     let mut resolved = HashMap::new();
     for (key, value) in headers {
-        let v = resolve_config_value_or_throw(value, &format!("{description} header \"{key}\""), env)?;
+        let v =
+            resolve_config_value_or_throw(value, &format!("{description} header \"{key}\""), env)?;
         resolved.insert(key.clone(), v);
     }
-    Ok(if resolved.is_empty() { None } else { Some(resolved) })
+    Ok(if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    })
 }
 
 /// Clear the command cache (Pi `clearConfigValueCache`, :285-287). Exported for tests.
@@ -548,12 +591,18 @@ mod tests {
     use super::*;
 
     fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn literal_passthrough() {
-        assert_eq!(resolve_config_value("sk-literal-key", None).as_deref(), Some("sk-literal-key"));
+        assert_eq!(
+            resolve_config_value("sk-literal-key", None).as_deref(),
+            Some("sk-literal-key")
+        );
     }
 
     #[test]
@@ -569,16 +618,28 @@ mod tests {
         );
         // prefix + var + suffix interpolation
         let env = env_of(&[("TOK", "abc")]);
-        assert_eq!(resolve_config_value("Bearer ${TOK}!", Some(&env)).as_deref(), Some("Bearer abc!"));
+        assert_eq!(
+            resolve_config_value("Bearer ${TOK}!", Some(&env)).as_deref(),
+            Some("Bearer abc!")
+        );
     }
 
     #[test]
     fn missing_env_var_fails_whole_template() {
         // R: any missing env var means the whole value is unresolved.
         let env = env_of(&[]);
-        assert_eq!(resolve_config_value("$DEFINITELY_UNSET_VAR_XYZ", Some(&env)), None);
-        assert_eq!(missing_config_value_env_var_names("$DEFINITELY_UNSET_VAR_XYZ", Some(&env)).len(), 1);
-        assert!(!is_config_value_configured("$DEFINITELY_UNSET_VAR_XYZ", Some(&env)));
+        assert_eq!(
+            resolve_config_value("$DEFINITELY_UNSET_VAR_XYZ", Some(&env)),
+            None
+        );
+        assert_eq!(
+            missing_config_value_env_var_names("$DEFINITELY_UNSET_VAR_XYZ", Some(&env)).len(),
+            1
+        );
+        assert!(!is_config_value_configured(
+            "$DEFINITELY_UNSET_VAR_XYZ",
+            Some(&env)
+        ));
     }
 
     #[test]
@@ -591,13 +652,19 @@ mod tests {
     #[test]
     fn unterminated_brace_is_literal_dollar() {
         // No closing `}` → literal `$` then the rest as literal (:50-53).
-        assert_eq!(resolve_config_value("${UNCLOSED", None).as_deref(), Some("${UNCLOSED"));
+        assert_eq!(
+            resolve_config_value("${UNCLOSED", None).as_deref(),
+            Some("${UNCLOSED")
+        );
     }
 
     #[test]
     fn invalid_brace_name_is_literal() {
         // `${1bad}` is not a valid env name → kept literal (:59-61).
-        assert_eq!(resolve_config_value("${1bad}", None).as_deref(), Some("${1bad}"));
+        assert_eq!(
+            resolve_config_value("${1bad}", None).as_deref(),
+            Some("${1bad}")
+        );
     }
 
     #[test]
@@ -605,7 +672,10 @@ mod tests {
         assert_eq!(config_value_env_var_name("$FOO").as_deref(), Some("FOO"));
         assert_eq!(config_value_env_var_name("pre$FOO"), None);
         assert_eq!(config_value_env_var_name("!echo hi"), None);
-        assert_eq!(config_value_env_var_names("$A-$B"), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            config_value_env_var_names("$A-$B"),
+            vec!["A".to_string(), "B".to_string()]
+        );
     }
 
     #[test]
@@ -615,9 +685,15 @@ mod tests {
         assert!(!is_command_config_value("$FOO"));
         #[cfg(unix)]
         {
-            assert_eq!(resolve_config_value("!printf cmd-key", None).as_deref(), Some("cmd-key"));
+            assert_eq!(
+                resolve_config_value("!printf cmd-key", None).as_deref(),
+                Some("cmd-key")
+            );
             // cached: a second call returns the same value even though it would re-run.
-            assert_eq!(resolve_config_value("!printf cmd-key", None).as_deref(), Some("cmd-key"));
+            assert_eq!(
+                resolve_config_value("!printf cmd-key", None).as_deref(),
+                Some("cmd-key")
+            );
             // non-zero exit → None
             assert_eq!(resolve_config_value("!false", None), None);
         }
@@ -626,8 +702,12 @@ mod tests {
     #[test]
     fn or_throw_messages() {
         let env = env_of(&[]);
-        let e = resolve_config_value_or_throw("$MISSING_ENV_VAR_ABC", "api key", Some(&env)).unwrap_err();
-        assert!(e.contains("environment variable: MISSING_ENV_VAR_ABC"), "{e}");
+        let e = resolve_config_value_or_throw("$MISSING_ENV_VAR_ABC", "api key", Some(&env))
+            .unwrap_err();
+        assert!(
+            e.contains("environment variable: MISSING_ENV_VAR_ABC"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -649,7 +729,9 @@ mod tests {
         // forward slashes are normalized to backslashes first.
         assert!(is_legacy_wsl_bash_path("D:/Windows/System32/bash.exe"));
         // Git Bash / other locations are NOT the legacy WSL shim.
-        assert!(!is_legacy_wsl_bash_path(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_legacy_wsl_bash_path(
+            r"C:\Program Files\Git\bin\bash.exe"
+        ));
         assert!(!is_legacy_wsl_bash_path(r"C:\Windows\System32\cmd.exe"));
         assert!(!is_legacy_wsl_bash_path("/bin/bash"));
         assert!(!is_legacy_wsl_bash_path("bash"));

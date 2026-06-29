@@ -8,26 +8,26 @@
 //!
 //! Wire JSON uses the vendor's own field names (snake_case), NOT the cyrup camelCase convention.
 
+use crate::HeaderMap;
 use crate::api::compat::{
+    CacheControlFormat, MaxTokensField, ResolvedCompat, ThinkingFormat,
     clamp_openai_prompt_cache_key, get_compat, level_map_lookup, mapped_effort_or, off_is_not_null,
-    off_value_or, sanitize_surrogates, thinking_level_key, CacheControlFormat, MaxTokensField,
-    ResolvedCompat, ThinkingFormat,
+    off_value_or, sanitize_surrogates, thinking_level_key,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
-use crate::HeaderMap;
 use cyrup_core::{
-    ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ModelThinkingLevel, ToolCall,
-    ToolCallId, Usage,
+    ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
+    ToolCall, ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -41,7 +41,9 @@ pub struct OpenAiCompletionsApi {
 
 impl Default for OpenAiCompletionsApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -78,7 +80,8 @@ impl ApiImpl for OpenAiCompletionsApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -95,12 +98,26 @@ impl ApiImpl for OpenAiCompletionsApi {
 
         let body = build_body_with_env(model, ctx, opts, auth.env.as_ref());
         let headers = build_headers(model, auth, opts, &compat, cache_session_id);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -109,7 +126,8 @@ impl ApiImpl for OpenAiCompletionsApi {
             Ok(s) => s,
             Err(e) => {
                 // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -125,7 +143,11 @@ impl ApiImpl for OpenAiCompletionsApi {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/chat/completions` (appended unless `base` already names it).
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
+    let base = auth
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or(model.base_url.as_str());
     Some(chat_completions_url(base))
 }
 
@@ -265,9 +287,7 @@ pub(crate) fn build_body_with_env(
     // Prompt caching (OpenAI `prompt_cache_key` / `prompt_cache_retention`).
     let want_cache_key = (base_url.contains("api.openai.com") && cache != CacheRetention::None)
         || (cache == CacheRetention::Long && compat.supports_long_cache_retention);
-    if want_cache_key
-        && let Some(sid) = &opts.session_id
-    {
+    if want_cache_key && let Some(sid) = &opts.session_id {
         obj.insert(
             "prompt_cache_key".to_string(),
             json!(clamp_openai_prompt_cache_key(sid.as_str())),
@@ -278,7 +298,10 @@ pub(crate) fn build_body_with_env(
     }
 
     if compat.supports_usage_in_streaming {
-        obj.insert("stream_options".to_string(), json!({ "include_usage": true }));
+        obj.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
     }
     if compat.supports_store {
         obj.insert("store".to_string(), json!(false));
@@ -415,7 +438,10 @@ fn apply_reasoning(
             if let Some(e) = eff
                 && sre
             {
-                obj.insert("reasoning_effort".to_string(), json!(mapped_effort_or(map, level, e)));
+                obj.insert(
+                    "reasoning_effort".to_string(),
+                    json!(mapped_effort_or(map, level, e)),
+                );
             }
         }
         ThinkingFormat::Openrouter => {
@@ -443,12 +469,18 @@ fn apply_reasoning(
             if let Some(e) = eff
                 && sre
             {
-                obj.insert("reasoning_effort".to_string(), json!(mapped_effort_or(map, level, e)));
+                obj.insert(
+                    "reasoning_effort".to_string(),
+                    json!(mapped_effort_or(map, level, e)),
+                );
             }
         }
         ThinkingFormat::StringThinking => {
             if let Some(e) = eff {
-                obj.insert("thinking".to_string(), json!(mapped_effort_or(map, level, e)));
+                obj.insert(
+                    "thinking".to_string(),
+                    json!(mapped_effort_or(map, level, e)),
+                );
             } else if off_is_not_null(map) {
                 obj.insert("thinking".to_string(), json!(off_value_or(map, "none")));
             }
@@ -462,9 +494,7 @@ fn apply_reasoning(
                         json!(mapped_effort_or(map, level, e)),
                     );
                 }
-            } else if sre
-                && let Some(Some(s)) = level_map_lookup(map, "off")
-            {
+            } else if sre && let Some(Some(s)) = level_map_lookup(map, "off") {
                 obj.insert("reasoning_effort".to_string(), json!(s));
             }
         }
@@ -591,7 +621,10 @@ fn add_cache_control_to_text_content(message: &mut Map<String, Value>, cc: &Valu
             part.insert("type".to_string(), json!("text"));
             part.insert("text".to_string(), json!(text));
             part.insert("cache_control".to_string(), cc.clone());
-            message.insert("content".to_string(), Value::Array(vec![Value::Object(part)]));
+            message.insert(
+                "content".to_string(),
+                Value::Array(vec![Value::Object(part)]),
+            );
             true
         }
         Some(Value::Array(_)) => {
@@ -643,13 +676,12 @@ pub(crate) fn convert_tools(tools: &[ToolDef], compat: &ResolvedCompat) -> Vec<V
 // ---------------------------------------------------------------------------
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
-const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
+    "(tool image omitted: model does not support images)";
 
 /// `true` if `am` was produced by exactly this model (Pi `isSameModel`).
 fn is_same_model(am: &AssistantMessage, model: &Model) -> bool {
-    am.provider == model.provider
-        && am.api == model.api
-        && am.model == model.id.as_str()
+    am.provider == model.provider && am.api == model.api && am.model == model.id.as_str()
 }
 
 /// Normalize a tool-call id for cross-provider replay (Pi `convertMessages.normalizeToolCallId`).
@@ -658,12 +690,22 @@ fn normalize_tool_call_id(model: &Model, id: &str) -> String {
         let call_id = id.split('|').next().unwrap_or("");
         return call_id
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .take(40)
             .collect();
     }
     if model.provider.as_str() == "openai" {
-        return if id.chars().count() > 40 { id.chars().take(40).collect() } else { id.to_string() };
+        return if id.chars().count() > 40 {
+            id.chars().take(40).collect()
+        } else {
+            id.to_string()
+        };
     }
     id.to_string()
 }
@@ -705,22 +747,30 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
         .iter()
         .map(|m| match m {
             Message::User { content, timestamp } => Message::User {
-                content: replace_images_with_placeholder(content, NON_VISION_USER_IMAGE_PLACEHOLDER),
+                content: replace_images_with_placeholder(
+                    content,
+                    NON_VISION_USER_IMAGE_PLACEHOLDER,
+                ),
                 timestamp: *timestamp,
             },
-            Message::ToolResult { tool_call_id, tool_name, content, is_error, details, timestamp } => {
-                Message::ToolResult {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    content: replace_images_with_placeholder(
-                        content,
-                        NON_VISION_TOOL_IMAGE_PLACEHOLDER,
-                    ),
-                    is_error: *is_error,
-                    details: details.clone(),
-                    timestamp: *timestamp,
-                }
-            }
+            Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                timestamp,
+            } => Message::ToolResult {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                content: replace_images_with_placeholder(
+                    content,
+                    NON_VISION_TOOL_IMAGE_PLACEHOLDER,
+                ),
+                is_error: *is_error,
+                details: details.clone(),
+                timestamp: *timestamp,
+            },
             other => other.clone(),
         })
         .collect()
@@ -788,7 +838,14 @@ pub(crate) fn transform_messages_with_source(
         .iter()
         .map(|msg| match msg {
             Message::User { .. } => msg.clone(),
-            Message::ToolResult { tool_call_id, tool_name, content, is_error, details, timestamp } => {
+            Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                timestamp,
+            } => {
                 if let Some(norm) = tool_call_id_map.get(tool_call_id.as_str()).cloned()
                     && norm != tool_call_id.as_str()
                 {
@@ -808,7 +865,11 @@ pub(crate) fn transform_messages_with_source(
                 let mut new_content: Vec<Content> = Vec::new();
                 for block in &am.content {
                     match block {
-                        Content::Thinking { thinking, thinking_signature, redacted } => {
+                        Content::Thinking {
+                            thinking,
+                            thinking_signature,
+                            redacted,
+                        } => {
                             if *redacted {
                                 if same {
                                     new_content.push(block.clone());
@@ -901,7 +962,11 @@ pub(crate) fn transform_messages_with_source(
 }
 
 /// Map cyrup [`Message`]s to OpenAI chat messages (Pi `convertMessages`, applying the compat flags).
-pub(crate) fn convert_messages(model: &Model, ctx: &Context, compat: &ResolvedCompat) -> Vec<Value> {
+pub(crate) fn convert_messages(
+    model: &Model,
+    ctx: &Context,
+    compat: &ResolvedCompat,
+) -> Vec<Value> {
     let transformed = transform_messages(&ctx.messages, model);
     let mut params: Vec<Value> = Vec::new();
 
@@ -955,8 +1020,12 @@ pub(crate) fn convert_messages(model: &Model, ctx: &Context, compat: &ResolvedCo
             Message::ToolResult { .. } => {
                 let mut image_blocks: Vec<Value> = Vec::new();
                 let mut j = i;
-                while let Some(Message::ToolResult { tool_call_id, tool_name, content, .. }) =
-                    transformed.get(j)
+                while let Some(Message::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    ..
+                }) = transformed.get(j)
                 {
                     let text_result = content
                         .iter()
@@ -1008,8 +1077,9 @@ pub(crate) fn convert_messages(model: &Model, ctx: &Context, compat: &ResolvedCo
                             "content": "I have processed the tool results.",
                         }));
                     }
-                    let mut arr =
-                        vec![json!({ "type": "text", "text": "Attached image(s) from tool result:" })];
+                    let mut arr = vec![
+                        json!({ "type": "text", "text": "Attached image(s) from tool result:" }),
+                    ];
                     arr.extend(image_blocks);
                     params.push(json!({ "role": "user", "content": Value::Array(arr) }));
                     last_role = Some("user");
@@ -1040,7 +1110,9 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text, .. } if !text.trim().is_empty() => Some(sanitize_surrogates(text)),
+            Content::Text { text, .. } if !text.trim().is_empty() => {
+                Some(sanitize_surrogates(text))
+            }
             _ => None,
         })
         .collect();
@@ -1050,9 +1122,11 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Thinking { thinking, thinking_signature, .. } if !thinking.trim().is_empty() => {
-                Some((thinking, thinking_signature))
-            }
+            Content::Thinking {
+                thinking,
+                thinking_signature,
+                ..
+            } if !thinking.trim().is_empty() => Some((thinking, thinking_signature)),
             _ => None,
         })
         .collect();
@@ -1125,7 +1199,10 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         }
         obj.insert("tool_calls".to_string(), Value::Array(tc_values));
         if !reasoning_details.is_empty() {
-            obj.insert("reasoning_details".to_string(), Value::Array(reasoning_details));
+            obj.insert(
+                "reasoning_details".to_string(),
+                Value::Array(reasoning_details),
+            );
         }
     }
 
@@ -1191,8 +1268,16 @@ fn join_text(content: &[Content]) -> String {
 /// One in-progress content block, in first-appearance order (its index == `content_index`).
 enum Block {
     Text(String),
-    Thinking { text: String, signature: Option<String> },
-    Tool { id: String, name: String, args: String, thought_signature: Option<String> },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    Tool {
+        id: String,
+        name: String,
+        args: String,
+        thought_signature: Option<String>,
+    },
 }
 
 /// Streaming-decode state.
@@ -1252,7 +1337,12 @@ fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
                 thinking_signature: signature.clone(),
                 redacted: false,
             },
-            Block::Tool { id, name, args, thought_signature } => Content::ToolCall(ToolCall {
+            Block::Tool {
+                id,
+                name,
+                args,
+                thought_signature,
+            } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),
                 arguments: parse_partial_json(args),
@@ -1276,7 +1366,12 @@ where
 
     let mut dec = Decoder::default();
 
-    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+    if !sink
+        .send(StreamEvent::Start {
+            partial: dec.snapshot(model, api),
+        })
+        .await
+    {
         return;
     }
 
@@ -1285,7 +1380,8 @@ where
             Ok(f) => f,
             Err(e) => {
                 // transport/decode/abort mid-stream → terminal Error (R-01-018/044/045)
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -1312,13 +1408,22 @@ where
     for idx in 0..block_count {
         let partial = dec.snapshot(model, api);
         let ev = match dec.blocks.get(idx) {
-            Some(Block::Text(text)) => {
-                StreamEvent::TextEnd { content_index: idx, content: text.clone(), partial }
-            }
-            Some(Block::Thinking { text, .. }) => {
-                StreamEvent::ThinkingEnd { content_index: idx, content: text.clone(), partial }
-            }
-            Some(Block::Tool { id, name, args, thought_signature }) => StreamEvent::ToolCallEnd {
+            Some(Block::Text(text)) => StreamEvent::TextEnd {
+                content_index: idx,
+                content: text.clone(),
+                partial,
+            },
+            Some(Block::Thinking { text, .. }) => StreamEvent::ThinkingEnd {
+                content_index: idx,
+                content: text.clone(),
+                partial,
+            },
+            Some(Block::Tool {
+                id,
+                name,
+                args,
+                thought_signature,
+            }) => StreamEvent::ToolCallEnd {
                 content_index: idx,
                 tool_call: ToolCall {
                     id: ToolCallId::from(id.as_str()),
@@ -1389,7 +1494,10 @@ async fn process_chunk(
             .map(str::to_string)
             .unwrap_or_else(|| "Provider returned an error".to_string());
         if let Some(raw) = err.get("metadata").and_then(|m| m.get("raw")) {
-            let raw_str = raw.as_str().map(str::to_string).unwrap_or_else(|| raw.to_string());
+            let raw_str = raw
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| raw.to_string());
             if !raw_str.is_empty() {
                 message.push('\n');
                 message.push_str(&raw_str);
@@ -1400,7 +1508,11 @@ async fn process_chunk(
         return true;
     }
 
-    let choice = match chunk.get("choices").and_then(Value::as_array).and_then(|c| c.first()) {
+    let choice = match chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+    {
         Some(c) => c,
         None => return true,
     };
@@ -1439,7 +1551,11 @@ async fn process_chunk(
         }
         let partial = dec.snapshot(model, api);
         if !sink
-            .send(StreamEvent::TextDelta { content_index: idx, delta: text.to_string(), partial })
+            .send(StreamEvent::TextDelta {
+                content_index: idx,
+                delta: text.to_string(),
+                partial,
+            })
             .await
         {
             return false;
@@ -1493,11 +1609,15 @@ async fn process_chunk(
             if let Some(id) = encrypted_reasoning_detail_id(detail) {
                 let serialized = detail.to_string();
                 if let Some(&idx) = dec.tool_by_id.get(id) {
-                    if let Some(Block::Tool { thought_signature, .. }) = dec.blocks.get_mut(idx) {
+                    if let Some(Block::Tool {
+                        thought_signature, ..
+                    }) = dec.blocks.get_mut(idx)
+                    {
                         *thought_signature = Some(serialized);
                     }
                 } else {
-                    dec.pending_reasoning_by_tool_id.insert(id.to_string(), serialized);
+                    dec.pending_reasoning_by_tool_id
+                        .insert(id.to_string(), serialized);
                 }
             }
         }
@@ -1512,8 +1632,14 @@ fn encrypted_reasoning_detail_id(detail: &Value) -> Option<&str> {
     if detail.get("type").and_then(Value::as_str) != Some("reasoning.encrypted") {
         return None;
     }
-    let id = detail.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
-    let _data = detail.get("data").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let id = detail
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let _data = detail
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
     Some(id)
 }
 
@@ -1532,7 +1658,13 @@ async fn ensure_text_block(
     dec.blocks.push(Block::Text(String::new()));
     dec.text_idx = Some(idx);
     let partial = dec.snapshot(model, api);
-    if !sink.send(StreamEvent::TextStart { content_index: idx, partial }).await {
+    if !sink
+        .send(StreamEvent::TextStart {
+            content_index: idx,
+            partial,
+        })
+        .await
+    {
         return None;
     }
     Some(idx)
@@ -1557,7 +1689,13 @@ async fn ensure_thinking_block(
     });
     dec.thinking_idx = Some(idx);
     let partial = dec.snapshot(model, api);
-    if !sink.send(StreamEvent::ThinkingStart { content_index: idx, partial }).await {
+    if !sink
+        .send(StreamEvent::ThinkingStart {
+            content_index: idx,
+            partial,
+        })
+        .await
+    {
         return None;
     }
     Some(idx)
@@ -1572,7 +1710,10 @@ async fn process_tool_call_delta(
     sink: &EventSink,
 ) -> bool {
     let stream_index = tc.get("index").and_then(Value::as_i64);
-    let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let id = tc
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
     let name = tc
         .get("function")
         .and_then(|f| f.get("name"))
@@ -1606,7 +1747,13 @@ async fn process_tool_call_delta(
                 dec.tool_by_id.insert(i.to_string(), idx);
             }
             let partial = dec.snapshot(model, api);
-            if !sink.send(StreamEvent::ToolCallStart { content_index: idx, partial }).await {
+            if !sink
+                .send(StreamEvent::ToolCallStart {
+                    content_index: idx,
+                    partial,
+                })
+                .await
+            {
                 return false;
             }
             idx
@@ -1617,8 +1764,12 @@ async fn process_tool_call_delta(
     // `applyPendingReasoningDetail`).
     let pending = id.and_then(|i| dec.pending_reasoning_by_tool_id.remove(i));
 
-    if let Some(Block::Tool { id: bid, name: bname, args, thought_signature }) =
-        dec.blocks.get_mut(idx)
+    if let Some(Block::Tool {
+        id: bid,
+        name: bname,
+        args,
+        thought_signature,
+    }) = dec.blocks.get_mut(idx)
     {
         if let Some(i) = id
             && bid.is_empty()
@@ -1708,7 +1859,9 @@ fn parse_usage(raw: &Value, model: &Model) -> Usage {
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(Value::as_u64);
 
-    let input = prompt.saturating_sub(cache_read).saturating_sub(cache_write);
+    let input = prompt
+        .saturating_sub(cache_read)
+        .saturating_sub(cache_write);
     let mut usage = Usage {
         input,
         output: completion,
@@ -1729,7 +1882,10 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
         "stop" | "end" => (StopReason::Stop, None),
         "length" => (StopReason::Length, None),
         "tool_calls" | "function_call" => (StopReason::ToolUse, None),
-        other => (StopReason::Error, Some(format!("Provider finish_reason: {other}"))),
+        other => (
+            StopReason::Error,
+            Some(format!("Provider finish_reason: {other}")),
+        ),
     }
 }
 
@@ -1755,7 +1911,12 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::channel;
@@ -1773,7 +1934,12 @@ mod tests {
             base_url: "https://api.together.ai/v1".to_string(),
             reasoning: true,
             input: vec![Modality::Text],
-            cost: ModelCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.0 },
+            cost: ModelCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 0.0,
+            },
             context_window: 131072,
             max_tokens: 131072,
             thinking_level_map: None,
@@ -1784,7 +1950,10 @@ mod tests {
 
     fn auth_with_key() -> AuthResult {
         AuthResult {
-            auth: ModelAuth { api_key: Some("sk-xyz".into()), ..Default::default() },
+            auth: ModelAuth {
+                api_key: Some("sk-xyz".into()),
+                ..Default::default()
+            },
             env: None,
             source: Some("env".into()),
         }
@@ -1811,9 +1980,17 @@ mod tests {
     #[test]
     fn headers_set_bearer_auth() {
         let compat = get_compat(&model());
-        let headers =
-            build_headers(&model(), &auth_with_key(), &StreamOptions::default(), &compat, None);
-        assert_eq!(headers.get("Authorization"), Some(&Some("Bearer sk-xyz".to_string())));
+        let headers = build_headers(
+            &model(),
+            &auth_with_key(),
+            &StreamOptions::default(),
+            &compat,
+            None,
+        );
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&Some("Bearer sk-xyz".to_string()))
+        );
         // No session-affinity headers: the flag is false for `together` and there is no session id.
         assert!(!headers.contains_key("session_id"));
     }
@@ -1838,7 +2015,10 @@ mod tests {
             ("X-Drop".to_string(), None), // suppress the auth default
         ]));
         let opts = StreamOptions {
-            headers: Some(crate::HeaderMap::from([("X-All".to_string(), Some("opts".to_string()))])),
+            headers: Some(crate::HeaderMap::from([(
+                "X-All".to_string(),
+                Some("opts".to_string()),
+            )])),
             ..Default::default()
         };
         let headers = build_headers(&m, &auth, &opts, &compat, None);
@@ -1852,7 +2032,10 @@ mod tests {
         // `None` from model.headers suppresses the auth default (carried as `Some(None)`).
         assert_eq!(headers.get("X-Drop"), Some(&None));
         // Bearer auth still present.
-        assert_eq!(headers.get("Authorization"), Some(&Some("Bearer sk-xyz".to_string())));
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&Some("Bearer sk-xyz".to_string()))
+        );
     }
 
     #[test]
@@ -1860,12 +2043,18 @@ mod tests {
         let ctx = Context {
             system_prompt: Some("be terse".to_string()),
             messages: vec![
-                Message::User { content: vec![Content::text("hi")], timestamp: 0 },
+                Message::User {
+                    content: vec![Content::text("hi")],
+                    timestamp: 0,
+                },
                 Message::Assistant(AssistantMessage {
                     content: vec![Content::ToolCall(ToolCall {
                         id: ToolCallId::from("call_1"),
                         name: "get_weather".into(),
-                        arguments: json!({ "city": "Paris" }).as_object().cloned().expect("object"),
+                        arguments: json!({ "city": "Paris" })
+                            .as_object()
+                            .cloned()
+                            .expect("object"),
                         thought_signature: None,
                     })],
                     provider: "together".into(),
@@ -1923,7 +2112,10 @@ mod tests {
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0], json!({ "role": "system", "content": "be terse" }));
+        assert_eq!(
+            messages[0],
+            json!({ "role": "system", "content": "be terse" })
+        );
         assert_eq!(messages[1], json!({ "role": "user", "content": "hi" }));
         // assistant tool call — content is `null` (Pi sends null unless an assistant message is
         // required after tool results; Together does not require that).
@@ -1956,7 +2148,10 @@ mod tests {
     fn reasoning_effort_omitted_for_non_reasoning_model() {
         let mut m = model();
         m.reasoning = false;
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_body(&m, &Context::default(), &opts);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoning").is_none());
@@ -1991,9 +2186,14 @@ mod tests {
     fn openai_reasoning_effort_uses_thinking_level_map() {
         let mut m = openai_model();
         // Map "high" -> "xhigh" wire value (Pi `thinkingLevelMap`).
-        m.thinking_level_map =
-            Some(crate::model::ThinkingLevelMap::from([("high".to_string(), Some("xhigh".to_string()))]));
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        m.thinking_level_map = Some(crate::model::ThinkingLevelMap::from([(
+            "high".to_string(),
+            Some("xhigh".to_string()),
+        )]));
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_body(&m, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "xhigh");
     }
@@ -2092,7 +2292,13 @@ mod tests {
         let events = collect_events(raw).await;
 
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextStart { content_index: 0, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::TextStart {
+                content_index: 0,
+                ..
+            }
+        )));
         let deltas: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -2131,8 +2337,13 @@ mod tests {
         assert!(matches!(&events[0], StreamEvent::Start { partial } if partial.content.is_empty()));
         for ev in &events {
             match ev {
-                StreamEvent::Done { .. } | StreamEvent::Error { .. } => assert!(ev.partial().is_none()),
-                _ => assert!(ev.partial().is_some(), "non-terminal must carry partial: {ev:?}"),
+                StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+                    assert!(ev.partial().is_none())
+                }
+                _ => assert!(
+                    ev.partial().is_some(),
+                    "non-terminal must carry partial: {ev:?}"
+                ),
             }
         }
 
@@ -2161,9 +2372,17 @@ mod tests {
         );
         let events = collect_events(raw).await;
 
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { content_index: 0, .. })));
-        let delta_count =
-            events.iter().filter(|e| matches!(e, StreamEvent::ToolCallDelta { .. })).count();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallStart {
+                content_index: 0,
+                ..
+            }
+        )));
+        let delta_count = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallDelta { .. }))
+            .count();
         assert_eq!(delta_count, 2);
 
         let tc_end = events.iter().find_map(|e| match e {
@@ -2173,7 +2392,10 @@ mod tests {
         let tc = tc_end.expect("toolcall_end");
         assert_eq!(tc.id.as_str(), "call_9");
         assert_eq!(tc.name, "add");
-        assert_eq!(serde_json::Value::Object(tc.arguments), json!({ "a": 1, "b": 2 }));
+        assert_eq!(
+            serde_json::Value::Object(tc.arguments),
+            json!({ "a": 1, "b": 2 })
+        );
 
         match events.last() {
             Some(StreamEvent::Done { message, .. }) => {
@@ -2200,13 +2422,19 @@ mod tests {
         let sigs: std::collections::HashMap<String, Option<String>> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallEnd { tool_call, .. } => {
-                    Some((tool_call.id.as_str().to_string(), tool_call.thought_signature.clone()))
-                }
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some((
+                    tool_call.id.as_str().to_string(),
+                    tool_call.thought_signature.clone(),
+                )),
                 _ => None,
             })
             .collect();
-        assert!(sigs["call_a"].as_deref().unwrap().contains("reasoning.encrypted"));
+        assert!(
+            sigs["call_a"]
+                .as_deref()
+                .unwrap()
+                .contains("reasoning.encrypted")
+        );
         assert!(sigs["call_a"].as_deref().unwrap().contains("AAA"));
         assert!(sigs["call_b"].as_deref().unwrap().contains("BBB"));
     }
@@ -2222,7 +2450,13 @@ mod tests {
         );
         let events = collect_events(raw).await;
 
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ThinkingStart {
+                content_index: 0,
+                ..
+            }
+        )));
         let think: String = events
             .iter()
             .filter_map(|e| match e {
@@ -2277,11 +2511,13 @@ mod tests {
         match events.last() {
             Some(StreamEvent::Error { error: message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Error);
-                assert!(message
-                    .error_message
-                    .as_deref()
-                    .unwrap()
-                    .contains("content_filter"));
+                assert!(
+                    message
+                        .error_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("content_filter")
+                );
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
@@ -2321,24 +2557,35 @@ mod tests {
 
         // Unset caller retention + PI_CACHE_RETENTION=long (scoped overlay) => promoted to Long,
         // which (on api.openai.com, supportsLongCacheRetention) emits `prompt_cache_retention`.
-        let opts = StreamOptions { cache_retention: None, ..Default::default() };
+        let opts = StreamOptions {
+            cache_retention: None,
+            ..Default::default()
+        };
         let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env));
         assert_eq!(body["prompt_cache_retention"], "24h");
 
         // Explicit caller value wins over env: Short stays Short (no 24h).
-        let opts =
-            StreamOptions { cache_retention: Some(CacheRetention::Short), ..Default::default() };
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Short),
+            ..Default::default()
+        };
         let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env));
         assert!(body.get("prompt_cache_retention").is_none());
 
         // resolve_cache_retention precedence, directly (overlay-driven, deterministic).
-        assert_eq!(resolve_cache_retention(None, Some(&env)), CacheRetention::Long);
+        assert_eq!(
+            resolve_cache_retention(None, Some(&env)),
+            CacheRetention::Long
+        );
         assert_eq!(
             resolve_cache_retention(Some(CacheRetention::None), Some(&env)),
             CacheRetention::None
         );
         let empty = BTreeMap::new();
-        assert_eq!(resolve_cache_retention(None, Some(&empty)), CacheRetention::Short);
+        assert_eq!(
+            resolve_cache_retention(None, Some(&empty)),
+            CacheRetention::Short
+        );
     }
 
     // Gap 3: Pi `createClient` (openai-completions.ts:515-519) — session-affinity headers are
@@ -2351,11 +2598,22 @@ mod tests {
             ..Default::default()
         });
         let compat = get_compat(&m);
-        let headers =
-            build_headers(&m, &auth_with_key(), &StreamOptions::default(), &compat, Some("sess-7"));
+        let headers = build_headers(
+            &m,
+            &auth_with_key(),
+            &StreamOptions::default(),
+            &compat,
+            Some("sess-7"),
+        );
         assert_eq!(headers.get("session_id"), Some(&Some("sess-7".to_string())));
-        assert_eq!(headers.get("x-client-request-id"), Some(&Some("sess-7".to_string())));
-        assert_eq!(headers.get("x-session-affinity"), Some(&Some("sess-7".to_string())));
+        assert_eq!(
+            headers.get("x-client-request-id"),
+            Some(&Some("sess-7".to_string()))
+        );
+        assert_eq!(
+            headers.get("x-session-affinity"),
+            Some(&Some("sess-7".to_string()))
+        );
 
         // Flag off (default for every provider) => not emitted even with a session id present.
         let compat_off = get_compat(&model());
@@ -2369,7 +2627,13 @@ mod tests {
         assert!(!headers.contains_key("session_id"));
 
         // Flag on but no session id => not emitted.
-        let headers = build_headers(&m, &auth_with_key(), &StreamOptions::default(), &compat, None);
+        let headers = build_headers(
+            &m,
+            &auth_with_key(),
+            &StreamOptions::default(),
+            &compat,
+            None,
+        );
         assert!(!headers.contains_key("session_id"));
     }
 

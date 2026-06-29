@@ -1,7 +1,7 @@
 //! Model + capability/cost metadata (arch-01 §4.2 / func-01 §4.2).
 
-use crate::api::compat::OpenAiCompletionsCompat;
 use crate::HeaderMap;
+use crate::api::compat::OpenAiCompletionsCompat;
 use cyrup_core::{ApiId, ModelId, ProviderId};
 
 /// Maps pi thinking levels (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) to provider/model

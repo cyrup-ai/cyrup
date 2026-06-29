@@ -65,8 +65,7 @@ pub fn repair_json(json: &str) -> String {
                     continue;
                 }
                 Some('u') => {
-                    let unicode_digits: String =
-                        chars.iter().skip(index + 2).take(4).collect();
+                    let unicode_digits: String = chars.iter().skip(index + 2).take(4).collect();
                     if unicode_digits.len() == 4
                         && unicode_digits.chars().all(|d| d.is_ascii_hexdigit())
                     {
@@ -150,7 +149,10 @@ pub fn parse_streaming_json_object(partial_json: Option<&str>) -> Map<String, Va
 /// `None` only when nothing parseable is present at all.
 fn parse_partial(input: &str) -> Option<Value> {
     let chars: Vec<char> = input.chars().collect();
-    let mut p = PartialParser { chars: &chars, pos: 0 };
+    let mut p = PartialParser {
+        chars: &chars,
+        pos: 0,
+    };
     p.skip_ws();
     let value = p.parse_value()?;
     Some(value)
@@ -192,7 +194,7 @@ impl PartialParser<'_> {
         loop {
             self.skip_ws();
             match self.peek() {
-                None => break,        // truncated → return what we have
+                None => break, // truncated → return what we have
                 Some('}') => {
                     self.pos += 1;
                     break;
@@ -205,7 +207,9 @@ impl PartialParser<'_> {
                 _ => break, // malformed
             }
             // Parse the key.
-            let Some(key) = self.parse_string() else { break };
+            let Some(key) = self.parse_string() else {
+                break;
+            };
             self.skip_ws();
             if self.peek() != Some(':') {
                 // Key without a colon/value (truncated mid-key): drop it (Pi/partial-json behaviour).
@@ -260,7 +264,9 @@ impl PartialParser<'_> {
             match c {
                 '"' => return Some(out), // closed
                 '\\' => {
-                    let Some(esc) = self.peek() else { return Some(out) };
+                    let Some(esc) = self.peek() else {
+                        return Some(out);
+                    };
                     self.pos += 1;
                     match esc {
                         '"' => out.push('"'),
@@ -272,8 +278,7 @@ impl PartialParser<'_> {
                         'r' => out.push('\r'),
                         't' => out.push('\t'),
                         'u' => {
-                            let hex: String =
-                                self.chars.iter().skip(self.pos).take(4).collect();
+                            let hex: String = self.chars.iter().skip(self.pos).take(4).collect();
                             let code = (hex.len() == 4)
                                 .then(|| u32::from_str_radix(&hex, 16).ok())
                                 .flatten();
@@ -299,11 +304,16 @@ impl PartialParser<'_> {
         if self.peek() == Some('-') {
             self.pos += 1;
         }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')
+        {
             self.pos += 1;
         }
-        let raw: String =
-            self.chars.get(start..self.pos).unwrap_or(&[]).iter().collect();
+        let raw: String = self
+            .chars
+            .get(start..self.pos)
+            .unwrap_or(&[])
+            .iter()
+            .collect();
         // Try the full slice, then progressively trim a trailing partial exponent/sign/dot.
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             return Some(v);
@@ -346,7 +356,12 @@ impl PartialParser<'_> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

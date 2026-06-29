@@ -9,14 +9,14 @@
 
 use crate::api::channel;
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthOverrides, AuthResult, CredentialStore,
-    EnvAuthContext, InMemoryCredentialStore,
+    AuthContext, AuthOverrides, AuthResult, CredentialStore, EnvAuthContext,
+    InMemoryCredentialStore, resolve_provider_auth,
 };
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
 use crate::provider::Provider;
-use crate::stream::{collect_message, StreamEvent, StreamOptions};
+use crate::stream::{StreamEvent, StreamOptions, collect_message};
 use crate::utils::simple_options::SimpleStreamOptions;
 use cyrup_core::{AssistantMessage, EventStream, ModelThinkingLevel};
 use futures::StreamExt;
@@ -50,7 +50,9 @@ pub fn create_models(options: CreateModelsOptions) -> Models {
         credentials: options
             .credentials
             .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new())),
-        auth_context: options.auth_context.unwrap_or_else(|| Arc::new(EnvAuthContext)),
+        auth_context: options
+            .auth_context
+            .unwrap_or_else(|| Arc::new(EnvAuthContext)),
     }
 }
 
@@ -59,7 +61,8 @@ impl Models {
 
     /// Upsert/replace by `provider.id` (Pi `setProvider`). Ids are unique.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.providers.insert(provider.id().as_str().to_string(), provider);
+        self.providers
+            .insert(provider.id().as_str().to_string(), provider);
     }
 
     /// Remove a provider by id (Pi `deleteProvider`).
@@ -93,13 +96,19 @@ impl Models {
                 .get(id)
                 .map(|p| p.models().to_vec())
                 .unwrap_or_default(),
-            None => self.providers.values().flat_map(|p| p.models().to_vec()).collect(),
+            None => self
+                .providers
+                .values()
+                .flat_map(|p| p.models().to_vec())
+                .collect(),
         }
     }
 
     /// Runtime model lookup against last-known lists (Pi `getModel`).
     pub fn get_model(&self, provider: &str, id: &str) -> Option<Model> {
-        self.get_models(Some(provider)).into_iter().find(|m| m.id.as_str() == id)
+        self.get_models(Some(provider))
+            .into_iter()
+            .find(|m| m.id.as_str() == id)
     }
 
     // ---- auth (Pi models.ts:216) ----
@@ -153,7 +162,8 @@ impl Models {
 
             let Some(provider) = provider else {
                 let err = ProviderError::UnknownProvider(provider_id.clone());
-                sink.send(err.into_error_event(provider_id, &model_id, api)).await;
+                sink.send(err.into_error_event(provider_id, &model_id, api))
+                    .await;
                 return;
             };
 
@@ -167,7 +177,8 @@ impl Models {
                 match helper.apply_auth(&model_owned, &options).await {
                     Ok(v) => v,
                     Err(e) => {
-                        sink.send(e.into_error_event(provider_id, &model_id, api)).await;
+                        sink.send(e.into_error_event(provider_id, &model_id, api))
+                            .await;
                         return;
                     }
                 };
@@ -222,7 +233,8 @@ impl Models {
 
             let Some(provider) = provider else {
                 let err = ProviderError::UnknownProvider(provider_id.clone());
-                sink.send(err.into_error_event(provider_id, &model_id, api)).await;
+                sink.send(err.into_error_event(provider_id, &model_id, api))
+                    .await;
                 return;
             };
 
@@ -236,7 +248,8 @@ impl Models {
                 match helper.apply_auth(&model_owned, &options.base).await {
                     Ok(v) => v,
                     Err(e) => {
-                        sink.send(e.into_error_event(provider_id, &model_id, api)).await;
+                        sink.send(e.into_error_event(provider_id, &model_id, api))
+                            .await;
                         return;
                     }
                 };
@@ -324,7 +337,10 @@ impl AuthHelper {
             model,
             self.credentials.as_ref(),
             self.auth_context.as_ref(),
-            AuthOverrides { api_key: options.api_key.as_deref(), env: None },
+            AuthOverrides {
+                api_key: options.api_key.as_deref(),
+                env: None,
+            },
         )
         .await?;
         let Some(resolution) = resolution else {
@@ -413,10 +429,11 @@ pub fn clamp_thinking_level(model: &Model, level: ModelThinkingLevel) -> ModelTh
     if available.contains(&level) {
         return level;
     }
-    let Some(requested_index) =
-        EXTENDED_THINKING_LEVELS.iter().position(|l| *l == level)
-    else {
-        return available.first().copied().unwrap_or(ModelThinkingLevel::Off);
+    let Some(requested_index) = EXTENDED_THINKING_LEVELS.iter().position(|l| *l == level) else {
+        return available
+            .first()
+            .copied()
+            .unwrap_or(ModelThinkingLevel::Off);
     };
     for candidate in EXTENDED_THINKING_LEVELS.iter().skip(requested_index) {
         if available.contains(candidate) {
@@ -428,7 +445,10 @@ pub fn clamp_thinking_level(model: &Model, level: ModelThinkingLevel) -> ModelTh
             return *candidate;
         }
     }
-    available.first().copied().unwrap_or(ModelThinkingLevel::Off)
+    available
+        .first()
+        .copied()
+        .unwrap_or(ModelThinkingLevel::Off)
 }
 
 /// Two models are equal iff their id AND provider match (Pi `modelsAreEqual`).
@@ -445,7 +465,12 @@ pub fn has_api(model: &Model, api: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::Credential;
@@ -503,7 +528,11 @@ mod tests {
         let groq_only = models.get_models(Some("groq"));
         assert!(all.len() > groq_only.len());
         assert!(groq_only.iter().all(|m| m.provider.as_str() == "groq"));
-        assert!(models.get_model("xai", &groq_only[0].id.clone().to_string()).is_none());
+        assert!(
+            models
+                .get_model("xai", &groq_only[0].id.clone().to_string())
+                .is_none()
+        );
 
         models.delete_provider("groq");
         assert!(models.get_provider("groq").is_none());
@@ -523,7 +552,11 @@ mod tests {
             )])))),
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
-        let m = models.get_models(Some("groq")).into_iter().next().expect("a groq model");
+        let m = models
+            .get_models(Some("groq"))
+            .into_iter()
+            .next()
+            .expect("a groq model");
         let auth = models.get_auth(&m).await.expect("ok").expect("configured");
         assert_eq!(auth.auth.api_key.as_deref(), Some("sk-groq"));
         assert_eq!(auth.source.as_deref(), Some("env"));
@@ -545,7 +578,11 @@ mod tests {
             )])))),
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
-        let m = models.get_models(Some("groq")).into_iter().next().expect("groq model");
+        let m = models
+            .get_models(Some("groq"))
+            .into_iter()
+            .next()
+            .expect("groq model");
         let auth = models.get_auth(&m).await.expect("ok").expect("configured");
         // Stored credential owns the provider (env not consulted, R-01-012).
         assert_eq!(auth.auth.api_key.as_deref(), Some("stored-key"));
@@ -556,8 +593,9 @@ mod tests {
     async fn stream_unknown_provider_yields_error_terminal() {
         let models = create_models(CreateModelsOptions::default());
         let m = model("ghost", "m1", false, None);
-        let msg = collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
-            .await;
+        let msg =
+            collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("unknown provider"));
     }
@@ -574,13 +612,21 @@ mod tests {
             )])))),
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
-        let mut m = models.get_models(Some("groq")).into_iter().next().expect("groq model");
+        let mut m = models
+            .get_models(Some("groq"))
+            .into_iter()
+            .next()
+            .expect("groq model");
         m.base_url = "http://127.0.0.1:1/v1".to_string();
-        let msg = collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
-            .await;
+        let msg =
+            collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved: {err}"
+        );
         assert!(err.contains("transport"), "expected transport error: {err}");
     }
 
@@ -607,13 +653,23 @@ mod tests {
             )])))),
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
-        let mut m = models.get_models(Some("groq")).into_iter().next().expect("groq model");
+        let mut m = models
+            .get_models(Some("groq"))
+            .into_iter()
+            .next()
+            .expect("groq model");
         m.base_url = "http://127.0.0.1:1/v1".to_string();
-        let opts = SimpleStreamOptions { reasoning: Some(cyrup_core::ThinkingLevel::Low), ..Default::default() };
+        let opts = SimpleStreamOptions {
+            reasoning: Some(cyrup_core::ThinkingLevel::Low),
+            ..Default::default()
+        };
         let msg = collect_message(models.stream_simple(&m, &Context::default(), &opts)).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved: {err}"
+        );
         assert!(err.contains("transport"), "expected transport error: {err}");
     }
 
@@ -631,7 +687,10 @@ mod tests {
     fn supported_thinking_levels_match_pi() {
         // Non-reasoning → only off.
         let plain = model("p", "a", false, None);
-        assert_eq!(get_supported_thinking_levels(&plain), vec![ModelThinkingLevel::Off]);
+        assert_eq!(
+            get_supported_thinking_levels(&plain),
+            vec![ModelThinkingLevel::Off]
+        );
 
         // Reasoning, no map → off,minimal,low,medium,high (xhigh requires an explicit entry).
         let r = model("p", "b", true, None);
@@ -665,11 +724,17 @@ mod tests {
         map.insert("xhigh".to_string(), Some("max".to_string()));
         let m = model("p", "c", true, Some(map));
         // medium unsupported → nearest higher supported is xhigh.
-        assert_eq!(clamp_thinking_level(&m, ModelThinkingLevel::Medium), ModelThinkingLevel::Xhigh);
+        assert_eq!(
+            clamp_thinking_level(&m, ModelThinkingLevel::Medium),
+            ModelThinkingLevel::Xhigh
+        );
 
         // Non-reasoning model clamps everything to off.
         let plain = model("p", "a", false, None);
-        assert_eq!(clamp_thinking_level(&plain, ModelThinkingLevel::High), ModelThinkingLevel::Off);
+        assert_eq!(
+            clamp_thinking_level(&plain, ModelThinkingLevel::High),
+            ModelThinkingLevel::Off
+        );
     }
 
     #[test]
@@ -761,9 +826,15 @@ mod tests {
         // A fleet provider has no dynamic source (`refresh_models` → None): refresh is a clean Ok.
         let mut models = create_models(CreateModelsOptions::default());
         models.set_provider(Arc::new(fleet::GROQ.provider()));
-        models.refresh(Some("groq")).await.expect("static refresh is a no-op");
+        models
+            .refresh(Some("groq"))
+            .await
+            .expect("static refresh is a no-op");
         // Unknown provider id is also a no-op (Pi `if (!entry?.refreshModels) return`).
-        models.refresh(Some("does-not-exist")).await.expect("unknown is a no-op");
+        models
+            .refresh(Some("does-not-exist"))
+            .await
+            .expect("unknown is a no-op");
     }
 
     #[tokio::test]
@@ -780,7 +851,10 @@ mod tests {
         let mut models = create_models(CreateModelsOptions::default());
         let (p, fetches) = dyn_provider("dyn-bad", true);
         models.set_provider(p);
-        let err = models.refresh(Some("dyn-bad")).await.expect_err("should fail");
+        let err = models
+            .refresh(Some("dyn-bad"))
+            .await
+            .expect_err("should fail");
         assert_eq!(err.code(), "model_source");
         assert!(err.to_string().contains("Model refresh failed for dyn-bad"));
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -796,8 +870,19 @@ mod tests {
         let (ok, ok_fetches) = dyn_provider("dyn-ok", false);
         models.set_provider(bad);
         models.set_provider(ok);
-        models.refresh(None).await.expect("best-effort never errors");
-        assert_eq!(bad_fetches.load(Ordering::SeqCst), 1, "failing source still fetched");
-        assert_eq!(ok_fetches.load(Ordering::SeqCst), 1, "healthy source fetched");
+        models
+            .refresh(None)
+            .await
+            .expect("best-effort never errors");
+        assert_eq!(
+            bad_fetches.load(Ordering::SeqCst),
+            1,
+            "failing source still fetched"
+        );
+        assert_eq!(
+            ok_fetches.load(Ordering::SeqCst),
+            1,
+            "healthy source fetched"
+        );
     }
 }

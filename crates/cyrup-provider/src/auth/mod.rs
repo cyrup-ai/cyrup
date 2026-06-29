@@ -11,11 +11,9 @@ use crate::model::Model;
 use std::sync::Arc;
 
 pub use helpers::{env_key, keyless_local};
-pub use resolve::{resolve_provider_auth, AuthOverrides};
+pub use resolve::{AuthOverrides, resolve_provider_auth};
 pub use store::{CredentialStore, InMemoryCredentialStore, ModifyFn};
-pub use types::{
-    AuthContext, AuthResult, Credential, EnvAuthContext, ModelAuth, ProviderEnv,
-};
+pub use types::{AuthContext, AuthResult, Credential, EnvAuthContext, ModelAuth, ProviderEnv};
 
 /// How a provider authenticates (func-01 §4.1: at least one of `api_key | oauth`).
 #[derive(Clone, Default)]
@@ -27,12 +25,18 @@ pub struct ProviderAuth {
 impl ProviderAuth {
     /// API-key-only auth.
     pub fn with_api_key(strategy: Arc<dyn ApiKeyAuth>) -> Self {
-        Self { api_key: Some(strategy), oauth: None }
+        Self {
+            api_key: Some(strategy),
+            oauth: None,
+        }
     }
 
     /// OAuth-only auth.
     pub fn with_oauth(strategy: Arc<dyn OAuthAuth>) -> Self {
-        Self { api_key: None, oauth: Some(strategy) }
+        Self {
+            api_key: None,
+            oauth: Some(strategy),
+        }
     }
 
     /// `true` if at least one strategy is configured (func-01 §4.1 invariant).

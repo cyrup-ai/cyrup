@@ -5,8 +5,8 @@
 //! generated `opencode-go.models.ts` catalog (both already-implemented wire protocols — no new
 //! API or dependency).
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -58,7 +58,12 @@ pub fn opencode_go_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::compat::ThinkingFormat;
@@ -79,7 +84,10 @@ mod tests {
     fn mixed_api_models_carry_their_compat() {
         let models = opencode_go_models();
         let find = |id: &str| {
-            models.iter().find(|m| m.id.as_str() == id).unwrap_or_else(|| panic!("missing {id}"))
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
         };
 
         // deepseek-v4-flash: openai-completions, deepseek thinking format + reasoning-content req.
@@ -87,7 +95,10 @@ mod tests {
         assert_eq!(ds.api.as_str(), OPENAI_COMPLETIONS);
         let dc = ds.compat.as_ref().expect("compat");
         assert_eq!(dc.thinking_format, Some(ThinkingFormat::Deepseek));
-        assert_eq!(dc.requires_reasoning_content_on_assistant_messages, Some(true));
+        assert_eq!(
+            dc.requires_reasoning_content_on_assistant_messages,
+            Some(true)
+        );
 
         // minimax-m3: anthropic-messages, no compat block (rides anthropic defaults).
         let mm = find("minimax-m3");
@@ -97,7 +108,10 @@ mod tests {
 
         // qwen3.6-plus: openai-completions, qwen thinking format.
         let q = find("qwen3.6-plus");
-        assert_eq!(q.compat.as_ref().and_then(|c| c.thinking_format), Some(ThinkingFormat::Qwen));
+        assert_eq!(
+            q.compat.as_ref().and_then(|c| c.thinking_format),
+            Some(ThinkingFormat::Qwen)
+        );
     }
 
     #[test]

@@ -74,7 +74,11 @@ impl TrustStore {
         // Pi throws on a non-object top-level (trust-manager.ts:111-113).
         let obj = match value {
             Value::Object(o) => o,
-            _ => return Err(ConfigError::Trust("Invalid trust store: expected an object".into())),
+            _ => {
+                return Err(ConfigError::Trust(
+                    "Invalid trust store: expected an object".into(),
+                ));
+            }
         };
         let mut out = BTreeMap::new();
         for (k, v) in obj {
@@ -101,12 +105,13 @@ impl TrustStore {
         let mut current: Option<&Path> = Some(cwd.as_path());
         while let Some(dir) = current {
             if let Some(key) = dir.to_str()
-                && let Some(Some(b)) = map.get(key) {
-                    return Ok(Some(TrustEntry {
-                        path: dir.to_path_buf(),
-                        decision: TrustDecision::from_bool(*b),
-                    }));
-                }
+                && let Some(Some(b)) = map.get(key)
+            {
+                return Ok(Some(TrustEntry {
+                    path: dir.to_path_buf(),
+                    decision: TrustDecision::from_bool(*b),
+                }));
+            }
             current = dir.parent();
         }
         Ok(None)
@@ -223,7 +228,11 @@ pub enum TrustOutcome {
 pub fn decide_trust(input: TrustInputs) -> TrustOutcome {
     // 1. explicit per-run override (--approve / --no-approve) wins (R-07-009).
     if let Some(o) = input.trust_override {
-        return if o { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+        return if o {
+            TrustOutcome::Trusted
+        } else {
+            TrustOutcome::Untrusted
+        };
     }
     // 2. nothing to gate (R-07-006).
     if !input.has_resources {
@@ -231,7 +240,11 @@ pub fn decide_trust(input: TrustInputs) -> TrustOutcome {
     }
     // 3. saved decision / ancestor match (R-07-013).
     if let Some(saved) = input.saved {
-        return if saved.is_trusted() { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+        return if saved.is_trusted() {
+            TrustOutcome::Trusted
+        } else {
+            TrustOutcome::Untrusted
+        };
     }
     // 4. non-interactive policy (R-07-009).
     match input.default_trust {
@@ -266,7 +279,9 @@ pub struct TrustOption {
 /// `getProjectTrustParentPath`, trust-manager.ts:59-63).
 pub fn project_trust_parent_path(cwd: &Path) -> Option<PathBuf> {
     let cwd = canonicalize(cwd);
-    cwd.parent().filter(|p| *p != cwd.as_path()).map(Path::to_path_buf)
+    cwd.parent()
+        .filter(|p| *p != cwd.as_path())
+        .map(Path::to_path_buf)
 }
 
 /// The interactive trust-prompt message (Pi `formatProjectTrustPrompt`, project-trust.ts:24-26).
@@ -344,14 +359,22 @@ pub fn decide_trust_with_extension(
 ) -> TrustOutcome {
     // Steps 1-2 mirror `decide_trust`: explicit override, then "nothing to gate".
     if let Some(o) = input.trust_override {
-        return if o { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+        return if o {
+            TrustOutcome::Trusted
+        } else {
+            TrustOutcome::Untrusted
+        };
     }
     if !input.has_resources {
         return TrustOutcome::Trusted;
     }
     // Extension hook (before the saved decision).
     if let Some(ext) = extension {
-        return if ext.trusted { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+        return if ext.trusted {
+            TrustOutcome::Trusted
+        } else {
+            TrustOutcome::Untrusted
+        };
     }
     // Remaining tiers (saved → default → prompt) are identical to `decide_trust`; `trust_override`
     // is `None` and `has_resources` is `true` here, so re-running those checks is a no-op.
@@ -470,32 +493,50 @@ mod tests {
         assert_eq!(decide_trust(base), TrustOutcome::Untrusted);
         // print + always → trusted
         assert_eq!(
-            decide_trust(TrustInputs { default_trust: DefaultProjectTrust::Always, ..base }),
+            decide_trust(TrustInputs {
+                default_trust: DefaultProjectTrust::Always,
+                ..base
+            }),
             TrustOutcome::Trusted
         );
         // --approve forces trust for one run
         assert_eq!(
-            decide_trust(TrustInputs { trust_override: Some(true), ..base }),
+            decide_trust(TrustInputs {
+                trust_override: Some(true),
+                ..base
+            }),
             TrustOutcome::Trusted
         );
         // --no-approve forces untrusted
         assert_eq!(
-            decide_trust(TrustInputs { trust_override: Some(false), ..base }),
+            decide_trust(TrustInputs {
+                trust_override: Some(false),
+                ..base
+            }),
             TrustOutcome::Untrusted
         );
         // no trust-requiring resources → trusted
         assert_eq!(
-            decide_trust(TrustInputs { has_resources: false, ..base }),
+            decide_trust(TrustInputs {
+                has_resources: false,
+                ..base
+            }),
             TrustOutcome::Trusted
         );
         // saved decision wins
         assert_eq!(
-            decide_trust(TrustInputs { saved: Some(TrustDecision::Trusted), ..base }),
+            decide_trust(TrustInputs {
+                saved: Some(TrustDecision::Trusted),
+                ..base
+            }),
             TrustOutcome::Trusted
         );
         // interactive + ask + no saved → needs prompt
         assert_eq!(
-            decide_trust(TrustInputs { mode: AppMode::Interactive, ..base }),
+            decide_trust(TrustInputs {
+                mode: AppMode::Interactive,
+                ..base
+            }),
             TrustOutcome::NeedsPrompt
         );
         // interactive + ask + prompt said yes → trusted (persist handled by caller)
@@ -552,15 +593,27 @@ mod tests {
         // extension says trusted → trusted, beating the saved "untrusted".
         let out = decide_trust_with_extension(
             base,
-            Some(ExtensionTrust { trusted: true, remember: false }),
+            Some(ExtensionTrust {
+                trusted: true,
+                remember: false,
+            }),
         );
         assert_eq!(out, TrustOutcome::Trusted);
         // no extension → falls back to saved decision (untrusted).
-        assert_eq!(decide_trust_with_extension(base, None), TrustOutcome::Untrusted);
+        assert_eq!(
+            decide_trust_with_extension(base, None),
+            TrustOutcome::Untrusted
+        );
         // override still wins over the extension.
         let out = decide_trust_with_extension(
-            TrustInputs { trust_override: Some(false), ..base },
-            Some(ExtensionTrust { trusted: true, remember: true }),
+            TrustInputs {
+                trust_override: Some(false),
+                ..base
+            },
+            Some(ExtensionTrust {
+                trusted: true,
+                remember: true,
+            }),
         );
         assert_eq!(out, TrustOutcome::Untrusted);
     }
@@ -572,11 +625,20 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let opts = trust_options(&cwd, true);
         assert_eq!(opts.first().unwrap().label, "Trust");
-        assert!(opts.iter().any(|o| o.label.starts_with("Trust parent folder (")));
+        assert!(
+            opts.iter()
+                .any(|o| o.label.starts_with("Trust parent folder ("))
+        );
         assert!(opts.iter().any(|o| o.label == "Trust (this session only)"));
-        assert!(opts.iter().any(|o| o.label == "Do not trust (this session only)"));
+        assert!(
+            opts.iter()
+                .any(|o| o.label == "Do not trust (this session only)")
+        );
         // session-only options carry no saved_path.
-        let session = opts.iter().find(|o| o.label.contains("this session only")).unwrap();
+        let session = opts
+            .iter()
+            .find(|o| o.label.contains("this session only"))
+            .unwrap();
         assert!(session.saved_path.is_none());
         assert!(opts.first().unwrap().saved_path.is_some());
     }

@@ -220,7 +220,11 @@ pub fn level_map_lookup<'a>(
 }
 
 /// `model.thinkingLevelMap?.[level] ?? <fallback>` — both `undefined` and `null` fall back.
-pub fn mapped_effort_or(map: Option<&ThinkingLevelMap>, level: ModelThinkingLevel, fallback: &str) -> String {
+pub fn mapped_effort_or(
+    map: Option<&ThinkingLevelMap>,
+    level: ModelThinkingLevel,
+    fallback: &str,
+) -> String {
     match level_map_lookup(map, thinking_level_key(level)) {
         Some(Some(s)) => s.clone(),
         _ => fallback.to_string(),
@@ -254,8 +258,9 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
     let is_together = provider == "together"
         || base_url.contains("api.together.ai")
         || base_url.contains("api.together.xyz");
-    let is_moonshot =
-        provider == "moonshotai" || provider == "moonshotai-cn" || base_url.contains("api.moonshot.");
+    let is_moonshot = provider == "moonshotai"
+        || provider == "moonshotai-cn"
+        || base_url.contains("api.moonshot.");
     let is_openrouter = provider == "openrouter" || base_url.contains("openrouter.ai");
     let is_cloudflare_workers_ai =
         provider == "cloudflare-workers-ai" || base_url.contains("api.cloudflare.com");
@@ -386,7 +391,9 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
             .clone()
             .unwrap_or(detected.chat_template_kwargs),
         zai_tool_stream: c.zai_tool_stream.unwrap_or(detected.zai_tool_stream),
-        supports_strict_mode: c.supports_strict_mode.unwrap_or(detected.supports_strict_mode),
+        supports_strict_mode: c
+            .supports_strict_mode
+            .unwrap_or(detected.supports_strict_mode),
         cache_control_format: c.cache_control_format.or(detected.cache_control_format),
         send_session_affinity_headers: c
             .send_session_affinity_headers
@@ -404,7 +411,10 @@ pub fn clamp_openai_prompt_cache_key(key: &str) -> String {
     if chars.len() <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH {
         return key.to_string();
     }
-    chars.into_iter().take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).collect()
+    chars
+        .into_iter()
+        .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
+        .collect()
 }
 
 /// Remove unpaired UTF-16 surrogate code units (Pi `sanitizeSurrogates`).
@@ -417,7 +427,12 @@ pub fn sanitize_surrogates(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::model::{Modality, ModelCost};
@@ -466,7 +481,11 @@ mod tests {
 
     #[test]
     fn model_compat_overrides_detection() {
-        let mut m = base_model("together", "https://api.together.ai/v1", "openai/gpt-oss-120b");
+        let mut m = base_model(
+            "together",
+            "https://api.together.ai/v1",
+            "openai/gpt-oss-120b",
+        );
         m.compat = Some(OpenAiCompletionsCompat {
             supports_reasoning_effort: Some(true),
             thinking_format: Some(ThinkingFormat::Openai),
@@ -485,11 +504,20 @@ mod tests {
         map.insert("high".to_string(), Some("high".to_string()));
         map.insert("low".to_string(), None);
         // present string
-        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::High, "fb"), "high");
+        assert_eq!(
+            mapped_effort_or(Some(&map), ModelThinkingLevel::High, "fb"),
+            "high"
+        );
         // present null -> fallback
-        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::Low, "fb"), "fb");
+        assert_eq!(
+            mapped_effort_or(Some(&map), ModelThinkingLevel::Low, "fb"),
+            "fb"
+        );
         // absent -> fallback
-        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::Medium, "fb"), "fb");
+        assert_eq!(
+            mapped_effort_or(Some(&map), ModelThinkingLevel::Medium, "fb"),
+            "fb"
+        );
     }
 
     #[test]

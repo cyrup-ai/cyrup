@@ -1,7 +1,7 @@
 //! Custom-provider auth helpers (arch-01 §3.7 / func-01 R-01-062/063).
 
-use super::types::{AuthContext, AuthResult, Credential, ModelAuth};
 use super::ApiKeyAuth;
+use super::types::{AuthContext, AuthResult, Credential, ModelAuth};
 use crate::error::AuthError;
 use crate::model::Model;
 use std::sync::Arc;
@@ -14,7 +14,9 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    Arc::new(EnvKeyAuth { vars: vars.into_iter().map(Into::into).collect() })
+    Arc::new(EnvKeyAuth {
+        vars: vars.into_iter().map(Into::into).collect(),
+    })
 }
 
 /// A keyless-local strategy (func-01 R-01-062): always resolves as "configured, no key" — for local
@@ -43,7 +45,10 @@ impl ApiKeyAuth for EnvKeyAuth {
         if let Some(cred) = cred {
             return Ok(match cred {
                 Credential::ApiKey { key, env } => Some(AuthResult {
-                    auth: ModelAuth { api_key: key.clone(), ..Default::default() },
+                    auth: ModelAuth {
+                        api_key: key.clone(),
+                        ..Default::default()
+                    },
                     env: env.clone(),
                     source: Some("stored".to_string()),
                 }),
@@ -80,6 +85,10 @@ impl ApiKeyAuth for KeylessLocalAuth {
     ) -> Result<Option<AuthResult>, AuthError> {
         // Always "configured, no key" (R-01-062), carrying any provider-scoped env overlay.
         let env = cred.and_then(|c| c.env().cloned());
-        Ok(Some(AuthResult { auth: ModelAuth::default(), env, source: Some("keyless".to_string()) }))
+        Ok(Some(AuthResult {
+            auth: ModelAuth::default(),
+            env,
+            source: Some("keyless".to_string()),
+        }))
     }
 }

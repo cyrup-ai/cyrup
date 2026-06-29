@@ -55,9 +55,7 @@ pub use package::{
     ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice,
     UpdateReport, UpdateTarget, has_unsafe_git_install_part, parse_git_url, resolve_manifest,
 };
-pub use prompt::{
-    PromptTemplate, expand_prompt_template, parse_command_args, substitute_args,
-};
+pub use prompt::{PromptTemplate, expand_prompt_template, parse_command_args, substitute_args};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};
 pub use skill::{
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, Skill, SkillFrontMatter, SkillPointer,

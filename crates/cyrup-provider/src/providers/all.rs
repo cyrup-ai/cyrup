@@ -50,17 +50,17 @@
 //! ordering returned by [`all_providers`] is therefore informational only (grouped by constructor
 //! for clarity) — resolution is by id, not by position.
 
-use crate::api::{builtin_registry, ApiRegistry};
+use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore};
-use crate::collection::{create_models, CreateModelsOptions, Models};
+use crate::collection::{CreateModelsOptions, Models, create_models};
 use crate::provider::Provider;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
 use crate::providers::{
     anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
-    fireworks_provider_with, google_provider_with, mistral_provider_with, opencode_go_provider_with,
-    opencode_provider_with, openai_provider_with, together_provider_with,
+    fireworks_provider_with, google_provider_with, mistral_provider_with, openai_provider_with,
+    opencode_go_provider_with, opencode_provider_with, together_provider_with,
 };
 use std::sync::Arc;
 
@@ -93,7 +93,10 @@ pub fn all_providers_with(
     }
 
     // anthropic (Pi `all.ts:74`).
-    providers.push(Arc::new(anthropic_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(anthropic_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // azure-openai-responses (Pi `all.ts:75`).
     providers.push(Arc::new(azure_openai_responses_provider_with(
@@ -102,14 +105,26 @@ pub fn all_providers_with(
     )));
 
     // cloudflare-ai-gateway / cloudflare-workers-ai (Pi `all.ts:77-78`).
-    providers.push(Arc::new(cloudflare_ai_gateway_provider_with(store.clone(), registry.clone())));
-    providers.push(Arc::new(cloudflare_workers_ai_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(cloudflare_ai_gateway_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+    providers.push(Arc::new(cloudflare_workers_ai_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // fireworks (Pi `all.ts:80`).
-    providers.push(Arc::new(fireworks_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(fireworks_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // google (Pi `all.ts:82`).
-    providers.push(Arc::new(google_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(google_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // anthropic-compatible fleet: kimi-coding, minimax, minimax-cn, vercel-ai-gateway
     // (Pi `all.ts` lines 86,87,88,99).
@@ -118,14 +133,26 @@ pub fn all_providers_with(
     }
 
     // mistral (Pi `all.ts:89`).
-    providers.push(Arc::new(mistral_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(mistral_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // openai (Pi `all.ts:93`).
-    providers.push(Arc::new(openai_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(openai_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // opencode / opencode-go (Pi `all.ts:95-96`).
-    providers.push(Arc::new(opencode_provider_with(store.clone(), registry.clone())));
-    providers.push(Arc::new(opencode_go_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(opencode_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+    providers.push(Arc::new(opencode_go_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
 
     // together (Pi `all.ts:98`).
     providers.push(Arc::new(together_provider_with(store, registry)));
@@ -145,7 +172,12 @@ pub fn default_models(options: CreateModelsOptions) -> Models {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -153,8 +185,11 @@ mod tests {
     #[test]
     fn registry_contains_implemented_provider_ids() {
         let models = default_models(CreateModelsOptions::default());
-        let ids: Vec<String> =
-            models.get_providers().iter().map(|p| p.id().as_str().to_string()).collect();
+        let ids: Vec<String> = models
+            .get_providers()
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
 
         // A representative cross-section of every constructor group.
         for expected in [
@@ -180,12 +215,23 @@ mod tests {
             "minimax",
             "vercel-ai-gateway",
         ] {
-            assert!(ids.iter().any(|id| id == expected), "missing built-in provider '{expected}'");
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "missing built-in provider '{expected}'"
+            );
         }
 
         // Pending providers are intentionally NOT registered (no fabrication).
-        for pending in ["amazon-bedrock", "github-copilot", "google-vertex", "openai-codex"] {
-            assert!(!ids.iter().any(|id| id == pending), "pending provider '{pending}' must not be registered");
+        for pending in [
+            "amazon-bedrock",
+            "github-copilot",
+            "google-vertex",
+            "openai-codex",
+        ] {
+            assert!(
+                !ids.iter().any(|id| id == pending),
+                "pending provider '{pending}' must not be registered"
+            );
         }
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
@@ -197,7 +243,9 @@ mod tests {
     fn together_kimi_k2_6_resolves_through_registry() {
         let models = default_models(CreateModelsOptions::default());
 
-        let together = models.get_provider("together").expect("together provider registered");
+        let together = models
+            .get_provider("together")
+            .expect("together provider registered");
         assert_eq!(together.id().as_str(), "together");
 
         let kimi = models

@@ -8,7 +8,7 @@
 //! in `providers/cloudflare-auth.ts` (workers-ai kind) + the verbatim `cloudflare-workers-ai.models.ts`
 //! catalog.
 
-use crate::api::{builtin_registry, ApiRegistry};
+use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::types::{AuthContext, AuthResult, Credential, ModelAuth, ProviderEnv};
 use crate::auth::{ApiKeyAuth, CredentialStore, InMemoryCredentialStore, ProviderAuth};
 use crate::error::AuthError;
@@ -101,7 +101,11 @@ impl ApiKeyAuth for CloudflareWorkersAiAuth {
         let mut env = ProviderEnv::new();
         env.insert(CLOUDFLARE_ACCOUNT_ID.to_string(), account_id);
 
-        let source = if cred.is_some() { "stored credential" } else { CLOUDFLARE_API_KEY };
+        let source = if cred.is_some() {
+            "stored credential"
+        } else {
+            CLOUDFLARE_API_KEY
+        };
 
         Ok(Some(AuthResult {
             auth: ModelAuth {
@@ -175,16 +179,27 @@ impl ApiKeyAuth for CloudflareAiGatewayAuth {
 
         // Pi `auth.headers`: `cf-aig-authorization: Bearer <key>` + suppress Authorization / x-api-key.
         let mut headers = crate::HeaderMap::new();
-        headers.insert("cf-aig-authorization".to_string(), Some(format!("Bearer {api_key}")));
+        headers.insert(
+            "cf-aig-authorization".to_string(),
+            Some(format!("Bearer {api_key}")),
+        );
         headers.insert("Authorization".to_string(), None);
         headers.insert("x-api-key".to_string(), None);
 
-        let source = if cred.is_some() { "stored credential" } else { CLOUDFLARE_API_KEY };
+        let source = if cred.is_some() {
+            "stored credential"
+        } else {
+            CLOUDFLARE_API_KEY
+        };
 
         Ok(Some(AuthResult {
             // Pi sets only `headers` + `baseUrl` (no `apiKey`); the gateway carries the key in the
             // `cf-aig-authorization` header instead.
-            auth: ModelAuth { api_key: None, headers: Some(headers), base_url: Some(base_url) },
+            auth: ModelAuth {
+                api_key: None,
+                headers: Some(headers),
+                base_url: Some(base_url),
+            },
             env: Some(env),
             source: Some(source.to_string()),
         }))
@@ -246,16 +261,21 @@ pub fn cloudflare_workers_ai_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::openai_completions::build_body;
-    use crate::auth::types::AuthContext;
     use crate::auth::InMemoryCredentialStore;
+    use crate::auth::types::AuthContext;
     use crate::context::Context;
     use crate::known_api::OPENAI_COMPLETIONS;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::{ProviderId, StopReason};
     use std::collections::BTreeMap;
 
@@ -275,13 +295,19 @@ mod tests {
         let models = cloudflare_workers_ai_models();
         assert_eq!(models.len(), 13);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS));
-        assert!(models.iter().all(|m| m.provider.as_str() == "cloudflare-workers-ai"));
+        assert!(
+            models
+                .iter()
+                .all(|m| m.provider.as_str() == "cloudflare-workers-ai")
+        );
         // Every catalog entry carries the unresolved account-id placeholder in its base URL.
-        assert!(models
-            .iter()
-            .all(|m| m.base_url == "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"));
+        assert!(models.iter().all(|m| m.base_url
+            == "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"));
         // The shared compat block (Pi: store/developer/long-cache off, session-affinity on).
-        let m = models.iter().find(|m| m.id.as_str() == "@cf/openai/gpt-oss-120b").expect("gpt-oss");
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "@cf/openai/gpt-oss-120b")
+            .expect("gpt-oss");
         let c = m.compat.as_ref().expect("compat");
         assert_eq!(c.supports_store, Some(false));
         assert_eq!(c.supports_developer_role, Some(false));
@@ -309,14 +335,22 @@ mod tests {
             (CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string()),
             (CLOUDFLARE_ACCOUNT_ID.to_string(), "acct-123".to_string()),
         ]));
-        let result = auth.resolve(&model, &ctx, None).await.expect("ok").expect("configured");
+        let result = auth
+            .resolve(&model, &ctx, None)
+            .await
+            .expect("ok")
+            .expect("configured");
         assert_eq!(result.auth.api_key.as_deref(), Some("cf-key"));
         assert_eq!(
             result.auth.base_url.as_deref(),
             Some("https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1")
         );
         assert_eq!(
-            result.env.as_ref().and_then(|e| e.get(CLOUDFLARE_ACCOUNT_ID)).map(String::as_str),
+            result
+                .env
+                .as_ref()
+                .and_then(|e| e.get(CLOUDFLARE_ACCOUNT_ID))
+                .map(String::as_str),
             Some("acct-123")
         );
         assert_eq!(result.source.as_deref(), Some(CLOUDFLARE_API_KEY));
@@ -325,13 +359,32 @@ mod tests {
     #[tokio::test]
     async fn resolve_requires_both_key_and_account_id() {
         let auth = CloudflareWorkersAiAuth;
-        let model = cloudflare_workers_ai_models().into_iter().next().expect("model");
+        let model = cloudflare_workers_ai_models()
+            .into_iter()
+            .next()
+            .expect("model");
         // Only the api key → not configured.
-        let ctx = MapEnv(BTreeMap::from([(CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string())]));
-        assert!(auth.resolve(&model, &ctx, None).await.expect("ok").is_none());
+        let ctx = MapEnv(BTreeMap::from([(
+            CLOUDFLARE_API_KEY.to_string(),
+            "cf-key".to_string(),
+        )]));
+        assert!(
+            auth.resolve(&model, &ctx, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
         // Only the account id → not configured.
-        let ctx = MapEnv(BTreeMap::from([(CLOUDFLARE_ACCOUNT_ID.to_string(), "acct".to_string())]));
-        assert!(auth.resolve(&model, &ctx, None).await.expect("ok").is_none());
+        let ctx = MapEnv(BTreeMap::from([(
+            CLOUDFLARE_ACCOUNT_ID.to_string(),
+            "acct".to_string(),
+        )]));
+        assert!(
+            auth.resolve(&model, &ctx, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -339,7 +392,10 @@ mod tests {
         // A stored api-key credential supplies the key directly and the account id via its env
         // overlay (Pi `resolveValue`: api key from `credential.key`, others from `credential.env`).
         let auth = CloudflareWorkersAiAuth;
-        let model = cloudflare_workers_ai_models().into_iter().next().expect("model");
+        let model = cloudflare_workers_ai_models()
+            .into_iter()
+            .next()
+            .expect("model");
         let cred = Credential::ApiKey {
             key: Some("stored-key".to_string()),
             env: Some(ProviderEnv::from([(
@@ -349,10 +405,20 @@ mod tests {
         };
         // Ambient env is empty — everything comes from the credential.
         let ctx = MapEnv(BTreeMap::new());
-        let result =
-            auth.resolve(&model, &ctx, Some(&cred)).await.expect("ok").expect("configured");
+        let result = auth
+            .resolve(&model, &ctx, Some(&cred))
+            .await
+            .expect("ok")
+            .expect("configured");
         assert_eq!(result.auth.api_key.as_deref(), Some("stored-key"));
-        assert!(result.auth.base_url.as_deref().unwrap().contains("stored-acct"));
+        assert!(
+            result
+                .auth
+                .base_url
+                .as_deref()
+                .unwrap()
+                .contains("stored-acct")
+        );
         assert_eq!(result.source.as_deref(), Some("stored credential"));
     }
 
@@ -363,10 +429,16 @@ mod tests {
             Arc::new(builtin_registry()),
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
-        let model = provider.get_model("@cf/openai/gpt-oss-120b").expect("model").clone();
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let model = provider
+            .get_model("@cf/openai/gpt-oss-120b")
+            .expect("model")
+            .clone();
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("not configured"));
     }
@@ -385,15 +457,24 @@ mod tests {
             // An unroutable host as the "account id" so the substituted URL fails fast at connect.
             (CLOUDFLARE_ACCOUNT_ID.to_string(), "acct".to_string()),
         ]))));
-        let mut model = provider.get_model("@cf/openai/gpt-oss-120b").expect("model").clone();
+        let mut model = provider
+            .get_model("@cf/openai/gpt-oss-120b")
+            .expect("model")
+            .clone();
         // Replace the catalog base URL with one whose placeholder yields an unroutable address.
         model.base_url = "http://127.0.0.1:1/{CLOUDFLARE_ACCOUNT_ID}/v1".to_string();
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved: {err}"
+        );
         assert!(err.contains("transport"), "expected transport error: {err}");
     }
 
@@ -402,7 +483,10 @@ mod tests {
         // A cloudflare reasoning model encodes through the openai-completions body builder; with no
         // store support the body omits `store`, and a reasoning model carries a reasoning field.
         let models = cloudflare_workers_ai_models();
-        let m = models.iter().find(|m| m.id.as_str() == "@cf/openai/gpt-oss-120b").expect("gpt-oss");
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "@cf/openai/gpt-oss-120b")
+            .expect("gpt-oss");
         let opts = StreamOptions {
             reasoning: cyrup_core::ModelThinkingLevel::High,
             max_tokens: Some(64),
@@ -430,7 +514,11 @@ mod tests {
         // openai-completions + 16 openai-responses, all carrying the dual account/gateway placeholders.
         let models = cloudflare_ai_gateway_models();
         assert_eq!(models.len(), 37);
-        assert!(models.iter().all(|m| m.provider.as_str() == "cloudflare-ai-gateway"));
+        assert!(
+            models
+                .iter()
+                .all(|m| m.provider.as_str() == "cloudflare-ai-gateway")
+        );
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
         assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 17);
         assert_eq!(count(OPENAI_COMPLETIONS), 4);
@@ -462,7 +550,11 @@ mod tests {
             (CLOUDFLARE_ACCOUNT_ID.to_string(), "acct-123".to_string()),
             (CLOUDFLARE_GATEWAY_ID.to_string(), "gw-789".to_string()),
         ]));
-        let result = auth.resolve(&model, &ctx, None).await.expect("ok").expect("configured");
+        let result = auth
+            .resolve(&model, &ctx, None)
+            .await
+            .expect("ok")
+            .expect("configured");
         // No api key on the auth — the gateway carries it in the header.
         assert!(result.auth.api_key.is_none());
         let headers = result.auth.headers.expect("headers");
@@ -478,27 +570,46 @@ mod tests {
             Some("https://gateway.ai.cloudflare.com/v1/acct-123/gw-789/anthropic")
         );
         let env = result.env.expect("env");
-        assert_eq!(env.get(CLOUDFLARE_ACCOUNT_ID).map(String::as_str), Some("acct-123"));
-        assert_eq!(env.get(CLOUDFLARE_GATEWAY_ID).map(String::as_str), Some("gw-789"));
+        assert_eq!(
+            env.get(CLOUDFLARE_ACCOUNT_ID).map(String::as_str),
+            Some("acct-123")
+        );
+        assert_eq!(
+            env.get(CLOUDFLARE_GATEWAY_ID).map(String::as_str),
+            Some("gw-789")
+        );
         assert_eq!(result.source.as_deref(), Some(CLOUDFLARE_API_KEY));
     }
 
     #[tokio::test]
     async fn ai_gateway_requires_key_account_and_gateway() {
         let auth = CloudflareAiGatewayAuth;
-        let model = cloudflare_ai_gateway_models().into_iter().next().expect("model");
+        let model = cloudflare_ai_gateway_models()
+            .into_iter()
+            .next()
+            .expect("model");
         // Missing gateway id → not configured (Pi `kind === "ai-gateway" && !gatewayId`).
         let ctx = MapEnv(BTreeMap::from([
             (CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string()),
             (CLOUDFLARE_ACCOUNT_ID.to_string(), "acct".to_string()),
         ]));
-        assert!(auth.resolve(&model, &ctx, None).await.expect("ok").is_none());
+        assert!(
+            auth.resolve(&model, &ctx, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
         // Missing account id → not configured.
         let ctx = MapEnv(BTreeMap::from([
             (CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string()),
             (CLOUDFLARE_GATEWAY_ID.to_string(), "gw".to_string()),
         ]));
-        assert!(auth.resolve(&model, &ctx, None).await.expect("ok").is_none());
+        assert!(
+            auth.resolve(&model, &ctx, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -518,15 +629,21 @@ mod tests {
             ])),
         };
         let ctx = MapEnv(BTreeMap::new());
-        let result =
-            auth.resolve(&model, &ctx, Some(&cred)).await.expect("ok").expect("configured");
+        let result = auth
+            .resolve(&model, &ctx, Some(&cred))
+            .await
+            .expect("ok")
+            .expect("configured");
         let headers = result.auth.headers.expect("headers");
         assert_eq!(
             headers.get("cf-aig-authorization"),
             Some(&Some("Bearer stored-key".to_string()))
         );
         let base = result.auth.base_url.unwrap();
-        assert!(base.contains("/stored-acct/stored-gw/openai"), "base: {base}");
+        assert!(
+            base.contains("/stored-acct/stored-gw/openai"),
+            "base: {base}"
+        );
         assert_eq!(result.source.as_deref(), Some("stored credential"));
     }
 
@@ -537,10 +654,16 @@ mod tests {
             Arc::new(builtin_registry()),
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
-        let model = provider.get_model("claude-3-5-haiku").expect("model").clone();
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let model = provider
+            .get_model("claude-3-5-haiku")
+            .expect("model")
+            .clone();
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("not configured"));
     }
@@ -550,7 +673,11 @@ mod tests {
         // For one model of each api (anthropic-messages / openai-completions / openai-responses),
         // a fully-configured gateway resolves auth and reaches transport (proving each api accepts
         // header-only auth with no api key). Point at an unroutable host so it fails fast at connect.
-        for id in ["claude-3-5-haiku", "workers-ai/@cf/moonshotai/kimi-k2.5", "gpt-4"] {
+        for id in [
+            "claude-3-5-haiku",
+            "workers-ai/@cf/moonshotai/kimi-k2.5",
+            "gpt-4",
+        ] {
             let provider = cloudflare_ai_gateway_provider_with(
                 Arc::new(InMemoryCredentialStore::new()),
                 Arc::new(builtin_registry()),
@@ -570,8 +697,14 @@ mod tests {
             .await;
             assert_eq!(msg.stop_reason, StopReason::Error, "{id}");
             let err = msg.error_message.unwrap();
-            assert!(!err.contains("not configured"), "{id}: auth should resolve: {err}");
-            assert!(err.contains("transport"), "{id}: expected transport error: {err}");
+            assert!(
+                !err.contains("not configured"),
+                "{id}: auth should resolve: {err}"
+            );
+            assert!(
+                err.contains("transport"),
+                "{id}: expected transport error: {err}"
+            );
         }
     }
 

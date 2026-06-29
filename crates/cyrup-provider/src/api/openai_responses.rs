@@ -11,6 +11,7 @@
 //!
 //! Wire JSON uses OpenAI's own field names (snake_case), NOT the cyrup camelCase convention.
 
+use crate::HeaderMap;
 use crate::api::compat::{
     clamp_openai_prompt_cache_key, get_responses_compat, mapped_effort_or, off_is_not_null,
     off_value_or, sanitize_surrogates, thinking_level_key,
@@ -22,18 +23,17 @@ use crate::collection::clamp_thinking_level;
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::parse_streaming_json_object;
-use crate::HeaderMap;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     TextPhase, TextSignatureV1, ToolCall, ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -44,6 +44,53 @@ const API_ID: &str = crate::known_api::OPENAI_RESPONSES;
 /// `OPENAI_TOOL_CALL_PROVIDERS`, openai-responses.ts:26).
 const OPENAI_TOOL_CALL_PROVIDERS: &[&str] = &["openai", "openai-codex", "opencode"];
 
+/// Reasoning-summary verbosity (Pi `reasoningSummary`, openai-responses.ts:80:
+/// `"auto" | "detailed" | "concise" | null`). `Null` reproduces Pi's explicit `null`, which — like
+/// an absent value — falls back to `"auto"` (`options?.reasoningSummary || "auto"`, line 257).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    Auto,
+    Detailed,
+    Concise,
+    Null,
+}
+
+impl ReasoningSummary {
+    /// The wire string for the `reasoning.summary` field, or `None` for `null`.
+    fn as_wire(self) -> Option<&'static str> {
+        match self {
+            ReasoningSummary::Auto => Some("auto"),
+            ReasoningSummary::Detailed => Some("detailed"),
+            ReasoningSummary::Concise => Some("concise"),
+            ReasoningSummary::Null => None,
+        }
+    }
+}
+
+/// Per-API typed options for the `openai-responses` wire protocol (Pi `OpenAIResponsesOptions`,
+/// openai-responses.ts:78-82). `reasoningEffort` already maps onto `StreamOptions.reasoning`; the
+/// remaining fields live here, carried via
+/// [`StreamOptions::api_options`](crate::StreamOptions::api_options). Defaults reproduce Pi exactly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpenAiResponsesOptions {
+    /// Reasoning-summary verbosity (Pi `reasoningSummary`, openai-responses.ts:80). `None` = Pi
+    /// default (`"auto"` when a reasoning request is built).
+    pub reasoning_summary: Option<ReasoningSummary>,
+    /// Service tier (Pi `serviceTier`, openai-responses.ts:81). `None` = omit the field (Pi's
+    /// default — `params.service_tier` is set only when `serviceTier` is defined, line 242).
+    pub service_tier: Option<String>,
+}
+
+/// The wire `reasoning.summary` value for an optional [`OpenAiResponsesOptions`] (Pi
+/// `options?.reasoningSummary || "auto"`, openai-responses.ts:257): a concrete non-null value wins;
+/// `None`/`Null` fall back to `"auto"`.
+fn reasoning_summary_or_auto(opts: Option<&OpenAiResponsesOptions>) -> &'static str {
+    opts.and_then(|o| o.reasoning_summary)
+        .and_then(ReasoningSummary::as_wire)
+        .unwrap_or("auto")
+}
+
 /// The `ApiImpl` for `"openai-responses"`.
 pub struct OpenAiResponsesApi {
     api: ApiId,
@@ -51,7 +98,9 @@ pub struct OpenAiResponsesApi {
 
 impl Default for OpenAiResponsesApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -88,7 +137,8 @@ impl ApiImpl for OpenAiResponsesApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -101,19 +151,34 @@ impl ApiImpl for OpenAiResponsesApi {
                 let e = ProviderError::Transport(
                     format!("No API key for provider: {}", model.provider).into(),
                 );
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
 
         let body = build_params(model, ctx, opts, auth.env.as_ref());
         let headers = build_headers(model, auth, opts, &api_key);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -121,7 +186,8 @@ impl ApiImpl for OpenAiResponsesApi {
         let frames = match open_sse(&client, req, cancel, None, None).await {
             Ok(s) => s,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -137,7 +203,11 @@ impl ApiImpl for OpenAiResponsesApi {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/responses` (the OpenAI SDK's `client.responses.create` path).
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
+    let base = auth
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or(model.base_url.as_str());
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/responses") {
         Some(trimmed.to_string())
@@ -153,8 +223,10 @@ fn resolve_api_key(auth: &AuthResult, opts: &StreamOptions) -> Option<String> {
     if let Some(key) = &auth.auth.api_key {
         return Some(key.clone());
     }
-    let has = |name: &str| header_present(auth.auth.headers.as_ref(), name)
-        || header_present(opts.headers.as_ref(), name);
+    let has = |name: &str| {
+        header_present(auth.auth.headers.as_ref(), name)
+            || header_present(opts.headers.as_ref(), name)
+    };
     if has("authorization") || has("cf-aig-authorization") {
         return Some("unused".to_string());
     }
@@ -167,7 +239,8 @@ fn header_present(headers: Option<&HeaderMap>, name: &str) -> bool {
     let Some(map) = headers else { return false };
     let want = name.to_ascii_lowercase();
     map.iter().any(|(k, v)| {
-        k.to_ascii_lowercase() == want && v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        k.to_ascii_lowercase() == want
+            && v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
     })
 }
 
@@ -234,8 +307,20 @@ pub(crate) fn build_params(
         obj.insert("temperature".to_string(), json!(temp));
     }
 
+    // service_tier (Pi `if (options?.serviceTier !== undefined) params.service_tier = …`,
+    // openai-responses.ts:242-244). Omitted when unset (Pi default).
+    if let Some(tier) = opts
+        .openai_responses_options()
+        .and_then(|o| o.service_tier.as_deref())
+    {
+        obj.insert("service_tier".to_string(), json!(tier));
+    }
+
     if !ctx.tools.is_empty() {
-        obj.insert("tools".to_string(), Value::Array(convert_responses_tools(&ctx.tools)));
+        obj.insert(
+            "tools".to_string(),
+            Value::Array(convert_responses_tools(&ctx.tools)),
+        );
     }
 
     if model.reasoning {
@@ -244,8 +329,16 @@ pub(crate) fn build_params(
         if clamped != ModelThinkingLevel::Off {
             let key = thinking_level_key(clamped);
             let effort = mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key);
-            obj.insert("reasoning".to_string(), json!({ "effort": effort, "summary": "auto" }));
-            obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+            // Pi `summary: options?.reasoningSummary || "auto"` (openai-responses.ts:257).
+            let summary = reasoning_summary_or_auto(opts.openai_responses_options());
+            obj.insert(
+                "reasoning".to_string(),
+                json!({ "effort": effort, "summary": summary }),
+            );
+            obj.insert(
+                "include".to_string(),
+                json!(["reasoning.encrypted_content"]),
+            );
         } else if model.provider.as_str() != "github-copilot"
             && off_is_not_null(model.thinking_level_map.as_ref())
         {
@@ -260,9 +353,17 @@ pub(crate) fn build_params(
 /// Build the request headers: `Authorization: Bearer <key>` plus the model / session / opts header
 /// overlays (Pi `createClient`, openai-responses.ts:193-229). Precedence (low → high): auth Bearer
 /// < `model.headers` < session affinity < `opts.headers`.
-fn build_headers(model: &Model, auth: &AuthResult, opts: &StreamOptions, api_key: &str) -> HeaderMap {
+fn build_headers(
+    model: &Model,
+    auth: &AuthResult,
+    opts: &StreamOptions,
+    api_key: &str,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("Authorization".to_string(), Some(format!("Bearer {api_key}")));
+    headers.insert(
+        "Authorization".to_string(),
+        Some(format!("Bearer {api_key}")),
+    );
     if let Some(overlay) = &auth.auth.headers {
         for (name, value) in overlay {
             headers.insert(name.clone(), value.clone());
@@ -284,7 +385,10 @@ fn build_headers(model: &Model, auth: &AuthResult, opts: &StreamOptions, api_key
         if compat.send_session_id_header {
             headers.insert("session_id".to_string(), Some(sid.as_str().to_string()));
         }
-        headers.insert("x-client-request-id".to_string(), Some(sid.as_str().to_string()));
+        headers.insert(
+            "x-client-request-id".to_string(),
+            Some(sid.as_str().to_string()),
+        );
     }
 
     // Merge opts headers last so they override defaults (openai-responses.ts:219-221).
@@ -305,7 +409,13 @@ fn build_headers(model: &Model, auth: &AuthResult, opts: &StreamOptions, api_key
 fn normalize_id_part(part: &str) -> String {
     let sanitized: String = part
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let truncated: String = sanitized.chars().take(64).collect();
     truncated.trim_end_matches('_').to_string()
@@ -358,7 +468,11 @@ pub(crate) fn convert_responses_messages(
 
     if let Some(system) = &ctx.system_prompt {
         let compat = get_responses_compat(model);
-        let role = if model.reasoning && compat.supports_developer_role { "developer" } else { "system" };
+        let role = if model.reasoning && compat.supports_developer_role {
+            "developer"
+        } else {
+            "system"
+        };
         messages.push(json!({ "role": role, "content": sanitize_surrogates(system) }));
     }
 
@@ -393,7 +507,9 @@ pub(crate) fn convert_responses_messages(
                 let mut text_block_index: i64 = 0;
                 for block in &am.content {
                     match block {
-                        Content::Thinking { thinking_signature, .. } => {
+                        Content::Thinking {
+                            thinking_signature, ..
+                        } => {
                             if let Some(sig) = thinking_signature {
                                 // The signature is the JSON-encoded reasoning item; replay verbatim.
                                 if let Ok(item) = serde_json::from_str::<Value>(sig) {
@@ -401,7 +517,10 @@ pub(crate) fn convert_responses_messages(
                                 }
                             }
                         }
-                        Content::Text { text, text_signature } => {
+                        Content::Text {
+                            text,
+                            text_signature,
+                        } => {
                             let parsed = text_signature.as_deref().and_then(parse_text_signature);
                             let fallback = if text_block_index == 0 {
                                 format!("msg_pi_{msg_index}")
@@ -442,7 +561,10 @@ pub(crate) fn convert_responses_messages(
                             let mut item_id = parts.get(1).copied().map(|s| s.to_string());
                             // Drop a different-model `fc_*` item id to avoid pairing validation.
                             if is_different_model
-                                && item_id.as_deref().map(|s| s.starts_with("fc_")).unwrap_or(false)
+                                && item_id
+                                    .as_deref()
+                                    .map(|s| s.starts_with("fc_"))
+                                    .unwrap_or(false)
                             {
                                 item_id = None;
                             }
@@ -467,7 +589,11 @@ pub(crate) fn convert_responses_messages(
                 }
                 messages.extend(output);
             }
-            Message::ToolResult { tool_call_id, content, .. } => {
+            Message::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
                 let text_result = content
                     .iter()
                     .filter_map(|c| match c {
@@ -478,8 +604,11 @@ pub(crate) fn convert_responses_messages(
                     .join("\n");
                 let has_images = content.iter().any(|c| matches!(c, Content::Image { .. }));
                 let has_text = !text_result.is_empty();
-                let call_id =
-                    tool_call_id.as_str().split('|').next().unwrap_or(tool_call_id.as_str());
+                let call_id = tool_call_id
+                    .as_str()
+                    .split('|')
+                    .next()
+                    .unwrap_or(tool_call_id.as_str());
 
                 let output: Value = if has_images && model.supports_image_input() {
                     let mut parts: Vec<Value> = Vec::new();
@@ -528,7 +657,11 @@ fn parse_text_signature(signature: &str) -> Option<TextSignatureV1> {
     {
         return Some(v1);
     }
-    Some(TextSignatureV1 { v: 1, id: signature.to_string(), phase: None })
+    Some(TextSignatureV1 {
+        v: 1,
+        id: signature.to_string(),
+        phase: None,
+    })
 }
 
 /// The wire string for a [`TextPhase`] (Pi `commentary` / `final_answer`).
@@ -568,9 +701,20 @@ enum SlotKind {
 }
 
 enum RBlock {
-    Thinking { thinking: String, signature: Option<String> },
-    Text { text: String, signature: Option<String> },
-    Tool { call_id: String, item_id: String, name: String, partial_json: String },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    Text {
+        text: String,
+        signature: Option<String>,
+    },
+    Tool {
+        call_id: String,
+        item_id: String,
+        name: String,
+        partial_json: String,
+    },
 }
 
 struct RDecoder {
@@ -614,7 +758,10 @@ impl RDecoder {
     }
 
     fn slot(&self, output_index: i64, kind: SlotKind) -> Option<usize> {
-        self.slots.get(&output_index).filter(|(_, k)| *k == kind).map(|(i, _)| *i)
+        self.slots
+            .get(&output_index)
+            .filter(|(_, k)| *k == kind)
+            .map(|(i, _)| *i)
     }
 }
 
@@ -622,7 +769,10 @@ fn blocks_to_content(blocks: &[RBlock]) -> Vec<Content> {
     blocks
         .iter()
         .map(|b| match b {
-            RBlock::Thinking { thinking, signature } => Content::Thinking {
+            RBlock::Thinking {
+                thinking,
+                signature,
+            } => Content::Thinking {
                 thinking: thinking.clone(),
                 thinking_signature: signature.clone(),
                 redacted: false,
@@ -631,7 +781,12 @@ fn blocks_to_content(blocks: &[RBlock]) -> Vec<Content> {
                 text: text.clone(),
                 text_signature: signature.clone(),
             },
-            RBlock::Tool { call_id, item_id, name, partial_json } => Content::ToolCall(ToolCall {
+            RBlock::Tool {
+                call_id,
+                item_id,
+                name,
+                partial_json,
+            } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(format!("{call_id}|{item_id}").as_str()),
                 name: name.clone(),
                 arguments: parse_streaming_json_object(Some(partial_json)),
@@ -650,7 +805,12 @@ where
     let model_id = model.id.as_str().to_string();
 
     let mut dec = RDecoder::default();
-    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+    if !sink
+        .send(StreamEvent::Start {
+            partial: dec.snapshot(model, api),
+        })
+        .await
+    {
         return;
     }
 
@@ -658,7 +818,8 @@ where
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -667,8 +828,14 @@ where
             continue;
         }
         let Ok(event) = serde_json::from_str::<Value>(data) else {
-            emit_error(&dec, model, api, sink, "Could not parse OpenAI Responses SSE event".into())
-                .await;
+            emit_error(
+                &dec,
+                model,
+                api,
+                sink,
+                "Could not parse OpenAI Responses SSE event".into(),
+            )
+            .await;
             return;
         };
         match process_event(&event, &mut dec, model, api, sink).await {
@@ -711,7 +878,10 @@ async fn process_event(
     sink: &EventSink,
 ) -> ProcessResult {
     let etype = event.get("type").and_then(Value::as_str).unwrap_or("");
-    let oi = event.get("output_index").and_then(Value::as_i64).unwrap_or(0);
+    let oi = event
+        .get("output_index")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
 
     macro_rules! emit {
         ($ev:expr) => {
@@ -732,15 +902,18 @@ async fn process_event(
                 && let Some((ci, kind)) = create_slot(dec, oi, item)
             {
                 let ev = match kind {
-                    SlotKind::Thinking => {
-                        StreamEvent::ThinkingStart { content_index: ci, partial: dec.snapshot(model, api) }
-                    }
-                    SlotKind::Text => {
-                        StreamEvent::TextStart { content_index: ci, partial: dec.snapshot(model, api) }
-                    }
-                    SlotKind::Tool => {
-                        StreamEvent::ToolCallStart { content_index: ci, partial: dec.snapshot(model, api) }
-                    }
+                    SlotKind::Thinking => StreamEvent::ThinkingStart {
+                        content_index: ci,
+                        partial: dec.snapshot(model, api),
+                    },
+                    SlotKind::Text => StreamEvent::TextStart {
+                        content_index: ci,
+                        partial: dec.snapshot(model, api),
+                    },
+                    SlotKind::Tool => StreamEvent::ToolCallStart {
+                        content_index: ci,
+                        partial: dec.snapshot(model, api),
+                    },
                 };
                 emit!(ev);
             }
@@ -803,8 +976,9 @@ async fn process_event(
                 if let Some(RBlock::Tool { partial_json, .. }) = dec.blocks.get_mut(ci) {
                     let previous = partial_json.clone();
                     *partial_json = arguments.to_string();
-                    if let Some(rest) =
-                        arguments.strip_prefix(previous.as_str()).filter(|r| !r.is_empty())
+                    if let Some(rest) = arguments
+                        .strip_prefix(previous.as_str())
+                        .filter(|r| !r.is_empty())
                     {
                         maybe_delta = Some(rest.to_string());
                     }
@@ -819,7 +993,9 @@ async fn process_event(
             }
         }
         "response.output_item.done" => {
-            let Some(item) = event.get("item") else { return ProcessResult::Continue };
+            let Some(item) = event.get("item") else {
+                return ProcessResult::Continue;
+            };
             let Some((ci, kind)) = get_or_create_slot(dec, oi, item, model, api, sink).await else {
                 return ProcessResult::Continue;
             };
@@ -838,7 +1014,11 @@ async fn process_event(
                         String::new()
                     };
                     let sig = serde_json::to_string(item).ok();
-                    if let Some(RBlock::Thinking { thinking, signature }) = dec.blocks.get_mut(ci) {
+                    if let Some(RBlock::Thinking {
+                        thinking,
+                        signature,
+                    }) = dec.blocks.get_mut(ci)
+                    {
                         *thinking = final_text.clone();
                         *signature = sig;
                     }
@@ -901,7 +1081,10 @@ async fn process_event(
         }
         "error" => {
             let code = event.get("code").and_then(Value::as_str).unwrap_or("");
-            let message = event.get("message").and_then(Value::as_str).unwrap_or("Unknown error");
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown error");
             return ProcessResult::Error(format!("Error Code {code}: {message}"));
         }
         "response.failed" => {
@@ -909,11 +1092,18 @@ async fn process_event(
             let response = event.get("response");
             let error = response.and_then(|r| r.get("error"));
             let msg = if let Some(error) = error.filter(|e| !e.is_null()) {
-                let code = error.get("code").and_then(Value::as_str).unwrap_or("unknown");
-                let message = error.get("message").and_then(Value::as_str).unwrap_or("no message");
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no message");
                 format!("{code}: {message}")
-            } else if let Some(reason) =
-                response.and_then(|r| r.pointer("/incomplete_details/reason")).and_then(Value::as_str)
+            } else if let Some(reason) = response
+                .and_then(|r| r.pointer("/incomplete_details/reason"))
+                .and_then(Value::as_str)
             {
                 format!("incomplete: {reason}")
             } else {
@@ -931,15 +1121,50 @@ async fn process_event(
 fn create_slot(dec: &mut RDecoder, output_index: i64, item: &Value) -> Option<(usize, SlotKind)> {
     let item_type = item.get("type").and_then(Value::as_str)?;
     let (block, kind) = match item_type {
-        "reasoning" => (RBlock::Thinking { thinking: String::new(), signature: None }, SlotKind::Thinking),
-        "message" => (RBlock::Text { text: String::new(), signature: None }, SlotKind::Text),
+        "reasoning" => (
+            RBlock::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
+            SlotKind::Thinking,
+        ),
+        "message" => (
+            RBlock::Text {
+                text: String::new(),
+                signature: None,
+            },
+            SlotKind::Text,
+        ),
         "function_call" => {
-            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let item_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            let partial_json =
-                item.get("arguments").and_then(Value::as_str).unwrap_or("").to_string();
-            (RBlock::Tool { call_id, item_id, name, partial_json }, SlotKind::Tool)
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let partial_json = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            (
+                RBlock::Tool {
+                    call_id,
+                    item_id,
+                    name,
+                    partial_json,
+                },
+                SlotKind::Tool,
+            )
         }
         _ => return None,
     };
@@ -964,9 +1189,18 @@ async fn get_or_create_slot(
     }
     let (ci, kind) = create_slot(dec, output_index, item)?;
     let ev = match kind {
-        SlotKind::Thinking => StreamEvent::ThinkingStart { content_index: ci, partial: dec.snapshot(model, api) },
-        SlotKind::Text => StreamEvent::TextStart { content_index: ci, partial: dec.snapshot(model, api) },
-        SlotKind::Tool => StreamEvent::ToolCallStart { content_index: ci, partial: dec.snapshot(model, api) },
+        SlotKind::Thinking => StreamEvent::ThinkingStart {
+            content_index: ci,
+            partial: dec.snapshot(model, api),
+        },
+        SlotKind::Text => StreamEvent::TextStart {
+            content_index: ci,
+            partial: dec.snapshot(model, api),
+        },
+        SlotKind::Tool => StreamEvent::ToolCallStart {
+            content_index: ci,
+            partial: dec.snapshot(model, api),
+        },
     };
     sink.send(ev).await;
     Some((ci, kind))
@@ -979,27 +1213,46 @@ fn finalize_response(response: Option<&Value>, dec: &mut RDecoder, model: &Model
         dec.response_id = Some(id.to_string());
     }
     if let Some(usage) = response.and_then(|r| r.get("usage")) {
-        let cached = usage.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let cached = usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         dec.usage = Usage {
             input: input_tokens.saturating_sub(cached),
-            output: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+            output: usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             cache_read: cached,
             cache_write: 0,
             cache_write_1h: None,
             reasoning: Some(
-                usage.pointer("/output_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0),
+                usage
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             ),
-            total_tokens: usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
+            total_tokens: usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             cost: Default::default(),
         };
     }
     apply_cost(&model.cost, &mut dec.usage);
     // Service-tier pricing (Pi applyServiceTierPricing): driven by the response's `service_tier`.
-    let service_tier = response.and_then(|r| r.get("service_tier")).and_then(Value::as_str);
+    let service_tier = response
+        .and_then(|r| r.get("service_tier"))
+        .and_then(Value::as_str);
     apply_service_tier_pricing(&mut dec.usage, service_tier, model);
 
-    let status = response.and_then(|r| r.get("status")).and_then(Value::as_str);
+    let status = response
+        .and_then(|r| r.get("status"))
+        .and_then(Value::as_str);
     dec.stop_reason = map_stop_reason(status);
     let has_tool = dec.blocks.iter().any(|b| matches!(b, RBlock::Tool { .. }));
     if has_tool && dec.stop_reason == StopReason::Stop {
@@ -1058,7 +1311,9 @@ fn parse_phase(s: &str) -> Option<TextPhase> {
 
 /// Join a reasoning item's `summary`/`content` array of `{text}` parts with `"\n\n"`.
 fn join_text_array(value: Option<&Value>) -> String {
-    let Some(Value::Array(arr)) = value else { return String::new() };
+    let Some(Value::Array(arr)) = value else {
+        return String::new();
+    };
     arr.iter()
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
@@ -1067,7 +1322,9 @@ fn join_text_array(value: Option<&Value>) -> String {
 
 /// Join a message item's `content` parts: `output_text.text` or `refusal` (Pi `item.content?.map`).
 fn join_message_content(value: Option<&Value>) -> String {
-    let Some(Value::Array(arr)) = value else { return String::new() };
+    let Some(Value::Array(arr)) = value else {
+        return String::new();
+    };
     arr.iter()
         .map(|c| {
             if c.get("type").and_then(Value::as_str) == Some("output_text") {
@@ -1095,7 +1352,12 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::model::{Modality, ModelCost};
@@ -1111,7 +1373,12 @@ mod tests {
             base_url: "https://api.openai.com/v1".to_string(),
             reasoning: true,
             input: vec![Modality::Text],
-            cost: ModelCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.0 },
+            cost: ModelCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 0.0,
+            },
             context_window: 400_000,
             max_tokens: 128_000,
             thinking_level_map: None,
@@ -1123,7 +1390,10 @@ mod tests {
     fn user_ctx(text: &str) -> Context {
         Context {
             system_prompt: None,
-            messages: vec![Message::User { content: vec![Content::text(text)], timestamp: 0 }],
+            messages: vec![Message::User {
+                content: vec![Content::text(text)],
+                timestamp: 0,
+            }],
             tools: Vec::new(),
         }
     }
@@ -1143,13 +1413,19 @@ mod tests {
     #[test]
     fn url_appends_responses() {
         let m = model();
-        assert_eq!(resolve_url(&m, &auth()).as_deref(), Some("https://api.openai.com/v1/responses"));
+        assert_eq!(
+            resolve_url(&m, &auth()).as_deref(),
+            Some("https://api.openai.com/v1/responses")
+        );
     }
 
     #[test]
     fn build_params_basic_shape() {
         let m = model();
-        let opts = StreamOptions { max_tokens: Some(100), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
         let body = build_params(&m, &user_ctx("hi"), &opts, None);
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
@@ -1164,11 +1440,67 @@ mod tests {
     #[test]
     fn reasoning_effort_encodes_with_encrypted_content() {
         let m = model();
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_params(&m, &user_ctx("hi"), &opts, None);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn reasoning_summary_per_api_option_overrides_auto() {
+        // Pi `summary: options?.reasoningSummary || "auto"` (openai-responses.ts:257).
+        let m = model();
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            api_options: Some(crate::stream::ApiStreamOptions::OpenAiResponses(
+                OpenAiResponsesOptions {
+                    reasoning_summary: Some(ReasoningSummary::Detailed),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts, None);
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+
+        // Explicit `null` falls back to "auto" (Pi `|| "auto"`).
+        let opts_null = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            api_options: Some(crate::stream::ApiStreamOptions::OpenAiResponses(
+                OpenAiResponsesOptions {
+                    reasoning_summary: Some(ReasoningSummary::Null),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts_null, None);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn service_tier_per_api_option_threads_to_request() {
+        // Pi sets `params.service_tier` only when `serviceTier` is defined (openai-responses.ts:242).
+        let m = model();
+        // Omitted by default.
+        let body = build_params(&m, &user_ctx("hi"), &StreamOptions::default(), None);
+        assert!(body.get("service_tier").is_none());
+
+        let opts = StreamOptions {
+            api_options: Some(crate::stream::ApiStreamOptions::OpenAiResponses(
+                OpenAiResponsesOptions {
+                    service_tier: Some("priority".to_string()),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts, None);
+        assert_eq!(body["service_tier"], "priority");
     }
 
     #[test]
@@ -1229,11 +1561,20 @@ mod tests {
     #[test]
     fn headers_carry_bearer_and_session() {
         let m = model();
-        let opts = StreamOptions { session_id: Some("sess-7".into()), ..Default::default() };
+        let opts = StreamOptions {
+            session_id: Some("sess-7".into()),
+            ..Default::default()
+        };
         let h = build_headers(&m, &auth(), &opts, "sk-test");
-        assert_eq!(h.get("Authorization"), Some(&Some("Bearer sk-test".to_string())));
+        assert_eq!(
+            h.get("Authorization"),
+            Some(&Some("Bearer sk-test".to_string()))
+        );
         assert_eq!(h.get("session_id"), Some(&Some("sess-7".to_string())));
-        assert_eq!(h.get("x-client-request-id"), Some(&Some("sess-7".to_string())));
+        assert_eq!(
+            h.get("x-client-request-id"),
+            Some(&Some("sess-7".to_string()))
+        );
     }
 
     #[test]
@@ -1333,7 +1674,11 @@ mod tests {
         let stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
         let msg = collect_message(stream).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("terminal response event"));
+        assert!(
+            msg.error_message
+                .unwrap()
+                .contains("terminal response event")
+        );
     }
 
     #[tokio::test]

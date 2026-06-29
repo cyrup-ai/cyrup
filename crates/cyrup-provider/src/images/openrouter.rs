@@ -7,8 +7,8 @@
 //! [`Content::Image`] blocks (Pi `openrouter-images.ts:86-97`).
 
 use super::{AssistantImages, ImagesApiImpl, ImagesContext, ImagesModel, ImagesOptions};
-use crate::stream::sse::build_client;
 use crate::stream::ProviderResponse;
+use crate::stream::sse::build_client;
 use cyrup_core::{ApiId, Content, Usage};
 use serde_json::json;
 use std::sync::Arc;
@@ -16,7 +16,9 @@ use std::time::Duration;
 
 /// Build the `openrouter-images` [`ImagesApiImpl`] (Pi `openrouterImagesApi()`).
 pub fn factory() -> Arc<dyn ImagesApiImpl> {
-    Arc::new(OpenRouterImages { api: ApiId::from(super::OPENROUTER_IMAGES) })
+    Arc::new(OpenRouterImages {
+        api: ApiId::from(super::OPENROUTER_IMAGES),
+    })
 }
 
 struct OpenRouterImages {
@@ -58,7 +60,10 @@ async fn run(
 ) -> Result<AssistantImages, GenError> {
     // `if (!apiKey) throw new Error("No API key for provider: …")` (openrouter-images.ts:53-56).
     let Some(api_key) = options.api_key.clone() else {
-        return Err(GenError::Message(format!("No API key for provider: {}", model.provider)));
+        return Err(GenError::Message(format!(
+            "No API key for provider: {}",
+            model.provider
+        )));
     };
 
     // `buildParams(model, context)` (openrouter-images.ts:124-151).
@@ -100,17 +105,29 @@ async fn run(
     let resp_headers = header_record(response.headers());
     // `options?.onResponse?.({ status, headers }, model)` (openrouter-images.ts:71).
     if let Some(hook) = &options.on_response {
-        hook(&ProviderResponse { status: status.as_u16(), headers: resp_headers }, model);
+        hook(
+            &ProviderResponse {
+                status: status.as_u16(),
+                headers: resp_headers,
+            },
+            model,
+        );
     }
 
     if !status.is_success() {
         // The OpenAI SDK throws on a non-2xx response; Pi catches it and surfaces the body text.
         let body = response.text().await.unwrap_or_default();
-        return Err(GenError::Message(format!("http {}: {}", status.as_u16(), body)));
+        return Err(GenError::Message(format!(
+            "http {}: {}",
+            status.as_u16(),
+            body
+        )));
     }
 
-    let body: serde_json::Value =
-        response.json().await.map_err(|e| GenError::Message(e.to_string()))?;
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| GenError::Message(e.to_string()))?;
 
     Ok(parse_response(model, &body))
 }
@@ -155,20 +172,28 @@ fn parse_response(model: &ImagesModel, body: &serde_json::Value) -> AssistantIma
         output.usage = Some(parse_usage(model, usage));
     }
 
-    let Some(choice) = body.get("choices").and_then(|c| c.as_array()).and_then(|c| c.first()) else {
+    let Some(choice) = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+    else {
         return output;
     };
     let message = choice.get("message");
 
     // `if (typeof content === "string" && content.length > 0)` (openrouter-images.ts:82).
-    if let Some(text) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str())
+    if let Some(text) = message
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
         && !text.is_empty()
     {
         output.output.push(Content::text(text));
     }
 
     // `for (const image of choice.message.images ?? [])` (openrouter-images.ts:86-96).
-    let images = message.and_then(|m| m.get("images")).and_then(|i| i.as_array());
+    let images = message
+        .and_then(|m| m.get("images"))
+        .and_then(|i| i.as_array());
     for image in images.into_iter().flatten() {
         let image_url = image.get("image_url");
         let url = match image_url {
@@ -219,7 +244,9 @@ fn parse_usage(model: &ImagesModel, raw: &serde_json::Value) -> Usage {
     } else {
         reported_cached
     };
-    let input = prompt_tokens.saturating_sub(cache_read).saturating_sub(cache_write);
+    let input = prompt_tokens
+        .saturating_sub(cache_read)
+        .saturating_sub(cache_write);
     let output = num(raw, &["completion_tokens"]);
 
     let mut usage = Usage {
@@ -252,18 +279,29 @@ fn merged_headers(model: &ImagesModel, options: &ImagesOptions) -> crate::Header
 }
 
 /// Flatten a `reqwest` header map into the string record Pi's `headersToRecord` produces.
-fn header_record(headers: &reqwest::header::HeaderMap) -> std::collections::BTreeMap<String, String> {
+fn header_record(
+    headers: &reqwest::header::HeaderMap,
+) -> std::collections::BTreeMap<String, String> {
     headers
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_string(), v.to_string()))
+        })
         .collect()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
-    use crate::images::{get_image_model, openrouter_image_models, ImagesStopReason};
+    use crate::images::{ImagesStopReason, get_image_model, openrouter_image_models};
     use crate::model::Modality;
 
     fn nano_banana() -> ImagesModel {
@@ -279,7 +317,10 @@ mod tests {
         let ctx = ImagesContext {
             input: vec![
                 Content::text("a cat"),
-                Content::Image { data: "QUJD".into(), mime_type: "image/png".into() },
+                Content::Image {
+                    data: "QUJD".into(),
+                    mime_type: "image/png".into(),
+                },
             ],
         };
         let params = build_params(&model, &ctx);
@@ -359,9 +400,11 @@ mod tests {
 
     #[test]
     fn every_catalog_model_emits_image_output() {
-        assert!(openrouter_image_models()
-            .iter()
-            .all(|m| m.output.contains(&Modality::Image)));
+        assert!(
+            openrouter_image_models()
+                .iter()
+                .all(|m| m.output.contains(&Modality::Image))
+        );
     }
 
     /// Live smoke test against the real OpenRouter image API. Ignored by default; run with
@@ -374,12 +417,24 @@ mod tests {
             return;
         };
         let model = nano_banana();
-        let ctx = ImagesContext { input: vec![Content::text("a small red circle on white")] };
-        let opts = ImagesOptions { api_key: Some(key), ..Default::default() };
+        let ctx = ImagesContext {
+            input: vec![Content::text("a small red circle on white")],
+        };
+        let opts = ImagesOptions {
+            api_key: Some(key),
+            ..Default::default()
+        };
         let out = factory().generate_images(&model, &ctx, &opts).await;
-        assert_eq!(out.stop_reason, ImagesStopReason::Stop, "error: {:?}", out.error_message);
+        assert_eq!(
+            out.stop_reason,
+            ImagesStopReason::Stop,
+            "error: {:?}",
+            out.error_message
+        );
         assert!(
-            out.output.iter().any(|c| matches!(c, Content::Image { .. })),
+            out.output
+                .iter()
+                .any(|c| matches!(c, Content::Image { .. })),
             "expected an image, got {:?}",
             out.output
         );

@@ -81,12 +81,16 @@ impl PackageSource {
             return Err(ResourceError::Unsupported);
         }
         if is_local_path(trimmed) {
-            return Ok(PackageSource::Path { path: PathBuf::from(trimmed) });
+            return Ok(PackageSource::Path {
+                path: PathBuf::from(trimmed),
+            });
         }
         if let Some(parsed) = parse_git_url(trimmed) {
             return Ok(parsed.into_source());
         }
-        Ok(PackageSource::Path { path: PathBuf::from(trimmed) })
+        Ok(PackageSource::Path {
+            path: PathBuf::from(trimmed),
+        })
     }
 
     /// The pin ref, if this source carries one (only Git does).
@@ -100,7 +104,9 @@ impl PackageSource {
     /// Stable identity of an install (used to upsert the registry record).
     pub fn package_id(&self) -> PackageId {
         match self {
-            PackageSource::Git { url, .. } => PackageId::from(format!("git:{}", normalize_git(url))),
+            PackageSource::Git { url, .. } => {
+                PackageId::from(format!("git:{}", normalize_git(url)))
+            }
             PackageSource::Path { path } => {
                 let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 PackageId::from(format!("path:{}", abs.display()))
@@ -130,6 +136,12 @@ fn normalize_git(url: &str) -> String {
 pub fn id_dir_name(id: &PackageId) -> String {
     id.as_str()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }

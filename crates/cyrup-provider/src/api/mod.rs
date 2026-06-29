@@ -121,9 +121,18 @@ pub fn builtin_registry() -> ApiRegistry {
 
 /// Register the built-in wire-protocol factories into `reg`.
 pub fn register_builtins(reg: &mut ApiRegistry) {
-    reg.register(ApiId::from(crate::known_api::OPENAI_COMPLETIONS), openai_completions::factory);
-    reg.register(ApiId::from(crate::known_api::ANTHROPIC_MESSAGES), anthropic_messages::factory);
-    reg.register(ApiId::from(crate::known_api::OPENAI_RESPONSES), openai_responses::factory);
+    reg.register(
+        ApiId::from(crate::known_api::OPENAI_COMPLETIONS),
+        openai_completions::factory,
+    );
+    reg.register(
+        ApiId::from(crate::known_api::ANTHROPIC_MESSAGES),
+        anthropic_messages::factory,
+    );
+    reg.register(
+        ApiId::from(crate::known_api::OPENAI_RESPONSES),
+        openai_responses::factory,
+    );
     reg.register(
         ApiId::from(crate::known_api::AZURE_OPENAI_RESPONSES),
         azure_openai_responses::factory,

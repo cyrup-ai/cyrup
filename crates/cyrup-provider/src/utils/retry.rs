@@ -107,7 +107,12 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use cyrup_core::ProviderId;
@@ -126,9 +131,15 @@ mod tests {
 
     #[test]
     fn non_error_turns_are_not_retryable() {
-        assert!(!is_retryable_assistant_error(&err(StopReason::Stop, Some("overloaded"))));
+        assert!(!is_retryable_assistant_error(&err(
+            StopReason::Stop,
+            Some("overloaded")
+        )));
         assert!(!is_retryable_assistant_error(&err(StopReason::Error, None)));
-        assert!(!is_retryable_assistant_error(&err(StopReason::Error, Some(""))));
+        assert!(!is_retryable_assistant_error(&err(
+            StopReason::Error,
+            Some("")
+        )));
     }
 
     #[test]
@@ -178,7 +189,10 @@ mod tests {
     fn non_retryable_wins_even_with_retryable_wording() {
         // "Monthly usage limit reached (429)" matches retryable "429" but the non-retryable limit
         // pattern takes precedence (Pi checks non-retryable first).
-        let m = err(StopReason::Error, Some("Monthly usage limit reached (429 rate limit)"));
+        let m = err(
+            StopReason::Error,
+            Some("Monthly usage limit reached (429 rate limit)"),
+        );
         assert!(!is_retryable_assistant_error(&m));
     }
 

@@ -27,7 +27,9 @@ pub struct RefreshDedup {
 
 impl RefreshDedup {
     pub fn new() -> Self {
-        Self { inflight: Mutex::new(None) }
+        Self {
+            inflight: Mutex::new(None),
+        }
     }
 
     /// Run `fetch` deduplicated: the first caller starts it; concurrent callers await the same
@@ -40,8 +42,7 @@ impl RefreshDedup {
     {
         // Fast path — a concurrent caller already has a fetch in flight: clone and await it. The
         // lock guard is read-and-dropped inside this expression (no await held under the lock).
-        let existing: Option<SharedFut> =
-            self.inflight.lock().ok().and_then(|slot| slot.clone());
+        let existing: Option<SharedFut> = self.inflight.lock().ok().and_then(|slot| slot.clone());
         if let Some(shared) = existing {
             return finish(shared.await);
         }
@@ -106,7 +107,11 @@ mod tests {
         let (a, b) = tokio::join!(dedup.run(mk()), dedup.run(mk()));
         a.expect("ok");
         b.expect("ok");
-        assert_eq!(count.load(Ordering::SeqCst), 1, "concurrent calls share one fetch");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "concurrent calls share one fetch"
+        );
 
         // After the memo clears, a fresh call re-fetches.
         dedup.run(mk()).await.expect("ok");

@@ -45,7 +45,10 @@ impl ParsedGitUrl {
             Some(r) if is_hex_commit(&r) => PinRef::Commit(r),
             Some(r) => PinRef::Tag(r),
         };
-        PackageSource::Git { url: self.repo, reff }
+        PackageSource::Git {
+            url: self.repo,
+            reff,
+        }
     }
 }
 
@@ -89,7 +92,10 @@ fn split_ref(url: &str) -> (String, Option<String>) {
                 if repo_path.is_empty() || reff.is_empty() {
                     (url.to_string(), None)
                 } else {
-                    (format!("{scheme_authority}/{repo_path}"), Some(reff.to_string()))
+                    (
+                        format!("{scheme_authority}/{repo_path}"),
+                        Some(reff.to_string()),
+                    )
                 }
             }
         };
@@ -208,11 +214,11 @@ fn build_git_source(
     if path.starts_with('/') {
         return None;
     }
-    let normalized_path = path.strip_suffix(".git").unwrap_or(path).trim_start_matches('/');
-    if host.is_empty()
-        || normalized_path.is_empty()
-        || normalized_path.split('/').count() < 2
-    {
+    let normalized_path = path
+        .strip_suffix(".git")
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    if host.is_empty() || normalized_path.is_empty() || normalized_path.split('/').count() < 2 {
         return None;
     }
     if has_unsafe_git_install_part(&host, false)
@@ -221,7 +227,13 @@ fn build_git_source(
         return None;
     }
     let pinned = reff.is_some();
-    Some(ParsedGitUrl { repo, host, path: normalized_path.to_string(), reff, pinned })
+    Some(ParsedGitUrl {
+        repo,
+        host,
+        path: normalized_path.to_string(),
+        reff,
+        pinned,
+    })
 }
 
 /// Parse a non-shorthand git URL (↔ Pi `parseGenericGitUrl`, git.ts:126-163): scp-like, explicit
@@ -264,7 +276,11 @@ fn parse_generic_git_url(url: &str) -> Option<ParsedGitUrl> {
 pub fn parse_git_url(source: &str) -> Option<ParsedGitUrl> {
     let trimmed = source.trim();
     let has_git_prefix = trimmed.starts_with("git:");
-    let url = if has_git_prefix { trimmed[4..].trim() } else { trimmed };
+    let url = if has_git_prefix {
+        trimmed[4..].trim()
+    } else {
+        trimmed
+    };
 
     if !has_git_prefix && !has_protocol_prefix(url) {
         return None;
@@ -304,7 +320,11 @@ fn resolve_hosted(
     if let Some(r) = split_ref_opt {
         candidates.push(format!("{repo_base}#{r}"));
     }
-    candidates.push(if force_https { format!("https://{url}") } else { url.to_string() });
+    candidates.push(if force_https {
+        format!("https://{url}")
+    } else {
+        url.to_string()
+    });
 
     for candidate in &candidates {
         let Some(info) = hosted_git_info_from_url(candidate) else {
@@ -325,7 +345,11 @@ fn resolve_hosted(
         } else {
             split_repo.to_string()
         };
-        let path = format!("{}/{}", info.user.as_deref().unwrap_or("null"), info.project);
+        let path = format!(
+            "{}/{}",
+            info.user.as_deref().unwrap_or("null"),
+            info.project
+        );
         // git.ts:202/220: `info.committish || split.ref || undefined` — empty committish is falsy.
         let reff = info
             .committish
@@ -422,9 +446,7 @@ impl GitHostKind {
     /// The protocols this host accepts for url-form parsing (↔ `host.protocols`).
     fn protocols(self) -> &'static [&'static str] {
         match self {
-            GitHostKind::Github => {
-                &["git:", "http:", "git+ssh:", "git+https:", "ssh:", "https:"]
-            }
+            GitHostKind::Github => &["git:", "http:", "git+ssh:", "git+https:", "ssh:", "https:"],
             GitHostKind::Bitbucket | GitHostKind::Gitlab => {
                 &["git+ssh:", "git+https:", "ssh:", "https:"]
             }
@@ -486,7 +508,11 @@ impl GitHostKind {
                 if user.is_empty() || project.is_empty() {
                     return None;
                 }
-                Some(Segments { user: Some(user.to_string()), project, committish })
+                Some(Segments {
+                    user: Some(user.to_string()),
+                    project,
+                    committish,
+                })
             }
             GitHostKind::Bitbucket => {
                 let parts = split_limit(pathname, 4);
@@ -502,7 +528,11 @@ impl GitHostKind {
                 if user.is_empty() || project.is_empty() {
                     return None;
                 }
-                Some(Segments { user: Some(user.to_string()), project, committish: hash_committish })
+                Some(Segments {
+                    user: Some(user.to_string()),
+                    project,
+                    committish: hash_committish,
+                })
             }
             GitHostKind::Gitlab => {
                 let path = pathname.strip_prefix('/').unwrap_or(pathname);
@@ -519,7 +549,11 @@ impl GitHostKind {
                 if user.is_empty() || project.is_empty() {
                     return None;
                 }
-                Some(Segments { user: Some(user), project, committish: hash_committish })
+                Some(Segments {
+                    user: Some(user),
+                    project,
+                    committish: hash_committish,
+                })
             }
             GitHostKind::Gist => {
                 let parts = split_limit(pathname, 4);
@@ -542,7 +576,11 @@ impl GitHostKind {
                 if let Some(p) = project.strip_suffix(".git") {
                     project = p.to_string();
                 }
-                Some(Segments { user, project, committish: hash_committish })
+                Some(Segments {
+                    user,
+                    project,
+                    committish: hash_committish,
+                })
             }
             GitHostKind::Sourcehut => {
                 let parts = split_limit(pathname, 4);
@@ -558,7 +596,11 @@ impl GitHostKind {
                 if user.is_empty() || project.is_empty() {
                     return None;
                 }
-                Some(Segments { user: Some(user.to_string()), project, committish: hash_committish })
+                Some(Segments {
+                    user: Some(user.to_string()),
+                    project,
+                    committish: hash_committish,
+                })
             }
         }
     }
@@ -677,15 +719,28 @@ fn mini_url(s: &str) -> Option<MiniUrl> {
         let authority = after.get(..path_start)?;
         let path = after.get(path_start..)?;
         let host_part = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let hostname = host_part.split(':').next().unwrap_or(host_part).to_ascii_lowercase();
-        let pathname = if path.is_empty() { String::new() } else { normalize_path(path) };
+        let hostname = host_part
+            .split(':')
+            .next()
+            .unwrap_or(host_part)
+            .to_ascii_lowercase();
+        let pathname = if path.is_empty() {
+            String::new()
+        } else {
+            normalize_path(path)
+        };
         (hostname, pathname)
     } else {
         // Opaque path (e.g. `github:owner/repo`) — no authority, no normalization.
         (String::new(), pre.to_string())
     };
 
-    Some(MiniUrl { protocol, hostname, pathname, hash })
+    Some(MiniUrl {
+        protocol,
+        hostname,
+        pathname,
+        hash,
+    })
 }
 
 /// `correctProtocol(arg, protocols)` (↔ `parse-url.js`): insert `//` after a bare
@@ -708,10 +763,18 @@ fn correct_protocol(arg: &str) -> String {
     let first_at = find_i(arg, '@');
     let fc = first_colon.map_or(-1, |i| i as i64);
     if first_at > -1 {
-        return if first_at > fc { format!("git+ssh://{arg}") } else { arg.to_string() };
+        return if first_at > fc {
+            format!("git+ssh://{arg}")
+        } else {
+            arg.to_string()
+        };
     }
     match first_colon {
-        Some(i) => format!("{}//{}", arg.get(..=i).unwrap_or(""), arg.get(i + 1..).unwrap_or("")),
+        Some(i) => format!(
+            "{}//{}",
+            arg.get(..=i).unwrap_or(""),
+            arg.get(i + 1..).unwrap_or("")
+        ),
         None => format!("//{arg}"),
     }
 }
@@ -752,7 +815,9 @@ fn is_github_shorthand(arg: &str) -> bool {
     let first_slash = find_i(arg, '/');
     let second_slash = {
         let start = (first_slash + 1).max(0) as usize;
-        arg.get(start..).and_then(|s| s.find('/')).map_or(-1, |p| (p + start) as i64)
+        arg.get(start..)
+            .and_then(|s| s.find('/'))
+            .map_or(-1, |p| (p + start) as i64)
     };
     let first_colon = find_i(arg, ':');
     let first_space = arg.find(char::is_whitespace).map_or(-1, |i| i as i64);
@@ -765,7 +830,10 @@ fn is_github_shorthand(arg: &str) -> bool {
         second_slash == -1 || (first_hash > -1 && second_slash > first_hash);
     let has_slash = first_slash > 0;
     let does_not_end_with_slash = if first_hash > -1 {
-        usize::try_from(first_hash - 1).ok().and_then(|i| arg.as_bytes().get(i)) != Some(&b'/')
+        usize::try_from(first_hash - 1)
+            .ok()
+            .and_then(|i| arg.as_bytes().get(i))
+            != Some(&b'/')
     } else {
         !arg.ends_with('/')
     };
@@ -787,18 +855,27 @@ fn hosted_git_info_from_url(giturl: &str) -> Option<HostedInfo> {
     if giturl.is_empty() {
         return None;
     }
-    let corrected =
-        if is_github_shorthand(giturl) { format!("github:{giturl}") } else { giturl.to_string() };
+    let corrected = if is_github_shorthand(giturl) {
+        format!("github:{giturl}")
+    } else {
+        giturl.to_string()
+    };
     let parsed = parse_url(&corrected)?;
 
     let shortcut = GitHostKind::from_shortcut(&parsed.protocol);
-    let domain_key = parsed.hostname.strip_prefix("www.").unwrap_or(&parsed.hostname);
+    let domain_key = parsed
+        .hostname
+        .strip_prefix("www.")
+        .unwrap_or(&parsed.hostname);
     let host_kind = shortcut.or_else(|| GitHostKind::from_domain(domain_key))?;
 
     if shortcut.is_some() {
         // Shortcut branch (`gitHostShortcut`): the path is `user/project`, auth `@`
         // trimmed, committish from `#frag`.
-        let raw = parsed.pathname.strip_prefix('/').unwrap_or(&parsed.pathname);
+        let raw = parsed
+            .pathname
+            .strip_prefix('/')
+            .unwrap_or(&parsed.pathname);
         let trimmed = match raw.find('@') {
             Some(at) => raw.get(at + 1..).unwrap_or(""),
             None => raw,
@@ -806,7 +883,11 @@ fn hosted_git_info_from_url(giturl: &str) -> Option<HostedInfo> {
         let (user, project_src) = match trimmed.rfind('/') {
             Some(ls) => {
                 let user_raw = decode_uri_component(trimmed.get(..ls).unwrap_or(""))?;
-                let user = if user_raw.is_empty() { None } else { Some(user_raw) };
+                let user = if user_raw.is_empty() {
+                    None
+                } else {
+                    Some(user_raw)
+                };
                 (user, trimmed.get(ls + 1..).unwrap_or(""))
             }
             None => (None, trimmed),
@@ -818,9 +899,16 @@ fn hosted_git_info_from_url(giturl: &str) -> Option<HostedInfo> {
         let committish = if parsed.hash.is_empty() {
             None
         } else {
-            Some(decode_uri_component(parsed.hash.strip_prefix('#').unwrap_or(&parsed.hash))?)
+            Some(decode_uri_component(
+                parsed.hash.strip_prefix('#').unwrap_or(&parsed.hash),
+            )?)
         };
-        Some(HostedInfo { domain: host_kind.domain().to_string(), user, project, committish })
+        Some(HostedInfo {
+            domain: host_kind.domain().to_string(),
+            user,
+            project,
+            committish,
+        })
     } else {
         // Url branch: the host's `extract` plus a per-host protocol gate.
         if !host_kind.protocols().contains(&parsed.protocol.as_str()) {
@@ -846,7 +934,12 @@ fn hosted_git_info_from_url(giturl: &str) -> Option<HostedInfo> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod hosted_tests {
     use super::*;
 
@@ -878,7 +971,8 @@ mod hosted_tests {
         assert_eq!(scp.committish.as_deref(), Some("v1.0"));
 
         // `..` is normalized away by the URL path machine (so it is NOT a traversal).
-        let dots = hosted_git_info_from_url("https://github.com/../etc/passwd").expect("normalized");
+        let dots =
+            hosted_git_info_from_url("https://github.com/../etc/passwd").expect("normalized");
         assert_eq!(dots.user.as_deref(), Some("etc"));
         assert_eq!(dots.project, "passwd");
 

@@ -6,8 +6,8 @@
 //! API authenticates with `Authorization: Bearer` (set by the wire impl). Base URL
 //! `https://api.mistral.ai` (the `/v1/chat/completions` path is appended by the wire impl).
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -50,18 +50,26 @@ pub fn mistral_provider_with(
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.
 pub fn mistral_provider() -> WireProvider {
-    mistral_provider_with(Arc::new(InMemoryCredentialStore::new()), Arc::new(builtin_registry()))
+    mistral_provider_with(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
     use crate::context::Context;
     use crate::known_api::MISTRAL_CONVERSATIONS;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::StopReason;
     use std::collections::BTreeMap;
 
@@ -80,7 +88,11 @@ mod tests {
     fn catalog_parses_verbatim_with_expected_count() {
         let models = mistral_models();
         assert_eq!(models.len(), 30);
-        assert!(models.iter().all(|m| m.api.as_str() == MISTRAL_CONVERSATIONS));
+        assert!(
+            models
+                .iter()
+                .all(|m| m.api.as_str() == MISTRAL_CONVERSATIONS)
+        );
         assert!(models.iter().all(|m| m.provider.as_str() == "mistral"));
         assert!(models.iter().all(|m| m.base_url == MISTRAL_BASE_URL));
     }
@@ -89,8 +101,16 @@ mod tests {
     fn reasoning_and_non_reasoning_present() {
         let models = mistral_models();
         let find = |id: &str| models.iter().find(|m| m.id.as_str() == id);
-        assert!(find("magistral-medium-latest").expect("magistral-medium-latest").reasoning);
-        assert!(!find("codestral-latest").expect("codestral-latest").reasoning);
+        assert!(
+            find("magistral-medium-latest")
+                .expect("magistral-medium-latest")
+                .reasoning
+        );
+        assert!(
+            !find("codestral-latest")
+                .expect("codestral-latest")
+                .reasoning
+        );
     }
 
     #[test]
@@ -121,7 +141,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_auth_then_fails_at_transport() {
-        let env = MapEnv(BTreeMap::from([("MISTRAL_API_KEY".to_string(), "sk-mistral".to_string())]));
+        let env = MapEnv(BTreeMap::from([(
+            "MISTRAL_API_KEY".to_string(),
+            "sk-mistral".to_string(),
+        )]));
         let provider = mistral_provider_with(
             Arc::new(InMemoryCredentialStore::new()),
             Arc::new(builtin_registry()),
@@ -137,8 +160,14 @@ mod tests {
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// Live smoke test against the real Mistral API. Ignored by default; run with `MISTRAL_API_KEY`
@@ -161,9 +190,17 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let opts = StreamOptions { max_tokens: Some(64), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(64),
+            ..Default::default()
+        };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;
-        assert_ne!(msg.stop_reason, StopReason::Error, "got error: {:?}", msg.error_message);
+        assert_ne!(
+            msg.stop_reason,
+            StopReason::Error,
+            "got error: {:?}",
+            msg.error_message
+        );
         let has_text = msg
             .content
             .iter()

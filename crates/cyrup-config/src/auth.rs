@@ -35,7 +35,10 @@ pub enum Credential {
 
 impl Credential {
     pub fn api_key(key: impl Into<String>) -> Self {
-        Credential::ApiKey { key: Some(key.into()), env: None }
+        Credential::ApiKey {
+            key: Some(key.into()),
+            env: None,
+        }
     }
 
     /// The usable request key for an `api_key` credential (None for OAuth, handled separately).
@@ -86,7 +89,11 @@ impl AuthStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        Arc::clone(guard.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+        Arc::clone(
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// `--api-key`: explicit per-run override (R-07-018).
@@ -103,7 +110,10 @@ impl AuthStore {
     }
 
     pub fn runtime_api_key(&self, provider: &ProviderId) -> Option<String> {
-        self.runtime.read().ok().and_then(|g| g.get(provider.as_str()).cloned())
+        self.runtime
+            .read()
+            .ok()
+            .and_then(|g| g.get(provider.as_str()).cloned())
     }
 
     fn read_file(&self) -> Result<AuthFile, AuthError> {
@@ -183,7 +193,8 @@ impl AuthStore {
             .iter()
             .filter_map(|(k, v)| serde_json::to_value(v).ok().map(|v| (k.clone(), v)))
             .collect();
-        let mut text = serde_json::to_string_pretty(&Value::Object(obj)).map_err(AuthError::Parse)?;
+        let mut text =
+            serde_json::to_string_pretty(&Value::Object(obj)).map_err(AuthError::Parse)?;
         text.push('\n');
         crate::lock::write_atomic(&self.path, text.as_bytes(), true)
             .map_err(|e| AuthError::Lock(e.to_string()))?;
@@ -219,7 +230,11 @@ impl AuthStore {
         env: Option<&HashMap<String, String>>,
     ) -> AuthStatus {
         if matches!(self.read_file(), Ok(map) if map.contains_key(provider.as_str())) {
-            return AuthStatus { configured: true, source: Some(AuthSource::Stored), label: None };
+            return AuthStatus {
+                configured: true,
+                source: Some(AuthSource::Stored),
+                label: None,
+            };
         }
         if self.runtime_api_key(provider).is_some() {
             return AuthStatus {
@@ -237,7 +252,11 @@ impl AuthStore {
                 label: Some(first),
             };
         }
-        AuthStatus { configured: false, source: None, label: None }
+        AuthStatus {
+            configured: false,
+            source: None,
+            label: None,
+        }
     }
 
     /// Resolve a usable API key for a provider (Pi `AuthStorage.getApiKey`, auth-storage.ts:462-520):
@@ -261,13 +280,21 @@ impl AuthStore {
         }
 
         match self.read(provider).await? {
-            Some(Credential::ApiKey { key: Some(raw), env: cred_env }) => {
+            Some(Credential::ApiKey {
+                key: Some(raw),
+                env: cred_env,
+            }) => {
                 let scoped: Option<HashMap<String, String>> =
                     cred_env.map(|m| m.into_iter().collect());
-                return Ok(crate::config_value::resolve_config_value(&raw, scoped.as_ref()));
+                return Ok(crate::config_value::resolve_config_value(
+                    &raw,
+                    scoped.as_ref(),
+                ));
             }
             Some(Credential::ApiKey { key: None, .. }) => { /* fall through to env */ }
-            Some(Credential::Oauth { access, expires, .. }) => {
+            Some(Credential::Oauth {
+                access, expires, ..
+            }) => {
                 let now = unix_millis();
                 if now < expires {
                     return Ok(Some(access));
@@ -358,19 +385,30 @@ pub fn resolve_auth(
 ) -> Result<Option<ResolvedAuth>, AuthError> {
     // 1. explicit per-request (incl. --api-key) — top tier.
     if let Some(k) = explicit {
-        return Ok(Some(ResolvedAuth { key: k.to_string(), source: CredentialSource::Explicit }));
+        return Ok(Some(ResolvedAuth {
+            key: k.to_string(),
+            source: CredentialSource::Explicit,
+        }));
     }
     // 2. stored credential — suppresses env.
     match stored {
         Stored::ApiKey(k) => {
-            return Ok(Some(ResolvedAuth { key: k.clone(), source: CredentialSource::Stored }));
+            return Ok(Some(ResolvedAuth {
+                key: k.clone(),
+                source: CredentialSource::Stored,
+            }));
         }
         Stored::OAuth(t) => {
-            return Ok(Some(ResolvedAuth { key: t.clone(), source: CredentialSource::Stored }));
+            return Ok(Some(ResolvedAuth {
+                key: t.clone(),
+                source: CredentialSource::Stored,
+            }));
         }
         Stored::OAuthRefreshFailed => {
             // Stored credential present but refresh failed: no env fallback (A-07-5).
-            return Err(AuthError::Oauth("refresh failed; refusing env fallback".to_string()));
+            return Err(AuthError::Oauth(
+                "refresh failed; refusing env fallback".to_string(),
+            ));
         }
         Stored::None => {}
     }
@@ -383,7 +421,10 @@ pub fn resolve_auth(
     }
     // 4. environment variables.
     if let Some(k) = env {
-        return Ok(Some(ResolvedAuth { key: k.to_string(), source: CredentialSource::Env }));
+        return Ok(Some(ResolvedAuth {
+            key: k.to_string(),
+            source: CredentialSource::Env,
+        }));
     }
     // 5. model/provider-configured key/command.
     if let Some(k) = configured {
@@ -431,9 +472,11 @@ mod tests {
         // A-07-5: stored credential used over env; delete → env.
         let (s, _p) = store();
         let provider = ProviderId::from("anthropic");
-        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("stored-key"))) })
-            .await
-            .unwrap();
+        s.modify(&provider, |_| async {
+            Ok(Some(Credential::api_key("stored-key")))
+        })
+        .await
+        .unwrap();
 
         let stored = s.read(&provider).await.unwrap();
         let stored_kind = match stored {
@@ -489,9 +532,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.source, CredentialSource::Env);
-        let r = resolve_auth(None, &Stored::None, None, None, Some("cfg")).unwrap().unwrap();
+        let r = resolve_auth(None, &Stored::None, None, None, Some("cfg"))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.source, CredentialSource::Configured);
-        assert!(resolve_auth(None, &Stored::None, None, None, None).unwrap().is_none());
+        assert!(
+            resolve_auth(None, &Stored::None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -562,10 +611,20 @@ mod tests {
         let (s, _p) = store();
         let a = ProviderId::from("a");
         let b = ProviderId::from("b");
-        s.modify(&a, |_| async { Ok(Some(Credential::api_key("ka"))) }).await.unwrap();
-        s.modify(&b, |_| async { Ok(Some(Credential::api_key("kb"))) }).await.unwrap();
-        assert_eq!(s.read(&a).await.unwrap().unwrap().stored_api_key(), Some("ka"));
-        assert_eq!(s.read(&b).await.unwrap().unwrap().stored_api_key(), Some("kb"));
+        s.modify(&a, |_| async { Ok(Some(Credential::api_key("ka"))) })
+            .await
+            .unwrap();
+        s.modify(&b, |_| async { Ok(Some(Credential::api_key("kb"))) })
+            .await
+            .unwrap();
+        assert_eq!(
+            s.read(&a).await.unwrap().unwrap().stored_api_key(),
+            Some("ka")
+        );
+        assert_eq!(
+            s.read(&b).await.unwrap().unwrap().stored_api_key(),
+            Some("kb")
+        );
     }
 
     #[cfg(unix)]
@@ -575,11 +634,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (s, path) = store();
         let provider = ProviderId::from("x");
-        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("k"))) }).await.unwrap();
+        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("k"))) })
+            .await
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let dir_mode =
-            std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dir_mode, 0o700);
     }
 
@@ -607,7 +671,13 @@ mod tests {
 
         // runtime override wins over stored.
         s.set_runtime_api_key(provider.clone(), "cli-key".to_string());
-        assert_eq!(s.get_api_key(&provider, true, None).await.unwrap().as_deref(), Some("cli-key"));
+        assert_eq!(
+            s.get_api_key(&provider, true, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli-key")
+        );
         s.remove_runtime_api_key(&provider);
 
         // no stored credential → env fallback via the provider→env map (openai).
@@ -615,11 +685,17 @@ mod tests {
         let env: HashMap<String, String> =
             [("OPENAI_API_KEY".to_string(), "sk-env".to_string())].into();
         assert_eq!(
-            s.get_api_key(&openai, true, Some(&env)).await.unwrap().as_deref(),
+            s.get_api_key(&openai, true, Some(&env))
+                .await
+                .unwrap()
+                .as_deref(),
             Some("sk-env")
         );
         // include_fallback = false suppresses env.
-        assert_eq!(s.get_api_key(&openai, false, Some(&env)).await.unwrap(), None);
+        assert_eq!(
+            s.get_api_key(&openai, false, Some(&env)).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -639,7 +715,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            s.get_api_key(&provider, true, None).await.unwrap().as_deref(),
+            s.get_api_key(&provider, true, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("fresh-token")
         );
         // expired token → None (refresh lives outside the crate; no env fallback for oauth).
@@ -668,7 +747,9 @@ mod tests {
         assert_eq!(st.source, Some(AuthSource::Environment));
         assert_eq!(st.label.as_deref(), Some("OPENAI_API_KEY"));
         // stored source.
-        s.modify(&openai, |_| async { Ok(Some(Credential::api_key("k"))) }).await.unwrap();
+        s.modify(&openai, |_| async { Ok(Some(Credential::api_key("k"))) })
+            .await
+            .unwrap();
         let st = s.get_auth_status(&openai, Some(&env));
         assert!(st.configured);
         assert_eq!(st.source, Some(AuthSource::Stored));
@@ -694,7 +775,9 @@ mod tests {
 
         // api_key without env → None.
         let bare = ProviderId::from("bare");
-        s.modify(&bare, |_| async { Ok(Some(Credential::api_key("k"))) }).await.unwrap();
+        s.modify(&bare, |_| async { Ok(Some(Credential::api_key("k"))) })
+            .await
+            .unwrap();
         assert_eq!(s.get_provider_env(&bare).await.unwrap(), None);
 
         // OAuth credential → None.
@@ -712,7 +795,10 @@ mod tests {
         assert_eq!(s.get_provider_env(&oauth).await.unwrap(), None);
 
         // missing provider → None.
-        assert_eq!(s.get_provider_env(&ProviderId::from("nope")).await.unwrap(), None);
+        assert_eq!(
+            s.get_provider_env(&ProviderId::from("nope")).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -731,7 +817,10 @@ mod tests {
         .await
         .unwrap();
         // BTreeMap → sorted.
-        assert_eq!(s.list().unwrap(), vec!["anthropic".to_string(), "openai".to_string()]);
+        assert_eq!(
+            s.list().unwrap(),
+            vec!["anthropic".to_string(), "openai".to_string()]
+        );
         // deleting a provider drops it from the list.
         s.delete(&ProviderId::from("openai")).await.unwrap();
         assert_eq!(s.list().unwrap(), vec!["anthropic".to_string()]);
@@ -741,6 +830,9 @@ mod tests {
     fn pkce_challenge_is_stable() {
         // RFC 7636 appendix B test vector.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        assert_eq!(pkce::challenge(verifier), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pkce::challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 }

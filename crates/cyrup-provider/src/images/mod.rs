@@ -19,15 +19,15 @@
 
 pub mod openrouter;
 
+use crate::HeaderMap;
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthOverrides, AuthResult, CredentialStore,
-    EnvAuthContext, InMemoryCredentialStore, ProviderAuth, ProviderEnv,
+    AuthContext, AuthOverrides, AuthResult, CredentialStore, EnvAuthContext,
+    InMemoryCredentialStore, ProviderAuth, ProviderEnv, resolve_provider_auth,
 };
 use crate::collection::CreateModelsOptions;
 use crate::error::ProviderError;
 use crate::model::{Modality, Model, ModelCost, ThinkingLevelMap};
 use crate::stream::ProviderResponse;
-use crate::HeaderMap;
 use cyrup_core::{ApiId, CancelToken, Content, ProviderId, Usage};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -155,7 +155,11 @@ impl AssistantImages {
             output: Vec::new(),
             response_id: None,
             usage: None,
-            stop_reason: if aborted { ImagesStopReason::Aborted } else { ImagesStopReason::Error },
+            stop_reason: if aborted {
+                ImagesStopReason::Aborted
+            } else {
+                ImagesStopReason::Error
+            },
             error_message: Some(message.into()),
             timestamp: now_ms(),
         }
@@ -403,7 +407,9 @@ pub fn create_images_models(options: CreateModelsOptions) -> ImagesModels {
         credentials: options
             .credentials
             .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new())),
-        auth_context: options.auth_context.unwrap_or_else(|| Arc::new(EnvAuthContext)),
+        auth_context: options
+            .auth_context
+            .unwrap_or_else(|| Arc::new(EnvAuthContext)),
     }
 }
 
@@ -436,14 +442,24 @@ impl ImagesModels {
     /// Last-known models from one provider, or all providers (Pi `getModels`, images-models.ts:126).
     pub fn get_models(&self, provider: Option<&str>) -> Vec<ImagesModel> {
         match provider {
-            Some(id) => self.providers.get(id).map(|p| p.get_models()).unwrap_or_default(),
-            None => self.providers.values().flat_map(|p| p.get_models()).collect(),
+            Some(id) => self
+                .providers
+                .get(id)
+                .map(|p| p.get_models())
+                .unwrap_or_default(),
+            None => self
+                .providers
+                .values()
+                .flat_map(|p| p.get_models())
+                .collect(),
         }
     }
 
     /// Runtime model lookup against last-known lists (Pi `getModel`, images-models.ts:148).
     pub fn get_model(&self, provider: &str, id: &str) -> Option<ImagesModel> {
-        self.get_models(Some(provider)).into_iter().find(|m| m.id == id)
+        self.get_models(Some(provider))
+            .into_iter()
+            .find(|m| m.id == id)
     }
 
     /// Ask dynamic providers to re-fetch their model lists (Pi `refresh`, images-models.ts:152).
@@ -467,10 +483,7 @@ impl ImagesModels {
     }
 
     /// Resolve request auth for an image model (Pi `getAuth`, images-models.ts:170).
-    pub async fn get_auth(
-        &self,
-        model: &ImagesModel,
-    ) -> Result<Option<AuthResult>, ProviderError> {
+    pub async fn get_auth(&self, model: &ImagesModel) -> Result<Option<AuthResult>, ProviderError> {
         let Some(provider) = self.providers.get(model.provider.as_str()) else {
             return Ok(None);
         };
@@ -523,7 +536,10 @@ impl ImagesModels {
                 &model.to_auth_model(),
                 self.credentials.as_ref(),
                 self.auth_context.as_ref(),
-                AuthOverrides { api_key: options.api_key.as_deref(), env: options.env.as_ref() },
+                AuthOverrides {
+                    api_key: options.api_key.as_deref(),
+                    env: options.env.as_ref(),
+                },
             )
             .await
             .map_err(|e| e.to_string())?,
@@ -553,7 +569,9 @@ impl ImagesModels {
             env,
             ..options.clone()
         };
-        Ok(provider.generate_images(&request_model, context, &request_options).await)
+        Ok(provider
+            .generate_images(&request_model, context, &request_options)
+            .await)
     }
 }
 
@@ -619,7 +637,10 @@ pub fn openrouter_image_models() -> Vec<ImagesModel> {
 /// All known image models, grouped by provider (Pi `IMAGE_MODELS`, image-models.generated.ts:6).
 pub fn image_models() -> BTreeMap<String, Vec<ImagesModel>> {
     let mut out = BTreeMap::new();
-    out.insert(OPENROUTER_PROVIDER_ID.to_string(), openrouter_image_models());
+    out.insert(
+        OPENROUTER_PROVIDER_ID.to_string(),
+        openrouter_image_models(),
+    );
     out
 }
 
@@ -635,11 +656,18 @@ pub fn get_image_models(provider: &str) -> Vec<ImagesModel> {
 
 /// One static catalog model by provider + id (Pi `getImageModel`, image-models.ts:23).
 pub fn get_image_model(provider: &str, model_id: &str) -> Option<ImagesModel> {
-    get_image_models(provider).into_iter().find(|m| m.id == model_id)
+    get_image_models(provider)
+        .into_iter()
+        .find(|m| m.id == model_id)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::env_key;
@@ -666,7 +694,11 @@ mod tests {
         assert_eq!(models.len(), 37);
         assert!(models.iter().all(|m| m.api.as_str() == OPENROUTER_IMAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openrouter"));
-        assert!(models.iter().all(|m| m.base_url == "https://openrouter.ai/api/v1"));
+        assert!(
+            models
+                .iter()
+                .all(|m| m.base_url == "https://openrouter.ai/api/v1")
+        );
         // Every image model emits image output.
         assert!(models.iter().all(|m| m.output.contains(&Modality::Image)));
     }
@@ -680,9 +712,11 @@ mod tests {
         assert!(get_image_model("nope", "x").is_none());
         // Nano Banana emits both text + image; FLUX is image-only.
         assert!(sample_model().outputs_text());
-        assert!(!get_image_model("openrouter", "black-forest-labs/flux.2-flex")
-            .unwrap()
-            .outputs_text());
+        assert!(
+            !get_image_model("openrouter", "black-forest-labs/flux.2-flex")
+                .unwrap()
+                .outputs_text()
+        );
     }
 
     #[test]
@@ -746,7 +780,9 @@ mod tests {
     async fn generate_unknown_provider_yields_error_envelope() {
         let models = create_images_models(CreateModelsOptions::default());
         let m = sample_model();
-        let out = models.generate_images(&m, &ImagesContext::default(), &ImagesOptions::default()).await;
+        let out = models
+            .generate_images(&m, &ImagesContext::default(), &ImagesOptions::default())
+            .await;
         assert_eq!(out.stop_reason, ImagesStopReason::Error);
         assert!(out.error_message.unwrap().contains("Unknown provider"));
     }
@@ -765,10 +801,17 @@ mod tests {
         models.set_provider(openrouter_provider_for_tests());
         let mut m = sample_model();
         m.base_url = "http://127.0.0.1:1/api/v1".into();
-        let ctx = ImagesContext { input: vec![Content::text("a red square")] };
-        let out = models.generate_images(&m, &ctx, &ImagesOptions::default()).await;
+        let ctx = ImagesContext {
+            input: vec![Content::text("a red square")],
+        };
+        let out = models
+            .generate_images(&m, &ctx, &ImagesOptions::default())
+            .await;
         assert_eq!(out.stop_reason, ImagesStopReason::Error);
         let err = out.error_message.unwrap();
-        assert!(!err.contains("No API key"), "auth should have resolved: {err}");
+        assert!(
+            !err.contains("No API key"),
+            "auth should have resolved: {err}"
+        );
     }
 }

@@ -25,11 +25,18 @@ enum Node {
     /// `\s` — ASCII whitespace (` \t\n\r\x0c\x0b`), matching JS `\s` for the inputs we see.
     Space,
     /// `[…]` character class.
-    Class { items: Vec<ClassItem>, negated: bool },
+    Class {
+        items: Vec<ClassItem>,
+        negated: bool,
+    },
     /// `(?:…|…)` non-capturing group: a list of alternative sequences.
     Group(Vec<Vec<Node>>),
     /// A quantifier applied to the preceding single element.
-    Quant { inner: Box<Node>, min: usize, max: usize },
+    Quant {
+        inner: Box<Node>,
+        min: usize,
+        max: usize,
+    },
     /// `^` start-of-string anchor.
     Start,
 }
@@ -51,11 +58,16 @@ impl Regex {
     /// Compile `pattern`. An unparseable pattern compiles to one that never matches (no panic).
     pub fn new(pattern: &str) -> Self {
         let chars: Vec<char> = pattern.chars().collect();
-        let mut parser = Parser { chars: &chars, pos: 0 };
+        let mut parser = Parser {
+            chars: &chars,
+            pos: 0,
+        };
         let alternatives = parser.parse_alternation().unwrap_or_default();
         // A trailing unconsumed tail means a parse error → never-match.
         if parser.pos != chars.len() {
-            return Regex { alternatives: Vec::new() };
+            return Regex {
+                alternatives: Vec::new(),
+            };
         }
         Regex { alternatives }
     }
@@ -145,7 +157,11 @@ impl Parser<'_> {
             }
             _ => return Some(atom),
         };
-        Some(Node::Quant { inner: Box::new(atom), min, max })
+        Some(Node::Quant {
+            inner: Box::new(atom),
+            min,
+            max,
+        })
     }
 
     /// Parse `{n}` or `{n,m}` (or `{n,}`). Returns `None` (and does not advance) if it is not a
@@ -407,7 +423,12 @@ fn match_nodes(nodes: &[Node], chars: &[char], i: usize) -> Vec<usize> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

@@ -73,8 +73,11 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
 /// :119-127). Only reports actual key vars (excludes ambient AWS/ADC sources). `None` when none set.
 pub fn find_env_keys(provider: &str, env: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
     let vars = api_key_env_vars(provider)?;
-    let found: Vec<String> =
-        vars.iter().filter(|v| provider_env_value(v, env).is_some()).map(|v| v.to_string()).collect();
+    let found: Vec<String> = vars
+        .iter()
+        .filter(|v| provider_env_value(v, env).is_some())
+        .map(|v| v.to_string())
+        .collect();
     if found.is_empty() { None } else { Some(found) }
 }
 
@@ -138,7 +141,10 @@ mod tests {
     use super::*;
 
     fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -148,15 +154,24 @@ mod tests {
             api_key_env_vars("anthropic"),
             Some(&["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"][..])
         );
-        assert_eq!(api_key_env_vars("github-copilot"), Some(&["COPILOT_GITHUB_TOKEN"][..]));
+        assert_eq!(
+            api_key_env_vars("github-copilot"),
+            Some(&["COPILOT_GITHUB_TOKEN"][..])
+        );
         assert_eq!(api_key_env_vars("totally-unknown-provider"), None);
     }
 
     #[test]
     fn find_and_get_from_scoped_env_map() {
         let env = env_of(&[("OPENAI_API_KEY", "sk-openai")]);
-        assert_eq!(find_env_keys("openai", Some(&env)), Some(vec!["OPENAI_API_KEY".to_string()]));
-        assert_eq!(get_env_api_key("openai", Some(&env)).as_deref(), Some("sk-openai"));
+        assert_eq!(
+            find_env_keys("openai", Some(&env)),
+            Some(vec!["OPENAI_API_KEY".to_string()])
+        );
+        assert_eq!(
+            get_env_api_key("openai", Some(&env)).as_deref(),
+            Some("sk-openai")
+        );
         // unset
         let empty = env_of(&[]);
         assert_eq!(find_env_keys("openai", Some(&empty)), None);
@@ -165,15 +180,24 @@ mod tests {
 
     #[test]
     fn anthropic_oauth_token_precedence() {
-        let env = env_of(&[("ANTHROPIC_API_KEY", "sk-api"), ("ANTHROPIC_OAUTH_TOKEN", "tok-oauth")]);
+        let env = env_of(&[
+            ("ANTHROPIC_API_KEY", "sk-api"),
+            ("ANTHROPIC_OAUTH_TOKEN", "tok-oauth"),
+        ]);
         // first configured var wins -> OAUTH_TOKEN is listed first.
-        assert_eq!(get_env_api_key("anthropic", Some(&env)).as_deref(), Some("tok-oauth"));
+        assert_eq!(
+            get_env_api_key("anthropic", Some(&env)).as_deref(),
+            Some("tok-oauth")
+        );
     }
 
     #[test]
     fn bedrock_ambient_credentials_sentinel() {
         let env = env_of(&[("AWS_PROFILE", "default")]);
-        assert_eq!(get_env_api_key("amazon-bedrock", Some(&env)).as_deref(), Some("<authenticated>"));
+        assert_eq!(
+            get_env_api_key("amazon-bedrock", Some(&env)).as_deref(),
+            Some("<authenticated>")
+        );
         let env = env_of(&[("AWS_ACCESS_KEY_ID", "id")]); // missing secret → not authenticated
         assert_eq!(get_env_api_key("amazon-bedrock", Some(&env)), None);
     }

@@ -22,8 +22,7 @@ fn default_proxy_port(scheme: &str) -> u16 {
 }
 
 /// Pi's `UNSUPPORTED_PROXY_PROTOCOL_MESSAGE` (node-http-proxy.ts:89).
-pub const UNSUPPORTED_PROXY_PROTOCOL_MESSAGE: &str =
-    "Unsupported proxy protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP or HTTPS proxy URL.";
+pub const UNSUPPORTED_PROXY_PROTOCOL_MESSAGE: &str = "Unsupported proxy protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP or HTTPS proxy URL.";
 
 /// A proxy-resolution failure (Pi throws an `Error` for these, node-http-proxy.ts:102-108).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -36,15 +35,13 @@ pub enum ProxyError {
 
 /// `getProxyEnv(key, env)` (node-http-proxy.ts:13-23): lower-case overlay, upper-case overlay,
 /// ambient lower-case, ambient upper-case — first non-empty wins (`||` skips empty strings).
-async fn get_proxy_env(
-    key: &str,
-    ctx: &dyn AuthContext,
-    env: Option<&ProviderEnv>,
-) -> String {
+async fn get_proxy_env(key: &str, ctx: &dyn AuthContext, env: Option<&ProviderEnv>) -> String {
     let lower = key.to_lowercase();
     let upper = key.to_uppercase();
     let from_overlay = |name: &str| -> Option<String> {
-        env.and_then(|e| e.get(name)).filter(|v| !v.is_empty()).cloned()
+        env.and_then(|e| e.get(name))
+            .filter(|v| !v.is_empty())
+            .cloned()
     };
     if let Some(v) = from_overlay(&lower) {
         return v;
@@ -76,30 +73,36 @@ async fn should_proxy_hostname(
         return false;
     }
     // `.every(...)`: proxy iff EVERY no_proxy entry permits it.
-    no_proxy.split(|c: char| c == ',' || c.is_whitespace()).all(|proxy| {
-        if proxy.is_empty() {
-            return true;
-        }
-        // `^(.+):(\d+)$` — split a trailing `:port`.
-        let (mut proxy_hostname, proxy_port) = match proxy.rsplit_once(':') {
-            Some((host, p)) if !host.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-                (host, p.parse::<u16>().unwrap_or(0))
+    no_proxy
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .all(|proxy| {
+            if proxy.is_empty() {
+                return true;
             }
-            _ => (proxy, 0u16),
-        };
-        // A port-qualified entry that targets a different port never blocks (returns true → proxy).
-        if proxy_port != 0 && proxy_port != port {
-            return true;
-        }
-        // `^[.*]` — entries NOT starting with `.` or `*` are exact-host matches.
-        if !proxy_hostname.starts_with('.') && !proxy_hostname.starts_with('*') {
-            return hostname != proxy_hostname;
-        }
-        if let Some(stripped) = proxy_hostname.strip_prefix('*') {
-            proxy_hostname = stripped;
-        }
-        !hostname.ends_with(proxy_hostname)
-    })
+            // `^(.+):(\d+)$` — split a trailing `:port`.
+            let (mut proxy_hostname, proxy_port) = match proxy.rsplit_once(':') {
+                Some((host, p))
+                    if !host.is_empty()
+                        && !p.is_empty()
+                        && p.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    (host, p.parse::<u16>().unwrap_or(0))
+                }
+                _ => (proxy, 0u16),
+            };
+            // A port-qualified entry that targets a different port never blocks (returns true → proxy).
+            if proxy_port != 0 && proxy_port != port {
+                return true;
+            }
+            // `^[.*]` — entries NOT starting with `.` or `*` are exact-host matches.
+            if !proxy_hostname.starts_with('.') && !proxy_hostname.starts_with('*') {
+                return hostname != proxy_hostname;
+            }
+            if let Some(stripped) = proxy_hostname.strip_prefix('*') {
+                proxy_hostname = stripped;
+            }
+            !hostname.ends_with(proxy_hostname)
+        })
 }
 
 /// `getProxyForUrl(targetUrl, env)` (node-http-proxy.ts:69-87): the raw proxy string for a target,
@@ -152,13 +155,20 @@ pub async fn resolve_http_proxy_url_for_target(
     })?;
     let scheme = proxy_url.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(ProxyError::UnsupportedProtocol { protocol: format!("{scheme}:") });
+        return Err(ProxyError::UnsupportedProtocol {
+            protocol: format!("{scheme}:"),
+        });
     }
     Ok(Some(proxy_url))
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -174,7 +184,12 @@ mod tests {
         }
     }
     fn ctx<const N: usize>(pairs: [(&str, &str); N]) -> MapEnv {
-        MapEnv(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
     }
 
     #[tokio::test]
@@ -212,8 +227,9 @@ mod tests {
     #[tokio::test]
     async fn overlay_env_wins_over_ambient() {
         let env = ctx([("https_proxy", "http://ambient:1")]);
-        let overlay: ProviderEnv =
-            [("https_proxy".to_string(), "http://overlay:2".to_string())].into_iter().collect();
+        let overlay: ProviderEnv = [("https_proxy".to_string(), "http://overlay:2".to_string())]
+            .into_iter()
+            .collect();
         let out = resolve_http_proxy_url_for_target("https://x.example.com/", &env, Some(&overlay))
             .await
             .expect("ok")
@@ -233,29 +249,43 @@ mod tests {
     #[tokio::test]
     async fn no_proxy_suffix_and_exact_match() {
         // Suffix match (`.example.com`) excludes the host; an unrelated host still proxies.
-        let env = ctx([("https_proxy", "http://proxy:8080"), ("no_proxy", ".example.com")]);
-        assert!(resolve_http_proxy_url_for_target("https://api.example.com/", &env, None)
-            .await
-            .expect("ok")
-            .is_none());
-        assert!(resolve_http_proxy_url_for_target("https://other.test/", &env, None)
-            .await
-            .expect("ok")
-            .is_some());
+        let env = ctx([
+            ("https_proxy", "http://proxy:8080"),
+            ("no_proxy", ".example.com"),
+        ]);
+        assert!(
+            resolve_http_proxy_url_for_target("https://api.example.com/", &env, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+        assert!(
+            resolve_http_proxy_url_for_target("https://other.test/", &env, None)
+                .await
+                .expect("ok")
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn no_proxy_port_qualified_only_blocks_matching_port() {
         // `host:443` blocks the default-port https target but not an explicit :8443 one.
-        let env = ctx([("https_proxy", "http://proxy:8080"), ("no_proxy", "api.example.com:443")]);
-        assert!(resolve_http_proxy_url_for_target("https://api.example.com/", &env, None)
-            .await
-            .expect("ok")
-            .is_none());
-        assert!(resolve_http_proxy_url_for_target("https://api.example.com:8443/", &env, None)
-            .await
-            .expect("ok")
-            .is_some());
+        let env = ctx([
+            ("https_proxy", "http://proxy:8080"),
+            ("no_proxy", "api.example.com:443"),
+        ]);
+        assert!(
+            resolve_http_proxy_url_for_target("https://api.example.com/", &env, None)
+                .await
+                .expect("ok")
+                .is_none()
+        );
+        assert!(
+            resolve_http_proxy_url_for_target("https://api.example.com:8443/", &env, None)
+                .await
+                .expect("ok")
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -16,27 +16,37 @@ pub struct PackageStore {
 
 impl PackageStore {
     pub fn new(global_dir: PathBuf, project_root: Option<PathBuf>) -> Self {
-        Self { global_dir, project_root }
+        Self {
+            global_dir,
+            project_root,
+        }
     }
 
     /// The packages root dir for a scope (`<global>/packages` or `<project>/.cyrup/packages`).
     pub fn packages_root(&self, scope: InstallScope) -> Option<PathBuf> {
         match scope {
             InstallScope::Global => Some(self.global_dir.join("packages")),
-            InstallScope::Project => self.project_root.as_ref().map(|r| r.join(".cyrup").join("packages")),
+            InstallScope::Project => self
+                .project_root
+                .as_ref()
+                .map(|r| r.join(".cyrup").join("packages")),
         }
     }
 
     /// The working-tree dir for a package id in a scope.
     pub fn package_dir(&self, scope: InstallScope, id: &PackageId) -> Option<PathBuf> {
-        self.packages_root(scope).map(|root| root.join(id_dir_name(id)))
+        self.packages_root(scope)
+            .map(|root| root.join(id_dir_name(id)))
     }
 
     /// The `packages.json` registry path for a scope.
     pub fn registry_path(&self, scope: InstallScope) -> Option<PathBuf> {
         match scope {
             InstallScope::Global => Some(self.global_dir.join("packages.json")),
-            InstallScope::Project => self.project_root.as_ref().map(|r| r.join(".cyrup").join("packages.json")),
+            InstallScope::Project => self
+                .project_root
+                .as_ref()
+                .map(|r| r.join(".cyrup").join("packages.json")),
         }
     }
 }
@@ -54,6 +64,9 @@ pub fn installed_dir(
     if let PackageSource::Path { path } = source {
         return Some(path.clone());
     }
-    let store = PackageStore::new(global_dir.to_path_buf(), project_root.map(Path::to_path_buf));
+    let store = PackageStore::new(
+        global_dir.to_path_buf(),
+        project_root.map(Path::to_path_buf),
+    );
     store.package_dir(scope, id)
 }

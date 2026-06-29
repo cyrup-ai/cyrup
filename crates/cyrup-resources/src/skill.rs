@@ -38,7 +38,11 @@ pub struct SkillFrontMatter {
     pub disable_model_invocation: bool,
     /// Standard optional field. Accepts the Agent Skills standard kebab key `allowed-tools` as
     /// well as `allowedTools` (A-09-10, cross-harness fidelity).
-    #[serde(default, alias = "allowed-tools", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        alias = "allowed-tools",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub allowed_tools: Vec<String>,
     /// Unmodelled keys round-trip unchanged.
     #[serde(flatten)]
@@ -53,8 +57,15 @@ pub fn validate_name(name: &str) -> Vec<String> {
     if len > MAX_NAME_LENGTH {
         errors.push(format!("name exceeds {MAX_NAME_LENGTH} characters ({len})"));
     }
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-        errors.push("name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)".to_string());
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        errors.push(
+            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"
+                .to_string(),
+        );
     }
     if name.starts_with('-') || name.ends_with('-') {
         errors.push("name must not start or end with a hyphen".to_string());
@@ -74,7 +85,9 @@ pub fn validate_description(description: Option<&str>) -> Vec<String> {
         Some(d) => {
             let len = d.chars().count();
             if len > MAX_DESCRIPTION_LENGTH {
-                errors.push(format!("description exceeds {MAX_DESCRIPTION_LENGTH} characters ({len})"));
+                errors.push(format!(
+                    "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({len})"
+                ));
             }
         }
     }
@@ -158,9 +171,12 @@ impl Skill {
     ) -> Result<(Option<Skill>, Vec<ResourceDiagnostic>), ResourceError> {
         let raw = std::fs::read_to_string(skill_md)?;
         let front: SkillFrontMatter = match split_front_matter(&raw).0 {
-            Some(front_str) => serde_yml::from_str(&front_str).map_err(|e| {
-                ResourceError::FrontMatter { path: skill_md.to_path_buf(), reason: e.to_string() }
-            })?,
+            Some(front_str) => {
+                serde_yml::from_str(&front_str).map_err(|e| ResourceError::FrontMatter {
+                    path: skill_md.to_path_buf(),
+                    reason: e.to_string(),
+                })?
+            }
             // No frontmatter block → empty frontmatter (utils/frontmatter.ts returns `{}`).
             None => SkillFrontMatter {
                 name: None,
@@ -172,8 +188,11 @@ impl Skill {
         };
 
         let dir = skill_md.parent().map(Path::to_path_buf).unwrap_or_default();
-        let parent_dir_name =
-            dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let parent_dir_name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
         // name = frontmatter name, else parent directory name (skills.ts:296).
         let name = match front.name.as_deref() {
             Some(n) if !n.is_empty() => n.to_string(),
@@ -182,14 +201,25 @@ impl Skill {
 
         let mut diagnostics: Vec<ResourceDiagnostic> = Vec::new();
         for msg in validate_description(front.description.as_deref()) {
-            diagnostics.push(ResourceDiagnostic::warning(ResourceKind::Skill, skill_md, msg));
+            diagnostics.push(ResourceDiagnostic::warning(
+                ResourceKind::Skill,
+                skill_md,
+                msg,
+            ));
         }
         for msg in validate_name(&name) {
-            diagnostics.push(ResourceDiagnostic::warning(ResourceKind::Skill, skill_md, msg));
+            diagnostics.push(ResourceDiagnostic::warning(
+                ResourceKind::Skill,
+                skill_md,
+                msg,
+            ));
         }
 
         // Drop the skill entirely when the description is missing/blank (skills.ts:305-307).
-        let has_description = front.description.as_deref().is_some_and(|d| !d.trim().is_empty());
+        let has_description = front
+            .description
+            .as_deref()
+            .is_some_and(|d| !d.trim().is_empty());
         if !has_description {
             return Ok((None, diagnostics));
         }
@@ -254,6 +284,10 @@ pub(crate) fn split_front_matter(raw: &str) -> (Option<String>, String) {
     // Pi: `yamlString = normalized.slice(4, endIndex)` (skips the opening `---` + one char).
     let yaml = normalized.get(4..end_index).unwrap_or("").to_string();
     // Pi: `body = normalized.slice(endIndex + 4).trim()` (skips the closing `\n---`).
-    let body = normalized.get(end_index.saturating_add(4)..).unwrap_or("").trim().to_string();
+    let body = normalized
+        .get(end_index.saturating_add(4)..)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     (Some(yaml), body)
 }

@@ -213,11 +213,16 @@ fn collect_skill_files(dir: &Path, root_level: bool, out: &mut Vec<PathBuf>) {
         out.push(skill_md);
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     children.sort();
     for path in children {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with('.') || name == "node_modules" {
             continue;
         }
@@ -232,11 +237,16 @@ fn collect_skill_files(dir: &Path, root_level: bool, out: &mut Vec<PathBuf>) {
 /// Recursively collect files with the given extension (1:1 with Pi `collectFiles`,
 /// package-manager.ts:295-343). Dot-entries and `node_modules` are skipped.
 fn collect_files_with_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     children.sort();
     for path in children {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with('.') || name == "node_modules" {
             continue;
         }
@@ -337,7 +347,11 @@ pub(crate) fn resolve_local_entries(
             // `resolvePathFromBase` with `trim: true`: a trimmed, base-relative (or absolute) path.
             let trimmed = entry.trim();
             let p = PathBuf::from(trimmed);
-            plain.push(if p.is_absolute() { p } else { base.join(trimmed) });
+            plain.push(if p.is_absolute() {
+                p
+            } else {
+                base.join(trimmed)
+            });
         }
     }
     let all = collect_files_from_paths(&plain, rtype);
@@ -370,7 +384,10 @@ fn apply_patterns_full(base: &Path, all: &[PathBuf], patterns: &[String]) -> Vec
     let mut result: Vec<PathBuf> = if includes.is_empty() {
         all.to_vec()
     } else {
-        all.iter().filter(|p| matches_any_pattern(base, p, &includes)).cloned().collect()
+        all.iter()
+            .filter(|p| matches_any_pattern(base, p, &includes))
+            .cloned()
+            .collect()
     };
     // Step 2: drop plain excludes (glob).
     if !excludes.is_empty() {
@@ -456,13 +473,17 @@ fn normalize_exact(pattern: &str) -> String {
 /// tested.
 fn matches_any_pattern(base: &Path, path: &Path, patterns: &[String]) -> bool {
     let rel = rel_posix(base, path);
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let abs = to_posix(path);
     let is_skill = name == "SKILL.md";
     let parent = if is_skill { path.parent() } else { None };
     let parent_rel = parent.map(|p| rel_posix(base, p));
-    let parent_name =
-        parent.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
+    let parent_name = parent
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
     let parent_abs = parent.map(to_posix);
 
     patterns.iter().any(|pat| {
@@ -486,7 +507,10 @@ fn matches_any_pattern(base: &Path, path: &Path, patterns: &[String]) -> bool {
 fn matches_any_exact(base: &Path, path: &Path, patterns: &[String]) -> bool {
     let rel = rel_posix(base, path);
     let abs = to_posix(path);
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let is_skill = name == "SKILL.md";
     let parent = if is_skill { path.parent() } else { None };
     let parent_rel = parent.map(|p| rel_posix(base, p));
@@ -500,8 +524,7 @@ fn matches_any_exact(base: &Path, path: &Path, patterns: &[String]) -> bool {
         if !is_skill {
             return false;
         }
-        parent_rel.as_deref() == Some(np.as_str())
-            || parent_abs.as_deref() == Some(np.as_str())
+        parent_rel.as_deref() == Some(np.as_str()) || parent_abs.as_deref() == Some(np.as_str())
     })
 }
 
@@ -510,7 +533,9 @@ fn matches_any_exact(base: &Path, path: &Path, patterns: &[String]) -> bool {
 /// (globset default), matching Pi's glob semantics. Both files and directories match (`nodir:false`).
 fn expand_glob(dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
     let normalized = pattern.strip_prefix("./").unwrap_or(pattern);
-    let Ok(glob) = globset::Glob::new(normalized) else { return };
+    let Ok(glob) = globset::Glob::new(normalized) else {
+        return;
+    };
     let matcher = glob.compile_matcher();
     let mut matches: Vec<PathBuf> = Vec::new();
     walk_tree(dir, dir, &matcher, &mut matches);
@@ -520,16 +545,16 @@ fn expand_glob(dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
 
 /// Recursively collect every path under `root` whose root-relative path matches `matcher`.
 /// Dot-directories and `node_modules` are skipped (consistent with the skill/resource walk).
-fn walk_tree(
-    root: &Path,
-    dir: &Path,
-    matcher: &globset::GlobMatcher,
-    out: &mut Vec<PathBuf>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+fn walk_tree(root: &Path, dir: &Path, matcher: &globset::GlobMatcher, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with('.') || name == "node_modules" {
             continue;
         }

@@ -88,11 +88,7 @@ pub async fn find_env_keys(
             found.push((*var).to_string());
         }
     }
-    if found.is_empty() {
-        None
-    } else {
-        Some(found)
-    }
+    if found.is_empty() { None } else { Some(found) }
 }
 
 /// Sentinel returned for ambient-credential providers (Vertex ADC / Bedrock) that are configured
@@ -116,10 +112,15 @@ pub async fn get_env_api_key(
     // Vertex AI: explicit api key OR Application Default Credentials (env-api-keys.ts:144).
     if provider == "google-vertex" {
         let has_credentials = has_vertex_adc_credentials(ctx, env).await;
-        let has_project = get_provider_env_value("GOOGLE_CLOUD_PROJECT", ctx, env).await.is_some()
-            || get_provider_env_value("GCLOUD_PROJECT", ctx, env).await.is_some();
-        let has_location =
-            get_provider_env_value("GOOGLE_CLOUD_LOCATION", ctx, env).await.is_some();
+        let has_project = get_provider_env_value("GOOGLE_CLOUD_PROJECT", ctx, env)
+            .await
+            .is_some()
+            || get_provider_env_value("GCLOUD_PROJECT", ctx, env)
+                .await
+                .is_some();
+        let has_location = get_provider_env_value("GOOGLE_CLOUD_LOCATION", ctx, env)
+            .await
+            .is_some();
         if has_credentials && has_project && has_location {
             return Some(AUTHENTICATED_SENTINEL.to_string());
         }
@@ -146,24 +147,25 @@ pub async fn get_env_api_key(
 /// Detect Google Application Default Credentials (1:1 with `hasVertexAdcCredentials`,
 /// `env-api-keys.ts:31`): an explicit `GOOGLE_APPLICATION_CREDENTIALS` path, else the default
 /// `~/.config/gcloud/application_default_credentials.json`.
-pub async fn has_vertex_adc_credentials(
-    ctx: &dyn AuthContext,
-    env: Option<&ProviderEnv>,
-) -> bool {
+pub async fn has_vertex_adc_credentials(ctx: &dyn AuthContext, env: Option<&ProviderEnv>) -> bool {
     if let Some(path) = get_provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", ctx, env).await {
         return ctx.file_exists(&path).await;
     }
     // Default ADC location under the home directory.
     if let Some(home) = ctx.env("HOME").await.filter(|h| !h.is_empty()) {
-        let default_path =
-            format!("{home}/.config/gcloud/application_default_credentials.json");
+        let default_path = format!("{home}/.config/gcloud/application_default_credentials.json");
         return ctx.file_exists(&default_path).await;
     }
     false
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -183,7 +185,10 @@ mod tests {
     }
     fn ctx(pairs: &[(&str, &str)]) -> MapCtx {
         MapCtx {
-            env: pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+            env: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
             files: Vec::new(),
         }
     }
@@ -191,12 +196,35 @@ mod tests {
     #[test]
     fn map_covers_every_fleet_provider() {
         for p in [
-            "openai", "anthropic", "google", "groq", "cerebras", "xai", "openrouter", "deepseek",
-            "nvidia", "moonshotai", "moonshotai-cn", "zai", "zai-coding-cn", "ant-ling",
-            "huggingface", "together", "fireworks", "mistral", "minimax", "github-copilot",
-            "xiaomi", "xiaomi-token-plan-cn", "xiaomi-token-plan-ams", "xiaomi-token-plan-sgp",
+            "openai",
+            "anthropic",
+            "google",
+            "groq",
+            "cerebras",
+            "xai",
+            "openrouter",
+            "deepseek",
+            "nvidia",
+            "moonshotai",
+            "moonshotai-cn",
+            "zai",
+            "zai-coding-cn",
+            "ant-ling",
+            "huggingface",
+            "together",
+            "fireworks",
+            "mistral",
+            "minimax",
+            "github-copilot",
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-sgp",
         ] {
-            assert!(api_key_env_vars(p).is_some(), "missing env-key mapping for {p}");
+            assert!(
+                api_key_env_vars(p).is_some(),
+                "missing env-key mapping for {p}"
+            );
         }
         assert!(api_key_env_vars("does-not-exist").is_none());
     }
@@ -204,18 +232,33 @@ mod tests {
     #[tokio::test]
     async fn anthropic_oauth_token_takes_precedence() {
         // Both present: OAUTH token wins (it is listed first).
-        let c = ctx(&[("ANTHROPIC_OAUTH_TOKEN", "oauth-tok"), ("ANTHROPIC_API_KEY", "sk-ant")]);
-        assert_eq!(get_env_api_key("anthropic", &c, None).await.as_deref(), Some("oauth-tok"));
+        let c = ctx(&[
+            ("ANTHROPIC_OAUTH_TOKEN", "oauth-tok"),
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+        ]);
+        assert_eq!(
+            get_env_api_key("anthropic", &c, None).await.as_deref(),
+            Some("oauth-tok")
+        );
         // Only the api key present: it is used.
         let c = ctx(&[("ANTHROPIC_API_KEY", "sk-ant")]);
-        assert_eq!(get_env_api_key("anthropic", &c, None).await.as_deref(), Some("sk-ant"));
+        assert_eq!(
+            get_env_api_key("anthropic", &c, None).await.as_deref(),
+            Some("sk-ant")
+        );
     }
 
     #[tokio::test]
     async fn moonshot_cn_shares_moonshot_key() {
         let c = ctx(&[("MOONSHOT_API_KEY", "ms-key")]);
-        assert_eq!(get_env_api_key("moonshotai", &c, None).await.as_deref(), Some("ms-key"));
-        assert_eq!(get_env_api_key("moonshotai-cn", &c, None).await.as_deref(), Some("ms-key"));
+        assert_eq!(
+            get_env_api_key("moonshotai", &c, None).await.as_deref(),
+            Some("ms-key")
+        );
+        assert_eq!(
+            get_env_api_key("moonshotai-cn", &c, None).await.as_deref(),
+            Some("ms-key")
+        );
     }
 
     #[tokio::test]
@@ -246,7 +289,10 @@ mod tests {
     async fn vertex_requires_credentials_project_and_location() {
         // Explicit api key path short-circuits to the literal key.
         let c = ctx(&[("GOOGLE_CLOUD_API_KEY", "vk")]);
-        assert_eq!(get_env_api_key("google-vertex", &c, None).await.as_deref(), Some("vk"));
+        assert_eq!(
+            get_env_api_key("google-vertex", &c, None).await.as_deref(),
+            Some("vk")
+        );
 
         // ADC sentinel only when credentials + project + location are all present.
         let mut m = MapCtx {
@@ -256,7 +302,10 @@ mod tests {
                     "/creds/adc.json".to_string(),
                 ),
                 ("GOOGLE_CLOUD_PROJECT".to_string(), "proj".to_string()),
-                ("GOOGLE_CLOUD_LOCATION".to_string(), "us-central1".to_string()),
+                (
+                    "GOOGLE_CLOUD_LOCATION".to_string(),
+                    "us-central1".to_string(),
+                ),
             ]),
             files: vec!["/creds/adc.json".to_string()],
         };
@@ -279,7 +328,10 @@ mod tests {
         // IAM pair requires BOTH keys.
         let c = ctx(&[("AWS_ACCESS_KEY_ID", "id")]);
         assert!(get_env_api_key("amazon-bedrock", &c, None).await.is_none());
-        let c = ctx(&[("AWS_ACCESS_KEY_ID", "id"), ("AWS_SECRET_ACCESS_KEY", "sec")]);
+        let c = ctx(&[
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "sec"),
+        ]);
         assert_eq!(
             get_env_api_key("amazon-bedrock", &c, None).await.as_deref(),
             Some(AUTHENTICATED_SENTINEL)

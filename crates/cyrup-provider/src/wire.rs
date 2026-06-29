@@ -10,9 +10,10 @@
 //! Concrete providers (anthropic/together/…) are `WireProvider` + a catalog + an api mapping; those
 //! land in the next steps.
 
-use crate::api::{channel, ApiRegistry};
+use crate::api::{ApiRegistry, channel};
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthOverrides, CredentialStore, EnvAuthContext, ProviderAuth,
+    AuthContext, AuthOverrides, CredentialStore, EnvAuthContext, ProviderAuth,
+    resolve_provider_auth,
 };
 use crate::context::Context;
 use crate::error::ProviderError;
@@ -108,8 +109,10 @@ impl Provider for WireProvider {
             // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018). The
             // provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
             // base-url (Pi `applyAuth`, models.ts:240-241).
-            let overrides =
-                AuthOverrides { api_key: options.api_key.as_deref(), env: options.env.as_ref() };
+            let overrides = AuthOverrides {
+                api_key: options.api_key.as_deref(),
+                env: options.env.as_ref(),
+            };
             let mut auth_result = match resolve_provider_auth(
                 &id,
                 &auth,
@@ -162,7 +165,9 @@ impl Provider for WireProvider {
             };
 
             // 3. Drive the wire protocol. `run` emits Start..deltas..terminal into the sink.
-            api_impl.run(&model, &context, &auth_result, &options, cancel, sink).await;
+            api_impl
+                .run(&model, &context, &auth_result, &options, cancel, sink)
+                .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -170,15 +175,20 @@ impl Provider for WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::{ApiImpl, EventSink};
     use crate::auth::types::{AuthContext, AuthResult, Credential};
-    use crate::auth::{env_key, InMemoryCredentialStore};
+    use crate::auth::{InMemoryCredentialStore, env_key};
     use crate::model::{Modality, ModelCost};
-    use crate::stream::sse::{open_sse, SseRequest};
     use crate::stream::collect_message;
+    use crate::stream::sse::{SseRequest, open_sse};
     use cyrup_core::{ApiId, CancelToken, Content, ToolCall, ToolCallId, Usage};
     use futures::StreamExt;
     use std::collections::BTreeMap;
@@ -275,8 +285,15 @@ mod tests {
             if let Ok(mut g) = self.seen_key.lock() {
                 *g = auth.auth.api_key.clone();
             }
-            sink.send(StreamEvent::Start { partial: test_partial() }).await;
-            sink.send(StreamEvent::TextStart { content_index: 0, partial: test_partial() }).await;
+            sink.send(StreamEvent::Start {
+                partial: test_partial(),
+            })
+            .await;
+            sink.send(StreamEvent::TextStart {
+                content_index: 0,
+                partial: test_partial(),
+            })
+            .await;
             sink.send(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "hi".into(),
@@ -289,8 +306,11 @@ mod tests {
                 partial: test_partial(),
             })
             .await;
-            sink.send(StreamEvent::ToolCallStart { content_index: 1, partial: test_partial() })
-                .await;
+            sink.send(StreamEvent::ToolCallStart {
+                content_index: 1,
+                partial: test_partial(),
+            })
+            .await;
             sink.send(StreamEvent::ToolCallDelta {
                 content_index: 1,
                 delta: "{\"x\":1}".into(),
@@ -300,7 +320,10 @@ mod tests {
             let tc = ToolCall {
                 id: ToolCallId::from("c1"),
                 name: "echo".into(),
-                arguments: serde_json::json!({"x": 1}).as_object().cloned().expect("object"),
+                arguments: serde_json::json!({"x": 1})
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
                 thought_signature: None,
             };
             sink.send(StreamEvent::ToolCallEnd {
@@ -315,7 +338,10 @@ mod tests {
                     Content::ToolCall(ToolCall {
                         id: ToolCallId::from("c1"),
                         name: "echo".into(),
-                        arguments: serde_json::json!({"x": 1}).as_object().cloned().expect("object"),
+                        arguments: serde_json::json!({"x": 1})
+                            .as_object()
+                            .cloned()
+                            .expect("object"),
                         thought_signature: None,
                     }),
                 ],
@@ -345,8 +371,7 @@ mod tests {
         }));
         let provider = provider_with(registry, &model);
 
-        let mut stream =
-            provider.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut stream = provider.stream(&model, &Context::default(), &StreamOptions::default());
         let mut events = Vec::new();
         while let Some(ev) = stream.next().await {
             events.push(ev);
@@ -354,12 +379,20 @@ mod tests {
 
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::TextDelta { content_index: 0, .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ToolCallEnd { content_index: 1, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::TextDelta {
+                content_index: 0,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallEnd {
+                content_index: 1,
+                ..
+            }
+        )));
         // Stored credential flowed through to the ApiImpl (auth resolution wired end-to-end).
         assert_eq!(seen_key.lock().unwrap().as_deref(), Some("sk-test"));
     }
@@ -450,7 +483,10 @@ mod tests {
                 }
             };
 
-            sink.send(StreamEvent::Start { partial: test_partial() }).await;
+            sink.send(StreamEvent::Start {
+                partial: test_partial(),
+            })
+            .await;
             let mut idx = 0usize;
             let mut text = String::new();
             while let Some(frame) = frames.next().await {
@@ -521,7 +557,9 @@ mod tests {
         let mut model = test_model("sse-echo");
         model.base_url = base_url;
         let registry = ApiRegistry::new();
-        registry.register_impl(Arc::new(SseEchoApi { api: ApiId::from("sse-echo") }));
+        registry.register_impl(Arc::new(SseEchoApi {
+            api: ApiId::from("sse-echo"),
+        }));
         (provider_with(registry, &model), model)
     }
 
@@ -530,8 +568,7 @@ mod tests {
         let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: alpha\n\ndata: beta\n\ndata: [DONE]\n\n";
         let url = spawn_mock(body).await;
         let (provider, model) = sse_provider(url);
-        let mut stream =
-            provider.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut stream = provider.stream(&model, &Context::default(), &StreamOptions::default());
         let mut deltas = Vec::new();
         let mut terminal = None;
         while let Some(ev) = stream.next().await {
@@ -576,7 +613,14 @@ mod tests {
         ))
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert_eq!(msg.error_message.unwrap().chars().take(9).collect::<String>(), "transport".to_string());
+        assert_eq!(
+            msg.error_message
+                .unwrap()
+                .chars()
+                .take(9)
+                .collect::<String>(),
+            "transport".to_string()
+        );
     }
 
     #[tokio::test]
@@ -596,10 +640,15 @@ mod tests {
         let mut model = test_model("sse-echo");
         model.base_url = format!("http://{addr}/v1/stream");
         let registry = ApiRegistry::new();
-        registry.register_impl(Arc::new(SseEchoApi { api: ApiId::from("sse-echo") }));
+        registry.register_impl(Arc::new(SseEchoApi {
+            api: ApiId::from("sse-echo"),
+        }));
         let provider = provider_with(registry, &model);
 
-        let opts = StreamOptions { cancel: Some(cancel.clone()), ..Default::default() };
+        let opts = StreamOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
         let stream = provider.stream(&model, &Context::default(), &opts);
 
         // Cancel shortly after starting.

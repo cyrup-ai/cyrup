@@ -4,10 +4,10 @@
 //! `OPENROUTER_API_KEY` (Pi `envApiKeyAuth("OpenRouter API key", ["OPENROUTER_API_KEY"])`). Its
 //! catalog is the verbatim generated `IMAGE_MODELS.openrouter` (37 models).
 
-use crate::auth::{env_key, ProviderAuth};
+use crate::auth::{ProviderAuth, env_key};
 use crate::images::{
-    create_images_provider, openrouter, openrouter_image_models, BuiltImagesProvider,
-    CreateImagesProviderOptions, OPENROUTER_PROVIDER_ID,
+    BuiltImagesProvider, CreateImagesProviderOptions, OPENROUTER_PROVIDER_ID,
+    create_images_provider, openrouter, openrouter_image_models,
 };
 
 /// The OpenRouter image provider's [`ProviderAuth`]: `OPENROUTER_API_KEY` (Pi `envApiKeyAuth`).
@@ -28,12 +28,17 @@ pub fn openrouter_images_provider() -> BuiltImagesProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
     use crate::collection::CreateModelsOptions;
-    use crate::images::{create_images_models, ImagesContext, ImagesOptions, ImagesStopReason};
+    use crate::images::{ImagesContext, ImagesOptions, ImagesStopReason, create_images_models};
     use cyrup_core::Content;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -68,9 +73,15 @@ mod tests {
             auth_context: Some(Arc::new(MapEnv(BTreeMap::new()))),
         });
         models.set_provider(Arc::new(openrouter_images_provider()));
-        let m = models.get_model("openrouter", "google/gemini-2.5-flash-image").expect("model");
-        let ctx = ImagesContext { input: vec![Content::text("a red square")] };
-        let out = models.generate_images(&m, &ctx, &ImagesOptions::default()).await;
+        let m = models
+            .get_model("openrouter", "google/gemini-2.5-flash-image")
+            .expect("model");
+        let ctx = ImagesContext {
+            input: vec![Content::text("a red square")],
+        };
+        let out = models
+            .generate_images(&m, &ctx, &ImagesOptions::default())
+            .await;
         assert_eq!(out.stop_reason, ImagesStopReason::Error);
         assert!(out.error_message.unwrap().contains("No API key"));
     }

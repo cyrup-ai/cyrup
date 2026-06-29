@@ -7,8 +7,8 @@
 //! provider has no provider-level base URL; the per-model `baseUrl` drives each request. The shared
 //! [`builtin_registry`] already provides all four wire impls, so this provider is purely additive.
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -48,11 +48,19 @@ pub fn opencode_provider_with(
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.
 pub fn opencode_provider() -> WireProvider {
-    opencode_provider_with(Arc::new(InMemoryCredentialStore::new()), Arc::new(builtin_registry()))
+    opencode_provider_with(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
@@ -61,7 +69,7 @@ mod tests {
         ANTHROPIC_MESSAGES, GOOGLE_GENERATIVE_AI, OPENAI_COMPLETIONS, OPENAI_RESPONSES,
     };
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::StopReason;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -148,7 +156,13 @@ mod tests {
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 }

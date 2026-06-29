@@ -43,7 +43,10 @@ pub async fn resolve_provider_auth(
 
     // 1. Explicit per-request key (highest precedence, R-01-011 #1).
     if let (Some(key), Some(api_key_auth)) = (overrides.api_key, auth.api_key.as_ref()) {
-        let cred = Credential::ApiKey { key: Some(key.to_string()), env: overrides.env.cloned() };
+        let cred = Credential::ApiKey {
+            key: Some(key.to_string()),
+            env: overrides.env.cloned(),
+        };
         return api_key_auth.resolve(model, req_ctx, Some(&cred)).await;
     }
 
@@ -87,7 +90,10 @@ fn merge_credential_env(cred: Credential, overlay: Option<&ProviderEnv>) -> Cred
             for (k, v) in overlay {
                 merged.insert(k.clone(), v.clone());
             }
-            Credential::ApiKey { key, env: Some(merged) }
+            Credential::ApiKey {
+                key,
+                env: Some(merged),
+            }
         }
         (cred, _) => cred,
     }
@@ -167,7 +173,11 @@ async fn resolve_stored_oauth(
     };
 
     let auth = oauth.to_auth(&cred).await?;
-    Ok(Some(AuthResult { auth, env: cred.env().cloned(), source: Some("OAuth".to_string()) }))
+    Ok(Some(AuthResult {
+        auth,
+        env: cred.env().cloned(),
+        source: Some("OAuth".to_string()),
+    }))
 }
 
 fn now_secs() -> i64 {
@@ -181,10 +191,10 @@ fn now_secs() -> i64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::auth::OAuthAuth;
     use crate::auth::helpers::env_key;
     use crate::auth::store::InMemoryCredentialStore;
     use crate::auth::types::{AuthContext, Credential, ModelAuth};
-    use crate::auth::OAuthAuth;
     use crate::model::{Modality, Model, ModelCost};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -223,7 +233,10 @@ mod tests {
     async fn stored_beats_env() {
         let store = InMemoryCredentialStore::new()
             .with_credential(ProviderId::from("p"), Credential::api_key("stored-key"));
-        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "env-key".to_string())]));
+        let ctx = MapCtx(BTreeMap::from([(
+            "API_KEY".to_string(),
+            "env-key".to_string(),
+        )]));
         let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
@@ -243,7 +256,10 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_env_when_nothing_stored() {
         let store = InMemoryCredentialStore::new();
-        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "env-key".to_string())]));
+        let ctx = MapCtx(BTreeMap::from([(
+            "API_KEY".to_string(),
+            "env-key".to_string(),
+        )]));
         let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
@@ -276,7 +292,10 @@ mod tests {
             &test_model(),
             &store,
             &ctx,
-            AuthOverrides { api_key: None, env: Some(&overlay) },
+            AuthOverrides {
+                api_key: None,
+                env: Some(&overlay),
+            },
         )
         .await
         .unwrap()
@@ -290,7 +309,10 @@ mod tests {
     #[tokio::test]
     async fn overlay_env_precedence_and_empty_fallthrough() {
         let store = InMemoryCredentialStore::new();
-        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "ambient-key".to_string())]));
+        let ctx = MapCtx(BTreeMap::from([(
+            "API_KEY".to_string(),
+            "ambient-key".to_string(),
+        )]));
         let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
 
         // Non-empty overlay wins.
@@ -301,7 +323,10 @@ mod tests {
             &test_model(),
             &store,
             &ctx,
-            AuthOverrides { api_key: None, env: Some(&overlay) },
+            AuthOverrides {
+                api_key: None,
+                env: Some(&overlay),
+            },
         )
         .await
         .unwrap()
@@ -316,7 +341,10 @@ mod tests {
             &test_model(),
             &store,
             &ctx,
-            AuthOverrides { api_key: None, env: Some(&empty) },
+            AuthOverrides {
+                api_key: None,
+                env: Some(&empty),
+            },
         )
         .await
         .unwrap()
@@ -340,15 +368,20 @@ mod tests {
         );
         let ctx = MapCtx(BTreeMap::new());
         let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
-        let overlay =
-            BTreeMap::from([("B".to_string(), "overlay-b".to_string()), ("C".to_string(), "overlay-c".to_string())]);
+        let overlay = BTreeMap::from([
+            ("B".to_string(), "overlay-b".to_string()),
+            ("C".to_string(), "overlay-c".to_string()),
+        ]);
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
             &auth,
             &test_model(),
             &store,
             &ctx,
-            AuthOverrides { api_key: None, env: Some(&overlay) },
+            AuthOverrides {
+                api_key: None,
+                env: Some(&overlay),
+            },
         )
         .await
         .unwrap()
@@ -364,7 +397,10 @@ mod tests {
     async fn explicit_override_beats_stored_and_env() {
         let store = InMemoryCredentialStore::new()
             .with_credential(ProviderId::from("p"), Credential::api_key("stored-key"));
-        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "env-key".to_string())]));
+        let ctx = MapCtx(BTreeMap::from([(
+            "API_KEY".to_string(),
+            "env-key".to_string(),
+        )]));
         let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
         let r = resolve_provider_auth(
             &ProviderId::from("p"),
@@ -372,7 +408,10 @@ mod tests {
             &test_model(),
             &store,
             &ctx,
-            AuthOverrides { api_key: Some("explicit-key"), env: None },
+            AuthOverrides {
+                api_key: Some("explicit-key"),
+                env: None,
+            },
         )
         .await
         .unwrap()
@@ -426,8 +465,13 @@ mod tests {
             ext: serde_json::Map::new(),
         };
         let store = InMemoryCredentialStore::new().with_credential(ProviderId::from("p"), expired);
-        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "env-key".to_string())]));
-        let oauth = Arc::new(FailingOAuth { calls: AtomicUsize::new(0) });
+        let ctx = MapCtx(BTreeMap::from([(
+            "API_KEY".to_string(),
+            "env-key".to_string(),
+        )]));
+        let oauth = Arc::new(FailingOAuth {
+            calls: AtomicUsize::new(0),
+        });
         // Provider supports BOTH oauth and an env key — but the failed refresh must NOT use the env.
         let auth = ProviderAuth {
             api_key: Some(env_key(["API_KEY"])),

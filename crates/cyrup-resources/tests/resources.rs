@@ -21,9 +21,10 @@ use cyrup_resources::package::lock;
 use cyrup_resources::{
     DiagnosticType, DiscoveryConfig, InstallScope, InstalledPackage, InstalledPackages,
     PackageManager, PackageSource, PackageStore, ParsedGitUrl, PinRef, ResourceHandle,
-    ResourceOverrides, ResourceScope, ResourceSelector, SECURITY_CAVEAT, Skill, Theme, ThemeWatcher,
-    UpdateTarget, builtin_themes, discover, expand_prompt_template, has_unsafe_git_install_part,
-    parse_command_args, parse_git_url, resolve_manifest, substitute_args, validate_name,
+    ResourceOverrides, ResourceScope, ResourceSelector, SECURITY_CAVEAT, Skill, Theme,
+    ThemeWatcher, UpdateTarget, builtin_themes, discover, expand_prompt_template,
+    has_unsafe_git_install_part, parse_command_args, parse_git_url, resolve_manifest,
+    substitute_args, validate_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,25 +95,78 @@ async fn run_discover(c: &DiscoveryConfig) -> cyrup_resources::DiscoveryReport {
 async fn a09_1_skill_discovery_pointer_command_and_trust_gate() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join(".cyrup/skills/foo/SKILL.md"), &skill_md("foo", "use when frobbing"));
+    write(
+        &root.join(".cyrup/skills/foo/SKILL.md"),
+        &skill_md("foo", "use when frobbing"),
+    );
 
     // Untrusted project: the project-scoped skill is hidden (R-09-003, fail-closed).
     let mut c = cfg(root);
     c.trusted_project = false;
     let untrusted = run_discover(&c).await;
-    assert!(!untrusted.registry.skills.contains("foo"), "untrusted project must hide skills");
+    assert!(
+        !untrusted.registry.skills.contains("foo"),
+        "untrusted project must hide skills"
+    );
 
     // Trusted project: the skill surfaces with a pointer + /skill:foo command.
     c.trusted_project = true;
     let report = run_discover(&c).await;
-    let skill = report.registry.skills.get_name("foo").expect("foo skill discovered");
+    let skill = report
+        .registry
+        .skills
+        .get_name("foo")
+        .expect("foo skill discovered");
     assert_eq!(skill.scope, ResourceScope::Project);
     assert_eq!(skill.command(), "/skill:foo");
 
     let pointer = skill.pointer();
     assert_eq!(pointer.name, "foo");
     assert_eq!(pointer.description.as_deref(), Some("use when frobbing"));
-    assert!(pointer.path.ends_with("SKILL.md"), "pointer points at SKILL.md for on-demand read");
+    assert!(
+        pointer.path.ends_with("SKILL.md"),
+        "pointer points at SKILL.md for on-demand read"
+    );
+}
+
+#[tokio::test]
+async fn g1_project_loose_resources_load_from_cwd_root_only() {
+    // Pi loads loose project resources from a single root only — `<cwd>/.cyrup/skills`
+    // (skills.ts:432 `resolve(resolvedCwd, CONFIG_DIR_NAME, "skills")`) — never every ancestor
+    // between cwd and the project root. A SKILL.md in an ancestor's `.cyrup/skills` must NOT be
+    // discovered; only the cwd root's loose skills load.
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path();
+    let nested = proj.join("sub/dir");
+    fs::create_dir_all(&nested).unwrap();
+
+    // ancestor (project_root) loose skill — must be ignored (no ancestor over-walk)
+    write(
+        &proj.join(".cyrup/skills/ancestor/SKILL.md"),
+        &skill_md("ancestor", "in the project root"),
+    );
+    // cwd loose skill — must load
+    write(
+        &nested.join(".cyrup/skills/here/SKILL.md"),
+        &skill_md("here", "in the cwd"),
+    );
+
+    let global = proj.join("global");
+    fs::create_dir_all(&global).unwrap();
+    let mut c = DiscoveryConfig::new(&nested, &global);
+    c.project_root = Some(proj.to_path_buf());
+    c.cwd = nested.clone();
+    c.trusted_project = true;
+
+    let report = run_discover(&c).await;
+    assert!(
+        report.registry.skills.contains("here"),
+        "cwd-rooted loose skill must load"
+    );
+    assert!(
+        !report.registry.skills.contains("ancestor"),
+        "ancestor `.cyrup/skills` must NOT be walked (Pi loads from cwd root only)"
+    );
 }
 
 #[tokio::test]
@@ -129,17 +183,30 @@ license: MIT\n\
     let p = tmp.path().join("skills/pdf/SKILL.md");
     write(&p, md);
 
-    let skill = Skill::load(&p, ResourceScope::Cli, cyrup_resources::ResourceOrigin::Builtin)
-        .expect("standard SKILL.md loads unchanged");
+    let skill = Skill::load(
+        &p,
+        ResourceScope::Cli,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .expect("standard SKILL.md loads unchanged");
     assert_eq!(skill.name, "pdf-processing");
     assert_eq!(skill.front.name.as_deref(), Some("pdf-processing"));
-    assert_eq!(skill.front.allowed_tools, vec!["read".to_string(), "bash".to_string()]);
-    assert!(skill.front.extra.contains_key("license"), "unmodelled keys round-trip via extra");
+    assert_eq!(
+        skill.front.allowed_tools,
+        vec!["read".to_string(), "bash".to_string()]
+    );
+    assert!(
+        skill.front.extra.contains_key("license"),
+        "unmodelled keys round-trip via extra"
+    );
 
     // Body is lazily read (R-09-026) and excludes the front-matter.
     let body = skill.read_body().await.unwrap();
     assert!(body.contains("Steps to process a PDF."));
-    assert!(!body.contains("pdf-processing"), "front-matter excluded from body");
+    assert!(
+        !body.contains("pdf-processing"),
+        "front-matter excluded from body"
+    );
 }
 
 // ===========================================================================
@@ -158,14 +225,21 @@ async fn a09_2_prompt_expansion_shell_args_and_disable() {
 
     let mut c = cfg(root);
     let report = run_discover(&c).await;
-    let tmpl = report.registry.prompts.get_name("review").expect("/review template discovered");
+    let tmpl = report
+        .registry
+        .prompts
+        .get_name("review")
+        .expect("/review template discovered");
     // name case is preserved (prompt-templates.ts:108); registry key is normalized.
     assert_eq!(tmpl.name, "Review");
     assert_eq!(tmpl.description, "Review a PR");
     assert_eq!(tmpl.argument_hint.as_deref(), Some("<pr> [focus]"));
 
     // `$1`, `$@`, and `${2:-default}` substitution.
-    assert_eq!(tmpl.expand("42 perf"), "Review 42 focusing on perf: 42 perf");
+    assert_eq!(
+        tmpl.expand("42 perf"),
+        "Review 42 focusing on perf: 42 perf"
+    );
     assert_eq!(tmpl.expand("42"), "Review 42 focusing on everything: 42");
 
     // `/name args` entry point matches case-sensitively (prompt-templates.ts:268-284).
@@ -175,14 +249,20 @@ async fn a09_2_prompt_expansion_shell_args_and_disable() {
         "Review 42 focusing on perf: 42 perf"
     );
     // Non-matching `/name` is returned unchanged.
-    assert_eq!(expand_prompt_template("/unknown x", all.iter()), "/unknown x");
+    assert_eq!(
+        expand_prompt_template("/unknown x", all.iter()),
+        "/unknown x"
+    );
     // A non-slash line is never expanded.
     assert_eq!(expand_prompt_template("hello $1", all.iter()), "hello $1");
 
     // --no-prompt-templates disables discovery (R-09-010).
     c.enable_prompts = false;
     let disabled = run_discover(&c).await;
-    assert!(!disabled.registry.prompts.contains("review"), "--no-prompt-templates disables it");
+    assert!(
+        !disabled.registry.prompts.contains("review"),
+        "--no-prompt-templates disables it"
+    );
 }
 
 #[test]
@@ -190,7 +270,11 @@ fn prompt_substitute_args_and_quote_parsing() {
     // Quote-aware tokenizer (prompt-templates.ts:24-55).
     assert_eq!(
         parse_command_args(r#"one "two three" 'four five'"#),
-        vec!["one".to_string(), "two three".to_string(), "four five".to_string()]
+        vec![
+            "one".to_string(),
+            "two three".to_string(),
+            "four five".to_string()
+        ]
     );
 
     let args = parse_command_args("a b c d");
@@ -268,8 +352,14 @@ async fn a09_2_frontmatter_body_trimmed_and_crlf_normalized() {
 #[tokio::test]
 async fn a09_3_builtin_dark_and_light_present() {
     let builtins = builtin_themes();
-    assert!(builtins.iter().any(|t| t.data.name == "dark"), "built-in dark exists (R-09-011)");
-    assert!(builtins.iter().any(|t| t.data.name == "light"), "built-in light exists (R-09-011)");
+    assert!(
+        builtins.iter().any(|t| t.data.name == "dark"),
+        "built-in dark exists (R-09-011)"
+    );
+    assert!(
+        builtins.iter().any(|t| t.data.name == "light"),
+        "built-in light exists (R-09-011)"
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let c = cfg(tmp.path());
@@ -284,17 +374,27 @@ async fn a09_3_theme_disable_flag() {
     let mut c = cfg(tmp.path());
     c.enable_themes = false;
     let report = run_discover(&c).await;
-    assert!(!report.registry.themes.contains("dark"), "--no-themes drops built-ins too");
+    assert!(
+        !report.registry.themes.contains("dark"),
+        "--no-themes drops built-ins too"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a09_3_theme_hot_reload_and_runtime_switch() {
     let tmp = tempfile::tempdir().unwrap();
     let active = tmp.path().join("active.json");
-    write(&active, &full_theme_json("mine", &[("bg", "#000000")], &[("background", "$bg")]));
+    write(
+        &active,
+        &full_theme_json("mine", &[("bg", "#000000")], &[("background", "$bg")]),
+    );
 
-    let theme = Theme::load(&active, ResourceScope::Cli, cyrup_resources::ResourceOrigin::Builtin)
-        .unwrap();
+    let theme = Theme::load(
+        &active,
+        ResourceScope::Cli,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .unwrap();
     let watcher = ThemeWatcher::spawn(
         std::sync::Arc::new(theme.data.clone()),
         active.clone(),
@@ -306,18 +406,29 @@ async fn a09_3_theme_hot_reload_and_runtime_switch() {
 
     // Mutate the active theme file; the watcher must publish the new theme (R-09-013).
     tokio::time::sleep(Duration::from_millis(120)).await;
-    write(&active, &full_theme_json("mine", &[("bg", "#ffffff")], &[("background", "$bg")]));
+    write(
+        &active,
+        &full_theme_json("mine", &[("bg", "#ffffff")], &[("background", "$bg")]),
+    );
 
     tokio::time::timeout(Duration::from_secs(5), rx.changed())
         .await
         .expect("hot-reload fired before timeout")
         .expect("watch channel open");
-    assert_eq!(rx.borrow().vars.get("bg").map(String::as_str), Some("#ffffff"));
+    assert_eq!(
+        rx.borrow().vars.get("bg").map(String::as_str),
+        Some("#ffffff")
+    );
 
     // Runtime switch to a different theme file (R-09-014).
     let other = tmp.path().join("other.json");
-    write(&other, &full_theme_json("other", &[], &[("foreground", "#abcdef")]));
-    watcher.retarget(other).expect("retarget to a new active theme");
+    write(
+        &other,
+        &full_theme_json("other", &[], &[("foreground", "#abcdef")]),
+    );
+    watcher
+        .retarget(other)
+        .expect("retarget to a new active theme");
     tokio::time::timeout(Duration::from_secs(5), rx.changed())
         .await
         .expect("retarget published before timeout")
@@ -341,10 +452,20 @@ fn theme_resolve_var_indirection_and_bad_hex() {
     let resolved = theme.resolve();
     assert_eq!(
         resolved.roles.get("background"),
-        Some(&cyrup_resources::ColorSpec::Rgb { r: 0x11, g: 0x22, b: 0x33 })
+        Some(&cyrup_resources::ColorSpec::Rgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33
+        })
     );
-    assert_eq!(resolved.roles.get("bad"), Some(&cyrup_resources::ColorSpec::Inherit));
-    assert_eq!(resolved.roles.get("blank"), Some(&cyrup_resources::ColorSpec::Inherit));
+    assert_eq!(
+        resolved.roles.get("bad"),
+        Some(&cyrup_resources::ColorSpec::Inherit)
+    );
+    assert_eq!(
+        resolved.roles.get("blank"),
+        Some(&cyrup_resources::ColorSpec::Inherit)
+    );
 }
 
 // ===========================================================================
@@ -352,9 +473,15 @@ fn theme_resolve_var_indirection_and_bad_hex() {
 // ===========================================================================
 
 fn make_package_tree(dir: &Path, with_manifest: bool, pi_key: bool) {
-    write(&dir.join("skills/alpha/SKILL.md"), &skill_md("alpha", "alpha skill"));
+    write(
+        &dir.join("skills/alpha/SKILL.md"),
+        &skill_md("alpha", "alpha skill"),
+    );
     write(&dir.join("prompts/greet.md"), "Hello {{who}}");
-    write(&dir.join("themes/midnight.json"), &full_theme_json("midnight", &[], &[]));
+    write(
+        &dir.join("themes/midnight.json"),
+        &full_theme_json("midnight", &[], &[]),
+    );
     fs::create_dir_all(dir.join("extensions/deploy")).unwrap();
     if with_manifest && !pi_key {
         write(
@@ -394,7 +521,10 @@ fn a09_4_manifest_resolution_toml_pi_and_autodiscover() {
     let t3 = tempfile::tempdir().unwrap();
     make_package_tree(t3.path(), false, false);
     let m = resolve_manifest(t3.path()).unwrap();
-    assert_eq!(m.kind, cyrup_resources::package::ManifestKind::AutoDiscovered);
+    assert_eq!(
+        m.kind,
+        cyrup_resources::package::ManifestKind::AutoDiscovered
+    );
     assert_eq!(m.skills, vec![t3.path().join("skills")]);
     assert_eq!(m.extensions, vec![t3.path().join("extensions")]);
 }
@@ -410,7 +540,9 @@ async fn a09_4_installed_package_resources_surface_in_discovery() {
     c.installed = InstalledPackages {
         packages: vec![InstalledPackage {
             id: cyrup_core::PackageId::from("path:pkg".to_string()),
-            source: PackageSource::Path { path: pkg_dir.clone() },
+            source: PackageSource::Path {
+                path: pkg_dir.clone(),
+            },
             scope: InstallScope::Global,
             resolved_commit: None,
             installed_at: "0".to_string(),
@@ -418,11 +550,24 @@ async fn a09_4_installed_package_resources_surface_in_discovery() {
         }],
     };
     let report = run_discover(&c).await;
-    assert!(report.registry.skills.contains("alpha"), "package skill surfaces");
-    assert!(report.registry.prompts.contains("greet"), "package prompt surfaces");
-    assert!(report.registry.themes.contains("midnight"), "package theme surfaces");
     assert!(
-        report.registry.ext_crate_paths.iter().any(|p| p.ends_with("deploy")),
+        report.registry.skills.contains("alpha"),
+        "package skill surfaces"
+    );
+    assert!(
+        report.registry.prompts.contains("greet"),
+        "package prompt surfaces"
+    );
+    assert!(
+        report.registry.themes.contains("midnight"),
+        "package theme surfaces"
+    );
+    assert!(
+        report
+            .registry
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("deploy")),
         "package extension crate path handed off to cyrup-ext"
     );
 }
@@ -440,17 +585,26 @@ async fn a09_5_local_path_install_list_remove() {
 
     let mgr = PackageManager::new(PackageStore::new(global, None));
     let (rec, notice) = mgr
-        .install(PackageSource::Path { path: pkg.clone() }, InstallScope::Global, true, CancelToken::new())
+        .install(
+            PackageSource::Path { path: pkg.clone() },
+            InstallScope::Global,
+            true,
+            CancelToken::new(),
+        )
         .await
         .expect("local-path install");
-    assert_eq!(notice.message, SECURITY_CAVEAT, "security caveat surfaced (R-09-019)");
+    assert_eq!(
+        notice.message, SECURITY_CAVEAT,
+        "security caveat surfaced (R-09-019)"
+    );
 
     let listed = mgr.list();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, rec.id);
 
     // enable/disable a resource within the package (R-09-018).
-    mgr.set_enabled(&rec.id, ResourceSelector::Skill("alpha".to_string()), false).unwrap();
+    mgr.set_enabled(&rec.id, ResourceSelector::Skill("alpha".to_string()), false)
+        .unwrap();
     let after = mgr.list();
     assert!(after[0].disabled.skills.contains("alpha"));
 
@@ -467,8 +621,14 @@ async fn a09_5_update_skips_pinned_and_one_moves_it() {
     let global = tmp.path().join("global");
     let store = PackageStore::new(global.clone(), None);
 
-    let default_src = PackageSource::Git { url: "file:///x/a".into(), reff: PinRef::Default };
-    let tag_src = PackageSource::Git { url: "file:///x/b".into(), reff: PinRef::Tag("v1".into()) };
+    let default_src = PackageSource::Git {
+        url: "file:///x/a".into(),
+        reff: PinRef::Default,
+    };
+    let tag_src = PackageSource::Git {
+        url: "file:///x/b".into(),
+        reff: PinRef::Tag("v1".into()),
+    };
     let default_id = default_src.package_id();
     let tag_id = tag_src.package_id();
     assert!(tag_src.pin().is_pinned());
@@ -498,14 +658,29 @@ async fn a09_5_update_skips_pinned_and_one_moves_it() {
     lock::save(&reg_path, &reg).unwrap();
 
     let mgr = PackageManager::new(store);
-    let report = mgr.update(UpdateTarget::All, CancelToken::new()).await.unwrap();
-    assert!(report.skipped_pinned.contains(&tag_id), "bulk update skips pinned (R-09-020)");
-    assert!(report.updated.contains(&default_id), "bulk update moves unpinned");
+    let report = mgr
+        .update(UpdateTarget::All, CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        report.skipped_pinned.contains(&tag_id),
+        "bulk update skips pinned (R-09-020)"
+    );
+    assert!(
+        report.updated.contains(&default_id),
+        "bulk update moves unpinned"
+    );
     assert!(!report.updated.contains(&tag_id));
 
     // update(One) moves the pinned package regardless.
-    let one = mgr.update(UpdateTarget::One(tag_id.clone()), CancelToken::new()).await.unwrap();
-    assert!(one.updated.contains(&tag_id), "explicit update(One) moves a pinned package");
+    let one = mgr
+        .update(UpdateTarget::One(tag_id.clone()), CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        one.updated.contains(&tag_id),
+        "explicit update(One) moves a pinned package"
+    );
 }
 
 #[tokio::test]
@@ -522,14 +697,20 @@ async fn a09_5_git_local_fixture_install() {
     let mgr = PackageManager::new(PackageStore::new(global.path().to_path_buf(), None));
     let (rec, _notice) = mgr
         .install(
-            PackageSource::Git { url: repo_dir.display().to_string(), reff: PinRef::Default },
+            PackageSource::Git {
+                url: repo_dir.display().to_string(),
+                reff: PinRef::Default,
+            },
             InstallScope::Global,
             true,
             CancelToken::new(),
         )
         .await
         .expect("install from local git repo");
-    assert!(rec.resolved_commit.is_some(), "HEAD commit resolved via gix (no network)");
+    assert!(
+        rec.resolved_commit.is_some(),
+        "HEAD commit resolved via gix (no network)"
+    );
     assert_eq!(mgr.list().len(), 1);
 }
 
@@ -577,14 +758,24 @@ async fn a09_6_project_install_trust_gated_with_security_notice() {
 
     // Untrusted project install is refused (R-09-017).
     let err = mgr
-        .install(PackageSource::Path { path: pkg.clone() }, InstallScope::Project, false, CancelToken::new())
+        .install(
+            PackageSource::Path { path: pkg.clone() },
+            InstallScope::Project,
+            false,
+            CancelToken::new(),
+        )
         .await
         .expect_err("untrusted project install must be refused");
     assert!(matches!(err, cyrup_resources::ResourceError::Untrusted(_)));
 
     // Trusted project install succeeds and still surfaces the security caveat (R-09-019).
     let (_rec, notice) = mgr
-        .install(PackageSource::Path { path: pkg }, InstallScope::Project, true, CancelToken::new())
+        .install(
+            PackageSource::Path { path: pkg },
+            InstallScope::Project,
+            true,
+            CancelToken::new(),
+        )
         .await
         .expect("trusted project install");
     assert_eq!(notice.message, SECURITY_CAVEAT);
@@ -604,8 +795,16 @@ async fn a09_7_resources_discover_contribution_merged() {
     let mut c = cfg(root);
     c.extra.skill_paths = vec![contributed.parent().unwrap().to_path_buf()];
     let report = run_discover(&c).await;
-    let skill = report.registry.skills.get_name("contrib").expect("contributed skill available");
-    assert_eq!(skill.scope, ResourceScope::Discovered, "enters at Discovered scope (R-09-022)");
+    let skill = report
+        .registry
+        .skills
+        .get_name("contrib")
+        .expect("contributed skill available");
+    assert_eq!(
+        skill.scope,
+        ResourceScope::Discovered,
+        "enters at Discovered scope (R-09-022)"
+    );
 }
 
 // ===========================================================================
@@ -624,10 +823,16 @@ async fn a09_8_reload_rediscovers_new_resources() {
     assert!(!handle.load().skills.contains("late"));
 
     // Add a new skill, then re-run discovery and atomically swap (R-09-023).
-    write(&root.join(".cyrup/skills/late/SKILL.md"), &skill_md("late", "added at runtime"));
+    write(
+        &root.join(".cyrup/skills/late/SKILL.md"),
+        &skill_md("late", "added at runtime"),
+    );
     let second = run_discover(&c).await;
     handle.store(std::sync::Arc::new(second.registry));
-    assert!(handle.load().skills.contains("late"), "/reload re-discovers new skill");
+    assert!(
+        handle.load().skills.contains("late"),
+        "/reload re-discovers new skill"
+    );
 }
 
 // ===========================================================================
@@ -638,19 +843,35 @@ async fn a09_8_reload_rediscovers_new_resources() {
 async fn a09_9_same_name_precedence_project_beats_global() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global one"));
-    write(&root.join(".cyrup/skills/dup/SKILL.md"), &skill_md("dup", "project one"));
+    write(
+        &root.join("global/skills/dup/SKILL.md"),
+        &skill_md("dup", "global one"),
+    );
+    write(
+        &root.join(".cyrup/skills/dup/SKILL.md"),
+        &skill_md("dup", "project one"),
+    );
 
     let mut c = cfg(root);
     c.trusted_project = true;
     let report = run_discover(&c).await;
 
     let winner = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(winner.scope, ResourceScope::Project, "project wins over global (R-09-024)");
+    assert_eq!(
+        winner.scope,
+        ResourceScope::Project,
+        "project wins over global (R-09-024)"
+    );
     assert_eq!(winner.front.description.as_deref(), Some("project one"));
 
     // Both candidates retained for diagnostics.
-    let count = report.registry.skills.all().iter().filter(|s| s.key.as_str() == "dup").count();
+    let count = report
+        .registry
+        .skills
+        .all()
+        .iter()
+        .filter(|s| s.key.as_str() == "dup")
+        .count();
     assert_eq!(count, 2, "shadowed candidate retained in `all`");
 }
 
@@ -663,14 +884,23 @@ fn skill_parent_dir_name_fallback_and_disable_model_invocation() {
     let tmp = tempfile::tempdir().unwrap();
     // No `name` in frontmatter → falls back to parent directory basename (skills.ts:296).
     let p = tmp.path().join("my-skill/SKILL.md");
-    write(&p, "---\ndescription: use when frobbing\ndisable-model-invocation: true\n---\nBody.\n");
+    write(
+        &p,
+        "---\ndescription: use when frobbing\ndisable-model-invocation: true\n---\nBody.\n",
+    );
 
-    let (skill, diags) =
-        Skill::load_with_diagnostics(&p, ResourceScope::Cli, cyrup_resources::ResourceOrigin::Builtin)
-            .unwrap();
+    let (skill, diags) = Skill::load_with_diagnostics(
+        &p,
+        ResourceScope::Cli,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .unwrap();
     let skill = skill.expect("skill loads with a parent-dir name");
     assert_eq!(skill.name, "my-skill");
-    assert!(skill.disable_model_invocation, "disable-model-invocation parsed (skills.ts:316)");
+    assert!(
+        skill.disable_model_invocation,
+        "disable-model-invocation parsed (skills.ts:316)"
+    );
     assert!(diags.is_empty(), "valid skill yields no diagnostics");
 }
 
@@ -680,12 +910,20 @@ fn skill_missing_description_is_dropped_with_warning() {
     let p = tmp.path().join("foo/SKILL.md");
     write(&p, "---\nname: foo\n---\nBody only, no description.\n");
 
-    let (skill, diags) =
-        Skill::load_with_diagnostics(&p, ResourceScope::Cli, cyrup_resources::ResourceOrigin::Builtin)
-            .unwrap();
-    assert!(skill.is_none(), "no-description skill is dropped (skills.ts:305-307)");
+    let (skill, diags) = Skill::load_with_diagnostics(
+        &p,
+        ResourceScope::Cli,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .unwrap();
     assert!(
-        diags.iter().any(|d| d.message.contains("description is required")),
+        skill.is_none(),
+        "no-description skill is dropped (skills.ts:305-307)"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("description is required")),
         "warning diagnostic emitted for missing description"
     );
 }
@@ -695,26 +933,48 @@ fn skill_invalid_name_warns_but_still_loads() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("x/SKILL.md");
     // Uppercase + underscore violate the name charset, but a valid description keeps the skill.
-    write(&p, "---\nname: Bad_Name\ndescription: use when testing\n---\nBody.\n");
+    write(
+        &p,
+        "---\nname: Bad_Name\ndescription: use when testing\n---\nBody.\n",
+    );
 
-    let (skill, diags) =
-        Skill::load_with_diagnostics(&p, ResourceScope::Cli, cyrup_resources::ResourceOrigin::Builtin)
-            .unwrap();
-    assert!(skill.is_some(), "skill kept despite invalid name (skills.ts: still load with warnings)");
-    assert!(diags.iter().any(|d| d.message.contains("invalid characters")));
+    let (skill, diags) = Skill::load_with_diagnostics(
+        &p,
+        ResourceScope::Cli,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .unwrap();
+    assert!(
+        skill.is_some(),
+        "skill kept despite invalid name (skills.ts: still load with warnings)"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("invalid characters"))
+    );
 
     // Direct validator checks (skills.ts:92-112).
     assert!(validate_name("good-name").is_empty());
     assert!(!validate_name("-bad").is_empty(), "leading hyphen invalid");
-    assert!(!validate_name("a--b").is_empty(), "consecutive hyphens invalid");
+    assert!(
+        !validate_name("a--b").is_empty(),
+        "consecutive hyphens invalid"
+    );
 }
 
 #[tokio::test]
 async fn skill_name_collision_emits_collision_diagnostic() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global one"));
-    write(&root.join(".cyrup/skills/dup/SKILL.md"), &skill_md("dup", "project one"));
+    write(
+        &root.join("global/skills/dup/SKILL.md"),
+        &skill_md("dup", "global one"),
+    );
+    write(
+        &root.join(".cyrup/skills/dup/SKILL.md"),
+        &skill_md("dup", "project one"),
+    );
 
     let mut c = cfg(root);
     c.trusted_project = true;
@@ -725,7 +985,10 @@ async fn skill_name_collision_emits_collision_diagnostic() {
         .iter()
         .find(|d| d.diagnostic_type == DiagnosticType::Collision)
         .expect("a collision diagnostic is emitted (skills.ts:410-427)");
-    let detail = collision.collision.as_ref().expect("collision detail present");
+    let detail = collision
+        .collision
+        .as_ref()
+        .expect("collision detail present");
     assert_eq!(detail.name, "dup");
     assert_ne!(detail.winner_path, detail.loser_path);
 }
@@ -748,7 +1011,11 @@ fn theme_recursive_vars_cycle_index_and_name_slash() {
     .unwrap();
     assert_eq!(
         t.resolve().roles.get("accent"),
-        Some(&ColorSpec::Rgb { r: 0x0a, g: 0x14, b: 0x1e })
+        Some(&ColorSpec::Rgb {
+            r: 0x0a,
+            g: 0x14,
+            b: 0x1e
+        })
     );
 
     // Circular reference degrades to Inherit (Pi throws; cyrup is total).
@@ -799,8 +1066,16 @@ async fn a09_9_theme_precedence_global_overrides_builtin() {
     );
     let c = cfg(root);
     let report = run_discover(&c).await;
-    let dark = report.registry.themes.get_name("dark").expect("dark present");
-    assert_eq!(dark.scope, ResourceScope::Global, "global theme overrides built-in");
+    let dark = report
+        .registry
+        .themes
+        .get_name("dark")
+        .expect("dark present");
+    assert_eq!(
+        dark.scope,
+        ResourceScope::Global,
+        "global theme overrides built-in"
+    );
 }
 
 // ===========================================================================
@@ -819,13 +1094,19 @@ fn theme_missing_required_tokens_is_rejected_with_pi_error() {
     )
     .expect_err("incomplete theme must be rejected");
     let msg = err.to_string();
-    assert!(msg.contains("Missing required color tokens"), "Pi error text: {msg}");
+    assert!(
+        msg.contains("Missing required color tokens"),
+        "Pi error text: {msg}"
+    );
     // A representative token from each schema section is reported as missing.
     for token in ["syntaxKeyword", "mdHeading", "thinkingHigh", "bashMode"] {
         assert!(msg.contains(token), "missing token `{token}` listed: {msg}");
     }
     // The present token is NOT reported as missing.
-    assert!(!msg.contains("- accent\n"), "provided token must not be flagged: {msg}");
+    assert!(
+        !msg.contains("- accent\n"),
+        "provided token must not be flagged: {msg}"
+    );
 
     // A complete theme parses cleanly.
     assert!(
@@ -844,33 +1125,71 @@ fn theme_missing_required_tokens_is_rejected_with_pi_error() {
 fn builtin_themes_carry_full_token_set_and_export() {
     use cyrup_resources::ColorSpec;
     let builtins = builtin_themes();
-    let dark = builtins.iter().find(|t| t.data.name == "dark").expect("dark builtin");
+    let dark = builtins
+        .iter()
+        .find(|t| t.data.name == "dark")
+        .expect("dark builtin");
 
     // Every required token resolves (no incomplete role map) — the gap that left cyrup-tui unable
     // to render (theme.rs:276-307 stub had only 4 non-Pi tokens).
     let resolved = dark.resolve();
     for token in cyrup_resources::REQUIRED_COLOR_TOKENS {
-        assert!(resolved.roles.contains_key(token), "dark resolves `{token}`");
+        assert!(
+            resolved.roles.contains_key(token),
+            "dark resolves `{token}`"
+        );
     }
     // A var-indirected token and a literal-hex token resolve to the Pi values.
     assert_eq!(
         resolved.roles.get("syntaxKeyword"),
-        Some(&ColorSpec::Rgb { r: 0x56, g: 0x9c, b: 0xd6 }),
+        Some(&ColorSpec::Rgb {
+            r: 0x56,
+            g: 0x9c,
+            b: 0xd6
+        }),
         "syntaxKeyword = #569CD6 (literal hex from dark.json)"
     );
     assert_eq!(
         resolved.roles.get("success"),
-        Some(&ColorSpec::Rgb { r: 0xb5, g: 0xbd, b: 0x68 }),
+        Some(&ColorSpec::Rgb {
+            r: 0xb5,
+            g: 0xbd,
+            b: 0x68
+        }),
         "success -> $green -> #b5bd68 (var indirection)"
     );
 
     // Typed export section resolves for HTML export (theme.ts:94-100; G10).
     let export = dark.resolve_export();
-    assert_eq!(export.page_bg, ColorSpec::Rgb { r: 0x18, g: 0x18, b: 0x1e });
-    assert_eq!(export.card_bg, ColorSpec::Rgb { r: 0x1e, g: 0x1e, b: 0x24 });
-    assert_eq!(export.info_bg, ColorSpec::Rgb { r: 0x3c, g: 0x37, b: 0x28 });
+    assert_eq!(
+        export.page_bg,
+        ColorSpec::Rgb {
+            r: 0x18,
+            g: 0x18,
+            b: 0x1e
+        }
+    );
+    assert_eq!(
+        export.card_bg,
+        ColorSpec::Rgb {
+            r: 0x1e,
+            g: 0x1e,
+            b: 0x24
+        }
+    );
+    assert_eq!(
+        export.info_bg,
+        ColorSpec::Rgb {
+            r: 0x3c,
+            g: 0x37,
+            b: 0x28
+        }
+    );
 
-    let light = builtins.iter().find(|t| t.data.name == "light").expect("light builtin");
+    let light = builtins
+        .iter()
+        .find(|t| t.data.name == "light")
+        .expect("light builtin");
     assert!(
         cyrup_resources::REQUIRED_COLOR_TOKENS
             .iter()
@@ -890,12 +1209,21 @@ async fn skill_walk_honors_ignore_files() {
     let skills_root = root.join("global/skills");
     // A per-directory ignore file scopes out one subtree (skills.ts:16,47-65,189,211).
     write(&skills_root.join(".gitignore"), "secret/\n*.fdignore\n");
-    write(&skills_root.join("secret/hidden/SKILL.md"), &skill_md("hidden", "should be ignored"));
-    write(&skills_root.join("visible/SKILL.md"), &skill_md("visible", "should load"));
+    write(
+        &skills_root.join("secret/hidden/SKILL.md"),
+        &skill_md("hidden", "should be ignored"),
+    );
+    write(
+        &skills_root.join("visible/SKILL.md"),
+        &skill_md("visible", "should load"),
+    );
 
     let c = cfg(root);
     let report = run_discover(&c).await;
-    assert!(report.registry.skills.contains("visible"), "non-ignored skill loads");
+    assert!(
+        report.registry.skills.contains("visible"),
+        "non-ignored skill loads"
+    );
     assert!(
         !report.registry.skills.contains("hidden"),
         "skill under a .gitignore'd directory is skipped (G5)"
@@ -911,13 +1239,25 @@ async fn skill_walk_ignore_negation_reincludes() {
     // wins (prefixIgnorePattern preserves negation, skills.ts:32-44). Negation cannot reach inside a
     // fully-ignored parent (standard gitignore semantics), so the re-include is a sibling.
     write(&skills_root.join(".gitignore"), "draft-*/\n!draft-keep/\n");
-    write(&skills_root.join("draft-drop/SKILL.md"), &skill_md("draftdrop", "ignored skill"));
-    write(&skills_root.join("draft-keep/SKILL.md"), &skill_md("draftkeep", "re-included skill"));
+    write(
+        &skills_root.join("draft-drop/SKILL.md"),
+        &skill_md("draftdrop", "ignored skill"),
+    );
+    write(
+        &skills_root.join("draft-keep/SKILL.md"),
+        &skill_md("draftkeep", "re-included skill"),
+    );
 
     let c = cfg(root);
     let report = run_discover(&c).await;
-    assert!(!report.registry.skills.contains("draftdrop"), "draft-drop ignored by glob");
-    assert!(report.registry.skills.contains("draftkeep"), "draft-keep re-included via negation");
+    assert!(
+        !report.registry.skills.contains("draftdrop"),
+        "draft-drop ignored by glob"
+    );
+    assert!(
+        report.registry.skills.contains("draftkeep"),
+        "draft-keep re-included via negation"
+    );
 }
 
 // ===========================================================================
@@ -958,7 +1298,11 @@ fn manifest_glob_entries_expand_to_files() {
     let m = resolve_manifest(dir).unwrap();
     assert_eq!(m.kind, cyrup_resources::package::ManifestKind::PackageJson);
     assert_eq!(m.themes.len(), 2, "glob expands to both theme files");
-    assert!(m.themes.iter().all(|p| p.extension().is_some_and(|e| e == "json")));
+    assert!(
+        m.themes
+            .iter()
+            .all(|p| p.extension().is_some_and(|e| e == "json"))
+    );
 }
 
 #[tokio::test]
@@ -966,8 +1310,14 @@ async fn manifest_glob_themes_surface_in_discovery() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let pkg_dir = root.join("pkgtree");
-    write(&pkg_dir.join("themes/midnight.json"), &full_theme_json("midnight", &[], &[]));
-    write(&pkg_dir.join("themes/noon.json"), &full_theme_json("noon", &[], &[]));
+    write(
+        &pkg_dir.join("themes/midnight.json"),
+        &full_theme_json("midnight", &[], &[]),
+    );
+    write(
+        &pkg_dir.join("themes/noon.json"),
+        &full_theme_json("noon", &[], &[]),
+    );
     write(
         &pkg_dir.join("package.json"),
         r#"{"name":"pack","pi":{"themes":["themes/*.json"]}}"#,
@@ -977,7 +1327,9 @@ async fn manifest_glob_themes_surface_in_discovery() {
     c.installed = InstalledPackages {
         packages: vec![InstalledPackage {
             id: cyrup_core::PackageId::from("path:pkg".to_string()),
-            source: PackageSource::Path { path: pkg_dir.clone() },
+            source: PackageSource::Path {
+                path: pkg_dir.clone(),
+            },
             scope: InstallScope::Global,
             resolved_commit: None,
             installed_at: "0".to_string(),
@@ -985,8 +1337,14 @@ async fn manifest_glob_themes_surface_in_discovery() {
         }],
     };
     let report = run_discover(&c).await;
-    assert!(report.registry.themes.contains("midnight"), "glob-matched theme file surfaces");
-    assert!(report.registry.themes.contains("noon"), "second glob-matched theme file surfaces");
+    assert!(
+        report.registry.themes.contains("midnight"),
+        "glob-matched theme file surfaces"
+    );
+    assert!(
+        report.registry.themes.contains("noon"),
+        "second glob-matched theme file surfaces"
+    );
 }
 
 // ===========================================================================
@@ -999,7 +1357,10 @@ async fn symlinked_duplicate_skill_collapses_without_collision() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let skills_root = root.join("global/skills");
-    write(&skills_root.join("real/SKILL.md"), &skill_md("dup", "the one true skill"));
+    write(
+        &skills_root.join("real/SKILL.md"),
+        &skill_md("dup", "the one true skill"),
+    );
     // A symlink to the real skill directory exposes the same SKILL.md under a second name.
     std::os::unix::fs::symlink(skills_root.join("real"), skills_root.join("alias")).unwrap();
 
@@ -1033,7 +1394,10 @@ async fn a09_5_git_ref_checkout_materializes_pinned_tag() {
     let mgr = PackageManager::new(store.clone());
     let (rec, _notice) = mgr
         .install(
-            PackageSource::Git { url: repo_dir.display().to_string(), reff: PinRef::Tag("v1".into()) },
+            PackageSource::Git {
+                url: repo_dir.display().to_string(),
+                reff: PinRef::Tag("v1".into()),
+            },
             InstallScope::Global,
             true,
             CancelToken::new(),
@@ -1043,9 +1407,15 @@ async fn a09_5_git_ref_checkout_materializes_pinned_tag() {
 
     // The store working copy must reflect the *pinned* ref, not default HEAD: marker.txt held "v1"
     // at the tagged commit and "v2" at HEAD. Locate the materialized clone via the store dir.
-    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
+    let store_dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
     let marker = store_dir.join("marker.txt");
-    assert!(marker.exists(), "checked-out tree present at {}", store_dir.display());
+    assert!(
+        marker.exists(),
+        "checked-out tree present at {}",
+        store_dir.display()
+    );
     assert_eq!(
         fs::read_to_string(&marker).unwrap().trim(),
         "v1",
@@ -1107,21 +1477,41 @@ fn manifest_override_exclude_drops_matching_source() {
     // as a literal source path that matches nothing (package-manager.ts:2154-2159, 696-717).
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write(&dir.join("skills/public/SKILL.md"), &skill_md("public", "public skill"));
-    write(&dir.join("skills/internal/SKILL.md"), &skill_md("internal", "internal skill"));
-    write(&dir.join("skills/secret/SKILL.md"), &skill_md("secret", "secret skill"));
+    write(
+        &dir.join("skills/public/SKILL.md"),
+        &skill_md("public", "public skill"),
+    );
+    write(
+        &dir.join("skills/internal/SKILL.md"),
+        &skill_md("internal", "internal skill"),
+    );
+    write(
+        &dir.join("skills/secret/SKILL.md"),
+        &skill_md("secret", "secret skill"),
+    );
     // Source glob enumerates all three; `!skills/internal` excludes one by its SKILL.md parent dir.
     write(
         &dir.join("package.json"),
         r#"{"name":"pack","pi":{"skills":["skills/*/SKILL.md","!skills/internal"]}}"#,
     );
     let m = resolve_manifest(dir).unwrap();
-    let names: Vec<String> =
-        m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
-    assert!(names.iter().any(|n| n.ends_with("skills/public/SKILL.md")), "public kept: {names:?}");
-    assert!(names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")), "secret kept: {names:?}");
+    let names: Vec<String> = m
+        .skills
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     assert!(
-        !names.iter().any(|n| n.ends_with("skills/internal/SKILL.md")),
+        names.iter().any(|n| n.ends_with("skills/public/SKILL.md")),
+        "public kept: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")),
+        "secret kept: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.ends_with("skills/internal/SKILL.md")),
         "internal excluded by `!`: {names:?}"
     );
 }
@@ -1140,10 +1530,19 @@ fn manifest_override_force_include_and_force_exclude() {
         r#"{"name":"pack","pi":{"skills":["skills/*/SKILL.md","!skills/*","+skills/b","-skills/c"]}}"#,
     );
     let m = resolve_manifest(dir).unwrap();
-    let names: Vec<String> =
-        m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
-    assert!(names.iter().any(|n| n.ends_with("skills/b/SKILL.md")), "b force-included: {names:?}");
-    assert!(!names.iter().any(|n| n.ends_with("skills/a/SKILL.md")), "a stays excluded: {names:?}");
+    let names: Vec<String> = m
+        .skills
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("skills/b/SKILL.md")),
+        "b force-included: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.ends_with("skills/a/SKILL.md")),
+        "a stays excluded: {names:?}"
+    );
     assert!(
         !names.iter().any(|n| n.ends_with("skills/c/SKILL.md")),
         "c force-excluded: {names:?}"
@@ -1157,8 +1556,14 @@ async fn manifest_override_patterns_surface_filtered_set_in_discovery() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let pkg_dir = root.join("pkgtree");
-    write(&pkg_dir.join("themes/keep.json"), &full_theme_json("keep", &[], &[]));
-    write(&pkg_dir.join("themes/drop.json"), &full_theme_json("drop", &[], &[]));
+    write(
+        &pkg_dir.join("themes/keep.json"),
+        &full_theme_json("keep", &[], &[]),
+    );
+    write(
+        &pkg_dir.join("themes/drop.json"),
+        &full_theme_json("drop", &[], &[]),
+    );
     write(
         &pkg_dir.join("package.json"),
         r#"{"name":"pack","pi":{"themes":["themes/*.json","!themes/drop.json"]}}"#,
@@ -1168,7 +1573,9 @@ async fn manifest_override_patterns_surface_filtered_set_in_discovery() {
     c.installed = InstalledPackages {
         packages: vec![InstalledPackage {
             id: cyrup_core::PackageId::from("path:pkg".to_string()),
-            source: PackageSource::Path { path: pkg_dir.clone() },
+            source: PackageSource::Path {
+                path: pkg_dir.clone(),
+            },
             scope: InstallScope::Global,
             resolved_commit: None,
             installed_at: "0".to_string(),
@@ -1176,7 +1583,10 @@ async fn manifest_override_patterns_surface_filtered_set_in_discovery() {
         }],
     };
     let report = run_discover(&c).await;
-    assert!(report.registry.themes.contains("keep"), "non-excluded theme surfaces");
+    assert!(
+        report.registry.themes.contains("keep"),
+        "non-excluded theme surfaces"
+    );
     assert!(
         !report.registry.themes.contains("drop"),
         "`!themes/drop.json` excludes the theme from discovery"
@@ -1201,8 +1611,14 @@ fn theme_out_of_range_int_color_rejected_with_other_errors() {
     )
     .expect_err("out-of-range color index must be rejected");
     let msg = err.to_string();
-    assert!(msg.contains("Other errors:"), "other-errors section present: {msg}");
-    assert!(msg.contains("/colors/accent"), "offending path reported: {msg}");
+    assert!(
+        msg.contains("Other errors:"),
+        "other-errors section present: {msg}"
+    );
+    assert!(
+        msg.contains("/colors/accent"),
+        "offending path reported: {msg}"
+    );
     assert!(
         !msg.contains("Missing required color tokens"),
         "no tokens missing — only the malformed value is reported: {msg}"
@@ -1223,9 +1639,18 @@ fn theme_non_scalar_color_value_rejected_with_combined_message() {
     )
     .expect_err("non-scalar color value must be rejected");
     let msg = err.to_string();
-    assert!(msg.contains("Missing required color tokens"), "missing section present: {msg}");
-    assert!(msg.contains("Other errors:"), "other section present: {msg}");
-    assert!(msg.contains("/colors/accent: Expected union value"), "bad value path + message: {msg}");
+    assert!(
+        msg.contains("Missing required color tokens"),
+        "missing section present: {msg}"
+    );
+    assert!(
+        msg.contains("Other errors:"),
+        "other section present: {msg}"
+    );
+    assert!(
+        msg.contains("/colors/accent: Expected union value"),
+        "bad value path + message: {msg}"
+    );
 }
 
 #[test]
@@ -1233,8 +1658,13 @@ fn theme_valid_int_and_string_colors_still_accepted() {
     // Regression guard: in-range integer indices and hex/var strings remain valid (theme.ts:23-26).
     let json = full_theme_json("ok", &[("v", "12")], &[("accent", "196"), ("text", "$v")]);
     assert!(
-        Theme::parse(&json, None, ResourceScope::Builtin, cyrup_resources::ResourceOrigin::Builtin)
-            .is_ok(),
+        Theme::parse(
+            &json,
+            None,
+            ResourceScope::Builtin,
+            cyrup_resources::ResourceOrigin::Builtin
+        )
+        .is_ok(),
         "valid int + string color values accepted"
     );
 }
@@ -1278,14 +1708,16 @@ fn git_url_hosted_shorthand_and_committish() {
     // npm `hosted-git-info@9.0.3` (the version Pi pins, package.json:51).
 
     // Bare GitHub shorthand `git:owner/repo` → https clone URL, github.com host, no ref.
-    let bare = parse_git_url("git:owner/repo").expect("bare shorthand resolves via hosted-git-info");
+    let bare =
+        parse_git_url("git:owner/repo").expect("bare shorthand resolves via hosted-git-info");
     assert_eq!(bare.repo, "https://owner/repo");
     assert_eq!(bare.host, "github.com");
     assert_eq!(bare.path, "owner/repo");
     assert_eq!(bare.reff, None);
 
     // Host-shortcut + multi-segment user resolves through the gitlab table.
-    let gl = parse_git_url("git:gitlab.com/group/sub/proj").expect("gitlab host-qualified resolves");
+    let gl =
+        parse_git_url("git:gitlab.com/group/sub/proj").expect("gitlab host-qualified resolves");
     assert_eq!(gl.repo, "https://gitlab.com/group/sub/proj");
     assert_eq!(gl.host, "gitlab.com");
     assert_eq!(gl.path, "group/sub/proj");
@@ -1303,15 +1735,42 @@ fn git_url_hosted_shorthand_and_committish() {
 fn git_url_security_rejects_traversal_and_injection() {
     // hasUnsafeGitInstallPart: path-traversal, leading-slash, NUL, and backslash are unsafe
     // (git.ts:84-102) — a SECURITY control.
-    assert!(has_unsafe_git_install_part("..", true), ".. segment is unsafe");
-    assert!(has_unsafe_git_install_part("a/../b", true), "embedded .. is unsafe");
-    assert!(has_unsafe_git_install_part("/abs", true), "leading slash is unsafe");
-    assert!(has_unsafe_git_install_part("a\\b", true), "backslash is unsafe");
-    assert!(has_unsafe_git_install_part("%00", true), "encoded NUL is unsafe");
-    assert!(has_unsafe_git_install_part("%2e%2e/x", true), "encoded .. is unsafe");
-    assert!(has_unsafe_git_install_part("a/b", false), "slash disallowed when allow_slash=false");
-    assert!(!has_unsafe_git_install_part("user", false), "plain segment is safe");
-    assert!(!has_unsafe_git_install_part("user/repo", true), "user/repo path is safe");
+    assert!(
+        has_unsafe_git_install_part("..", true),
+        ".. segment is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("a/../b", true),
+        "embedded .. is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("/abs", true),
+        "leading slash is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("a\\b", true),
+        "backslash is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("%00", true),
+        "encoded NUL is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("%2e%2e/x", true),
+        "encoded .. is unsafe"
+    );
+    assert!(
+        has_unsafe_git_install_part("a/b", false),
+        "slash disallowed when allow_slash=false"
+    );
+    assert!(
+        !has_unsafe_git_install_part("user", false),
+        "plain segment is safe"
+    );
+    assert!(
+        !has_unsafe_git_install_part("user/repo", true),
+        "user/repo path is safe"
+    );
 
     // The validator is wired into the parser. A *percent-encoded* `..` survives URL parsing as a
     // literal `..` segment and is rejected by hasUnsafeGitInstallPart → None (verified against Pi).
@@ -1320,7 +1779,10 @@ fn git_url_security_rejects_traversal_and_injection() {
     // normalizes `/../etc/passwd` → `/etc/passwd`), so Pi accepts it with a normalized, safe path —
     // there is no surviving `..` segment to reject (verified 1:1 against hosted-git-info@9.0.3).
     let normalized = parse_git_url("https://github.com/../etc/passwd").expect("raw .. normalized");
-    assert_eq!(normalized.path, "etc/passwd", "raw .. collapsed by URL normalization, path is safe");
+    assert_eq!(
+        normalized.path, "etc/passwd",
+        "raw .. collapsed by URL normalization, path is safe"
+    );
     assert_eq!(normalized.host, "github.com");
 }
 
@@ -1347,8 +1809,14 @@ fn package_source_parse_routes_git_local_and_npm() {
         other => panic!("expected Git tag pin, got {other:?}"),
     }
     // Bare names / relative paths → local Path (isLocalPath, paths.ts:41-55).
-    assert!(matches!(PackageSource::parse("./pkg").unwrap(), PackageSource::Path { .. }));
-    assert!(matches!(PackageSource::parse("some-pkg").unwrap(), PackageSource::Path { .. }));
+    assert!(matches!(
+        PackageSource::parse("./pkg").unwrap(),
+        PackageSource::Path { .. }
+    ));
+    assert!(matches!(
+        PackageSource::parse("some-pkg").unwrap(),
+        PackageSource::Path { .. }
+    ));
     // npm channel dropped (R-09-021).
     assert!(matches!(
         PackageSource::parse("npm:foo@1.2.3"),
@@ -1372,19 +1840,40 @@ fn manifest_plain_dir_override_excludes_subdir() {
     // entry, which matched nothing.)
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    write(&dir.join("skills/public/SKILL.md"), &skill_md("public", "public skill"));
-    write(&dir.join("skills/internal/SKILL.md"), &skill_md("internal", "internal skill"));
-    write(&dir.join("skills/secret/SKILL.md"), &skill_md("secret", "secret skill"));
+    write(
+        &dir.join("skills/public/SKILL.md"),
+        &skill_md("public", "public skill"),
+    );
+    write(
+        &dir.join("skills/internal/SKILL.md"),
+        &skill_md("internal", "internal skill"),
+    );
+    write(
+        &dir.join("skills/secret/SKILL.md"),
+        &skill_md("secret", "secret skill"),
+    );
     write(
         &dir.join("package.json"),
         r#"{"name":"pack","pi":{"skills":["skills","!skills/internal"]}}"#,
     );
     let m = resolve_manifest(dir).unwrap();
-    let names: Vec<String> = m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
-    assert!(names.iter().any(|n| n.ends_with("skills/public/SKILL.md")), "public kept: {names:?}");
-    assert!(names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")), "secret kept: {names:?}");
+    let names: Vec<String> = m
+        .skills
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     assert!(
-        !names.iter().any(|n| n.ends_with("skills/internal/SKILL.md")),
+        names.iter().any(|n| n.ends_with("skills/public/SKILL.md")),
+        "public kept: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")),
+        "secret kept: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.ends_with("skills/internal/SKILL.md")),
         "internal dropped by `!skills/internal` after dir expansion: {names:?}"
     );
 }
@@ -1396,15 +1885,26 @@ async fn manifest_plain_dir_override_surfaces_filtered_skills_in_discovery() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let pkg_dir = root.join("pkgtree");
-    write(&pkg_dir.join("skills/keep/SKILL.md"), &skill_md("keepme", "kept skill"));
-    write(&pkg_dir.join("skills/internal/SKILL.md"), &skill_md("dropme", "internal skill"));
-    write(&pkg_dir.join("package.json"), r#"{"name":"pack","pi":{"skills":["skills","!skills/internal"]}}"#);
+    write(
+        &pkg_dir.join("skills/keep/SKILL.md"),
+        &skill_md("keepme", "kept skill"),
+    );
+    write(
+        &pkg_dir.join("skills/internal/SKILL.md"),
+        &skill_md("dropme", "internal skill"),
+    );
+    write(
+        &pkg_dir.join("package.json"),
+        r#"{"name":"pack","pi":{"skills":["skills","!skills/internal"]}}"#,
+    );
 
     let mut c = cfg(root);
     c.installed = InstalledPackages {
         packages: vec![InstalledPackage {
             id: cyrup_core::PackageId::from("path:pkg".to_string()),
-            source: PackageSource::Path { path: pkg_dir.clone() },
+            source: PackageSource::Path {
+                path: pkg_dir.clone(),
+            },
             scope: InstallScope::Global,
             resolved_commit: None,
             installed_at: "0".to_string(),
@@ -1412,8 +1912,14 @@ async fn manifest_plain_dir_override_surfaces_filtered_skills_in_discovery() {
         }],
     };
     let report = run_discover(&c).await;
-    assert!(report.registry.skills.contains("keepme"), "kept skill surfaces");
-    assert!(!report.registry.skills.contains("dropme"), "excluded skill is filtered out");
+    assert!(
+        report.registry.skills.contains("keepme"),
+        "kept skill surfaces"
+    );
+    assert!(
+        !report.registry.skills.contains("dropme"),
+        "excluded skill is filtered out"
+    );
 }
 
 // ===========================================================================
@@ -1428,8 +1934,14 @@ async fn settings_override_filters_loose_global_skills() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let global = root.join("global");
-    write(&global.join("skills/keep/SKILL.md"), &skill_md("keepskill", "kept"));
-    write(&global.join("skills/drop/SKILL.md"), &skill_md("dropskill", "dropped"));
+    write(
+        &global.join("skills/keep/SKILL.md"),
+        &skill_md("keepskill", "kept"),
+    );
+    write(
+        &global.join("skills/drop/SKILL.md"),
+        &skill_md("dropskill", "dropped"),
+    );
 
     // Baseline: both discovered with no overrides.
     let baseline = run_discover(&DiscoveryConfig::new(root, &global)).await;
@@ -1446,7 +1958,10 @@ async fn settings_override_filters_loose_global_skills() {
         ..Default::default()
     };
     let report = run_discover(&c).await;
-    assert!(report.registry.skills.contains("keepskill"), "keep retained under override");
+    assert!(
+        report.registry.skills.contains("keepskill"),
+        "keep retained under override"
+    );
     assert!(
         !report.registry.skills.contains("dropskill"),
         "drop excluded by settings `!skills/drop` override"
@@ -1473,17 +1988,25 @@ async fn git_clone_from_file_url_uses_real_gix_clone() {
     let mgr = PackageManager::new(store.clone());
     let (rec, _notice) = mgr
         .install(
-            PackageSource::Git { url, reff: PinRef::Default },
+            PackageSource::Git {
+                url,
+                reff: PinRef::Default,
+            },
             InstallScope::Global,
             true,
             CancelToken::new(),
         )
         .await
         .expect("install via real gix clone over file:// transport");
-    assert!(rec.resolved_commit.is_some(), "HEAD commit resolved by gix clone");
+    assert!(
+        rec.resolved_commit.is_some(),
+        "HEAD commit resolved by gix clone"
+    );
 
     // The working tree was actually checked out (the fixture's SKILL.md is present).
-    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
+    let store_dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
     assert!(
         store_dir.join("skills/alpha/SKILL.md").exists(),
         "gix checked out the worktree at {}",
@@ -1509,7 +2032,10 @@ async fn git_clone_url_with_ref_checks_out_pinned_tag() {
     let mgr = PackageManager::new(store.clone());
     let (rec, _notice) = mgr
         .install(
-            PackageSource::Git { url, reff: PinRef::Tag("v1".into()) },
+            PackageSource::Git {
+                url,
+                reff: PinRef::Tag("v1".into()),
+            },
             InstallScope::Global,
             true,
             CancelToken::new(),
@@ -1517,9 +2043,15 @@ async fn git_clone_url_with_ref_checks_out_pinned_tag() {
         .await
         .expect("gix clone of file:// pinned to tag v1");
 
-    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
+    let store_dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
     let marker = store_dir.join("marker.txt");
-    assert!(marker.exists(), "worktree checked out at {}", store_dir.display());
+    assert!(
+        marker.exists(),
+        "worktree checked out at {}",
+        store_dir.display()
+    );
     assert_eq!(
         fs::read_to_string(&marker).unwrap().trim(),
         "v1",
@@ -1544,30 +2076,59 @@ async fn git_update_pulls_new_commits_from_file_url() {
     let mgr = PackageManager::new(store.clone());
     let (rec, _notice) = mgr
         .install(
-            PackageSource::Git { url, reff: PinRef::Default },
+            PackageSource::Git {
+                url,
+                reff: PinRef::Default,
+            },
             InstallScope::Global,
             true,
             CancelToken::new(),
         )
         .await
         .expect("initial gix clone over file://");
-    let first = rec.resolved_commit.clone().expect("HEAD resolved on install");
+    let first = rec
+        .resolved_commit
+        .clone()
+        .expect("HEAD resolved on install");
 
     // Advance the remote (source repo) by one commit.
     fs::write(repo_dir.join("NEW.txt"), "new\n").unwrap();
-    assert!(git_in(&repo_dir, &["add", "-A"]), "stage new file in source repo");
-    assert!(git_in(&repo_dir, &["commit", "-q", "-m", "c2"]), "commit in source repo");
+    assert!(
+        git_in(&repo_dir, &["add", "-A"]),
+        "stage new file in source repo"
+    );
+    assert!(
+        git_in(&repo_dir, &["commit", "-q", "-m", "c2"]),
+        "commit in source repo"
+    );
 
-    let report = mgr.update(UpdateTarget::All, CancelToken::new()).await.unwrap();
+    let report = mgr
+        .update(UpdateTarget::All, CancelToken::new())
+        .await
+        .unwrap();
     assert!(report.updated.contains(&rec.id), "unpinned package updated");
 
     let after = mgr.list();
-    let updated = after.iter().find(|p| p.id == rec.id).expect("package still installed");
-    let second = updated.resolved_commit.clone().expect("HEAD resolved on update");
-    assert_ne!(first, second, "update pulled the new upstream commit (resolved_commit advanced)");
+    let updated = after
+        .iter()
+        .find(|p| p.id == rec.id)
+        .expect("package still installed");
+    let second = updated
+        .resolved_commit
+        .clone()
+        .expect("HEAD resolved on update");
+    assert_ne!(
+        first, second,
+        "update pulled the new upstream commit (resolved_commit advanced)"
+    );
 
-    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
-    assert!(store_dir.join("NEW.txt").exists(), "pulled worktree reflects the new commit");
+    let store_dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
+    assert!(
+        store_dir.join("NEW.txt").exists(),
+        "pulled worktree reflects the new commit"
+    );
 }
 
 /// True-network smoke test for the remote https transport. Ignored by default (and additionally
@@ -1595,10 +2156,18 @@ async fn git_clone_real_network_https() {
         )
         .await
         .expect("real https clone over the network");
-    assert!(rec.resolved_commit.is_some(), "remote HEAD resolved over https");
-    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
     assert!(
-        store_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false),
+        rec.resolved_commit.is_some(),
+        "remote HEAD resolved over https"
+    );
+    let store_dir = store
+        .package_dir(InstallScope::Global, &rec.id)
+        .expect("package dir");
+    assert!(
+        store_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
         "remote worktree materialized at {}",
         store_dir.display()
     );
@@ -1614,11 +2183,22 @@ async fn git_clone_real_network_https() {
 // ===========================================================================
 
 /// An installed package backed by a path tree containing a single named skill.
-fn pkg_with_skill(dir: &Path, id: &str, scope: InstallScope, name: &str, desc: &str) -> InstalledPackage {
-    write(&dir.join(format!("skills/{name}/SKILL.md")), &skill_md(name, desc));
+fn pkg_with_skill(
+    dir: &Path,
+    id: &str,
+    scope: InstallScope,
+    name: &str,
+    desc: &str,
+) -> InstalledPackage {
+    write(
+        &dir.join(format!("skills/{name}/SKILL.md")),
+        &skill_md(name, desc),
+    );
     InstalledPackage {
         id: cyrup_core::PackageId::from(id.to_string()),
-        source: PackageSource::Path { path: dir.to_path_buf() },
+        source: PackageSource::Path {
+            path: dir.to_path_buf(),
+        },
         scope,
         resolved_commit: None,
         installed_at: "0".to_string(),
@@ -1633,15 +2213,27 @@ fn g1_precedence_rank_matches_pi() {
     assert_eq!(ResourceScope::Project.precedence_rank(), 1);
     assert_eq!(ResourceScope::GlobalSettings.precedence_rank(), 2);
     assert_eq!(ResourceScope::Global.precedence_rank(), 3);
-    assert_eq!(ResourceScope::ProjectPackage.precedence_rank(), 4, "all packages rank 4");
+    assert_eq!(
+        ResourceScope::ProjectPackage.precedence_rank(),
+        4,
+        "all packages rank 4"
+    );
     assert_eq!(ResourceScope::GlobalPackage.precedence_rank(), 4);
     assert_eq!(
         ResourceScope::Cli.precedence_rank(),
         5,
         "CLI appended after the sorted accumulator (resource-loader.ts:421), so it loses to packages"
     );
-    assert_eq!(ResourceScope::Discovered.precedence_rank(), 6, "[CYRUP-DELTA] below CLI + packages");
-    assert_eq!(ResourceScope::Builtin.precedence_rank(), 7, "[CYRUP-DELTA] lowest");
+    assert_eq!(
+        ResourceScope::Discovered.precedence_rank(),
+        6,
+        "[CYRUP-DELTA] below CLI + packages"
+    );
+    assert_eq!(
+        ResourceScope::Builtin.precedence_rank(),
+        7,
+        "[CYRUP-DELTA] lowest"
+    );
 }
 
 #[tokio::test]
@@ -1651,7 +2243,10 @@ async fn g1_cli_loses_to_project_resource() {
     // (rank 5) (package-manager.ts:184-188).
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join(".cyrup/skills/dup/SKILL.md"), &skill_md("dup", "project one"));
+    write(
+        &root.join(".cyrup/skills/dup/SKILL.md"),
+        &skill_md("dup", "project one"),
+    );
     let cli = root.join("cli/dup/SKILL.md");
     write(&cli, &skill_md("dup", "cli one"));
 
@@ -1660,7 +2255,11 @@ async fn g1_cli_loses_to_project_resource() {
     c.cli.skills = vec![cli];
     let report = run_discover(&c).await;
     let w = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(w.scope, ResourceScope::Project, "project (rank 1) beats CLI (rank 5)");
+    assert_eq!(
+        w.scope,
+        ResourceScope::Project,
+        "project (rank 1) beats CLI (rank 5)"
+    );
     assert_eq!(w.front.description.as_deref(), Some("project one"));
 }
 
@@ -1672,7 +2271,10 @@ async fn g1_cli_loses_to_global_auto_and_to_package() {
     // ANY rank. Here a global auto-discovered loose file (rank 3) wins over the CLI path (rank 5).
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global auto"));
+    write(
+        &root.join("global/skills/dup/SKILL.md"),
+        &skill_md("dup", "global auto"),
+    );
     let cli = root.join("cli/dup/SKILL.md");
     write(&cli, &skill_md("dup", "cli one"));
 
@@ -1680,7 +2282,11 @@ async fn g1_cli_loses_to_global_auto_and_to_package() {
     c.cli.skills = vec![cli.clone()];
     let report = run_discover(&c).await;
     let w = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(w.scope, ResourceScope::Global, "global auto (rank 3) beats CLI (rank 5)");
+    assert_eq!(
+        w.scope,
+        ResourceScope::Global,
+        "global auto (rank 3) beats CLI (rank 5)"
+    );
     assert_eq!(w.front.description.as_deref(), Some("global auto"));
 
     // Now collide the CLI path with a *package* (rank 4): the package wins, because Pi appends the
@@ -1690,11 +2296,17 @@ async fn g1_cli_loses_to_global_auto_and_to_package() {
     let clip = root.join("cli2/only/SKILL.md");
     write(&clip, &skill_md("only", "cli loses"));
     let mut c2 = cfg(root);
-    c2.installed = InstalledPackages { packages: vec![pkg] };
+    c2.installed = InstalledPackages {
+        packages: vec![pkg],
+    };
     c2.cli.skills = vec![clip];
     let r2 = run_discover(&c2).await;
     let w2 = r2.registry.skills.get_name("only").expect("only present");
-    assert_eq!(w2.scope, ResourceScope::GlobalPackage, "package (rank 4) beats CLI (rank 5)");
+    assert_eq!(
+        w2.scope,
+        ResourceScope::GlobalPackage,
+        "package (rank 4) beats CLI (rank 5)"
+    );
     assert_eq!(w2.front.description.as_deref(), Some("pkg one"));
 }
 
@@ -1704,16 +2316,31 @@ async fn g1_global_loose_beats_project_package() {
     // file beats a project-local package on a same-name collision (package-manager.ts:185).
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global loose"));
+    write(
+        &root.join("global/skills/dup/SKILL.md"),
+        &skill_md("dup", "global loose"),
+    );
     let pkgdir = root.join("ppkg");
-    let pkg = pkg_with_skill(&pkgdir, "path:pp", InstallScope::Project, "dup", "project package");
+    let pkg = pkg_with_skill(
+        &pkgdir,
+        "path:pp",
+        InstallScope::Project,
+        "dup",
+        "project package",
+    );
 
     let mut c = cfg(root);
     c.trusted_project = true;
-    c.installed = InstalledPackages { packages: vec![pkg] };
+    c.installed = InstalledPackages {
+        packages: vec![pkg],
+    };
     let report = run_discover(&c).await;
     let w = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(w.scope, ResourceScope::Global, "global loose (rank 3) beats project package (rank 4)");
+    assert_eq!(
+        w.scope,
+        ResourceScope::Global,
+        "global loose (rank 3) beats project package (rank 4)"
+    );
     assert_eq!(w.front.description.as_deref(), Some("global loose"));
 }
 
@@ -1726,15 +2353,33 @@ async fn g1_project_package_beats_global_package() {
     let gdir = root.join("gpkg");
     let pdir = root.join("ppkg");
     // Register global first to prove the project-first re-ordering (not input order) decides.
-    let gpkg = pkg_with_skill(&gdir, "path:g", InstallScope::Global, "dup", "global package");
-    let ppkg = pkg_with_skill(&pdir, "path:p", InstallScope::Project, "dup", "project package");
+    let gpkg = pkg_with_skill(
+        &gdir,
+        "path:g",
+        InstallScope::Global,
+        "dup",
+        "global package",
+    );
+    let ppkg = pkg_with_skill(
+        &pdir,
+        "path:p",
+        InstallScope::Project,
+        "dup",
+        "project package",
+    );
 
     let mut c = cfg(root);
     c.trusted_project = true;
-    c.installed = InstalledPackages { packages: vec![gpkg, ppkg] };
+    c.installed = InstalledPackages {
+        packages: vec![gpkg, ppkg],
+    };
     let report = run_discover(&c).await;
     let w = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(w.scope, ResourceScope::ProjectPackage, "project package wins the rank-4 tie");
+    assert_eq!(
+        w.scope,
+        ResourceScope::ProjectPackage,
+        "project package wins the rank-4 tie"
+    );
     assert_eq!(w.front.description.as_deref(), Some("project package"));
 }
 
@@ -1746,24 +2391,54 @@ async fn g1_settings_entry_outranks_auto_in_same_scope() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     // Global: auto-discovered under global/skills, settings entry under global/extra.
-    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global auto"));
-    write(&root.join("global/extra/dup/SKILL.md"), &skill_md("dup", "global settings"));
+    write(
+        &root.join("global/skills/dup/SKILL.md"),
+        &skill_md("dup", "global auto"),
+    );
+    write(
+        &root.join("global/extra/dup/SKILL.md"),
+        &skill_md("dup", "global settings"),
+    );
     // Project: auto under .cyrup/skills, settings entry under .cyrup/extra (base = <cwd>/.cyrup).
-    write(&root.join(".cyrup/skills/pdup/SKILL.md"), &skill_md("pdup", "project auto"));
-    write(&root.join(".cyrup/extra/pdup/SKILL.md"), &skill_md("pdup", "project settings"));
+    write(
+        &root.join(".cyrup/skills/pdup/SKILL.md"),
+        &skill_md("pdup", "project auto"),
+    );
+    write(
+        &root.join(".cyrup/extra/pdup/SKILL.md"),
+        &skill_md("pdup", "project settings"),
+    );
 
     let mut c = cfg(root);
     c.trusted_project = true;
-    c.global_overrides = ResourceOverrides { skills: vec!["extra/dup".to_string()], ..Default::default() };
-    c.project_overrides = ResourceOverrides { skills: vec!["extra/pdup".to_string()], ..Default::default() };
+    c.global_overrides = ResourceOverrides {
+        skills: vec!["extra/dup".to_string()],
+        ..Default::default()
+    };
+    c.project_overrides = ResourceOverrides {
+        skills: vec!["extra/pdup".to_string()],
+        ..Default::default()
+    };
     let report = run_discover(&c).await;
 
     let g = report.registry.skills.get_name("dup").expect("dup present");
-    assert_eq!(g.scope, ResourceScope::GlobalSettings, "global settings (rank 2) beats auto (rank 3)");
+    assert_eq!(
+        g.scope,
+        ResourceScope::GlobalSettings,
+        "global settings (rank 2) beats auto (rank 3)"
+    );
     assert_eq!(g.front.description.as_deref(), Some("global settings"));
 
-    let p = report.registry.skills.get_name("pdup").expect("pdup present");
-    assert_eq!(p.scope, ResourceScope::ProjectSettings, "project settings (rank 0) beats auto (rank 1)");
+    let p = report
+        .registry
+        .skills
+        .get_name("pdup")
+        .expect("pdup present");
+    assert_eq!(
+        p.scope,
+        ResourceScope::ProjectSettings,
+        "project settings (rank 0) beats auto (rank 1)"
+    );
     assert_eq!(p.front.description.as_deref(), Some("project settings"));
 }
 
@@ -1774,22 +2449,39 @@ async fn g1_settings_entry_loads_prompt_and_theme_positive_listings() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(&root.join("global/extra/hello.md"), "Say hi to {{who}}");
-    write(&root.join("global/extra/cool.json"), &full_theme_json("cool", &[], &[]));
+    write(
+        &root.join("global/extra/cool.json"),
+        &full_theme_json("cool", &[], &[]),
+    );
     // A second prompt that the `!` pattern must keep filtering out of *auto-discovery*.
     write(&root.join("global/prompts/dropme.md"), "drop");
 
     let mut c = cfg(root);
     c.global_overrides = ResourceOverrides {
-        prompts: vec!["extra/hello.md".to_string(), "!prompts/dropme.md".to_string()],
+        prompts: vec![
+            "extra/hello.md".to_string(),
+            "!prompts/dropme.md".to_string(),
+        ],
         themes: vec!["extra/cool.json".to_string()],
         ..Default::default()
     };
     let report = run_discover(&c).await;
-    let pr = report.registry.prompts.get_name("hello").expect("settings prompt loaded");
+    let pr = report
+        .registry
+        .prompts
+        .get_name("hello")
+        .expect("settings prompt loaded");
     assert_eq!(pr.scope, ResourceScope::GlobalSettings);
-    let th = report.registry.themes.get_name("cool").expect("settings theme loaded");
+    let th = report
+        .registry
+        .themes
+        .get_name("cool")
+        .expect("settings theme loaded");
     assert_eq!(th.scope, ResourceScope::GlobalSettings);
-    assert!(!report.registry.prompts.contains("dropme"), "`!` pattern still filters auto-discovery");
+    assert!(
+        !report.registry.prompts.contains("dropme"),
+        "`!` pattern still filters auto-discovery"
+    );
 }
 
 #[tokio::test]
@@ -1797,14 +2489,26 @@ async fn g1_project_settings_entry_trust_gated() {
     // Project settings positive listings are trust-gated (fail-closed) like project loose files.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(&root.join(".cyrup/extra/secret/SKILL.md"), &skill_md("secret", "project settings skill"));
+    write(
+        &root.join(".cyrup/extra/secret/SKILL.md"),
+        &skill_md("secret", "project settings skill"),
+    );
 
     let mut c = cfg(root);
-    c.project_overrides = ResourceOverrides { skills: vec!["extra/secret".to_string()], ..Default::default() };
+    c.project_overrides = ResourceOverrides {
+        skills: vec!["extra/secret".to_string()],
+        ..Default::default()
+    };
 
     c.trusted_project = false;
-    assert!(!run_discover(&c).await.registry.skills.contains("secret"), "untrusted hides settings entry");
+    assert!(
+        !run_discover(&c).await.registry.skills.contains("secret"),
+        "untrusted hides settings entry"
+    );
 
     c.trusted_project = true;
-    assert!(run_discover(&c).await.registry.skills.contains("secret"), "trusted surfaces settings entry");
+    assert!(
+        run_discover(&c).await.registry.skills.contains("secret"),
+        "trusted surfaces settings entry"
+    );
 }

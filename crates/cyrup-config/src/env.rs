@@ -48,7 +48,8 @@ pub struct EnvVars {
 }
 
 fn first_env(keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    keys.iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 /// Port of Pi `isTruthyEnvFlag` (telemetry.ts:3-6, main.ts:95-98, package-manager.ts:42-46):
@@ -67,11 +68,15 @@ impl EnvVars {
             agent_dir: path(&["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"]),
             session_dir: path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]),
             package_dir: path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]),
-            offline: first_env(&["CYRUP_OFFLINE", "PI_OFFLINE"]).as_deref().is_some_and(truthy),
+            offline: first_env(&["CYRUP_OFFLINE", "PI_OFFLINE"])
+                .as_deref()
+                .is_some_and(truthy),
             skip_version_chk: first_env(&["CYRUP_SKIP_VERSION_CHECK", "PI_SKIP_VERSION_CHECK"])
                 .as_deref()
                 .is_some_and(truthy),
-            telemetry: first_env(&["CYRUP_TELEMETRY", "PI_TELEMETRY"]).as_deref().map(truthy),
+            telemetry: first_env(&["CYRUP_TELEMETRY", "PI_TELEMETRY"])
+                .as_deref()
+                .map(truthy),
             cache_retention: first_env(&["CYRUP_CACHE_RETENTION", "PI_CACHE_RETENTION"])
                 .as_deref()
                 .and_then(CacheRetention::parse)
@@ -150,7 +155,12 @@ impl ConfigDirs {
         // but a not-yet-existing cwd must not crash startup).
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
-        Ok(Self { agent_dir, session_dir, package_dir, cwd })
+        Ok(Self {
+            agent_dir,
+            session_dir,
+            package_dir,
+            cwd,
+        })
     }
 
     pub fn settings_path(&self) -> PathBuf {

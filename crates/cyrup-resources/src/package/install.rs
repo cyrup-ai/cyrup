@@ -20,7 +20,10 @@ pub struct PackageManager {
 
 /// The security caveat shown for every install (R-09-019).
 pub fn security_notice_for(source: PackageSource) -> SecurityNotice {
-    SecurityNotice { message: SECURITY_CAVEAT, source }
+    SecurityNotice {
+        message: SECURITY_CAVEAT,
+        source,
+    }
 }
 
 impl PackageManager {
@@ -65,7 +68,9 @@ impl PackageManager {
             }
             PackageSource::Git { url, reff } => {
                 let dir = self.store.package_dir(scope, &id).ok_or_else(|| {
-                    ResourceError::Manifest("project package dir unavailable (no project root)".into())
+                    ResourceError::Manifest(
+                        "project package dir unavailable (no project root)".into(),
+                    )
                 })?;
                 let url = url.clone();
                 let ref_name = reff.ref_name().map(str::to_string);
@@ -100,22 +105,27 @@ impl PackageManager {
     pub async fn remove(&self, id: &PackageId) -> Result<(), ResourceError> {
         let mut removed = false;
         for scope in [InstallScope::Global, InstallScope::Project] {
-            let Some(reg_path) = self.store.registry_path(scope) else { continue };
+            let Some(reg_path) = self.store.registry_path(scope) else {
+                continue;
+            };
             let mut reg = lock::load(&reg_path)?;
             if reg.remove(id) {
                 lock::save(&reg_path, &reg)?;
                 // Best-effort: drop the cloned working tree (not Path installs).
                 if let Some(dir) = self.store.package_dir(scope, id)
-                    && dir.exists() {
-                        let _ = std::fs::remove_dir_all(&dir);
-                    }
+                    && dir.exists()
+                {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 removed = true;
             }
         }
         if removed {
             Ok(())
         } else {
-            Err(ResourceError::Manifest(format!("package not installed: {id}")))
+            Err(ResourceError::Manifest(format!(
+                "package not installed: {id}"
+            )))
         }
     }
 
@@ -124,9 +134,10 @@ impl PackageManager {
         let mut out = Vec::new();
         for scope in [InstallScope::Global, InstallScope::Project] {
             if let Some(reg_path) = self.store.registry_path(scope)
-                && let Ok(reg) = lock::load(&reg_path) {
-                    out.extend(reg.packages);
-                }
+                && let Ok(reg) = lock::load(&reg_path)
+            {
+                out.extend(reg.packages);
+            }
         }
         out
     }
@@ -139,7 +150,9 @@ impl PackageManager {
     ) -> Result<UpdateReport, ResourceError> {
         let mut report = UpdateReport::default();
         for scope in [InstallScope::Global, InstallScope::Project] {
-            let Some(reg_path) = self.store.registry_path(scope) else { continue };
+            let Some(reg_path) = self.store.registry_path(scope) else {
+                continue;
+            };
             let mut reg = lock::load(&reg_path)?;
             let mut dirty = false;
             for pkg in &mut reg.packages {
@@ -178,7 +191,9 @@ impl PackageManager {
         enabled: bool,
     ) -> Result<(), ResourceError> {
         for scope in [InstallScope::Global, InstallScope::Project] {
-            let Some(reg_path) = self.store.registry_path(scope) else { continue };
+            let Some(reg_path) = self.store.registry_path(scope) else {
+                continue;
+            };
             let mut reg = lock::load(&reg_path)?;
             if let Some(pkg) = reg.find_mut(id) {
                 pkg.disabled.set(&sel, !enabled);
@@ -186,7 +201,9 @@ impl PackageManager {
                 return Ok(());
             }
         }
-        Err(ResourceError::Manifest(format!("package not installed: {id}")))
+        Err(ResourceError::Manifest(format!(
+            "package not installed: {id}"
+        )))
     }
 }
 
@@ -204,7 +221,9 @@ fn refresh(
         PackageSource::Path { .. } => Ok(()),
         PackageSource::Oci { .. } => Err(ResourceError::Unsupported),
         PackageSource::Git { url, reff } => {
-            let Some(dir) = store.package_dir(scope, &pkg.id) else { return Ok(()) };
+            let Some(dir) = store.package_dir(scope, &pkg.id) else {
+                return Ok(());
+            };
             match git_clone(url, &dir, reff.ref_name().map(str::to_string)) {
                 Ok(commit) => pkg.resolved_commit = Some(commit),
                 Err(_) => {
@@ -315,7 +334,9 @@ fn checkout_ref(dir: &std::path::Path, reff: &str) -> Result<String, ResourceErr
         .try_into_commit()
         .map_err(|e| ResourceError::Git(e.to_string()))?;
     let commit_hex = commit.id().to_hex().to_string();
-    let tree = commit.tree().map_err(|e| ResourceError::Git(e.to_string()))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| ResourceError::Git(e.to_string()))?;
     materialize_tree(&tree, dir)?;
     Ok(commit_hex)
 }
@@ -328,20 +349,24 @@ fn materialize_tree(tree: &gix::Tree<'_>, dst: &std::path::Path) -> Result<(), R
     std::fs::create_dir_all(dst)?;
     for entry in tree.iter() {
         let entry = entry.map_err(|e| ResourceError::Git(e.to_string()))?;
-        let Ok(name) = std::str::from_utf8(entry.filename()) else { continue };
+        let Ok(name) = std::str::from_utf8(entry.filename()) else {
+            continue;
+        };
         let path = dst.join(name);
         match entry.mode().kind() {
             EntryKind::Tree => {
-                let object =
-                    entry.object().map_err(|e| ResourceError::Git(e.to_string()))?;
+                let object = entry
+                    .object()
+                    .map_err(|e| ResourceError::Git(e.to_string()))?;
                 let subtree = object
                     .try_into_tree()
                     .map_err(|e| ResourceError::Git(e.to_string()))?;
                 materialize_tree(&subtree, &path)?;
             }
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                let object =
-                    entry.object().map_err(|e| ResourceError::Git(e.to_string()))?;
+                let object = entry
+                    .object()
+                    .map_err(|e| ResourceError::Git(e.to_string()))?;
                 std::fs::write(&path, &object.into_blob().data)?;
             }
             EntryKind::Commit => {}
@@ -372,6 +397,8 @@ fn git_head(dir: &std::path::Path) -> Result<String, ResourceError> {
 }
 
 fn git_head_repo(repo: &gix::Repository) -> Result<String, ResourceError> {
-    let commit = repo.head_commit().map_err(|e| ResourceError::Git(e.to_string()))?;
+    let commit = repo
+        .head_commit()
+        .map_err(|e| ResourceError::Git(e.to_string()))?;
     Ok(commit.id().to_hex().to_string())
 }

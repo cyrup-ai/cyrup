@@ -69,7 +69,8 @@ impl PromptTemplate {
             Some(d) if !d.is_empty() => d,
             _ => first_line_description(&body),
         };
-        let argument_hint = frontmatter_str(&frontmatter, "argument-hint").filter(|s| !s.is_empty());
+        let argument_hint =
+            frontmatter_str(&frontmatter, "argument-hint").filter(|s| !s.is_empty());
 
         Ok(PromptTemplate {
             key,
@@ -246,7 +247,10 @@ fn match_brace_form(content: &str, start: usize, args: &[String]) -> Option<(Str
     {
         let idx = num.parse::<usize>().ok()?.checked_sub(1)?;
         let value = args.get(idx).filter(|v| !v.is_empty());
-        return Some((value.cloned().unwrap_or_else(|| default.to_string()), consumed));
+        return Some((
+            value.cloned().unwrap_or_else(|| default.to_string()),
+            consumed,
+        ));
     }
 
     // `${@:N}` / `${@:N:L}`
@@ -317,10 +321,9 @@ fn parse_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, serde_yml
     match yaml {
         Some(front) => {
             // Pi silently treats a YAML parse fault as `{}` (prompt-templates.ts:129-131).
-            let map = serde_yml::from_str::<std::collections::BTreeMap<String, serde_yml::Value>>(
-                &front,
-            )
-            .unwrap_or_default();
+            let map =
+                serde_yml::from_str::<std::collections::BTreeMap<String, serde_yml::Value>>(&front)
+                    .unwrap_or_default();
             (map, body)
         }
         // No fence → empty frontmatter + the normalized whole content (frontmatter.ts:14,19,33).

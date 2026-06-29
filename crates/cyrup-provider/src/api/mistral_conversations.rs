@@ -14,6 +14,7 @@
 //! Wire JSON uses Mistral's own field names (camelCase: `maxTokens`, `toolChoice`, `promptMode`,
 //! `reasoningEffort`, `toolCalls`, `toolCallId`).
 
+use crate::HeaderMap;
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
 use crate::api::{ApiImpl, EventSink};
@@ -22,18 +23,17 @@ use crate::collection::clamp_thinking_level;
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::{Modality, Model};
-use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
-use crate::HeaderMap;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ToolCall, ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,7 +52,9 @@ pub struct MistralConversationsApi {
 
 impl Default for MistralConversationsApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -90,7 +92,8 @@ impl ApiImpl for MistralConversationsApi {
             _ => {
                 let e =
                     ProviderError::Transport(format!("No API key for provider: {provider}").into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -99,19 +102,34 @@ impl ApiImpl for MistralConversationsApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
 
         let body = build_chat_payload(model, ctx, opts);
         let headers = build_headers(model, opts, &api_key);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -119,7 +137,8 @@ impl ApiImpl for MistralConversationsApi {
         let frames = match open_sse(&client, req, cancel, None, None).await {
             Ok(s) => s,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -136,7 +155,11 @@ impl ApiImpl for MistralConversationsApi {
 /// mistral-conversations.ts:65-68). An auth base-url override wins over `model.base_url`. The
 /// endpoint is `{base}/v1/chat/completions`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
+    let base = auth
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or(model.base_url.as_str());
     Some(chat_url(base))
 }
 
@@ -166,8 +189,14 @@ fn should_use_prompt_caching(opts: &StreamOptions) -> Option<&str> {
 /// reuse. The model/opts header overlays layer last (a `None` value suppresses a default).
 pub(crate) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("content-type".to_string(), Some("application/json".to_string()));
-    headers.insert("authorization".to_string(), Some(format!("Bearer {api_key}")));
+    headers.insert(
+        "content-type".to_string(),
+        Some("application/json".to_string()),
+    );
+    headers.insert(
+        "authorization".to_string(),
+        Some(format!("Bearer {api_key}")),
+    );
 
     if let Some(overlay) = &model.headers {
         for (name, value) in overlay {
@@ -210,7 +239,10 @@ pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOpti
 
     // System prompt is prepended (Pi mistral-conversations.ts:260-265).
     if let Some(sp) = &ctx.system_prompt {
-        messages.insert(0, json!({ "role": "system", "content": sanitize_surrogates(sp) }));
+        messages.insert(
+            0,
+            json!({ "role": "system", "content": sanitize_surrogates(sp) }),
+        );
     }
 
     let mut obj = Map::new();
@@ -219,7 +251,10 @@ pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOpti
     obj.insert("messages".to_string(), Value::Array(messages));
 
     if !ctx.tools.is_empty() {
-        obj.insert("tools".to_string(), Value::Array(to_function_tools(&ctx.tools)));
+        obj.insert(
+            "tools".to_string(),
+            Value::Array(to_function_tools(&ctx.tools)),
+        );
     }
     if let Some(temp) = opts.temperature {
         obj.insert("temperature".to_string(), json!(temp));
@@ -333,7 +368,12 @@ pub(crate) fn to_function_tools(tools: &[ToolDef]) -> Vec<Value> {
 }
 
 /// The text for a tool-result message (Pi `buildToolResultText`, mistral-conversations.ts:600-619).
-fn build_tool_result_text(text: &str, has_images: bool, supports_images: bool, is_error: bool) -> String {
+fn build_tool_result_text(
+    text: &str,
+    has_images: bool,
+    supports_images: bool,
+    is_error: bool,
+) -> String {
     let trimmed = text.trim();
     let error_prefix = if is_error { "[tool error] " } else { "" };
     if !trimmed.is_empty() {
@@ -346,7 +386,11 @@ fn build_tool_result_text(text: &str, has_images: bool, supports_images: bool, i
     }
     if has_images {
         if supports_images {
-            return if is_error { "[tool error] (see attached image)".to_string() } else { "(see attached image)".to_string() };
+            return if is_error {
+                "[tool error] (see attached image)".to_string()
+            } else {
+                "(see attached image)".to_string()
+            };
         }
         return if is_error {
             "[tool error] (image omitted: model does not support images)".to_string()
@@ -354,7 +398,11 @@ fn build_tool_result_text(text: &str, has_images: bool, supports_images: bool, i
             "(image omitted: model does not support images)".to_string()
         };
     }
-    if is_error { "[tool error] (no tool output)".to_string() } else { "(no tool output)".to_string() }
+    if is_error {
+        "[tool error] (no tool output)".to_string()
+    } else {
+        "(no tool output)".to_string()
+    }
 }
 
 /// Convert cyrup [`Message`]s to Mistral chat messages (Pi `toChatMessages`,
@@ -396,8 +444,9 @@ pub(crate) fn to_chat_messages(messages: &[Message], supports_images: bool) -> V
                     match block {
                         Content::Text { text, .. } => {
                             if !text.trim().is_empty() {
-                                content_parts
-                                    .push(json!({ "type": "text", "text": sanitize_surrogates(text) }));
+                                content_parts.push(
+                                    json!({ "type": "text", "text": sanitize_surrogates(text) }),
+                                );
                             }
                         }
                         Content::Thinking { thinking, .. } => {
@@ -432,7 +481,13 @@ pub(crate) fn to_chat_messages(messages: &[Message], supports_images: bool) -> V
                     result.push(Value::Object(o));
                 }
             }
-            Message::ToolResult { tool_call_id, tool_name, content, is_error, .. } => {
+            Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => {
                 let text_result = content
                     .iter()
                     .filter_map(|c| match c {
@@ -491,8 +546,12 @@ impl MistralToolCallIdNormalizer {
             let candidate = derive_mistral_tool_call_id(id, attempt);
             let owner = self.reverse_map.borrow().get(&candidate).cloned();
             if owner.as_deref().map(|o| o == id).unwrap_or(true) {
-                self.id_map.borrow_mut().insert(id.to_string(), candidate.clone());
-                self.reverse_map.borrow_mut().insert(candidate.clone(), id.to_string());
+                self.id_map
+                    .borrow_mut()
+                    .insert(id.to_string(), candidate.clone());
+                self.reverse_map
+                    .borrow_mut()
+                    .insert(candidate.clone(), id.to_string());
                 return candidate;
             }
             attempt += 1;
@@ -507,8 +566,16 @@ fn derive_mistral_tool_call_id(id: &str, attempt: u32) -> String {
     if attempt == 0 && normalized.len() == MISTRAL_TOOL_CALL_ID_LENGTH {
         return normalized;
     }
-    let seed_base = if normalized.is_empty() { id.to_string() } else { normalized };
-    let seed = if attempt == 0 { seed_base } else { format!("{seed_base}:{attempt}") };
+    let seed_base = if normalized.is_empty() {
+        id.to_string()
+    } else {
+        normalized
+    };
+    let seed = if attempt == 0 {
+        seed_base
+    } else {
+        format!("{seed_base}:{attempt}")
+    };
     short_hash(&seed)
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -590,7 +657,10 @@ impl Decoder {
                         .get(&i)
                         .map(|p| parse_streaming_json_object(Some(p)))
                         .unwrap_or_else(|| tc.arguments.clone());
-                    Content::ToolCall(ToolCall { arguments: args, ..tc.clone() })
+                    Content::ToolCall(ToolCall {
+                        arguments: args,
+                        ..tc.clone()
+                    })
                 }
                 other => other.clone(),
             })
@@ -612,7 +682,12 @@ where
     let model_id = model.id.as_str().to_string();
 
     let mut dec = Decoder::default();
-    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+    if !sink
+        .send(StreamEvent::Start {
+            partial: dec.snapshot(model, api),
+        })
+        .await
+    {
         return;
     }
 
@@ -620,7 +695,8 @@ where
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -629,8 +705,14 @@ where
             continue;
         }
         let Some(chunk) = parse_json_with_repair(data) else {
-            emit_error(&dec, model, api, sink, "Could not parse Mistral SSE chunk".to_string())
-                .await;
+            emit_error(
+                &dec,
+                model,
+                api,
+                sink,
+                "Could not parse Mistral SSE chunk".to_string(),
+            )
+            .await;
             return;
         };
         if !process_chunk(&chunk, &mut dec, model, api, sink).await {
@@ -653,7 +735,9 @@ where
             model,
             api,
             sink,
-            dec.error_message.clone().unwrap_or_else(|| "An unknown error occurred".to_string()),
+            dec.error_message
+                .clone()
+                .unwrap_or_else(|| "An unknown error occurred".to_string()),
         )
         .await;
         return;
@@ -689,7 +773,11 @@ async fn process_chunk(
 
     if let Some(reason) = choice.get("finishReason").and_then(Value::as_str) {
         dec.stop_reason = map_chat_stop_reason(Some(reason));
-    } else if choice.get("finishReason").map(Value::is_null).unwrap_or(false) {
+    } else if choice
+        .get("finishReason")
+        .map(Value::is_null)
+        .unwrap_or(false)
+    {
         dec.stop_reason = map_chat_stop_reason(None);
     }
 
@@ -787,7 +875,13 @@ async fn push_text(
         dec.current = Some(CurrentKind::Text);
         let idx = dec.block_index();
         let partial = dec.snapshot(model, api);
-        if !sink.send(StreamEvent::TextStart { content_index: idx, partial }).await {
+        if !sink
+            .send(StreamEvent::TextStart {
+                content_index: idx,
+                partial,
+            })
+            .await
+        {
             return false;
         }
     }
@@ -796,7 +890,12 @@ async fn push_text(
         text.push_str(delta);
     }
     let partial = dec.snapshot(model, api);
-    sink.send(StreamEvent::TextDelta { content_index: idx, delta: delta.to_string(), partial }).await
+    sink.send(StreamEvent::TextDelta {
+        content_index: idx,
+        delta: delta.to_string(),
+        partial,
+    })
+    .await
 }
 
 /// Append a thinking delta, opening/closing blocks as needed.
@@ -815,7 +914,13 @@ async fn push_thinking(
         dec.current = Some(CurrentKind::Thinking);
         let idx = dec.block_index();
         let partial = dec.snapshot(model, api);
-        if !sink.send(StreamEvent::ThinkingStart { content_index: idx, partial }).await {
+        if !sink
+            .send(StreamEvent::ThinkingStart {
+                content_index: idx,
+                partial,
+            })
+            .await
+        {
             return false;
         }
     }
@@ -824,8 +929,12 @@ async fn push_thinking(
         thinking.push_str(delta);
     }
     let partial = dec.snapshot(model, api);
-    sink.send(StreamEvent::ThinkingDelta { content_index: idx, delta: delta.to_string(), partial })
-        .await
+    sink.send(StreamEvent::ThinkingDelta {
+        content_index: idx,
+        delta: delta.to_string(),
+        partial,
+    })
+    .await
 }
 
 /// Handle one streamed tool-call delta (Pi mistral-conversations.ts:418-464).
@@ -870,7 +979,13 @@ async fn process_tool_call(
         dec.tool_blocks_by_key.insert(key.clone(), block_idx);
         dec.tool_partial_args.insert(block_idx, String::new());
         let partial = dec.snapshot(model, api);
-        if !sink.send(StreamEvent::ToolCallStart { content_index: block_idx, partial }).await {
+        if !sink
+            .send(StreamEvent::ToolCallStart {
+                content_index: block_idx,
+                partial,
+            })
+            .await
+        {
             return false;
         }
     }
@@ -890,8 +1005,12 @@ async fn process_tool_call(
     }
 
     let partial = dec.snapshot(model, api);
-    sink.send(StreamEvent::ToolCallDelta { content_index: block_idx, delta: args_delta, partial })
-        .await
+    sink.send(StreamEvent::ToolCallDelta {
+        content_index: block_idx,
+        delta: args_delta,
+        partial,
+    })
+    .await
 }
 
 /// Emit the `*_end` for the in-progress text/thinking block, if any.
@@ -902,11 +1021,17 @@ async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId, sink: &Eve
     let idx = dec.block_index();
     let partial = dec.snapshot(model, api);
     let ev = match (kind, dec.blocks.get(idx)) {
-        (CurrentKind::Text, Some(Content::Text { text, .. })) => {
-            StreamEvent::TextEnd { content_index: idx, content: text.clone(), partial }
-        }
+        (CurrentKind::Text, Some(Content::Text { text, .. })) => StreamEvent::TextEnd {
+            content_index: idx,
+            content: text.clone(),
+            partial,
+        },
         (CurrentKind::Thinking, Some(Content::Thinking { thinking, .. })) => {
-            StreamEvent::ThinkingEnd { content_index: idx, content: thinking.clone(), partial }
+            StreamEvent::ThinkingEnd {
+                content_index: idx,
+                content: thinking.clone(),
+                partial,
+            }
         }
         _ => return true,
     };
@@ -933,12 +1058,24 @@ async fn finalize_tool_blocks(
             .get(&idx)
             .map(|p| parse_streaming_json_object(Some(p)))
             .unwrap_or_default();
-        let tool_call = ToolCall { id, name, arguments: args.clone(), thought_signature: None };
+        let tool_call = ToolCall {
+            id,
+            name,
+            arguments: args.clone(),
+            thought_signature: None,
+        };
         if let Some(Content::ToolCall(tc)) = dec.blocks.get_mut(idx) {
             tc.arguments = args;
         }
         let partial = dec.snapshot(model, api);
-        if !sink.send(StreamEvent::ToolCallEnd { content_index: idx, tool_call, partial }).await {
+        if !sink
+            .send(StreamEvent::ToolCallEnd {
+                content_index: idx,
+                tool_call,
+                partial,
+            })
+            .await
+        {
             return false;
         }
     }
@@ -950,7 +1087,10 @@ fn apply_usage(usage: &mut Usage, raw: &Value) {
     let prompt = raw.get("promptTokens").and_then(Value::as_u64).unwrap_or(0);
     let cached = mistral_cached_prompt_tokens(raw, prompt);
     usage.input = prompt.saturating_sub(cached);
-    usage.output = raw.get("completionTokens").and_then(Value::as_u64).unwrap_or(0);
+    usage.output = raw
+        .get("completionTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     usage.cache_read = cached;
     usage.cache_write = 0;
     usage.total_tokens = raw
@@ -964,10 +1104,14 @@ fn apply_usage(usage: &mut Usage, raw: &Value) {
 /// `getMistralCachedPromptTokens`, mistral-conversations.ts:274-293), clamped to `[0, promptTokens]`.
 fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
     let candidates = [
-        raw.get("promptTokensDetails").and_then(|d| d.get("cachedTokens")),
-        raw.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")),
-        raw.get("promptTokenDetails").and_then(|d| d.get("cachedTokens")),
-        raw.get("prompt_token_details").and_then(|d| d.get("cached_tokens")),
+        raw.get("promptTokensDetails")
+            .and_then(|d| d.get("cachedTokens")),
+        raw.get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens")),
+        raw.get("promptTokenDetails")
+            .and_then(|d| d.get("cachedTokens")),
+        raw.get("prompt_token_details")
+            .and_then(|d| d.get("cached_tokens")),
         raw.get("numCachedTokens"),
         raw.get("num_cached_tokens"),
     ];
@@ -1009,7 +1153,12 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::channel;
@@ -1026,7 +1175,12 @@ mod tests {
             base_url: "https://api.mistral.ai".to_string(),
             reasoning,
             input: vec![Modality::Text],
-            cost: ModelCost { input: 0.4, output: 2.0, cache_read: 0.04, cache_write: 0.0 },
+            cost: ModelCost {
+                input: 0.4,
+                output: 2.0,
+                cache_read: 0.04,
+                cache_write: 0.0,
+            },
             context_window: 256_000,
             max_tokens: 4096,
             thinking_level_map: None,
@@ -1038,15 +1192,24 @@ mod tests {
     fn user_ctx(text: &str) -> Context {
         Context {
             system_prompt: Some("be brief".to_string()),
-            messages: vec![Message::User { content: vec![Content::text(text)], timestamp: 0 }],
+            messages: vec![Message::User {
+                content: vec![Content::text(text)],
+                timestamp: 0,
+            }],
             tools: Vec::new(),
         }
     }
 
     #[test]
     fn url_appends_chat_completions() {
-        assert_eq!(chat_url("https://api.mistral.ai"), "https://api.mistral.ai/v1/chat/completions");
-        assert_eq!(chat_url("https://api.mistral.ai/"), "https://api.mistral.ai/v1/chat/completions");
+        assert_eq!(
+            chat_url("https://api.mistral.ai"),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_url("https://api.mistral.ai/"),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -1058,17 +1221,27 @@ mod tests {
         };
         let headers = build_headers(&m, &opts, "sk-mistral");
         assert_eq!(
-            headers.get("authorization").and_then(|v| v.clone()).as_deref(),
+            headers
+                .get("authorization")
+                .and_then(|v| v.clone())
+                .as_deref(),
             Some("Bearer sk-mistral")
         );
         // x-affinity set from the session id (default cacheRetention is not "none").
-        assert_eq!(headers.get("x-affinity").and_then(|v| v.clone()).as_deref(), Some("sess-1"));
+        assert_eq!(
+            headers.get("x-affinity").and_then(|v| v.clone()).as_deref(),
+            Some("sess-1")
+        );
     }
 
     #[test]
     fn build_payload_basic_shape() {
         let m = model_with("codestral-latest", false);
-        let opts = StreamOptions { max_tokens: Some(1000), temperature: Some(0.3), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(1000),
+            temperature: Some(0.3),
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("hello"), &opts);
         assert_eq!(body["model"], "codestral-latest");
         assert_eq!(body["stream"], true);
@@ -1086,7 +1259,10 @@ mod tests {
     #[test]
     fn reasoning_effort_models_emit_effort() {
         let m = model_with("mistral-small-latest", true);
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert_eq!(body["reasoningEffort"], "high");
         assert!(body.get("promptMode").is_none());
@@ -1095,7 +1271,10 @@ mod tests {
     #[test]
     fn prompt_mode_reasoning_for_other_reasoning_models() {
         let m = model_with("magistral-medium-latest", true);
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::Medium, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::Medium,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert_eq!(body["promptMode"], "reasoning");
         assert!(body.get("reasoningEffort").is_none());
@@ -1104,7 +1283,10 @@ mod tests {
     #[test]
     fn prompt_cache_key_set_with_session() {
         let m = model_with("codestral-latest", false);
-        let opts = StreamOptions { session_id: Some(SessionId::from("s9")), ..Default::default() };
+        let opts = StreamOptions {
+            session_id: Some(SessionId::from("s9")),
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert_eq!(body["promptCacheKey"], "s9");
     }
@@ -1118,7 +1300,10 @@ mod tests {
             parameters: json!({ "type": "object", "properties": { "p": { "type": "string" } } }),
         }];
         let m = model_with("codestral-latest", false);
-        let opts = StreamOptions { tool_choice: Some(ToolChoice::Required), ..Default::default() };
+        let opts = StreamOptions {
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
         let body = build_body(&m, &ctx, &opts);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
@@ -1184,9 +1369,11 @@ mod tests {
         let events = collect(raw.as_bytes().to_vec(), &m).await;
 
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello"))
+        );
         let tool = events
             .iter()
             .find_map(|e| match e {
@@ -1196,7 +1383,10 @@ mod tests {
             .expect("toolcall_end");
         assert_eq!(tool.id.as_str(), "abcdefghi");
         assert_eq!(tool.name, "read");
-        assert_eq!(tool.arguments.get("path").and_then(Value::as_str), Some("a"));
+        assert_eq!(
+            tool.arguments.get("path").and_then(Value::as_str),
+            Some("a")
+        );
 
         let msg = events
             .iter()
@@ -1221,12 +1411,16 @@ mod tests {
         );
         let m = model_with("magistral-small", true);
         let events = collect(raw.as_bytes().to_vec(), &m).await;
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "ponder")));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "answer")));
+        assert!(
+            events.iter().any(
+                |e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "ponder")
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "answer"))
+        );
         let msg = events
             .iter()
             .find_map(|e| match e {

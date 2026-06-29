@@ -6,8 +6,8 @@
 //! Azure endpoint configuration (base URL / resource name / api version / deployment-name map) is
 //! resolved from the provider env by the wire impl; see [`crate::api::azure_openai_responses`].
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -58,14 +58,19 @@ pub fn azure_openai_responses_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
     use crate::context::Context;
     use crate::known_api::AZURE_OPENAI_RESPONSES;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::{ProviderId, StopReason};
     use std::collections::BTreeMap;
 
@@ -84,15 +89,24 @@ mod tests {
     fn catalog_parses_with_expected_count_and_tags() {
         let models = azure_openai_responses_models();
         assert_eq!(models.len(), 42);
-        assert!(models.iter().all(|m| m.api.as_str() == AZURE_OPENAI_RESPONSES));
-        assert!(models.iter().all(|m| m.provider.as_str() == "azure-openai-responses"));
+        assert!(
+            models
+                .iter()
+                .all(|m| m.api.as_str() == AZURE_OPENAI_RESPONSES)
+        );
+        assert!(
+            models
+                .iter()
+                .all(|m| m.provider.as_str() == "azure-openai-responses")
+        );
         // At least one reasoning model carries a thinkingLevelMap (24 in Pi's catalog).
         assert!(models.iter().any(|m| m.thinking_level_map.is_some()));
     }
 
     #[test]
     fn env_mapping_present() {
-        let vars = crate::env_api_keys::api_key_env_vars("azure-openai-responses").expect("mapping");
+        let vars =
+            crate::env_api_keys::api_key_env_vars("azure-openai-responses").expect("mapping");
         assert!(vars.contains(&AZURE_OPENAI_API_KEY));
     }
 
@@ -112,9 +126,12 @@ mod tests {
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
         let model = provider.models().first().expect("model").clone();
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("not configured"));
     }
@@ -135,12 +152,18 @@ mod tests {
         let mut model = provider.models().first().expect("model").clone();
         // A concrete (unroutable) base URL so normalization + the /responses route are exercised.
         model.base_url = "http://127.0.0.1:1".to_string();
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved: {err}"
+        );
         assert!(err.contains("transport"), "expected transport error: {err}");
     }
 
@@ -159,12 +182,21 @@ mod tests {
         // Catalog models carry an empty baseUrl, so no Azure endpoint can be resolved.
         let model = provider.models().first().expect("model").clone();
         assert_eq!(model.base_url, "");
-        let msg =
-            collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-                .await;
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved: {err}");
-        assert!(err.contains("Azure OpenAI base URL is required"), "expected config error: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved: {err}"
+        );
+        assert!(
+            err.contains("Azure OpenAI base URL is required"),
+            "expected config error: {err}"
+        );
     }
 }

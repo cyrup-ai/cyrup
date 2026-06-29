@@ -5,8 +5,8 @@
 //! the generated `fireworks.models.ts` catalog (both already-implemented wire protocols — no new
 //! API or dependency).
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -62,7 +62,12 @@ pub fn fireworks_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::known_api::{ANTHROPIC_MESSAGES, OPENAI_COMPLETIONS};
@@ -83,7 +88,10 @@ mod tests {
     fn anthropic_and_openai_models_route_per_api() {
         let models = fireworks_models();
         let find = |id: &str| {
-            models.iter().find(|m| m.id.as_str() == id).unwrap_or_else(|| panic!("missing {id}"))
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
         };
 
         // glm-5p2 is the openai-completions model with a /v1 base URL + thinking level map.

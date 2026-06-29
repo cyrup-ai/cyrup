@@ -22,11 +22,18 @@ impl NetworkPolicy {
     pub fn resolve(s: &EffectiveSettings, env: &EnvVars, cli: &CliConfigOverrides) -> Self {
         let offline = cli.offline || env.offline;
         // Telemetry: env override wins over the settings value (R-07-028).
-        let install_telemetry = env.telemetry.unwrap_or_else(|| s.enable_install_telemetry());
+        let install_telemetry = env
+            .telemetry
+            .unwrap_or_else(|| s.enable_install_telemetry());
         // Update check is independent of telemetry; only the env skip toggle disables it here.
         let update_check = !env.skip_version_chk;
         let analytics = s.enable_analytics();
-        Self { offline, update_check, install_telemetry, analytics }
+        Self {
+            offline,
+            update_check,
+            install_telemetry,
+            analytics,
+        }
     }
 
     pub fn allow_update_check(&self) -> bool {
@@ -61,7 +68,10 @@ mod tests {
         // A-07-7
         let s = eff(serde_json::json!({ "enableInstallTelemetry": true, "enableAnalytics": true }));
         let env = EnvVars::default();
-        let cli = CliConfigOverrides { offline: true, ..Default::default() };
+        let cli = CliConfigOverrides {
+            offline: true,
+            ..Default::default()
+        };
         let p = NetworkPolicy::resolve(&s, &env, &cli);
         assert!(!p.allow_update_check());
         assert!(!p.allow_install_telemetry());
@@ -80,7 +90,10 @@ mod tests {
 
         // env skip-version-check disables update check but not telemetry
         let s = eff(serde_json::json!({ "enableInstallTelemetry": true }));
-        let env = EnvVars { skip_version_chk: true, ..Default::default() };
+        let env = EnvVars {
+            skip_version_chk: true,
+            ..Default::default()
+        };
         let p = NetworkPolicy::resolve(&s, &env, &CliConfigOverrides::default());
         assert!(!p.allow_update_check());
         assert!(p.allow_install_telemetry());
@@ -89,7 +102,10 @@ mod tests {
     #[test]
     fn env_telemetry_overrides_settings() {
         let s = eff(serde_json::json!({ "enableInstallTelemetry": true }));
-        let env = EnvVars { telemetry: Some(false), ..Default::default() };
+        let env = EnvVars {
+            telemetry: Some(false),
+            ..Default::default()
+        };
         let p = NetworkPolicy::resolve(&s, &env, &CliConfigOverrides::default());
         assert!(!p.allow_install_telemetry());
     }

@@ -41,9 +41,7 @@ enum ColorValueRaw {
 /// Deserialize a color map accepting string or integer values (theme.ts ColorValueSchema). Integer
 /// indices 0-255 are converted to `#rrggbb` via the xterm-256 palette; out-of-range integers become
 /// the empty (inherit) value.
-fn de_color_map<'de, D>(
-    de: D,
-) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+fn de_color_map<'de, D>(de: D) -> Result<std::collections::BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -82,11 +80,7 @@ fn bad_color(val: &serde_json::Value) -> Option<&'static str> {
 
 /// Validate every value in an optional color record (`vars`, `export`) and push any malformed value
 /// to `other` as `  - {prefix}/{key}: {message}` (theme.ts:528-531).
-fn validate_color_record(
-    prefix: &str,
-    value: &serde_json::Value,
-    other: &mut Vec<String>,
-) {
+fn validate_color_record(prefix: &str, value: &serde_json::Value, other: &mut Vec<String>) {
     if let Some(obj) = value.as_object() {
         for (k, val) in obj {
             if let Some(msg) = bad_color(val) {
@@ -189,7 +183,11 @@ pub struct Theme {
 pub enum ColorSpec {
     #[default]
     Inherit,
-    Rgb { r: u8, g: u8, b: u8 },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 
 /// Roles resolved to concrete colors; cyrup-tui maps these to `ratatui::Color` (arch-10).
@@ -312,11 +310,10 @@ impl Theme {
             });
         }
 
-        let data: ThemeData =
-            serde_json::from_value(value).map_err(|e| ResourceError::Theme {
-                path: path.clone().unwrap_or_default(),
-                reason: e.to_string(),
-            })?;
+        let data: ThemeData = serde_json::from_value(value).map_err(|e| ResourceError::Theme {
+            path: path.clone().unwrap_or_default(),
+            reason: e.to_string(),
+        })?;
         // Theme name must not contain `/` — reserved for the `light/dark` auto-theme setting
         // (theme.ts:506-512,551).
         if data.name.contains('/') {
@@ -328,7 +325,11 @@ impl Theme {
         let mut key = ResourceKey::normalize(&data.name);
         if key.is_empty() {
             // Fall back to the file stem.
-            if let Some(stem) = path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
+            if let Some(stem) = path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+            {
                 key = ResourceKey::normalize(stem);
             }
         }
@@ -338,7 +339,13 @@ impl Theme {
                 reason: "theme has no `name` and no file stem".to_string(),
             });
         }
-        Ok(Theme { key, data, origin_path: path, scope, origin })
+        Ok(Theme {
+            key,
+            data,
+            origin_path: path,
+            scope,
+            origin,
+        })
     }
 
     /// Load a theme from a `.json` file.
@@ -681,9 +688,7 @@ pub const BUILTIN_LIGHT_JSON: &str = r##"{
 pub fn builtin_themes() -> Vec<Theme> {
     let mut out = Vec::new();
     for json in [BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON] {
-        if let Ok(t) =
-            Theme::parse(json, None, ResourceScope::Builtin, ResourceOrigin::Builtin)
-        {
+        if let Ok(t) = Theme::parse(json, None, ResourceScope::Builtin, ResourceOrigin::Builtin) {
             out.push(t);
         }
     }
@@ -732,12 +737,18 @@ impl ThemeWatcher {
             },
             cfg,
         )
-        .map_err(|e| ResourceError::Theme { path: path.clone(), reason: e.to_string() })?;
+        .map_err(|e| ResourceError::Theme {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
 
         // Watch the file directly; the poll watcher detects content/mtime changes.
         watcher
             .watch(&path, notify::RecursiveMode::NonRecursive)
-            .map_err(|e| ResourceError::Theme { path: path.clone(), reason: e.to_string() })?;
+            .map_err(|e| ResourceError::Theme {
+                path: path.clone(),
+                reason: e.to_string(),
+            })?;
 
         let inner = Arc::new(std::sync::Mutex::new(WatcherInner { watcher, path, tx }));
         let task_inner = Arc::clone(&inner);
@@ -754,7 +765,11 @@ impl ThemeWatcher {
             }
         });
 
-        Ok(ThemeWatcher { rx, inner, _task: task })
+        Ok(ThemeWatcher {
+            rx,
+            inner,
+            _task: task,
+        })
     }
 
     /// A fresh receiver for the active-theme channel.
@@ -765,16 +780,19 @@ impl ThemeWatcher {
     /// Switch the watched file at runtime (R-09-014). Immediately publishes the new file's theme.
     pub fn retarget(&self, path: PathBuf) -> Result<(), ResourceError> {
         use notify::Watcher;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| ResourceError::Theme { path: path.clone(), reason: "lock".into() })?;
+        let mut guard = self.inner.lock().map_err(|_| ResourceError::Theme {
+            path: path.clone(),
+            reason: "lock".into(),
+        })?;
         let old = guard.path.clone();
         let _ = guard.watcher.unwatch(&old);
         guard
             .watcher
             .watch(&path, notify::RecursiveMode::NonRecursive)
-            .map_err(|e| ResourceError::Theme { path: path.clone(), reason: e.to_string() })?;
+            .map_err(|e| ResourceError::Theme {
+                path: path.clone(),
+                reason: e.to_string(),
+            })?;
         guard.path = path;
         drop(guard);
         reload(&self.inner);

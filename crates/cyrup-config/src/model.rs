@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use cyrup_core::{ProviderId, ModelThinkingLevel};
+use cyrup_core::{ModelThinkingLevel, ProviderId};
 use cyrup_provider::Model;
 
 use crate::error::ConfigError;
@@ -86,8 +86,11 @@ impl<'a> ModelResolver<'a> {
         }
 
         // 2. bare exact id (ambiguous across providers ⇒ error).
-        let exact: Vec<&Model> =
-            self.available.iter().filter(|m| m.id.as_str().to_ascii_lowercase() == lower).collect();
+        let exact: Vec<&Model> = self
+            .available
+            .iter()
+            .filter(|m| m.id.as_str().to_ascii_lowercase() == lower)
+            .collect();
         match exact.len() {
             1 => {
                 if let Some(m) = exact.first() {
@@ -128,9 +131,14 @@ impl<'a> ModelResolver<'a> {
             Match::One(m) => Ok(Some(m)),
             Match::None => Ok(None),
             Match::Ambiguous(v) => {
-                let providers: Vec<String> =
-                    v.iter().map(|m| format!("{}/{}", m.provider, m.id)).collect();
-                Err(format!("ambiguous model id '{reference}': matches {}", providers.join(", ")))
+                let providers: Vec<String> = v
+                    .iter()
+                    .map(|m| format!("{}/{}", m.provider, m.id))
+                    .collect();
+                Err(format!(
+                    "ambiguous model id '{reference}': matches {}",
+                    providers.join(", ")
+                ))
             }
         }
     }
@@ -148,8 +156,10 @@ impl<'a> ModelResolver<'a> {
                 };
             }
             Match::Ambiguous(v) => {
-                let providers: Vec<String> =
-                    v.iter().map(|m| format!("{}/{}", m.provider, m.id)).collect();
+                let providers: Vec<String> = v
+                    .iter()
+                    .map(|m| format!("{}/{}", m.provider, m.id))
+                    .collect();
                 return ParsedModel {
                     model: None,
                     thinking_level: None,
@@ -165,14 +175,23 @@ impl<'a> ModelResolver<'a> {
 
         // Strip a trailing `:<token>` (colon-safe: split at the LAST colon, recurse on prefix).
         let Some(idx) = pattern.rfind(':') else {
-            return ParsedModel { model: None, thinking_level: None, warning: None, ambiguous: false };
+            return ParsedModel {
+                model: None,
+                thinking_level: None,
+                warning: None,
+                ambiguous: false,
+            };
         };
         let (prefix, rest) = pattern.split_at(idx);
         let suffix = rest.get(1..).unwrap_or("");
 
         if let Some(level) = parse_thinking_level(suffix) {
             let inner = self.parse_pattern(prefix, strict);
-            let thinking = if inner.warning.is_some() || inner.ambiguous { None } else { Some(level) };
+            let thinking = if inner.warning.is_some() || inner.ambiguous {
+                None
+            } else {
+                Some(level)
+            };
             ParsedModel {
                 model: inner.model,
                 thinking_level: thinking,
@@ -180,7 +199,12 @@ impl<'a> ModelResolver<'a> {
                 ambiguous: inner.ambiguous,
             }
         } else if strict {
-            ParsedModel { model: None, thinking_level: None, warning: None, ambiguous: false }
+            ParsedModel {
+                model: None,
+                thinking_level: None,
+                warning: None,
+                ambiguous: false,
+            }
         } else {
             let inner = self.parse_pattern(prefix, strict);
             ParsedModel {
@@ -213,11 +237,20 @@ impl<'a> ModelResolver<'a> {
     pub fn resolve_scope(&self, patterns: &[String]) -> Vec<ScopedModel> {
         let mut out: Vec<ScopedModel> = Vec::new();
         let mut seen: Vec<(String, String)> = Vec::new();
-        let push = |model: Model, level: Option<ModelThinkingLevel>, seen: &mut Vec<(String, String)>, out: &mut Vec<ScopedModel>| {
-            let key = (model.provider.as_str().to_string(), model.id.as_str().to_string());
+        let push = |model: Model,
+                    level: Option<ModelThinkingLevel>,
+                    seen: &mut Vec<(String, String)>,
+                    out: &mut Vec<ScopedModel>| {
+            let key = (
+                model.provider.as_str().to_string(),
+                model.id.as_str().to_string(),
+            );
             if !seen.contains(&key) {
                 seen.push(key);
-                out.push(ScopedModel { model, thinking_level: level });
+                out.push(ScopedModel {
+                    model,
+                    thinking_level: level,
+                });
             }
         };
 
@@ -270,13 +303,15 @@ fn glob_match_chars(p: &[char], t: &[char]) -> bool {
             star_pi = Some(pi);
             star_ti = ti;
             pi += 1;
-        } else if let (Some(tc), true) = (t.get(ti).copied(), pc.is_some()) && {
-            let (m, next) = match_unit(p, pi, tc);
-            if m {
-                pi = next;
+        } else if let (Some(tc), true) = (t.get(ti).copied(), pc.is_some())
+            && {
+                let (m, next) = match_unit(p, pi, tc);
+                if m {
+                    pi = next;
+                }
+                m
             }
-            m
-        } {
+        {
             ti += 1;
         } else if let Some(sp) = star_pi {
             // Backtrack: let the `*` consume one more text char.
@@ -518,8 +553,10 @@ fn first_default_or_first(available: &[Model]) -> Option<Model> {
 /// Synthesize a custom model for `(provider, model_id)` by cloning the provider's curated-default
 /// (or first) model and overriding id/name (Pi `buildFallbackModel`, model-resolver.ts:163-177).
 pub fn build_fallback_model(provider: &str, model_id: &str, available: &[Model]) -> Option<Model> {
-    let provider_models: Vec<&Model> =
-        available.iter().filter(|m| m.provider.as_str() == provider).collect();
+    let provider_models: Vec<&Model> = available
+        .iter()
+        .filter(|m| m.provider.as_str() == provider)
+        .collect();
     let base = provider_models.first().copied()?;
     let default_id = default_model_per_provider(provider);
     let base = match default_id {
@@ -611,7 +648,10 @@ pub fn resolve_cli_model(
             m.id.as_str().to_ascii_lowercase() == lower
                 || format!("{}/{}", m.provider, m.id).to_ascii_lowercase() == lower
         }) {
-            return CliModelResult { model: Some(exact.clone()), ..Default::default() };
+            return CliModelResult {
+                model: Some(exact.clone()),
+                ..Default::default()
+            };
         }
     }
 
@@ -619,13 +659,20 @@ pub fn resolve_cli_model(
     if let (Some(cp), Some(p)) = (cli_provider, provider.as_deref()) {
         let _ = cp;
         let prefix = format!("{p}/");
-        if cli_model.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+        if cli_model
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
             pattern = cli_model[prefix.len()..].to_string();
         }
     }
 
     let candidates: Vec<Model> = match provider.as_deref() {
-        Some(p) => all.iter().filter(|m| m.provider.as_str() == p).cloned().collect(),
+        Some(p) => all
+            .iter()
+            .filter(|m| m.provider.as_str() == p)
+            .cloned()
+            .collect(),
         None => all.to_vec(),
     };
     let resolver = ModelResolver::new(&candidates);
@@ -641,12 +688,17 @@ pub fn resolve_cli_model(
                 })
                 .collect();
             if !raw_exact.is_empty() && !has_configured_auth(&model) {
-                let authed: Vec<&Model> =
-                    raw_exact.into_iter().filter(|m| has_configured_auth(m)).collect();
+                let authed: Vec<&Model> = raw_exact
+                    .into_iter()
+                    .filter(|m| has_configured_auth(m))
+                    .collect();
                 if authed.len() == 1
                     && let Some(m) = authed.first()
                 {
-                    return CliModelResult { model: Some((*m).clone()), ..Default::default() };
+                    return CliModelResult {
+                        model: Some((*m).clone()),
+                        ..Default::default()
+                    };
                 }
             }
         }
@@ -665,7 +717,10 @@ pub fn resolve_cli_model(
             m.id.as_str().to_ascii_lowercase() == lower
                 || format!("{}/{}", m.provider, m.id).to_ascii_lowercase() == lower
         }) {
-            return CliModelResult { model: Some(exact.clone()), ..Default::default() };
+            return CliModelResult {
+                model: Some(exact.clone()),
+                ..Default::default()
+            };
         }
         let fallback = ModelResolver::new(all).parse_pattern(cli_model, true);
         if let Some(m) = fallback.model {
@@ -793,7 +848,9 @@ pub fn find_initial_model(
 
     // 3. Saved default from settings.
     if let (Some(dp), Some(dm)) = (default_provider, default_model_id)
-        && let Some(found) = all.iter().find(|m| m.provider.as_str() == dp && m.id.as_str() == dm)
+        && let Some(found) = all
+            .iter()
+            .find(|m| m.provider.as_str() == dp && m.id.as_str() == dm)
     {
         return InitialModelResult {
             model: Some(found.clone()),
@@ -841,17 +898,25 @@ pub fn restore_model_from_session(
     available: &[Model],
     has_configured_auth: &dyn Fn(&Model) -> bool,
 ) -> RestoredModelResult {
-    let restored =
-        all.iter().find(|m| m.provider.as_str() == saved_provider && m.id.as_str() == saved_model_id);
+    let restored = all
+        .iter()
+        .find(|m| m.provider.as_str() == saved_provider && m.id.as_str() == saved_model_id);
     let restored_has_auth = restored.is_some_and(has_configured_auth);
 
     if let Some(model) = restored
         && restored_has_auth
     {
-        return RestoredModelResult { model: Some(model.clone()), fallback_message: None };
+        return RestoredModelResult {
+            model: Some(model.clone()),
+            fallback_message: None,
+        };
     }
 
-    let reason = if restored.is_none() { "model no longer exists" } else { "no auth configured" };
+    let reason = if restored.is_none() {
+        "model no longer exists"
+    } else {
+        "no auth configured"
+    };
 
     if let Some(current) = current_model {
         return RestoredModelResult {
@@ -868,10 +933,16 @@ pub fn restore_model_from_session(
             "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
             fallback.provider, fallback.id
         );
-        return RestoredModelResult { model: Some(fallback), fallback_message: Some(msg) };
+        return RestoredModelResult {
+            model: Some(fallback),
+            fallback_message: Some(msg),
+        };
     }
 
-    RestoredModelResult { model: None, fallback_message: None }
+    RestoredModelResult {
+        model: None,
+        fallback_message: None,
+    }
 }
 
 /// A `models.json` provider request config (Pi `ProviderConfigSchema`, model-registry.ts:204-214):
@@ -928,7 +999,11 @@ impl ProviderConfig {
             }
             None => None,
         };
-        Ok(ResolvedRequestAuth { api_key, headers, auth_header: self.auth_header })
+        Ok(ResolvedRequestAuth {
+            api_key,
+            headers,
+            auth_header: self.auth_header,
+        })
     }
 }
 
@@ -986,14 +1061,20 @@ mod tests {
         let models = vec![model("anthropic", "claude-opus-4-latest", "Claude Opus 4")];
         let r = ModelResolver::new(&models);
         let parsed = r.parse_pattern("claude-opus:high", true);
-        assert_eq!(parsed.model.as_ref().unwrap().id.as_str(), "claude-opus-4-latest");
+        assert_eq!(
+            parsed.model.as_ref().unwrap().id.as_str(),
+            "claude-opus-4-latest"
+        );
         assert_eq!(parsed.thinking_level, Some(ModelThinkingLevel::High));
     }
 
     #[test]
     fn ambiguous_bare_id_errors() {
         // A-07-6
-        let models = vec![model("a", "shared", "A Shared"), model("b", "shared", "B Shared")];
+        let models = vec![
+            model("a", "shared", "A Shared"),
+            model("b", "shared", "B Shared"),
+        ];
         let r = ModelResolver::new(&models);
         let err = r.find_exact("shared");
         assert!(err.is_err());
@@ -1011,7 +1092,10 @@ mod tests {
         ];
         let r = ModelResolver::new(&models);
         let parsed = r.parse_pattern("claude-3-5-sonnet", false);
-        assert_eq!(parsed.model.as_ref().unwrap().id.as_str(), "claude-3-5-sonnet-latest");
+        assert_eq!(
+            parsed.model.as_ref().unwrap().id.as_str(),
+            "claude-3-5-sonnet-latest"
+        );
     }
 
     #[test]
@@ -1028,7 +1112,10 @@ mod tests {
         let r = ModelResolver::new(&models);
         // exact match on an id that contains a colon
         let parsed = r.parse_pattern("openai/gpt-4o:extended", true);
-        assert_eq!(parsed.model.as_ref().unwrap().id.as_str(), "gpt-4o:extended");
+        assert_eq!(
+            parsed.model.as_ref().unwrap().id.as_str(),
+            "gpt-4o:extended"
+        );
         assert_eq!(parsed.thinking_level, None);
     }
 
@@ -1083,9 +1170,15 @@ mod tests {
     #[test]
     fn default_model_table_matches_pi() {
         // model-resolver.ts:14-50
-        assert_eq!(default_model_per_provider("anthropic"), Some("claude-opus-4-8"));
+        assert_eq!(
+            default_model_per_provider("anthropic"),
+            Some("claude-opus-4-8")
+        );
         assert_eq!(default_model_per_provider("openai"), Some("gpt-5.5"));
-        assert_eq!(default_model_per_provider("amazon-bedrock"), Some("us.anthropic.claude-opus-4-6-v1"));
+        assert_eq!(
+            default_model_per_provider("amazon-bedrock"),
+            Some("us.anthropic.claude-opus-4-6-v1")
+        );
         assert_eq!(default_model_per_provider("totally-unknown"), None);
     }
 
@@ -1113,11 +1206,22 @@ mod tests {
         // A custom model id under a known provider builds a fallback from the provider default.
         let models = vec![model("anthropic", "claude-opus-4-8", "Opus")];
         let auth = |_: &Model| true;
-        let r = resolve_cli_model(Some("anthropic"), Some("my-custom-id"), None, &models, &auth);
+        let r = resolve_cli_model(
+            Some("anthropic"),
+            Some("my-custom-id"),
+            None,
+            &models,
+            &auth,
+        );
         let m = r.model.as_ref().unwrap();
         assert_eq!(m.id.as_str(), "my-custom-id");
         assert_eq!(m.provider.as_str(), "anthropic");
-        assert!(r.warning.as_ref().unwrap().contains("Using custom model id"));
+        assert!(
+            r.warning
+                .as_ref()
+                .unwrap()
+                .contains("Using custom model id")
+        );
     }
 
     #[test]
@@ -1130,17 +1234,44 @@ mod tests {
         let auth = |_: &Model| true;
         // CLI args win.
         let r = find_initial_model(
-            Some("openai"), Some("gpt-5.5"), &[], false, None, None, None, &all, &available, &auth,
+            Some("openai"),
+            Some("gpt-5.5"),
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &all,
+            &available,
+            &auth,
         );
         assert_eq!(r.model.as_ref().unwrap().id.as_str(), "gpt-5.5");
         // No CLI, no scoped, no saved → curated default (anthropic first in table → opus).
         let r = find_initial_model(
-            None, None, &[], false, None, None, None, &all, &available, &auth,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &all,
+            &available,
+            &auth,
         );
         assert_eq!(r.model.as_ref().unwrap().id.as_str(), "claude-opus-4-8");
         // Saved settings default beats curated default.
         let r = find_initial_model(
-            None, None, &[], false, Some("openai"), Some("gpt-5.5"), None, &all, &available, &auth,
+            None,
+            None,
+            &[],
+            false,
+            Some("openai"),
+            Some("gpt-5.5"),
+            None,
+            &all,
+            &available,
+            &auth,
         );
         assert_eq!(r.model.as_ref().unwrap().id.as_str(), "gpt-5.5");
     }
@@ -1151,12 +1282,31 @@ mod tests {
         let available = all.clone();
         // saved model has no auth → fall back to curated default with a message.
         let no_auth = |_: &Model| false;
-        let r = restore_model_from_session("anthropic", "claude-opus-4-8", None, &all, &available, &no_auth);
-        assert!(r.fallback_message.as_ref().unwrap().contains("no auth configured"));
+        let r = restore_model_from_session(
+            "anthropic",
+            "claude-opus-4-8",
+            None,
+            &all,
+            &available,
+            &no_auth,
+        );
+        assert!(
+            r.fallback_message
+                .as_ref()
+                .unwrap()
+                .contains("no auth configured")
+        );
         assert_eq!(r.model.as_ref().unwrap().id.as_str(), "claude-opus-4-8");
         // saved model with auth → restored, no message.
         let yes_auth = |_: &Model| true;
-        let r = restore_model_from_session("anthropic", "claude-opus-4-8", None, &all, &available, &yes_auth);
+        let r = restore_model_from_session(
+            "anthropic",
+            "claude-opus-4-8",
+            None,
+            &all,
+            &available,
+            &yes_auth,
+        );
         assert!(r.fallback_message.is_none());
     }
 
@@ -1175,7 +1325,11 @@ mod tests {
         assert_eq!(scoped.len(), 2);
         // `:level` suffix on a glob applies to every match.
         let scoped = r.resolve_scope(&["anthropic/*:high".to_string()]);
-        assert!(scoped.iter().all(|s| s.thinking_level == Some(ModelThinkingLevel::High)));
+        assert!(
+            scoped
+                .iter()
+                .all(|s| s.thinking_level == Some(ModelThinkingLevel::High))
+        );
     }
 
     #[test]
@@ -1194,7 +1348,12 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("literal-key"));
         assert_eq!(resolved.auth_header, Some(true));
         // missing file → empty
-        assert!(load_models_file(&dir.join("nope.json")).unwrap().providers.is_empty());
+        assert!(
+            load_models_file(&dir.join("nope.json"))
+                .unwrap()
+                .providers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1207,6 +1366,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.first().unwrap().id.as_str(), "my-model");
         // missing file → empty
-        assert!(load_custom_models(&dir.join("nope.json")).unwrap().is_empty());
+        assert!(
+            load_custom_models(&dir.join("nope.json"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

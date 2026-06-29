@@ -10,25 +10,25 @@
 //!
 //! Wire JSON uses Anthropic's own field names (snake_case), NOT the cyrup camelCase convention.
 
-use crate::api::compat::{sanitize_surrogates, AnthropicMessagesCompat};
+use crate::HeaderMap;
+use crate::api::compat::{AnthropicMessagesCompat, sanitize_surrogates};
 use crate::api::openai_completions::transform_messages_with;
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
-use crate::HeaderMap;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
     ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 /// The wire-protocol id this impl serves.
@@ -40,6 +40,42 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header tokens (Pi anthropic-messages.ts:167-168).
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// How thinking content is returned (Pi `AnthropicThinkingDisplay`, anthropic-messages.ts:165).
+/// `"summarized"` returns summarized thinking text; `"omitted"` returns an empty thinking field
+/// (the encrypted signature still travels back for multi-turn continuity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+impl AnthropicThinkingDisplay {
+    /// The wire string for the `thinking.display` field.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            AnthropicThinkingDisplay::Summarized => "summarized",
+            AnthropicThinkingDisplay::Omitted => "omitted",
+        }
+    }
+}
+
+/// Per-API typed options for the `anthropic-messages` wire protocol (Pi `AnthropicOptions`,
+/// anthropic-messages.ts:183-230). Only the fields cyrup does not already carry on the unified
+/// [`StreamOptions`](crate::StreamOptions) live here; the rest (`thinkingEnabled`,
+/// `thinkingBudgetTokens`, `effort`) map onto `StreamOptions.reasoning`/`thinking_budgets`. Carried
+/// via [`StreamOptions::api_options`](crate::StreamOptions::api_options). All fields default to
+/// `None`, reproducing Pi's defaults exactly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnthropicOptions {
+    /// Request the interleaved-thinking beta header for non-adaptive thinking models (Pi
+    /// `interleavedThinking`, anthropic-messages.ts:230). `None` = Pi default (`true`).
+    pub interleaved_thinking: Option<bool>,
+    /// How thinking content is returned (Pi `thinkingDisplay`, anthropic-messages.ts:223). `None` =
+    /// Pi default (`"summarized"`).
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
+}
 
 /// Stealth-mode Claude Code identity (Pi anthropic-messages.ts:73).
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
@@ -72,7 +108,9 @@ pub struct AnthropicMessagesApi {
 
 impl Default for AnthropicMessagesApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -109,20 +147,40 @@ impl ApiImpl for AnthropicMessagesApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
 
-        let is_oauth = auth.auth.api_key.as_deref().map(is_oauth_token).unwrap_or(false);
+        let is_oauth = auth
+            .auth
+            .api_key
+            .as_deref()
+            .map(is_oauth_token)
+            .unwrap_or(false);
         let body = build_params(model, ctx, opts, auth.env.as_ref(), is_oauth);
         let headers = build_headers(model, ctx, auth, opts, is_oauth);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112; applied per request as in bedrock-converse-stream.ts:187).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -130,7 +188,8 @@ impl ApiImpl for AnthropicMessagesApi {
         let frames = match open_sse(&client, req, cancel, None, None).await {
             Ok(s) => s,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -177,12 +236,19 @@ fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
 
 /// `model.compat?.forceAdaptiveThinking === true` (Pi default false).
 fn force_adaptive_thinking(model: &Model) -> bool {
-    model.compat.as_ref().and_then(|c| c.force_adaptive_thinking).unwrap_or(false)
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.force_adaptive_thinking)
+        .unwrap_or(false)
 }
 
 /// `model.thinkingLevelMap?.off !== null` (a missing key is `undefined`, which `!== null`).
 fn off_is_not_null(model: &Model) -> bool {
-    !matches!(model.thinking_level_map.as_ref().and_then(|m| m.get("off")), Some(None))
+    !matches!(
+        model.thinking_level_map.as_ref().and_then(|m| m.get("off")),
+        Some(None)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +293,8 @@ fn get_cache_control(
     }
     let mut cc = Map::new();
     cc.insert("type".to_string(), json!("ephemeral"));
-    if retention == CacheRetention::Long && get_anthropic_compat(model).supports_long_cache_retention
+    if retention == CacheRetention::Long
+        && get_anthropic_compat(model).supports_long_cache_retention
     {
         cc.insert("ttl".to_string(), json!("1h"));
     }
@@ -274,7 +341,11 @@ fn is_oauth_token(api_key: &str) -> bool {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/v1/messages`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
+    let base = auth
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or(model.base_url.as_str());
     Some(messages_url(base))
 }
 
@@ -303,7 +374,11 @@ pub(crate) fn build_headers(
     opts: &StreamOptions,
     is_oauth: bool,
 ) -> HeaderMap {
-    let interleaved = true; // Pi `options?.interleavedThinking ?? true`.
+    // Pi `options?.interleavedThinking ?? true` (anthropic-messages.ts:520).
+    let interleaved = opts
+        .anthropic_options()
+        .and_then(|o| o.interleaved_thinking)
+        .unwrap_or(true);
     let needs_interleaved = interleaved && !force_adaptive_thinking(model);
     let mut betas: Vec<&str> = Vec::new();
     if should_use_fine_grained_beta(model, ctx) {
@@ -314,22 +389,35 @@ pub(crate) fn build_headers(
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("anthropic-version".to_string(), Some(ANTHROPIC_VERSION.to_string()));
-    headers.insert("content-type".to_string(), Some("application/json".to_string()));
+    headers.insert(
+        "anthropic-version".to_string(),
+        Some(ANTHROPIC_VERSION.to_string()),
+    );
+    headers.insert(
+        "content-type".to_string(),
+        Some("application/json".to_string()),
+    );
     headers.insert("accept".to_string(), Some("application/json".to_string()));
-    headers
-        .insert("anthropic-dangerous-direct-browser-access".to_string(), Some("true".to_string()));
+    headers.insert(
+        "anthropic-dangerous-direct-browser-access".to_string(),
+        Some("true".to_string()),
+    );
 
     if is_oauth {
         // OAuth: Bearer auth + Claude Code identity headers (Pi anthropic-messages.ts:855-872).
         if let Some(key) = &auth.auth.api_key {
             headers.insert("authorization".to_string(), Some(format!("Bearer {key}")));
         }
-        let mut oauth_betas =
-            vec!["claude-code-20250219".to_string(), "oauth-2025-04-20".to_string()];
+        let mut oauth_betas = vec![
+            "claude-code-20250219".to_string(),
+            "oauth-2025-04-20".to_string(),
+        ];
         oauth_betas.extend(betas.iter().map(|b| b.to_string()));
         headers.insert("anthropic-beta".to_string(), Some(oauth_betas.join(",")));
-        headers.insert("user-agent".to_string(), Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")));
+        headers.insert(
+            "user-agent".to_string(),
+            Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
+        );
         headers.insert("x-app".to_string(), Some("cli".to_string()));
     } else {
         // API key auth (Pi anthropic-messages.ts:877-896).
@@ -345,7 +433,10 @@ pub(crate) fn build_headers(
             && get_anthropic_compat(model).send_session_affinity_headers
             && let Some(sid) = &opts.session_id
         {
-            headers.insert("x-session-affinity".to_string(), Some(sid.as_str().to_string()));
+            headers.insert(
+                "x-session-affinity".to_string(),
+                Some(sid.as_str().to_string()),
+            );
         }
     }
 
@@ -452,10 +543,16 @@ pub(crate) fn build_params(
             cache_control.as_ref(),
         ));
         if let Some(sp) = &ctx.system_prompt {
-            system.push(system_text(&sanitize_surrogates(sp), cache_control.as_ref()));
+            system.push(system_text(
+                &sanitize_surrogates(sp),
+                cache_control.as_ref(),
+            ));
         }
     } else if let Some(sp) = &ctx.system_prompt {
-        system.push(system_text(&sanitize_surrogates(sp), cache_control.as_ref()));
+        system.push(system_text(
+            &sanitize_surrogates(sp),
+            cache_control.as_ref(),
+        ));
     }
     if !system.is_empty() {
         obj.insert("system".to_string(), Value::Array(system));
@@ -470,8 +567,11 @@ pub(crate) fn build_params(
     }
 
     if !ctx.tools.is_empty() {
-        let tool_cc =
-            if compat.supports_cache_control_on_tools { cache_control.as_ref() } else { None };
+        let tool_cc = if compat.supports_cache_control_on_tools {
+            cache_control.as_ref()
+        } else {
+            None
+        };
         obj.insert(
             "tools".to_string(),
             Value::Array(convert_tools(
@@ -486,7 +586,13 @@ pub(crate) fn build_params(
     // Thinking configuration (Pi anthropic-messages.ts:957-986).
     if model.reasoning {
         if thinking_enabled {
-            let display = json!("summarized");
+            // Pi `options.thinkingDisplay ?? "summarized"` (anthropic-messages.ts:962).
+            let display = json!(
+                opts.anthropic_options()
+                    .and_then(|o| o.thinking_display)
+                    .map(AnthropicThinkingDisplay::as_wire)
+                    .unwrap_or("summarized")
+            );
             if adaptive {
                 let mut thinking = Map::new();
                 thinking.insert("type".to_string(), json!("adaptive"));
@@ -554,7 +660,13 @@ fn system_text(text: &str, cache_control: Option<&Value>) -> Value {
 /// non-`[a-zA-Z0-9_-]` → `_`, truncated to 64 chars.
 fn normalize_tool_call_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect()
 }
@@ -626,8 +738,12 @@ pub(crate) fn convert_messages(
                 // Collect consecutive tool results into one `user` message of `tool_result` blocks.
                 let mut tool_results: Vec<Value> = Vec::new();
                 let mut j = i;
-                while let Some(Message::ToolResult { tool_call_id, content, is_error, .. }) =
-                    transformed.get(j)
+                while let Some(Message::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    ..
+                }) = transformed.get(j)
                 {
                     let mut tr = Map::new();
                     tr.insert("type".to_string(), json!("tool_result"));
@@ -709,7 +825,11 @@ fn build_assistant(
                 }
                 blocks.push(json!({ "type": "text", "text": sanitize_surrogates(text) }));
             }
-            Content::Thinking { thinking, thinking_signature, redacted } => {
+            Content::Thinking {
+                thinking,
+                thinking_signature,
+                redacted,
+            } => {
                 if *redacted {
                     blocks.push(json!({
                         "type": "redacted_thinking",
@@ -720,8 +840,10 @@ fn build_assistant(
                 if thinking.trim().is_empty() {
                     continue;
                 }
-                let sig_empty =
-                    thinking_signature.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
+                let sig_empty = thinking_signature
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
                 if sig_empty {
                     if allow_empty_signature {
                         blocks.push(json!({
@@ -730,7 +852,8 @@ fn build_assistant(
                             "signature": "",
                         }));
                     } else {
-                        blocks.push(json!({ "type": "text", "text": sanitize_surrogates(thinking) }));
+                        blocks
+                            .push(json!({ "type": "text", "text": sanitize_surrogates(thinking) }));
                     }
                 } else {
                     blocks.push(json!({
@@ -741,7 +864,11 @@ fn build_assistant(
                 }
             }
             Content::ToolCall(tc) => {
-                let name = if is_oauth { to_claude_code_name(&tc.name) } else { tc.name.clone() };
+                let name = if is_oauth {
+                    to_claude_code_name(&tc.name)
+                } else {
+                    tc.name.clone()
+                };
                 blocks.push(json!({
                     "type": "tool_use",
                     "id": tc.id.as_str(),
@@ -806,10 +933,21 @@ pub(crate) fn convert_tools(
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            let name = if is_oauth { to_claude_code_name(&tool.name) } else { tool.name.clone() };
-            let properties =
-                tool.parameters.get("properties").cloned().unwrap_or_else(|| json!({}));
-            let required = tool.parameters.get("required").cloned().unwrap_or_else(|| json!([]));
+            let name = if is_oauth {
+                to_claude_code_name(&tool.name)
+            } else {
+                tool.name.clone()
+            };
+            let properties = tool
+                .parameters
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let required = tool
+                .parameters
+                .get("required")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             let mut o = Map::new();
             o.insert("name".to_string(), json!(name));
             o.insert("description".to_string(), json!(tool.description));
@@ -847,7 +985,10 @@ fn map_stop_reason(reason: &str, stop_details: Option<&Value>) -> (StopReason, O
         }
         "pause_turn" | "stop_sequence" => (StopReason::Stop, None),
         "sensitive" => (StopReason::Error, None),
-        other => (StopReason::Error, Some(format!("Unhandled stop reason: {other}"))),
+        other => (
+            StopReason::Error,
+            Some(format!("Unhandled stop reason: {other}")),
+        ),
     }
 }
 
@@ -857,17 +998,30 @@ fn map_stop_reason(reason: &str, stop_details: Option<&Value>) -> (StopReason, O
 
 /// One in-progress content block, keyed by the Anthropic `index`.
 enum Block {
-    Text { index: i64, text: String },
-    Thinking { index: i64, thinking: String, signature: String, redacted: bool },
-    Tool { index: i64, id: String, name: String, partial_json: String },
+    Text {
+        index: i64,
+        text: String,
+    },
+    Thinking {
+        index: i64,
+        thinking: String,
+        signature: String,
+        redacted: bool,
+    },
+    Tool {
+        index: i64,
+        id: String,
+        name: String,
+        partial_json: String,
+    },
 }
 
 impl Block {
     fn index(&self) -> i64 {
         match self {
-            Block::Text { index, .. } | Block::Thinking { index, .. } | Block::Tool { index, .. } => {
-                *index
-            }
+            Block::Text { index, .. }
+            | Block::Thinking { index, .. }
+            | Block::Tool { index, .. } => *index,
         }
     }
 }
@@ -918,7 +1072,12 @@ fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
         .iter()
         .map(|b| match b {
             Block::Text { text, .. } => Content::text(text.clone()),
-            Block::Thinking { thinking, signature, redacted, .. } => Content::Thinking {
+            Block::Thinking {
+                thinking,
+                signature,
+                redacted,
+                ..
+            } => Content::Thinking {
                 thinking: thinking.clone(),
                 thinking_signature: if signature.is_empty() {
                     None
@@ -927,7 +1086,12 @@ fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
                 },
                 redacted: *redacted,
             },
-            Block::Tool { id, name, partial_json, .. } => Content::ToolCall(ToolCall {
+            Block::Tool {
+                id,
+                name,
+                partial_json,
+                ..
+            } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),
                 arguments: parse_streaming_json_object(Some(partial_json)),
@@ -957,7 +1121,12 @@ pub(crate) async fn decode_stream<S>(
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
         ..Default::default()
     };
-    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+    if !sink
+        .send(StreamEvent::Start {
+            partial: dec.snapshot(model, api),
+        })
+        .await
+    {
         return;
     }
 
@@ -965,7 +1134,8 @@ pub(crate) async fn decode_stream<S>(
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -1006,7 +1176,9 @@ pub(crate) async fn decode_stream<S>(
                 model,
                 api,
                 sink,
-                dec.error_message.clone().unwrap_or_else(|| "An unknown error occurred".to_string()),
+                dec.error_message
+                    .clone()
+                    .unwrap_or_else(|| "An unknown error occurred".to_string()),
             )
             .await;
             return;
@@ -1016,8 +1188,14 @@ pub(crate) async fn decode_stream<S>(
     // Stream ended. A `message_start` with no `message_stop` is a protocol error (Pi
     // anthropic-messages.ts:463-465).
     if dec.saw_message_start && !dec.saw_message_stop {
-        emit_error(&dec, model, api, sink, "Anthropic stream ended before message_stop".to_string())
-            .await;
+        emit_error(
+            &dec,
+            model,
+            api,
+            sink,
+            "Anthropic stream ended before message_stop".to_string(),
+        )
+        .await;
         return;
     }
 
@@ -1100,10 +1278,15 @@ async fn process_block_start(
     };
     match cb.get("type").and_then(Value::as_str) {
         Some("text") => {
-            dec.blocks.push(Block::Text { index, text: String::new() });
-            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::TextStart {
-                content_index: pos,
-                partial,
+            dec.blocks.push(Block::Text {
+                index,
+                text: String::new(),
+            });
+            send_with_pos(dec, model, api, sink, |pos, partial| {
+                StreamEvent::TextStart {
+                    content_index: pos,
+                    partial,
+                }
             })
             .await
         }
@@ -1114,28 +1297,40 @@ async fn process_block_start(
                 signature: String::new(),
                 redacted: false,
             });
-            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ThinkingStart {
-                content_index: pos,
-                partial,
+            send_with_pos(dec, model, api, sink, |pos, partial| {
+                StreamEvent::ThinkingStart {
+                    content_index: pos,
+                    partial,
+                }
             })
             .await
         }
         Some("redacted_thinking") => {
-            let data = cb.get("data").and_then(Value::as_str).unwrap_or("").to_string();
+            let data = cb
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             dec.blocks.push(Block::Thinking {
                 index,
                 thinking: "[Reasoning redacted]".to_string(),
                 signature: data,
                 redacted: true,
             });
-            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ThinkingStart {
-                content_index: pos,
-                partial,
+            send_with_pos(dec, model, api, sink, |pos, partial| {
+                StreamEvent::ThinkingStart {
+                    content_index: pos,
+                    partial,
+                }
             })
             .await
         }
         Some("tool_use") => {
-            let id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = cb
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let raw_name = cb.get("name").and_then(Value::as_str).unwrap_or("");
             // OAuth: map the Claude-Code tool name back to the caller's declared name (Pi decode,
             // anthropic-messages.ts:592-594).
@@ -1144,10 +1339,17 @@ async fn process_block_start(
             } else {
                 raw_name.to_string()
             };
-            dec.blocks.push(Block::Tool { index, id, name, partial_json: String::new() });
-            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ToolCallStart {
-                content_index: pos,
-                partial,
+            dec.blocks.push(Block::Tool {
+                index,
+                id,
+                name,
+                partial_json: String::new(),
+            });
+            send_with_pos(dec, model, api, sink, |pos, partial| {
+                StreamEvent::ToolCallStart {
+                    content_index: pos,
+                    partial,
+                }
             })
             .await
         }
@@ -1199,7 +1401,10 @@ async fn process_block_delta(
             .await
         }
         Some("input_json_delta") => {
-            let text = delta.get("partial_json").and_then(Value::as_str).unwrap_or("");
+            let text = delta
+                .get("partial_json")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if let Some(Block::Tool { partial_json, .. }) = dec.blocks.get_mut(pos) {
                 partial_json.push_str(text);
             }
@@ -1236,13 +1441,22 @@ async fn process_block_stop(
     };
     let partial = dec.snapshot(model, api);
     let ev = match dec.blocks.get(pos) {
-        Some(Block::Text { text, .. }) => {
-            StreamEvent::TextEnd { content_index: pos, content: text.clone(), partial }
-        }
-        Some(Block::Thinking { thinking, .. }) => {
-            StreamEvent::ThinkingEnd { content_index: pos, content: thinking.clone(), partial }
-        }
-        Some(Block::Tool { id, name, partial_json, .. }) => StreamEvent::ToolCallEnd {
+        Some(Block::Text { text, .. }) => StreamEvent::TextEnd {
+            content_index: pos,
+            content: text.clone(),
+            partial,
+        },
+        Some(Block::Thinking { thinking, .. }) => StreamEvent::ThinkingEnd {
+            content_index: pos,
+            content: thinking.clone(),
+            partial,
+        },
+        Some(Block::Tool {
+            id,
+            name,
+            partial_json,
+            ..
+        }) => StreamEvent::ToolCallEnd {
             content_index: pos,
             tool_call: ToolCall {
                 id: ToolCallId::from(id.as_str()),
@@ -1283,13 +1497,7 @@ async fn finish_blocks(_dec: &Decoder, _model: &Model, _api: &ApiId, _sink: &Eve
 
 /// Emit a terminal error event carrying the partial snapshot's content (Pi's catch block,
 /// anthropic-messages.ts:727-736).
-async fn emit_error(
-    dec: &Decoder,
-    model: &Model,
-    api: &ApiId,
-    sink: &EventSink,
-    message: String,
-) {
+async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink, message: String) {
     let mut msg = dec.snapshot(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
@@ -1307,9 +1515,18 @@ fn build_final_message(dec: &Decoder, model: &Model, api: &ApiId) -> AssistantMe
 /// Apply `message_start` usage (Pi anthropic-messages.ts:551-558): seeds input/output/cache counts.
 fn apply_message_start_usage(usage: &mut Usage, raw: &Value) {
     usage.input = raw.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    usage.output = raw.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-    usage.cache_read = raw.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    usage.cache_write = raw.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    usage.output = raw
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.cache_read = raw
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.cache_write = raw
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let long = raw
         .get("cache_creation")
         .and_then(|c| c.get("ephemeral_1h_input_tokens"))
@@ -1330,11 +1547,16 @@ fn apply_message_delta_usage(usage: &mut Usage, raw: &Value) {
     if let Some(v) = raw.get("cache_read_input_tokens").and_then(Value::as_u64) {
         usage.cache_read = v;
     }
-    if let Some(v) = raw.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+    if let Some(v) = raw
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+    {
         usage.cache_write = v;
     }
-    if let Some(v) =
-        raw.get("output_tokens_details").and_then(|d| d.get("thinking_tokens")).and_then(Value::as_u64)
+    if let Some(v) = raw
+        .get("output_tokens_details")
+        .and_then(|d| d.get("thinking_tokens"))
+        .and_then(Value::as_u64)
     {
         usage.reasoning = Some(v);
     }
@@ -1349,7 +1571,12 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::channel;
@@ -1361,7 +1588,10 @@ mod tests {
 
     fn auth_with(api_key: Option<&str>) -> AuthResult {
         AuthResult {
-            auth: ModelAuth { api_key: api_key.map(String::from), ..Default::default() },
+            auth: ModelAuth {
+                api_key: api_key.map(String::from),
+                ..Default::default()
+            },
             env: None,
             source: None,
         }
@@ -1376,7 +1606,12 @@ mod tests {
             base_url: "https://api.anthropic.com".to_string(),
             reasoning: true,
             input: vec![Modality::Text, Modality::Image],
-            cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            cost: ModelCost {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_write: 6.25,
+            },
             context_window: 200_000,
             max_tokens: 64_000,
             thinking_level_map: None,
@@ -1398,8 +1633,14 @@ mod tests {
 
     #[test]
     fn url_appends_v1_messages() {
-        assert_eq!(messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
-        assert_eq!(messages_url("https://api.anthropic.com/"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url("https://api.anthropic.com/"),
+            "https://api.anthropic.com/v1/messages"
+        );
         assert_eq!(
             messages_url("https://api.anthropic.com/v1/messages"),
             "https://api.anthropic.com/v1/messages"
@@ -1409,7 +1650,10 @@ mod tests {
     #[test]
     fn build_params_basic_shape() {
         let m = model();
-        let opts = StreamOptions { max_tokens: Some(1000), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("hello"), &opts);
         assert_eq!(body["model"], "claude-opus-4-5");
         assert_eq!(body["stream"], true);
@@ -1421,7 +1665,10 @@ mod tests {
         // message, so the string is promoted to a single cached text block (Pi convertMessages).
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
-        assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         // A reasoning model with reasoning Off (and `off` not null-marked) emits thinking:disabled
         // (Pi buildParams: `thinkingEnabled === false && thinkingLevelMap?.off !== null`).
         assert_eq!(body["thinking"]["type"], "disabled");
@@ -1444,6 +1691,36 @@ mod tests {
     }
 
     #[test]
+    fn thinking_display_per_api_option_overrides_default() {
+        // Pi `options.thinkingDisplay ?? "summarized"` (anthropic-messages.ts:962). The typed
+        // per-API option flips the emitted `thinking.display` for both budget and adaptive thinking.
+        let m = model(); // not adaptive
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            max_tokens: Some(4000),
+            api_options: Some(crate::stream::ApiStreamOptions::Anthropic(
+                AnthropicOptions {
+                    thinking_display: Some(AnthropicThinkingDisplay::Omitted),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("think"), &opts);
+        assert_eq!(body["thinking"]["display"], "omitted");
+
+        // Adaptive model carries the same display through to the adaptive thinking block.
+        let mut adaptive = model();
+        adaptive.compat = Some(ModelCompat {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        });
+        let body = build_body(&adaptive, &user_ctx("deep"), &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "omitted");
+    }
+
+    #[test]
     fn custom_thinking_budgets_override_default_budget_tokens() {
         // Pi `streamSimple` forwards `options.thinkingBudgets` into `adjustMaxTokensForThinking`
         // (anthropic-messages.ts:792-797). A custom `high` budget must override the built-in default
@@ -1461,19 +1738,33 @@ mod tests {
         let body = build_body(&m, &user_ctx("think"), &opts);
         assert_eq!(body["thinking"]["budget_tokens"].as_u64().unwrap(), 30_000);
         // Sanity: without the override the default (16_384) is used, proving the field threads.
-        let default_opts =
-            StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let default_opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let default_body = build_body(&m, &user_ctx("think"), &default_opts);
-        assert_eq!(default_body["thinking"]["budget_tokens"].as_u64().unwrap(), 16_384);
+        assert_eq!(
+            default_body["thinking"]["budget_tokens"].as_u64().unwrap(),
+            16_384
+        );
     }
 
     #[test]
     fn adaptive_thinking_encodes_effort() {
         let mut m = model();
-        m.compat = Some(ModelCompat { force_adaptive_thinking: Some(true), ..Default::default() });
-        m.thinking_level_map =
-            Some([("xhigh".to_string(), Some("xhigh".to_string()))].into_iter().collect());
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::Xhigh, ..Default::default() };
+        m.compat = Some(ModelCompat {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        });
+        m.thinking_level_map = Some(
+            [("xhigh".to_string(), Some("xhigh".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::Xhigh,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("deep"), &opts);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "xhigh");
@@ -1483,7 +1774,10 @@ mod tests {
     fn disabled_thinking_when_off_map_not_null() {
         let mut m = model();
         // off not present => off !== null => disabled emitted.
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::Off, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::Off,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert_eq!(body["thinking"]["type"], "disabled");
         // when off is null-marked, no thinking key.
@@ -1496,11 +1790,17 @@ mod tests {
     fn temperature_only_without_thinking_and_when_supported() {
         let mut m = model();
         m.reasoning = false;
-        let opts = StreamOptions { temperature: Some(0.7), ..Default::default() };
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert!((body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
         // supportsTemperature=false suppresses it (Opus 4.7+).
-        m.compat = Some(ModelCompat { supports_temperature: Some(false), ..Default::default() });
+        m.compat = Some(ModelCompat {
+            supports_temperature: Some(false),
+            ..Default::default()
+        });
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert!(body.get("temperature").is_none());
     }
@@ -1514,7 +1814,10 @@ mod tests {
             parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
         }];
         let m = model();
-        let opts = StreamOptions { cache_retention: Some(CacheRetention::Long), ..Default::default() };
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        };
         let body = build_body(&m, &ctx, &opts);
         let tool = &body["tools"][0];
         assert_eq!(tool["name"], "read");
@@ -1529,8 +1832,10 @@ mod tests {
     #[test]
     fn fine_grained_beta_when_eager_unsupported() {
         let mut m = model();
-        m.compat =
-            Some(ModelCompat { supports_eager_tool_input_streaming: Some(false), ..Default::default() });
+        m.compat = Some(ModelCompat {
+            supports_eager_tool_input_streaming: Some(false),
+            ..Default::default()
+        });
         let mut ctx = user_ctx("x");
         ctx.tools = vec![ToolDef {
             name: "read".to_string(),
@@ -1539,8 +1844,14 @@ mod tests {
         }];
         let auth = auth_with(None);
         let headers = build_headers(&m, &ctx, &auth, &StreamOptions::default(), false);
-        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
-        assert!(beta.contains(FINE_GRAINED_TOOL_STREAMING_BETA), "got: {beta}");
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
+        assert!(
+            beta.contains(FINE_GRAINED_TOOL_STREAMING_BETA),
+            "got: {beta}"
+        );
         // tools omit eager_input_streaming when unsupported.
         let body = build_body(&m, &ctx, &StreamOptions::default());
         assert!(body["tools"][0].get("eager_input_streaming").is_none());
@@ -1550,15 +1861,73 @@ mod tests {
     fn api_key_headers_and_version() {
         let m = model();
         let auth = auth_with(Some("sk-ant-api03-xxx"));
-        let headers = build_headers(&m, &Context::default(), &auth, &StreamOptions::default(), false);
-        assert_eq!(headers.get("x-api-key").and_then(|v| v.clone()).as_deref(), Some("sk-ant-api03-xxx"));
+        let headers = build_headers(
+            &m,
+            &Context::default(),
+            &auth,
+            &StreamOptions::default(),
+            false,
+        );
         assert_eq!(
-            headers.get("anthropic-version").and_then(|v| v.clone()).as_deref(),
+            headers.get("x-api-key").and_then(|v| v.clone()).as_deref(),
+            Some("sk-ant-api03-xxx")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|v| v.clone())
+                .as_deref(),
             Some(ANTHROPIC_VERSION)
         );
         // interleaved-thinking beta is sent for non-adaptive reasoning models.
-        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
         assert!(beta.contains(INTERLEAVED_THINKING_BETA));
+    }
+
+    #[test]
+    fn interleaved_thinking_per_api_option_suppresses_beta() {
+        // Pi `options?.interleavedThinking ?? true` (anthropic-messages.ts:520): an explicit
+        // `false` drops the interleaved-thinking beta header that is otherwise sent by default.
+        let m = model();
+        let auth = auth_with(Some("sk-ant-api03-xxx"));
+
+        let default_headers = build_headers(
+            &m,
+            &Context::default(),
+            &auth,
+            &StreamOptions::default(),
+            false,
+        );
+        let default_beta = default_headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
+        assert!(
+            default_beta.contains(INTERLEAVED_THINKING_BETA),
+            "beta on by default"
+        );
+
+        let opts = StreamOptions {
+            api_options: Some(crate::stream::ApiStreamOptions::Anthropic(
+                AnthropicOptions {
+                    interleaved_thinking: Some(false),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let headers = build_headers(&m, &Context::default(), &auth, &opts, false);
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
+        assert!(
+            !beta.contains(INTERLEAVED_THINKING_BETA),
+            "explicit false suppresses the beta"
+        );
     }
 
     #[test]
@@ -1567,16 +1936,31 @@ mod tests {
         let auth = auth_with(Some("sk-ant-oat01-yyy"));
         let is_oauth = is_oauth_token(auth.auth.api_key.as_deref().unwrap());
         assert!(is_oauth);
-        let headers = build_headers(&m, &Context::default(), &auth, &StreamOptions::default(), is_oauth);
+        let headers = build_headers(
+            &m,
+            &Context::default(),
+            &auth,
+            &StreamOptions::default(),
+            is_oauth,
+        );
         assert_eq!(
-            headers.get("authorization").and_then(|v| v.clone()).as_deref(),
+            headers
+                .get("authorization")
+                .and_then(|v| v.clone())
+                .as_deref(),
             Some("Bearer sk-ant-oat01-yyy")
         );
         assert!(!headers.contains_key("x-api-key"));
-        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default();
         assert!(beta.contains("claude-code-20250219"));
         assert!(beta.contains("oauth-2025-04-20"));
-        assert_eq!(headers.get("x-app").and_then(|v| v.clone()).as_deref(), Some("cli"));
+        assert_eq!(
+            headers.get("x-app").and_then(|v| v.clone()).as_deref(),
+            Some("cli")
+        );
     }
 
     #[test]
@@ -1632,7 +2016,10 @@ mod tests {
 
     #[test]
     fn normalize_tool_call_id_rule() {
-        assert_eq!(normalize_tool_call_id("call/with|bad chars"), "call_with_bad_chars");
+        assert_eq!(
+            normalize_tool_call_id("call/with|bad chars"),
+            "call_with_bad_chars"
+        );
         let long = "a".repeat(100);
         assert_eq!(normalize_tool_call_id(&long).chars().count(), 64);
     }
@@ -1641,7 +2028,10 @@ mod tests {
     fn tool_choice_mapping() {
         use crate::stream::ToolChoice;
         assert_eq!(tool_choice_wire(&ToolChoice::Auto), json!({"type":"auto"}));
-        assert_eq!(tool_choice_wire(&ToolChoice::Required), json!({"type":"any"}));
+        assert_eq!(
+            tool_choice_wire(&ToolChoice::Required),
+            json!({"type":"any"})
+        );
         assert_eq!(
             tool_choice_wire(&ToolChoice::Function { name: "x".into() }),
             json!({"type":"tool","name":"x"})
@@ -1693,7 +2083,11 @@ mod tests {
         let events = collect(raw.as_bytes().to_vec(), &m).await;
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
         // text delta carried "Hello".
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello"))
+        );
         // tool call end with parsed args.
         let tool_end = events.iter().find_map(|e| match e {
             StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call.clone()),
@@ -1702,7 +2096,10 @@ mod tests {
         let tool = tool_end.expect("toolcall_end");
         assert_eq!(tool.id.as_str(), "toolu_9");
         assert_eq!(tool.name, "read");
-        assert_eq!(tool.arguments.get("path").and_then(Value::as_str), Some("a"));
+        assert_eq!(
+            tool.arguments.get("path").and_then(Value::as_str),
+            Some("a")
+        );
         // terminal done with ToolUse + usage/cost computed.
         let done = events.iter().find_map(|e| match e {
             StreamEvent::Done { message, .. } => Some(message.clone()),
@@ -1743,9 +2140,11 @@ mod tests {
         let msg = done.expect("done");
         assert_eq!(msg.stop_reason, StopReason::Stop);
         let thinking = msg.content.iter().find_map(|c| match c {
-            Content::Thinking { thinking, thinking_signature, .. } => {
-                Some((thinking.clone(), thinking_signature.clone()))
-            }
+            Content::Thinking {
+                thinking,
+                thinking_signature,
+                ..
+            } => Some((thinking.clone(), thinking_signature.clone())),
             _ => None,
         });
         let (thinking, sig) = thinking.expect("thinking block");

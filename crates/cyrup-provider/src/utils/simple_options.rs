@@ -92,6 +92,8 @@ pub fn build_base_options(
         // Per-level custom thinking budgets ride through to budget-based providers (Pi
         // `streamSimple` forwards `options.thinkingBudgets`, anthropic-messages.ts:792-797).
         thinking_budgets: options.thinking_budgets,
+        // Per-API typed options ride through unchanged (Pi `streamSimple` preserves `options`).
+        api_options: options.base.api_options.clone(),
     }
 }
 
@@ -145,7 +147,12 @@ fn budget_for_level(level: ThinkingLevel, custom: Option<&ThinkingBudgets>) -> u
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::model::{Modality, ModelCost};
@@ -194,7 +201,10 @@ mod tests {
     fn clamp_floors_at_one_when_window_full() {
         let m = model(100, 4_096);
         // window smaller than the safety margin → available negative → floor at 1.
-        assert_eq!(clamp_max_tokens_to_context(&m, &ctx("hello world"), 4_096), 1);
+        assert_eq!(
+            clamp_max_tokens_to_context(&m, &ctx("hello world"), 4_096),
+            1
+        );
     }
 
     #[test]
@@ -226,12 +236,16 @@ mod tests {
         let mut opts = SimpleStreamOptions::default();
         opts.base.api_key = Some("from-options".into());
         assert_eq!(
-            build_base_options(&m, &ctx("x"), &opts, Some("from-param")).api_key.as_deref(),
+            build_base_options(&m, &ctx("x"), &opts, Some("from-param"))
+                .api_key
+                .as_deref(),
             Some("from-param")
         );
         // empty param falls back to the option.
         assert_eq!(
-            build_base_options(&m, &ctx("x"), &opts, Some("")).api_key.as_deref(),
+            build_base_options(&m, &ctx("x"), &opts, Some(""))
+                .api_key
+                .as_deref(),
             Some("from-options")
         );
     }
@@ -245,10 +259,19 @@ mod tests {
     #[test]
     fn adjust_default_budgets() {
         // No explicit cap: use model cap; budget = default for the level.
-        assert_eq!(adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::Medium, None), (32_000, 8_192));
-        assert_eq!(adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::High, None), (32_000, 16_384));
+        assert_eq!(
+            adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::Medium, None),
+            (32_000, 8_192)
+        );
+        assert_eq!(
+            adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::High, None),
+            (32_000, 16_384)
+        );
         // xhigh collapses to high's budget.
-        assert_eq!(adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::Xhigh, None), (32_000, 16_384));
+        assert_eq!(
+            adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::Xhigh, None),
+            (32_000, 16_384)
+        );
     }
 
     #[test]
@@ -277,7 +300,10 @@ mod tests {
 
     #[test]
     fn adjust_custom_budget_overrides_default() {
-        let custom = ThinkingBudgets { medium: Some(5_000), ..ThinkingBudgets::default() };
+        let custom = ThinkingBudgets {
+            medium: Some(5_000),
+            ..ThinkingBudgets::default()
+        };
         assert_eq!(
             adjust_max_tokens_for_thinking(None, 32_000, ThinkingLevel::Medium, Some(&custom)),
             (32_000, 5_000)

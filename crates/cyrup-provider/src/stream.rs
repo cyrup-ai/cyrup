@@ -1,8 +1,8 @@
 //! The streaming event model + per-request options (arch-01 §8 / func-01 §8).
 
 use cyrup_core::{
-    AssistantMessage, CancelToken, EventStream, ProviderId, SessionId, StopReason, ModelThinkingLevel,
-    ToolCall,
+    AssistantMessage, CancelToken, EventStream, ModelThinkingLevel, ProviderId, SessionId,
+    StopReason, ToolCall,
 };
 use futures::StreamExt;
 
@@ -41,8 +41,9 @@ pub struct ProviderResponse {
 
 /// Inspect or replace a provider payload before sending (Pi `StreamOptions.onPayload`,
 /// types.ts:130-134). Returning `None` keeps the payload unchanged.
-pub type OnPayload =
-    std::sync::Arc<dyn Fn(&serde_json::Value, &crate::model::Model) -> Option<serde_json::Value> + Send + Sync>;
+pub type OnPayload = std::sync::Arc<
+    dyn Fn(&serde_json::Value, &crate::model::Model) -> Option<serde_json::Value> + Send + Sync,
+>;
 
 /// Invoked after an HTTP response is received and before its body stream is consumed (Pi
 /// `StreamOptions.onResponse`, types.ts:135-139).
@@ -135,6 +136,82 @@ pub struct StreamOptions {
     /// Invoked after an HTTP response is received, before its body is consumed (Pi
     /// `StreamOptions.onResponse`, types.ts:135). Additive; defaults to `None`.
     pub on_response: Option<OnResponseHook>,
+    /// Per-API typed options (Pi `ApiStreamOptions<TApi>` / `ApiOptionsMap`, types.ts:189-214). A
+    /// wire impl extracts its own variant and ignores the rest; an absent or mismatched variant
+    /// leaves every default unchanged. Additive; defaults to `None`.
+    pub api_options: Option<ApiStreamOptions>,
+}
+
+/// Per-API typed stream options, mirroring Pi's `ApiStreamOptions<TApi>` resolution against
+/// `ApiOptionsMap` (types.ts:189-214): each known API resolves to its own concrete option struct.
+/// A wire impl downcasts to its own variant via [`StreamOptions`]'s typed accessors; any other
+/// variant is ignored (the impl keeps Pi's defaults). Only the variants whose fields cyrup did not
+/// already carry on [`StreamOptions`] are modeled here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiStreamOptions {
+    /// Options for the `anthropic-messages` wire protocol.
+    Anthropic(crate::api::anthropic_messages::AnthropicOptions),
+    /// Options for the `openai-responses` wire protocol.
+    OpenAiResponses(crate::api::openai_responses::OpenAiResponsesOptions),
+    /// Options for the `azure-openai-responses` wire protocol.
+    AzureOpenAiResponses(crate::api::azure_openai_responses::AzureOpenAiResponsesOptions),
+}
+
+impl ApiStreamOptions {
+    /// The `anthropic-messages` options, if this is that variant.
+    pub fn anthropic(&self) -> Option<&crate::api::anthropic_messages::AnthropicOptions> {
+        match self {
+            ApiStreamOptions::Anthropic(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `openai-responses` options, if this is that variant.
+    pub fn openai_responses(
+        &self,
+    ) -> Option<&crate::api::openai_responses::OpenAiResponsesOptions> {
+        match self {
+            ApiStreamOptions::OpenAiResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `azure-openai-responses` options, if this is that variant.
+    pub fn azure_openai_responses(
+        &self,
+    ) -> Option<&crate::api::azure_openai_responses::AzureOpenAiResponsesOptions> {
+        match self {
+            ApiStreamOptions::AzureOpenAiResponses(o) => Some(o),
+            _ => None,
+        }
+    }
+}
+
+impl StreamOptions {
+    /// The carried `anthropic-messages` per-API options, if any.
+    pub fn anthropic_options(&self) -> Option<&crate::api::anthropic_messages::AnthropicOptions> {
+        self.api_options
+            .as_ref()
+            .and_then(ApiStreamOptions::anthropic)
+    }
+
+    /// The carried `openai-responses` per-API options, if any.
+    pub fn openai_responses_options(
+        &self,
+    ) -> Option<&crate::api::openai_responses::OpenAiResponsesOptions> {
+        self.api_options
+            .as_ref()
+            .and_then(ApiStreamOptions::openai_responses)
+    }
+
+    /// The carried `azure-openai-responses` per-API options, if any.
+    pub fn azure_openai_responses_options(
+        &self,
+    ) -> Option<&crate::api::azure_openai_responses::AzureOpenAiResponsesOptions> {
+        self.api_options
+            .as_ref()
+            .and_then(ApiStreamOptions::azure_openai_responses)
+    }
 }
 
 /// Terminal-`done` reason. Pi narrows the `done` event's `reason` to
@@ -222,36 +299,75 @@ pub enum StreamEvent {
     #[serde(rename = "start")]
     Start { partial: AssistantMessage },
     #[serde(rename = "text_start")]
-    TextStart { content_index: usize, partial: AssistantMessage },
+    TextStart {
+        content_index: usize,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "text_delta")]
-    TextDelta { content_index: usize, delta: String, partial: AssistantMessage },
+    TextDelta {
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "text_end")]
-    TextEnd { content_index: usize, content: String, partial: AssistantMessage },
+    TextEnd {
+        content_index: usize,
+        content: String,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "thinking_start")]
-    ThinkingStart { content_index: usize, partial: AssistantMessage },
+    ThinkingStart {
+        content_index: usize,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "thinking_delta")]
-    ThinkingDelta { content_index: usize, delta: String, partial: AssistantMessage },
+    ThinkingDelta {
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "thinking_end")]
-    ThinkingEnd { content_index: usize, content: String, partial: AssistantMessage },
+    ThinkingEnd {
+        content_index: usize,
+        content: String,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "toolcall_start")]
-    ToolCallStart { content_index: usize, partial: AssistantMessage },
+    ToolCallStart {
+        content_index: usize,
+        partial: AssistantMessage,
+    },
     #[serde(rename = "toolcall_delta")]
-    ToolCallDelta { content_index: usize, delta: String, partial: AssistantMessage },
+    ToolCallDelta {
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
     /// Pi `toolcall_end` (types.ts:463). The `tool_call` field carries Pi's `type:"toolCall"`
     /// discriminant first (Pi `ToolCall.type`, types.ts:345) because [`ToolCall`] now self-tags via
     /// its own [`serde::Serialize`] impl — the single source of the discriminant. Deserialize uses
     /// `ToolCall`'s derived impl, which tolerates the extra `type` key.
     #[serde(rename = "toolcall_end")]
-    ToolCallEnd { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
+    ToolCallEnd {
+        content_index: usize,
+        tool_call: ToolCall,
+        partial: AssistantMessage,
+    },
     /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse} (Pi narrows the `done` reason
     /// to `Extract<StopReason,"stop"|"length"|"toolUse">`, types.ts:464); `message.stop_reason`
     /// matches.
     #[serde(rename = "done")]
-    Done { reason: DoneReason, message: AssistantMessage },
+    Done {
+        reason: DoneReason,
+        message: AssistantMessage,
+    },
     /// Terminal: error/abort. `reason` ∈ {error, aborted} (Pi narrows the `error` reason to
     /// `Extract<StopReason,"aborted"|"error">`, types.ts:465); the final message is keyed `error`.
     #[serde(rename = "error")]
-    Error { reason: ErrorReason, error: AssistantMessage },
+    Error {
+        reason: ErrorReason,
+        error: AssistantMessage,
+    },
 }
 
 impl StreamEvent {
@@ -262,7 +378,10 @@ impl StreamEvent {
     pub fn terminal(message: AssistantMessage) -> Self {
         match DoneReason::try_from(message.stop_reason) {
             Ok(reason) => StreamEvent::Done { reason, message },
-            Err(reason) => StreamEvent::Error { reason, error: message },
+            Err(reason) => StreamEvent::Error {
+                reason,
+                error: message,
+            },
         }
     }
 
@@ -319,8 +438,7 @@ pub async fn collect_message(mut stream: EventStream<StreamEvent>) -> AssistantM
 /// `createAssistantMessageEventStream`, event-stream.ts:69-88). Specializes cyrup-core's generic
 /// [`cyrup_core::FinalizingStream`] over `StreamEvent`/`AssistantMessage`, keying completion on the
 /// `Done`/`Error` terminals and extracting their message (Pi `isComplete`/`extractResult`).
-pub type AssistantMessageEventStream =
-    cyrup_core::FinalizingStream<StreamEvent, AssistantMessage>;
+pub type AssistantMessageEventStream = cyrup_core::FinalizingStream<StreamEvent, AssistantMessage>;
 
 /// The producer half an extension drives to author an [`AssistantMessageEventStream`].
 pub type AssistantMessageEventSink = cyrup_core::FinalizingSink<StreamEvent, AssistantMessage>;
@@ -329,12 +447,14 @@ pub type AssistantMessageEventSink = cyrup_core::FinalizingSink<StreamEvent, Ass
 /// `createAssistantMessageEventStream()`, event-stream.ts:85-88). The sink's `push`/`end` feed the
 /// stream; `result()` resolves to the terminal message (or a synthesized error if it ends without
 /// a terminal, matching [`collect_message`]'s no-panic policy).
-pub fn create_assistant_message_event_stream(
-) -> (AssistantMessageEventSink, AssistantMessageEventStream) {
+pub fn create_assistant_message_event_stream()
+-> (AssistantMessageEventSink, AssistantMessageEventStream) {
     cyrup_core::finalizing_channel(
         |e: &StreamEvent| matches!(e, StreamEvent::Done { .. } | StreamEvent::Error { .. }),
         |e: &StreamEvent| {
-            e.terminal_message().cloned().unwrap_or_else(synth_terminal_less_message)
+            e.terminal_message()
+                .cloned()
+                .unwrap_or_else(synth_terminal_less_message)
         },
         synth_terminal_less_message,
     )
@@ -382,16 +502,36 @@ mod tests {
         let p = empty_partial();
         let cases = [
             (StreamEvent::Start { partial: p.clone() }, "start"),
-            (StreamEvent::TextStart { content_index: 0, partial: p.clone() }, "text_start"),
             (
-                StreamEvent::TextDelta { content_index: 0, delta: "d".into(), partial: p.clone() },
+                StreamEvent::TextStart {
+                    content_index: 0,
+                    partial: p.clone(),
+                },
+                "text_start",
+            ),
+            (
+                StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "d".into(),
+                    partial: p.clone(),
+                },
                 "text_delta",
             ),
             (
-                StreamEvent::TextEnd { content_index: 0, content: "c".into(), partial: p.clone() },
+                StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: "c".into(),
+                    partial: p.clone(),
+                },
                 "text_end",
             ),
-            (StreamEvent::ThinkingStart { content_index: 0, partial: p.clone() }, "thinking_start"),
+            (
+                StreamEvent::ThinkingStart {
+                    content_index: 0,
+                    partial: p.clone(),
+                },
+                "thinking_start",
+            ),
             (
                 StreamEvent::ThinkingDelta {
                     content_index: 0,
@@ -408,7 +548,13 @@ mod tests {
                 },
                 "thinking_end",
             ),
-            (StreamEvent::ToolCallStart { content_index: 0, partial: p.clone() }, "toolcall_start"),
+            (
+                StreamEvent::ToolCallStart {
+                    content_index: 0,
+                    partial: p.clone(),
+                },
+                "toolcall_start",
+            ),
             (
                 StreamEvent::ToolCallDelta {
                     content_index: 0,
@@ -418,11 +564,17 @@ mod tests {
                 "toolcall_delta",
             ),
             (
-                StreamEvent::Done { reason: DoneReason::Stop, message: p.clone() },
+                StreamEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: p.clone(),
+                },
                 "done",
             ),
             (
-                StreamEvent::Error { reason: ErrorReason::Error, error: p.clone() },
+                StreamEvent::Error {
+                    reason: ErrorReason::Error,
+                    error: p.clone(),
+                },
                 "error",
             ),
         ];
@@ -451,7 +603,11 @@ mod tests {
             partial: empty_partial(),
         };
         let s = serde_json::to_string(&ev).expect("serialize");
-        assert_eq!(s.matches("\"type\"").count(), 2, "event tag + toolCall tag, no dup: {s}");
+        assert_eq!(
+            s.matches("\"type\"").count(),
+            2,
+            "event tag + toolCall tag, no dup: {s}"
+        );
         let v: serde_json::Value = serde_json::from_str(&s).expect("json");
         assert_eq!(v["type"], "toolcall_end");
         assert_eq!(v["toolCall"]["type"], "toolCall");
@@ -460,7 +616,10 @@ mod tests {
         assert!(v["toolCall"]["arguments"].is_object());
         // `type` is emitted first, byte-1:1 with Pi's `ToolCall` field order.
         let tc = &s[s.find("\"toolCall\":{").expect("toolCall obj")..];
-        assert!(tc.starts_with("\"toolCall\":{\"type\":\"toolCall\""), "{tc}");
+        assert!(
+            tc.starts_with("\"toolCall\":{\"type\":\"toolCall\""),
+            "{tc}"
+        );
         let back: StreamEvent = serde_json::from_str(&s).expect("roundtrip");
         assert_eq!(back, ev);
     }
@@ -479,7 +638,10 @@ mod tests {
             (DoneReason::ToolUse, StopReason::ToolUse, "toolUse"),
         ];
         for (reason, stop, wire) in done_cases {
-            let ev = StreamEvent::Done { reason, message: p.clone() };
+            let ev = StreamEvent::Done {
+                reason,
+                message: p.clone(),
+            };
             let v = serde_json::to_value(&ev).expect("serialize");
             assert_eq!(v["type"], "done");
             assert_eq!(v["reason"], wire, "done reason wire byte for {reason:?}");
@@ -494,7 +656,10 @@ mod tests {
             (ErrorReason::Aborted, StopReason::Aborted, "aborted"),
         ];
         for (reason, stop, wire) in err_cases {
-            let ev = StreamEvent::Error { reason, error: p.clone() };
+            let ev = StreamEvent::Error {
+                reason,
+                error: p.clone(),
+            };
             let v = serde_json::to_value(&ev).expect("serialize");
             assert_eq!(v["type"], "error");
             assert_eq!(v["reason"], wire, "error reason wire byte for {reason:?}");
@@ -515,19 +680,31 @@ mod tests {
             m
         };
         match StreamEvent::terminal(mk(StopReason::Stop)) {
-            StreamEvent::Done { reason: DoneReason::Stop, .. } => {}
+            StreamEvent::Done {
+                reason: DoneReason::Stop,
+                ..
+            } => {}
             other => panic!("expected done/stop, got {other:?}"),
         }
         match StreamEvent::terminal(mk(StopReason::ToolUse)) {
-            StreamEvent::Done { reason: DoneReason::ToolUse, .. } => {}
+            StreamEvent::Done {
+                reason: DoneReason::ToolUse,
+                ..
+            } => {}
             other => panic!("expected done/toolUse, got {other:?}"),
         }
         match StreamEvent::terminal(mk(StopReason::Error)) {
-            StreamEvent::Error { reason: ErrorReason::Error, .. } => {}
+            StreamEvent::Error {
+                reason: ErrorReason::Error,
+                ..
+            } => {}
             other => panic!("expected error/error, got {other:?}"),
         }
         match StreamEvent::terminal(mk(StopReason::Aborted)) {
-            StreamEvent::Error { reason: ErrorReason::Aborted, .. } => {}
+            StreamEvent::Error {
+                reason: ErrorReason::Aborted,
+                ..
+            } => {}
             other => panic!("expected error/aborted, got {other:?}"),
         }
     }

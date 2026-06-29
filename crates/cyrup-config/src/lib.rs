@@ -32,7 +32,7 @@ pub mod trust;
 pub(crate) mod test_util;
 
 pub use auth::{
-    resolve_auth, AuthStatus, AuthStore, Credential, CredentialSource, ResolvedAuth, Stored,
+    AuthStatus, AuthStore, Credential, CredentialSource, ResolvedAuth, Stored, resolve_auth,
 };
 pub use config_value::{
     clear_config_value_cache, config_value_env_var_name, config_value_env_var_names,
@@ -44,21 +44,21 @@ pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use model::{
-    build_fallback_model, default_model_per_provider, find_initial_model, load_custom_models,
-    load_models_file, parse_thinking_level, resolve_cli_model, restore_model_from_session,
     CliModelResult, InitialModelResult, ModelCycler, ModelFile, ModelResolver, ParsedModel,
-    ProviderConfig, RestoredModelResult, ScopedModel,
+    ProviderConfig, RestoredModelResult, ScopedModel, build_fallback_model,
+    default_model_per_provider, find_initial_model, load_custom_models, load_models_file,
+    parse_thinking_level, resolve_cli_model, restore_model_from_session,
 };
 pub use policy::NetworkPolicy;
 pub use settings::{
-    deep_merge, migrate_settings, parse_http_idle_timeout_ms, CompactionSettings,
-    DefaultProjectTrust, EffectiveSettings, FileSettingsStore, InMemorySettingsStore, PackageSource,
-    RetrySettings, Settings, SettingsManager, SettingsScope, SettingsStore,
-    DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+    CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DefaultProjectTrust, EffectiveSettings,
+    FileSettingsStore, InMemorySettingsStore, PackageSource, RetrySettings, Settings,
+    SettingsManager, SettingsScope, SettingsStore, deep_merge, migrate_settings,
+    parse_http_idle_timeout_ms,
 };
 pub use trust::{
-    decide_trust, decide_trust_with_extension, format_project_trust_prompt,
-    has_trust_requiring_resources, project_trust_parent_path, resource_stage, select_loaded,
-    should_load, trust_options, AppMode, ExtensionTrust, ResourceKind, ResourceStage, TrustDecision,
-    TrustEntry, TrustInputs, TrustOption, TrustOutcome, TrustStore,
+    AppMode, ExtensionTrust, ResourceKind, ResourceStage, TrustDecision, TrustEntry, TrustInputs,
+    TrustOption, TrustOutcome, TrustStore, decide_trust, decide_trust_with_extension,
+    format_project_trust_prompt, has_trust_requiring_resources, project_trust_parent_path,
+    resource_stage, select_loaded, should_load, trust_options,
 };

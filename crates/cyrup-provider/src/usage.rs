@@ -20,7 +20,13 @@ pub fn compute_cost(cost: &ModelCost, u: &Usage) -> Cost {
     let short = u.cache_write.saturating_sub(long);
     let cache_write = (cost.cache_write * short as f64 + cost.input * 2.0 * long as f64) / 1e6;
 
-    Cost { input, output, cache_read, cache_write, total: input + output + cache_read + cache_write }
+    Cost {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total: input + output + cache_read + cache_write,
+    }
 }
 
 /// Recompute `total_tokens` and the precomputed `cost` on a usage vector in place (func-01 R-01-027).
@@ -36,7 +42,12 @@ mod tests {
 
     fn rates() -> ModelCost {
         // USD per 1e6 tokens.
-        ModelCost { input: 3.0, output: 15.0, cache_read: 0.30, cache_write: 3.75 }
+        ModelCost {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.30,
+            cache_write: 3.75,
+        }
     }
 
     #[test]
@@ -72,7 +83,10 @@ mod tests {
 
     #[test]
     fn long_writes_default_to_zero() {
-        let u = Usage { cache_write: 1_000_000, ..Default::default() };
+        let u = Usage {
+            cache_write: 1_000_000,
+            ..Default::default()
+        };
         let c = compute_cost(&rates(), &u);
         // all short: 1,000,000 @ 3.75/1e6 = 3.75
         assert!((c.cache_write - 3.75).abs() < 1e-9);
@@ -80,7 +94,13 @@ mod tests {
 
     #[test]
     fn apply_cost_sets_total_tokens() {
-        let mut u = Usage { input: 10, output: 20, cache_read: 5, cache_write: 0, ..Default::default() };
+        let mut u = Usage {
+            input: 10,
+            output: 20,
+            cache_read: 5,
+            cache_write: 0,
+            ..Default::default()
+        };
         apply_cost(&rates(), &mut u);
         assert_eq!(u.total_tokens, 35);
         assert!(u.cost.total > 0.0);

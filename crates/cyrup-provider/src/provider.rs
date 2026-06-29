@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamOptions};
-use crate::utils::simple_options::{build_base_options, SimpleStreamOptions};
+use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
 use cyrup_core::{EventStream, ProviderId};
 
 /// A runtime unit owning a model catalog, auth, and stream behavior (func-01 §6).
@@ -93,7 +93,12 @@ pub trait Provider: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::model::{Modality, ModelCost};
@@ -164,7 +169,10 @@ mod tests {
         Context {
             system_prompt: None,
             messages: vec![Message::User {
-                content: vec![cyrup_core::Content::Text { text: "hi".into(), text_signature: None }],
+                content: vec![cyrup_core::Content::Text {
+                    text: "hi".into(),
+                    text_signature: None,
+                }],
                 timestamp: 0,
             }],
             tools: Vec::new(),

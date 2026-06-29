@@ -29,8 +29,13 @@ impl FileLock {
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-        FileExt::lock(&file).map_err(|_| ConfigError::Lock { path: lock_path.clone() })?;
-        Ok(Self { file, path: lock_path })
+        FileExt::lock(&file).map_err(|_| ConfigError::Lock {
+            path: lock_path.clone(),
+        })?;
+        Ok(Self {
+            file,
+            path: lock_path,
+        })
     }
 }
 
@@ -41,7 +46,10 @@ impl Drop for FileLock {
 }
 
 fn lock_path_for(target: &Path) -> PathBuf {
-    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".lock");
     match target.parent() {
         Some(p) => p.join(name),
@@ -71,7 +79,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), Confi
     if let Some(parent) = parent {
         ensure_dir(parent)?;
     }
-    let file_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     let mut tmp_name = file_name;
     tmp_name.push(format!(".tmp.{}", std::process::id()));
     let tmp_path = match parent {

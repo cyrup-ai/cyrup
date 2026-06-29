@@ -14,6 +14,7 @@
 //! Wire JSON uses Google's own field names (camelCase: `functionCall`, `thoughtSignature`,
 //! `maxOutputTokens`, `thinkingConfig`), NOT cyrup's serde camelCase convention.
 
+use crate::HeaderMap;
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
 use crate::api::{ApiImpl, EventSink};
@@ -22,20 +23,19 @@ use crate::collection::clamp_thinking_level;
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::{Modality, Model};
-use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::json_parse::parse_json_with_repair;
 use crate::utils::simple_options::ThinkingBudgets;
-use crate::HeaderMap;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ThinkingLevel, ToolCall, ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
-use serde_json::{json, Map, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The wire-protocol id this impl serves.
 const API_ID: &str = crate::known_api::GOOGLE_GENERATIVE_AI;
@@ -51,7 +51,9 @@ pub struct GoogleGenerativeAiApi {
 
 impl Default for GoogleGenerativeAiApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -87,10 +89,10 @@ impl ApiImpl for GoogleGenerativeAiApi {
         let api_key = match &auth.auth.api_key {
             Some(k) if !k.is_empty() => k.clone(),
             _ => {
-                let e = ProviderError::Transport(
-                    format!("No API key for provider: {provider}").into(),
-                );
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                let e =
+                    ProviderError::Transport(format!("No API key for provider: {provider}").into());
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -99,19 +101,34 @@ impl ApiImpl for GoogleGenerativeAiApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
 
         let body = build_params(model, ctx, opts);
         let headers = build_headers(model, opts, &api_key);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -119,7 +136,8 @@ impl ApiImpl for GoogleGenerativeAiApi {
         let frames = match open_sse(&client, req, cancel, None, None).await {
             Ok(s) => s,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -136,7 +154,11 @@ impl ApiImpl for GoogleGenerativeAiApi {
 /// An auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/models/{model}:streamGenerateContent?alt=sse`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
+    let base = auth
+        .auth
+        .base_url
+        .as_deref()
+        .unwrap_or(model.base_url.as_str());
     Some(stream_url(base, model.id.as_str()))
 }
 
@@ -151,7 +173,10 @@ pub(crate) fn stream_url(base: &str, model_id: &str) -> String {
 /// `None` value suppresses a default).
 pub(crate) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("content-type".to_string(), Some("application/json".to_string()));
+    headers.insert(
+        "content-type".to_string(),
+        Some("application/json".to_string()),
+    );
     headers.insert("x-goog-api-key".to_string(), Some(api_key.to_string()));
 
     // model.headers < opts.headers (a `None` suppresses a default — Pi `providerHeadersToRecord`,
@@ -222,7 +247,10 @@ pub(crate) fn build_params(model: &Model, ctx: &Context, opts: &StreamOptions) -
     }
 
     if !generation_config.is_empty() {
-        obj.insert("generationConfig".to_string(), Value::Object(generation_config));
+        obj.insert(
+            "generationConfig".to_string(),
+            Value::Object(generation_config),
+        );
     }
 
     Value::Object(obj)
@@ -422,7 +450,9 @@ fn is_valid_thought_signature(sig: &str) -> bool {
     let body = sig.trim_end_matches('=');
     // At most two `=` padding chars (validated by the length-mod-4 rule above).
     sig.len() - body.len() <= 2
-        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
 }
 
 /// Keep a signature only for the same provider/model and valid base64 (Pi `resolveThoughtSignature`,
@@ -441,7 +471,13 @@ fn normalize_tool_call_id(model_id: &str, id: &str) -> String {
         return id.to_string();
     }
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect()
 }
@@ -450,8 +486,9 @@ fn normalize_tool_call_id(model_id: &str, id: &str) -> String {
 /// google-shared.ts:91-235).
 pub(crate) fn convert_messages(model: &Model, ctx: &Context) -> Vec<Value> {
     let model_id = model.id.as_str().to_string();
-    let transformed =
-        transform_messages_with(&ctx.messages, model, |id| normalize_tool_call_id(&model_id, id));
+    let transformed = transform_messages_with(&ctx.messages, model, |id| {
+        normalize_tool_call_id(&model_id, id)
+    });
 
     let supports_image = model.input.contains(&Modality::Image);
     let multimodal_fr = supports_multimodal_function_response(&model_id);
@@ -476,7 +513,13 @@ pub(crate) fn convert_messages(model: &Model, ctx: &Context) -> Vec<Value> {
                 }
                 contents.push(json!({ "role": "model", "parts": parts }));
             }
-            Message::ToolResult { tool_name, tool_call_id, content, is_error, .. } => {
+            Message::ToolResult {
+                tool_name,
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 let text_result = content
                     .iter()
                     .filter_map(|c| match c {
@@ -574,7 +617,10 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
     for block in &am.content {
         match block {
-            Content::Text { text, text_signature } => {
+            Content::Text {
+                text,
+                text_signature,
+            } => {
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -586,7 +632,11 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
                 }
                 parts.push(Value::Object(o));
             }
-            Content::Thinking { thinking, thinking_signature, .. } => {
+            Content::Thinking {
+                thinking,
+                thinking_signature,
+                ..
+            } => {
                 if thinking.trim().is_empty() {
                     continue;
                 }
@@ -738,7 +788,12 @@ where
     let model_id = model.id.as_str().to_string();
 
     let mut dec = Decoder::default();
-    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+    if !sink
+        .send(StreamEvent::Start {
+            partial: dec.snapshot(model, api),
+        })
+        .await
+    {
         return;
     }
 
@@ -746,7 +801,8 @@ where
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -755,8 +811,14 @@ where
             continue;
         }
         let Some(chunk) = parse_json_with_repair(data) else {
-            emit_error(&dec, model, api, sink, "Could not parse Gemini SSE chunk".to_string())
-                .await;
+            emit_error(
+                &dec,
+                model,
+                api,
+                sink,
+                "Could not parse Gemini SSE chunk".to_string(),
+            )
+            .await;
             return;
         };
         if !process_chunk(&chunk, &mut dec, model, api, sink).await {
@@ -775,7 +837,9 @@ where
             model,
             api,
             sink,
-            dec.error_message.clone().unwrap_or_else(|| "An unknown error occurred".to_string()),
+            dec.error_message
+                .clone()
+                .unwrap_or_else(|| "An unknown error occurred".to_string()),
         )
         .await;
         return;
@@ -802,7 +866,10 @@ async fn process_chunk(
 
     let candidate = chunk.get("candidates").and_then(|c| c.get(0));
     if let Some(candidate) = candidate
-        && let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(Value::as_array)
+        && let Some(parts) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
     {
         for part in parts {
             if part.get("text").and_then(Value::as_str).is_some()
@@ -818,7 +885,10 @@ async fn process_chunk(
         }
     }
 
-    if let Some(reason) = candidate.and_then(|c| c.get("finishReason")).and_then(Value::as_str) {
+    if let Some(reason) = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(Value::as_str)
+    {
         dec.stop_reason = map_stop_reason(reason);
         if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_))) {
             dec.stop_reason = StopReason::ToolUse;
@@ -843,7 +913,11 @@ async fn process_text_part(
     let text = part.get("text").and_then(Value::as_str).unwrap_or("");
     let signature = part.get("thoughtSignature").and_then(Value::as_str);
     let is_thinking = part.get("thought").and_then(Value::as_bool) == Some(true);
-    let want = if is_thinking { CurrentKind::Thinking } else { CurrentKind::Text };
+    let want = if is_thinking {
+        CurrentKind::Thinking
+    } else {
+        CurrentKind::Text
+    };
 
     // Transition: close the current block + open a new one when the kind changes.
     if dec.current != Some(want) {
@@ -855,7 +929,13 @@ async fn process_text_part(
             dec.current = Some(CurrentKind::Thinking);
             let idx = dec.block_index();
             let partial = dec.snapshot(model, api);
-            if !sink.send(StreamEvent::ThinkingStart { content_index: idx, partial }).await {
+            if !sink
+                .send(StreamEvent::ThinkingStart {
+                    content_index: idx,
+                    partial,
+                })
+                .await
+            {
                 return false;
             }
         } else {
@@ -863,7 +943,13 @@ async fn process_text_part(
             dec.current = Some(CurrentKind::Text);
             let idx = dec.block_index();
             let partial = dec.snapshot(model, api);
-            if !sink.send(StreamEvent::TextStart { content_index: idx, partial }).await {
+            if !sink
+                .send(StreamEvent::TextStart {
+                    content_index: idx,
+                    partial,
+                })
+                .await
+            {
                 return false;
             }
         }
@@ -871,23 +957,38 @@ async fn process_text_part(
 
     let idx = dec.block_index();
     match dec.blocks.get_mut(idx) {
-        Some(Content::Thinking { thinking, thinking_signature, .. }) => {
+        Some(Content::Thinking {
+            thinking,
+            thinking_signature,
+            ..
+        }) => {
             thinking.push_str(text);
             if let Some(s) = retain_signature(thinking_signature.as_deref(), signature) {
                 *thinking_signature = Some(s);
             }
             let partial = dec.snapshot(model, api);
-            sink.send(StreamEvent::ThinkingDelta { content_index: idx, delta: text.to_string(), partial })
-                .await
+            sink.send(StreamEvent::ThinkingDelta {
+                content_index: idx,
+                delta: text.to_string(),
+                partial,
+            })
+            .await
         }
-        Some(Content::Text { text: acc, text_signature }) => {
+        Some(Content::Text {
+            text: acc,
+            text_signature,
+        }) => {
             acc.push_str(text);
             if let Some(s) = retain_signature(text_signature.as_deref(), signature) {
                 *text_signature = Some(s);
             }
             let partial = dec.snapshot(model, api);
-            sink.send(StreamEvent::TextDelta { content_index: idx, delta: text.to_string(), partial })
-                .await
+            sink.send(StreamEvent::TextDelta {
+                content_index: idx,
+                delta: text.to_string(),
+                partial,
+            })
+            .await
         }
         _ => true,
     }
@@ -910,13 +1011,22 @@ async fn process_function_call(
         Some(fc) => fc,
         None => return true,
     };
-    let name = fc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    let provided_id = fc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let name = fc
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let provided_id = fc
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
 
     // Unique-id synthesis (Pi google-generative-ai.ts:181-186): mint a new id when absent or a dup.
     let dup = provided_id
         .map(|pid| {
-            dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(tc) if tc.id.as_str() == pid))
+            dec.blocks
+                .iter()
+                .any(|b| matches!(b, Content::ToolCall(tc) if tc.id.as_str() == pid))
         })
         .unwrap_or(false);
     let tool_call_id = match provided_id {
@@ -932,8 +1042,10 @@ async fn process_function_call(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let thought_signature =
-        part.get("thoughtSignature").and_then(Value::as_str).map(str::to_string);
+    let thought_signature = part
+        .get("thoughtSignature")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let tool_call = ToolCall {
         id: ToolCallId::from(tool_call_id.as_str()),
@@ -946,17 +1058,35 @@ async fn process_function_call(
     let idx = dec.block_index();
 
     let partial = dec.snapshot(model, api);
-    if !sink.send(StreamEvent::ToolCallStart { content_index: idx, partial }).await {
+    if !sink
+        .send(StreamEvent::ToolCallStart {
+            content_index: idx,
+            partial,
+        })
+        .await
+    {
         return false;
     }
     let delta = serde_json::to_string(&Value::Object(tool_call.arguments.clone()))
         .unwrap_or_else(|_| "{}".to_string());
     let partial = dec.snapshot(model, api);
-    if !sink.send(StreamEvent::ToolCallDelta { content_index: idx, delta, partial }).await {
+    if !sink
+        .send(StreamEvent::ToolCallDelta {
+            content_index: idx,
+            delta,
+            partial,
+        })
+        .await
+    {
         return false;
     }
     let partial = dec.snapshot(model, api);
-    sink.send(StreamEvent::ToolCallEnd { content_index: idx, tool_call, partial }).await
+    sink.send(StreamEvent::ToolCallEnd {
+        content_index: idx,
+        tool_call,
+        partial,
+    })
+    .await
 }
 
 /// Emit the `*_end` for the in-progress text/thinking block, if any (Pi google-generative-ai.ts:106-122).
@@ -967,11 +1097,17 @@ async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId, sink: &Eve
     let idx = dec.block_index();
     let partial = dec.snapshot(model, api);
     let ev = match (kind, dec.blocks.get(idx)) {
-        (CurrentKind::Text, Some(Content::Text { text, .. })) => {
-            StreamEvent::TextEnd { content_index: idx, content: text.clone(), partial }
-        }
+        (CurrentKind::Text, Some(Content::Text { text, .. })) => StreamEvent::TextEnd {
+            content_index: idx,
+            content: text.clone(),
+            partial,
+        },
         (CurrentKind::Thinking, Some(Content::Thinking { thinking, .. })) => {
-            StreamEvent::ThinkingEnd { content_index: idx, content: thinking.clone(), partial }
+            StreamEvent::ThinkingEnd {
+                content_index: idx,
+                content: thinking.clone(),
+                partial,
+            }
         }
         _ => return true,
     };
@@ -989,11 +1125,26 @@ fn retain_signature(_existing: Option<&str>, incoming: Option<&str>) -> Option<S
 
 /// Apply Gemini `usageMetadata` (Pi google-generative-ai.ts:216-235).
 fn apply_usage(usage: &mut Usage, meta: &Value) {
-    let prompt = meta.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let cached = meta.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let candidates = meta.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let thoughts = meta.get("thoughtsTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let total = meta.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0);
+    let prompt = meta
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = meta
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let candidates = meta
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let thoughts = meta
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = meta
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
     usage.input = prompt.saturating_sub(cached);
     usage.output = candidates + thoughts;
@@ -1021,7 +1172,12 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::channel;
@@ -1038,7 +1194,12 @@ mod tests {
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             reasoning,
             input: vec![Modality::Text, Modality::Image],
-            cost: ModelCost { input: 0.3, output: 2.5, cache_read: 0.03, cache_write: 0.0 },
+            cost: ModelCost {
+                input: 0.3,
+                output: 2.5,
+                cache_read: 0.03,
+                cache_write: 0.0,
+            },
             context_window: 1_048_576,
             max_tokens: 65_536,
             thinking_level_map: None,
@@ -1050,7 +1211,10 @@ mod tests {
     fn user_ctx(text: &str) -> Context {
         Context {
             system_prompt: Some("be brief".to_string()),
-            messages: vec![Message::User { content: vec![Content::text(text)], timestamp: 0 }],
+            messages: vec![Message::User {
+                content: vec![Content::text(text)],
+                timestamp: 0,
+            }],
             tools: Vec::new(),
         }
     }
@@ -1058,7 +1222,10 @@ mod tests {
     #[test]
     fn url_appends_streaming_endpoint() {
         assert_eq!(
-            stream_url("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro"),
+            stream_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-2.5-pro"
+            ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
         assert_eq!(
@@ -1072,11 +1239,17 @@ mod tests {
         let m = model_with("gemini-2.0-flash", false);
         let headers = build_headers(&m, &StreamOptions::default(), "test-key");
         assert_eq!(
-            headers.get("x-goog-api-key").and_then(|v| v.clone()).as_deref(),
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.clone())
+                .as_deref(),
             Some("test-key")
         );
         assert_eq!(
-            headers.get("content-type").and_then(|v| v.clone()).as_deref(),
+            headers
+                .get("content-type")
+                .and_then(|v| v.clone())
+                .as_deref(),
             Some("application/json")
         );
     }
@@ -1084,7 +1257,11 @@ mod tests {
     #[test]
     fn build_params_basic_shape() {
         let m = model_with("gemini-2.0-flash", false);
-        let opts = StreamOptions { max_tokens: Some(1000), temperature: Some(0.4), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(1000),
+            temperature: Some(0.4),
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("hello"), &opts);
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
@@ -1098,7 +1275,10 @@ mod tests {
     #[test]
     fn thinking_budget_for_gemini_2_5() {
         let m = model_with("gemini-2.5-pro", true);
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("think"), &opts);
         let tc = &body["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], true);
@@ -1109,7 +1289,10 @@ mod tests {
     #[test]
     fn thinking_level_for_gemini_3_pro() {
         let m = model_with("gemini-3-pro-preview", true);
-        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_body(&m, &user_ctx("think"), &opts);
         let tc = &body["generationConfig"]["thinkingConfig"];
         assert_eq!(tc["includeThoughts"], true);
@@ -1122,11 +1305,17 @@ mod tests {
         // Gemini 2.x reasoning model with reasoning off → thinkingBudget: 0.
         let m = model_with("gemini-2.5-flash", true);
         let body = build_body(&m, &user_ctx("x"), &StreamOptions::default());
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
         // Gemini 3 pro reasoning model with reasoning off → thinkingLevel: LOW.
         let m3 = model_with("gemini-3-pro-preview", true);
         let body = build_body(&m3, &user_ctx("x"), &StreamOptions::default());
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
+        );
     }
 
     #[test]
@@ -1138,11 +1327,17 @@ mod tests {
             parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
         }];
         let m = model_with("gemini-2.0-flash", false);
-        let opts = StreamOptions { tool_choice: Some(ToolChoice::Required), ..Default::default() };
+        let opts = StreamOptions {
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
         let body = build_body(&m, &ctx, &opts);
         let decl = &body["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], "read");
-        assert_eq!(decl["parametersJsonSchema"]["properties"]["path"]["type"], "string");
+        assert_eq!(
+            decl["parametersJsonSchema"]["properties"]["path"]["type"],
+            "string"
+        );
         assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 
@@ -1151,12 +1346,17 @@ mod tests {
         assert!(is_gemini3_pro(&model_with("gemini-3-pro-preview", true)));
         assert!(is_gemini3_pro(&model_with("gemini-3.1-pro", true)));
         assert!(!is_gemini3_pro(&model_with("gemini-2.5-pro", true)));
-        assert!(is_gemini3_flash(&model_with("gemini-3-flash-preview", true)));
+        assert!(is_gemini3_flash(&model_with(
+            "gemini-3-flash-preview",
+            true
+        )));
         assert!(is_gemini3_flash(&model_with("gemini-flash-latest", true)));
         assert!(is_gemma4(&model_with("gemma-4-2b", true)));
         assert_eq!(gemini_major_version("gemini-2.5-pro"), Some(2));
         assert_eq!(gemini_major_version("gemini-3-pro-preview"), Some(3));
-        assert!(supports_multimodal_function_response("gemini-3-pro-preview"));
+        assert!(supports_multimodal_function_response(
+            "gemini-3-pro-preview"
+        ));
         assert!(!supports_multimodal_function_response("gemini-2.5-pro"));
         assert!(supports_multimodal_function_response("claude-opus-4-5"));
     }
@@ -1167,7 +1367,10 @@ mod tests {
         let ctx = Context {
             system_prompt: None,
             messages: vec![
-                Message::User { content: vec![Content::text("hi")], timestamp: 0 },
+                Message::User {
+                    content: vec![Content::text("hi")],
+                    timestamp: 0,
+                },
                 Message::ToolResult {
                     tool_call_id: cyrup_core::ToolCallId::from("c1"),
                     tool_name: "read".to_string(),
@@ -1221,12 +1424,14 @@ mod tests {
         let events = collect(raw.as_bytes().to_vec(), &m).await;
 
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "reasoning")));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello")));
+        assert!(events.iter().any(
+            |e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "reasoning")
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello"))
+        );
         let tool = events
             .iter()
             .find_map(|e| match e {
@@ -1235,7 +1440,10 @@ mod tests {
             })
             .expect("toolcall_end");
         assert_eq!(tool.name, "read");
-        assert_eq!(tool.arguments.get("path").and_then(Value::as_str), Some("a"));
+        assert_eq!(
+            tool.arguments.get("path").and_then(Value::as_str),
+            Some("a")
+        );
 
         let msg = events
             .iter()
@@ -1272,7 +1480,11 @@ mod tests {
             })
             .expect("toolcall_end");
         // Synthesized id is `{name}_{millis}_{counter}`.
-        assert!(tool.id.as_str().starts_with("ping_"), "got: {}", tool.id.as_str());
+        assert!(
+            tool.id.as_str().starts_with("ping_"),
+            "got: {}",
+            tool.id.as_str()
+        );
     }
 
     #[test]

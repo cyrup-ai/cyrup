@@ -17,6 +17,7 @@
 //! overrides (Pi `AzureOpenAIResponsesOptions`) are part of the typed per-API options downcast
 //! surface (gap #11) and are not reachable through the unified `StreamOptions`.
 
+use crate::HeaderMap;
 use crate::api::compat::{
     clamp_openai_prompt_cache_key, mapped_effort_or, off_is_not_null, off_value_or,
     thinking_level_key,
@@ -31,11 +32,10 @@ use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{build_client, open_sse, SseRequest};
 use crate::stream::StreamOptions;
-use crate::HeaderMap;
+use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -46,10 +46,31 @@ const API_ID: &str = "azure-openai-responses";
 /// azure-openai-responses.ts:19).
 const DEFAULT_AZURE_API_VERSION: &str = "v1";
 
+/// Per-API typed options for the `azure-openai-responses` wire protocol (Pi
+/// `AzureOpenAIResponsesOptions`, azure-openai-responses.ts:52-59). Each per-request override wins
+/// over the corresponding `AZURE_OPENAI_*` provider-env value. Carried via
+/// [`StreamOptions::api_options`](crate::StreamOptions::api_options); all fields default to `None`
+/// (env-only resolution, unchanged behavior).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AzureOpenAiResponsesOptions {
+    /// Pi `azureApiVersion` (azure-openai-responses.ts:55) — wins over `AZURE_OPENAI_API_VERSION`.
+    pub azure_api_version: Option<String>,
+    /// Pi `azureResourceName` (azure-openai-responses.ts:56) — wins over `AZURE_OPENAI_RESOURCE_NAME`.
+    pub azure_resource_name: Option<String>,
+    /// Pi `azureBaseUrl` (azure-openai-responses.ts:57) — wins over `AZURE_OPENAI_BASE_URL`.
+    pub azure_base_url: Option<String>,
+    /// Pi `azureDeploymentName` (azure-openai-responses.ts:58) — wins over the deployment-name map.
+    pub azure_deployment_name: Option<String>,
+}
+
 /// Providers whose tool-call ids carry the `call_id|item_id` Responses shape (Pi
 /// `AZURE_TOOL_CALL_PROVIDERS`, azure-openai-responses.ts:20).
-const AZURE_TOOL_CALL_PROVIDERS: &[&str] =
-    &["openai", "openai-codex", "opencode", "azure-openai-responses"];
+const AZURE_TOOL_CALL_PROVIDERS: &[&str] = &[
+    "openai",
+    "openai-codex",
+    "opencode",
+    "azure-openai-responses",
+];
 
 /// The `ApiImpl` for `"azure-openai-responses"`.
 pub struct AzureOpenAiResponsesApi {
@@ -58,7 +79,9 @@ pub struct AzureOpenAiResponsesApi {
 
 impl Default for AzureOpenAiResponsesApi {
     fn default() -> Self {
-        Self { api: ApiId::from(API_ID) }
+        Self {
+            api: ApiId::from(API_ID),
+        }
     }
 }
 
@@ -94,30 +117,46 @@ impl ApiImpl for AzureOpenAiResponsesApi {
 
         // No api key → Pi `throw new Error("No API key for provider: …")`.
         let Some(api_key) = auth.auth.api_key.clone() else {
-            let e =
-                ProviderError::Transport(format!("No API key for provider: {provider}").into());
-            sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+            let e = ProviderError::Transport(format!("No API key for provider: {provider}").into());
+            sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                .await;
             return;
         };
 
-        // resolveAzureConfig → base URL + api version (env-driven), then the `/responses` endpoint.
-        let url = match resolve_request_url(model, env) {
+        let azure = opts.azure_openai_responses_options();
+        // resolveAzureConfig → base URL + api version (option override → env), then `/responses`.
+        let url = match resolve_request_url(model, env, azure) {
             Ok(url) => url,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
 
-        let deployment = resolve_deployment_name(model, env);
+        let deployment = resolve_deployment_name(model, env, azure);
         let body = build_params(model, ctx, opts, &deployment);
         let headers = build_headers(model, opts, &api_key);
-        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+        let req = SseRequest {
+            method: reqwest::Method::POST,
+            url,
+            headers,
+            body: Some(body),
+        };
 
-        let client = match build_client() {
+        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
+        // node-http-proxy.ts:92-112).
+        let client = match build_client_for_target(
+            &req.url,
+            &crate::auth::types::EnvAuthContext,
+            auth.env.as_ref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -125,7 +164,8 @@ impl ApiImpl for AzureOpenAiResponsesApi {
         let frames = match open_sse(&client, req, cancel, None, None).await {
             Ok(s) => s,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                    .await;
                 return;
             }
         };
@@ -160,10 +200,20 @@ fn parse_deployment_name_map(value: Option<&str>) -> BTreeMap<String, String> {
     map
 }
 
-/// 1:1 port of Pi `resolveDeploymentName` (azure-openai-responses.ts:35-43): the
-/// `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` mapping for this model id, else the model id itself. (The
-/// per-request `azureDeploymentName` override is part of the typed-options surface, gap #11.)
-fn resolve_deployment_name(model: &Model, env: Option<&ProviderEnv>) -> String {
+/// 1:1 port of Pi `resolveDeploymentName` (azure-openai-responses.ts:37-44): the per-request
+/// `azureDeploymentName` override wins; else the `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` mapping for this
+/// model id, else the model id itself.
+fn resolve_deployment_name(
+    model: &Model,
+    env: Option<&ProviderEnv>,
+    azure: Option<&AzureOpenAiResponsesOptions>,
+) -> String {
+    if let Some(name) = azure
+        .and_then(|o| o.azure_deployment_name.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
     let map = parse_deployment_name_map(
         provider_env_value("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", env).as_deref(),
     );
@@ -205,23 +255,41 @@ fn normalize_azure_base_url(base_url: &str) -> Result<String, ProviderError> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-/// 1:1 port of Pi `resolveAzureConfig` (azure-openai-responses.ts:206-249): resolve the
-/// (normalized base URL, api version) from `AZURE_OPENAI_BASE_URL` → `AZURE_OPENAI_RESOURCE_NAME` →
-/// `model.baseUrl`, erroring when none is configured.
+/// 1:1 port of Pi `resolveAzureConfig` (azure-openai-responses.ts:198-249): resolve the
+/// (normalized base URL, api version). Each per-request override (`azureApiVersion`/`azureBaseUrl`/
+/// `azureResourceName`) wins over its `AZURE_OPENAI_*` env value; the base URL then falls back to
+/// `AZURE_OPENAI_RESOURCE_NAME`/`azureResourceName` → `model.baseUrl`, erroring when none is set.
 fn resolve_azure_config(
     model: &Model,
     env: Option<&ProviderEnv>,
+    azure: Option<&AzureOpenAiResponsesOptions>,
 ) -> Result<(String, String), ProviderError> {
-    let api_version = provider_env_value("AZURE_OPENAI_API_VERSION", env)
+    // `options?.azureApiVersion || env || DEFAULT` (empty string is falsy in Pi's `||`).
+    let api_version = azure
+        .and_then(|o| o.azure_api_version.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| provider_env_value("AZURE_OPENAI_API_VERSION", env))
         .unwrap_or_else(|| DEFAULT_AZURE_API_VERSION.to_string());
 
-    let mut resolved = provider_env_value("AZURE_OPENAI_BASE_URL", env)
+    // `options?.azureBaseUrl?.trim() || env?.trim() || undefined`.
+    let mut resolved = azure
+        .and_then(|o| o.azure_base_url.as_ref())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            provider_env_value("AZURE_OPENAI_BASE_URL", env)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    // `options?.azureResourceName || env`.
+    let resource_name = azure
+        .and_then(|o| o.azure_resource_name.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| provider_env_value("AZURE_OPENAI_RESOURCE_NAME", env));
 
     if resolved.is_none()
-        && let Some(resource) = provider_env_value("AZURE_OPENAI_RESOURCE_NAME", env)
-            .filter(|s| !s.is_empty())
+        && let Some(resource) = resource_name.filter(|s| !s.is_empty())
     {
         resolved = Some(build_default_base_url(&resource));
     }
@@ -245,8 +313,12 @@ fn resolve_azure_config(
 
 /// The `POST` target: `{normalizedBaseUrl}/responses?api-version=<ver>` (the AzureOpenAI SDK's
 /// `responses.create` route on the `/openai/v1` base).
-fn resolve_request_url(model: &Model, env: Option<&ProviderEnv>) -> Result<String, ProviderError> {
-    let (base, api_version) = resolve_azure_config(model, env)?;
+fn resolve_request_url(
+    model: &Model,
+    env: Option<&ProviderEnv>,
+    azure: Option<&AzureOpenAiResponsesOptions>,
+) -> Result<String, ProviderError> {
+    let (base, api_version) = resolve_azure_config(model, env, azure)?;
     Ok(format!("{base}/responses?api-version={api_version}"))
 }
 
@@ -288,7 +360,10 @@ pub(crate) fn build_params(
     }
 
     if !ctx.tools.is_empty() {
-        obj.insert("tools".to_string(), Value::Array(convert_responses_tools(&ctx.tools)));
+        obj.insert(
+            "tools".to_string(),
+            Value::Array(convert_responses_tools(&ctx.tools)),
+        );
     }
 
     if model.reasoning {
@@ -299,8 +374,14 @@ pub(crate) fn build_params(
         if clamped != ModelThinkingLevel::Off {
             let key = thinking_level_key(clamped);
             let effort = mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key);
-            obj.insert("reasoning".to_string(), json!({ "effort": effort, "summary": "auto" }));
-            obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+            obj.insert(
+                "reasoning".to_string(),
+                json!({ "effort": effort, "summary": "auto" }),
+            );
+            obj.insert(
+                "include".to_string(),
+                json!(["reasoning.encrypted_content"]),
+            );
         } else if off_is_not_null(model.thinking_level_map.as_ref()) {
             let effort = off_value_or(model.thinking_level_map.as_ref(), "none");
             obj.insert("reasoning".to_string(), json!({ "effort": effort }));
@@ -332,7 +413,12 @@ fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) -> HeaderMa
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::model::{Modality, ModelCost};
@@ -357,7 +443,10 @@ mod tests {
     }
 
     fn env(pairs: &[(&str, &str)]) -> ProviderEnv {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -369,10 +458,30 @@ mod tests {
 
         let m = azure_model("gpt-4", false);
         let e = env(&[("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "gpt-4=my-deploy")]);
-        assert_eq!(resolve_deployment_name(&m, Some(&e)), "my-deploy");
+        assert_eq!(resolve_deployment_name(&m, Some(&e), None), "my-deploy");
         // Unmapped model id falls back to the id itself.
         let m2 = azure_model("gpt-5", false);
-        assert_eq!(resolve_deployment_name(&m2, Some(&e)), "gpt-5");
+        assert_eq!(resolve_deployment_name(&m2, Some(&e), None), "gpt-5");
+
+        // Per-request `azureDeploymentName` override wins over the env map (Pi line 38-39).
+        let opt = AzureOpenAiResponsesOptions {
+            azure_deployment_name: Some("override-dep".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_deployment_name(&m, Some(&e), Some(&opt)),
+            "override-dep"
+        );
+        // An empty-string override is falsy (Pi `if (options?.azureDeploymentName)`) and falls back
+        // to the env map.
+        let empty = AzureOpenAiResponsesOptions {
+            azure_deployment_name: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_deployment_name(&m, Some(&e), Some(&empty)),
+            "my-deploy"
+        );
     }
 
     #[test]
@@ -389,8 +498,10 @@ mod tests {
         );
         // Full /openai/v1/responses path coerced back to the base.
         assert_eq!(
-            normalize_azure_base_url("https://my-res.cognitiveservices.azure.com/openai/v1/responses")
-                .unwrap(),
+            normalize_azure_base_url(
+                "https://my-res.cognitiveservices.azure.com/openai/v1/responses"
+            )
+            .unwrap(),
             "https://my-res.cognitiveservices.azure.com/openai/v1"
         );
         // Non-azure host: left as-is (trailing slash trimmed).
@@ -411,18 +522,45 @@ mod tests {
             ("AZURE_OPENAI_RESOURCE_NAME", "res"),
             ("AZURE_OPENAI_API_VERSION", "2025-01-01"),
         ]);
-        let (base, ver) = resolve_azure_config(&m, Some(&e)).unwrap();
+        let (base, ver) = resolve_azure_config(&m, Some(&e), None).unwrap();
         assert_eq!(base, "https://b.openai.azure.com/openai/v1");
         assert_eq!(ver, "2025-01-01");
 
         // Resource name builds the default base; default api version.
         let e2 = env(&[("AZURE_OPENAI_RESOURCE_NAME", "myres")]);
-        let (base2, ver2) = resolve_azure_config(&m, Some(&e2)).unwrap();
+        let (base2, ver2) = resolve_azure_config(&m, Some(&e2), None).unwrap();
         assert_eq!(base2, "https://myres.openai.azure.com/openai/v1");
         assert_eq!(ver2, DEFAULT_AZURE_API_VERSION);
 
         // Nothing configured (model.baseUrl is empty) → error.
-        assert!(resolve_azure_config(&m, Some(&env(&[]))).is_err());
+        assert!(resolve_azure_config(&m, Some(&env(&[])), None).is_err());
+    }
+
+    #[test]
+    fn resolve_config_per_request_overrides_win_over_env() {
+        // Each per-request override wins over its AZURE_OPENAI_* env value (Pi azure-openai-
+        // responses.ts:202-208).
+        let m = azure_model("gpt-4", false);
+        let e = env(&[
+            ("AZURE_OPENAI_BASE_URL", "https://env.openai.azure.com"),
+            ("AZURE_OPENAI_API_VERSION", "2024-env"),
+        ]);
+        let opt = AzureOpenAiResponsesOptions {
+            azure_base_url: Some("https://opt.openai.azure.com".to_string()),
+            azure_api_version: Some("2025-opt".to_string()),
+            ..Default::default()
+        };
+        let (base, ver) = resolve_azure_config(&m, Some(&e), Some(&opt)).unwrap();
+        assert_eq!(base, "https://opt.openai.azure.com/openai/v1");
+        assert_eq!(ver, "2025-opt");
+
+        // azureResourceName override builds the default base when no base URL is set anywhere.
+        let opt2 = AzureOpenAiResponsesOptions {
+            azure_resource_name: Some("optres".to_string()),
+            ..Default::default()
+        };
+        let (base2, _) = resolve_azure_config(&m, Some(&env(&[])), Some(&opt2)).unwrap();
+        assert_eq!(base2, "https://optres.openai.azure.com/openai/v1");
     }
 
     #[test]
@@ -430,7 +568,7 @@ mod tests {
         let m = azure_model("gpt-4", false);
         let e = env(&[("AZURE_OPENAI_RESOURCE_NAME", "res")]);
         assert_eq!(
-            resolve_request_url(&m, Some(&e)).unwrap(),
+            resolve_request_url(&m, Some(&e), None).unwrap(),
             "https://res.openai.azure.com/openai/v1/responses?api-version=v1"
         );
     }
@@ -445,28 +583,49 @@ mod tests {
             ..Default::default()
         };
         let body = build_params(&m, &ctx, &opts, "my-deployment");
-        assert_eq!(body.get("model").and_then(Value::as_str), Some("my-deployment"));
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("my-deployment")
+        );
         assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
-        assert_eq!(body.get("prompt_cache_key").and_then(Value::as_str), Some("sess-1"));
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(Value::as_str),
+            Some("sess-1")
+        );
         // Azure never sets prompt_cache_retention.
         assert!(body.get("prompt_cache_retention").is_none());
-        assert_eq!(body.get("max_output_tokens").and_then(Value::as_u64), Some(128));
+        assert_eq!(
+            body.get("max_output_tokens").and_then(Value::as_u64),
+            Some(128)
+        );
     }
 
     #[test]
     fn build_params_reasoning_effort_and_include() {
         let mut m = azure_model("o5", true);
         m.thinking_level_map = Some(
-            [("high".to_string(), Some("high".to_string()))].into_iter().collect(),
+            [("high".to_string(), Some("high".to_string()))]
+                .into_iter()
+                .collect(),
         );
-        let opts =
-            StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
         let body = build_params(&m, &Context::default(), &opts, "o5");
         let reasoning = body.get("reasoning").expect("reasoning");
-        assert_eq!(reasoning.get("effort").and_then(Value::as_str), Some("high"));
-        assert_eq!(reasoning.get("summary").and_then(Value::as_str), Some("auto"));
         assert_eq!(
-            body.get("include").and_then(Value::as_array).map(|a| a.len()),
+            reasoning.get("effort").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            reasoning.get("summary").and_then(Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            body.get("include")
+                .and_then(Value::as_array)
+                .map(|a| a.len()),
             Some(1)
         );
     }

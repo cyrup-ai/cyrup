@@ -106,7 +106,10 @@ fn last_assistant_usage_info(messages: &[Message]) -> Option<(&Usage, usize)> {
     for (i, message) in messages.iter().enumerate().rev() {
         if let Message::Assistant(assistant) = message {
             use cyrup_core::StopReason;
-            if matches!(assistant.stop_reason, StopReason::Aborted | StopReason::Error) {
+            if matches!(
+                assistant.stop_reason,
+                StopReason::Aborted | StopReason::Error
+            ) {
                 continue;
             }
             if calculate_context_tokens(&assistant.usage) > 0 {
@@ -137,7 +140,12 @@ fn estimate_messages(messages: &[Message]) -> ContextUsageEstimate {
     for message in messages {
         tokens += estimate_message_tokens(message);
     }
-    ContextUsageEstimate { tokens, usage_tokens: 0, trailing_tokens: tokens, last_usage_index: None }
+    ContextUsageEstimate {
+        tokens,
+        usage_tokens: 0,
+        trailing_tokens: tokens,
+        last_usage_index: None,
+    }
 }
 
 /// Estimate context tokens for a full [`Context`] (Pi `estimateContextTokens`, estimate.ts:94-111).
@@ -178,14 +186,22 @@ fn tools_to_json(tools: &[ToolDef]) -> serde_json::Value {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use cyrup_core::{AssistantMessage, ProviderId, StopReason, ToolCall, ToolCallId, Usage};
 
     fn user(text: &str) -> Message {
         Message::User {
-            content: vec![Content::Text { text: text.to_string(), text_signature: None }],
+            content: vec![Content::Text {
+                text: text.to_string(),
+                text_signature: None,
+            }],
             timestamp: 0,
         }
     }
@@ -194,16 +210,30 @@ mod tests {
         let mut m = AssistantMessage::errored(ProviderId::from("p"), "m", None, stop, "");
         m.error_message = None;
         m.usage = usage;
-        m.content = vec![Content::Text { text: "hello world".into(), text_signature: None }];
+        m.content = vec![Content::Text {
+            text: "hello world".into(),
+            text_signature: None,
+        }];
         Message::Assistant(m)
     }
 
     #[test]
     fn calculate_context_tokens_prefers_total_else_sums() {
-        let with_total = Usage { total_tokens: 100, input: 1, output: 2, ..Usage::default() };
+        let with_total = Usage {
+            total_tokens: 100,
+            input: 1,
+            output: 2,
+            ..Usage::default()
+        };
         assert_eq!(calculate_context_tokens(&with_total), 100);
-        let no_total =
-            Usage { total_tokens: 0, input: 10, output: 20, cache_read: 5, cache_write: 5, ..Usage::default() };
+        let no_total = Usage {
+            total_tokens: 0,
+            input: 10,
+            output: 20,
+            cache_read: 5,
+            cache_write: 5,
+            ..Usage::default()
+        };
         assert_eq!(calculate_context_tokens(&no_total), 40);
     }
 
@@ -216,8 +246,10 @@ mod tests {
 
     #[test]
     fn image_block_counts_estimated_chars() {
-        let content =
-            vec![Content::Image { data: "x".into(), mime_type: "image/png".into() }];
+        let content = vec![Content::Image {
+            data: "x".into(),
+            mime_type: "image/png".into(),
+        }];
         // ceil(4800/4) = 1200
         assert_eq!(estimate_text_and_image_content_tokens(&content), 1200);
     }
@@ -226,7 +258,8 @@ mod tests {
     fn assistant_toolcall_counts_name_plus_args_json() {
         let mut args = serde_json::Map::new();
         args.insert("path".into(), serde_json::Value::String("a.txt".into()));
-        let mut m = AssistantMessage::errored(ProviderId::from("p"), "m", None, StopReason::Stop, "");
+        let mut m =
+            AssistantMessage::errored(ProviderId::from("p"), "m", None, StopReason::Stop, "");
         m.error_message = None;
         m.content = vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from("t1"),
@@ -241,10 +274,17 @@ mod tests {
 
     #[test]
     fn context_estimate_uses_last_assistant_usage_and_skips_prefix() {
-        let usage = Usage { total_tokens: 500, ..Usage::default() };
+        let usage = Usage {
+            total_tokens: 500,
+            ..Usage::default()
+        };
         let ctx = Context {
             system_prompt: Some("a very long system prompt".into()),
-            messages: vec![user("hi"), assistant_with_usage(usage, StopReason::Stop), user("again")],
+            messages: vec![
+                user("hi"),
+                assistant_with_usage(usage, StopReason::Stop),
+                user("again"),
+            ],
             tools: Vec::new(),
         };
         let est = estimate_context_tokens(&ctx);
@@ -265,12 +305,18 @@ mod tests {
         let est = estimate_context_tokens(&ctx);
         assert_eq!(est.last_usage_index, None);
         // tokens = msg("hello") + prefix("sys")
-        assert_eq!(est.tokens, estimate_text_tokens("hello") + estimate_text_tokens("sys"));
+        assert_eq!(
+            est.tokens,
+            estimate_text_tokens("hello") + estimate_text_tokens("sys")
+        );
     }
 
     #[test]
     fn aborted_assistant_usage_is_skipped() {
-        let usage = Usage { total_tokens: 999, ..Usage::default() };
+        let usage = Usage {
+            total_tokens: 999,
+            ..Usage::default()
+        };
         let ctx = Context {
             system_prompt: None,
             messages: vec![assistant_with_usage(usage, StopReason::Aborted), user("hi")],

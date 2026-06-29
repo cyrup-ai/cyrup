@@ -7,8 +7,8 @@
 //! Mirrors `providers/{ant-ling,cerebras,deepseek,groq,huggingface,moonshotai,moonshotai-cn,nvidia,
 //! openrouter,xai,xiaomi,xiaomi-token-plan-*,zai,zai-coding-cn}.ts` + their `.models.ts` catalogs.
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -78,12 +78,22 @@ impl FleetSpec {
         store: Arc<dyn CredentialStore>,
         registry: Arc<ApiRegistry>,
     ) -> WireProvider {
-        WireProvider::new(self.id, self.name, self.models(), self.auth(), store, registry)
+        WireProvider::new(
+            self.id,
+            self.name,
+            self.models(),
+            self.auth(),
+            store,
+            registry,
+        )
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
     pub fn provider(&self) -> WireProvider {
-        self.provider_with(Arc::new(InMemoryCredentialStore::new()), Arc::new(builtin_registry()))
+        self.provider_with(
+            Arc::new(InMemoryCredentialStore::new()),
+            Arc::new(builtin_registry()),
+        )
     }
 }
 
@@ -98,11 +108,19 @@ pub fn fleet_providers_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
 ) -> Vec<WireProvider> {
-    FLEET.iter().map(|s| s.provider_with(store.clone(), registry.clone())).collect()
+    FLEET
+        .iter()
+        .map(|s| s.provider_with(store.clone(), registry.clone()))
+        .collect()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::openai_completions::build_body;
@@ -140,10 +158,19 @@ mod tests {
             let models = spec.models();
             assert_eq!(models.len(), *count, "catalog count mismatch for {id}");
             // Every model is openai-completions and tagged with the provider id.
-            assert!(models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS), "{id} api");
-            assert!(models.iter().all(|m| m.provider.as_str() == *id), "{id} provider tag");
+            assert!(
+                models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS),
+                "{id} api"
+            );
+            assert!(
+                models.iter().all(|m| m.provider.as_str() == *id),
+                "{id} provider tag"
+            );
             // baseUrl is always present in the generated catalog.
-            assert!(models.iter().all(|m| !m.base_url.is_empty()), "{id} baseUrl");
+            assert!(
+                models.iter().all(|m| !m.base_url.is_empty()),
+                "{id} baseUrl"
+            );
         }
     }
 
@@ -163,13 +190,19 @@ mod tests {
         // DeepSeek models carry the deepseek thinking format + a thinkingLevelMap (high->"high",
         // xhigh->"max"), proving the catalog's compat + thinkingLevelMap deserialize 1:1.
         let models = DEEPSEEK.models();
-        let m = models.iter().find(|m| m.id.as_str() == "deepseek-v4-pro").expect("v4-pro");
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "deepseek-v4-pro")
+            .expect("v4-pro");
         let compat = m.compat.as_ref().expect("compat");
         assert_eq!(
             compat.thinking_format,
             Some(crate::api::compat::ThinkingFormat::Deepseek)
         );
-        assert_eq!(compat.requires_reasoning_content_on_assistant_messages, Some(true));
+        assert_eq!(
+            compat.requires_reasoning_content_on_assistant_messages,
+            Some(true)
+        );
         let map = m.thinking_level_map.as_ref().expect("map");
         assert_eq!(map.get("high"), Some(&Some("high".to_string())));
         assert_eq!(map.get("xhigh"), Some(&Some("max".to_string())));
@@ -185,14 +218,20 @@ mod tests {
             ..Default::default()
         };
         let cerebras = CEREBRAS.models();
-        let gpt = cerebras.iter().find(|m| m.id.as_str() == "gpt-oss-120b").expect("gpt-oss");
+        let gpt = cerebras
+            .iter()
+            .find(|m| m.id.as_str() == "gpt-oss-120b")
+            .expect("gpt-oss");
         let body = build_body(gpt, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "high");
 
         // A deepseek model (deepseek thinking format) maps high->"high" via thinkingLevelMap and
         // sends reasoning_effort (deepseek supports it) — proving catalog compat reaches the encoder.
         let ds = DEEPSEEK.models();
-        let m = ds.iter().find(|m| m.id.as_str() == "deepseek-v4-pro").expect("v4-pro");
+        let m = ds
+            .iter()
+            .find(|m| m.id.as_str() == "deepseek-v4-pro")
+            .expect("v4-pro");
         let body = build_body(m, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "high");
     }

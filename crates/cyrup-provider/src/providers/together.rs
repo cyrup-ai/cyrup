@@ -3,8 +3,8 @@
 //! catalog. Mirrors Pi's `providers/together.ts` + `together.models.ts`.
 
 use crate::api::compat::{MaxTokensField, OpenAiCompletionsCompat, ThinkingFormat};
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::known_api::OPENAI_COMPLETIONS;
 use crate::model::{Modality, Model, ModelCost, ThinkingLevelMap};
 use crate::wire::WireProvider;
@@ -21,12 +21,20 @@ pub const TOGETHER_API_KEY_ENV: &str = "TOGETHER_API_KEY";
 
 /// USD-per-1e6-token cost (Together never reports a separate cache-write price).
 fn cost(input: f64, output: f64, cache_read: f64) -> ModelCost {
-    ModelCost { input, output, cache_read, cache_write: 0.0 }
+    ModelCost {
+        input,
+        output,
+        cache_read,
+        cache_write: 0.0,
+    }
 }
 
 /// Build a `thinkingLevelMap` from `(level, Some(value) | None)` pairs (Pi `ThinkingLevelMap`).
 fn level_map(pairs: &[(&str, Option<&str>)]) -> ThinkingLevelMap {
-    pairs.iter().map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string()))).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string())))
+        .collect()
 }
 
 /// The Together compat block shared by every catalog entry (Pi `together.models.ts` `compat`):
@@ -345,13 +353,18 @@ pub fn together_provider() -> WireProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::auth::types::AuthContext;
     use crate::context::Context;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::StopReason;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -386,7 +399,10 @@ mod tests {
         // Every model id present in Pi's `together.models.ts` (19 entries).
         assert_eq!(models.len(), 19);
         let find = |id: &str| {
-            models.iter().find(|m| m.id.as_str() == id).unwrap_or_else(|| panic!("missing {id}"))
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
         };
 
         // gpt-oss: openai thinking format + reasoning_effort supported.
@@ -402,7 +418,10 @@ mod tests {
         let dc = ds.compat.as_ref().unwrap();
         assert_eq!(dc.thinking_format, Some(ThinkingFormat::Together));
         assert_eq!(dc.supports_reasoning_effort, Some(true));
-        assert_eq!(ds.thinking_level_map.as_ref().unwrap().get("high"), Some(&Some("high".to_string())));
+        assert_eq!(
+            ds.thinking_level_map.as_ref().unwrap().get("high"),
+            Some(&Some("high".to_string()))
+        );
         assert_eq!(ds.context_window, 512_000);
         assert_eq!(ds.max_tokens, 384_000);
 
@@ -417,7 +436,11 @@ mod tests {
         assert_eq!(m3.max_tokens, 250_000);
 
         // Standard together models: store/developer/strict/long-cache all off; max_tokens field.
-        for id in ["zai-org/GLM-5.1", "moonshotai/Kimi-K2.6", "Qwen/Qwen3.6-Plus"] {
+        for id in [
+            "zai-org/GLM-5.1",
+            "moonshotai/Kimi-K2.6",
+            "Qwen/Qwen3.6-Plus",
+        ] {
             let c = find(id).compat.as_ref().unwrap();
             assert_eq!(c.supports_store, Some(false));
             assert_eq!(c.supports_developer_role, Some(false));
@@ -434,11 +457,17 @@ mod tests {
         use crate::context::Context;
         use cyrup_core::ModelThinkingLevel;
         let models = together_models();
-        let opts =
-            StreamOptions { reasoning: ModelThinkingLevel::High, max_tokens: Some(50), ..Default::default() };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            max_tokens: Some(50),
+            ..Default::default()
+        };
 
         // A `together` thinkingFormat model => reasoning: { enabled }, never reasoning_effort.
-        let glm = models.iter().find(|m| m.id.as_str() == "zai-org/GLM-5").unwrap();
+        let glm = models
+            .iter()
+            .find(|m| m.id.as_str() == "zai-org/GLM-5")
+            .unwrap();
         let body = build_body(glm, &Context::default(), &opts);
         assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
         assert!(body.get("reasoning_effort").is_none());
@@ -446,14 +475,20 @@ mod tests {
         assert!(body.get("max_completion_tokens").is_none());
 
         // gpt-oss (openai format + reasoning_effort) => reasoning_effort, no reasoning object.
-        let gpt = models.iter().find(|m| m.id.as_str() == "openai/gpt-oss-120b").unwrap();
+        let gpt = models
+            .iter()
+            .find(|m| m.id.as_str() == "openai/gpt-oss-120b")
+            .unwrap();
         let body = build_body(gpt, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("reasoning").is_none());
 
         // DeepSeek (together format + reasoning_effort supported) => BOTH reasoning.enabled and
         // reasoning_effort mapped via thinkingLevelMap (high -> "high").
-        let ds = models.iter().find(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro").unwrap();
+        let ds = models
+            .iter()
+            .find(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro")
+            .unwrap();
         let body = build_body(ds, &Context::default(), &opts);
         assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
         assert_eq!(body["reasoning_effort"], "high");
@@ -505,8 +540,14 @@ mod tests {
         // Auth resolved (no "not configured"); failure is a transport error terminal.
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// Live smoke test against the real Together API. Ignored by default; run with
@@ -556,6 +597,10 @@ mod tests {
             Content::Thinking { thinking, .. } => !thinking.trim().is_empty(),
             _ => false,
         });
-        assert!(has_content, "expected non-empty assistant content, got: {:?}", msg.content);
+        assert!(
+            has_content,
+            "expected non-empty assistant content, got: {:?}",
+            msg.content
+        );
     }
 }

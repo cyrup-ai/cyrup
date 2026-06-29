@@ -9,8 +9,8 @@
 //! subsystem is tracked as a separate blocker (it needs a local callback HTTP server + PKCE) — the
 //! resolution path (explicit → stored → env) is fully wired here.
 
-use crate::api::{builtin_registry, ApiRegistry};
-use crate::auth::{env_key, CredentialStore, InMemoryCredentialStore, ProviderAuth};
+use crate::api::{ApiRegistry, builtin_registry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
@@ -119,12 +119,22 @@ impl AnthropicFleetSpec {
         store: Arc<dyn CredentialStore>,
         registry: Arc<ApiRegistry>,
     ) -> WireProvider {
-        WireProvider::new(self.id, self.name, self.models(), self.auth(), store, registry)
+        WireProvider::new(
+            self.id,
+            self.name,
+            self.models(),
+            self.auth(),
+            store,
+            registry,
+        )
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
     pub fn provider(&self) -> WireProvider {
-        self.provider_with(Arc::new(InMemoryCredentialStore::new()), Arc::new(builtin_registry()))
+        self.provider_with(
+            Arc::new(InMemoryCredentialStore::new()),
+            Arc::new(builtin_registry()),
+        )
     }
 }
 
@@ -138,11 +148,19 @@ pub fn anthropic_fleet_providers_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
 ) -> Vec<WireProvider> {
-    ANTHROPIC_FLEET.iter().map(|s| s.provider_with(store.clone(), registry.clone())).collect()
+    ANTHROPIC_FLEET
+        .iter()
+        .map(|s| s.provider_with(store.clone(), registry.clone()))
+        .collect()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::api::compat::ModelCompat;
@@ -150,7 +168,7 @@ mod tests {
     use crate::context::Context;
     use crate::known_api::ANTHROPIC_MESSAGES;
     use crate::provider::Provider;
-    use crate::stream::{collect_message, StreamOptions};
+    use crate::stream::{StreamOptions, collect_message};
     use cyrup_core::StopReason;
     use std::collections::BTreeMap;
 
@@ -181,7 +199,10 @@ mod tests {
     fn flagship_compat_and_thinking_map_deserialize() {
         let models = anthropic_models();
         let find = |id: &str| {
-            models.iter().find(|m| m.id.as_str() == id).unwrap_or_else(|| panic!("missing {id}"))
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
         };
 
         // Opus 4.7: adaptive thinking + temperature unsupported + xhigh->xhigh map.
@@ -190,15 +211,27 @@ mod tests {
         assert_eq!(c.force_adaptive_thinking, Some(true));
         assert_eq!(c.supports_temperature, Some(false));
         assert_eq!(
-            opus47.thinking_level_map.as_ref().and_then(|m| m.get("xhigh")),
+            opus47
+                .thinking_level_map
+                .as_ref()
+                .and_then(|m| m.get("xhigh")),
             Some(&Some("xhigh".to_string()))
         );
 
         // Opus 4.6: adaptive + xhigh->"max".
         let opus46 = find("claude-opus-4-6");
-        assert_eq!(opus46.compat.as_ref().and_then(|c| c.force_adaptive_thinking), Some(true));
         assert_eq!(
-            opus46.thinking_level_map.as_ref().and_then(|m| m.get("xhigh")),
+            opus46
+                .compat
+                .as_ref()
+                .and_then(|c| c.force_adaptive_thinking),
+            Some(true)
+        );
+        assert_eq!(
+            opus46
+                .thinking_level_map
+                .as_ref()
+                .and_then(|m| m.get("xhigh")),
             Some(&Some("max".to_string()))
         );
 
@@ -233,9 +266,18 @@ mod tests {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));
             let models = spec.models();
             assert_eq!(models.len(), count, "catalog count mismatch for {id}");
-            assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES), "{id} api");
-            assert!(models.iter().all(|m| m.provider.as_str() == id), "{id} provider tag");
-            assert!(models.iter().all(|m| !m.base_url.is_empty()), "{id} baseUrl");
+            assert!(
+                models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES),
+                "{id} api"
+            );
+            assert!(
+                models.iter().all(|m| m.provider.as_str() == id),
+                "{id} provider tag"
+            );
+            assert!(
+                models.iter().all(|m| !m.base_url.is_empty()),
+                "{id} baseUrl"
+            );
             // Every fleet provider has an env-key mapping in env-api-keys.
             let vars = crate::env_api_keys::api_key_env_vars(id)
                 .unwrap_or_else(|| panic!("no env mapping for {id}"));
@@ -249,10 +291,13 @@ mod tests {
         // carries `forceAdaptiveThinking`/`supportsTemperature` — proving the union compat reaches
         // the anthropic-messages catalog path.
         let models = VERCEL_AI_GATEWAY.models();
-        let adaptive = models.iter().find(|m| {
-            m.compat.as_ref().and_then(|c| c.force_adaptive_thinking) == Some(true)
-        });
-        assert!(adaptive.is_some(), "expected at least one adaptive-thinking model");
+        let adaptive = models
+            .iter()
+            .find(|m| m.compat.as_ref().and_then(|c| c.force_adaptive_thinking) == Some(true));
+        assert!(
+            adaptive.is_some(),
+            "expected at least one adaptive-thinking model"
+        );
     }
 
     #[tokio::test]
@@ -294,8 +339,14 @@ mod tests {
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "auth should have resolved, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "auth should have resolved, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// Live smoke test against the real Anthropic API. Ignored by default; run with
@@ -318,10 +369,21 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let opts = StreamOptions { max_tokens: Some(64), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(64),
+            ..Default::default()
+        };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;
-        assert_ne!(msg.stop_reason, StopReason::Error, "got error: {:?}", msg.error_message);
-        let has_text = msg.content.iter().any(|c| matches!(c, Content::Text { text, .. } if !text.trim().is_empty()));
+        assert_ne!(
+            msg.stop_reason,
+            StopReason::Error,
+            "got error: {:?}",
+            msg.error_message
+        );
+        let has_text = msg
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Text { text, .. } if !text.trim().is_empty()));
         assert!(has_text, "expected non-empty text, got: {:?}", msg.content);
     }
 }

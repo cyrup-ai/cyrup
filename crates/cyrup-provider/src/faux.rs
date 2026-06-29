@@ -242,19 +242,22 @@ impl FauxProvider {
     pub fn with_config(config: FauxConfig) -> Self {
         let id = config.provider;
         let api = config.api;
-        let min_token_size = config.min_token_size.max(1).min(config.max_token_size.max(1));
+        let min_token_size = config
+            .min_token_size
+            .max(1)
+            .min(config.max_token_size.max(1));
         let max_token_size = config.max_token_size.max(min_token_size);
         let defs = if config.models.is_empty() {
             FauxConfig::default().models
         } else {
             config.models
         };
-        let models: Vec<Model> =
-            defs.into_iter().map(|d| d.into_model(&api, &id)).collect();
+        let models: Vec<Model> = defs.into_iter().map(|d| d.into_model(&api, &id)).collect();
         // `with_config` always yields ≥1 model (defaults fill the empty case).
-        let default_model = models.first().cloned().unwrap_or_else(|| {
-            FauxModelDefinition::new(DEFAULT_MODEL_ID).into_model(&api, &id)
-        });
+        let default_model = models
+            .first()
+            .cloned()
+            .unwrap_or_else(|| FauxModelDefinition::new(DEFAULT_MODEL_ID).into_model(&api, &id));
         Self {
             id,
             api,
@@ -365,7 +368,10 @@ fn split_by_token_size(text: &str, rng: &mut u64, min: usize, max: usize) -> Vec
     while i < chars.len() {
         let char_size = (next_token_size(rng, min, max) * 4).max(1);
         let end = (i + char_size).min(chars.len());
-        let chunk: String = chars.get(i..end).map(|s| s.iter().collect()).unwrap_or_default();
+        let chunk: String = chars
+            .get(i..end)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
         chunks.push(chunk);
         i = end;
     }
@@ -399,7 +405,9 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
         p
     };
 
-    let mut events = vec![StreamEvent::Start { partial: mk(Vec::new()) }];
+    let mut events = vec![StreamEvent::Start {
+        partial: mk(Vec::new()),
+    }];
     let mut acc: Vec<Content> = Vec::new();
 
     for (i, block) in message.content.iter().enumerate() {
@@ -407,7 +415,10 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
             Content::Text { text, .. } => {
                 let mut cur = acc.clone();
                 cur.push(Content::text(String::new()));
-                events.push(StreamEvent::TextStart { content_index: i, partial: mk(cur.clone()) });
+                events.push(StreamEvent::TextStart {
+                    content_index: i,
+                    partial: mk(cur.clone()),
+                });
                 let mut grown = String::new();
                 for chunk in split_by_token_size(text, &mut rng, min, max) {
                     grown.push_str(&chunk);
@@ -553,7 +564,13 @@ pub fn faux_event_stream(
         {
             st.done = true;
             let aborted = aborted_message(&st.prev_partial);
-            return Some((StreamEvent::Error { reason: ErrorReason::Aborted, error: aborted }, st));
+            return Some((
+                StreamEvent::Error {
+                    reason: ErrorReason::Aborted,
+                    error: aborted,
+                },
+                st,
+            ));
         }
         let ev = match st.events.next() {
             Some(e) => e,
@@ -594,7 +611,13 @@ impl Provider for FauxProvider {
         let call_count = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(cb) = &self.on_response {
             // Pi `onResponse({status, headers}, requestModel)` (faux.ts:449).
-            cb(&FauxResponseMeta { status: 200, headers: HashMap::new() }, request_model);
+            cb(
+                &FauxResponseMeta {
+                    status: 200,
+                    headers: HashMap::new(),
+                },
+                request_model,
+            );
         }
 
         let step = self.queue.lock().ok().and_then(|mut q| q.pop_front());
@@ -703,7 +726,11 @@ fn apply_usage_estimate(
 fn slice_chars(s: &str, start: usize, end: usize) -> &str {
     // Byte-accurate prefix slicing is fine here: `commonPrefixLength` counts chars but the cached
     // text is reused verbatim, so a char-index → byte-range conversion keeps the estimate stable.
-    let bytes_start = s.char_indices().nth(start).map(|(i, _)| i).unwrap_or(s.len());
+    let bytes_start = s
+        .char_indices()
+        .nth(start)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
     let bytes_end = if end == usize::MAX {
         s.len()
     } else {
@@ -721,7 +748,9 @@ fn content_to_text(content: &[Content]) -> String {
         .iter()
         .map(|b| match b {
             Content::Text { text, .. } => text.clone(),
-            Content::Image { mime_type, data, .. } => {
+            Content::Image {
+                mime_type, data, ..
+            } => {
                 format!("[image:{mime_type}:{}]", data.len())
             }
             _ => String::new(),
@@ -737,7 +766,11 @@ fn assistant_content_to_text(content: &[Content]) -> String {
             Content::Text { text, .. } => text.clone(),
             Content::Thinking { thinking, .. } => thinking.clone(),
             Content::ToolCall(tc) => {
-                format!("{}:{}", tc.name, serde_json::to_string(&tc.arguments).unwrap_or_default())
+                format!(
+                    "{}:{}",
+                    tc.name,
+                    serde_json::to_string(&tc.arguments).unwrap_or_default()
+                )
             }
             Content::Image { .. } => String::new(),
         })
@@ -749,7 +782,9 @@ fn message_to_text(message: &Message) -> String {
     match message {
         Message::User { content, .. } => content_to_text(content),
         Message::Assistant(a) => assistant_content_to_text(&a.content),
-        Message::ToolResult { tool_name, content, .. } => {
+        Message::ToolResult {
+            tool_name, content, ..
+        } => {
             let mut parts = vec![tool_name.clone()];
             parts.push(content_to_text(content));
             parts.join("\n")
@@ -771,10 +806,17 @@ fn serialize_context(context: &Context) -> String {
         parts.push(format!("system:{sp}"));
     }
     for message in &context.messages {
-        parts.push(format!("{}:{}", role_label(message), message_to_text(message)));
+        parts.push(format!(
+            "{}:{}",
+            role_label(message),
+            message_to_text(message)
+        ));
     }
     if !context.tools.is_empty() {
-        parts.push(format!("tools:{}", serde_json::to_string(&context.tools).unwrap_or_default()));
+        parts.push(format!(
+            "tools:{}",
+            serde_json::to_string(&context.tools).unwrap_or_default()
+        ));
     }
     parts.join("\n\n")
 }
@@ -848,7 +890,11 @@ pub fn faux_assistant_message_with(
         response_model: None,
         response_id: options.response_id,
         diagnostics: None,
-        usage: Usage { output, total_tokens: output, ..Default::default() },
+        usage: Usage {
+            output,
+            total_tokens: output,
+            ..Default::default()
+        },
         stop_reason,
         error_message: options.error_message,
         timestamp: options.timestamp.unwrap_or(0),
@@ -866,7 +912,10 @@ mod tests {
     #[tokio::test]
     async fn streams_scripted_text_and_done() {
         let faux = FauxProvider::new();
-        faux.set_responses(vec![faux_assistant_message(vec![faux_text("hello")], StopReason::Stop)]);
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text("hello")],
+            StopReason::Stop,
+        )]);
         let model = faux.model().clone();
         let stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
         let msg = collect_message(stream).await;
@@ -892,7 +941,10 @@ mod tests {
     async fn event_ordering_is_start_blocks_terminal() {
         let faux = FauxProvider::new();
         faux.set_responses(vec![faux_assistant_message(
-            vec![faux_thinking("t"), faux_tool_call("echo", serde_json::json!({"x": 1}))],
+            vec![
+                faux_thinking("t"),
+                faux_tool_call("echo", serde_json::json!({"x": 1})),
+            ],
             StopReason::ToolUse,
         )]);
         let model = faux.model().clone();
@@ -903,10 +955,20 @@ mod tests {
         }
         assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0, .. })));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { content_index: 1, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ThinkingStart {
+                content_index: 0,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallEnd {
+                content_index: 1,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
@@ -918,8 +980,12 @@ mod tests {
         ]);
         assert_eq!(faux.pending_count(), 2);
         let model = faux.model().clone();
-        let m1 = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default())).await;
-        let m2 = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let m1 =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
+        let m2 =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(m1.content, vec![faux_text("first")]);
         assert_eq!(m2.content, vec![faux_text("second")]);
         assert_eq!(faux.call_count(), 2);
@@ -930,7 +996,10 @@ mod tests {
         let faux = FauxProvider::new();
         // 60 chars ⇒ many 12–20-char deltas (>1).
         let long = "x".repeat(60);
-        faux.set_responses(vec![faux_assistant_message(vec![faux_text(&long)], StopReason::Stop)]);
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text(&long)],
+            StopReason::Stop,
+        )]);
         let model = faux.model().clone();
         let mut stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
         let mut deltas = 0;
@@ -948,11 +1017,18 @@ mod tests {
     #[tokio::test]
     async fn dynamic_factory_sees_call_state() {
         let faux = FauxProvider::new();
-        faux.set_response_steps(vec![FauxResponseStep::factory(|_ctx, _opts, state, _model| {
-            faux_assistant_message(vec![faux_text(format!("call-{}", state.call_count))], StopReason::Stop)
-        })]);
+        faux.set_response_steps(vec![FauxResponseStep::factory(
+            |_ctx, _opts, state, _model| {
+                faux_assistant_message(
+                    vec![faux_text(format!("call-{}", state.call_count))],
+                    StopReason::Stop,
+                )
+            },
+        )]);
         let model = faux.model().clone();
-        let msg = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let msg =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(msg.content, vec![faux_text("call-1")]);
     }
 
@@ -961,12 +1037,21 @@ mod tests {
         use cyrup_core::SessionId;
         let faux = FauxProvider::new();
         // The factory branches on the resolved StreamOptions (Pi's 2nd factory arg, faux.ts:96-101).
-        faux.set_response_steps(vec![FauxResponseStep::factory(|_ctx, opts, _state, _model| {
-            let sid = opts.session_id.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default();
-            faux_assistant_message(vec![faux_text(format!("sid-{sid}"))], StopReason::Stop)
-        })]);
+        faux.set_response_steps(vec![FauxResponseStep::factory(
+            |_ctx, opts, _state, _model| {
+                let sid = opts
+                    .session_id
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default();
+                faux_assistant_message(vec![faux_text(format!("sid-{sid}"))], StopReason::Stop)
+            },
+        )]);
         let model = faux.model().clone();
-        let opts = StreamOptions { session_id: Some(SessionId::from("s7")), ..Default::default() };
+        let opts = StreamOptions {
+            session_id: Some(SessionId::from("s7")),
+            ..Default::default()
+        };
         let msg = collect_message(faux.stream(&model, &Context::default(), &opts)).await;
         assert_eq!(msg.content, vec![faux_text("sid-s7")]);
     }
@@ -974,27 +1059,46 @@ mod tests {
     #[tokio::test]
     async fn async_factory_resolves_lazily() {
         let faux = FauxProvider::new();
-        faux.set_response_steps(vec![FauxResponseStep::async_factory(|_ctx, _opts, state, _model| async move {
-            // `await` work is allowed in the async factory (Pi `Promise<AssistantMessage>`).
-            tokio::task::yield_now().await;
-            faux_assistant_message(vec![faux_text(format!("async-{}", state.call_count))], StopReason::Stop)
-        })]);
+        faux.set_response_steps(vec![FauxResponseStep::async_factory(
+            |_ctx, _opts, state, _model| async move {
+                // `await` work is allowed in the async factory (Pi `Promise<AssistantMessage>`).
+                tokio::task::yield_now().await;
+                faux_assistant_message(
+                    vec![faux_text(format!("async-{}", state.call_count))],
+                    StopReason::Stop,
+                )
+            },
+        )]);
         let model = faux.model().clone();
-        let msg = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let msg =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(msg.content, vec![faux_text("async-1")]);
     }
 
     #[tokio::test]
     async fn aborted_before_start_yields_aborted_error() {
         let faux = FauxProvider::new();
-        faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text("hi")],
+            StopReason::Stop,
+        )]);
         let model = faux.model().clone();
         let cancel = CancelToken::new();
         cancel.cancel();
-        let opts = StreamOptions { cancel: Some(cancel), ..Default::default() };
+        let opts = StreamOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        };
         let mut stream = faux.stream(&model, &Context::default(), &opts);
         let first = stream.next().await.expect("an event");
-        assert!(matches!(first, StreamEvent::Error { reason: ErrorReason::Aborted, .. }));
+        assert!(matches!(
+            first,
+            StreamEvent::Error {
+                reason: ErrorReason::Aborted,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1012,9 +1116,14 @@ mod tests {
             ..Default::default()
         };
         let faux = FauxProvider::with_config(cfg);
-        faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text("hi")],
+            StopReason::Stop,
+        )]);
         let model = faux.model().clone();
-        let _ = collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        let _ =
+            collect_message(faux.stream(&model, &Context::default(), &StreamOptions::default()))
+                .await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -1028,16 +1137,28 @@ mod tests {
         ]);
         let model = faux.model().clone();
         let sid = SessionId::from("s1");
-        let opts = StreamOptions { session_id: Some(sid), ..Default::default() };
-        let mut ctx = Context { system_prompt: Some("hello world prompt".into()), ..Default::default() };
+        let opts = StreamOptions {
+            session_id: Some(sid),
+            ..Default::default()
+        };
+        let mut ctx = Context {
+            system_prompt: Some("hello world prompt".into()),
+            ..Default::default()
+        };
         let m1 = collect_message(faux.stream(&model, &ctx, &opts)).await;
         // First call writes the cache, reads nothing.
         assert!(m1.usage.cache_write > 0);
         assert_eq!(m1.usage.cache_read, 0);
         // Append more to the same prompt prefix → second call reads the shared prefix.
-        ctx.messages.push(Message::User { content: vec![Content::text("more")], timestamp: 0 });
+        ctx.messages.push(Message::User {
+            content: vec![Content::text("more")],
+            timestamp: 0,
+        });
         let m2 = collect_message(faux.stream(&model, &ctx, &opts)).await;
-        assert!(m2.usage.cache_read > 0, "expected a cache read on the shared prefix");
+        assert!(
+            m2.usage.cache_read > 0,
+            "expected a cache read on the shared prefix"
+        );
     }
 
     #[tokio::test]

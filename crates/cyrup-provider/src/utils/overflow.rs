@@ -12,28 +12,28 @@ use std::sync::OnceLock;
 /// Provider-specific overflow error patterns (Pi `OVERFLOW_PATTERNS`, overflow.ts:35-59). Each entry
 /// is the exact Pi source pattern (the `/i` flag is implicit — [`Regex`] is always case-insensitive).
 const OVERFLOW_PATTERNS: &[&str] = &[
-    r"prompt is too long",                       // Anthropic token overflow
-    r"request_too_large",                        // Anthropic request byte-size overflow (HTTP 413)
-    r"input is too long for requested model",    // Amazon Bedrock
-    r"exceeds the context window",               // OpenAI (Completions & Responses API)
+    r"prompt is too long",                    // Anthropic token overflow
+    r"request_too_large",                     // Anthropic request byte-size overflow (HTTP 413)
+    r"input is too long for requested model", // Amazon Bedrock
+    r"exceeds the context window",            // OpenAI (Completions & Responses API)
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
-    r"input token count.*exceeds the maximum",   // Google (Gemini)
-    r"maximum prompt length is \d+",             // xAI (Grok)
-    r"reduce the length of the messages",        // Groq
-    r"maximum context length is \d+ tokens",     // OpenRouter (most backends)
+    r"input token count.*exceeds the maximum", // Google (Gemini)
+    r"maximum prompt length is \d+",           // xAI (Grok)
+    r"reduce the length of the messages",      // Groq
+    r"maximum context length is \d+ tokens",   // OpenRouter (most backends)
     r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", // OpenRouter/Poolside
     r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)", // Together AI
-    r"exceeds the limit of \d+",                 // GitHub Copilot
-    r"exceeds the available context size",       // llama.cpp server
-    r"greater than the context length",          // LM Studio
-    r"context window exceeds limit",             // MiniMax
-    r"exceeded model token limit",               // Kimi For Coding
+    r"exceeds the limit of \d+",           // GitHub Copilot
+    r"exceeds the available context size", // llama.cpp server
+    r"greater than the context length",    // LM Studio
+    r"context window exceeds limit",       // MiniMax
+    r"exceeded model token limit",         // Kimi For Coding
     r"too large for model with \d+ maximum context length", // Mistral
-    r"model_context_window_exceeded",            // z.ai non-standard finish_reason as error text
+    r"model_context_window_exceeded",      // z.ai non-standard finish_reason as error text
     r"prompt too long; exceeded (?:max )?context length", // Ollama explicit overflow error
-    r"context[_ ]length[_ ]exceeded",            // Generic fallback
-    r"too many tokens",                          // Generic fallback
-    r"token limit exceeded",                     // Generic fallback
+    r"context[_ ]length[_ ]exceeded",      // Generic fallback
+    r"too many tokens",                    // Generic fallback
+    r"token limit exceeded",               // Generic fallback
     r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)", // Cerebras: 400/413 with no body
 ];
 
@@ -52,7 +52,12 @@ fn overflow_regexes() -> &'static [Regex] {
 
 fn non_overflow_regexes() -> &'static [Regex] {
     static CELL: OnceLock<Vec<Regex>> = OnceLock::new();
-    CELL.get_or_init(|| NON_OVERFLOW_PATTERNS.iter().map(|p| Regex::new(p)).collect())
+    CELL.get_or_init(|| {
+        NON_OVERFLOW_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p))
+            .collect()
+    })
 }
 
 /// Check if an assistant message represents a context-overflow error (Pi `isContextOverflow`,
@@ -73,7 +78,9 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
     if let (StopReason::Error, Some(error_message)) =
         (message.stop_reason, message.error_message.as_deref())
     {
-        let is_non_overflow = non_overflow_regexes().iter().any(|p| p.is_match(error_message));
+        let is_non_overflow = non_overflow_regexes()
+            .iter()
+            .any(|p| p.is_match(error_message));
         if !is_non_overflow && overflow_regexes().iter().any(|p| p.is_match(error_message)) {
             return true;
         }
@@ -108,7 +115,12 @@ pub fn overflow_patterns() -> &'static [&'static str] {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use cyrup_core::{ProviderId, Usage};
@@ -123,16 +135,20 @@ mod tests {
         )
     }
 
-    fn ok_with_usage(stop: StopReason, input: u64, cache_read: u64, output: u64) -> AssistantMessage {
-        let mut m = AssistantMessage::errored(
-            ProviderId::from("zai"),
-            "glm",
-            None,
-            stop,
-            "",
-        );
+    fn ok_with_usage(
+        stop: StopReason,
+        input: u64,
+        cache_read: u64,
+        output: u64,
+    ) -> AssistantMessage {
+        let mut m = AssistantMessage::errored(ProviderId::from("zai"), "glm", None, stop, "");
         m.error_message = None;
-        m.usage = Usage { input, cache_read, output, ..Usage::default() };
+        m.usage = Usage {
+            input,
+            cache_read,
+            output,
+            ..Usage::default()
+        };
         m
     }
 
@@ -154,15 +170,18 @@ mod tests {
             "the request exceeds the available context size, try increasing it", // llama.cpp
             "tokens to keep from the initial prompt is greater than the context length", // LM Studio
             "prompt token count of 9000 exceeds the limit of 8192", // GitHub Copilot
-            "invalid params, context window exceeds limit", // MiniMax
+            "invalid params, context window exceeds limit",         // MiniMax
             "Your request exceeded model token limit: 8192 (requested: 9000)", // Kimi
             "Prompt contains 9000 tokens ... too large for model with 8192 maximum context length", // Mistral
             "input is too long for requested model", // Bedrock
-            "400 (no body)", // Cerebras
-            "413 status code (no body)", // Cerebras
+            "400 (no body)",                         // Cerebras
+            "413 status code (no body)",             // Cerebras
         ];
         for c in cases {
-            assert!(is_context_overflow(&err(c), None), "should detect overflow: {c}");
+            assert!(
+                is_context_overflow(&err(c), None),
+                "should detect overflow: {c}"
+            );
         }
     }
 
@@ -170,13 +189,17 @@ mod tests {
     #[test]
     fn excludes_non_overflow_errors() {
         // Bedrock throttling shares "too many tokens" wording but must NOT be overflow.
-        let throttle = err("ThrottlingException: Too many tokens, please wait before trying again.");
+        let throttle =
+            err("ThrottlingException: Too many tokens, please wait before trying again.");
         // The NON_OVERFLOW exclusion is anchored to a human-readable prefix; this raw form has no
         // such prefix, so verify the prefixed form (formatBedrockError output) is excluded.
         let prefixed = err("Throttling error: Too many tokens, please wait before trying again.");
         assert!(!is_context_overflow(&prefixed, None));
         // And generic rate-limit text never counts as overflow.
-        assert!(!is_context_overflow(&err("rate limit exceeded, too many tokens"), None));
+        assert!(!is_context_overflow(
+            &err("rate limit exceeded, too many tokens"),
+            None
+        ));
         // The bare throttle (no prefix) DOES match "too many tokens" — Pi's behavior; documented.
         assert!(is_context_overflow(&throttle, None));
     }
@@ -201,6 +224,9 @@ mod tests {
 
     #[test]
     fn clean_message_is_not_overflow() {
-        assert!(!is_context_overflow(&err("the model refused the request"), Some(200_000)));
+        assert!(!is_context_overflow(
+            &err("the model refused the request"),
+            Some(200_000)
+        ));
     }
 }

@@ -20,9 +20,11 @@ pub mod context;
 pub mod env_api_keys;
 pub mod error;
 pub mod images;
+pub mod legacy_api_aliases;
 pub mod model;
 pub mod provider;
 pub mod providers;
+pub mod session_resources;
 pub mod stream;
 pub mod usage;
 pub mod utils;
@@ -39,100 +41,105 @@ pub use api::mistral_conversations::MistralConversationsApi;
 pub use api::openai_completions::OpenAiCompletionsApi;
 pub use api::openai_responses::OpenAiResponsesApi;
 pub use api::{
-    builtin_registry, channel, register_builtins, ApiFactory, ApiImpl, ApiRegistry, EventSink,
+    ApiFactory, ApiImpl, ApiRegistry, EventSink, builtin_registry, channel, register_builtins,
 };
-pub use providers::{together_models, together_provider, together_provider_with, TOGETHER_BASE_URL};
+pub use auth::{
+    ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialStore,
+    EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn, OAuthAuth, ProviderAuth,
+    ProviderEnv, env_key, keyless_local, resolve_provider_auth,
+};
+pub use catalog::{load_catalog, seed_catalog};
+pub use collection::{
+    CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, clamp_thinking_level, create_models,
+    get_supported_thinking_levels, has_api, models_are_equal,
+};
+pub use context::{Context, ToolDef};
+pub use cyrup_core::ApiId;
+pub use env_api_keys::{
+    AUTHENTICATED_SENTINEL, api_key_env_vars, find_env_keys, get_env_api_key,
+    get_provider_env_value,
+};
+pub use error::{AuthError, BoxErr, ProviderError};
+pub use images::{
+    AssistantImages, CreateImagesProviderOptions, ImagesApiImpl, ImagesApiRegistry, ImagesContext,
+    ImagesModel, ImagesModels, ImagesOptions, ImagesProvider, ImagesStopReason, OPENROUTER_IMAGES,
+    create_images_models, create_images_provider, generate_images, get_image_model,
+    get_image_models, get_image_providers, image_models, images_builtin_registry,
+    openrouter_image_models, register_images_builtins,
+};
+pub use model::{Modality, Model, ModelCost};
+pub use provider::Provider;
+pub use providers::all::{all_providers, all_providers_with, default_models};
+pub use providers::fleet::{FLEET, FleetSpec, fleet_providers_with, fleet_spec};
 pub use providers::{
-    azure_openai_responses_auth, azure_openai_responses_models, azure_openai_responses_provider,
-    azure_openai_responses_provider_with, AZURE_OPENAI_API_KEY, AZURE_OPENAI_RESPONSES_PROVIDER_ID,
+    ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
+    anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,
+    anthropic_provider_with,
 };
 pub use providers::{
-    anthropic_auth, anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models,
-    anthropic_provider, anthropic_provider_with, AnthropicFleetSpec, ANTHROPIC_BASE_URL,
-    ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID,
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_RESPONSES_PROVIDER_ID, azure_openai_responses_auth,
+    azure_openai_responses_models, azure_openai_responses_provider,
+    azure_openai_responses_provider_with,
 };
 pub use providers::{
+    CLOUDFLARE_AI_GATEWAY_PROVIDER_ID, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
     cloudflare_ai_gateway_auth, cloudflare_ai_gateway_models, cloudflare_ai_gateway_provider,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_auth, cloudflare_workers_ai_models,
     cloudflare_workers_ai_provider, cloudflare_workers_ai_provider_with,
-    CLOUDFLARE_AI_GATEWAY_PROVIDER_ID, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
-};
-pub use providers::fleet::{fleet_spec, fleet_providers_with, FleetSpec, FLEET};
-pub use providers::{
-    fireworks_auth, fireworks_models, fireworks_provider, fireworks_provider_with,
-    FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID,
 };
 pub use providers::{
-    google_auth, google_models, google_provider, google_provider_with, GOOGLE_BASE_URL,
-    GOOGLE_PROVIDER_ID,
+    FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID, fireworks_auth, fireworks_models,
+    fireworks_provider, fireworks_provider_with,
 };
 pub use providers::{
-    mistral_auth, mistral_models, mistral_provider, mistral_provider_with, MISTRAL_BASE_URL,
-    MISTRAL_PROVIDER_ID,
+    GOOGLE_BASE_URL, GOOGLE_PROVIDER_ID, google_auth, google_models, google_provider,
+    google_provider_with,
 };
 pub use providers::{
-    opencode_auth, opencode_models, opencode_provider, opencode_provider_with, OPENCODE_PROVIDER_ID,
+    MISTRAL_BASE_URL, MISTRAL_PROVIDER_ID, mistral_auth, mistral_models, mistral_provider,
+    mistral_provider_with,
 };
 pub use providers::{
-    opencode_go_auth, opencode_go_models, opencode_go_provider, opencode_go_provider_with,
-    OPENCODE_GO_PROVIDER_ID,
+    OPENAI_BASE_URL, OPENAI_PROVIDER_ID, openai_auth, openai_models, openai_provider,
+    openai_provider_with,
 };
 pub use providers::{
-    openai_auth, openai_models, openai_provider, openai_provider_with, OPENAI_BASE_URL,
-    OPENAI_PROVIDER_ID,
+    OPENCODE_GO_PROVIDER_ID, opencode_go_auth, opencode_go_models, opencode_go_provider,
+    opencode_go_provider_with,
 };
-pub use collection::{
-    clamp_thinking_level, create_models, get_supported_thinking_levels, has_api, models_are_equal,
-    CreateModelsOptions, Models, EXTENDED_THINKING_LEVELS,
+pub use providers::{
+    OPENCODE_PROVIDER_ID, opencode_auth, opencode_models, opencode_provider, opencode_provider_with,
 };
-pub use providers::all::{all_providers, all_providers_with, default_models};
-pub use env_api_keys::{
-    api_key_env_vars, find_env_keys, get_env_api_key, get_provider_env_value, AUTHENTICATED_SENTINEL,
-};
-pub use auth::{
-    env_key, keyless_local, resolve_provider_auth, ApiKeyAuth, AuthContext, AuthOverrides,
-    AuthResult, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore, ModelAuth,
-    ModifyFn, OAuthAuth, ProviderAuth, ProviderEnv,
-};
-pub use catalog::{load_catalog, seed_catalog};
-pub use images::{
-    create_images_models, create_images_provider, generate_images, get_image_model,
-    get_image_models, get_image_providers, image_models, images_builtin_registry,
-    openrouter_image_models, register_images_builtins, AssistantImages, CreateImagesProviderOptions,
-    ImagesApiImpl, ImagesApiRegistry, ImagesContext, ImagesModel, ImagesModels, ImagesOptions,
-    ImagesProvider, ImagesStopReason, OPENROUTER_IMAGES,
+pub use providers::{
+    TOGETHER_BASE_URL, together_models, together_provider, together_provider_with,
 };
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
-pub use context::{Context, ToolDef};
-pub use cyrup_core::ApiId;
-pub use error::{AuthError, BoxErr, ProviderError};
-pub use model::{Modality, Model, ModelCost};
-pub use provider::Provider;
-pub use stream::sse::{build_client, decode_sse_bytes, open_sse, OnRequest, OnResponse, SseFrame, SseRequest};
+pub use stream::sse::{
+    OnRequest, OnResponse, SseFrame, SseRequest, build_client, build_client_for_target,
+    build_client_with_proxy, decode_sse_bytes, open_sse,
+};
 pub use stream::{
-    collect_message, create_assistant_message_event_stream, AssistantMessageEventSink,
-    AssistantMessageEventStream, CacheRetention, OnPayload, OnResponseHook, ProviderResponse,
-    StreamEvent, StreamOptions, ToolChoice, Transport,
+    AssistantMessageEventSink, AssistantMessageEventStream, CacheRetention, OnPayload,
+    OnResponseHook, ProviderResponse, StreamEvent, StreamOptions, ToolChoice, Transport,
+    collect_message, create_assistant_message_event_stream,
 };
+pub use usage::{apply_cost, compute_cost};
 pub use utils::estimate::{
-    calculate_context_tokens, estimate_context_tokens, estimate_message_tokens,
-    estimate_text_tokens, ContextUsageEstimate,
+    ContextUsageEstimate, calculate_context_tokens, estimate_context_tokens,
+    estimate_message_tokens, estimate_text_tokens,
 };
-pub use utils::json_parse::{
-    parse_streaming_json, parse_streaming_json_object, repair_json,
-};
+pub use utils::json_parse::{parse_streaming_json, parse_streaming_json_object, repair_json};
 pub use utils::node_http_proxy::{
-    resolve_http_proxy_url_for_target, ProxyError, UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
+    ProxyError, UNSUPPORTED_PROXY_PROTOCOL_MESSAGE, resolve_http_proxy_url_for_target,
 };
 pub use utils::overflow::{is_context_overflow, overflow_patterns};
 pub use utils::refresh::RefreshDedup;
 pub use utils::retry::is_retryable_assistant_error;
 pub use utils::simple_options::{
-    adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context, clamp_reasoning,
-    SimpleStreamOptions, ThinkingBudgets,
+    SimpleStreamOptions, ThinkingBudgets, adjust_max_tokens_for_thinking, build_base_options,
+    clamp_max_tokens_to_context, clamp_reasoning,
 };
-pub use usage::{apply_cost, compute_cost};
-pub use validate::{validate_named_tool_call, validate_tool_call, ToolValidationError};
+pub use validate::{ToolValidationError, validate_named_tool_call, validate_tool_call};
 pub use wire::WireProvider;
 
 /// Header overlay: a `None` value suppresses a would-be default header (arch-01 §3.1).

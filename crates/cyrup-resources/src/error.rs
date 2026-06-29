@@ -57,7 +57,11 @@ pub struct ResourceWarning {
 
 impl ResourceWarning {
     pub fn new(kind: ResourceKind, path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
-        Self { kind, path: path.into(), reason: reason.into() }
+        Self {
+            kind,
+            path: path.into(),
+            reason: reason.into(),
+        }
     }
 }
 
@@ -99,7 +103,11 @@ pub struct ResourceDiagnostic {
 }
 
 impl ResourceDiagnostic {
-    pub fn warning(kind: ResourceKind, path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+    pub fn warning(
+        kind: ResourceKind,
+        path: impl Into<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
         let _ = kind;
         Self {
             diagnostic_type: DiagnosticType::Warning,
