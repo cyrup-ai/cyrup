@@ -141,7 +141,9 @@ impl Tool for GrepTool {
                 .unwrap_or_else(|| to_posix(&search_root));
             files.push((search_root.clone(), rel));
         } else {
-            let mut walk = self.fs.walk(&search_root, WalkOpts::default());
+            // Pi runs `rg --hidden` (grep.ts:215): search dotfiles/dot-dirs while still honoring
+            // `.gitignore` (arch-03:404). So include hidden files in the walk.
+            let mut walk = self.fs.walk(&search_root, WalkOpts { include_hidden: true });
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(error::aborted()),
@@ -212,47 +214,65 @@ impl Tool for GrepTool {
         let joined = out.join("\n");
         let t = truncate_head(&joined, TruncOpts::bytes_only(self.opts.max_bytes));
 
+        // Pi joins every notice into ONE bracket (grep.ts:338-356), e.g.
+        // `[100 matches limit reached. Use limit=200 for more, or refine pattern. 50.0KB limit
+        //   reached. Some lines truncated to 500 chars. Use read tool to see full lines]`.
         let mut text = t.content.clone();
+        let mut notices: Vec<String> = Vec::new();
         if count >= limit {
-            text.push_str(&format!(
-                "\n\n[{limit} match limit reached. Use limit={} to see more.]",
+            notices.push(format!(
+                "{limit} matches limit reached. Use limit={} for more, or refine pattern",
                 limit.saturating_mul(2)
             ));
         }
         if t.info.truncated {
-            text.push_str(&format!(
-                "\n\n[Output truncated at {}.]",
-                format_size(self.opts.max_bytes)
-            ));
+            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
         }
         if any_line_truncated {
-            text.push_str(&format!(
-                "\n\n[Some lines truncated to {GREP_MAX_LINE_LENGTH} chars.]"
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
             ));
         }
+        if !notices.is_empty() {
+            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
+        }
 
-        let details = crate::details::GrepDetails {
-            truncation: Some(t.info),
-            match_limit_reached: if count >= limit { Some(limit) } else { None },
-            lines_truncated: if any_line_truncated { Some(true) } else { None },
+        // Pi only adds `truncation` to details when the byte cap actually fired, and emits
+        // `details: undefined` when no key is set (grep.ts:337-360). Mirror that exactly.
+        let match_limit_reached = if count >= limit { Some(limit) } else { None };
+        let lines_truncated = if any_line_truncated { Some(true) } else { None };
+        let truncation = if t.info.truncated { Some(t.info) } else { None };
+        let details = if truncation.is_some()
+            || match_limit_reached.is_some()
+            || lines_truncated.is_some()
+        {
+            serde_json::to_value(crate::details::GrepDetails {
+                truncation,
+                match_limit_reached,
+                lines_truncated,
+            })
+            .ok()
+        } else {
+            None
         };
 
         Ok(ToolResult {
             content: vec![Content::text(text)],
-            details: serde_json::to_value(details).ok(),
+            details,
             terminate: false,
         })
     }
 }
 
 impl ToolMeta for GrepTool {
+    // Verbatim from Pi (grep.ts:131-132). DEFAULT_LIMIT=100, DEFAULT_MAX_BYTES/1024=50,
+    // GREP_MAX_LINE_LENGTH=500. Pi defines no promptGuidelines for grep.
     fn description(&self) -> &str {
-        "Search file contents recursively (gitignore-aware), returning filepath:line: match."
+        "Search file contents for a pattern. Returns matching lines with file paths and line \
+         numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is \
+         hit first). Long lines are truncated to 500 chars."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("grep: search file contents by regex.")
-    }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `grep` to find code by content; pass `glob` to narrow files and `context` for surrounding lines."]
+        Some("Search file contents for patterns (respects .gitignore)")
     }
 }

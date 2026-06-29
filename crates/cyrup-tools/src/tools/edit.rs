@@ -111,7 +111,10 @@ impl Tool for EditTool {
         let input: EditInput =
             serde_json::from_value(params).map_err(|e| error::invalid(format!("edit: {e}")))?;
         if input.edits.is_empty() {
-            return Err(error::invalid("edit: at least one edit is required"));
+            // Pi `validateEditInput` (edit.ts:120-125).
+            return Err(error::invalid(
+                "Edit tool input is invalid. edits must contain at least one replacement.",
+            ));
         }
 
         let abs = path::resolve_to_cwd(&input.path, &self.cwd);
@@ -128,52 +131,15 @@ impl Tool for EditTool {
         let ending = edit_diff::detect_line_ending(body);
         let norm = edit_diff::normalize_to_lf(body);
 
-        // Compute every edit's unique offset against the ORIGINAL (R-03-017).
-        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
-        for e in &input.edits {
-            let mut indices = norm.match_indices(&e.old_text);
-            let first = indices.next();
-            let extra = indices.next();
-            match (first, extra) {
-                (None, _) => {
-                    return Err(error::invalid(format!(
-                        "edit: oldText not found in {}:\n{}",
-                        input.path, e.old_text
-                    )));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(error::invalid(format!(
-                        "edit: oldText is not unique in {} (matches more than once):\n{}",
-                        input.path, e.old_text
-                    )));
-                }
-                (Some((start, matched)), None) => {
-                    ranges.push((start, start + matched.len(), &e.new_text));
-                }
-            }
-        }
-
-        // Non-overlap check (R-03-017).
-        ranges.sort_by_key(|r| r.0);
-        let mut prev_end = 0usize;
-        for (i, (start, end, _)) in ranges.iter().enumerate() {
-            if i > 0 && *start < prev_end {
-                return Err(error::invalid(
-                    "edit: edits overlap; they must apply to disjoint regions",
-                ));
-            }
-            prev_end = *end;
-        }
-
-        // Splice all edits against the original in ascending order.
-        let mut new_body = String::with_capacity(norm.len());
-        let mut cursor = 0usize;
-        for (start, end, new_text) in &ranges {
-            new_body.push_str(norm.get(cursor..*start).unwrap_or(""));
-            new_body.push_str(new_text);
-            cursor = *end;
-        }
-        new_body.push_str(norm.get(cursor..).unwrap_or(""));
+        // Exact-then-fuzzy multi-edit core (R-03-017, edit-diff.ts:304-366).
+        let pairs: Vec<(String, String)> = input
+            .edits
+            .iter()
+            .map(|e| (e.old_text.clone(), e.new_text.clone()))
+            .collect();
+        let applied = edit_diff::apply_edits_to_normalized_content(&norm, &pairs, &input.path)
+            .map_err(|e| error::invalid(e.0))?;
+        let new_body = applied.new_content;
 
         if cancel.is_cancelled() {
             return Err(error::aborted());
@@ -184,9 +150,9 @@ impl Tool for EditTool {
         let final_text = if had_bom { format!("\u{feff}{restored}") } else { restored };
         self.fs.write_atomic(&abs, final_text.as_bytes()).await?;
 
-        let diff = edit_diff::display_diff(&norm, &new_body);
-        let patch = edit_diff::unified_patch(&input.path, &norm, &new_body);
-        let first_changed_line = edit_diff::first_changed_line(&norm, &new_body);
+        let (diff, first_changed_line) =
+            edit_diff::generate_diff_string(&applied.base_content, &new_body);
+        let patch = edit_diff::unified_patch(&input.path, &applied.base_content, &new_body);
 
         let count = input.edits.len();
         Ok(ToolResult {
@@ -201,13 +167,28 @@ impl Tool for EditTool {
 }
 
 impl ToolMeta for EditTool {
+    // Verbatim from Pi (edit.ts:296-308).
     fn description(&self) -> &str {
-        "Apply exact-match edits to a file; each oldText must match exactly once."
+        "Edit a single file using exact text replacement. Every edits[].oldText must match a \
+         unique, non-overlapping region of the original file. If two changes affect the same block \
+         or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not \
+         include large unchanged regions just to connect distant changes."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("edit: replace unique text spans in a file.")
+        Some(
+            "Make precise file edits with exact text replacement, including multiple disjoint edits \
+             in one call",
+        )
     }
     fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `edit` for targeted changes; include enough context so each oldText is unique."]
+        &[
+            "Use edit for precise changes (edits[].oldText must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with multiple \
+             entries in edits[] instead of multiple edit calls",
+            "Each edits[].oldText is matched against the original file, not after earlier edits are \
+             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep edits[].oldText as small as possible while still being unique in the file. Do not \
+             pad with large unchanged regions.",
+        ]
     }
 }

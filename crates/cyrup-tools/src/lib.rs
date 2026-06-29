@@ -30,7 +30,8 @@ pub mod truncate;
 pub use cyrup_core::ToolError;
 
 pub use config::{
-    BashOpts, EditOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, ToolsOptions, WriteOpts,
+    BashOpts, BashSpawnContext, BashSpawnHook, EditOpts, FindOpts, GrepOpts, LsOpts, ReadOpts,
+    ToolsOptions, WriteOpts,
 };
 pub use isolation::{
     protected_path_rule, OsSandbox, PermissionPolicy, PolicyDecision, ProtectedFs, ProtectedPaths,

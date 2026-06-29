@@ -83,16 +83,37 @@ async fn read_window_and_truncation_and_oversized() {
     assert!(text.contains("line1\nline2\nline3"));
     assert!(text.contains("Showing lines 1-3 of 10"), "got: {text}");
 
-    // Oversized single line -> bash fallback error.
+    // Oversized single line -> Pi resolves SUCCESSFULLY with a bash-fallback content note
+    // (read.ts:290-294,315), not an error. Details carry the truncation.
     std::fs::write(cwd.join("long.txt"), "x".repeat(200)).unwrap();
     let read_tiny =
         ReadTool::new(fs(), cwd.clone(), ReadOpts { max_bytes: 50, ..ReadOpts::default() });
-    let err = read_tiny
+    let r = read_tiny
         .execute(cid(), serde_json::json!({ "path": "long.txt" }), CancelToken::new(), noop_sink())
         .await
-        .unwrap_err();
-    let msg = err.to_string();
+        .unwrap();
+    let msg = first_text(&r);
     assert!(msg.contains("exceeds") && msg.contains("bash"), "got: {msg}");
+    assert!(msg.contains("50.0KB") || msg.contains("50B"), "got: {msg}");
+    assert!(r.details.is_some(), "first-line-exceeds must attach truncation details");
+}
+
+// A non-truncated read returns the file content VERBATIM, preserving the trailing newline — Pi's
+// `truncateHead` short-circuits and returns the input unchanged (truncate.ts:87-101). Previously
+// cyrup rebuilt from split lines and dropped the final `\n`, a pervasive byte divergence on `read`.
+#[tokio::test]
+async fn read_preserves_trailing_newline_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("nl.txt"), "hello\nworld\n").unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(cid(), serde_json::json!({ "path": "nl.txt" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert_eq!(text, "hello\nworld\n", "trailing newline must be preserved verbatim");
+    assert!(r.details.is_none(), "no truncation -> no details");
 }
 
 #[tokio::test]
@@ -108,11 +129,16 @@ async fn read_missing_file_errors() {
 
 // ---------------------------------------------------------------- A-03-2 image
 
+// Pi (read.ts:246-263) STILL returns the image block for a non-vision model — together with the
+// warning note — and the request layer strips it later. Detection is by MAGIC BYTES, so the
+// fixture must be a real PNG (an invalid header would be read as text).
+#[cfg(feature = "inline-images")]
 #[tokio::test]
-async fn read_image_non_vision_warns() {
+async fn read_image_non_vision_keeps_block_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    std::fs::write(cwd.join("pic.png"), b"\x89PNG not-really").unwrap();
+    let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+    img.save(cwd.join("pic.png")).unwrap();
     let read = ReadTool::new(
         fs(),
         cwd,
@@ -123,8 +149,30 @@ async fn read_image_non_vision_warns() {
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.contains("does not support images"), "got: {text}");
+    assert!(
+        text.contains("Current model does not support images. The image will be omitted from this request."),
+        "got: {text}"
+    );
+    // Verbatim Pi note prefix for the processed (output) mime.
+    assert!(text.starts_with("Read image file ["), "got: {text}");
+    // The image block is preserved even for non-vision models.
+    assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
+}
+
+// A non-image file with an image extension must be read as TEXT now that detection is magic-byte
+// based (mime.ts), not extension based.
+#[tokio::test]
+async fn read_fake_image_extension_is_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("pic.png"), b"\x89PNG not-really a png\n").unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
     assert!(!r.content.iter().any(|c| matches!(c, Content::Image { .. })));
+    assert!(first_text(&r).contains("not-really"));
 }
 
 #[cfg(feature = "inline-images")]
@@ -177,7 +225,8 @@ async fn edit_unique_crlf_bom_diff() {
     assert_eq!(after, "\u{feff}one\r\nTWO\r\nthree\r\n", "CRLF+BOM preserved");
 
     let details = r.details.unwrap();
-    assert!(details["diff"].as_str().unwrap().contains("+TWO"));
+    // Pi line-numbered display diff (`+NN TWO`).
+    assert!(details["diff"].as_str().unwrap().contains("+2 TWO"), "diff: {}", details["diff"]);
     assert!(details["patch"].as_str().unwrap().contains("@@"));
     assert_eq!(details["firstChangedLine"], 2);
 }
@@ -197,7 +246,12 @@ async fn edit_non_unique_errors() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not unique"));
+    // Pi duplicate-match wording (edit-diff.ts:268-277).
+    assert!(
+        err.to_string().contains("Found 2 occurrences") && err.to_string().contains("must be unique"),
+        "got: {}",
+        err
+    );
 }
 
 #[tokio::test]
@@ -249,7 +303,7 @@ async fn write_creates_dirs_and_serializes() {
         )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("Wrote 5 bytes"));
+    assert!(first_text(&r).contains("Successfully wrote 5 bytes"));
     assert_eq!(std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(), "hello");
 
     // Concurrent writes to the same path: no corruption (final == one full content).
@@ -377,7 +431,7 @@ async fn bash_truncation_spills_to_temp_file() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { max_lines: 5, max_bytes: 100, command_prefix: None },
+        BashOpts { max_lines: 5, max_bytes: 100, ..Default::default() },
     );
     let r = bash
         .execute(
@@ -433,6 +487,59 @@ async fn grep_format_and_gitignore_and_no_matches() {
 }
 
 #[tokio::test]
+async fn grep_and_find_search_hidden_files() {
+    // Pi runs `rg --hidden` / `fd --hidden` (grep.ts:215, find.ts:224): dotfiles ARE searched while
+    // `.gitignore` is still honored.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join(".env"), "SECRET=hello-hidden\n").unwrap();
+    std::fs::create_dir(cwd.join(".config")).unwrap();
+    std::fs::write(cwd.join(".config/app.toml"), "key = hidden\n").unwrap();
+    std::fs::write(cwd.join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(cwd.join("ignored.txt"), "hello-hidden\n").unwrap();
+
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
+    let r = grep
+        .execute(cid(), serde_json::json!({ "pattern": "hello-hidden" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains(".env:1:"), "hidden dotfile must be searched: {text}");
+    // gitignored file is still excluded even though hidden search is on.
+    assert!(!text.contains("ignored.txt"), "gitignore must still apply: {text}");
+
+    let find = FindTool::new(fs(), cwd, FindOpts::default());
+    let r = find
+        .execute(cid(), serde_json::json!({ "pattern": "*.toml" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert!(first_text(&r).contains(".config/app.toml"), "got: {}", first_text(&r));
+}
+
+#[tokio::test]
+async fn edit_fuzzy_matches_curly_quote_end_to_end() {
+    // The model sends an ASCII apostrophe but disk has a curly U+2019; Pi's fuzzy fallback matches.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("s.rs"), "let s = \u{2019}hi\u{2019};\n").unwrap();
+    let edit = edit_tool(cwd.clone());
+    let r = edit
+        .execute(
+            cid(),
+            serde_json::json!({
+                "path": "s.rs",
+                "edits": [{ "oldText": "let s = 'hi';", "newText": "let s = 'bye';" }]
+            }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(first_text(&r).contains("replaced 1 block"));
+    assert_eq!(std::fs::read_to_string(cwd.join("s.rs")).unwrap(), "let s = 'bye';\n");
+}
+
+#[tokio::test]
 async fn find_format_and_gitignore_and_sentinel() {
     let dir = fixture_repo();
     let cwd = dir.path().to_path_buf();
@@ -474,7 +581,7 @@ async fn find_limit_truncation() {
         .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), CancelToken::new(), noop_sink())
         .await
         .unwrap();
-    assert!(first_text(&r).contains("result limit reached"), "got: {}", first_text(&r));
+    assert!(first_text(&r).contains("results limit reached"), "got: {}", first_text(&r));
     assert_eq!(r.details.unwrap()["resultLimitReached"], 2);
 }
 
@@ -667,4 +774,181 @@ async fn tool_logic_is_backend_agnostic() {
         .unwrap();
     assert!(first_text(&r).contains("data"));
     assert!(reads.load(Ordering::SeqCst) >= 1, "tool routed through the seam");
+}
+
+// ---------------------------------------------------------------- round-2 1:1 additions
+
+// gap #3 — spawnHook lets an extension rewrite {command,cwd,env} before exec (bash.ts:139-144).
+#[tokio::test]
+async fn bash_spawn_hook_rewrites_command() {
+    use cyrup_tools::config::BashSpawnContext;
+    let dir = tempfile::tempdir().unwrap();
+    let hook: cyrup_tools::config::BashSpawnHook = Arc::new(|mut ctx: BashSpawnContext| {
+        // Replace the model's command entirely.
+        ctx.command = "echo rewritten-by-hook".to_string();
+        ctx
+    });
+    let bash = bash_tool(
+        dir.path().to_path_buf(),
+        BashOpts { spawn_hook: Some(hook), ..Default::default() },
+    );
+    let r = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo original" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains("rewritten-by-hook"), "got: {text}");
+    assert!(!text.contains("original"), "got: {text}");
+}
+
+// gap #5 — bin_dir is prepended to the child PATH (getShellEnv, shell.ts:122-134).
+#[tokio::test]
+async fn bash_bin_dir_prepended_to_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("managed-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let bash = bash_tool(
+        dir.path().to_path_buf(),
+        BashOpts { bin_dir: Some(bin.clone()), ..Default::default() },
+    );
+    let r = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "printf '%s' \"$PATH\"" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.starts_with(&bin.to_string_lossy().into_owned()), "PATH was: {text}");
+}
+
+// gap #4 — an explicit but missing shellPath yields the `Custom shell path not found` error,
+// surfaced per-exec (shell.ts:73; bash.ts:69).
+#[tokio::test]
+async fn bash_missing_shell_path_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(
+        dir.path().to_path_buf(),
+        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+    );
+    let err = bash
+        .execute(cid(), serde_json::json!({ "command": "echo hi" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Custom shell path not found"), "got: {err}");
+}
+
+// gap #13 — read offset bound is `allLines.length` (the trailing-newline phantom line counts),
+// and the out-of-bounds error reads `(N lines total)` (read.ts:268-275).
+#[tokio::test]
+async fn read_offset_bound_counts_trailing_newline_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // 3 newline-terminated lines ⇒ split("\n") has 4 elements (the 4th empty).
+    std::fs::write(cwd.join("f.txt"), "a\nb\nc\n").unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    // offset=4 selects the empty phantom line (in-bounds), returns "".
+    let ok = read
+        .execute(cid(), serde_json::json!({ "path": "f.txt", "offset": 4 }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert_eq!(first_text(&ok), "");
+    // offset=5 is past the 4-element basis ⇒ error worded with "lines total".
+    let err = read
+        .execute(cid(), serde_json::json!({ "path": "f.txt", "offset": 5 }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("beyond end of file (4 lines total)"), "got: {err}");
+}
+
+// gap #8 — write reports JS string length (UTF-16 units), not UTF-8 bytes (write.ts:222).
+#[tokio::test]
+async fn write_reports_utf16_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let write = WriteTool::new(fs(), Arc::new(FileMutationLocks::new()), cwd.clone(), Default::default());
+    // "é𝄞" = 1 (é, 1 UTF-16 unit) + 1 (𝄞, astral, 2 UTF-16 units) = 3 UTF-16 units, 6 UTF-8 bytes.
+    let r = write
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "u.txt", "content": "é𝄞" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(first_text(&r).contains("Successfully wrote 3 bytes to u.txt"), "got: {}", first_text(&r));
+}
+
+// gap #11 — a small directory with no truncation and no limit-hit emits NO `details` object (ls.ts).
+#[tokio::test]
+async fn ls_omits_details_when_not_notable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("only.txt"), "x").unwrap();
+    let ls = LsTool::new(fs(), cwd, LsOpts::default());
+    let r = ls
+        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert!(r.details.is_none(), "details should be omitted: {:?}", r.details);
+}
+
+// gap #1 — magic-byte detection for each supported type, animated-PNG / lossless-JPEG rejection.
+#[test]
+fn image_magic_detection() {
+    use cyrup_tools::ops::ImageMime;
+    let png_sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    // Valid PNG: IHDR length 13 + "IHDR".
+    let mut png = Vec::from(png_sig);
+    png.extend_from_slice(&[0, 0, 0, 13]); // length BE
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&[0u8; 8]);
+    assert_eq!(ImageMime::from_magic(&png), Some(ImageMime::Png));
+    // Animated PNG (acTL before IDAT) is rejected.
+    let mut apng = Vec::from(png_sig);
+    apng.extend_from_slice(&[0, 0, 0, 13]);
+    apng.extend_from_slice(b"IHDR");
+    apng.extend_from_slice(&[0u8; 13 + 4]); // IHDR data + crc
+    apng.extend_from_slice(&[0, 0, 0, 8]); // acTL length
+    apng.extend_from_slice(b"acTL");
+    assert_eq!(ImageMime::from_magic(&apng), None);
+    // JPEG, and the lossless 0xF7 variant rejected.
+    assert_eq!(ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xe0]), Some(ImageMime::Jpeg));
+    assert_eq!(ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xf7]), None);
+    assert_eq!(ImageMime::from_magic(b"GIF89a"), Some(ImageMime::Gif));
+    let mut webp = Vec::from(*b"RIFF");
+    webp.extend_from_slice(&[0, 0, 0, 0]);
+    webp.extend_from_slice(b"WEBP");
+    assert_eq!(ImageMime::from_magic(&webp), Some(ImageMime::Webp));
+    // Plain text is not an image.
+    assert_eq!(ImageMime::from_magic(b"hello world\n"), None);
+}
+
+// gap #1 — an oversized image is resized to fit 2000px and carries the coordinate-mapping
+// dimension note (image-resize-core.ts + formatDimensionNote). Exercises decode→orientation→
+// resize→encode end to end.
+#[cfg(feature = "inline-images")]
+#[tokio::test]
+async fn read_image_oversized_is_resized_with_dimension_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // 2400x10 PNG ⇒ wider than the 2000px cap ⇒ must be resized.
+    let img = image::RgbaImage::from_pixel(2400, 10, image::Rgba([1, 2, 3, 255]));
+    img.save(cwd.join("wide.png")).unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(cid(), serde_json::json!({ "path": "wide.png" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains("Image: original 2400x10, displayed at 2000x"), "got: {text}");
+    assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
 }

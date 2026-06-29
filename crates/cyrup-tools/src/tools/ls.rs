@@ -103,38 +103,49 @@ impl Tool for LsTool {
         let joined = lines.join("\n");
         let t = truncate_head(&joined, TruncOpts::bytes_only(self.opts.max_bytes));
 
+        // Pi joins notices into ONE bracket (ls.ts:185-197); note: no "or refine pattern".
         let mut text = t.content.clone();
+        let mut notices: Vec<String> = Vec::new();
         if limit_reached {
-            text.push_str(&format!(
-                "\n\n[{limit} entry limit reached. Use limit={} to see more.]",
+            notices.push(format!(
+                "{limit} entries limit reached. Use limit={} for more",
                 limit.saturating_mul(2)
             ));
         }
         if t.info.truncated {
-            text.push_str(&format!("\n\n[Output truncated at {}.]", format_size(self.opts.max_bytes)));
+            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
+        }
+        if !notices.is_empty() {
+            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
 
-        let details = LsDetails {
-            truncation: Some(t.info),
-            entry_limit_reached: if limit_reached { Some(limit) } else { None },
+        // Pi adds `truncation` only when the byte cap fired and emits `details: undefined` when no
+        // key is set (ls.ts:184-201). Mirror that exactly.
+        let entry_limit_reached = if limit_reached { Some(limit) } else { None };
+        let truncation = if t.info.truncated { Some(t.info) } else { None };
+        let details = if truncation.is_some() || entry_limit_reached.is_some() {
+            serde_json::to_value(LsDetails { truncation, entry_limit_reached }).ok()
+        } else {
+            None
         };
 
         Ok(ToolResult {
             content: vec![Content::text(text)],
-            details: serde_json::to_value(details).ok(),
+            details,
             terminate: false,
         })
     }
 }
 
 impl ToolMeta for LsTool {
+    // Verbatim from Pi (ls.ts:103-104). DEFAULT_LIMIT=500, DEFAULT_MAX_BYTES/1024=50. Pi defines no
+    // promptGuidelines for ls.
     fn description(&self) -> &str {
-        "List directory entries (including dotfiles), sorted case-insensitively."
+        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for \
+         directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is \
+         hit first)."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("ls: list directory contents.")
-    }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `ls` to inspect a directory; entries ending in '/' are subdirectories."]
+        Some("List directory contents")
     }
 }

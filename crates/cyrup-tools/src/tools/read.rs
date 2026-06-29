@@ -76,22 +76,28 @@ impl Tool for ReadTool {
             return Err(error::aborted());
         }
 
+        // Read once through the (remote-aware) seam, then decide text-vs-image by MAGIC BYTES — Pi
+        // sniffs the file header (read.ts:243 → mime.ts), not the extension.
+        let bytes = self.fs.read(&abs).await?;
+
         // Image branch (R-03-012).
-        if let Some(mime) = self.fs.detect_image_mime(&abs) {
-            return self.read_image(&abs, mime).await;
+        if let Some(mime) = crate::ops::ImageMime::from_magic(&bytes) {
+            return self.read_image(bytes, mime).await;
         }
 
         // Text branch (R-03-011).
-        let bytes = self.fs.read(&abs).await?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
+        // Pi's basis is `allLines.length` — the raw `split("\n")` count, which INCLUDES the empty
+        // phantom element after a trailing newline (read.ts:268-269). Do not pop it: the offset
+        // bound, the `of N` continuation count, and the out-of-bounds error all key off this count.
         let lines: Vec<&str> = text.split('\n').collect();
-        let total = if text.ends_with('\n') { lines.len().saturating_sub(1) } else { lines.len() };
+        let total = lines.len();
 
         let start = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
-        if start >= total && total > 0 {
+        if start >= total {
             return Err(error::invalid(format!(
-                "Offset {} is beyond end of file ({} lines)",
-                input.offset.unwrap_or(1),
+                "Offset {} is beyond end of file ({} lines total)",
+                input.offset.unwrap_or(0),
                 total
             )));
         }
@@ -110,26 +116,48 @@ impl Tool for ReadTool {
         );
 
         if t.info.first_line_exceeds_limit {
+            // Pi resolves SUCCESSFULLY here (read.ts:290-294,315): the note is the content and the
+            // truncation is attached as `details`, so the model gets an actionable result, not an
+            // `isError` failure. `firstLineSize` is the byte length of the first selected line.
             let line_no = start + 1;
-            return Err(error::invalid(format!(
-                "[Line {line_no} is {}, exceeds the {} read limit. Use bash: sed -n '{line_no}p' {} | head -c {}]",
-                format_size(t.info.total_bytes),
+            let first_line_bytes = window.first().map_or(0, |l| l.len());
+            let out = format!(
+                "[Line {line_no} is {}, exceeds {} limit. Use bash: sed -n '{line_no}p' {} | head -c {}]",
+                format_size(first_line_bytes),
                 format_size(self.opts.max_bytes),
                 input.path,
                 self.opts.max_bytes,
-            )));
+            );
+            return Ok(ToolResult {
+                content: vec![Content::text(out)],
+                details: serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok(),
+                terminate: false,
+            });
         }
 
         let mut out = t.content.clone();
         if t.info.truncated {
             let shown_to = start + t.info.output_lines;
-            out.push_str(&format!(
-                "\n\n[Showing lines {}-{} of {}. Use offset={} to continue.]",
-                start + 1,
-                shown_to,
-                total,
-                shown_to + 1
-            ));
+            // Pi distinguishes line- vs byte-triggered truncation in the continuation note
+            // (read.ts:300-304): the byte case appends the `(50.0KB limit)` qualifier.
+            if t.info.truncated_by == Some(crate::truncate::TruncatedBy::Lines) {
+                out.push_str(&format!(
+                    "\n\n[Showing lines {}-{} of {}. Use offset={} to continue.]",
+                    start + 1,
+                    shown_to,
+                    total,
+                    shown_to + 1
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\n\n[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
+                    start + 1,
+                    shown_to,
+                    total,
+                    format_size(self.opts.max_bytes),
+                    shown_to + 1
+                ));
+            }
         } else if end < total {
             let remaining = total - end;
             out.push_str(&format!(
@@ -138,40 +166,52 @@ impl Tool for ReadTool {
             ));
         }
 
+        // Pi only sets `details` on the firstLineExceeds and truncated branches; the user-limited
+        // and plain branches leave it `undefined` (read.ts:294-315). Mirror that.
+        let details = if t.info.truncated {
+            serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok()
+        } else {
+            None
+        };
         Ok(ToolResult {
             content: vec![Content::text(out)],
-            details: serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok(),
+            details,
             terminate: false,
         })
     }
 }
 
 impl ReadTool {
+    /// Faithful port of Pi's image read path (read.ts:247-263). The model-facing note is
+    /// `Read image file [<mime>]` plus any processing hints, and — for non-vision models — the
+    /// image block is STILL returned together with a warning note (Pi keeps the block; the request
+    /// layer strips it later). `mime` is the magic-byte-detected type.
     async fn read_image(
         &self,
-        abs: &std::path::Path,
+        bytes: Vec<u8>,
         mime: crate::ops::ImageMime,
     ) -> Result<ToolResult, ToolError> {
-        let bytes = self.fs.read(abs).await?;
-
-        if !self.opts.supports_images {
-            let note = format!(
-                "Read image file [{}] ({}).\n[Current model does not support images; image data omitted.]",
-                mime.mime(),
-                format_size(bytes.len())
-            );
-            return Ok(ToolResult {
-                content: vec![Content::text(note)],
-                details: None,
-                terminate: false,
-            });
-        }
+        // `getNonVisionImageNote` (read.ts:87-92).
+        let non_vision_note: Option<&str> = if self.opts.supports_images {
+            None
+        } else {
+            Some("[Current model does not support images. The image will be omitted from this request.]")
+        };
 
         #[cfg(feature = "inline-images")]
         {
-            match encode_image(&bytes, self.opts.max_image_dim) {
-                Ok((data, out_mime)) => {
-                    let note = format!("Read image file [{}].", mime.mime());
+            match image_proc::process_image(&bytes, mime, self.opts.max_image_dim) {
+                image_proc::Processed::Ok { data, mime: out_mime, hints } => {
+                    // `Read image file [${processed.mimeType}]` + hints + nonVisionNote.
+                    let mut note = format!("Read image file [{out_mime}]");
+                    for h in &hints {
+                        note.push('\n');
+                        note.push_str(h);
+                    }
+                    if let Some(nv) = non_vision_note {
+                        note.push('\n');
+                        note.push_str(nv);
+                    }
                     Ok(ToolResult {
                         content: vec![
                             Content::text(note),
@@ -181,17 +221,35 @@ impl ReadTool {
                         terminate: false,
                     })
                 }
-                Err(e) => Err(error::invalid(format!("Could not decode image: {e}"))),
+                image_proc::Processed::Failed { message } => {
+                    // `Read image file [${mimeType}]\n${message}` + nonVisionNote (no image block).
+                    let mut note = format!("Read image file [{}]\n{message}", mime.mime());
+                    if let Some(nv) = non_vision_note {
+                        note.push('\n');
+                        note.push_str(nv);
+                    }
+                    Ok(ToolResult {
+                        content: vec![Content::text(note)],
+                        details: None,
+                        terminate: false,
+                    })
+                }
             }
         }
 
         #[cfg(not(feature = "inline-images"))]
         {
-            let note = format!(
+            // Image decoding is only compiled out under `--no-default-features`; the default build
+            // always inlines. Surface the detected type + a build note (and the non-vision note).
+            let mut note = format!(
                 "Read image file [{}] ({}).\n[Image inlining is not enabled in this build (feature `inline-images`).]",
                 mime.mime(),
                 format_size(bytes.len())
             );
+            if let Some(nv) = non_vision_note {
+                note.push('\n');
+                note.push_str(nv);
+            }
             Ok(ToolResult {
                 content: vec![Content::text(note)],
                 details: None,
@@ -201,24 +259,213 @@ impl ReadTool {
     }
 }
 
+/// Image normalize+resize, a faithful port of Pi's `processImage`/`resizeImageInProcess`
+/// (image-process.ts, image-resize-core.ts). Decodes via the `image` crate (already in the
+/// lockfile), applies EXIF orientation, preserves the source format when it is an inline-supported
+/// type, converts unsupported types (bmp) to PNG, and resizes to fit 2000x2000 / 4.5MB of base64.
 #[cfg(feature = "inline-images")]
-fn encode_image(bytes: &[u8], max_dim: u32) -> Result<(String, String), String> {
+mod image_proc {
+    use super::base64_encode;
+    use crate::ops::ImageMime;
+    use image::{DynamicImage, ImageDecoder};
     use std::io::Cursor;
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
-    let (w, h) = (img.width(), img.height());
-    let resized = if w > max_dim || h > max_dim {
-        img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
-    let mut out = Cursor::new(Vec::new());
-    resized
-        .write_to(&mut out, image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    Ok((base64_encode(&out.into_inner()), "image/png".to_string()))
+
+    /// 4.5MB of base64 payload — Pi's headroom below Anthropic's 5MB limit (image-resize-core.ts:22).
+    const MAX_B64_BYTES: usize = 4_718_592;
+    /// Pi's default JPEG quality (image-resize-core.ts:28) + its descending retry ladder (line 122).
+    const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+
+    pub enum Processed {
+        Ok { data: String, mime: String, hints: Vec<String> },
+        Failed { message: String },
+    }
+
+    struct Resized {
+        data: String,
+        mime: String,
+        original_width: u32,
+        original_height: u32,
+        width: u32,
+        height: u32,
+        was_resized: bool,
+    }
+
+    /// `processImage` (image-process.ts:72-119) with `autoResizeImages = true` (Pi's read default).
+    pub fn process_image(orig: &[u8], detected: ImageMime, max_dim: u32) -> Processed {
+        // normalizeImage (image-process.ts:49-65): keep supported inline formats as-is; convert
+        // everything else (bmp) to PNG, baking EXIF orientation in.
+        let (norm_bytes, norm_mime, converted_from): (std::borrow::Cow<[u8]>, &str, Option<&str>) =
+            match detected {
+                ImageMime::Png => (std::borrow::Cow::Borrowed(orig), "image/png", None),
+                ImageMime::Jpeg => (std::borrow::Cow::Borrowed(orig), "image/jpeg", None),
+                ImageMime::Gif => (std::borrow::Cow::Borrowed(orig), "image/gif", None),
+                ImageMime::Webp => (std::borrow::Cow::Borrowed(orig), "image/webp", None),
+                ImageMime::Bmp => match convert_to_png(orig) {
+                    Some(png) => (std::borrow::Cow::Owned(png), "image/png", Some("image/bmp")),
+                    None => {
+                        return Processed::Failed {
+                            message:
+                                "[Image omitted: could not be converted to a supported inline image format.]"
+                                    .to_string(),
+                        }
+                    }
+                },
+            };
+
+        match resize_image(&norm_bytes, norm_mime, max_dim) {
+            Some(r) => {
+                let mut hints: Vec<String> = Vec::new();
+                // conversionHint (image-process.ts:67-70).
+                if let Some(from) = converted_from
+                    && from != r.mime
+                {
+                    hints.push(format!("[Image converted from {from} to {}.]", r.mime));
+                }
+                // formatDimensionNote (image-resize.ts:116-123).
+                if r.was_resized {
+                    let scale = f64::from(r.original_width) / f64::from(r.width.max(1));
+                    hints.push(format!(
+                        "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {:.2} \
+                         to map to original image.]",
+                        r.original_width, r.original_height, r.width, r.height, scale
+                    ));
+                }
+                Processed::Ok { data: r.data, mime: r.mime, hints }
+            }
+            None => Processed::Failed {
+                message: "[Image omitted: could not be resized below the inline image size limit.]"
+                    .to_string(),
+            },
+        }
+    }
+
+    /// `convertImageBytesToPng` (image-convert.ts:4-24): decode (EXIF-oriented) + re-encode PNG.
+    fn convert_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+        let img = decode_with_orientation(bytes)?;
+        encode_png(&img)
+    }
+
+    /// Decode + apply EXIF orientation (Pi `applyExifOrientation`). The `image` crate exposes the
+    /// decoder's EXIF orientation (0.25+) which we bake into the pixels.
+    fn decode_with_orientation(bytes: &[u8]) -> Option<DynamicImage> {
+        let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+        let mut decoder = reader.into_decoder().ok()?;
+        let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = DynamicImage::from_decoder(decoder).ok()?;
+        img.apply_orientation(orientation);
+        Some(img)
+    }
+
+    fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
+        Some(buf)
+    }
+
+    fn encode_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let rgb = img.to_rgb8();
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+        enc.encode_image(&rgb).ok()?;
+        Some(buf)
+    }
+
+    /// `resizeImageInProcess` (image-resize-core.ts:59-164). Returns `None` only when the image
+    /// cannot be brought under the base64 budget even at 1x1 (or decode fails).
+    fn resize_image(bytes: &[u8], mime: &str, max_dim: u32) -> Option<Resized> {
+        let input_base64_size = bytes.len().div_ceil(3) * 4;
+        let img = decode_with_orientation(bytes)?;
+        let original_width = img.width();
+        let original_height = img.height();
+
+        // Already within all limits ⇒ send the ORIGINAL (normalized) bytes untouched.
+        if original_width <= max_dim
+            && original_height <= max_dim
+            && input_base64_size < MAX_B64_BYTES
+        {
+            return Some(Resized {
+                data: base64_encode(bytes),
+                mime: mime.to_string(),
+                original_width,
+                original_height,
+                width: original_width,
+                height: original_height,
+                was_resized: false,
+            });
+        }
+
+        // Initial target dims, preserving aspect ratio (image-resize-core.ts:96-106).
+        let (mut target_w, mut target_h) = (original_width, original_height);
+        if target_w > max_dim {
+            target_h = ((f64::from(target_h) * f64::from(max_dim)) / f64::from(target_w)).round() as u32;
+            target_w = max_dim;
+        }
+        if target_h > max_dim {
+            target_w = ((f64::from(target_w) * f64::from(max_dim)) / f64::from(target_h)).round() as u32;
+            target_h = max_dim;
+        }
+
+        let (mut cw, mut ch) = (target_w.max(1), target_h.max(1));
+        loop {
+            let resized = img.resize_exact(cw, ch, image::imageops::FilterType::Lanczos3);
+            // Candidate order (image-resize-core.ts:112-115): PNG first, then JPEG by quality.
+            if let Some(png) = encode_png(&resized) {
+                let data = base64_encode(&png);
+                if data.len() < MAX_B64_BYTES {
+                    return Some(Resized {
+                        data,
+                        mime: "image/png".to_string(),
+                        original_width,
+                        original_height,
+                        width: cw,
+                        height: ch,
+                        was_resized: true,
+                    });
+                }
+            }
+            for q in dedup_qualities() {
+                if let Some(jpg) = encode_jpeg(&resized, q) {
+                    let data = base64_encode(&jpg);
+                    if data.len() < MAX_B64_BYTES {
+                        return Some(Resized {
+                            data,
+                            mime: "image/jpeg".to_string(),
+                            original_width,
+                            original_height,
+                            width: cw,
+                            height: ch,
+                            was_resized: true,
+                        });
+                    }
+                }
+            }
+
+            if cw == 1 && ch == 1 {
+                break;
+            }
+            let nw = if cw == 1 { 1 } else { 1.max((f64::from(cw) * 0.75).floor() as u32) };
+            let nh = if ch == 1 { 1 } else { 1.max((f64::from(ch) * 0.75).floor() as u32) };
+            if nw == cw && nh == ch {
+                break;
+            }
+            cw = nw;
+            ch = nh;
+        }
+        None
+    }
+
+    fn dedup_qualities() -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for q in JPEG_QUALITIES {
+            if !out.contains(&q) {
+                out.push(q);
+            }
+        }
+        out
+    }
 }
 
-/// Minimal RFC 4648 base64 (no padding omission); avoids an extra dependency.
+/// Minimal RFC 4648 standard base64 (matches Node's `Buffer.toString("base64")`).
 #[cfg(feature = "inline-images")]
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -248,13 +495,17 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 impl ToolMeta for ReadTool {
+    // Verbatim from Pi (read.ts:212-214). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
     fn description(&self) -> &str {
-        "Read a text file (UTF-8) within a line/byte window, or return an image attachment."
+        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
+         Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB \
+         (whichever is hit first). Use offset/limit for large files. When you need the full file, \
+         continue with offset until complete."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("read: read a file's contents (text window or image).")
+        Some("Read file contents")
     }
     fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `read` to inspect file contents before editing; pass `offset`/`limit` for large files."]
+        &["Use read to examine files instead of cat or sed."]
     }
 }

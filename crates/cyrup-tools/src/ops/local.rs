@@ -114,7 +114,9 @@ impl FsOps for LocalFs {
                 .hidden(!opts.include_hidden)
                 .git_ignore(true)
                 .git_exclude(true)
-                .git_global(false)
+                // Pi runs `rg`/`fd` which honor the user's global gitignore (`~/.gitignore`,
+                // arch-03:404). Mirror that with `git_global(true)`.
+                .git_global(true)
                 .require_git(false)
                 .parents(true)
                 .build();
@@ -210,7 +212,9 @@ fn kill_tree(child: &mut tokio::process::Child) {
 fn exit_from(status: std::process::ExitStatus) -> ExitStatus {
     match status.code() {
         Some(code) => ExitStatus::Exited(code),
-        None => ExitStatus::Killed,
+        // No exit code ⇒ died to a signal we did not send (the cancel/timeout branches break with
+        // their own statuses before reaching here). Pi maps this to `exitCode: null` ⇒ success.
+        None => ExitStatus::Signaled,
     }
 }
 
@@ -239,6 +243,14 @@ impl ProcOps for LocalProc {
     ) -> Result<ExitStatus, ToolError> {
         if spec.shell.program.as_os_str().is_empty() {
             spec.shell = self.shell.clone();
+        }
+        // Pi checks the cwd exists before spawning (bash.ts:70-74) so the model gets an actionable
+        // message instead of a raw spawn error.
+        if tokio::fs::metadata(&spec.cwd).await.is_err() {
+            return Err(error::invalid(format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                error::show(&spec.cwd)
+            )));
         }
         let stdin_command =
             if spec.shell.transport == Transport::Stdin { Some(spec.command.clone()) } else { None };

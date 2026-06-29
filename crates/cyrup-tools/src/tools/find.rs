@@ -72,7 +72,9 @@ impl Tool for FindTool {
         let limit = input.limit.unwrap_or(self.opts.limit);
 
         let mut results: Vec<String> = Vec::new();
-        let mut walk = self.fs.walk(&search_root, WalkOpts::default());
+        // Pi runs `fd --hidden` (find.ts:224): match dotfiles/dot-dirs while still honoring
+        // `.gitignore` (arch-03:430). So include hidden files in the walk.
+        let mut walk = self.fs.walk(&search_root, WalkOpts { include_hidden: true });
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(error::aborted()),
@@ -109,47 +111,58 @@ impl Tool for FindTool {
         }
 
         results.sort();
-        let total = results.len();
-        let limit_reached = total > limit;
-        if limit_reached {
+        if results.len() > limit {
             results.truncate(limit);
         }
+        // Pi: `resultLimitReached = relativized.length >= effectiveLimit` (find.ts:322).
+        let limit_reached = results.len() >= limit;
 
         let joined = results.join("\n");
         let t = truncate_head(&joined, TruncOpts::bytes_only(self.opts.max_bytes));
 
+        // Pi joins notices into ONE bracket (find.ts:327-339).
         let mut text = t.content.clone();
+        let mut notices: Vec<String> = Vec::new();
         if limit_reached {
-            text.push_str(&format!(
-                "\n\n[{limit} result limit reached. Use limit={} to see more.]",
+            notices.push(format!(
+                "{limit} results limit reached. Use limit={} for more, or refine pattern",
                 limit.saturating_mul(2)
             ));
         }
         if t.info.truncated {
-            text.push_str(&format!("\n\n[Output truncated at {}.]", format_size(self.opts.max_bytes)));
+            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
+        }
+        if !notices.is_empty() {
+            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
 
-        let details = FindDetails {
-            truncation: Some(t.info),
-            result_limit_reached: if limit_reached { Some(limit) } else { None },
+        // Pi adds `truncation` only when the byte cap fired and emits `details: undefined` when no
+        // key is set (find.ts:326-344). Mirror that exactly.
+        let result_limit_reached = if limit_reached { Some(limit) } else { None };
+        let truncation = if t.info.truncated { Some(t.info) } else { None };
+        let details = if truncation.is_some() || result_limit_reached.is_some() {
+            serde_json::to_value(FindDetails { truncation, result_limit_reached }).ok()
+        } else {
+            None
         };
 
         Ok(ToolResult {
             content: vec![Content::text(text)],
-            details: serde_json::to_value(details).ok(),
+            details,
             terminate: false,
         })
     }
 }
 
 impl ToolMeta for FindTool {
+    // Verbatim from Pi (find.ts:117-118). DEFAULT_LIMIT=1000, DEFAULT_MAX_BYTES/1024=50. Pi defines
+    // no promptGuidelines for find.
     fn description(&self) -> &str {
-        "Find files by glob (gitignore-aware), returning sorted relative paths."
+        "Search for files by glob pattern. Returns matching file paths relative to the search \
+         directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is \
+         hit first)."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("find: locate files by glob pattern.")
-    }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `find` to locate files by name; a pattern with '/' matches the full relative path."]
+        Some("Find files by glob pattern (respects .gitignore)")
     }
 }

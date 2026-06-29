@@ -33,7 +33,10 @@ unicode-segmentation = { workspace = true }
 image = { workspace = true, optional = true }
 
 [features]
-# Decode/resize images in `read` (arch-03 §6.3, R-03-012). Off by default to keep cold-start lean.
+# Decode/resize images in `read` (arch-03 §6.3, R-03-012). ON by default for strict Pi parity:
+# Pi always returns image attachments from `read` (read.ts:247-263). `image` is already in the
+# lockfile, so enabling it by default adds no new external dependency.
+default = ["inline-images"]
 inline-images = ["dep:image"]
 
 [target."cfg(unix)".dependencies]

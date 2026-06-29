@@ -11,27 +11,44 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-/// A map of per-path async mutexes keyed by a canonicalized path.
+/// A map of per-path async mutexes keyed by a fully-resolved (realpath) path.
 #[derive(Default)]
 pub struct FileMutationLocks {
-    map: DashMap<PathBuf, Arc<Mutex<()>>>,
+    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
+}
+
+/// RAII guard for a per-file mutation lock. On drop it releases the mutex and evicts the map entry
+/// once no other holder/waiter references it (Pi deletes the queue entry when it drains,
+/// file-mutation-queue.ts:57-59), so the lock map cannot grow without bound.
+pub struct MutationGuard {
+    inner: Option<OwnedMutexGuard<()>>,
+    lock: Option<Arc<Mutex<()>>>,
+    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
+    key: PathBuf,
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        // Release the mutex and drop our clone of the Arc *before* the eviction check, so the only
+        // remaining strong refs are the map's plus any genuinely active holders/waiters.
+        self.inner.take();
+        self.lock.take();
+        // `remove_if` runs the predicate while holding the shard lock, so a concurrent `guard()`
+        // that has just cloned the Arc is observed (strong_count > 1) and the entry is kept.
+        self.map.remove_if(&self.key, |_, v| Arc::strong_count(v) == 1);
+    }
 }
 
 impl FileMutationLocks {
     pub fn new() -> Self {
-        Self { map: DashMap::new() }
+        Self { map: Arc::new(DashMap::new()) }
     }
 
-    /// Canonical key: canonicalize the parent dir (it usually exists even for new files) and rejoin
-    /// the file name, so different spellings of the same path share a lock. Falls back to the path.
+    /// Full-symlink-resolved key (Pi `realpath(resolve(filePath))`, file-mutation-queue.ts:16-26).
+    /// Falls back to the (already absolute) path when it does not exist yet — e.g. a `write` to a
+    /// brand-new file — mirroring Pi's ENOENT/ENOTDIR fallback.
     fn key(path: &Path) -> PathBuf {
-        match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
-                Ok(canon) => canon.join(name),
-                Err(_) => path.to_path_buf(),
-            },
-            _ => path.to_path_buf(),
-        }
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
@@ -40,12 +57,17 @@ impl FileMutationLocks {
         &self,
         path: &Path,
         cancel: &CancelToken,
-    ) -> Result<OwnedMutexGuard<()>, ToolError> {
+    ) -> Result<MutationGuard, ToolError> {
         let key = Self::key(path);
-        let lock = self.map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
+        let lock = self.map.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
         tokio::select! {
             _ = cancel.cancelled() => Err(error::aborted()),
-            g = lock.lock_owned() => Ok(g),
+            g = lock.clone().lock_owned() => Ok(MutationGuard {
+                inner: Some(g),
+                lock: Some(lock),
+                map: Arc::clone(&self.map),
+                key,
+            }),
         }
     }
 }

@@ -101,7 +101,7 @@ async fn protected_paths_block_writes_pass_reads() {
         .execute(cid(), serde_json::json!({ "path": "src/main.rs", "content": "fn main(){}" }), CancelToken::new(), noop_sink())
         .await
         .unwrap();
-    assert!(first_text(&ok).contains("Wrote"));
+    assert!(first_text(&ok).contains("Successfully wrote"));
 
     // Reads pass through even for protected paths: pre-create a .env on disk and read it.
     std::fs::write(cwd.join(".env"), "API=abc").unwrap();
@@ -215,7 +215,7 @@ async fn backend_swap_retargets_tools_without_contract_change() {
         .await
         .unwrap();
     // Identical tool contract/output regardless of backend.
-    assert!(first_text(&w).contains("Wrote 6 bytes to out.txt"));
+    assert!(first_text(&w).contains("Successfully wrote 6 bytes to out.txt"));
     assert_eq!(writes.load(Ordering::SeqCst), 1, "write routed through the swapped backend");
     assert_eq!(last_write.lock().unwrap().as_ref().unwrap(), &cwd.join("out.txt"));
 

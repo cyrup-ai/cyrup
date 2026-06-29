@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use shell::{ShellConfig, Transport};
+pub use shell::{shell_env, ShellConfig, Transport};
 
 /// Access mode for [`FsOps::access`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +71,116 @@ impl ImageMime {
             _ => None,
         }
     }
+
+    /// Detect a supported image type from its **magic bytes** (Pi `detectSupportedImageMimeType`,
+    /// mime.ts:6-23). This is content sniffing, not the extension — Pi opens the file and reads the
+    /// header; cyrup sniffs the bytes returned by the (remote-aware) [`FsOps::read`] seam. Animated
+    /// PNG (`acTL` before `IDAT`) and the JPEG `0xFF 0xD8 0xFF 0xF7` (lossless JPEG) variant are
+    /// rejected; BMP headers are structurally validated.
+    pub fn from_magic(buf: &[u8]) -> Option<Self> {
+        const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        if starts_with(buf, &[0xff, 0xd8, 0xff]) {
+            return if buf.get(3) == Some(&0xf7) { None } else { Some(ImageMime::Jpeg) };
+        }
+        if starts_with(buf, &PNG_SIG) {
+            return if is_png(buf) && !is_animated_png(buf) { Some(ImageMime::Png) } else { None };
+        }
+        if starts_with_ascii(buf, 0, b"GIF") {
+            return Some(ImageMime::Gif);
+        }
+        if starts_with_ascii(buf, 0, b"RIFF") && starts_with_ascii(buf, 8, b"WEBP") {
+            return Some(ImageMime::Webp);
+        }
+        if starts_with_ascii(buf, 0, b"BM") && is_bmp(buf) {
+            return Some(ImageMime::Bmp);
+        }
+        None
+    }
+}
+
+fn starts_with(buf: &[u8], bytes: &[u8]) -> bool {
+    buf.len() >= bytes.len() && buf.iter().zip(bytes).all(|(a, b)| a == b)
+}
+
+fn starts_with_ascii(buf: &[u8], offset: usize, text: &[u8]) -> bool {
+    match buf.get(offset..offset + text.len()) {
+        Some(slice) => slice == text,
+        None => false,
+    }
+}
+
+fn read_u16_le(buf: &[u8], off: usize) -> u32 {
+    u32::from(buf.get(off).copied().unwrap_or(0)) + (u32::from(buf.get(off + 1).copied().unwrap_or(0)) << 8)
+}
+
+fn read_u32_be(buf: &[u8], off: usize) -> u32 {
+    (u32::from(buf.get(off).copied().unwrap_or(0)) << 24)
+        | (u32::from(buf.get(off + 1).copied().unwrap_or(0)) << 16)
+        | (u32::from(buf.get(off + 2).copied().unwrap_or(0)) << 8)
+        | u32::from(buf.get(off + 3).copied().unwrap_or(0))
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from(buf.get(off).copied().unwrap_or(0))
+        | (u32::from(buf.get(off + 1).copied().unwrap_or(0)) << 8)
+        | (u32::from(buf.get(off + 2).copied().unwrap_or(0)) << 16)
+        | (u32::from(buf.get(off + 3).copied().unwrap_or(0)) << 24)
+}
+
+/// `isPng` (mime.ts:36-40): IHDR chunk with declared length 13 immediately after the signature.
+fn is_png(buf: &[u8]) -> bool {
+    buf.len() >= 16 && read_u32_be(buf, 8) == 13 && starts_with_ascii(buf, 12, b"IHDR")
+}
+
+/// `isAnimatedPng` (mime.ts:42-55): an `acTL` chunk appearing before the first `IDAT`.
+fn is_animated_png(buf: &[u8]) -> bool {
+    let mut offset = 8usize; // PNG_SIGNATURE.length
+    while offset + 8 <= buf.len() {
+        let chunk_len = read_u32_be(buf, offset) as usize;
+        let chunk_type_offset = offset + 4;
+        if starts_with_ascii(buf, chunk_type_offset, b"acTL") {
+            return true;
+        }
+        if starts_with_ascii(buf, chunk_type_offset, b"IDAT") {
+            return false;
+        }
+        let next = offset.saturating_add(8).saturating_add(chunk_len).saturating_add(4);
+        if next <= offset || next > buf.len() {
+            return false;
+        }
+        offset = next;
+    }
+    false
+}
+
+/// `isBmp` (mime.ts:57-81): structural validation of the BMP/DIB header.
+fn is_bmp(buf: &[u8]) -> bool {
+    if buf.len() < 26 {
+        return false;
+    }
+    let declared_file_size = read_u32_le(buf, 2);
+    let pixel_data_offset = read_u32_le(buf, 10);
+    let dib_header_size = read_u32_le(buf, 14);
+    if declared_file_size != 0 && declared_file_size < 26 {
+        return false;
+    }
+    if pixel_data_offset < 14 + dib_header_size {
+        return false;
+    }
+    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
+        return false;
+    }
+    let (color_planes, bits_per_pixel) = if dib_header_size == 12 {
+        (read_u16_le(buf, 22), read_u16_le(buf, 24))
+    } else if (40..=124).contains(&dib_header_size) {
+        if buf.len() < 30 {
+            return false;
+        }
+        (read_u16_le(buf, 26), read_u16_le(buf, 28))
+    } else {
+        return false;
+    };
+    color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
 }
 
 /// Options for a tree walk (grep/find). Hidden files are skipped by default (ripgrep/fd parity);
@@ -97,10 +207,13 @@ pub struct ExecSpec {
 }
 
 /// Process outcome. `Killed` (cancel) and `TimedOut` are returned as `Ok` so `bash` can craft the
-/// right error while preserving the accumulated output (R-03-023/024).
+/// right error while preserving the accumulated output (R-03-023/024). `Signaled` is a process that
+/// died to an external signal (no exit code) without our cancel — Pi returns `exitCode: null` and
+/// `bash` treats it as **success** with the output preserved (bash.ts:405), distinct from a cancel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitStatus {
     Exited(i32),
+    Signaled,
     Killed,
     TimedOut,
 }

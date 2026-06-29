@@ -76,23 +76,30 @@ impl Tool for WriteTool {
         let bytes = input.content.as_bytes();
         self.fs.write_atomic(&abs, bytes).await?;
 
-        let n = bytes.len();
+        // Pi reports `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte
+        // count, and uses the verb "Successfully wrote" (write.ts:222). Match both exactly.
+        let len_utf16 = input.content.encode_utf16().count();
         Ok(ToolResult {
-            content: vec![Content::text(format!("Wrote {n} bytes to {}", input.path))],
-            details: serde_json::to_value(WriteDetails { bytes_written: n }).ok(),
+            content: vec![Content::text(format!(
+                "Successfully wrote {len_utf16} bytes to {}",
+                input.path
+            ))],
+            details: serde_json::to_value(WriteDetails { bytes_written: len_utf16 }).ok(),
             terminate: false,
         })
     }
 }
 
 impl ToolMeta for WriteTool {
+    // Verbatim from Pi (write.ts:189-192).
     fn description(&self) -> &str {
-        "Create or overwrite a file atomically (creating parent directories as needed)."
+        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. \
+         Automatically creates parent directories."
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("write: create or overwrite a file with the given contents.")
+        Some("Create or overwrite files")
     }
     fn prompt_guidelines(&self) -> &[&str] {
-        &["Use `write` for new files or full rewrites; prefer `edit` for targeted changes."]
+        &["Use write only for new files or complete rewrites."]
     }
 }
