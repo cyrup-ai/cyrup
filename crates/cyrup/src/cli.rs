@@ -84,7 +84,7 @@ pub struct Cli {
     pub verbose: bool,
 
     /// The prompt: bare message words and `@file` references, merged with piped stdin (R-11-006/025).
-    #[arg(trailing_var_arg = true)]
+    #[arg(value_name = "PROMPT")]
     pub positionals: Vec<String>,
 }
 
@@ -241,5 +241,19 @@ mod tests {
         assert!(cli.to_session_config(&dirs, AppMode::Interactive).persist);
         let resume = parse(&["--resume", "/tmp/s.jsonl"]).to_session_config(&dirs, AppMode::Print);
         assert!(resume.persist);
+    }
+
+    #[test]
+    fn model_flag_is_parsed_regardless_of_position() {
+        // Regression: a `-m` placed AFTER the bare prompt must be parsed as the model flag,
+        // not swallowed by the prompt positional (the old `trailing_var_arg` bug silently fell
+        // back to faux).
+        let after = parse(&["-p", "Reply with pong", "-m", "together/moonshotai/Kimi-K2.6"]);
+        assert_eq!(after.model.as_deref(), Some("together/moonshotai/Kimi-K2.6"));
+        assert_eq!(after.positionals, vec!["Reply with pong".to_string()]);
+
+        let before = parse(&["-p", "-m", "together/moonshotai/Kimi-K2.6", "Reply with pong"]);
+        assert_eq!(before.model.as_deref(), Some("together/moonshotai/Kimi-K2.6"));
+        assert_eq!(before.positionals, vec!["Reply with pong".to_string()]);
     }
 }
