@@ -16,8 +16,16 @@ pub trait SessionStore: Send {
     fn is_persisted(&self) -> bool;
     /// Append ONE serialized entry line atomically (R-04-032). No-op in memory.
     fn append_line(&mut self, line: &str) -> Result<(), SessionError>;
-    /// Rewrite the whole file (first flush, migration, clone/fork seeding). No-op in memory.
+    /// Rewrite the whole file (migration / clone eager-seed). No-op in memory.
     fn rewrite(&mut self, header: &SessionHeader, entries: &[Entry]) -> Result<(), SessionError>;
+    /// Exclusive-create the file (header + entries), failing rather than clobbering a pre-existing
+    /// file — Pi's `openSync(file,"wx")` first-flush and `writeFileSync … {flag:"wx"}` fork header
+    /// (`session-manager.ts:927,1489`). This is the duplicate-header guard. No-op in memory.
+    fn create_exclusive(
+        &mut self,
+        header: &SessionHeader,
+        entries: &[Entry],
+    ) -> Result<(), SessionError>;
 }
 
 /// Append-only JSONL file backing.
@@ -74,6 +82,38 @@ impl SessionStore for DiskStore {
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
+
+    fn create_exclusive(
+        &mut self,
+        header: &SessionHeader,
+        entries: &[Entry],
+    ) -> Result<(), SessionError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // `create_new` is the atomic exclusive-create equivalent of Pi's `"wx"` flag: if the file
+        // already exists it errors (`AlreadyExists`/EEXIST) instead of overwriting, guarding the
+        // duplicate-header bug (`session-manager.ts:927,1489`). Written directly (no temp+rename)
+        // to mirror Pi, which writes header+entries straight to the freshly-created fd.
+        let mut f = match OpenOptions::new().write(true).create_new(true).open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(SessionError::AlreadyExists(self.path.clone()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut buf = String::new();
+        buf.push_str(&serde_json::to_string(header)?);
+        buf.push('\n');
+        for e in entries {
+            buf.push_str(&e.to_line()?);
+            buf.push('\n');
+        }
+        f.write_all(buf.as_bytes())?;
+        f.flush()?;
+        f.sync_data()?;
+        Ok(())
+    }
 }
 
 /// No-op backing for ephemeral sessions (R-04-027): never touches the filesystem.
@@ -93,6 +133,14 @@ impl SessionStore for MemStore {
     }
 
     fn rewrite(
+        &mut self,
+        _header: &SessionHeader,
+        _entries: &[Entry],
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    fn create_exclusive(
         &mut self,
         _header: &SessionHeader,
         _entries: &[Entry],

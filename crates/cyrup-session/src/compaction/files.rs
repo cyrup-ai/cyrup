@@ -25,20 +25,27 @@ pub struct FileOps {
 }
 
 impl FileOps {
-    /// Scan an assistant message's tool calls for read/write/edit + a `path`-like argument.
+    /// Scan an assistant message's tool calls, tracking the `read`/`write`/`edit` tools' `path`
+    /// argument. Pi `extractFileOpsFromMessage` (`utils.ts:38-55`) matches the tool name with an
+    /// EXACT switch (not a substring) and reads the path ONLY from `args.path`, so an unrelated tool
+    /// (e.g. `multiedit`) or a differently-named path arg is not tracked.
     pub fn absorb_message(&mut self, msg: &Message) {
         if let Message::Assistant(a) = msg {
             for c in &a.content {
-                if let Content::ToolCall(tc) = c {
-                    let name = tc.name.to_lowercase();
-                    if let Some(path) = extract_path(&tc.arguments) {
-                        if name.contains("read") {
+                if let Content::ToolCall(tc) = c
+                    && let Some(path) = extract_path(&tc.arguments)
+                {
+                    match tc.name.as_str() {
+                        "read" => {
                             self.read.insert(path);
-                        } else if name.contains("write") {
+                        }
+                        "write" => {
                             self.written.insert(path);
-                        } else if name.contains("edit") {
+                        }
+                        "edit" => {
                             self.edited.insert(path);
                         }
+                        _ => {}
                     }
                 }
             }
@@ -81,27 +88,25 @@ impl FileOps {
     }
 }
 
-/// Pull a filesystem path from common tool-call argument keys.
+/// Pull the filesystem path from a tool call's `args.path`. Pi reads ONLY `args.path`
+/// (`utils.ts:43`), so no alternate key (`file_path`, `absolutePath`, …) is consulted.
 fn extract_path(args: &serde_json::Map<String, Value>) -> Option<String> {
-    for key in ["path", "file_path", "filePath", "absolutePath", "absolute_path"] {
-        if let Some(s) = args.get(key).and_then(Value::as_str) {
-            return Some(s.to_string());
-        }
-    }
-    None
+    args.get("path").and_then(Value::as_str).map(str::to_string)
 }
 
-/// `"\n\n<read-files>…</read-files>\n\n<modified-files>…</modified-files>"`, or `""` when empty
-/// (R-05-013).
+/// `<read-files>`/`<modified-files>` blocks for the non-empty sections only, prefixed with `\n\n`,
+/// or `""` when both are empty (Pi `formatFileOperations`, `utils.ts:72-82`). Each section is emitted
+/// ONLY when it has entries — never an empty `<read-files></read-files>` block.
 pub fn format_file_operations(read: &[String], modified: &[String]) -> String {
-    if read.is_empty() && modified.is_empty() {
+    let mut sections: Vec<String> = Vec::new();
+    if !read.is_empty() {
+        sections.push(format!("<read-files>\n{}\n</read-files>", read.join("\n")));
+    }
+    if !modified.is_empty() {
+        sections.push(format!("<modified-files>\n{}\n</modified-files>", modified.join("\n")));
+    }
+    if sections.is_empty() {
         return String::new();
     }
-    let mut out = String::new();
-    out.push_str("\n\n<read-files>\n");
-    out.push_str(&read.join("\n"));
-    out.push_str("\n</read-files>\n\n<modified-files>\n");
-    out.push_str(&modified.join("\n"));
-    out.push_str("\n</modified-files>");
-    out
+    format!("\n\n{}", sections.join("\n\n"))
 }

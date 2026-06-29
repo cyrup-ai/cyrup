@@ -7,7 +7,7 @@ use crate::compaction::cutpoint::find_cut_point;
 use crate::compaction::files::FileOps;
 use crate::compaction::settings::CompactionSettings;
 use crate::compaction::tokens::{estimate_context_tokens, TokenCache};
-use crate::context::push_as_message;
+use crate::context::{build_context_messages, push_as_message};
 use crate::entry::{Entry, KnownEntry};
 
 /// The prepared compaction (also the before-compact hook input).
@@ -106,10 +106,12 @@ pub fn prepare_compaction(
         file_ops.absorb_message(m);
     }
 
-    // tokens_before = estimated size of the history portion being summarized.
-    let mut summarized = messages_to_summarize.clone();
-    summarized.extend(turn_prefix_messages.iter().cloned());
-    let tokens_before = estimate_context_tokens(&summarized).tokens;
+    // tokens_before = estimated size of the ENTIRE pre-compaction context being reduced (Pi
+    // `estimateContextTokens(buildSessionContext(pathEntries).messages).tokens`, `compaction.ts:678`),
+    // NOT just the summarized slice — this is the number persisted in `CompactionEntry.tokensBefore`.
+    let refs: Vec<&Entry> = path.iter().collect();
+    let full_context = build_context_messages(&refs);
+    let tokens_before = estimate_context_tokens(&full_context).tokens;
 
     Some(CompactionPreparation {
         first_kept_entry_id,

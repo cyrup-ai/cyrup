@@ -7,29 +7,86 @@ use std::sync::Mutex;
 
 use cyrup_core::{Content, EntryId, Message, StopReason, Usage};
 
+use crate::agent_message::AgentMessage;
 use crate::context::push_as_message;
-use crate::entry::Entry;
+use crate::entry::{Entry, KnownEntry};
 
 /// Images count as this many chars before the `/4` division (Pi parity).
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
-/// Conservative chars/4 estimate for a single message.
+/// UTF-16 code-unit length, matching JavaScript `String.length` (Pi estimates with `.length`,
+/// `compaction.ts:236-296`). Using unicode scalars instead would diverge on non-BMP / multi-byte
+/// text.
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Conservative chars/4 estimate for a single core message (Pi `estimateTokens`,
+/// `compaction.ts:256-296`).
 pub fn estimate_tokens(msg: &Message) -> u32 {
     let blocks = match msg {
         Message::User { content, .. } | Message::ToolResult { content, .. } => content,
         Message::Assistant(a) => &a.content,
     };
     let chars: usize = blocks.iter().map(content_chars).sum();
-    (chars / 4) as u32
+    // Pi rounds UP: `Math.ceil(chars / 4)` (`compaction.ts:264,277,287,291`). Flooring would
+    // systematically under-count every message by up to 1 token and shift the cut-point / trigger.
+    chars.div_ceil(4) as u32
+}
+
+/// Pi `estimateTokens` over the full `AgentMessage` superset (`compaction.ts:256-296`): a
+/// `bashExecution` costs `(command.length + output.length)/4`; a `custom` costs its content
+/// chars/4; core roles match [`estimate_tokens`]. This is what the cut-point walk accumulates, so
+/// it must match Pi's raw per-message estimate (not the rendered LLM text).
+pub fn estimate_agent_message(msg: &AgentMessage) -> u32 {
+    match msg {
+        AgentMessage::Core(m) => estimate_tokens(m),
+        AgentMessage::BashExecution(b) => {
+            // Pi `Math.ceil((command.length + output.length) / 4)` (`compaction.ts:284-287`).
+            (utf16_len(&b.command) + utf16_len(&b.output)).div_ceil(4) as u32
+        }
+        AgentMessage::Custom(c) => custom_content_chars(&c.content).div_ceil(4) as u32,
+    }
+}
+
+/// Pi `estimateTokens` for a `custom_message` entry's content (`custom` role → content chars/4,
+/// `compaction.ts:279-283`). Used by branch budgeting.
+pub fn estimate_custom_message_content(content: &serde_json::Value) -> u32 {
+    // Pi `Math.ceil(chars / 4)` (`compaction.ts:282`).
+    custom_content_chars(content).div_ceil(4) as u32
+}
+
+/// Pi `estimateTokens` for a `branchSummary`/`compactionSummary` message (`summary.length/4`,
+/// `compaction.ts:288-292`).
+pub fn estimate_summary_text(summary: &str) -> u32 {
+    // Pi `Math.ceil(summary.length / 4)` (`compaction.ts:288-292`).
+    utf16_len(summary).div_ceil(4) as u32
+}
+
+/// Chars in a `custom` message `content` (`string | (Text|Image)[]`), per Pi
+/// `estimateTextAndImageContentChars` (`compaction.ts:236-250`).
+fn custom_content_chars(content: &serde_json::Value) -> usize {
+    match content {
+        serde_json::Value::String(s) => utf16_len(s),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .map(|b| match b.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => b.get("text").and_then(serde_json::Value::as_str).map_or(0, utf16_len),
+                Some("image") => ESTIMATED_IMAGE_CHARS,
+                _ => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
 }
 
 fn content_chars(c: &Content) -> usize {
     match c {
-        Content::Text { text, .. } => text.chars().count(),
-        Content::Thinking { thinking, .. } => thinking.chars().count(),
+        Content::Text { text, .. } => utf16_len(text),
+        Content::Thinking { thinking, .. } => utf16_len(thinking),
         Content::ToolCall(tc) => {
-            tc.name.chars().count()
-                + serde_json::to_string(&tc.arguments).map(|s| s.chars().count()).unwrap_or(0)
+            utf16_len(&tc.name)
+                + serde_json::to_string(&tc.arguments).map(|s| utf16_len(&s)).unwrap_or(0)
         }
         Content::Image { .. } => ESTIMATED_IMAGE_CHARS,
     }
@@ -115,6 +172,26 @@ impl TokenCache {
             map.insert(id, est);
         }
         est
+    }
+
+    /// Estimate (chars/4) a `type:"message"` entry's raw `AgentMessage`, memoized by id; `0` for any
+    /// non-message entry. This mirrors Pi `findCutPoint`'s accumulation, which `continue`s past every
+    /// non-`message` entry and estimates `entry.message` directly (`compaction.ts:408-414`).
+    pub fn estimate_message_entry(&self, entry: &Entry) -> u32 {
+        if let Entry::Known(KnownEntry::Message { message, .. }) = entry {
+            let id = entry.id();
+            if let Ok(map) = self.map.lock()
+                && let Some(v) = map.get(&id) {
+                    return *v;
+                }
+            let est = estimate_agent_message(message);
+            if let Ok(mut map) = self.map.lock() {
+                map.insert(id, est);
+            }
+            est
+        } else {
+            0
+        }
     }
 
     /// Drop a cached estimate (only needed on rare entry mutation).

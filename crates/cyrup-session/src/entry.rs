@@ -5,10 +5,12 @@
 //! `serde(tag=…)` + untagged-fallback shape is not expressible with `serde_derive`, so [`Entry`]
 //! hand-implements `Serialize`/`Deserialize` and delegates known variants to [`KnownEntry`].
 
-use cyrup_core::{EntryId, Message, ModelId, ProviderId};
+use cyrup_core::{EntryId, ModelId, ProviderId};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+
+use crate::agent_message::AgentMessage;
 
 /// Fields shared by every tree entry; flattened into each variant on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,7 +36,10 @@ pub enum KnownEntry {
     Message {
         #[serde(flatten)]
         base: EntryBase,
-        message: Message,
+        /// The full Pi `AgentMessage` superset (`user`/`assistant`/`toolResult` plus the
+        /// `bashExecution`/`custom` roles), so bash/custom-role entries parse instead of degrading
+        /// to [`Entry::Unknown`] and being dropped from context (Pi `session-manager.ts:954`).
+        message: AgentMessage,
     },
     ModelChange {
         #[serde(flatten)]

@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use cyrup_core::{EntryId, Message, ModelId, ModelRef, ProviderId, SessionId};
 use serde_json::Value;
 
-use crate::context::{compaction_summary_message, push_as_message, SessionContext};
+use crate::agent_message::AgentMessage;
+use crate::context::{build_context_messages, SessionContext};
 use crate::entry::{Entry, EntryBase, KnownEntry};
+use crate::ids::validate_session_id;
 use crate::error::SessionError;
 use crate::header::SessionHeader;
 use crate::ids::{gen_session_id, gen_short_id, now_ts};
@@ -55,7 +57,13 @@ impl SessionManager {
         layout: &SessionLayout,
         opts: NewSessionOpts,
     ) -> Result<Self, SessionError> {
-        let id = opts.id.unwrap_or_else(gen_session_id);
+        let id = match opts.id {
+            Some(id) => {
+                validate_session_id(id.as_str()).map_err(SessionError::InvalidSessionId)?;
+                id
+            }
+            None => gen_session_id(),
+        };
         let ts = now_ts();
         let mut header = SessionHeader::new(id.clone(), cwd.to_string_lossy(), ts.clone());
         header.parent_session = opts.parent_session;
@@ -96,18 +104,51 @@ impl SessionManager {
         cwd: &Path,
         layout: &SessionLayout,
     ) -> Result<Self, SessionError> {
-        match newest_session_file(layout) {
+        Self::continue_recent_filtered(cwd, layout, false)
+    }
+
+    /// Continue the most recent session, optionally restricting the search to sessions whose header
+    /// cwd matches `cwd` — Pi's `continueRecent` applies this filter when a custom `sessionDir` that
+    /// is not the cwd-default is supplied (`filterCwd`, `session-manager.ts:1426-1434`), so a shared
+    /// directory holding sessions from several projects only resumes the current one. With
+    /// `filter_cwd = false` (the default layout case, where the dir already encodes the cwd) the
+    /// behavior is identical to [`Self::continue_recent`].
+    pub fn continue_recent_filtered(
+        cwd: &Path,
+        layout: &SessionLayout,
+        filter_cwd: bool,
+    ) -> Result<Self, SessionError> {
+        let filter = if filter_cwd { Some(cwd) } else { None };
+        match crate::listing::newest_session(&layout.dir(), filter) {
             Some(path) => Self::open(&path),
             None => Self::create(cwd, layout, NewSessionOpts::default()),
         }
     }
 
-    /// An ephemeral session with no file persistence (R-04-027).
+    /// An ephemeral session with no file persistence (R-04-027). Infallible convenience that takes
+    /// `opts.id` verbatim; use [`Self::try_in_memory`] for Pi's id validation.
     pub fn in_memory(cwd: &Path, opts: NewSessionOpts) -> Self {
         let id = opts.id.unwrap_or_else(gen_session_id);
         let mut header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
         header.parent_session = opts.parent_session;
         Self::assemble(header, cwd.to_path_buf(), Box::new(MemStore), Vec::new(), false)
+    }
+
+    /// An ephemeral session that validates a caller-supplied id, matching Pi: `inMemory` routes
+    /// through the constructor's `assertValidSessionId` (`session-manager.ts:830-831,1437-1439`), so
+    /// a malformed id is rejected for an ephemeral session exactly as for a persisted one. A `None`
+    /// id is generated. Prefer this over [`Self::in_memory`] when the id is caller-supplied.
+    pub fn try_in_memory(cwd: &Path, opts: NewSessionOpts) -> Result<Self, SessionError> {
+        let id = match opts.id {
+            Some(id) => {
+                validate_session_id(id.as_str()).map_err(SessionError::InvalidSessionId)?;
+                id
+            }
+            None => gen_session_id(),
+        };
+        let mut header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
+        header.parent_session = opts.parent_session;
+        Ok(Self::assemble(header, cwd.to_path_buf(), Box::new(MemStore), Vec::new(), false))
     }
 
     /// Fork a source session into a new file under `target_cwd`, copying all source history
@@ -122,14 +163,22 @@ impl SessionManager {
         if entries.is_empty() {
             return Err(SessionError::EmptyFork(src.to_path_buf()));
         }
-        let id = opts.id.unwrap_or_else(gen_session_id);
+        let id = match opts.id {
+            Some(id) => {
+                validate_session_id(id.as_str()).map_err(SessionError::InvalidSessionId)?;
+                id
+            }
+            None => gen_session_id(),
+        };
         let ts = now_ts();
         let mut header = SessionHeader::new(id.clone(), target_cwd.to_string_lossy(), ts.clone());
         header.parent_session =
             Some(opts.parent_session.unwrap_or_else(|| src.to_string_lossy().into_owned()));
         let path = layout.new_file_path(&ts, id.as_str());
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
-        store.rewrite(&header, &entries)?;
+        // Pi `forkFrom` writes the header with `{flag:"wx"}` (`session-manager.ts:1489`) — exclusive
+        // create that refuses to clobber an existing file.
+        store.create_exclusive(&header, &entries)?;
         Ok(Self::assemble(header, target_cwd.to_path_buf(), store, entries, true))
     }
 
@@ -185,10 +234,32 @@ impl SessionManager {
         let mut header = SessionHeader::new(id.clone(), self.cwd.to_string_lossy(), ts.clone());
         header.parent_session =
             self.session_file().map(|p| p.to_string_lossy().into_owned());
+
+        // Pi `createBranchedSession(leafId, { persist:false })` clones WITHOUT touching the disk
+        // (`session-manager.ts:1292-1392`). Mirror that for an in-memory source: produce a
+        // `MemStore`-backed clone with no file write at all (`flushed = false`).
+        if !self.store.is_persisted() {
+            return Ok(Self::assemble(
+                header,
+                self.cwd.clone(),
+                Box::new(MemStore),
+                retained,
+                false,
+            ));
+        }
+
         let path = layout.new_file_path(&ts, id.as_str());
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
-        store.rewrite(&header, &retained)?;
-        Ok(Self::assemble(header, self.cwd.clone(), store, retained, true))
+        // Pi `createBranchedSession` defers the file write until an assistant message exists
+        // (`session-manager.ts:1362-1368`, explicitly to avoid the duplicate-header bug): write
+        // eagerly only when the retained path already contains an assistant, otherwise leave the
+        // file uncreated and let the first assistant append flush it (`flushed = false`).
+        if entries_have_assistant(&retained) {
+            store.rewrite(&header, &retained)?;
+            Ok(Self::assemble(header, self.cwd.clone(), store, retained, true))
+        } else {
+            Ok(Self::assemble(header, self.cwd.clone(), store, retained, false))
+        }
     }
 
     // ---------------------------------------------------------- internal construction --------
@@ -222,15 +293,24 @@ impl SessionManager {
         self.children.clear();
         self.roots.clear();
         self.labels.clear();
+        // Pass 1: id index + labels (so parent existence can be checked in pass 2).
         for (idx, e) in self.entries.iter().enumerate() {
-            let id = e.id();
-            self.by_id.insert(id.clone(), idx);
-            match e.parent_id() {
-                Some(p) => self.children.entry(p).or_default().push(id.clone()),
-                None => self.roots.push(id.clone()),
-            }
+            self.by_id.insert(e.id(), idx);
             if let Entry::Known(KnownEntry::Label { target_id, label, base }) = e {
                 apply_label(&mut self.labels, target_id, label, &base.timestamp);
+            }
+        }
+        // Pass 2: parent→children, promoting roots per Pi `getTree` (`session-manager.ts:1210-1223`):
+        // a `null` parent, a self-parent (`parentId === id`), and an orphan (parent not present)
+        // are ALL treated as roots — so an orphaned subtree is never dropped and a self-parent
+        // never recurses into itself.
+        for e in &self.entries {
+            let id = e.id();
+            match e.parent_id() {
+                Some(p) if p != id && self.by_id.contains_key(&p) => {
+                    self.children.entry(p).or_default().push(id);
+                }
+                _ => self.roots.push(id),
             }
         }
     }
@@ -281,20 +361,31 @@ impl SessionManager {
                 self.store.append_line(&line)?;
             }
         } else if self.has_assistant_message() {
-            // First assistant message → create the file and write everything buffered so far.
-            self.store.rewrite(&self.header, &self.entries)?;
+            // First assistant message → exclusive-create the file and write everything buffered so
+            // far (Pi `_persist` first flush via `openSync(file,"wx")`, `session-manager.ts:926-935`).
+            self.store.create_exclusive(&self.header, &self.entries)?;
             self.flushed = true;
         }
         Ok(())
     }
 
     fn has_assistant_message(&self) -> bool {
-        self.entries.iter().any(|e| {
-            matches!(e, Entry::Known(KnownEntry::Message { message: Message::Assistant(_), .. }))
-        })
+        entries_have_assistant(&self.entries)
     }
 
+    /// Append a core `user`/`assistant`/`toolResult` message (Pi `appendMessage`,
+    /// `session-manager.ts:954`). Backward-compatible: callers still pass a [`cyrup_core::Message`].
     pub fn append_message(&mut self, message: Message) -> Result<EntryId, SessionError> {
+        self.append_agent_message(AgentMessage::Core(message))
+    }
+
+    /// Append any Pi `AgentMessage` (including the `bashExecution`/`custom` roles) inside a
+    /// `type:"message"` entry (Pi `appendMessage(Message | CustomMessage | BashExecutionMessage)`,
+    /// `session-manager.ts:954`).
+    pub fn append_agent_message(
+        &mut self,
+        message: AgentMessage,
+    ) -> Result<EntryId, SessionError> {
         self.push_entry(Entry::known(KnownEntry::Message { base: self.make_base(), message }))
     }
 
@@ -367,9 +458,11 @@ impl SessionManager {
     }
 
     pub fn append_session_info(&mut self, name: &str) -> Result<EntryId, SessionError> {
+        // Pi sanitizes on write: `name.replace(/[\r\n]+/g, " ").trim()` (`session-manager.ts:1031`),
+        // so newlines never corrupt the JSONL line and the persisted bytes match Pi.
         self.push_entry(Entry::known(KnownEntry::SessionInfo {
             base: self.make_base(),
-            name: Some(name.to_string()),
+            name: Some(sanitize_session_name(name)),
         }))
     }
 
@@ -429,18 +522,28 @@ impl SessionManager {
         out
     }
 
-    /// Defensive tree copy for UIs (children sorted by timestamp).
+    /// Defensive tree copy for UIs. Children are sorted by timestamp, but roots are left in
+    /// insertion order: Pi `getTree` sorts only each node's `children` and pushes roots in entry
+    /// order (`session-manager.ts:1210-1234`). Observable only with multiple roots (orphan /
+    /// self-parent entries); a well-formed session has exactly one root.
     pub fn tree(&self) -> Vec<TreeNode> {
-        let mut roots = self.roots.clone();
-        roots.sort_by_key(|id| self.entry(id).and_then(|e| e.base()).map(|b| b.timestamp.clone()));
-        roots.iter().filter_map(|id| self.build_node(id)).collect()
+        let mut visited = std::collections::HashSet::new();
+        self.roots.iter().filter_map(|id| self.build_node(id, &mut visited)).collect()
     }
 
-    fn build_node(&self, id: &EntryId) -> Option<TreeNode> {
+    fn build_node(
+        &self,
+        id: &EntryId,
+        visited: &mut std::collections::HashSet<EntryId>,
+    ) -> Option<TreeNode> {
+        // Cycle guard: a malformed file could still form a non-self loop; never revisit a node.
+        if !visited.insert(id.clone()) {
+            return None;
+        }
         let entry = self.entry(id)?.clone();
         let mut kids = self.children.get(id).cloned().unwrap_or_default();
         kids.sort_by_key(|k| self.entry(k).and_then(|e| e.base()).map(|b| b.timestamp.clone()));
-        let children = kids.iter().filter_map(|k| self.build_node(k)).collect();
+        let children = kids.iter().filter_map(|k| self.build_node(k, visited)).collect();
         Some(TreeNode { entry, children, label: self.label(id).map(str::to_string) })
     }
 
@@ -513,7 +616,6 @@ impl SessionManager {
 
         let mut thinking = "off".to_string();
         let mut model: Option<ModelRef> = None;
-        let mut compaction: Option<&Entry> = None;
         for e in &path {
             if let Entry::Known(k) = e {
                 match k {
@@ -527,53 +629,15 @@ impl SessionManager {
                             model: model_id.clone(),
                         });
                     }
-                    KnownEntry::Message { message: Message::Assistant(a), .. } => {
+                    KnownEntry::Message { message: AgentMessage::Core(Message::Assistant(a)), .. } => {
                         model = Some(a.model_ref());
                     }
-                    KnownEntry::Compaction { .. } => compaction = Some(e),
                     _ => {}
                 }
             }
         }
 
-        let mut messages = Vec::new();
-        match compaction {
-            Some(ce) => {
-                if let Entry::Known(KnownEntry::Compaction {
-                    summary,
-                    first_kept_entry_id,
-                    tokens_before,
-                    ..
-                }) = ce
-                {
-                    messages.push(compaction_summary_message(summary, *tokens_before));
-                    if let Some(cpos) = path.iter().position(|e| std::ptr::eq(*e, ce)) {
-                        if let Some(before) = path.get(..cpos) {
-                            let mut keeping = false;
-                            for e in before {
-                                if &e.id() == first_kept_entry_id {
-                                    keeping = true;
-                                }
-                                if keeping {
-                                    push_as_message(&mut messages, e);
-                                }
-                            }
-                        }
-                        if let Some(after) = path.get(cpos + 1..) {
-                            for e in after {
-                                push_as_message(&mut messages, e);
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                for e in &path {
-                    push_as_message(&mut messages, e);
-                }
-            }
-        }
-
+        let messages = build_context_messages(&path);
         SessionContext { messages, thinking_level: thinking, model }
     }
 
@@ -614,13 +678,47 @@ impl SessionManager {
         &self.cwd
     }
 
-    /// The most recent session display name (latest `SessionInfo`, R-04-028).
+    /// The most recent session display name (latest `SessionInfo`, R-04-028). Pi `getSessionName`
+    /// (`session-manager.ts:1045-1056`) returns the latest `session_info` name trimmed, mapping an
+    /// empty/whitespace-only name to `None` (an empty name explicitly clears the title).
     pub fn session_name(&self) -> Option<String> {
-        self.entries.iter().rev().find_map(|e| match e {
-            Entry::Known(KnownEntry::SessionInfo { name, .. }) => name.clone(),
+        // Stop at the latest `session_info`; its (possibly empty) name decides the result.
+        let latest = self.entries.iter().rev().find_map(|e| match e {
+            Entry::Known(KnownEntry::SessionInfo { name, .. }) => {
+                Some(name.as_deref().unwrap_or(""))
+            }
             _ => None,
-        })
+        })?;
+        let trimmed = latest.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
+}
+
+/// Pi name sanitization for `appendSessionInfo`: collapse any run of `\r`/`\n` to a single space,
+/// then trim (`session-manager.ts:1031`).
+fn sanitize_session_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_newline_run = false;
+    for ch in name.chars() {
+        if ch == '\r' || ch == '\n' {
+            if !in_newline_run {
+                out.push(' ');
+                in_newline_run = true;
+            }
+        } else {
+            out.push(ch);
+            in_newline_run = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Whether any entry is a core `assistant` message (Pi's `hasAssistant` guard,
+/// `session-manager.ts:915,1362`). Drives the deferred first-flush.
+fn entries_have_assistant(entries: &[Entry]) -> bool {
+    entries.iter().any(|e| {
+        matches!(e, Entry::Known(KnownEntry::Message { message, .. }) if message.is_core_assistant())
+    })
 }
 
 fn apply_label(
@@ -678,24 +776,4 @@ fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> 
 
     let header = header.ok_or_else(|| SessionError::NotASession { path: path.to_path_buf() })?;
     Ok((header, entries, recovered))
-}
-
-/// Newest `*.jsonl` file (by mtime) in the layout's cwd directory, if any (R-04-017).
-fn newest_session_file(layout: &SessionLayout) -> Option<PathBuf> {
-    let dir = layout.dir();
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let modified = match entry.metadata().and_then(|m| m.modified()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if best.as_ref().is_none_or(|(t, _)| modified >= *t) {
-            best = Some((modified, path));
-        }
-    }
-    best.map(|(_, p)| p)
 }

@@ -19,16 +19,53 @@ pub fn to_current(header: &mut SessionHeader, entries: &mut [Entry]) -> bool {
     if v < 2 {
         v1_to_v2(entries);
     }
-    // v2→v3 renames the legacy `hookMessage` message role to `custom`. cyrup-core's `Message`
-    // model has no `hookMessage` arm, so such roles already round-trip as `Entry::Unknown`; no
-    // structural change is required here beyond bumping the version.
+    if v < 3 {
+        v2_to_v3(entries);
+    }
     header.version = Some(CURRENT_VERSION);
     true
+}
+
+/// v2→v3: rename the legacy `hookMessage` message role to `custom` so it stays in LLM context (Pi
+/// `migrateV2ToV3`, `session-manager.ts:255-270`). A `hookMessage`-role message fails core parsing
+/// and is held as [`Entry::Unknown`]; after the rename it re-parses into the `custom`
+/// [`crate::agent_message::AgentMessage`] arm and once again contributes to context / cut-points.
+fn v2_to_v3(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        let Entry::Unknown(v) = e else { continue };
+        let is_message = v.get("type").and_then(Value::as_str) == Some("message");
+        let is_hook = v
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            == Some("hookMessage");
+        if !is_message || !is_hook {
+            continue;
+        }
+        if let Some(role) = v
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|m| m.get_mut("role"))
+        {
+            *role = Value::String("custom".to_string());
+        }
+        if let Ok(known) = serde_json::from_value::<KnownEntry>(v.clone()) {
+            *e = Entry::Known(known);
+        }
+    }
 }
 
 /// v1→v2: mint collision-checked 8-hex ids and chain `parentId` linearly (each entry's parent is
 /// the previous entry). Entries that already carry an id keep it. Legacy id-less entries (stored
 /// verbatim as `Entry::Unknown`) are given an id + parent and re-typed if their `type` is known.
+///
+/// A v1 `compaction` entry referenced its first-kept entry by numeric `firstKeptEntryIndex`; Pi
+/// `migrateV1ToV2` (`session-manager.ts:241-250`) resolves that index into the freshly-id'd entry
+/// array's `firstKeptEntryId` and drops the index field, otherwise the entry can never parse as a
+/// `Compaction` and the compaction boundary is lost in context building. Pi's index is taken over
+/// the **header-inclusive** file array (the `type:"session"` line is at index 0); cyrup's `entries`
+/// slice excludes the header, so the equivalent cyrup position is `firstKeptEntryIndex - 1` (index
+/// 0 ⇒ the session header ⇒ no conversion, mirroring Pi's `targetEntry.type !== "session"` guard).
 fn v1_to_v2(entries: &mut [Entry]) {
     let mut used: HashSet<EntryId> = entries
         .iter()
@@ -41,6 +78,9 @@ fn v1_to_v2(entries: &mut [Entry]) {
         })
         .collect();
 
+    // Ids assigned so far, by cyrup position, so a `compaction` can resolve its (earlier)
+    // `firstKeptEntryIndex` target the same way Pi reads `entries[index].id` mid-pass.
+    let mut assigned: Vec<EntryId> = Vec::with_capacity(entries.len());
     let mut prev: Option<EntryId> = None;
     for e in entries.iter_mut() {
         match e {
@@ -70,7 +110,9 @@ fn v1_to_v2(entries: &mut [Entry]) {
                             obj.insert("parentId".to_string(), Value::Null);
                         }
                     }
-                    // Re-type now that the entry is well-formed (e.g. a v1 `message`).
+                    convert_first_kept_index(obj, &assigned);
+                    // Re-type now that the entry is well-formed (e.g. a v1 `message` or the
+                    // just-converted `compaction`).
                     if let Ok(known) = serde_json::from_value::<KnownEntry>(Value::Object(obj.clone()))
                     {
                         *e = Entry::Known(known);
@@ -78,8 +120,34 @@ fn v1_to_v2(entries: &mut [Entry]) {
                 }
             }
         }
-        prev = Some(e.id());
+        let id = e.id();
+        assigned.push(id.clone());
+        prev = Some(id);
     }
+}
+
+/// Convert a v1 `compaction` entry's numeric `firstKeptEntryIndex` into a `firstKeptEntryId` using
+/// the already-assigned ids, then remove the index field (Pi `session-manager.ts:240-249`). The
+/// target is always an earlier entry (the first-kept entry precedes the appended compaction), so it
+/// is present in `assigned`; a `0` index (the session header) or an unresolved index drops the
+/// field without setting an id — exactly as Pi skips when `targetEntry` is the session entry.
+fn convert_first_kept_index(obj: &mut serde_json::Map<String, Value>, assigned: &[EntryId]) {
+    if obj.get("type").and_then(Value::as_str) != Some("compaction") {
+        return;
+    }
+    let Some(idx) = obj.get("firstKeptEntryIndex").and_then(Value::as_u64) else {
+        return;
+    };
+    // Header-inclusive (Pi) index → cyrup position; index 0 is the session header.
+    if let Some(pos) = (idx as usize).checked_sub(1)
+        && let Some(target) = assigned.get(pos)
+    {
+        obj.insert(
+            "firstKeptEntryId".to_string(),
+            Value::String(target.to_string()),
+        );
+    }
+    obj.remove("firstKeptEntryIndex");
 }
 
 fn mint_unique(used: &HashSet<EntryId>) -> EntryId {

@@ -14,6 +14,7 @@
 //! (arch-06) lives in [`prompt`].
 #![forbid(unsafe_code)]
 
+pub mod agent_message;
 pub mod compaction;
 pub mod context;
 pub mod entry;
@@ -31,12 +32,16 @@ pub use compaction::{
     serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionHooks,
     CompactionReason, CompactionSettings, NoHooks, Summarizer,
 };
+pub use agent_message::{AgentMessage, BashExecutionMessage, CustomRoleMessage};
 pub use context::SessionContext;
 pub use entry::{Entry, EntryBase, KnownEntry};
 pub use error::SessionError;
 pub use header::{SessionHeader, CURRENT_VERSION};
 pub use layout::{encode_cwd, SessionLayout, SessionsRoot};
-pub use listing::{list, list_all, resolve, SessionInfo, SessionSelector};
+pub use listing::{
+    list, list_all, list_all_in_dir, list_all_with_progress, list_in_dir, newest_session, resolve,
+    SessionInfo, SessionListProgress, SessionSelector,
+};
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
 pub use prompt::{
     apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,

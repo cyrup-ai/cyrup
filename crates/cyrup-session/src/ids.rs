@@ -18,6 +18,31 @@ pub fn gen_session_id() -> SessionId {
     SessionId::from(uuid::Uuid::now_v7().to_string())
 }
 
+/// Validate a caller-supplied session id (Pi `assertValidSessionId`, `session-manager.ts:207-213`):
+/// non-empty, only `[A-Za-z0-9._-]`, and first/last char alphanumeric. `Err` carries Pi's message.
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    fn alnum(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+    }
+    let bytes = id.as_bytes();
+    let ok = match bytes {
+        [] => false,
+        [only] => alnum(*only),
+        [first, mid @ .., last] => {
+            alnum(*first)
+                && alnum(*last)
+                && mid.iter().all(|&b| alnum(b) || matches!(b, b'.' | b'_' | b'-'))
+        }
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("Session id must be non-empty, contain only alphanumeric characters, '-', '_', and \
+'.', and start and end with an alphanumeric character"
+            .to_string())
+    }
+}
+
 /// Current time as an RFC3339 string.
 pub fn now_ts() -> String {
     time::OffsetDateTime::now_utc()

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
+use cyrup_session::agent_message::AgentMessage;
 use cyrup_session::{
     Entry, KnownEntry, NewSessionOpts, SessionLayout, SessionManager, SessionSelector,
 };
@@ -197,7 +198,9 @@ fn a04_4_fork_and_clone() {
 
 fn first_text_of_leaf(m: &SessionManager) -> String {
     match m.leaf_entry() {
-        Some(Entry::Known(KnownEntry::Message { message, .. })) => first_text(message),
+        Some(Entry::Known(KnownEntry::Message { message: AgentMessage::Core(m), .. })) => {
+            first_text(m)
+        }
         _ => String::new(),
     }
 }

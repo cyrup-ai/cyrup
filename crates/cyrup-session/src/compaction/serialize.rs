@@ -1,51 +1,53 @@
 //! Transcript serialization for summarization (arch-05 §6.6, R-05-012/025). Renders role-labeled
 //! lines so the model summarizes rather than continues the conversation; tool results are truncated
 //! to 2000 chars per-result before assembly (bounded peak memory). Exported for extensions (R-05-023).
+//! Byte-1:1 with Pi `serializeConversation` (`utils.ts:109-162`): parts joined with `\n\n`, tool-call
+//! args joined with `, ` and calls joined with `; `, arg values JSON-encoded, empty lines skipped.
 
 use cyrup_core::{Content, Message};
 
 /// Per-tool-result truncation budget, in characters (Pi parity).
 const TOOL_RESULT_LIMIT: usize = 2000;
 
-/// Render `messages` to the plain-text transcript form used for summarization (R-05-012).
+/// Render `messages` to the plain-text transcript form used for summarization (Pi
+/// `serializeConversation`, `utils.ts:109-162`).
 pub fn serialize_conversation(messages: &[Message]) -> String {
-    let mut out = String::new();
+    let mut parts: Vec<String> = Vec::new();
     for m in messages {
         match m {
             Message::User { content, .. } => {
-                push_line(&mut out, "[User]:", &text_of(content));
+                // Pi joins user text blocks with "" (no separator).
+                let body = join_text(content, "");
+                if !body.is_empty() {
+                    parts.push(format!("[User]: {body}"));
+                }
             }
             Message::Assistant(a) => {
                 let thinking = thinking_of(&a.content);
                 if !thinking.is_empty() {
-                    push_line(&mut out, "[Assistant thinking]:", &thinking);
+                    parts.push(format!("[Assistant thinking]: {thinking}"));
                 }
-                let text = text_of(&a.content);
+                let text = join_text(&a.content, "\n");
                 if !text.is_empty() {
-                    push_line(&mut out, "[Assistant]:", &text);
+                    parts.push(format!("[Assistant]: {text}"));
                 }
                 let calls = tool_calls_of(&a.content);
                 if !calls.is_empty() {
-                    push_line(&mut out, "[Assistant tool calls]:", &calls);
+                    parts.push(format!("[Assistant tool calls]: {calls}"));
                 }
             }
             Message::ToolResult { content, .. } => {
-                let truncated = truncate(&text_of(content));
-                push_line(&mut out, "[Tool result]:", &truncated);
+                let body = join_text(content, "");
+                if !body.is_empty() {
+                    parts.push(format!("[Tool result]: {}", truncate(&body)));
+                }
             }
         }
     }
-    out
+    parts.join("\n\n")
 }
 
-fn push_line(out: &mut String, label: &str, body: &str) {
-    out.push_str(label);
-    out.push(' ');
-    out.push_str(body);
-    out.push('\n');
-}
-
-fn text_of(content: &[Content]) -> String {
+fn join_text(content: &[Content], sep: &str) -> String {
     content
         .iter()
         .filter_map(|c| match c {
@@ -53,7 +55,7 @@ fn text_of(content: &[Content]) -> String {
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(sep)
 }
 
 fn thinking_of(content: &[Content]) -> String {
@@ -72,26 +74,24 @@ fn tool_calls_of(content: &[Content]) -> String {
         .iter()
         .filter_map(|c| match c {
             Content::ToolCall(tc) => {
-                // Pi `ToolCall.arguments` is always an object (types.ts:348); render `k=v` pairs.
+                // Pi: `${k}=${JSON.stringify(v)}` joined with ", " (args), calls joined with "; ".
                 let args = tc
                     .arguments
                     .iter()
                     .map(|(k, v)| format!("{k}={}", render_arg(v)))
                     .collect::<Vec<_>>()
-                    .join("; ");
+                    .join(", ");
                 Some(format!("{}({args})", tc.name))
             }
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join("; ")
 }
 
+/// `JSON.stringify(value)`: strings are quoted, objects/arrays/numbers/bools/null are compact JSON.
 fn render_arg(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
+    serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
 }
 
 /// Truncate a tool-result body to [`TOOL_RESULT_LIMIT`] chars, appending a marker (R-05-025).
@@ -102,5 +102,5 @@ fn truncate(s: &str) -> String {
     }
     let kept: String = s.chars().take(TOOL_RESULT_LIMIT).collect();
     let remaining = total - TOOL_RESULT_LIMIT;
-    format!("{kept}\n[... {remaining} more characters truncated]")
+    format!("{kept}\n\n[... {remaining} more characters truncated]")
 }

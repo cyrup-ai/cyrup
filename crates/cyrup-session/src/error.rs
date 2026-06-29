@@ -21,6 +21,8 @@ pub enum SessionError {
     AmbiguousSelector { prefix: String, n: usize },
     #[error("entry not found: {0}")]
     EntryNotFound(EntryId),
+    #[error("{0}")]
+    InvalidSessionId(String),
     #[error("cannot fork: source empty/invalid: {0}")]
     EmptyFork(PathBuf),
     #[error("session file already exists: {0}")]

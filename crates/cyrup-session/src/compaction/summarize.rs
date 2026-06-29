@@ -13,29 +13,108 @@ use crate::compaction::files::format_file_operations;
 use crate::compaction::prepare::CompactionPreparation;
 use crate::compaction::serialize::serialize_conversation;
 
-/// System prompt steering the model to summarize rather than continue (R-05-012).
-pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a summarization assistant. You are given a \
-transcript of a coding conversation and must produce a concise, structured summary that preserves \
-all information needed to continue the work. Do not continue the conversation; only summarize it.";
+/// System prompt steering the model to summarize rather than continue (R-05-012). Byte-1:1 with Pi
+/// `SUMMARIZATION_SYSTEM_PROMPT` (`utils.ts:168-170`).
+pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task \
+is to read a conversation between a user and an AI assistant, then produce a structured summary \
+following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any \
+questions in the conversation. ONLY output the structured summary.";
 
-/// Required-section structure (R-05-013).
-const FORMAT_INSTRUCTIONS: &str = "Produce a structured markdown summary with EXACTLY these \
-sections:\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### \
-Blocked\n## Key Decisions\n## Next Steps\n## Critical Context\n\nBe specific and preserve file \
-paths, identifiers, and decisions with their rationale.";
+/// Initial summarization prompt (R-05-008). Byte-1:1 with Pi `SUMMARIZATION_PROMPT`
+/// (`compaction.ts:460-491`).
+pub const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a \
+structured context checkpoint summary that another LLM will use to continue the work.
 
-/// Initial summarization prompt (R-05-008).
-pub const SUMMARIZATION_PROMPT: &str = FORMAT_INSTRUCTIONS;
+Use this EXACT format:
 
-/// Iterative-update prompt when a previous summary exists (R-05-008/012).
-pub const UPDATE_SUMMARIZATION_PROMPT: &str = "Update the previous summary to incorporate the new \
-conversation below, keeping the same section structure.\n\nProduce a structured markdown summary \
-with EXACTLY these sections:\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### \
-In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n## Critical Context";
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
-/// Prompt for the turn-prefix half of a split-turn compaction (R-05-006).
-pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "Summarize the following partial turn concisely, \
-capturing its goal, what was attempted, and any important context for continuing it.";
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or \"(none)\" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or \"(none)\" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// Iterative-update prompt when a previous summary exists (R-05-008/012). Byte-1:1 with Pi
+/// `UPDATE_SUMMARIZATION_PROMPT` (`compaction.ts:493-530`).
+pub const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to \
+incorporate into the existing summary provided in <previous-summary> tags.
+
+Update the existing structured summary with new information. RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed
+- UPDATE \"Next Steps\" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Use this EXACT format:
+
+## Goal
+[Preserve existing goals, add new ones if the task expanded]
+
+## Constraints & Preferences
+- [Preserve existing, add new ones discovered]
+
+## Progress
+### Done
+- [x] [Include previously done items AND newly completed items]
+
+### In Progress
+- [ ] [Current work - update based on progress]
+
+### Blocked
+- [Current blockers - remove if resolved]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Next Steps
+1. [Update based on current state]
+
+## Critical Context
+- [Preserve important context, add new if needed]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// Prompt for the turn-prefix half of a split-turn compaction (R-05-006). Byte-1:1 with Pi
+/// `TURN_PREFIX_SUMMARIZATION_PROMPT` (`compaction.ts:737-750`).
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large \
+to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.";
 
 /// A single non-streaming summarization request (arch-05 §3.6).
 pub struct SummarizationRequest<'a> {
@@ -105,9 +184,11 @@ fn model_ref(model: &Model) -> ModelRef {
     }
 }
 
-/// `min(floor(0.8*reserve), model.max_tokens)` (treating a zero `max_tokens` as unbounded).
-fn compute_max_tokens(reserve: u32, model_max: u32) -> u32 {
-    let from_reserve = (u64::from(reserve) * 4 / 5) as u32;
+/// `min(floor(frac*reserve), model.max_tokens)` (treating a zero `max_tokens` as unbounded).
+/// `frac` is `(num, den)`: history summaries use `0.8` (Pi `compaction.ts:578-581`); the turn-prefix
+/// half uses `0.5` (Pi `compaction.ts:863-866`).
+fn compute_max_tokens_frac(reserve: u32, model_max: u32, num: u64, den: u64) -> u32 {
+    let from_reserve = (u64::from(reserve) * num / den) as u32;
     if model_max == 0 {
         from_reserve.max(1)
     } else {
@@ -156,7 +237,12 @@ pub async fn generate_summary<S: Summarizer>(
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text: prompt,
-        max_tokens: compute_max_tokens(reserve, u32::try_from(model.max_tokens).unwrap_or(u32::MAX)),
+        max_tokens: compute_max_tokens_frac(
+            reserve,
+            u32::try_from(model.max_tokens).unwrap_or(u32::MAX),
+            4,
+            5,
+        ),
         model: model_ref(model),
         thinking: ModelThinkingLevel::Off,
     };
@@ -184,7 +270,12 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text: prompt,
-        max_tokens: compute_max_tokens(reserve, u32::try_from(model.max_tokens).unwrap_or(u32::MAX)),
+        max_tokens: compute_max_tokens_frac(
+            reserve,
+            u32::try_from(model.max_tokens).unwrap_or(u32::MAX),
+            1,
+            2,
+        ),
         model: model_ref(model),
         thinking: ModelThinkingLevel::Off,
     };

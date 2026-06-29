@@ -84,7 +84,11 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         if !s.enabled {
             return false;
         }
-        let msgs = prepare::messages_for(path);
+        // Estimate over the actual built context (Pi passes `estimateContextTokens(builtContext)`,
+        // `compaction.ts:225-228`), which differs from a raw entry map when a compaction is on the
+        // path or there is no assistant usage to anchor the estimate.
+        let refs: Vec<&Entry> = path.iter().collect();
+        let msgs = crate::context::build_context_messages(&refs);
         let est = estimate_context_tokens(&msgs);
         est.tokens > window.saturating_sub(s.reserve_tokens)
     }
@@ -224,7 +228,13 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                     if !user_wants_summary && settings.skip_prompt {
                         (None, false) // R-05-018: skip generation
                     } else {
-                        let prep = prepare_branch_entries(&collection.entries, settings.reserve_tokens);
+                        // Budget = model context window − reserve (Pi `branch-summarization.ts:304-307`),
+                        // NOT a flat reserve_tokens — this keeps far more branch history than a bare
+                        // reserve would.
+                        let budget = u32::try_from(model.context_window)
+                            .unwrap_or(u32::MAX)
+                            .saturating_sub(settings.reserve_tokens);
+                        let prep = prepare_branch_entries(&collection.entries, budget);
                         if prep.messages.is_empty() {
                             (None, false)
                         } else {
@@ -232,7 +242,6 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                                 &self.summarizer,
                                 &prep,
                                 model,
-                                settings.reserve_tokens,
                                 cancel.clone(),
                             )
                             .await?;

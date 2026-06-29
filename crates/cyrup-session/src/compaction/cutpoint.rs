@@ -1,10 +1,9 @@
 //! The deterministic cut-point algorithm (arch-05 §3.3/§6.2, R-05-005/006/007). Pure, no I/O.
 //!
 //! The cut MUST NOT fall between a tool call and its tool result: `ToolResult` entries are never
-//! valid cut points, so the first-kept boundary always snaps to a user/assistant/custom/summary
-//! entry, keeping a tool call and its following results on the same side.
-
-use cyrup_core::Message;
+//! valid cut points, so the first-kept boundary always snaps to a user/assistant/bash/custom/summary
+//! entry, keeping a tool call and its following results on the same side. Mirrors Pi
+//! `findValidCutPoints`/`findTurnStartIndex`/`findCutPoint` (`compaction.ts:305-454`).
 
 use crate::compaction::tokens::TokenCache;
 use crate::entry::{Entry, KnownEntry};
@@ -20,20 +19,42 @@ pub struct CutPoint {
     pub is_split_turn: bool,
 }
 
-/// Whether an entry may serve as a cut boundary. Everything except a `ToolResult` message qualifies
-/// (a tool result must stay with the assistant call that produced it).
+/// Whether an entry may serve as a cut boundary (Pi `findValidCutPoints`, `compaction.ts:305-343`):
+/// a `message` entry whose role is NOT `toolResult`, a `branch_summary` entry, or a `custom_message`
+/// entry. `model_change`/`thinking_level_change`/`compaction`/`custom`/`label`/`session_info` are
+/// explicitly NOT valid.
 fn is_valid_cut_point(entry: &Entry) -> bool {
-    !matches!(
+    matches!(
         entry,
-        Entry::Known(KnownEntry::Message { message: Message::ToolResult { .. }, .. })
+        Entry::Known(KnownEntry::Message { message, .. }) if !message.is_tool_result()
+    ) || matches!(
+        entry,
+        Entry::Known(KnownEntry::BranchSummary { .. } | KnownEntry::CustomMessage { .. })
     )
 }
 
-fn is_user_entry(entry: &Entry) -> bool {
-    matches!(entry, Entry::Known(KnownEntry::Message { message: Message::User { .. }, .. }))
+/// Whether an entry starts a turn (Pi `findTurnStartIndex`, `compaction.ts:350-365`): a
+/// `branch_summary`/`custom_message` entry (user-role messages), or a `message` entry with role
+/// `user` or `bashExecution`.
+fn is_turn_start_entry(entry: &Entry) -> bool {
+    match entry {
+        Entry::Known(KnownEntry::BranchSummary { .. } | KnownEntry::CustomMessage { .. }) => true,
+        Entry::Known(KnownEntry::Message { message, .. }) => message.is_turn_start(),
+        _ => false,
+    }
 }
 
-/// Valid cut boundaries (indices) in `[start, end)`; never a `ToolResult` (R-05-005).
+/// Whether the cut entry is a core `user` message (Pi `compaction.ts:446`: only role `user` makes a
+/// non-split cut — a `bashExecution` is treated as a split-turn start).
+fn is_core_user_entry(entry: &Entry) -> bool {
+    matches!(
+        entry,
+        Entry::Known(KnownEntry::Message { message, .. })
+            if matches!(message, crate::agent_message::AgentMessage::Core(cyrup_core::Message::User { .. }))
+    )
+}
+
+/// Valid cut boundaries (indices) in `[start, end)` (R-05-005).
 pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut i = start;
@@ -47,12 +68,12 @@ pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec
     out
 }
 
-/// First user entry at or before `idx` (turn start), bounded by `start`.
+/// First turn-start entry at or before `idx` (Pi `findTurnStartIndex`), bounded by `start`.
 pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<usize> {
     let mut i = idx.min(entries.len());
     loop {
         if let Some(e) = entries.get(i)
-            && is_user_entry(e) {
+            && is_turn_start_entry(e) {
                 return Some(i);
             }
         if i <= start {
@@ -62,8 +83,9 @@ pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<us
     }
 }
 
-/// Walk backward from `end` accumulating `estimate_tokens` until `keep_recent_tokens` is reached,
-/// then snap to the nearest valid cut point at or after that entry. Mirrors Pi `findCutPoint`.
+/// Walk backward from `end` accumulating per-message estimates until `keep_recent_tokens` is reached,
+/// snap to the nearest valid cut point at or after that entry, then fold leading non-message entries
+/// into the kept region. Mirrors Pi `findCutPoint` (`compaction.ts:392-454`).
 pub fn find_cut_point(
     entries: &[Entry],
     cache: &TokenCache,
@@ -72,40 +94,54 @@ pub fn find_cut_point(
     keep_recent_tokens: u32,
 ) -> CutPoint {
     let valid = find_valid_cut_points(entries, start, end);
+    if valid.is_empty() {
+        return CutPoint { first_kept_index: start, turn_start_index: None, is_split_turn: false };
+    }
 
-    // Walk backward, summing per-entry estimates until we cross the keep-recent budget.
+    // Walk backward, summing per-MESSAGE estimates (Pi `continue`s past non-message entries) until
+    // we cross the keep-recent budget.
     let mut acc: u32 = 0;
-    let mut cut_idx = start;
-    let mut crossed = false;
+    // Default: keep from the first valid message (Pi `cutPoints[0]`).
+    let mut cut_idx = valid.first().copied().unwrap_or(start);
     let mut i = end;
     while i > start {
         i -= 1;
-        if let Some(e) = entries.get(i) {
-            acc = acc.saturating_add(cache.estimate_entry(e));
+        let Some(e) = entries.get(i) else { continue };
+        if !matches!(e, Entry::Known(KnownEntry::Message { .. })) {
+            continue;
         }
+        acc = acc.saturating_add(cache.estimate_message_entry(e));
         if acc >= keep_recent_tokens {
-            cut_idx = i;
-            crossed = true;
+            // Snap to the closest valid cut point at or after this entry.
+            if let Some(&v) = valid.iter().find(|&&v| v >= i) {
+                cut_idx = v;
+            }
             break;
         }
     }
-    if !crossed {
-        cut_idx = start;
+
+    // Back-scan: fold any leading non-message entries (model/thinking change, custom_message,
+    // branch_summary, …) into the kept region, stopping at a compaction or a message
+    // (Pi `compaction.ts:429-442`).
+    while cut_idx > start {
+        match entries.get(cut_idx - 1) {
+            Some(Entry::Known(KnownEntry::Compaction { .. }))
+            | Some(Entry::Known(KnownEntry::Message { .. })) => break,
+            Some(_) => cut_idx -= 1,
+            None => break,
+        }
     }
 
-    // Snap to the nearest valid cut point at or after `cut_idx`; absent one, keep nothing extra.
-    let first_kept = valid.iter().copied().find(|&v| v >= cut_idx).unwrap_or(end);
-
-    // Split-turn iff the cut entry is not a user message and a turn start exists before it.
-    let is_user = entries.get(first_kept).is_some_and(is_user_entry);
+    // Split-turn iff the cut entry is not a core `user` message and a prior turn start exists.
+    let is_user = entries.get(cut_idx).is_some_and(is_core_user_entry);
     let (is_split_turn, turn_start_index) = if is_user {
         (false, None)
     } else {
-        match find_turn_start(entries, first_kept, start) {
-            Some(ts) if ts < first_kept => (true, Some(ts)),
+        match find_turn_start(entries, cut_idx, start) {
+            Some(ts) if ts < cut_idx => (true, Some(ts)),
             _ => (false, None),
         }
     };
 
-    CutPoint { first_kept_index: first_kept, turn_start_index, is_split_turn }
+    CutPoint { first_kept_index: cut_idx, turn_start_index, is_split_turn }
 }

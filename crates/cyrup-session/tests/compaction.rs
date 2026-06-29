@@ -21,6 +21,7 @@ use cyrup_session::compaction::summarize::{
 };
 use cyrup_session::compaction::tokens::TokenCache;
 use cyrup_session::compaction::{branch, CompactionError};
+use cyrup_session::agent_message::AgentMessage;
 use cyrup_session::{
     BranchSummarySettings, Compactor, CompactionSettings, Entry, EntryBase, KnownEntry,
     NewSessionOpts, NoHooks, SessionLayout, SessionManager,
@@ -100,7 +101,7 @@ fn msg_entry(id: &str, parent: Option<&str>, message: Message) -> Entry {
             parent_id: parent.map(EntryId::from),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
         },
-        message,
+        message: AgentMessage::Core(message),
     })
 }
 
@@ -260,8 +261,8 @@ fn a05_2_cut_never_splits_tool_call_from_result() {
     // user, assistant(tool call), tool result, assistant(final).
     let entries = vec![
         msg_entry("e0", None, user("do the thing with enough words to matter here")),
-        msg_entry("e1", Some("e0"), assistant_tool("read_file", "src/main.rs")),
-        msg_entry("e2", Some("e1"), tool_result("read_file", "src/main.rs", "fn main() {}")),
+        msg_entry("e1", Some("e0"), assistant_tool("read", "src/main.rs")),
+        msg_entry("e2", Some("e1"), tool_result("read", "src/main.rs", "fn main() {}")),
         msg_entry("e3", Some("e2"), assistant("done with a short final answer here")),
     ];
     let cache = TokenCache::default();
@@ -271,7 +272,10 @@ fn a05_2_cut_never_splits_tool_call_from_result() {
     assert!(
         !matches!(
             entries.get(cut.first_kept_index),
-            Some(Entry::Known(KnownEntry::Message { message: Message::ToolResult { .. }, .. }))
+            Some(Entry::Known(KnownEntry::Message {
+                message: AgentMessage::Core(Message::ToolResult { .. }),
+                ..
+            }))
         ),
         "first kept entry must not be a tool result"
     );
@@ -428,10 +432,10 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
 
     // First batch: read a.rs, edit c.rs.
     m.append_message(user("first batch start with enough words to matter here now")).unwrap();
-    m.append_message(assistant_tool("read_file", "a.rs")).unwrap();
-    m.append_message(tool_result("read_file", "a.rs", "contents")).unwrap();
-    m.append_message(assistant_tool("edit_file", "c.rs")).unwrap();
-    m.append_message(tool_result("edit_file", "c.rs", "ok")).unwrap();
+    m.append_message(assistant_tool("read", "a.rs")).unwrap();
+    m.append_message(tool_result("read", "a.rs", "contents")).unwrap();
+    m.append_message(assistant_tool("edit", "c.rs")).unwrap();
+    m.append_message(tool_result("edit", "c.rs", "ok")).unwrap();
     m.append_message(user("first batch end with enough words to matter here now ok")).unwrap();
     m.append_message(assistant("first batch reply with enough words to matter here ok")).unwrap();
 
@@ -443,8 +447,8 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
 
     // Second batch: read b.rs.
     m.append_message(user("second batch start with enough words to matter here now ok")).unwrap();
-    m.append_message(assistant_tool("read_file", "b.rs")).unwrap();
-    m.append_message(tool_result("read_file", "b.rs", "more")).unwrap();
+    m.append_message(assistant_tool("read", "b.rs")).unwrap();
+    m.append_message(tool_result("read", "b.rs", "more")).unwrap();
     m.append_message(user("second batch end with enough words to matter here now okay")).unwrap();
     m.append_message(assistant("second batch reply with enough words to matter here ok")).unwrap();
 
@@ -668,10 +672,10 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     let cwd = PathBuf::from("/proj/a05_10");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
     m.append_message(user("start with enough words to matter here now okay then")).unwrap();
-    m.append_message(assistant_tool("read_file", "src/lib.rs")).unwrap();
-    m.append_message(tool_result("read_file", "src/lib.rs", "code")).unwrap();
-    m.append_message(assistant_tool("edit_file", "src/main.rs")).unwrap();
-    m.append_message(tool_result("edit_file", "src/main.rs", "ok")).unwrap();
+    m.append_message(assistant_tool("read", "src/lib.rs")).unwrap();
+    m.append_message(tool_result("read", "src/lib.rs", "code")).unwrap();
+    m.append_message(assistant_tool("edit", "src/main.rs")).unwrap();
+    m.append_message(tool_result("edit", "src/main.rs", "ok")).unwrap();
     m.append_message(user("end with enough words to matter here now okay then done")).unwrap();
     m.append_message(assistant("reply with enough words to matter here now okay done")).unwrap();
 
