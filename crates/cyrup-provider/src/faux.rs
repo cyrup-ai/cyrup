@@ -236,12 +236,7 @@ fn events_for(message: AssistantMessage) -> Vec<StreamEvent> {
             Content::Image { .. } => {}
         }
     }
-    let reason = message.stop_reason;
-    if matches!(reason, StopReason::Error | StopReason::Aborted) {
-        events.push(StreamEvent::Error { reason, error: message });
-    } else {
-        events.push(StreamEvent::Done { reason, message });
-    }
+    events.push(StreamEvent::terminal(message));
     events
 }
 

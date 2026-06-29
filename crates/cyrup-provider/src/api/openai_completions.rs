@@ -1313,12 +1313,9 @@ where
         message.error_message = Some("Stream ended without finish_reason".to_string());
     }
 
-    let terminal = if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-        StreamEvent::Error { reason: message.stop_reason, error: message }
-    } else {
-        StreamEvent::Done { reason: message.stop_reason, message }
-    };
-    sink.send(terminal).await;
+    // `StreamEvent::terminal` narrows `stop_reason` into the `done`/`error` reason (error/aborted →
+    // error terminal, everything else → done) exactly as before, but with Pi's narrowed reason types.
+    sink.send(StreamEvent::terminal(message)).await;
 }
 
 /// Process one decoded chunk. Returns `false` if the consumer dropped the stream.

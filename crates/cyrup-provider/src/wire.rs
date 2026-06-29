@@ -122,7 +122,7 @@ impl Provider for WireProvider {
                         StopReason::Error,
                         format!("provider '{id}' is not configured (no credential or env key)"),
                     );
-                    sink.send(StreamEvent::Error { reason: msg.stop_reason, error: msg }).await;
+                    sink.send(StreamEvent::terminal(msg)).await;
                     return;
                 }
                 Err(e) => {
@@ -313,7 +313,7 @@ mod tests {
                 error_message: None,
                 timestamp: 0,
             };
-            sink.send(StreamEvent::Done { reason: StopReason::ToolUse, message: msg }).await;
+            sink.send(StreamEvent::terminal(msg)).await;
         }
     }
 
@@ -480,7 +480,7 @@ mod tests {
                 error_message: None,
                 timestamp: 0,
             };
-            sink.send(StreamEvent::Done { reason: StopReason::Stop, message: msg }).await;
+            sink.send(StreamEvent::terminal(msg)).await;
         }
     }
 

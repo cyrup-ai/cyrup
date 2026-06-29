@@ -139,7 +139,9 @@ impl ProviderError {
         api: Option<ApiId>,
     ) -> StreamEvent {
         let error = self.into_error_message(provider, model, api);
-        StreamEvent::Error { reason: error.stop_reason, error }
+        // `into_error_message` always sets `stop_reason ∈ {error, aborted}`, so `terminal` routes to
+        // the `error` terminal with the matching narrowed [`ErrorReason`].
+        StreamEvent::terminal(error)
     }
 }
 
@@ -147,6 +149,7 @@ impl ProviderError {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::stream::ErrorReason;
 
     #[test]
     fn taxonomy_codes() {
@@ -163,7 +166,7 @@ mod tests {
         let ev = ProviderError::Aborted.into_error_event("p".into(), "m", Some("test-api".into()));
         match ev {
             StreamEvent::Error { reason, error } => {
-                assert_eq!(reason, StopReason::Aborted);
+                assert_eq!(reason, ErrorReason::Aborted);
                 assert_eq!(error.stop_reason, StopReason::Aborted);
                 assert_eq!(error.api.to_string(), "test-api");
                 assert_eq!(error.error_message.as_deref(), Some("aborted"));
@@ -181,7 +184,7 @@ mod tests {
         );
         match ev {
             StreamEvent::Error { reason, error } => {
-                assert_eq!(reason, StopReason::Error);
+                assert_eq!(reason, ErrorReason::Error);
                 assert_eq!(error.stop_reason, StopReason::Error);
             }
             _ => panic!("expected error terminal"),

@@ -619,7 +619,7 @@ impl StreamFn for BlockingStreamFn {
         let tail = futures::stream::once(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let message = faux_assistant_message(vec![faux_text("late")], StopReason::Stop);
-            StreamEvent::Done { reason: message.stop_reason, message }
+            StreamEvent::terminal(message)
         });
         let start = StreamEvent::Start {
             partial: faux_assistant_message(Vec::new(), StopReason::Stop),

@@ -58,10 +58,9 @@ impl StreamFn for ProviderStreamFn {
                     StopReason::Error,
                     format!("no model '{}' in provider catalog", model.model),
                 );
-                Box::pin(futures::stream::iter(vec![StreamEvent::Error {
-                    reason: err.stop_reason,
-                    error: err,
-                }]))
+                // `err.stop_reason` is `Error`, so `terminal` builds the `error` terminal with the
+                // matching narrowed `ErrorReason`.
+                Box::pin(futures::stream::iter(vec![StreamEvent::terminal(err)]))
             }
         }
     }

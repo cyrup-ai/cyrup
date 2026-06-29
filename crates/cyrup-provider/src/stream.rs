@@ -70,6 +70,66 @@ pub struct StreamOptions {
     pub tool_choice: Option<ToolChoice>,
 }
 
+/// Terminal-`done` reason. Pi narrows the `done` event's `reason` to
+/// `Extract<StopReason, "stop" | "length" | "toolUse">` (Pi types.ts:464), so cyrup mirrors that
+/// with a dedicated enum rather than the full [`StopReason`] (arch-01 §3.3). `rename_all="camelCase"`
+/// makes the wire bytes byte-1:1 with the matching [`StopReason`] values: `"stop"`, `"length"`,
+/// `"toolUse"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DoneReason {
+    Stop,
+    Length,
+    ToolUse,
+}
+
+/// Terminal-`error` reason. Pi narrows the `error` event's `reason` to
+/// `Extract<StopReason, "aborted" | "error">` (Pi types.ts:465), mirrored here (arch-01 §3.3).
+/// `rename_all="camelCase"` makes the wire bytes byte-1:1 with the matching [`StopReason`] values:
+/// `"error"`, `"aborted"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorReason {
+    Error,
+    Aborted,
+}
+
+impl From<DoneReason> for StopReason {
+    fn from(reason: DoneReason) -> Self {
+        match reason {
+            DoneReason::Stop => StopReason::Stop,
+            DoneReason::Length => StopReason::Length,
+            DoneReason::ToolUse => StopReason::ToolUse,
+        }
+    }
+}
+
+impl From<ErrorReason> for StopReason {
+    fn from(reason: ErrorReason) -> Self {
+        match reason {
+            ErrorReason::Error => StopReason::Error,
+            ErrorReason::Aborted => StopReason::Aborted,
+        }
+    }
+}
+
+impl TryFrom<StopReason> for DoneReason {
+    /// A non-`done` [`StopReason`] (`error`/`aborted`) carries the [`ErrorReason`] it maps to, so the
+    /// caller can route it straight to the `error` terminal without a separate lookup (and without
+    /// ever panicking).
+    type Error = ErrorReason;
+
+    fn try_from(reason: StopReason) -> Result<Self, ErrorReason> {
+        match reason {
+            StopReason::Stop => Ok(DoneReason::Stop),
+            StopReason::Length => Ok(DoneReason::Length),
+            StopReason::ToolUse => Ok(DoneReason::ToolUse),
+            StopReason::Error => Err(ErrorReason::Error),
+            StopReason::Aborted => Err(ErrorReason::Aborted),
+        }
+    }
+}
+
 /// One streaming event (func-01 §8.1; 1:1 with Pi `AssistantMessageEvent`, types.ts:453-465).
 ///
 /// Ordering (func-01 §8.2): first event is `Start`; each content block at `content_index` follows
@@ -116,15 +176,29 @@ pub enum StreamEvent {
     /// `ToolCall`'s derived impl, which tolerates the extra `type` key.
     #[serde(rename = "toolcall_end")]
     ToolCallEnd { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
-    /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse}; `message.stop_reason` matches.
+    /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse} (Pi narrows the `done` reason
+    /// to `Extract<StopReason,"stop"|"length"|"toolUse">`, types.ts:464); `message.stop_reason`
+    /// matches.
     #[serde(rename = "done")]
-    Done { reason: StopReason, message: AssistantMessage },
-    /// Terminal: error/abort. `reason` ∈ {error, aborted}; the final message is keyed `error` (Pi).
+    Done { reason: DoneReason, message: AssistantMessage },
+    /// Terminal: error/abort. `reason` ∈ {error, aborted} (Pi narrows the `error` reason to
+    /// `Extract<StopReason,"aborted"|"error">`, types.ts:465); the final message is keyed `error`.
     #[serde(rename = "error")]
-    Error { reason: StopReason, error: AssistantMessage },
+    Error { reason: ErrorReason, error: AssistantMessage },
 }
 
 impl StreamEvent {
+    /// Build the correct terminal event for a final `message`, narrowing `message.stop_reason` into a
+    /// [`DoneReason`] (`done` terminal) or an [`ErrorReason`] (`error` terminal). The mapping is total
+    /// and never panics: `error`/`aborted` route to the `error` terminal, every other reason to the
+    /// `done` terminal — matching Pi's `done`/`error` split (types.ts:464-465).
+    pub fn terminal(message: AssistantMessage) -> Self {
+        match DoneReason::try_from(message.stop_reason) {
+            Ok(reason) => StreamEvent::Done { reason, message },
+            Err(reason) => StreamEvent::Error { reason, error: message },
+        }
+    }
+
     /// The final message iff this is a terminal event (func-01 R-01-023).
     pub fn terminal_message(&self) -> Option<&AssistantMessage> {
         match self {
@@ -212,7 +286,7 @@ fn synth_terminal_less_message() -> AssistantMessage {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use cyrup_core::{ToolCallId, Usage};
@@ -277,11 +351,11 @@ mod tests {
                 "toolcall_delta",
             ),
             (
-                StreamEvent::Done { reason: StopReason::Stop, message: p.clone() },
+                StreamEvent::Done { reason: DoneReason::Stop, message: p.clone() },
                 "done",
             ),
             (
-                StreamEvent::Error { reason: StopReason::Error, error: p.clone() },
+                StreamEvent::Error { reason: ErrorReason::Error, error: p.clone() },
                 "error",
             ),
         ];
@@ -322,5 +396,72 @@ mod tests {
         assert!(tc.starts_with("\"toolCall\":{\"type\":\"toolCall\""), "{tc}");
         let back: StreamEvent = serde_json::from_str(&s).expect("roundtrip");
         assert_eq!(back, ev);
+    }
+
+    /// Gap 3: the terminal `reason` is narrowed to Pi's `Extract<StopReason,…>` subsets
+    /// (types.ts:464-465: `done.reason ∈ {"stop","length","toolUse"}`,
+    /// `error.reason ∈ {"error","aborted"}`) yet the emitted bytes stay byte-1:1 with the old full
+    /// [`StopReason`] strings — and every value round-trips.
+    #[test]
+    fn terminal_reasons_are_pi_narrowed_subsets_and_byte_stable() {
+        let p = empty_partial();
+        // `done` reasons serialize EXACTLY as the matching `StopReason` did before the narrowing.
+        let done_cases = [
+            (DoneReason::Stop, StopReason::Stop, "stop"),
+            (DoneReason::Length, StopReason::Length, "length"),
+            (DoneReason::ToolUse, StopReason::ToolUse, "toolUse"),
+        ];
+        for (reason, stop, wire) in done_cases {
+            let ev = StreamEvent::Done { reason, message: p.clone() };
+            let v = serde_json::to_value(&ev).expect("serialize");
+            assert_eq!(v["type"], "done");
+            assert_eq!(v["reason"], wire, "done reason wire byte for {reason:?}");
+            // Byte-identical to the full-`StopReason` encoding it replaced.
+            assert_eq!(v["reason"], serde_json::to_value(stop).expect("stop"));
+            let back: StreamEvent = serde_json::from_value(v).expect("roundtrip");
+            assert_eq!(back, ev);
+        }
+        // `error` reasons likewise.
+        let err_cases = [
+            (ErrorReason::Error, StopReason::Error, "error"),
+            (ErrorReason::Aborted, StopReason::Aborted, "aborted"),
+        ];
+        for (reason, stop, wire) in err_cases {
+            let ev = StreamEvent::Error { reason, error: p.clone() };
+            let v = serde_json::to_value(&ev).expect("serialize");
+            assert_eq!(v["type"], "error");
+            assert_eq!(v["reason"], wire, "error reason wire byte for {reason:?}");
+            assert_eq!(v["reason"], serde_json::to_value(stop).expect("stop"));
+            let back: StreamEvent = serde_json::from_value(v).expect("roundtrip");
+            assert_eq!(back, ev);
+        }
+    }
+
+    /// `StreamEvent::terminal` routes by `stop_reason`: stop/length/toolUse → `done` with the
+    /// matching [`DoneReason`]; error/aborted → `error` with the matching [`ErrorReason`]. Total and
+    /// never panics.
+    #[test]
+    fn terminal_routes_stop_reason_without_panic() {
+        let mk = |stop: StopReason| {
+            let mut m = empty_partial();
+            m.stop_reason = stop;
+            m
+        };
+        match StreamEvent::terminal(mk(StopReason::Stop)) {
+            StreamEvent::Done { reason: DoneReason::Stop, .. } => {}
+            other => panic!("expected done/stop, got {other:?}"),
+        }
+        match StreamEvent::terminal(mk(StopReason::ToolUse)) {
+            StreamEvent::Done { reason: DoneReason::ToolUse, .. } => {}
+            other => panic!("expected done/toolUse, got {other:?}"),
+        }
+        match StreamEvent::terminal(mk(StopReason::Error)) {
+            StreamEvent::Error { reason: ErrorReason::Error, .. } => {}
+            other => panic!("expected error/error, got {other:?}"),
+        }
+        match StreamEvent::terminal(mk(StopReason::Aborted)) {
+            StreamEvent::Error { reason: ErrorReason::Aborted, .. } => {}
+            other => panic!("expected error/aborted, got {other:?}"),
+        }
     }
 }
