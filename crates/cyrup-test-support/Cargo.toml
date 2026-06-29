@@ -1,6 +1,6 @@
 [package]
 name = "cyrup-test-support"
-description = "Shared test harness: faux provider, headless AgentSession harness, golden recorders (arch-00 §11)"
+description = "Shared test harness: faux/scripted provider, headless AgentSession harness, golden recorder, differential + JSONL-interop runners, fixtures (arch-00 §11)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,4 +16,22 @@ workspace = true
 cyrup-core = { workspace = true }
 cyrup-provider = { workspace = true, features = ["faux"] }
 cyrup-agent = { workspace = true }
+cyrup-session = { workspace = true }
 cyrup-session-svc = { workspace = true }
+cyrup-config = { workspace = true }
+cyrup-tools = { workspace = true }
+cyrup-resources = { workspace = true }
+cyrup-ext = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+similar = { workspace = true }
+ratatui = "0.30.2"
+
+[dev-dependencies]
+tokio = { workspace = true }
