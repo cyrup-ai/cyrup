@@ -115,6 +115,31 @@ impl ProviderError {
         matches!(self, ProviderError::Aborted)
     }
 
+    /// A best-effort clone preserving the variant + `Display`. [`ProviderError`] is intentionally not
+    /// `Clone` (its boxed sources are not), so this reproduces an equivalent error — flattening
+    /// opaque boxed causes to their message — for fanning a single deduplicated result out to
+    /// concurrent awaiters (see [`crate::utils::refresh::RefreshDedup`]). The taxonomy [`code`] is
+    /// preserved for every variant whose code is realizable without its original source; the two
+    /// fully-opaque introspection variants (`Auth`/`Core`) collapse to `Decode` (they do not arise on
+    /// the model-refresh fetch path).
+    ///
+    /// [`code`]: ProviderError::code
+    pub fn reproduce(&self) -> ProviderError {
+        match self {
+            ProviderError::UnknownProvider(p) => ProviderError::UnknownProvider(p.clone()),
+            ProviderError::NoApiImpl(a) => ProviderError::NoApiImpl(a.clone()),
+            ProviderError::ModelSource(e) => ProviderError::ModelSource(e.to_string().into()),
+            ProviderError::Http { status, message } => {
+                ProviderError::Http { status: *status, message: message.clone() }
+            }
+            ProviderError::Transport(e) => ProviderError::Transport(e.to_string().into()),
+            ProviderError::Decode(s) => ProviderError::Decode(s.clone()),
+            ProviderError::Aborted => ProviderError::Aborted,
+            ProviderError::Auth(e) => ProviderError::Decode(e.to_string()),
+            ProviderError::Core(e) => ProviderError::Decode(e.to_string()),
+        }
+    }
+
     /// Build the terminal error `AssistantMessage` for this failure (func-01 R-01-045). Aborts use
     /// `StopReason::Aborted`; every other failure uses `StopReason::Error`. `api` is the producing
     /// wire-protocol id (Pi sets `output.api = model.api` even on the error path). The message is a

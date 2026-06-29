@@ -17,7 +17,9 @@ use std::sync::Arc;
 pub mod compat;
 
 /// Concrete wire-protocol implementations (one `ApiImpl` per submodule).
+pub mod anthropic_messages;
 pub mod openai_completions;
+pub mod openai_responses;
 
 /// Producer side of the provider stream channel. `ApiImpl::run` pushes the EXISTING
 /// `cyrup_provider::StreamEvent` here; the receiver is wrapped as the returned `EventStream`.
@@ -117,6 +119,8 @@ pub fn builtin_registry() -> ApiRegistry {
 /// Register the built-in wire-protocol factories into `reg`.
 pub fn register_builtins(reg: &mut ApiRegistry) {
     reg.register(ApiId::from(crate::known_api::OPENAI_COMPLETIONS), openai_completions::factory);
+    reg.register(ApiId::from(crate::known_api::ANTHROPIC_MESSAGES), anthropic_messages::factory);
+    reg.register(ApiId::from(crate::known_api::OPENAI_RESPONSES), openai_responses::factory);
 }
 
 #[cfg(test)]

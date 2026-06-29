@@ -3,6 +3,7 @@
 use crate::auth::ProviderAuth;
 use crate::collection::clamp_thinking_level;
 use crate::context::Context;
+use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::simple_options::{build_base_options, SimpleStreamOptions};
@@ -10,8 +11,9 @@ use cyrup_core::{EventStream, ProviderId};
 
 /// A runtime unit owning a model catalog, auth, and stream behavior (func-01 §6).
 ///
-/// Slice: `stream` + catalog reads. Auth resolution, dynamic `refresh`, and `stream_simple`
-/// (thinking-level mapping) land with the concrete providers.
+/// Slice: `stream` + catalog reads + `stream_simple` lowering + dynamic `refresh_models`. Auth
+/// resolution rides on [`Provider::provider_auth`].
+#[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     fn id(&self) -> &ProviderId;
 
@@ -28,6 +30,21 @@ pub trait Provider: Send + Sync {
 
     fn get_model(&self, id: &str) -> Option<&Model> {
         self.models().iter().find(|m| m.id.as_str() == id)
+    }
+
+    /// Dynamic providers only: re-fetch and update the model list (Pi `Provider.refreshModels?`,
+    /// models.ts:63). Side-effect-free discovery (no loading/downloading). Returns:
+    ///
+    /// - `None` for a static provider (no dynamic model source) — `Models::refresh` treats this as a
+    ///   no-op, exactly as Pi's optional `refreshModels?` being `undefined`.
+    /// - `Some(Ok(()))` when the refresh succeeded and the catalog was updated.
+    /// - `Some(Err(_))` when the fetch failed; the list stays at its last-known state and a later
+    ///   call retries (`Models::refresh(provider)` re-wraps it as a `model_source` error).
+    ///
+    /// Concurrent calls MUST share one in-flight fetch — an override builds that with
+    /// [`crate::utils::refresh::RefreshDedup`]. The default is `None` (static provider). Additive.
+    async fn refresh_models(&self) -> Option<Result<(), ProviderError>> {
+        None
     }
 
     /// Construct the response stream. Returns immediately; setup happens behind the stream and

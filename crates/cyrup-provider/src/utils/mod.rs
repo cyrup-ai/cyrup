@@ -13,8 +13,10 @@
 //!   (replaces the `regex` crate, which is outside this round's dependency budget).
 
 pub mod estimate;
+pub mod hash;
 pub mod json_parse;
 pub mod overflow;
+pub mod refresh;
 pub mod regexlite;
 pub mod retry;
 pub mod simple_options;

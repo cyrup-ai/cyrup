@@ -56,11 +56,21 @@ pub struct VercelGatewayRouting {
     pub order: Option<Vec<String>>,
 }
 
-/// Per-model compatibility overrides (Pi `OpenAICompletionsCompat`). Every field is optional; a
-/// `None` field falls back to the URL/provider auto-detected value (see [`get_compat`]).
+/// Per-model compatibility overrides — cyrup's **flat union** of every per-API compat shape.
+///
+/// Pi types `Model<API>["compat"]` per wire API via the `Model<API>` generic, so the single `compat`
+/// JSON key carries `OpenAICompletionsCompat` for `openai-completions` models and
+/// `AnthropicMessagesCompat` for `anthropic-messages` models (Pi `types.ts:531` / `:688`). cyrup's
+/// `Model` is **not** generic, so the honest non-generic representation is one struct holding the
+/// union of all per-API fields (every field optional, so a given model only sets the keys its api
+/// understands; the unused ones stay `None` and are skipped on serialize → byte-1:1 with Pi). The
+/// `openai-completions` resolver ([`get_compat`]) reads the openai subset; the `anthropic-messages`
+/// resolver (`api::anthropic_messages::get_anthropic_compat`) reads the anthropic subset. The
+/// [`OpenAiCompletionsCompat`] and [`AnthropicMessagesCompat`] aliases name this union at the use
+/// sites where one api's view is intended (closing gap #13's compat-union generalization).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenAiCompletionsCompat {
+pub struct ModelCompat {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -98,7 +108,72 @@ pub struct OpenAiCompletionsCompat {
     pub send_session_affinity_headers: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_long_cache_retention: Option<bool>,
+
+    // --- `anthropic-messages` subset (Pi `AnthropicMessagesCompat`, types.ts:531). These are read
+    // only by the anthropic-messages resolver; `supports_long_cache_retention` and
+    // `send_session_affinity_headers` above are SHARED with the anthropic subset (same field/default
+    // semantics on both apis), so they are not duplicated here. ---
+    /// Pi `supportsEagerToolInputStreaming` (default true): provider accepts per-tool
+    /// `eager_input_streaming`; when false, the legacy `fine-grained-tool-streaming` beta is sent
+    /// for tool-enabled requests instead.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_eager_tool_input_streaming: Option<bool>,
+    /// Pi `supportsCacheControlOnTools` (default true): provider accepts `cache_control` markers on
+    /// tool definitions.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_cache_control_on_tools: Option<bool>,
+    /// Pi `supportsTemperature` (default true): model accepts the Anthropic `temperature` field
+    /// (Claude Opus 4.7+ rejects non-default temperatures).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_temperature: Option<bool>,
+    /// Pi `forceAdaptiveThinking` (default false): force `thinking.type:"adaptive"` +
+    /// `output_config.effort` regardless of model id.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub force_adaptive_thinking: Option<bool>,
+    /// Pi `allowEmptySignature` (default false): replay empty thinking signatures as `signature:""`
+    /// instead of converting the thinking block to text.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allow_empty_signature: Option<bool>,
+
+    // --- `openai-responses` subset (Pi `OpenAIResponsesCompat`, openai-responses.ts:57-63). Read
+    // only by the openai-responses resolver. `supports_developer_role` and
+    // `supports_long_cache_retention` above are SHARED with this subset. ---
+    /// Pi `sendSessionIdHeader` (default true): provider accepts the `session_id` request header for
+    /// prompt-cache session affinity (openai-responses.ts:60 / `createClient` :212-215).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub send_session_id_header: Option<bool>,
 }
+
+/// The `openai-responses` view of [`ModelCompat`] (Pi `OpenAIResponsesCompat`,
+/// openai-responses.ts:10).
+pub type OpenAiResponsesCompat = ModelCompat;
+
+/// Fully-resolved openai-responses compat (Pi `Required<OpenAIResponsesCompat>`,
+/// openai-responses.ts:57-63). Each flag defaults to `true` (Pi `?? true`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedResponsesCompat {
+    pub supports_developer_role: bool,
+    pub send_session_id_header: bool,
+    pub supports_long_cache_retention: bool,
+}
+
+/// Resolve the openai-responses compat for a model (1:1 port of Pi `getCompat`,
+/// openai-responses.ts:57-63): every flag defaults to `true`.
+pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
+    let c = model.compat.as_ref();
+    ResolvedResponsesCompat {
+        supports_developer_role: c.and_then(|c| c.supports_developer_role).unwrap_or(true),
+        send_session_id_header: c.and_then(|c| c.send_session_id_header).unwrap_or(true),
+        supports_long_cache_retention: c
+            .and_then(|c| c.supports_long_cache_retention)
+            .unwrap_or(true),
+    }
+}
+
+/// The `openai-completions` view of [`ModelCompat`] (Pi `OpenAICompletionsCompat`, types.ts).
+pub type OpenAiCompletionsCompat = ModelCompat;
+/// The `anthropic-messages` view of [`ModelCompat`] (Pi `AnthropicMessagesCompat`, types.ts:531).
+pub type AnthropicMessagesCompat = ModelCompat;
 
 /// Fully-resolved compatibility settings (Pi `ResolvedOpenAICompletionsCompat`). Routing fields are
 /// read straight off `model.compat` at build time (matching Pi's `buildParams`), so they are not

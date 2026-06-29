@@ -756,6 +756,30 @@ fn insert_synthetic_tool_results(
 /// cross-model thinking, normalize tool-call ids, skip errored/aborted assistant turns, and
 /// synthesize results for orphaned tool calls.
 pub(crate) fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
+    transform_messages_with(messages, model, |id| normalize_tool_call_id(model, id))
+}
+
+/// [`transform_messages`] parameterized by the per-api tool-call-id normalizer (Pi
+/// `transformMessages(messages, model, normalizeToolCallId)`, transform-messages.ts:64-67). The
+/// `openai-completions` caller passes [`normalize_tool_call_id`]; the `anthropic-messages` caller
+/// passes its own 64-char/`^[a-zA-Z0-9_-]+$` normalizer.
+pub(crate) fn transform_messages_with(
+    messages: &[Message],
+    model: &Model,
+    normalize: impl Fn(&str) -> String,
+) -> Vec<Message> {
+    transform_messages_with_source(messages, model, |id, _src| normalize(id))
+}
+
+/// [`transform_messages_with`] whose normalizer also receives the source [`AssistantMessage`] (Pi
+/// `normalizeToolCallId(id, model, source)`, transform-messages.ts:67/134). The `openai-responses`
+/// caller needs `source` to decide whether a tool call is *foreign* (a different provider/api)
+/// when rewriting its `call_id|item_id` (openai-responses-shared.ts:109-121).
+pub(crate) fn transform_messages_with_source(
+    messages: &[Message],
+    model: &Model,
+    normalize: impl Fn(&str, &AssistantMessage) -> String,
+) -> Vec<Message> {
     let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
     let image_aware = downgrade_unsupported_images(messages, model);
 
@@ -817,7 +841,7 @@ pub(crate) fn transform_messages(messages: &[Message], model: &Model) -> Vec<Mes
                                 ntc.thought_signature = None;
                             }
                             if !same {
-                                let norm = normalize_tool_call_id(model, tc.id.as_str());
+                                let norm = normalize(tc.id.as_str(), am);
                                 if norm != tc.id.as_str() {
                                     tool_call_id_map
                                         .insert(tc.id.as_str().to_string(), norm.clone());

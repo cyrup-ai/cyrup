@@ -1,0 +1,1817 @@
+//! The `anthropic-messages` wire protocol (arch-01 §3.4 / func-01 R-01-*).
+//!
+//! One [`ApiImpl`] speaking the Anthropic Messages streaming API (`POST {baseUrl}/v1/messages`,
+//! SSE events `message_start` / `content_block_{start,delta,stop}` / `message_delta` /
+//! `message_stop`). Shared by every Anthropic-compatible provider (anthropic, kimi-coding, minimax,
+//! minimax-cn, vercel-ai-gateway). Pure JSON-over-SSE — no SDK, no new dependency. 1:1 port of Pi's
+//! `api/anthropic-messages.ts` encoder/decoder (extended thinking, `cache_control` + 1h ttl,
+//! thinking signatures, `redacted_thinking`, beta headers, eager tool input streaming, and the
+//! 64-char `^[a-zA-Z0-9_-]+$` tool-call-id rule).
+//!
+//! Wire JSON uses Anthropic's own field names (snake_case), NOT the cyrup camelCase convention.
+
+use crate::api::compat::{sanitize_surrogates, AnthropicMessagesCompat};
+use crate::api::openai_completions::transform_messages_with;
+use crate::api::{ApiImpl, EventSink};
+use crate::auth::{AuthResult, ProviderEnv};
+use crate::context::{Context, ToolDef};
+use crate::error::ProviderError;
+use crate::model::Model;
+use crate::stream::sse::{build_client, open_sse, SseFrame, SseRequest};
+use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
+use crate::usage::apply_cost;
+use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
+use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
+use crate::HeaderMap;
+use cyrup_core::{
+    ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
+    ToolCallId, Usage,
+};
+use futures::{Stream, StreamExt};
+use serde_json::{json, Map, Value};
+use std::sync::Arc;
+
+/// The wire-protocol id this impl serves.
+const API_ID: &str = crate::known_api::ANTHROPIC_MESSAGES;
+
+/// The Anthropic API version header value the SDK pins by default.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Beta header tokens (Pi anthropic-messages.ts:167-168).
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// Stealth-mode Claude Code identity (Pi anthropic-messages.ts:73).
+const CLAUDE_CODE_VERSION: &str = "2.1.75";
+
+/// Claude Code 2.x canonical tool names (Pi `claudeCodeTools`, anthropic-messages.ts:78-96).
+const CLAUDE_CODE_TOOLS: [&str; 17] = [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// The `ApiImpl` for `"anthropic-messages"`.
+pub struct AnthropicMessagesApi {
+    api: ApiId,
+}
+
+impl Default for AnthropicMessagesApi {
+    fn default() -> Self {
+        Self { api: ApiId::from(API_ID) }
+    }
+}
+
+impl AnthropicMessagesApi {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Lazy factory for the [`crate::api::ApiRegistry`].
+pub fn factory() -> Arc<dyn ApiImpl> {
+    Arc::new(AnthropicMessagesApi::new())
+}
+
+#[async_trait::async_trait]
+impl ApiImpl for AnthropicMessagesApi {
+    fn api(&self) -> &ApiId {
+        &self.api
+    }
+
+    async fn run(
+        &self,
+        model: &Model,
+        ctx: &Context,
+        auth: &AuthResult,
+        opts: &StreamOptions,
+        cancel: CancelToken,
+        sink: EventSink,
+    ) {
+        let provider = model.provider.clone();
+        let model_id = model.id.as_str().to_string();
+
+        let url = match resolve_url(model, auth) {
+            Some(url) => url,
+            None => {
+                let e = ProviderError::Transport("no base URL configured for model".into());
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                return;
+            }
+        };
+
+        let is_oauth = auth.auth.api_key.as_deref().map(is_oauth_token).unwrap_or(false);
+        let body = build_params(model, ctx, opts, auth.env.as_ref(), is_oauth);
+        let headers = build_headers(model, ctx, auth, opts, is_oauth);
+        let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
+
+        let client = match build_client() {
+            Ok(c) => c,
+            Err(e) => {
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                return;
+            }
+        };
+
+        let frames = match open_sse(&client, req, cancel, None, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                return;
+            }
+        };
+
+        decode_stream(frames, model, &self.api, &sink, is_oauth, &ctx.tools).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compat resolution (Pi getAnthropicCompat, anthropic-messages.ts:170-181)
+// ---------------------------------------------------------------------------
+
+/// Resolved Anthropic compat (Pi `Required<Omit<AnthropicMessagesCompat,"forceAdaptiveThinking">>`).
+struct ResolvedAnthropicCompat {
+    supports_eager_tool_input_streaming: bool,
+    supports_long_cache_retention: bool,
+    send_session_affinity_headers: bool,
+    supports_cache_control_on_tools: bool,
+    supports_temperature: bool,
+    allow_empty_signature: bool,
+}
+
+/// 1:1 port of Pi `getAnthropicCompat` (anthropic-messages.ts:170-181): every field defaults on,
+/// except `sendSessionAffinityHeaders`/`allowEmptySignature` which default off.
+fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
+    let c: Option<&AnthropicMessagesCompat> = model.compat.as_ref();
+    ResolvedAnthropicCompat {
+        supports_eager_tool_input_streaming: c
+            .and_then(|c| c.supports_eager_tool_input_streaming)
+            .unwrap_or(true),
+        supports_long_cache_retention: c
+            .and_then(|c| c.supports_long_cache_retention)
+            .unwrap_or(true),
+        send_session_affinity_headers: c
+            .and_then(|c| c.send_session_affinity_headers)
+            .unwrap_or(false),
+        supports_cache_control_on_tools: c
+            .and_then(|c| c.supports_cache_control_on_tools)
+            .unwrap_or(true),
+        supports_temperature: c.and_then(|c| c.supports_temperature).unwrap_or(true),
+        allow_empty_signature: c.and_then(|c| c.allow_empty_signature).unwrap_or(false),
+    }
+}
+
+/// `model.compat?.forceAdaptiveThinking === true` (Pi default false).
+fn force_adaptive_thinking(model: &Model) -> bool {
+    model.compat.as_ref().and_then(|c| c.force_adaptive_thinking).unwrap_or(false)
+}
+
+/// `model.thinkingLevelMap?.off !== null` (a missing key is `undefined`, which `!== null`).
+fn off_is_not_null(model: &Model) -> bool {
+    !matches!(model.thinking_level_map.as_ref().and_then(|m| m.get("off")), Some(None))
+}
+
+// ---------------------------------------------------------------------------
+// Cache retention (Pi resolveCacheRetention / getCacheControl)
+// ---------------------------------------------------------------------------
+
+/// Resolve a provider env value (Pi `getProviderEnvValue`): the scoped overlay wins over the process
+/// environment.
+fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
+    if let Some(map) = env
+        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
+    {
+        return Some(v.clone());
+    }
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// 1:1 port of Pi `resolveCacheRetention` (anthropic-messages.ts:46-54).
+fn resolve_cache_retention(
+    cache_retention: Option<CacheRetention>,
+    env: Option<&ProviderEnv>,
+) -> CacheRetention {
+    if let Some(c) = cache_retention {
+        return c;
+    }
+    if provider_env_value("PI_CACHE_RETENTION", env).as_deref() == Some("long") {
+        return CacheRetention::Long;
+    }
+    CacheRetention::Short
+}
+
+/// The `cache_control` ephemeral marker for the resolved retention (Pi `getCacheControl`,
+/// anthropic-messages.ts:56-70). `None` when retention is `none`.
+fn get_cache_control(
+    model: &Model,
+    cache_retention: Option<CacheRetention>,
+    env: Option<&ProviderEnv>,
+) -> Option<Value> {
+    let retention = resolve_cache_retention(cache_retention, env);
+    if retention == CacheRetention::None {
+        return None;
+    }
+    let mut cc = Map::new();
+    cc.insert("type".to_string(), json!("ephemeral"));
+    if retention == CacheRetention::Long && get_anthropic_compat(model).supports_long_cache_retention
+    {
+        cc.insert("ttl".to_string(), json!("1h"));
+    }
+    Some(Value::Object(cc))
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code tool-name mapping (Pi anthropic-messages.ts:98-109)
+// ---------------------------------------------------------------------------
+
+/// Map a tool name to Claude Code canonical casing if it matches case-insensitively (Pi
+/// `toClaudeCodeName`).
+fn to_claude_code_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    for t in CLAUDE_CODE_TOOLS {
+        if t.to_lowercase() == lower {
+            return t.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Map a Claude Code tool name back to a caller-declared tool name by case-insensitive match (Pi
+/// `fromClaudeCodeName`, anthropic-messages.ts:102-109).
+fn remap_decoded_tool_name(tool_names: &[String], name: &str) -> String {
+    let lower = name.to_lowercase();
+    for declared in tool_names {
+        if declared.to_lowercase() == lower {
+            return declared.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// `apiKey.includes("sk-ant-oat")` (Pi `isOAuthToken`, anthropic-messages.ts:809-811).
+fn is_oauth_token(api_key: &str) -> bool {
+    api_key.contains("sk-ant-oat")
+}
+
+// ---------------------------------------------------------------------------
+// Request encoding
+// ---------------------------------------------------------------------------
+
+/// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
+/// `{base}/v1/messages`.
+fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
+    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    Some(messages_url(base))
+}
+
+/// Normalize a base URL to the `/v1/messages` endpoint.
+pub(crate) fn messages_url(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/v1/messages") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
+/// `true` if the request should send the `fine-grained-tool-streaming` beta (Pi
+/// `shouldUseFineGrainedToolStreamingBeta`, anthropic-messages.ts:1184-1186).
+fn should_use_fine_grained_beta(model: &Model, ctx: &Context) -> bool {
+    !ctx.tools.is_empty() && !get_anthropic_compat(model).supports_eager_tool_input_streaming
+}
+
+/// Build the request headers (1:1 port of Pi `createClient`, anthropic-messages.ts:813-899). The
+/// auth/model/opts header overlays layer last (a `None` value suppresses a default).
+pub(crate) fn build_headers(
+    model: &Model,
+    ctx: &Context,
+    auth: &AuthResult,
+    opts: &StreamOptions,
+    is_oauth: bool,
+) -> HeaderMap {
+    let interleaved = true; // Pi `options?.interleavedThinking ?? true`.
+    let needs_interleaved = interleaved && !force_adaptive_thinking(model);
+    let mut betas: Vec<&str> = Vec::new();
+    if should_use_fine_grained_beta(model, ctx) {
+        betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+    }
+    if needs_interleaved {
+        betas.push(INTERLEAVED_THINKING_BETA);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-version".to_string(), Some(ANTHROPIC_VERSION.to_string()));
+    headers.insert("content-type".to_string(), Some("application/json".to_string()));
+    headers.insert("accept".to_string(), Some("application/json".to_string()));
+    headers
+        .insert("anthropic-dangerous-direct-browser-access".to_string(), Some("true".to_string()));
+
+    if is_oauth {
+        // OAuth: Bearer auth + Claude Code identity headers (Pi anthropic-messages.ts:855-872).
+        if let Some(key) = &auth.auth.api_key {
+            headers.insert("authorization".to_string(), Some(format!("Bearer {key}")));
+        }
+        let mut oauth_betas =
+            vec!["claude-code-20250219".to_string(), "oauth-2025-04-20".to_string()];
+        oauth_betas.extend(betas.iter().map(|b| b.to_string()));
+        headers.insert("anthropic-beta".to_string(), Some(oauth_betas.join(",")));
+        headers.insert("user-agent".to_string(), Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")));
+        headers.insert("x-app".to_string(), Some("cli".to_string()));
+    } else {
+        // API key auth (Pi anthropic-messages.ts:877-896).
+        if let Some(key) = &auth.auth.api_key {
+            headers.insert("x-api-key".to_string(), Some(key.clone()));
+        }
+        if !betas.is_empty() {
+            headers.insert("anthropic-beta".to_string(), Some(betas.join(",")));
+        }
+        // Session-affinity header when caching is enabled and the compat flag is set.
+        let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
+        if cache != CacheRetention::None
+            && get_anthropic_compat(model).send_session_affinity_headers
+            && let Some(sid) = &opts.session_id
+        {
+            headers.insert("x-session-affinity".to_string(), Some(sid.as_str().to_string()));
+        }
+    }
+
+    // Auth overlay < model.headers < opts.headers (a `None` suppresses a default).
+    if let Some(overlay) = &auth.auth.headers {
+        for (name, value) in overlay {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    if let Some(overlay) = &model.headers {
+        for (name, value) in overlay {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    if let Some(overlay) = &opts.headers {
+        for (name, value) in overlay {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+/// Map a unified [`ThinkingLevel`] to an Anthropic adaptive-thinking effort (Pi
+/// `mapThinkingLevelToEffort`, anthropic-messages.ts:747-765). A `thinkingLevelMap` string overrides.
+fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
+    let key = match level {
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Xhigh => "xhigh",
+    };
+    if let Some(Some(mapped)) = model.thinking_level_map.as_ref().and_then(|m| m.get(key)) {
+        return mapped.clone();
+    }
+    match level {
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
+        ThinkingLevel::Medium => "medium".to_string(),
+        ThinkingLevel::High | ThinkingLevel::Xhigh => "high".to_string(),
+    }
+}
+
+/// Test-only convenience wrapper for [`build_params`] with no env overlay and API-key auth.
+#[cfg(test)]
+pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
+    build_params(model, ctx, opts, None, false)
+}
+
+/// Build the Messages request JSON body (1:1 port of Pi `buildParams` + the `streamSimple` thinking
+/// lowering, anthropic-messages.ts:767-1004). The unified `opts.reasoning` level drives the thinking
+/// config and (for budget-based models) the `max_tokens` split.
+pub(crate) fn build_params(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+    env: Option<&ProviderEnv>,
+    is_oauth: bool,
+) -> Value {
+    let compat = get_anthropic_compat(model);
+    let cache_control = get_cache_control(model, opts.cache_retention, env);
+
+    let reasoning_on = opts.reasoning.is_on();
+    let thinking_enabled = model.reasoning && reasoning_on;
+    let adaptive = force_adaptive_thinking(model);
+
+    // max_tokens lowering (Pi `streamSimple`, anthropic-messages.ts:790-806). Budget-based models
+    // split the cap between thinking and output; adaptive / non-thinking just clamp to the context.
+    let mut budget_tokens: u64 = 1024;
+    let max_tokens: u64 = if thinking_enabled && !adaptive {
+        let level = opts.reasoning.level().unwrap_or(ThinkingLevel::High);
+        let (adjusted, budget) =
+            adjust_max_tokens_for_thinking(opts.max_tokens, model.max_tokens, level, None);
+        let mt = clamp_max_tokens_to_context(model, ctx, adjusted);
+        budget_tokens = budget.min(mt.saturating_sub(1024));
+        mt
+    } else {
+        clamp_max_tokens_to_context(model, ctx, opts.max_tokens.unwrap_or(model.max_tokens))
+    };
+
+    let mut obj = Map::new();
+    obj.insert("model".to_string(), json!(model.id.as_str()));
+    obj.insert(
+        "messages".to_string(),
+        Value::Array(convert_messages(
+            &ctx.messages,
+            model,
+            is_oauth,
+            cache_control.as_ref(),
+            compat.allow_empty_signature,
+        )),
+    );
+    obj.insert("max_tokens".to_string(), json!(max_tokens));
+    obj.insert("stream".to_string(), json!(true));
+
+    // System prompt (+ OAuth Claude Code identity).
+    let mut system: Vec<Value> = Vec::new();
+    if is_oauth {
+        system.push(system_text(
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control.as_ref(),
+        ));
+        if let Some(sp) = &ctx.system_prompt {
+            system.push(system_text(&sanitize_surrogates(sp), cache_control.as_ref()));
+        }
+    } else if let Some(sp) = &ctx.system_prompt {
+        system.push(system_text(&sanitize_surrogates(sp), cache_control.as_ref()));
+    }
+    if !system.is_empty() {
+        obj.insert("system".to_string(), Value::Array(system));
+    }
+
+    // Temperature is incompatible with extended thinking and unsupported on Opus 4.7+.
+    if let Some(temp) = opts.temperature
+        && !thinking_enabled
+        && compat.supports_temperature
+    {
+        obj.insert("temperature".to_string(), json!(temp));
+    }
+
+    if !ctx.tools.is_empty() {
+        let tool_cc =
+            if compat.supports_cache_control_on_tools { cache_control.as_ref() } else { None };
+        obj.insert(
+            "tools".to_string(),
+            Value::Array(convert_tools(
+                &ctx.tools,
+                is_oauth,
+                compat.supports_eager_tool_input_streaming,
+                tool_cc,
+            )),
+        );
+    }
+
+    // Thinking configuration (Pi anthropic-messages.ts:957-986).
+    if model.reasoning {
+        if thinking_enabled {
+            let display = json!("summarized");
+            if adaptive {
+                let mut thinking = Map::new();
+                thinking.insert("type".to_string(), json!("adaptive"));
+                thinking.insert("display".to_string(), display);
+                obj.insert("thinking".to_string(), Value::Object(thinking));
+                if let Some(level) = opts.reasoning.level() {
+                    let effort = map_thinking_level_to_effort(model, level);
+                    obj.insert("output_config".to_string(), json!({ "effort": effort }));
+                }
+            } else {
+                obj.insert(
+                    "thinking".to_string(),
+                    json!({
+                        "type": "enabled",
+                        "budget_tokens": budget_tokens.max(1),
+                        "display": display,
+                    }),
+                );
+            }
+        } else if off_is_not_null(model) {
+            obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        }
+    }
+
+    // metadata.user_id (Pi anthropic-messages.ts:988-993).
+    if let Some(meta) = &opts.metadata
+        && let Some(user_id) = meta.get("user_id").and_then(Value::as_str)
+    {
+        obj.insert("metadata".to_string(), json!({ "user_id": user_id }));
+    }
+
+    // tool_choice (Pi anthropic-messages.ts:995-1001). cyrup's unified ToolChoice maps onto
+    // Anthropic's `{type:"auto"|"any"|"none"}` / `{type:"tool",name}`.
+    if let Some(tc) = &opts.tool_choice {
+        obj.insert("tool_choice".to_string(), tool_choice_wire(tc));
+    }
+
+    Value::Object(obj)
+}
+
+/// Map cyrup's unified [`crate::stream::ToolChoice`] onto Anthropic's tool-choice wire shape.
+fn tool_choice_wire(tc: &crate::stream::ToolChoice) -> Value {
+    use crate::stream::ToolChoice;
+    match tc {
+        ToolChoice::Auto => json!({ "type": "auto" }),
+        ToolChoice::None => json!({ "type": "none" }),
+        // Anthropic spells "required" as "any".
+        ToolChoice::Required => json!({ "type": "any" }),
+        ToolChoice::Function { name } => json!({ "type": "tool", "name": name }),
+    }
+}
+
+/// A `system` text block, optionally cached.
+fn system_text(text: &str, cache_control: Option<&Value>) -> Value {
+    let mut o = Map::new();
+    o.insert("type".to_string(), json!("text"));
+    o.insert("text".to_string(), json!(text));
+    if let Some(cc) = cache_control {
+        o.insert("cache_control".to_string(), cc.clone());
+    }
+    Value::Object(o)
+}
+
+/// Anthropic tool-call-id normalization (Pi `normalizeToolCallId`, anthropic-messages.ts:1006-1009):
+/// non-`[a-zA-Z0-9_-]` → `_`, truncated to 64 chars.
+fn normalize_tool_call_id(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(64)
+        .collect()
+}
+
+/// Convert tool-result / user content blocks to Anthropic format (Pi `convertContentBlocks`,
+/// anthropic-messages.ts:114-161). Text-only collapses to a string; mixed content becomes a block
+/// array (a leading `(see attached image)` text block is added when only images are present).
+fn convert_content_blocks(content: &[Content]) -> Value {
+    let has_images = content.iter().any(|c| matches!(c, Content::Image { .. }));
+    if !has_images {
+        let joined = content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return json!(sanitize_surrogates(&joined));
+    }
+
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut has_text = false;
+    for block in content {
+        match block {
+            Content::Text { text, .. } => {
+                has_text = true;
+                blocks.push(json!({ "type": "text", "text": sanitize_surrogates(text) }));
+            }
+            Content::Image { data, mime_type } => blocks.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime_type, "data": data },
+            })),
+            _ => {}
+        }
+    }
+    if !has_text {
+        blocks.insert(0, json!({ "type": "text", "text": "(see attached image)" }));
+    }
+    Value::Array(blocks)
+}
+
+/// Map cyrup [`Message`]s to Anthropic `messages` (1:1 port of Pi `convertMessages`,
+/// anthropic-messages.ts:1011-1182).
+pub(crate) fn convert_messages(
+    messages: &[Message],
+    model: &Model,
+    is_oauth: bool,
+    cache_control: Option<&Value>,
+    allow_empty_signature: bool,
+) -> Vec<Value> {
+    let transformed = transform_messages_with(messages, model, normalize_tool_call_id);
+    let mut params: Vec<Value> = Vec::new();
+
+    let mut i = 0;
+    while let Some(msg) = transformed.get(i) {
+        match msg {
+            Message::User { content, .. } => {
+                if let Some(value) = build_user(content) {
+                    params.push(value);
+                }
+            }
+            Message::Assistant(am) => {
+                if let Some(value) = build_assistant(am, is_oauth, allow_empty_signature) {
+                    params.push(value);
+                }
+            }
+            Message::ToolResult { .. } => {
+                // Collect consecutive tool results into one `user` message of `tool_result` blocks.
+                let mut tool_results: Vec<Value> = Vec::new();
+                let mut j = i;
+                while let Some(Message::ToolResult { tool_call_id, content, is_error, .. }) =
+                    transformed.get(j)
+                {
+                    let mut tr = Map::new();
+                    tr.insert("type".to_string(), json!("tool_result"));
+                    tr.insert("tool_use_id".to_string(), json!(tool_call_id.as_str()));
+                    tr.insert("content".to_string(), convert_content_blocks(content));
+                    tr.insert("is_error".to_string(), json!(is_error));
+                    tool_results.push(Value::Object(tr));
+                    j += 1;
+                }
+                i = j;
+                params.push(json!({ "role": "user", "content": Value::Array(tool_results) }));
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // cache_control on the last user message's last block (Pi anthropic-messages.ts:1157-1179).
+    if let Some(cc) = cache_control {
+        apply_last_user_cache_control(&mut params, cc);
+    }
+
+    params
+}
+
+/// Build a `user` message; `None` when it has no non-empty content (Pi anthropic-messages.ts:1026-1063).
+fn build_user(content: &[Content]) -> Option<Value> {
+    let only_text = content.iter().all(|c| matches!(c, Content::Text { .. }));
+    if only_text {
+        let joined = content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if joined.trim().is_empty() {
+            return None;
+        }
+        return Some(json!({ "role": "user", "content": sanitize_surrogates(&joined) }));
+    }
+
+    let mut blocks: Vec<Value> = Vec::new();
+    for block in content {
+        match block {
+            Content::Text { text, .. } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                blocks.push(json!({ "type": "text", "text": sanitize_surrogates(text) }));
+            }
+            Content::Image { data, mime_type } => blocks.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime_type, "data": data },
+            })),
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": "user", "content": Value::Array(blocks) }))
+}
+
+/// Build an `assistant` message; `None` when it has no content blocks (Pi
+/// anthropic-messages.ts:1064-1120).
+fn build_assistant(
+    am: &AssistantMessage,
+    is_oauth: bool,
+    allow_empty_signature: bool,
+) -> Option<Value> {
+    let mut blocks: Vec<Value> = Vec::new();
+    for block in &am.content {
+        match block {
+            Content::Text { text, .. } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                blocks.push(json!({ "type": "text", "text": sanitize_surrogates(text) }));
+            }
+            Content::Thinking { thinking, thinking_signature, redacted } => {
+                if *redacted {
+                    blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": thinking_signature.clone().unwrap_or_default(),
+                    }));
+                    continue;
+                }
+                if thinking.trim().is_empty() {
+                    continue;
+                }
+                let sig_empty =
+                    thinking_signature.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true);
+                if sig_empty {
+                    if allow_empty_signature {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": sanitize_surrogates(thinking),
+                            "signature": "",
+                        }));
+                    } else {
+                        blocks.push(json!({ "type": "text", "text": sanitize_surrogates(thinking) }));
+                    }
+                } else {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": sanitize_surrogates(thinking),
+                        "signature": thinking_signature.clone().unwrap_or_default(),
+                    }));
+                }
+            }
+            Content::ToolCall(tc) => {
+                let name = if is_oauth { to_claude_code_name(&tc.name) } else { tc.name.clone() };
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": tc.id.as_str(),
+                    "name": name,
+                    "input": Value::Object(tc.arguments.clone()),
+                }));
+            }
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": "assistant", "content": Value::Array(blocks) }))
+}
+
+/// Add `cache_control` to the last user message's last cache-eligible block (Pi
+/// anthropic-messages.ts:1157-1179).
+fn apply_last_user_cache_control(params: &mut [Value], cc: &Value) {
+    let Some(last) = params.last_mut() else {
+        return;
+    };
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    match last.get_mut("content") {
+        Some(Value::Array(arr)) => {
+            if let Some(block) = arr.last_mut()
+                && let Some(o) = block.as_object_mut()
+            {
+                let kind = o.get("type").and_then(Value::as_str);
+                if matches!(kind, Some("text") | Some("image") | Some("tool_result")) {
+                    o.insert("cache_control".to_string(), cc.clone());
+                }
+            }
+        }
+        Some(Value::String(_)) => {
+            if let Some(Value::String(s)) = last.get("content") {
+                let text = s.clone();
+                if let Some(o) = last.as_object_mut() {
+                    o.insert(
+                        "content".to_string(),
+                        json!([{ "type": "text", "text": text, "cache_control": cc.clone() }]),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Map cyrup [`ToolDef`]s to Anthropic `tools` (Pi `convertTools`, anthropic-messages.ts:1188-1211).
+/// `cache_control` is applied to the last tool only; `eager_input_streaming` when supported.
+pub(crate) fn convert_tools(
+    tools: &[ToolDef],
+    is_oauth: bool,
+    supports_eager: bool,
+    cache_control: Option<&Value>,
+) -> Vec<Value> {
+    let last = tools.len().saturating_sub(1);
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let name = if is_oauth { to_claude_code_name(&tool.name) } else { tool.name.clone() };
+            let properties =
+                tool.parameters.get("properties").cloned().unwrap_or_else(|| json!({}));
+            let required = tool.parameters.get("required").cloned().unwrap_or_else(|| json!([]));
+            let mut o = Map::new();
+            o.insert("name".to_string(), json!(name));
+            o.insert("description".to_string(), json!(tool.description));
+            if supports_eager {
+                o.insert("eager_input_streaming".to_string(), json!(true));
+            }
+            o.insert(
+                "input_schema".to_string(),
+                json!({ "type": "object", "properties": properties, "required": required }),
+            );
+            if let Some(cc) = cache_control
+                && index == last
+            {
+                o.insert("cache_control".to_string(), cc.clone());
+            }
+            Value::Object(o)
+        })
+        .collect()
+}
+
+/// Map an Anthropic `stop_reason` to a cyrup [`StopReason`] (Pi `mapStopReason`,
+/// anthropic-messages.ts:1213-1239). Unknown reasons return an error with a message.
+fn map_stop_reason(reason: &str, stop_details: Option<&Value>) -> (StopReason, Option<String>) {
+    match reason {
+        "end_turn" => (StopReason::Stop, None),
+        "max_tokens" => (StopReason::Length, None),
+        "tool_use" => (StopReason::ToolUse, None),
+        "refusal" => {
+            let explanation = stop_details
+                .and_then(|d| d.get("explanation"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "The model refused to complete the request".to_string());
+            (StopReason::Error, Some(explanation))
+        }
+        "pause_turn" | "stop_sequence" => (StopReason::Stop, None),
+        "sensitive" => (StopReason::Error, None),
+        other => (StopReason::Error, Some(format!("Unhandled stop reason: {other}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response decoding
+// ---------------------------------------------------------------------------
+
+/// One in-progress content block, keyed by the Anthropic `index`.
+enum Block {
+    Text { index: i64, text: String },
+    Thinking { index: i64, thinking: String, signature: String, redacted: bool },
+    Tool { index: i64, id: String, name: String, partial_json: String },
+}
+
+impl Block {
+    fn index(&self) -> i64 {
+        match self {
+            Block::Text { index, .. } | Block::Thinking { index, .. } | Block::Tool { index, .. } => {
+                *index
+            }
+        }
+    }
+}
+
+/// Streaming-decode state (mirrors Pi's `output` accumulation, anthropic-messages.ts:476-715).
+#[derive(Default)]
+struct Decoder {
+    blocks: Vec<Block>,
+    usage: Usage,
+    response_id: Option<String>,
+    stop_reason: Option<StopReason>,
+    error_message: Option<String>,
+    saw_message_start: bool,
+    saw_message_stop: bool,
+    /// OAuth replay remaps decoded tool names back to the caller's declared names (Pi
+    /// `fromClaudeCodeName`, anthropic-messages.ts:592-594).
+    is_oauth: bool,
+    tool_names: Vec<String>,
+}
+
+impl Decoder {
+    fn position_of(&self, index: i64) -> Option<usize> {
+        self.blocks.iter().position(|b| b.index() == index)
+    }
+
+    /// Build the live `partial` snapshot.
+    fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+        let mut usage = self.usage.clone();
+        apply_cost(&model.cost, &mut usage);
+        AssistantMessage {
+            content: blocks_to_content(&self.blocks),
+            provider: model.provider.clone(),
+            model: model.id.as_str().to_string(),
+            api: api.clone(),
+            response_model: None,
+            response_id: self.response_id.clone(),
+            diagnostics: None,
+            usage,
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            error_message: self.error_message.clone(),
+            timestamp: now_millis(),
+        }
+    }
+}
+
+fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Text { text, .. } => Content::text(text.clone()),
+            Block::Thinking { thinking, signature, redacted, .. } => Content::Thinking {
+                thinking: thinking.clone(),
+                thinking_signature: if signature.is_empty() {
+                    None
+                } else {
+                    Some(signature.clone())
+                },
+                redacted: *redacted,
+            },
+            Block::Tool { id, name, partial_json, .. } => Content::ToolCall(ToolCall {
+                id: ToolCallId::from(id.as_str()),
+                name: name.clone(),
+                arguments: parse_streaming_json_object(Some(partial_json)),
+                thought_signature: None,
+            }),
+        })
+        .collect()
+}
+
+/// Drive the Anthropic SSE frame stream into ordered [`StreamEvent`]s (1:1 with Pi's stream loop,
+/// anthropic-messages.ts:546-737).
+pub(crate) async fn decode_stream<S>(
+    mut frames: S,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    is_oauth: bool,
+    tools: &[ToolDef],
+) where
+    S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
+{
+    let provider = model.provider.clone();
+    let model_id = model.id.as_str().to_string();
+
+    let mut dec = Decoder {
+        is_oauth,
+        tool_names: tools.iter().map(|t| t.name.clone()).collect(),
+        ..Default::default()
+    };
+    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
+        return;
+    }
+
+    while let Some(frame) = frames.next().await {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
+                return;
+            }
+        };
+        // An `event: error` frame surfaces the data as an error (Pi anthropic-messages.ts:439-441).
+        if frame.event == "error" {
+            let msg = if frame.data.trim().is_empty() {
+                "Anthropic stream error".to_string()
+            } else {
+                frame.data.clone()
+            };
+            emit_error(&dec, model, api, sink, msg).await;
+            return;
+        }
+        if !is_message_event(&frame.event) {
+            continue;
+        }
+        let data = frame.data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        let Some(event) = parse_json_with_repair(data) else {
+            emit_error(
+                &dec,
+                model,
+                api,
+                sink,
+                format!("Could not parse Anthropic SSE event {}", frame.event),
+            )
+            .await;
+            return;
+        };
+        if !process_event(&event, &mut dec, model, api, sink).await {
+            return; // consumer dropped
+        }
+        if dec.stop_reason == Some(StopReason::Error) {
+            emit_error(
+                &dec,
+                model,
+                api,
+                sink,
+                dec.error_message.clone().unwrap_or_else(|| "An unknown error occurred".to_string()),
+            )
+            .await;
+            return;
+        }
+    }
+
+    // Stream ended. A `message_start` with no `message_stop` is a protocol error (Pi
+    // anthropic-messages.ts:463-465).
+    if dec.saw_message_start && !dec.saw_message_stop {
+        emit_error(&dec, model, api, sink, "Anthropic stream ended before message_stop".to_string())
+            .await;
+        return;
+    }
+
+    finish_blocks(&dec, model, api, sink).await;
+    let message = build_final_message(&dec, model, api);
+    sink.send(StreamEvent::terminal(message)).await;
+}
+
+/// Whether `event` is one of the six Anthropic message events (Pi `ANTHROPIC_MESSAGE_EVENTS`).
+fn is_message_event(event: &str) -> bool {
+    matches!(
+        event,
+        "message_start"
+            | "message_delta"
+            | "message_stop"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+    )
+}
+
+/// Process one decoded Anthropic event. Returns `false` if the consumer dropped the stream.
+async fn process_event(
+    event: &Value,
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
+    match event.get("type").and_then(Value::as_str) {
+        Some("message_start") => {
+            dec.saw_message_start = true;
+            if let Some(message) = event.get("message") {
+                if let Some(id) = message.get("id").and_then(Value::as_str) {
+                    dec.response_id = Some(id.to_string());
+                }
+                if let Some(usage) = message.get("usage") {
+                    apply_message_start_usage(&mut dec.usage, usage);
+                }
+            }
+            true
+        }
+        Some("content_block_start") => process_block_start(event, dec, model, api, sink).await,
+        Some("content_block_delta") => process_block_delta(event, dec, model, api, sink).await,
+        Some("content_block_stop") => process_block_stop(event, dec, model, api, sink).await,
+        Some("message_delta") => {
+            if let Some(delta) = event.get("delta")
+                && let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+            {
+                let (stop, err) = map_stop_reason(reason, delta.get("stop_details"));
+                dec.stop_reason = Some(stop);
+                if let Some(err) = err {
+                    dec.error_message = Some(err);
+                }
+            }
+            if let Some(usage) = event.get("usage") {
+                apply_message_delta_usage(&mut dec.usage, usage);
+            }
+            true
+        }
+        Some("message_stop") => {
+            dec.saw_message_stop = true;
+            true
+        }
+        _ => true,
+    }
+}
+
+async fn process_block_start(
+    event: &Value,
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
+    let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+    let cb = match event.get("content_block") {
+        Some(c) => c,
+        None => return true,
+    };
+    match cb.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            dec.blocks.push(Block::Text { index, text: String::new() });
+            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::TextStart {
+                content_index: pos,
+                partial,
+            })
+            .await
+        }
+        Some("thinking") => {
+            dec.blocks.push(Block::Thinking {
+                index,
+                thinking: String::new(),
+                signature: String::new(),
+                redacted: false,
+            });
+            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ThinkingStart {
+                content_index: pos,
+                partial,
+            })
+            .await
+        }
+        Some("redacted_thinking") => {
+            let data = cb.get("data").and_then(Value::as_str).unwrap_or("").to_string();
+            dec.blocks.push(Block::Thinking {
+                index,
+                thinking: "[Reasoning redacted]".to_string(),
+                signature: data,
+                redacted: true,
+            });
+            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ThinkingStart {
+                content_index: pos,
+                partial,
+            })
+            .await
+        }
+        Some("tool_use") => {
+            let id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let raw_name = cb.get("name").and_then(Value::as_str).unwrap_or("");
+            // OAuth: map the Claude-Code tool name back to the caller's declared name (Pi decode,
+            // anthropic-messages.ts:592-594).
+            let name = if dec.is_oauth {
+                remap_decoded_tool_name(&dec.tool_names, raw_name)
+            } else {
+                raw_name.to_string()
+            };
+            dec.blocks.push(Block::Tool { index, id, name, partial_json: String::new() });
+            send_with_pos(dec, model, api, sink, |pos, partial| StreamEvent::ToolCallStart {
+                content_index: pos,
+                partial,
+            })
+            .await
+        }
+        _ => true,
+    }
+}
+
+async fn process_block_delta(
+    event: &Value,
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
+    let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+    let delta = match event.get("delta") {
+        Some(d) => d,
+        None => return true,
+    };
+    let pos = match dec.position_of(index) {
+        Some(p) => p,
+        None => return true,
+    };
+    match delta.get("type").and_then(Value::as_str) {
+        Some("text_delta") => {
+            let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+            if let Some(Block::Text { text: acc, .. }) = dec.blocks.get_mut(pos) {
+                acc.push_str(text);
+            }
+            let partial = dec.snapshot(model, api);
+            sink.send(StreamEvent::TextDelta {
+                content_index: pos,
+                delta: text.to_string(),
+                partial,
+            })
+            .await
+        }
+        Some("thinking_delta") => {
+            let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+            if let Some(Block::Thinking { thinking, .. }) = dec.blocks.get_mut(pos) {
+                thinking.push_str(text);
+            }
+            let partial = dec.snapshot(model, api);
+            sink.send(StreamEvent::ThinkingDelta {
+                content_index: pos,
+                delta: text.to_string(),
+                partial,
+            })
+            .await
+        }
+        Some("input_json_delta") => {
+            let text = delta.get("partial_json").and_then(Value::as_str).unwrap_or("");
+            if let Some(Block::Tool { partial_json, .. }) = dec.blocks.get_mut(pos) {
+                partial_json.push_str(text);
+            }
+            let partial = dec.snapshot(model, api);
+            sink.send(StreamEvent::ToolCallDelta {
+                content_index: pos,
+                delta: text.to_string(),
+                partial,
+            })
+            .await
+        }
+        Some("signature_delta") => {
+            let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
+            if let Some(Block::Thinking { signature, .. }) = dec.blocks.get_mut(pos) {
+                signature.push_str(sig);
+            }
+            true // signature deltas do not emit a stream event (Pi anthropic-messages.ts:640-647)
+        }
+        _ => true,
+    }
+}
+
+async fn process_block_stop(
+    event: &Value,
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
+    let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+    let pos = match dec.position_of(index) {
+        Some(p) => p,
+        None => return true,
+    };
+    let partial = dec.snapshot(model, api);
+    let ev = match dec.blocks.get(pos) {
+        Some(Block::Text { text, .. }) => {
+            StreamEvent::TextEnd { content_index: pos, content: text.clone(), partial }
+        }
+        Some(Block::Thinking { thinking, .. }) => {
+            StreamEvent::ThinkingEnd { content_index: pos, content: thinking.clone(), partial }
+        }
+        Some(Block::Tool { id, name, partial_json, .. }) => StreamEvent::ToolCallEnd {
+            content_index: pos,
+            tool_call: ToolCall {
+                id: ToolCallId::from(id.as_str()),
+                name: name.clone(),
+                arguments: parse_streaming_json_object(Some(partial_json)),
+                thought_signature: None,
+            },
+            partial,
+        },
+        None => return true,
+    };
+    sink.send(ev).await
+}
+
+/// Push a `*_start` event for the just-pushed block (its position is `len-1`).
+async fn send_with_pos<F>(
+    dec: &Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    make: F,
+) -> bool
+where
+    F: FnOnce(usize, AssistantMessage) -> StreamEvent,
+{
+    let pos = dec.blocks.len().saturating_sub(1);
+    let partial = dec.snapshot(model, api);
+    sink.send(make(pos, partial)).await
+}
+
+/// Emit any block `*_end` events the stream did not already close (no-op when all closed cleanly,
+/// which is the normal path — Anthropic always sends `content_block_stop`).
+async fn finish_blocks(_dec: &Decoder, _model: &Model, _api: &ApiId, _sink: &EventSink) {
+    // Anthropic always emits a `content_block_stop` per block, so the `*_end` events are already
+    // sent by `process_block_stop`. This hook exists for symmetry with the openai-completions
+    // decoder and is intentionally a no-op.
+}
+
+/// Emit a terminal error event carrying the partial snapshot's content (Pi's catch block,
+/// anthropic-messages.ts:727-736).
+async fn emit_error(
+    dec: &Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    message: String,
+) {
+    let mut msg = dec.snapshot(model, api);
+    msg.stop_reason = StopReason::Error;
+    msg.error_message = Some(message);
+    sink.send(StreamEvent::terminal(msg)).await;
+}
+
+/// Build the terminal message from the final decoder state.
+fn build_final_message(dec: &Decoder, model: &Model, api: &ApiId) -> AssistantMessage {
+    let mut msg = dec.snapshot(model, api);
+    msg.stop_reason = dec.stop_reason.unwrap_or(StopReason::Stop);
+    msg.error_message = dec.error_message.clone();
+    msg
+}
+
+/// Apply `message_start` usage (Pi anthropic-messages.ts:551-558): seeds input/output/cache counts.
+fn apply_message_start_usage(usage: &mut Usage, raw: &Value) {
+    usage.input = raw.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    usage.output = raw.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    usage.cache_read = raw.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    usage.cache_write = raw.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let long = raw
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.cache_write_1h = Some(long);
+}
+
+/// Apply `message_delta` usage (Pi anthropic-messages.ts:690-709): only present fields update,
+/// preserving `input_tokens` from `message_start` when a proxy omits it.
+fn apply_message_delta_usage(usage: &mut Usage, raw: &Value) {
+    if let Some(v) = raw.get("input_tokens").and_then(Value::as_u64) {
+        usage.input = v;
+    }
+    if let Some(v) = raw.get("output_tokens").and_then(Value::as_u64) {
+        usage.output = v;
+    }
+    if let Some(v) = raw.get("cache_read_input_tokens").and_then(Value::as_u64) {
+        usage.cache_read = v;
+    }
+    if let Some(v) = raw.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+        usage.cache_write = v;
+    }
+    if let Some(v) =
+        raw.get("output_tokens_details").and_then(|d| d.get("thinking_tokens")).and_then(Value::as_u64)
+    {
+        usage.reasoning = Some(v);
+    }
+}
+
+/// Current unix time in milliseconds (0 on a clock error — never panics).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::api::channel;
+    use crate::api::compat::ModelCompat;
+    use crate::auth::types::ModelAuth;
+    use crate::model::{Modality, ModelCost};
+    use crate::stream::sse::decode_sse_bytes;
+    use cyrup_core::{AssistantMessage, Message, ModelThinkingLevel, ProviderId};
+
+    fn auth_with(api_key: Option<&str>) -> AuthResult {
+        AuthResult {
+            auth: ModelAuth { api_key: api_key.map(String::from), ..Default::default() },
+            env: None,
+            source: None,
+        }
+    }
+
+    fn model() -> Model {
+        Model {
+            id: "claude-opus-4-5".into(),
+            name: "Claude Opus 4.5".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: Some("https://api.anthropic.com".to_string()),
+            reasoning: true,
+            input: vec![Modality::Text, Modality::Image],
+            output: vec![Modality::Text],
+            cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
+            context_window: 200_000,
+            max_tokens: 64_000,
+            thinking_level_map: None,
+            compat: None,
+            headers: None,
+        }
+    }
+
+    fn user_ctx(text: &str) -> Context {
+        Context {
+            system_prompt: Some("be brief".to_string()),
+            messages: vec![Message::User {
+                content: vec![Content::text(text)],
+                timestamp: 0,
+            }],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn url_appends_v1_messages() {
+        assert_eq!(messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(messages_url("https://api.anthropic.com/"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            messages_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn build_params_basic_shape() {
+        let m = model();
+        let opts = StreamOptions { max_tokens: Some(1000), ..Default::default() };
+        let body = build_body(&m, &user_ctx("hello"), &opts);
+        assert_eq!(body["model"], "claude-opus-4-5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 1000);
+        // system prompt is an array of text blocks.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "be brief");
+        // user message text-only; default (short) retention applies cache_control to the last user
+        // message, so the string is promoted to a single cached text block (Pi convertMessages).
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        // A reasoning model with reasoning Off (and `off` not null-marked) emits thinking:disabled
+        // (Pi buildParams: `thinkingEnabled === false && thinkingLevelMap?.off !== null`).
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn budget_thinking_encodes_enabled_with_budget() {
+        let m = model(); // not adaptive
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            max_tokens: Some(4000),
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("think"), &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body["thinking"]["budget_tokens"].as_u64().unwrap() > 0);
+        // temperature omitted while thinking is enabled.
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn adaptive_thinking_encodes_effort() {
+        let mut m = model();
+        m.compat = Some(ModelCompat { force_adaptive_thinking: Some(true), ..Default::default() });
+        m.thinking_level_map =
+            Some([("xhigh".to_string(), Some("xhigh".to_string()))].into_iter().collect());
+        let opts = StreamOptions { reasoning: ModelThinkingLevel::Xhigh, ..Default::default() };
+        let body = build_body(&m, &user_ctx("deep"), &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn disabled_thinking_when_off_map_not_null() {
+        let mut m = model();
+        // off not present => off !== null => disabled emitted.
+        let opts = StreamOptions { reasoning: ModelThinkingLevel::Off, ..Default::default() };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        // when off is null-marked, no thinking key.
+        m.thinking_level_map = Some([("off".to_string(), None)].into_iter().collect());
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn temperature_only_without_thinking_and_when_supported() {
+        let mut m = model();
+        m.reasoning = false;
+        let opts = StreamOptions { temperature: Some(0.7), ..Default::default() };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert!((body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+        // supportsTemperature=false suppresses it (Opus 4.7+).
+        m.compat = Some(ModelCompat { supports_temperature: Some(false), ..Default::default() });
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn tools_encode_eager_streaming_and_cache_control() {
+        let mut ctx = user_ctx("use a tool");
+        ctx.tools = vec![ToolDef {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+        }];
+        let m = model();
+        let opts = StreamOptions { cache_retention: Some(CacheRetention::Long), ..Default::default() };
+        let body = build_body(&m, &ctx, &opts);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "read");
+        assert_eq!(tool["eager_input_streaming"], true);
+        assert_eq!(tool["input_schema"]["type"], "object");
+        assert_eq!(tool["input_schema"]["required"][0], "path");
+        // long retention => cache_control with 1h ttl on the last tool.
+        assert_eq!(tool["cache_control"]["type"], "ephemeral");
+        assert_eq!(tool["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn fine_grained_beta_when_eager_unsupported() {
+        let mut m = model();
+        m.compat =
+            Some(ModelCompat { supports_eager_tool_input_streaming: Some(false), ..Default::default() });
+        let mut ctx = user_ctx("x");
+        ctx.tools = vec![ToolDef {
+            name: "read".to_string(),
+            description: "d".to_string(),
+            parameters: json!({}),
+        }];
+        let auth = auth_with(None);
+        let headers = build_headers(&m, &ctx, &auth, &StreamOptions::default(), false);
+        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
+        assert!(beta.contains(FINE_GRAINED_TOOL_STREAMING_BETA), "got: {beta}");
+        // tools omit eager_input_streaming when unsupported.
+        let body = build_body(&m, &ctx, &StreamOptions::default());
+        assert!(body["tools"][0].get("eager_input_streaming").is_none());
+    }
+
+    #[test]
+    fn api_key_headers_and_version() {
+        let m = model();
+        let auth = auth_with(Some("sk-ant-api03-xxx"));
+        let headers = build_headers(&m, &Context::default(), &auth, &StreamOptions::default(), false);
+        assert_eq!(headers.get("x-api-key").and_then(|v| v.clone()).as_deref(), Some("sk-ant-api03-xxx"));
+        assert_eq!(
+            headers.get("anthropic-version").and_then(|v| v.clone()).as_deref(),
+            Some(ANTHROPIC_VERSION)
+        );
+        // interleaved-thinking beta is sent for non-adaptive reasoning models.
+        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
+        assert!(beta.contains(INTERLEAVED_THINKING_BETA));
+    }
+
+    #[test]
+    fn oauth_headers_use_bearer_and_identity() {
+        let m = model();
+        let auth = auth_with(Some("sk-ant-oat01-yyy"));
+        let is_oauth = is_oauth_token(auth.auth.api_key.as_deref().unwrap());
+        assert!(is_oauth);
+        let headers = build_headers(&m, &Context::default(), &auth, &StreamOptions::default(), is_oauth);
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.clone()).as_deref(),
+            Some("Bearer sk-ant-oat01-yyy")
+        );
+        assert!(!headers.contains_key("x-api-key"));
+        let beta = headers.get("anthropic-beta").and_then(|v| v.clone()).unwrap_or_default();
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("oauth-2025-04-20"));
+        assert_eq!(headers.get("x-app").and_then(|v| v.clone()).as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn oauth_remaps_tool_names_to_claude_code() {
+        let mut ctx = user_ctx("x");
+        ctx.tools = vec![ToolDef {
+            name: "bash".to_string(),
+            description: "run".to_string(),
+            parameters: json!({}),
+        }];
+        let m = model();
+        // build_params with is_oauth=true via direct call.
+        let body = build_params(&m, &ctx, &StreamOptions::default(), None, true);
+        assert_eq!(body["tools"][0]["name"], "Bash");
+    }
+
+    #[test]
+    fn tool_results_collapse_into_one_user_message() {
+        let mut m = model();
+        m.reasoning = false;
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::ToolResult {
+                    tool_call_id: ToolCallId::from("toolu_1"),
+                    tool_name: "read".to_string(),
+                    content: vec![Content::text("result A")],
+                    is_error: false,
+                    details: None,
+                    timestamp: 0,
+                },
+                Message::ToolResult {
+                    tool_call_id: ToolCallId::from("toolu_2"),
+                    tool_name: "read".to_string(),
+                    content: vec![Content::text("result B")],
+                    is_error: false,
+                    details: None,
+                    timestamp: 0,
+                },
+            ],
+            tools: Vec::new(),
+        };
+        let body = build_body(&m, &ctx, &StreamOptions::default());
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+        assert_eq!(blocks[0]["content"], "result A");
+    }
+
+    #[test]
+    fn normalize_tool_call_id_rule() {
+        assert_eq!(normalize_tool_call_id("call/with|bad chars"), "call_with_bad_chars");
+        let long = "a".repeat(100);
+        assert_eq!(normalize_tool_call_id(&long).chars().count(), 64);
+    }
+
+    #[test]
+    fn tool_choice_mapping() {
+        use crate::stream::ToolChoice;
+        assert_eq!(tool_choice_wire(&ToolChoice::Auto), json!({"type":"auto"}));
+        assert_eq!(tool_choice_wire(&ToolChoice::Required), json!({"type":"any"}));
+        assert_eq!(
+            tool_choice_wire(&ToolChoice::Function { name: "x".into() }),
+            json!({"type":"tool","name":"x"})
+        );
+    }
+
+    async fn collect(frames_bytes: Vec<u8>, m: &Model) -> Vec<StreamEvent> {
+        let (sink, mut rx) = channel(64);
+        let api = ApiId::from(API_ID);
+        let frames = decode_sse_bytes(frames_bytes);
+        let m2 = m.clone();
+        let api2 = api.clone();
+        let task = tokio::spawn(async move {
+            decode_stream(frames, &m2, &api2, &sink, false, &[]).await;
+        });
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        events
+    }
+
+    #[tokio::test]
+    async fn decodes_text_and_tool_stream() {
+        // A realistic Anthropic SSE transcript: message_start, a text block, a tool_use block, and
+        // message_delta(tool_use) + message_stop.
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
+        // text delta carried "Hello".
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "Hello")));
+        // tool call end with parsed args.
+        let tool_end = events.iter().find_map(|e| match e {
+            StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call.clone()),
+            _ => None,
+        });
+        let tool = tool_end.expect("toolcall_end");
+        assert_eq!(tool.id.as_str(), "toolu_9");
+        assert_eq!(tool.name, "read");
+        assert_eq!(tool.arguments.get("path").and_then(Value::as_str), Some("a"));
+        // terminal done with ToolUse + usage/cost computed.
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        let msg = done.expect("done terminal");
+        assert_eq!(msg.stop_reason, StopReason::ToolUse);
+        assert_eq!(msg.response_id.as_deref(), Some("msg_1"));
+        assert_eq!(msg.usage.input, 10);
+        assert_eq!(msg.usage.output, 7);
+        assert!(msg.usage.cost.total > 0.0);
+    }
+
+    #[tokio::test]
+    async fn decodes_thinking_with_signature() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        let msg = done.expect("done");
+        assert_eq!(msg.stop_reason, StopReason::Stop);
+        let thinking = msg.content.iter().find_map(|c| match c {
+            Content::Thinking { thinking, thinking_signature, .. } => {
+                Some((thinking.clone(), thinking_signature.clone()))
+            }
+            _ => None,
+        });
+        let (thinking, sig) = thinking.expect("thinking block");
+        assert_eq!(thinking, "reason");
+        assert_eq!(sig.as_deref(), Some("SIG"));
+    }
+
+    #[tokio::test]
+    async fn missing_message_stop_is_error() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let err = events.iter().find_map(|e| match e {
+            StreamEvent::Error { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+        let msg = err.expect("error terminal");
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert!(msg.error_message.unwrap().contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn sse_error_event_is_error_terminal() {
+        let raw = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let err = events.iter().find_map(|e| match e {
+            StreamEvent::Error { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn redacted_thinking_replays_as_redacted_block() {
+        let mut m = model();
+        m.reasoning = false;
+        let am = AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: "[Reasoning redacted]".to_string(),
+                thinking_signature: Some("OPAQUE".to_string()),
+                redacted: true,
+            }],
+            provider: ProviderId::from("anthropic"),
+            model: "claude-opus-4-5".into(),
+            api: API_ID.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        let value = build_assistant(&am, false, false).expect("assistant");
+        assert_eq!(value["content"][0]["type"], "redacted_thinking");
+        assert_eq!(value["content"][0]["data"], "OPAQUE");
+    }
+
+    #[test]
+    fn empty_signature_thinking_becomes_text_unless_allowed() {
+        let am = AssistantMessage {
+            content: vec![Content::Thinking {
+                thinking: "raw reasoning".to_string(),
+                thinking_signature: None,
+                redacted: false,
+            }],
+            provider: ProviderId::from("anthropic"),
+            model: "claude-opus-4-5".into(),
+            api: API_ID.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        // default: convert to text.
+        let v = build_assistant(&am, false, false).expect("assistant");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "raw reasoning");
+        // allowEmptySignature: keep as thinking with empty signature.
+        let v = build_assistant(&am, false, true).expect("assistant");
+        assert_eq!(v["content"][0]["type"], "thinking");
+        assert_eq!(v["content"][0]["signature"], "");
+    }
+}

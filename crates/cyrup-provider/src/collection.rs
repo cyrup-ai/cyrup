@@ -268,10 +268,36 @@ impl Models {
         collect_message(self.stream_simple(model, context, options)).await
     }
 
-    /// Re-fetch dynamic model lists (Pi `refresh`). Every built-in fleet provider is static (no
-    /// `refreshModels`), so this is a best-effort no-op today; the dynamic-refresh hook + in-flight
-    /// dedup land with dynamic providers (gap doc #22).
-    pub async fn refresh(&self, _provider: Option<&str>) -> Result<(), ProviderError> {
+    /// Ask dynamic providers to re-fetch their model lists (1:1 port of Pi `refresh`,
+    /// models.ts:198-214).
+    ///
+    /// With a provider id: a static provider (no [`Provider::refresh_models`] source → `None`) is a
+    /// no-op (`Ok(())`); a dynamic provider's fetch failure is surfaced as a `model_source`
+    /// [`ProviderError`] (Pi wraps the cause in `ModelsError("model_source", …)`; an error that is
+    /// already a `model_source` error is re-raised unchanged, mirroring Pi's
+    /// `if (error instanceof ModelsError) throw error`).
+    ///
+    /// Without a provider id: every provider is refreshed concurrently, best-effort — failures are
+    /// swallowed (Pi `Promise.allSettled`). Static providers are no-ops.
+    pub async fn refresh(&self, provider: Option<&str>) -> Result<(), ProviderError> {
+        if let Some(id) = provider {
+            let Some(entry) = self.providers.get(id) else {
+                // Unknown provider: no refresh source → no-op (Pi `if (!entry?.refreshModels) return`).
+                return Ok(());
+            };
+            return match entry.refresh_models().await {
+                None => Ok(()),
+                Some(Ok(())) => Ok(()),
+                Some(Err(e @ ProviderError::ModelSource(_))) => Err(e),
+                Some(Err(e)) => Err(ProviderError::ModelSource(
+                    format!("Model refresh failed for {id}: {e}").into(),
+                )),
+            };
+        }
+
+        // Best-effort: refresh every provider concurrently, ignoring failures (Pi `allSettled`).
+        let refreshes = self.providers.values().map(|p| p.refresh_models());
+        futures::future::join_all(refreshes).await;
         Ok(())
     }
 }
@@ -657,5 +683,122 @@ mod tests {
         assert!(!models_are_equal(Some(&a), None));
         assert!(has_api(&a, OPENAI_COMPLETIONS));
         assert!(!has_api(&a, "anthropic-messages"));
+    }
+
+    // ---- dynamic-refresh dispatch (Pi `Models.refresh`, models.ts:198-214) ----
+
+    use crate::utils::refresh::RefreshDedup;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A dynamic provider whose `refresh_models` counts fetches (deduplicated via [`RefreshDedup`])
+    /// and optionally fails. `stream()` is unused here and yields a terminal error immediately.
+    struct DynProvider {
+        id: cyrup_core::ProviderId,
+        models: Vec<Model>,
+        fetches: Arc<AtomicUsize>,
+        fail: bool,
+        dedup: RefreshDedup,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for DynProvider {
+        fn id(&self) -> &cyrup_core::ProviderId {
+            &self.id
+        }
+        fn models(&self) -> &[Model] {
+            &self.models
+        }
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> EventStream<StreamEvent> {
+            let msg = cyrup_core::AssistantMessage::errored(
+                model.provider.clone(),
+                model.id.as_str(),
+                Some(model.api.clone()),
+                cyrup_core::StopReason::Error,
+                "unused",
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = tx.send(StreamEvent::terminal(msg)).await;
+            });
+            Box::pin(ReceiverStream::new(rx))
+        }
+        async fn refresh_models(&self) -> Option<Result<(), ProviderError>> {
+            let fetches = self.fetches.clone();
+            let fail = self.fail;
+            Some(
+                self.dedup
+                    .run(move || async move {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        if fail {
+                            Err(ProviderError::Transport("network down".into()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await,
+            )
+        }
+    }
+
+    fn dyn_provider(id: &str, fail: bool) -> (Arc<DynProvider>, Arc<AtomicUsize>) {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let p = Arc::new(DynProvider {
+            id: cyrup_core::ProviderId::from(id),
+            models: vec![model(id, "m1", false, None)],
+            fetches: fetches.clone(),
+            fail,
+            dedup: RefreshDedup::new(),
+        });
+        (p, fetches)
+    }
+
+    #[tokio::test]
+    async fn refresh_static_provider_is_noop() {
+        // A fleet provider has no dynamic source (`refresh_models` → None): refresh is a clean Ok.
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(fleet::GROQ.provider()));
+        models.refresh(Some("groq")).await.expect("static refresh is a no-op");
+        // Unknown provider id is also a no-op (Pi `if (!entry?.refreshModels) return`).
+        models.refresh(Some("does-not-exist")).await.expect("unknown is a no-op");
+    }
+
+    #[tokio::test]
+    async fn refresh_dynamic_provider_calls_fetch() {
+        let mut models = create_models(CreateModelsOptions::default());
+        let (p, fetches) = dyn_provider("dyn-ok", false);
+        models.set_provider(p);
+        models.refresh(Some("dyn-ok")).await.expect("ok");
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_dynamic_failure_is_model_source() {
+        let mut models = create_models(CreateModelsOptions::default());
+        let (p, fetches) = dyn_provider("dyn-bad", true);
+        models.set_provider(p);
+        let err = models.refresh(Some("dyn-bad")).await.expect_err("should fail");
+        assert_eq!(err.code(), "model_source");
+        assert!(err.to_string().contains("Model refresh failed for dyn-bad"));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_all_is_best_effort_and_swallows_failures() {
+        // A mix of a static provider, a failing dynamic provider, and a healthy dynamic provider:
+        // refresh(None) must call every dynamic source and never error (Pi `allSettled`).
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(fleet::GROQ.provider())); // static
+        let (bad, bad_fetches) = dyn_provider("dyn-bad", true);
+        let (ok, ok_fetches) = dyn_provider("dyn-ok", false);
+        models.set_provider(bad);
+        models.set_provider(ok);
+        models.refresh(None).await.expect("best-effort never errors");
+        assert_eq!(bad_fetches.load(Ordering::SeqCst), 1, "failing source still fetched");
+        assert_eq!(ok_fetches.load(Ordering::SeqCst), 1, "healthy source fetched");
     }
 }

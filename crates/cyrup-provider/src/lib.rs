@@ -31,12 +31,35 @@ pub mod wire;
 #[cfg(any(test, feature = "faux"))]
 pub mod faux;
 
+pub use api::anthropic_messages::AnthropicMessagesApi;
 pub use api::openai_completions::OpenAiCompletionsApi;
+pub use api::openai_responses::OpenAiResponsesApi;
 pub use api::{
     builtin_registry, channel, register_builtins, ApiFactory, ApiImpl, ApiRegistry, EventSink,
 };
 pub use providers::{together_models, together_provider, together_provider_with, TOGETHER_BASE_URL};
+pub use providers::{
+    anthropic_auth, anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models,
+    anthropic_provider, anthropic_provider_with, AnthropicFleetSpec, ANTHROPIC_BASE_URL,
+    ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID,
+};
+pub use providers::{
+    cloudflare_workers_ai_auth, cloudflare_workers_ai_models, cloudflare_workers_ai_provider,
+    cloudflare_workers_ai_provider_with, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
+};
 pub use providers::fleet::{fleet_spec, fleet_providers_with, FleetSpec, FLEET};
+pub use providers::{
+    fireworks_auth, fireworks_models, fireworks_provider, fireworks_provider_with,
+    FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID,
+};
+pub use providers::{
+    opencode_go_auth, opencode_go_models, opencode_go_provider, opencode_go_provider_with,
+    OPENCODE_GO_PROVIDER_ID,
+};
+pub use providers::{
+    openai_auth, openai_models, openai_provider, openai_provider_with, OPENAI_BASE_URL,
+    OPENAI_PROVIDER_ID,
+};
 pub use collection::{
     clamp_thinking_level, create_models, get_supported_thinking_levels, has_api, models_are_equal,
     CreateModelsOptions, Models, EXTENDED_THINKING_LEVELS,
@@ -69,6 +92,7 @@ pub use utils::json_parse::{
     parse_streaming_json, parse_streaming_json_object, repair_json,
 };
 pub use utils::overflow::{is_context_overflow, overflow_patterns};
+pub use utils::refresh::RefreshDedup;
 pub use utils::retry::is_retryable_assistant_error;
 pub use utils::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context, clamp_reasoning,
