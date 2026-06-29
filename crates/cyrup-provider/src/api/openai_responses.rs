@@ -173,7 +173,7 @@ fn header_present(headers: Option<&HeaderMap>, name: &str) -> bool {
 
 /// Resolve a provider env value (Pi `getProviderEnvValue`): the scoped `env` overlay wins over the
 /// process environment.
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
+pub(crate) fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
     if let Some(map) = env
         && let Some(v) = map.get(name).filter(|v| !v.is_empty())
     {

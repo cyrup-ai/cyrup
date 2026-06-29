@@ -15,6 +15,7 @@
 pub mod estimate;
 pub mod hash;
 pub mod json_parse;
+pub mod node_http_proxy;
 pub mod overflow;
 pub mod refresh;
 pub mod regexlite;

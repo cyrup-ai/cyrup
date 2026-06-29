@@ -19,6 +19,7 @@ pub mod collection;
 pub mod context;
 pub mod env_api_keys;
 pub mod error;
+pub mod images;
 pub mod model;
 pub mod provider;
 pub mod providers;
@@ -32,6 +33,9 @@ pub mod wire;
 pub mod faux;
 
 pub use api::anthropic_messages::AnthropicMessagesApi;
+pub use api::azure_openai_responses::AzureOpenAiResponsesApi;
+pub use api::google_generative_ai::GoogleGenerativeAiApi;
+pub use api::mistral_conversations::MistralConversationsApi;
 pub use api::openai_completions::OpenAiCompletionsApi;
 pub use api::openai_responses::OpenAiResponsesApi;
 pub use api::{
@@ -39,18 +43,35 @@ pub use api::{
 };
 pub use providers::{together_models, together_provider, together_provider_with, TOGETHER_BASE_URL};
 pub use providers::{
+    azure_openai_responses_auth, azure_openai_responses_models, azure_openai_responses_provider,
+    azure_openai_responses_provider_with, AZURE_OPENAI_API_KEY, AZURE_OPENAI_RESPONSES_PROVIDER_ID,
+};
+pub use providers::{
     anthropic_auth, anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models,
     anthropic_provider, anthropic_provider_with, AnthropicFleetSpec, ANTHROPIC_BASE_URL,
     ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID,
 };
 pub use providers::{
-    cloudflare_workers_ai_auth, cloudflare_workers_ai_models, cloudflare_workers_ai_provider,
-    cloudflare_workers_ai_provider_with, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
+    cloudflare_ai_gateway_auth, cloudflare_ai_gateway_models, cloudflare_ai_gateway_provider,
+    cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_auth, cloudflare_workers_ai_models,
+    cloudflare_workers_ai_provider, cloudflare_workers_ai_provider_with,
+    CLOUDFLARE_AI_GATEWAY_PROVIDER_ID, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
 };
 pub use providers::fleet::{fleet_spec, fleet_providers_with, FleetSpec, FLEET};
 pub use providers::{
     fireworks_auth, fireworks_models, fireworks_provider, fireworks_provider_with,
     FIREWORKS_BASE_URL, FIREWORKS_PROVIDER_ID,
+};
+pub use providers::{
+    google_auth, google_models, google_provider, google_provider_with, GOOGLE_BASE_URL,
+    GOOGLE_PROVIDER_ID,
+};
+pub use providers::{
+    mistral_auth, mistral_models, mistral_provider, mistral_provider_with, MISTRAL_BASE_URL,
+    MISTRAL_PROVIDER_ID,
+};
+pub use providers::{
+    opencode_auth, opencode_models, opencode_provider, opencode_provider_with, OPENCODE_PROVIDER_ID,
 };
 pub use providers::{
     opencode_go_auth, opencode_go_models, opencode_go_provider, opencode_go_provider_with,
@@ -73,6 +94,14 @@ pub use auth::{
     ModifyFn, OAuthAuth, ProviderAuth, ProviderEnv,
 };
 pub use catalog::{load_catalog, seed_catalog};
+pub use images::{
+    create_images_models, create_images_provider, generate_images, get_image_model,
+    get_image_models, get_image_providers, image_models, images_builtin_registry,
+    openrouter_image_models, register_images_builtins, AssistantImages, CreateImagesProviderOptions,
+    ImagesApiImpl, ImagesApiRegistry, ImagesContext, ImagesModel, ImagesModels, ImagesOptions,
+    ImagesProvider, ImagesStopReason, OPENROUTER_IMAGES,
+};
+pub use providers::{openrouter_images_auth, openrouter_images_provider};
 pub use context::{Context, ToolDef};
 pub use cyrup_core::ApiId;
 pub use error::{AuthError, BoxErr, ProviderError};
@@ -90,6 +119,9 @@ pub use utils::estimate::{
 };
 pub use utils::json_parse::{
     parse_streaming_json, parse_streaming_json_object, repair_json,
+};
+pub use utils::node_http_proxy::{
+    resolve_http_proxy_url_for_target, ProxyError, UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
 };
 pub use utils::overflow::{is_context_overflow, overflow_patterns};
 pub use utils::refresh::RefreshDedup;
@@ -110,6 +142,8 @@ pub mod known_api {
     pub const ANTHROPIC_MESSAGES: &str = "anthropic-messages";
     pub const OPENAI_COMPLETIONS: &str = "openai-completions";
     pub const OPENAI_RESPONSES: &str = "openai-responses";
+    pub const AZURE_OPENAI_RESPONSES: &str = "azure-openai-responses";
     pub const GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
+    pub const MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
     pub const BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
 }
