@@ -71,16 +71,23 @@ impl TrustStore {
         }
         let value: Value =
             serde_json::from_str(&text).map_err(|e| ConfigError::Trust(format!("parse: {e}")))?;
+        // Pi throws on a non-object top-level (trust-manager.ts:111-113).
         let obj = match value {
             Value::Object(o) => o,
-            _ => return Ok(BTreeMap::new()),
+            _ => return Err(ConfigError::Trust("Invalid trust store: expected an object".into())),
         };
         let mut out = BTreeMap::new();
         for (k, v) in obj {
+            // Pi throws on any non-`true`/`false`/`null` value (trust-manager.ts:117-121) instead of
+            // silently skipping — a malformed trust.json is a hard error.
             let decision = match v {
                 Value::Bool(b) => Some(b),
                 Value::Null => None,
-                _ => continue,
+                _ => {
+                    return Err(ConfigError::Trust(format!(
+                        "Invalid trust store: value for {k:?} must be true, false, or null"
+                    )));
+                }
             };
             out.insert(k, decision);
         }
@@ -244,46 +251,111 @@ pub fn decide_trust(input: TrustInputs) -> TrustOutcome {
     }
 }
 
-/// A prompt option (arch-07 §3.4). `updates` empty = session-only (no persist).
+/// A prompt option (arch-07 §3.4; Pi `ProjectTrustOption`). `updates` empty = session-only (no
+/// persist). `saved_path` is the path the option persists a decision for (`None` for session-only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustOption {
     pub label: String,
     pub trusted: bool,
     pub updates: Vec<(PathBuf, Option<TrustDecision>)>,
+    /// The trust-store path this option writes (Pi `ProjectTrustOption.savedPath`).
+    pub saved_path: Option<PathBuf>,
 }
 
-/// Build the standard trust prompt options for `cwd` (R-07-008/010).
+/// The parent trust-store path for `cwd`, or `None` at the filesystem root (Pi
+/// `getProjectTrustParentPath`, trust-manager.ts:59-63).
+pub fn project_trust_parent_path(cwd: &Path) -> Option<PathBuf> {
+    let cwd = canonicalize(cwd);
+    cwd.parent().filter(|p| *p != cwd.as_path()).map(Path::to_path_buf)
+}
+
+/// The interactive trust-prompt message (Pi `formatProjectTrustPrompt`, project-trust.ts:24-26).
+pub fn format_project_trust_prompt(cwd: &Path) -> String {
+    format!(
+        "Trust project folder?\n{}\n\nThis allows cyrup to load .cyrup settings and resources, \
+install missing project packages, and execute project extensions.",
+        cwd.display()
+    )
+}
+
+/// Build the standard trust prompt options for `cwd` (Pi `getProjectTrustOptions`,
+/// trust-manager.ts:65-95; R-07-008/010).
 pub fn trust_options(cwd: &Path, include_session_only: bool) -> Vec<TrustOption> {
     let cwd = canonicalize(cwd);
     let mut opts = vec![TrustOption {
-        label: "Trust this folder".to_string(),
+        label: "Trust".to_string(),
         trusted: true,
         updates: vec![(cwd.clone(), Some(TrustDecision::Trusted))],
+        saved_path: Some(cwd.clone()),
     }];
-    if let Some(parent) = cwd.parent() {
+    if let Some(parent) = project_trust_parent_path(&cwd) {
         opts.push(TrustOption {
-            label: "Trust parent folder".to_string(),
+            label: format!("Trust parent folder ({})", parent.display()),
             trusted: true,
             // parent=true, cwd=null (remove) — descendants inherit via ancestor match.
             updates: vec![
-                (parent.to_path_buf(), Some(TrustDecision::Trusted)),
+                (parent.clone(), Some(TrustDecision::Trusted)),
                 (cwd.clone(), None),
             ],
+            saved_path: Some(parent),
         });
     }
     if include_session_only {
         opts.push(TrustOption {
-            label: "Trust this session only".to_string(),
+            label: "Trust (this session only)".to_string(),
             trusted: true,
             updates: Vec::new(),
+            saved_path: None,
         });
     }
     opts.push(TrustOption {
         label: "Do not trust".to_string(),
         trusted: false,
-        updates: vec![(cwd, Some(TrustDecision::Untrusted))],
+        updates: vec![(cwd.clone(), Some(TrustDecision::Untrusted))],
+        saved_path: Some(cwd),
     });
+    if include_session_only {
+        opts.push(TrustOption {
+            label: "Do not trust (this session only)".to_string(),
+            trusted: false,
+            updates: Vec::new(),
+            saved_path: None,
+        });
+    }
     opts
+}
+
+/// An extension's `project_trust` verdict (Pi `emitProjectTrustEvent` result,
+/// project-trust.ts:54-69). `remember` asks the caller to persist the decision to the trust store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtensionTrust {
+    pub trusted: bool,
+    pub remember: bool,
+}
+
+/// Staged trust decision WITH an optional extension `project_trust` hook consulted *before* the
+/// saved decision (Pi `resolveProjectTrusted`, project-trust.ts:46-95). Additive companion to
+/// [`decide_trust`] (whose `TrustInputs` is a stable public type and cannot gain a field). When the
+/// extension returns a verdict it wins over the saved/default/prompt tiers; `ExtensionTrust.remember`
+/// signals the caller to persist via the trust store.
+pub fn decide_trust_with_extension(
+    input: TrustInputs,
+    extension: Option<ExtensionTrust>,
+) -> TrustOutcome {
+    // Steps 1-2 mirror `decide_trust`: explicit override, then "nothing to gate".
+    if let Some(o) = input.trust_override {
+        return if o { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+    }
+    if !input.has_resources {
+        return TrustOutcome::Trusted;
+    }
+    // Extension hook (before the saved decision).
+    if let Some(ext) = extension {
+        return if ext.trusted { TrustOutcome::Trusted } else { TrustOutcome::Untrusted };
+    }
+    // Remaining tiers (saved → default → prompt) are identical to `decide_trust`; `trust_override`
+    // is `None` and `has_resources` is `true` here, so re-running those checks is a no-op.
+    decide_trust(input)
 }
 
 /// A resource category, classified by trust stage (R-07-007).
@@ -453,6 +525,67 @@ mod tests {
         assert_eq!(pre, vec![&"g-ctx", &"g-ext", &"cli-ext"]);
         let post = select_loaded(&resources, true);
         assert_eq!(post.len(), 7);
+    }
+
+    #[test]
+    fn invalid_trust_value_errors() {
+        // Gap 18 / trust-manager.ts:117-121: non-bool/null values are a hard error, not skipped.
+        let dir = tmp();
+        let path = dir.join("trust.json");
+        std::fs::write(&path, r#"{ "/some/path": "yes" }"#).unwrap();
+        let store = TrustStore::new(path);
+        let cwd = dir.join("some").join("path");
+        assert!(matches!(store.nearest(&cwd), Err(ConfigError::Trust(_))));
+    }
+
+    #[test]
+    fn extension_hook_overrides_saved_decision() {
+        // project-trust.ts:54-69: extension verdict is consulted before the saved decision.
+        let base = TrustInputs {
+            has_resources: true,
+            trust_override: None,
+            saved: Some(TrustDecision::Untrusted),
+            default_trust: DefaultProjectTrust::Ask,
+            mode: AppMode::Print,
+            prompt_choice: None,
+        };
+        // extension says trusted → trusted, beating the saved "untrusted".
+        let out = decide_trust_with_extension(
+            base,
+            Some(ExtensionTrust { trusted: true, remember: false }),
+        );
+        assert_eq!(out, TrustOutcome::Trusted);
+        // no extension → falls back to saved decision (untrusted).
+        assert_eq!(decide_trust_with_extension(base, None), TrustOutcome::Untrusted);
+        // override still wins over the extension.
+        let out = decide_trust_with_extension(
+            TrustInputs { trust_override: Some(false), ..base },
+            Some(ExtensionTrust { trusted: true, remember: true }),
+        );
+        assert_eq!(out, TrustOutcome::Untrusted);
+    }
+
+    #[test]
+    fn trust_options_match_pi_labels_and_saved_path() {
+        let dir = tmp();
+        let cwd = dir.join("p").join("c");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let opts = trust_options(&cwd, true);
+        assert_eq!(opts.first().unwrap().label, "Trust");
+        assert!(opts.iter().any(|o| o.label.starts_with("Trust parent folder (")));
+        assert!(opts.iter().any(|o| o.label == "Trust (this session only)"));
+        assert!(opts.iter().any(|o| o.label == "Do not trust (this session only)"));
+        // session-only options carry no saved_path.
+        let session = opts.iter().find(|o| o.label.contains("this session only")).unwrap();
+        assert!(session.saved_path.is_none());
+        assert!(opts.first().unwrap().saved_path.is_some());
+    }
+
+    #[test]
+    fn project_trust_prompt_copy() {
+        let p = format_project_trust_prompt(Path::new("/tmp/proj"));
+        assert!(p.contains("install missing project packages"));
+        assert!(p.contains("execute project extensions"));
     }
 
     #[test]

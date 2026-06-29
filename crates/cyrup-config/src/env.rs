@@ -37,14 +37,26 @@ pub struct EnvVars {
     pub visual: Option<String>,
     pub editor: Option<String>,
     pub http_proxy: Option<String>,
+    /// `CYRUP_CLEAR_ON_SHRINK` (← `PI_CLEAR_ON_SHRINK`) — true only when the value is exactly `"1"`
+    /// (Pi `getClearOnShrink`, settings-manager.ts:1082). Used as the env fallback when the
+    /// `terminal.clearOnShrink` setting is absent.
+    pub clear_on_shrink: bool,
+    /// `CYRUP_HARDWARE_CURSOR` (← `PI_HARDWARE_CURSOR`) — true only when the value is exactly `"1"`
+    /// (Pi `getShowHardwareCursor`, settings-manager.ts:1166). Env fallback for the
+    /// `showHardwareCursor` setting.
+    pub hardware_cursor: bool,
 }
 
 fn first_env(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// Port of Pi `isTruthyEnvFlag` (telemetry.ts:3-6, main.ts:95-98, package-manager.ts:42-46):
+/// a flag env is truthy only when it is exactly `1`, or case-insensitively `true`/`yes`. Pi does
+/// NOT trim or accept `on`, so `CYRUP_TELEMETRY=on` / `PI_TELEMETRY=on` must NOT enable telemetry
+/// (and likewise for `*_OFFLINE` / `*_SKIP_VERSION_CHECK`, which use the same flag predicate).
 fn truthy(s: &str) -> bool {
-    matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
 }
 
 impl EnvVars {
@@ -67,6 +79,11 @@ impl EnvVars {
             visual: first_env(&["VISUAL"]),
             editor: first_env(&["EDITOR"]),
             http_proxy: first_env(&["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
+            // Pi compares strictly to "1" (settings-manager.ts:1082,1166), not the broader truthy set.
+            clear_on_shrink: first_env(&["CYRUP_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"]).as_deref()
+                == Some("1"),
+            hardware_cursor: first_env(&["CYRUP_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR"]).as_deref()
+                == Some("1"),
         }
     }
 }
@@ -150,5 +167,53 @@ impl ConfigDirs {
     }
     pub fn project_settings_path(&self) -> PathBuf {
         self.project_config_dir().join("settings.json")
+    }
+
+    // Additional global config-dir paths (Pi `ConfigDirs`, config.ts:524-566). All sit under the
+    // agent dir alongside settings/trust/auth.
+    /// `models.json` — custom-model / provider-config file (consumed by `load_models_file`).
+    pub fn models_path(&self) -> PathBuf {
+        self.agent_dir.join("models.json")
+    }
+    pub fn themes_dir(&self) -> PathBuf {
+        self.agent_dir.join("themes")
+    }
+    pub fn tools_dir(&self) -> PathBuf {
+        self.agent_dir.join("tools")
+    }
+    pub fn bin_dir(&self) -> PathBuf {
+        self.agent_dir.join("bin")
+    }
+    pub fn prompts_dir(&self) -> PathBuf {
+        self.agent_dir.join("prompts")
+    }
+    pub fn debug_log_path(&self) -> PathBuf {
+        self.agent_dir.join("debug.log")
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::truthy;
+
+    #[test]
+    fn truthy_matches_pi_is_truthy_env_flag() {
+        // Pi isTruthyEnvFlag (telemetry.ts:3-6): only 1 / true / yes (case-insensitive for the
+        // latter two); `on` is NOT accepted, and there is no trimming.
+        assert!(truthy("1"));
+        assert!(truthy("true"));
+        assert!(truthy("TRUE"));
+        assert!(truthy("yes"));
+        assert!(truthy("Yes"));
+        // Divergence that was the gap: `on` must be falsy.
+        assert!(!truthy("on"));
+        assert!(!truthy("ON"));
+        assert!(!truthy("0"));
+        assert!(!truthy("false"));
+        assert!(!truthy(""));
+        // Pi does not trim, so surrounding whitespace is not truthy.
+        assert!(!truthy(" 1"));
+        assert!(!truthy("1 "));
     }
 }

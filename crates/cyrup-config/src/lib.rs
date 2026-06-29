@@ -18,7 +18,9 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod config_value;
 pub mod env;
+pub mod env_keys;
 pub mod error;
 pub mod lock;
 pub mod model;
@@ -30,20 +32,33 @@ pub mod trust;
 pub(crate) mod test_util;
 
 pub use auth::{
-    AuthStore, Credential, CredentialSource, ResolvedAuth, Stored, resolve_auth,
+    resolve_auth, AuthStatus, AuthStore, Credential, CredentialSource, ResolvedAuth, Stored,
+};
+pub use config_value::{
+    clear_config_value_cache, config_value_env_var_name, config_value_env_var_names,
+    is_command_config_value, is_config_value_configured, missing_config_value_env_var_names,
+    resolve_config_value, resolve_config_value_or_throw, resolve_config_value_uncached,
+    resolve_headers, resolve_headers_or_throw,
 };
 pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
+pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use model::{
-    load_custom_models, parse_thinking_level, ModelCycler, ModelResolver, ParsedModel, ScopedModel,
+    build_fallback_model, default_model_per_provider, find_initial_model, load_custom_models,
+    load_models_file, parse_thinking_level, resolve_cli_model, restore_model_from_session,
+    CliModelResult, InitialModelResult, ModelCycler, ModelFile, ModelResolver, ParsedModel,
+    ProviderConfig, RestoredModelResult, ScopedModel,
 };
 pub use policy::NetworkPolicy;
 pub use settings::{
-    deep_merge, DefaultProjectTrust, EffectiveSettings, FileSettingsStore, InMemorySettingsStore,
-    Settings, SettingsManager, SettingsScope, SettingsStore,
+    deep_merge, migrate_settings, parse_http_idle_timeout_ms, CompactionSettings,
+    DefaultProjectTrust, EffectiveSettings, FileSettingsStore, InMemorySettingsStore, PackageSource,
+    RetrySettings, Settings, SettingsManager, SettingsScope, SettingsStore,
+    DEFAULT_HTTP_IDLE_TIMEOUT_MS,
 };
 pub use trust::{
-    decide_trust, has_trust_requiring_resources, resource_stage, select_loaded, should_load,
-    trust_options, AppMode, ResourceKind, ResourceStage, TrustDecision, TrustEntry, TrustInputs,
-    TrustOption, TrustOutcome, TrustStore,
+    decide_trust, decide_trust_with_extension, format_project_trust_prompt,
+    has_trust_requiring_resources, project_trust_parent_path, resource_stage, select_loaded,
+    should_load, trust_options, AppMode, ExtensionTrust, ResourceKind, ResourceStage, TrustDecision,
+    TrustEntry, TrustInputs, TrustOption, TrustOutcome, TrustStore,
 };

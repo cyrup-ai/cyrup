@@ -120,6 +120,31 @@ impl AuthStore {
         Ok(map.get(provider.as_str()).cloned())
     }
 
+    /// Provider-scoped env of a stored `api_key` credential (Pi `AuthStorage.getProviderEnv`,
+    /// auth-storage.ts:305-308). Returns `Some` (a copy of the credential's `env` map, possibly
+    /// empty — mirroring Pi's truthy `cred.env` check on a present object) only for an `api_key`
+    /// credential that carries an `env`; `None` for OAuth, a missing credential, or an `api_key`
+    /// without `env`. The model-registry consumer (model-registry.ts:704,809) passes this map as
+    /// the scoped `env` when resolving a `models.json` `apiKey`/`headers` config value via
+    /// [`crate::config_value::resolve_config_value`].
+    pub async fn get_provider_env(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<Option<HashMap<String, String>>, AuthError> {
+        match self.read(provider).await? {
+            Some(Credential::ApiKey { env: Some(env), .. }) => Ok(Some(env.into_iter().collect())),
+            _ => Ok(None),
+        }
+    }
+
+    /// All providers with a stored credential in `auth.json` (Pi `AuthStorage.list`,
+    /// auth-storage.ts:329-331). Used by the interactive auth UI to enumerate configured providers
+    /// (interactive-mode.ts:4671). Keys are returned in sorted order (the on-disk map is a
+    /// `BTreeMap`), which is deterministic; Pi returns `Object.keys` insertion order.
+    pub fn list(&self) -> Result<Vec<String>, AuthError> {
+        Ok(self.read_file()?.into_keys().collect())
+    }
+
     /// Serialized read-modify-write per provider — the ONLY write path. OAuth refresh MUST happen
     /// inside `f`; a failure there preserves the stored credential and never falls back to env
     /// (R-07-015/017, R-01-014). Returns the post-write credential.
@@ -172,6 +197,122 @@ impl AuthStore {
         self.modify(provider, |_current| async { Ok(None) }).await?;
         Ok(())
     }
+
+    /// Whether any form of auth is configured for a provider WITHOUT refreshing tokens (Pi
+    /// `AuthStorage.hasAuth`, auth-storage.ts:344-349): runtime override, a stored credential, or a
+    /// known env var. `env` is an optional scoped override map for the env tier.
+    pub fn has_auth(&self, provider: &ProviderId, env: Option<&HashMap<String, String>>) -> bool {
+        if self.runtime_api_key(provider).is_some() {
+            return true;
+        }
+        if matches!(self.read_file(), Ok(map) if map.contains_key(provider.as_str())) {
+            return true;
+        }
+        crate::env_keys::get_env_api_key(provider.as_str(), env).is_some()
+    }
+
+    /// Report auth status without exposing values or refreshing (Pi `getAuthStatus`,
+    /// auth-storage.ts:354-369). Precedence: stored → runtime(`--api-key`) → environment.
+    pub fn get_auth_status(
+        &self,
+        provider: &ProviderId,
+        env: Option<&HashMap<String, String>>,
+    ) -> AuthStatus {
+        if matches!(self.read_file(), Ok(map) if map.contains_key(provider.as_str())) {
+            return AuthStatus { configured: true, source: Some(AuthSource::Stored), label: None };
+        }
+        if self.runtime_api_key(provider).is_some() {
+            return AuthStatus {
+                configured: false,
+                source: Some(AuthSource::Runtime),
+                label: Some("--api-key".to_string()),
+            };
+        }
+        if let Some(keys) = crate::env_keys::find_env_keys(provider.as_str(), env)
+            && let Some(first) = keys.into_iter().next()
+        {
+            return AuthStatus {
+                configured: false,
+                source: Some(AuthSource::Environment),
+                label: Some(first),
+            };
+        }
+        AuthStatus { configured: false, source: None, label: None }
+    }
+
+    /// Resolve a usable API key for a provider (Pi `AuthStorage.getApiKey`, auth-storage.ts:462-520):
+    /// runtime override → stored api_key (via `resolveConfigValue`) → OAuth access token (if not
+    /// expired) → env fallback (unless `include_fallback` is false).
+    ///
+    /// NOTE: a stored OAuth credential whose access token has **expired** requires a network refresh
+    /// against the provider's token endpoint. That refresh (Pi `getOAuthProvider`/`getOAuthApiKey`)
+    /// is intentionally out of `cyrup-config` (DI-10: no network I/O); until the OAuth provider
+    /// registry lands, an expired token resolves to `None` so model discovery skips the provider —
+    /// matching Pi's refresh-failure end state (auth-storage.ts:503-505).
+    pub async fn get_api_key(
+        &self,
+        provider: &ProviderId,
+        include_fallback: bool,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>, AuthError> {
+        // 1. Runtime override (`--api-key`) wins.
+        if let Some(k) = self.runtime_api_key(provider) {
+            return Ok(Some(k));
+        }
+
+        match self.read(provider).await? {
+            Some(Credential::ApiKey { key: Some(raw), env: cred_env }) => {
+                let scoped: Option<HashMap<String, String>> =
+                    cred_env.map(|m| m.into_iter().collect());
+                return Ok(crate::config_value::resolve_config_value(&raw, scoped.as_ref()));
+            }
+            Some(Credential::ApiKey { key: None, .. }) => { /* fall through to env */ }
+            Some(Credential::Oauth { access, expires, .. }) => {
+                let now = unix_millis();
+                if now < expires {
+                    return Ok(Some(access));
+                }
+                // Expired: refresh lives outside this crate (see method note).
+                return Ok(None);
+            }
+            None => {}
+        }
+
+        if !include_fallback {
+            return Ok(None);
+        }
+        Ok(crate::env_keys::get_env_api_key(provider.as_str(), env))
+    }
+}
+
+/// Current unix time in milliseconds (OAuth `expires` is an epoch-ms timestamp, like `Date.now()`).
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Where a resolved/queried credential came from (Pi `AuthStatus.source`, auth-storage.ts:38-42).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSource {
+    Stored,
+    Runtime,
+    Environment,
+    Fallback,
+    ModelsJsonKey,
+    ModelsJsonCommand,
+}
+
+/// Non-secret auth status for a provider (Pi `AuthStatus`, auth-storage.ts:38-42). `configured` is
+/// true only for a persisted (`stored`) credential; `label` carries the human-readable source hint
+/// (e.g. the env-var name or `--api-key`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthStatus {
+    pub configured: bool,
+    pub source: Option<AuthSource>,
+    pub label: Option<String>,
 }
 
 /// What the credential store yields for request-time resolution (arch-07 §6.3).
@@ -446,6 +587,154 @@ mod tests {
     fn malformed_auth_file_surfaces_parse_error() {
         let r = parse_auth("{ not json");
         assert!(matches!(r, Err(AuthError::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn get_api_key_resolves_template_and_runtime_and_env() {
+        let (s, _p) = store();
+        let provider = ProviderId::from("acme-test-provider");
+        // stored value is a `$VAR` template resolved via the credential's scoped env map.
+        s.modify(&provider, |_| async {
+            Ok(Some(Credential::ApiKey {
+                key: Some("$ACME_KEY".to_string()),
+                env: Some([("ACME_KEY".to_string(), "resolved-secret".to_string())].into()),
+            }))
+        })
+        .await
+        .unwrap();
+        let key = s.get_api_key(&provider, true, None).await.unwrap();
+        assert_eq!(key.as_deref(), Some("resolved-secret"));
+
+        // runtime override wins over stored.
+        s.set_runtime_api_key(provider.clone(), "cli-key".to_string());
+        assert_eq!(s.get_api_key(&provider, true, None).await.unwrap().as_deref(), Some("cli-key"));
+        s.remove_runtime_api_key(&provider);
+
+        // no stored credential → env fallback via the provider→env map (openai).
+        let openai = ProviderId::from("openai");
+        let env: HashMap<String, String> =
+            [("OPENAI_API_KEY".to_string(), "sk-env".to_string())].into();
+        assert_eq!(
+            s.get_api_key(&openai, true, Some(&env)).await.unwrap().as_deref(),
+            Some("sk-env")
+        );
+        // include_fallback = false suppresses env.
+        assert_eq!(s.get_api_key(&openai, false, Some(&env)).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_api_key_oauth_expiry() {
+        let (s, _p) = store();
+        let provider = ProviderId::from("oauth-prov");
+        // valid (future) access token is returned.
+        let future = unix_millis() + 600_000;
+        s.modify(&provider, |_| async move {
+            Ok(Some(Credential::Oauth {
+                refresh: "r".into(),
+                access: "fresh-token".into(),
+                expires: future,
+                ext: Map::new(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_api_key(&provider, true, None).await.unwrap().as_deref(),
+            Some("fresh-token")
+        );
+        // expired token → None (refresh lives outside the crate; no env fallback for oauth).
+        s.modify(&provider, |_| async {
+            Ok(Some(Credential::Oauth {
+                refresh: "r".into(),
+                access: "stale".into(),
+                expires: 1,
+                ext: Map::new(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.get_api_key(&provider, true, None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn auth_status_sources() {
+        let (s, _p) = store();
+        let openai = ProviderId::from("openai");
+        // environment source with label.
+        let env: HashMap<String, String> =
+            [("OPENAI_API_KEY".to_string(), "sk-env".to_string())].into();
+        let st = s.get_auth_status(&openai, Some(&env));
+        assert!(!st.configured);
+        assert_eq!(st.source, Some(AuthSource::Environment));
+        assert_eq!(st.label.as_deref(), Some("OPENAI_API_KEY"));
+        // stored source.
+        s.modify(&openai, |_| async { Ok(Some(Credential::api_key("k"))) }).await.unwrap();
+        let st = s.get_auth_status(&openai, Some(&env));
+        assert!(st.configured);
+        assert_eq!(st.source, Some(AuthSource::Stored));
+        assert!(s.has_auth(&openai, Some(&env)));
+    }
+
+    #[tokio::test]
+    async fn get_provider_env_returns_scoped_env_for_api_key_only() {
+        // Pi AuthStorage.getProviderEnv (auth-storage.ts:305-308).
+        let (s, _p) = store();
+        let prov = ProviderId::from("acme");
+        // api_key with env → Some(copy).
+        s.modify(&prov, |_| async {
+            Ok(Some(Credential::ApiKey {
+                key: Some("$ACME_KEY".to_string()),
+                env: Some([("ACME_KEY".to_string(), "secret".to_string())].into()),
+            }))
+        })
+        .await
+        .unwrap();
+        let env = s.get_provider_env(&prov).await.unwrap().unwrap();
+        assert_eq!(env.get("ACME_KEY").map(String::as_str), Some("secret"));
+
+        // api_key without env → None.
+        let bare = ProviderId::from("bare");
+        s.modify(&bare, |_| async { Ok(Some(Credential::api_key("k"))) }).await.unwrap();
+        assert_eq!(s.get_provider_env(&bare).await.unwrap(), None);
+
+        // OAuth credential → None.
+        let oauth = ProviderId::from("oauthp");
+        s.modify(&oauth, |_| async {
+            Ok(Some(Credential::Oauth {
+                refresh: "r".into(),
+                access: "a".into(),
+                expires: 0,
+                ext: Map::new(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.get_provider_env(&oauth).await.unwrap(), None);
+
+        // missing provider → None.
+        assert_eq!(s.get_provider_env(&ProviderId::from("nope")).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_providers_with_credentials() {
+        // Pi AuthStorage.list (auth-storage.ts:329-331).
+        let (s, _p) = store();
+        assert!(s.list().unwrap().is_empty());
+        s.modify(&ProviderId::from("openai"), |_| async {
+            Ok(Some(Credential::api_key("a")))
+        })
+        .await
+        .unwrap();
+        s.modify(&ProviderId::from("anthropic"), |_| async {
+            Ok(Some(Credential::api_key("b")))
+        })
+        .await
+        .unwrap();
+        // BTreeMap → sorted.
+        assert_eq!(s.list().unwrap(), vec!["anthropic".to_string(), "openai".to_string()]);
+        // deleting a provider drops it from the list.
+        s.delete(&ProviderId::from("openai")).await.unwrap();
+        assert_eq!(s.list().unwrap(), vec!["anthropic".to_string()]);
     }
 
     #[test]
