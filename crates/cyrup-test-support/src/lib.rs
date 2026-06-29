@@ -45,8 +45,9 @@ pub use auth::{
     real_auth_path, resolve_api_key, resolve_api_key_refreshing, resolve_api_key_refreshing_in,
 };
 pub use differential::{
-    assert_event_kinds, diff_normalized, diff_sequences, event_kind_sequence, run_differential,
-    stream_event_type_sequence,
+    assert_event_kinds, canonical_event, canonicalize_cross_impl, diff_normalized, diff_sequences,
+    event_kind_sequence, pi_fixture_events, run_differential, stream_event_type_sequence,
+    value_type_sequence,
 };
 pub use golden::{normalize_value, snapshot, verify as verify_golden, verify_snapshot};
 pub use harness::{
@@ -336,26 +337,24 @@ mod smoke {
         assert_eq!(event_kind_sequence(&events).first().map(String::as_str), Some("agent_start"));
     }
 
-    /// Differential fixture (func-00 R-00-012): the harness's emitted event-kind ordering for a
-    /// plain text turn matches the committed golden sequence (`fixtures/pi/text-turn.events.jsonl`),
-    /// which mirrors Pi `agent-loop.ts:109-366`. The text turn streams Start → text_start →
-    /// text_delta → text_end → Done, and the agent re-emits the refreshed partial on a *distinct*
-    /// `message_update` for each content-block event (Pi emits one `AssistantMessageEvent` per block
-    /// event; agent-loop.ts:319-340), so a single text block yields three `message_update`s.
+    /// Differential anchor (func-00 R-00-012): the harness's emitted session-event ordering for a
+    /// plain text turn matches a sequence **captured from RUNNING Pi** — its own `agentLoop()`
+    /// (`pi/packages/agent/src/agent-loop.ts`) driven by Pi's own faux core, recorded into
+    /// `fixtures/pi/text-turn.pi-captured.events.jsonl` (see
+    /// `spec/gap-analysis/fixtures-capture/capture-agentloop-textturn.ts`). The text turn streams
+    /// text_start → text_delta → text_end, and the agent re-emits the refreshed partial on a
+    /// *distinct* `message_update` per content-block event (Pi agent-loop.ts:319-366), so one text
+    /// block yields three `message_update`s — an 11-event sequence Pi and cyrup emit identically.
     ///
-    /// NOTE: this golden is SELF-recorded from cyrup's own harness, not a real cross-impl Pi-runtime
-    /// capture — capturing against a live Pi runtime remains test-support's known open gap. Treat it
-    /// as a regression anchor for cyrup's Pi-faithful ordering, not as proof of Pi-runtime equality.
+    /// This is now a TRUE cross-impl anchor (R-00-012 "identical emitted event sequence: types +
+    /// ordering"), not a self-golden. The self-recorded `text-turn.events.jsonl` remains as a
+    /// field-level regression golden; this test anchors the *ordering* to real Pi data.
     #[tokio::test]
     async fn differential_matches_pi_captured_fixture() {
-        let fixture = include_str!("../fixtures/pi/text-turn.events.jsonl");
-        let expected: Vec<String> = fixture
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-            .collect();
-        assert_eq!(expected.len(), 11, "fixture event count");
+        let fixture = include_str!("../fixtures/pi/text-turn.pi-captured.events.jsonl");
+        let pi_events = crate::differential::pi_fixture_events(fixture);
+        let expected = crate::differential::value_type_sequence(&pi_events);
+        assert_eq!(expected.len(), 11, "Pi-captured fixture event count");
 
         let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text("hi")]))
             .await
@@ -363,7 +362,7 @@ mod smoke {
         let events = harness.run("hello").await.expect("run");
         let actual = event_kind_sequence(&events);
         assert_event_kinds(&expected, &actual)
-            .expect("cyrup text-turn ordering diverges from the Pi-captured fixture");
+            .expect("cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence");
     }
 
     /// The faux core tool-call id matches Pi's `tool:<ts>:<rand>` shape (deterministic [CYRUP-DELTA]).
@@ -583,6 +582,68 @@ mod smoke {
         assert!(types.iter().any(|t| t == "thinking_delta"));
         assert!(types.iter().any(|t| t == "thinking_end"));
         assert_eq!(types.last().map(String::as_str), Some("done"));
+    }
+
+    /// TRUE cross-impl anchor (R-00-012): cyrup's live faux `thinking` stream is diffed against a
+    /// fixture **captured from running Pi's own faux core** (node executing
+    /// `pi/packages/ai/src/providers/faux.ts`; see `fixtures/pi/thinking-stream.pi-captured.events.jsonl`
+    /// + `spec/gap-analysis/fixtures-capture/capture-faux-thinking.ts`). Asserts (1) identical emitted
+    /// event **type + ordering** (R-00-012's exact contract) and (2) field-level equality of the
+    /// terminal `done` message after folding the two documented Pi<->cyrup representation deltas
+    /// (`role` type-encoding; integer-vs-`f64` numbers) via `canonical_event`. The intermediate
+    /// `partial` snapshots intentionally diverge: Pi's shallow `{...partial}` clone aliases the nested
+    /// `content` array (faux.ts:338,347) so its `thinking_start` partial shows the FINAL `"ok"`,
+    /// whereas cyrup's value-semantics snapshot correctly shows `""` — a Pi quirk cyrup does not
+    /// reproduce, so the field-level anchor is the unambiguous terminal message.
+    #[tokio::test]
+    async fn pi_captured_thinking_stream_is_true_cross_impl_anchor() {
+        use cyrup_provider::{Context, Provider, StreamOptions};
+
+        // The real-Pi capture (skips the `{"_note":…}` provenance line).
+        let jsonl = std::fs::read_to_string(fixture_path("thinking-stream.pi-captured.events.jsonl"))
+            .expect("read Pi-captured fixture");
+        let pi_events = crate::differential::pi_fixture_events(&jsonl);
+        assert!(!pi_events.is_empty(), "Pi-captured fixture has no typed events");
+
+        // cyrup's live faux stream for the identical scenario.
+        let provider = faux::FauxProvider::new();
+        provider.set_responses(vec![faux::faux_assistant_message(
+            vec![faux::faux_thinking("ok")],
+            cyrup_core::StopReason::Stop,
+        )]);
+        let model = provider.model().clone();
+        let cy_events =
+            drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+
+        // (1) type + ordering — R-00-012's exact contract, fully cross-impl.
+        let pi_types = crate::differential::value_type_sequence(&pi_events);
+        let cy_types = stream_event_type_sequence(&cy_events);
+        assert_eq!(pi_types, cy_types, "Pi vs cyrup event type+ordering mismatch");
+        assert_eq!(pi_types.first().map(String::as_str), Some("start"));
+        assert_eq!(pi_types.last().map(String::as_str), Some("done"));
+
+        // (2) terminal `done` message — field-level, modulo the two documented deltas.
+        let pi_done = pi_events
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("done"))
+            .cloned()
+            .expect("Pi capture has a done event");
+        let cy_done = cy_events
+            .iter()
+            .find(|e| {
+                serde_json::to_value(e)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some("done")
+            })
+            .map(|e| serde_json::to_value(e).expect("serialize cyrup done"))
+            .expect("cyrup has a done event");
+        assert_eq!(
+            crate::differential::canonical_event(pi_done),
+            crate::differential::canonical_event(cy_done),
+            "Pi vs cyrup terminal `done` message diverges beyond the documented role/number deltas",
+        );
     }
 
     #[tokio::test]

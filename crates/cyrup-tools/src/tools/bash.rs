@@ -13,7 +13,7 @@ use cyrup_core::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,45 +97,79 @@ impl Tool for BashTool {
         // Pi emits an initial empty update before streaming (bash.ts:338-340).
         sink(ToolUpdate { content: vec![], details: None });
 
-        let exec_result = {
-            let acc_ref = &mut acc;
-            let sink_ref = &mut sink;
-            let mut last: Option<Instant> = None;
+        // Pi debounces mid-stream output updates with a 100ms throttle that has BOTH a leading edge
+        // AND a scheduled TRAILING-edge `setTimeout` flush (`scheduleOutputUpdate`, bash.ts:158,
+        // 302-336): a sub-threshold burst that arrives just after a leading emit is still flushed
+        // ~100ms later, MID-STREAM, rather than waiting for the final settle. The `ProcOps::exec`
+        // seam delivers data through a SYNCHRONOUS `on_data` callback with no timer, so — without
+        // changing that cross-crate seam — each chunk is forwarded over an unbounded channel and a
+        // concurrent tokio "flusher" runs alongside `exec`, owning the throttle timer and emitting
+        // with the exact leading+trailing cadence Pi uses (`emitOutputUpdate`/`clearUpdateTimer`,
+        // bash.ts:302-335). The channel closes when `exec` returns (its sender is dropped), which
+        // ends the flusher; the final settle update below is Pi's `finishOutput` flush (bash.ts:
+        // 348-356).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let exec_fut = async move {
             let mut on_data = move |chunk: &[u8]| {
-                acc_ref.append(chunk);
-                // Leading-edge 100ms throttle (Pi BASH_UPDATE_THROTTLE_MS, bash.ts:158,323-336).
-                // [CYRUP-DELTA]: Pi additionally schedules a *trailing* flush of the last dirty
-                // snapshot via a timer; cyrup's `on_data` is a synchronous callback with no timer
-                // task, so a sub-100ms final burst is instead delivered by the guaranteed final
-                // settle update below — the settled content is identical.
-                let due = last.is_none_or(|t| t.elapsed() >= Duration::from_millis(100));
-                if due {
-                    last = Some(Instant::now());
-                    // Pi sends `snapshot.content` plus `details: { truncation?, fullOutputPath? }`
-                    // (bash.ts:306-313). Build the same mid-stream snapshot here.
-                    let snap = acc_ref.tail_string();
-                    let preview = truncate_tail(&snap, TruncOpts::new(max_lines, max_bytes));
-                    let truncated = acc_ref.is_truncated();
-                    let total_lines = acc_ref.total_lines();
-                    let total_bytes = acc_ref.total_bytes();
-                    let full_path = acc_ref.snapshot_path();
-                    let details = stream_details(
-                        preview.info,
-                        truncated,
-                        total_lines,
-                        total_bytes,
-                        max_bytes,
-                        full_path,
-                    );
-                    sink_ref(ToolUpdate {
-                        content: vec![Content::text(preview.content)],
-                        details,
-                    });
-                }
+                // A closed receiver (flusher already gone) is ignored: the bytes are still part of
+                // the final snapshot, exactly like Pi dropping a late `onUpdate`.
+                let _ = tx.send(chunk.to_vec());
             };
-            self.proc.exec(spec, cancel.clone(), timeout, &mut on_data).await
+            let result = self.proc.exec(spec, cancel, timeout, &mut on_data).await;
+            // Drop the sender so the flusher's `recv()` returns `None` and it settles.
+            drop(on_data);
+            result
         };
 
+        let flush_fut = async {
+            let throttle = Duration::from_millis(100);
+            let mut last_emit: Option<tokio::time::Instant> = None;
+            let mut dirty = false;
+            // The single pending trailing-edge timer (Pi `updateTimer`, bash.ts:298,332).
+            let mut deadline: Option<tokio::time::Instant> = None;
+            loop {
+                let timer_deadline = deadline;
+                tokio::select! {
+                    biased;
+                    maybe = rx.recv() => match maybe {
+                        Some(chunk) => {
+                            acc.append(&chunk);
+                            dirty = true;
+                            // Pi: `delay = THROTTLE - (now - lastUpdateAt)`; `delay <= 0` ⇒ leading
+                            // edge (emit immediately), else arm ONE trailing timer and coalesce
+                            // further chunks into it (`updateTimer ??=`, bash.ts:323-335).
+                            let due = last_emit.is_none_or(|t| t.elapsed() >= throttle);
+                            if due {
+                                deadline = None;
+                                flush_update(
+                                    &mut acc, &mut sink, &mut dirty, &mut last_emit, max_lines,
+                                    max_bytes,
+                                );
+                            } else if deadline.is_none() {
+                                deadline = last_emit.map(|t| t + throttle);
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = async move {
+                        match timer_deadline {
+                            Some(d) => tokio::time::sleep_until(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        // Trailing edge fired: flush the accumulated dirty snapshot (Pi's
+                        // `updateTimer` callback → `emitOutputUpdate`, bash.ts:332-335).
+                        deadline = None;
+                        flush_update(
+                            &mut acc, &mut sink, &mut dirty, &mut last_emit, max_lines, max_bytes,
+                        );
+                    }
+                }
+            }
+        };
+
+        let (exec_result, ()) = tokio::join!(exec_fut, flush_fut);
         let status = exec_result?;
 
         let tail = acc.tail_string();
@@ -278,6 +312,44 @@ fn stream_details(
     let truncation = if truncated { Some(info) } else { None };
     let full_output_path = full_path.map(|p| p.to_string_lossy().into_owned());
     serde_json::to_value(BashDetails { truncation, full_output_path }).ok()
+}
+
+/// Build a mid-stream `onUpdate` payload from the live accumulator (Pi `emitOutputUpdate`'s
+/// `snapshot` + `onUpdate({ content, details })`, bash.ts:306-313): `snapshot.content` plus the
+/// `{ truncation?, fullOutputPath? }` details shape.
+fn build_stream_update(
+    acc: &mut OutputAccumulator,
+    max_lines: usize,
+    max_bytes: usize,
+) -> ToolUpdate {
+    let snap = acc.tail_string();
+    let preview = truncate_tail(&snap, TruncOpts::new(max_lines, max_bytes));
+    let truncated = acc.is_truncated();
+    let total_lines = acc.total_lines();
+    let total_bytes = acc.total_bytes();
+    let full_path = acc.snapshot_path();
+    let details =
+        stream_details(preview.info, truncated, total_lines, total_bytes, max_bytes, full_path);
+    ToolUpdate { content: vec![Content::text(preview.content)], details }
+}
+
+/// Pi's `emitOutputUpdate` (bash.ts:302-314): a no-op unless something is dirty; otherwise clear the
+/// dirty flag, stamp `lastUpdateAt`, and emit the current snapshot. The `last_emit` stamp drives the
+/// next throttle window so the leading/trailing cadence matches Pi 1:1.
+fn flush_update(
+    acc: &mut OutputAccumulator,
+    sink: &mut ToolUpdateSink,
+    dirty: &mut bool,
+    last_emit: &mut Option<tokio::time::Instant>,
+    max_lines: usize,
+    max_bytes: usize,
+) {
+    if !*dirty {
+        return;
+    }
+    *dirty = false;
+    *last_emit = Some(tokio::time::Instant::now());
+    sink(build_stream_update(acc, max_lines, max_bytes));
 }
 
 impl ToolMeta for BashTool {

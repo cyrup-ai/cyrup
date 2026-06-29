@@ -13,7 +13,7 @@ use cyrup_core::{
 };
 use cyrup_tools::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts};
 use cyrup_tools::ops::local::LocalFs;
-use cyrup_tools::ops::{Backend, FsOps, ProcOps, ShellConfig};
+use cyrup_tools::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps, ShellConfig};
 use cyrup_tools::registry::{Availability, ToolRegistry};
 use cyrup_tools::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
 use cyrup_tools::{FileMutationLocks, ToolsOptions};
@@ -705,6 +705,81 @@ impl Tool for Boom {
     ) -> Result<ToolResult, ToolError> {
         Err(ToolError::new("boom went the tool"))
     }
+}
+
+// A `ProcOps` that emits two chunks within the throttle window, then HOLDS the stream open past the
+// 100ms throttle (so the trailing-edge timer can fire mid-stream) before emitting a final chunk.
+// Mirrors Pi's `scheduleOutputUpdate` leading+trailing cadence (bash.ts:302-336).
+struct ScriptedProc;
+#[async_trait::async_trait]
+impl ProcOps for ScriptedProc {
+    async fn exec(
+        &self,
+        _spec: ExecSpec,
+        _cancel: CancelToken,
+        _timeout: Option<std::time::Duration>,
+        on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
+    ) -> Result<ExitStatus, ToolError> {
+        // First chunk -> leading-edge emit ("a"). Second chunk arrives within the throttle window,
+        // so it can only reach the consumer via the scheduled TRAILING flush.
+        on_data(b"a");
+        on_data(b"b");
+        // Keep the stream (and thus the channel) open past the throttle; with paused time the
+        // flusher's 100ms trailing timer fires here -> mid-stream "ab" flush.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // After the trailing flush, this chunk is again past the throttle -> leading-edge "abc".
+        on_data(b"c");
+        Ok(ExitStatus::Exited(0))
+    }
+}
+
+fn update_text(u: &ToolUpdate) -> String {
+    u.content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// gap — Pi flushes a sub-threshold output burst MID-STREAM via a scheduled trailing-edge timer
+// (`scheduleOutputUpdate` -> `setTimeout` -> `emitOutputUpdate`, bash.ts:302-336). cyrup must too:
+// the second chunk ("b") arrives inside the throttle window after the leading "a" emit, so the only
+// way the consumer sees "ab" BEFORE the final settle is the trailing flush. `start_paused` makes the
+// timer deterministic (tokio auto-advances virtual time to the next deadline when otherwise idle).
+#[tokio::test(start_paused = true)]
+async fn bash_trailing_edge_flush_emits_midstream() {
+    let updates: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink: ToolUpdateSink = {
+        let updates = updates.clone();
+        Box::new(move |u: ToolUpdate| {
+            updates.lock().unwrap().push(update_text(&u));
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let bash = BashTool::new(
+        Arc::new(ScriptedProc),
+        ShellConfig::detect(),
+        dir.path().to_path_buf(),
+        BashOpts::default(),
+    );
+    let r = bash
+        .execute(cid(), serde_json::json!({ "command": "x" }), CancelToken::new(), sink)
+        .await
+        .unwrap();
+
+    let recorded = updates.lock().unwrap().clone();
+    // Leading edge delivered "a".
+    assert!(recorded.iter().any(|t| t == "a"), "missing leading-edge 'a': {recorded:?}");
+    // The TRAILING-edge timer flushed the coalesced "ab" mid-stream (the regression under test):
+    // without it, "ab" never appears — the consumer would jump straight from "a" to "abc".
+    assert!(
+        recorded.iter().any(|t| t == "ab"),
+        "missing mid-stream trailing flush 'ab': {recorded:?}"
+    );
+    // Final settled content includes all output.
+    assert!(first_text(&r).contains("abc"), "final result missing 'abc': {}", first_text(&r));
 }
 
 #[tokio::test]
