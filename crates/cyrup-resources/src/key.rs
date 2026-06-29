@@ -1,7 +1,8 @@
 //! Normalized resource name key + collision rules (arch-09 §2, key.rs).
 //!
 //! A [`ResourceKey`] is the case-insensitive, trimmed identity of a resource by name. Two
-//! resources with the same key in different scopes collide; the higher scope wins (R-09-024).
+//! resources with the same key in different scopes collide; the lower-ranked scope wins per Pi's
+//! `resourcePrecedenceRank` ([`crate::scope::ResourceScope::precedence_rank`]).
 
 /// Normalized resource name (lower-cased, trimmed). Used as the map key for same-name precedence.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]

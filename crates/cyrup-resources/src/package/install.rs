@@ -190,8 +190,11 @@ impl PackageManager {
     }
 }
 
-/// Best-effort refresh of an installed package. Git: re-resolve HEAD from the local clone (network
-/// fetch is fixture-gated / deferred, §12). Path: no-op.
+/// Refresh an installed package. Git: re-clone the source URL (real fetch via `gix`) so the working
+/// tree and recorded commit advance with the remote, mirroring Pi `updateGit`; for a bare on-disk
+/// source path the local repo is re-copied and re-resolved. If the source is unreachable the update
+/// degrades gracefully — the last known commit (or the local clone's HEAD) is retained rather than
+/// failing the whole run. Path: no-op.
 fn refresh(
     pkg: &mut InstalledPackage,
     scope: InstallScope,
@@ -200,11 +203,17 @@ fn refresh(
     match &pkg.source {
         PackageSource::Path { .. } => Ok(()),
         PackageSource::Oci { .. } => Err(ResourceError::Unsupported),
-        PackageSource::Git { .. } => {
-            if let Some(dir) = store.package_dir(scope, &pkg.id)
-                && let Ok(commit) = git_head(&dir) {
-                    pkg.resolved_commit = Some(commit);
+        PackageSource::Git { url, reff } => {
+            let Some(dir) = store.package_dir(scope, &pkg.id) else { return Ok(()) };
+            match git_clone(url, &dir, reff.ref_name().map(str::to_string)) {
+                Ok(commit) => pkg.resolved_commit = Some(commit),
+                Err(_) => {
+                    // Unreachable source: keep going. If a local clone is present, re-read its HEAD.
+                    if let Ok(commit) = git_head(&dir) {
+                        pkg.resolved_commit = Some(commit);
+                    }
                 }
+            }
             Ok(())
         }
     }
@@ -212,16 +221,16 @@ fn refresh(
 
 /// Materialize a git package working tree at `dir` and return the resolved commit (hex).
 ///
-/// **Channel note (§7.6, §12):** network fetch over the wire is fixture-gated — it needs gix's
-/// `blocking-network-client` feature, which is off by default to keep print-mode builds lean. The
-/// supported, deterministic path is a **local git repo** (a `file://` URL or a filesystem path to a
-/// real repo, e.g. a local fixture): its tree is copied into the store and the requested ref is
-/// checked out with `gix` (no network).
+/// Two transports (§7.6, utils/git.ts):
+/// - A bare **on-disk repo directory** (a filesystem path, no URL scheme) is copied into the store
+///   and the requested ref checked out from its object database — fully offline/deterministic.
+/// - A **URL** (`file://`, `https://`, `http://`, `ssh://`, `git://`) is fetched with `gix`'s real
+///   clone machinery (`blocking-network-client`), so remote installs work, not just local fixtures.
 ///
 /// When `ref_name` is set (a branch/tag/commit pin, utils/git.ts:6-19), the named ref is resolved
-/// against the local object database and its tree is materialized over the working copy so the pin
-/// is actually applied (R-09-018/020) — the recorded commit is the ref's commit, not default HEAD.
-/// When it is absent, the cloned HEAD is used.
+/// and its tree materialized over the working copy so the pin is actually applied (R-09-018/020) —
+/// the recorded commit is the ref's commit, not default HEAD. When it is absent, the cloned HEAD is
+/// used.
 fn git_clone(
     url: &str,
     dir: &std::path::Path,
@@ -230,19 +239,67 @@ fn git_clone(
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let local = url.strip_prefix("file://").unwrap_or(url);
-    let src = std::path::Path::new(local);
-    if src.is_dir() {
-        copy_tree(src, dir)?;
-        return match ref_name {
-            Some(reff) => checkout_ref(dir, &reff),
-            None => git_head(dir),
-        };
+    // A bare on-disk path (no URL scheme) is copied directly — deterministic and offline.
+    if !url.contains("://") {
+        let src = std::path::Path::new(url);
+        if src.is_dir() {
+            copy_tree(src, dir)?;
+            return match ref_name {
+                Some(reff) => checkout_ref(dir, &reff),
+                None => git_head(dir),
+            };
+        }
+        return Err(ResourceError::Git(format!(
+            "not a git repo directory and not a URL: {url}"
+        )));
     }
-    Err(ResourceError::Git(format!(
-        "network git fetch is fixture-gated (build gix with `blocking-network-client`); \
-         use a local repo path/file:// URL: {url}"
-    )))
+    // A scheme URL (file://, https://, http://, ssh://, git://) — real gix clone.
+    git_clone_url(url, dir, ref_name)
+}
+
+/// Clone a git URL into `dir` with `gix` (real network/file transport via `blocking-network-client`)
+/// and return the resolved commit (hex). Mirrors Pi's `git clone` step in install/updateGit.
+fn git_clone_url(
+    url: &str,
+    dir: &std::path::Path,
+    ref_name: Option<String>,
+) -> Result<String, ResourceError> {
+    use std::sync::atomic::AtomicBool;
+
+    // A fresh clone requires the target dir to be empty/absent; clear any stale tree.
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let mut prepare =
+        gix::prepare_clone(url, dir).map_err(|e| ResourceError::Git(e.to_string()))?;
+    if let Some(reff) = ref_name.as_deref() {
+        prepare = prepare
+            .with_ref_name(Some(reff))
+            .map_err(|e| ResourceError::Git(e.to_string()))?;
+    }
+    let interrupt = AtomicBool::default();
+    let (mut checkout, _) = prepare
+        .fetch_then_checkout(gix::progress::Discard, &interrupt)
+        .map_err(|e| ResourceError::Git(e.to_string()))?;
+    let (repo, _) = checkout
+        .main_worktree(gix::progress::Discard, &interrupt)
+        .map_err(|e| ResourceError::Git(e.to_string()))?;
+
+    // Resolve the recorded commit: the pinned ref if given, else the checked-out HEAD.
+    let commit_hex = match ref_name.as_deref() {
+        Some(reff) => repo
+            .rev_parse_single(reff)
+            .map_err(|e| ResourceError::Git(format!("ref `{reff}` not found: {e}")))?
+            .object()
+            .map_err(|e| ResourceError::Git(e.to_string()))?
+            .try_into_commit()
+            .map_err(|e| ResourceError::Git(e.to_string()))?
+            .id()
+            .to_hex()
+            .to_string(),
+        None => git_head_repo(&repo)?,
+    };
+    Ok(commit_hex)
 }
 
 /// Resolve `reff` (branch/tag/commit) in the local clone at `dir`, materialize its tree over the

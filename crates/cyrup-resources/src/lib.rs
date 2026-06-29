@@ -10,8 +10,12 @@
 //! - **Packages** ([`PackageManager`]) — manifest-declared bundles, git/local-path installs.
 //!
 //! [`discover`] runs one pass over all roots and returns a [`ResourceRegistry`] snapshot held
-//! behind [`ResourceHandle`] (lock-free reads, atomic `/reload` swap). Precedence is
-//! deterministic (built-in -> global -> project -> discovered -> cli, later wins; R-09-024).
+//! behind [`ResourceHandle`] (lock-free reads, atomic `/reload` swap). Same-name precedence is a
+//! 1:1 port of Pi's `resourcePrecedenceRank` (package-manager.ts:172-188): the lower-ranked
+//! candidate wins under first-wins dedup — project-settings < project-auto < user-settings <
+//! user-auto < any package < CLI (the explicit `--skill`/`--prompt-template`/`--theme` paths Pi
+//! appends after the sorted accumulator, resource-loader.ts:421) — see
+//! [`scope::ResourceScope::precedence_rank`].
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -37,8 +41,8 @@ use std::sync::Arc;
 pub use cyrup_core::PackageId;
 
 pub use discovery::{
-    CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceRegistry,
-    ResourceSet, discover,
+    CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceOverrides,
+    ResourceRegistry, ResourceSet, discover,
 };
 pub use error::{
     Collision, DiagnosticType, ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning,
@@ -48,8 +52,8 @@ pub use package::install::{PackageManager, security_notice_for};
 pub use package::source::{PackageSource, PinRef};
 pub use package::{
     DisabledSet, InstalledPackage, InstalledPackages, ManifestResources, PackageStore,
-    ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice, UpdateReport,
-    UpdateTarget, resolve_manifest,
+    ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice,
+    UpdateReport, UpdateTarget, has_unsafe_git_install_part, parse_git_url, resolve_manifest,
 };
 pub use prompt::{
     PromptTemplate, expand_prompt_template, parse_command_args, substitute_args,

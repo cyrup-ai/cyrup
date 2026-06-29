@@ -11,8 +11,11 @@ use cyrup_core::CancelToken;
 
 use crate::error::{ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning};
 use crate::key::ResourceKey;
+use crate::package::manifest::{ManifestResourceType, resolve_local_entries};
 use crate::package::store::installed_dir;
-use crate::package::{DisabledSet, InstalledPackages, ResourceSelector, resolve_manifest};
+use crate::package::{
+    DisabledSet, InstalledPackage, InstalledPackages, ResourceSelector, resolve_manifest,
+};
 use crate::prompt::PromptTemplate;
 use crate::scope::{InstallScope, ResourceOrigin, ResourceScope};
 use crate::skill::Skill;
@@ -38,14 +41,23 @@ impl<T: Named + Clone> Default for ResourceSet<T> {
 }
 
 impl<T: Named + Clone> ResourceSet<T> {
-    /// Build from all candidates, applying precedence: higher [`ResourceScope`] wins a same-name
-    /// collision; within a scope, insertion (path) order decides (R-09-024).
-    pub fn build(mut all: Vec<T>) -> Self {
-        // Stable sort ascending by scope so higher scopes are inserted last and overwrite.
-        all.sort_by_key(|c| c.scope());
-        let mut by_key = HashMap::new();
-        for c in &all {
-            by_key.insert(c.key().clone(), c.clone());
+    /// Build from all candidates, applying Pi's precedence: candidates are ordered by
+    /// [`ResourceScope::precedence_rank`] ascending (**lower rank wins**), ties broken by insertion
+    /// order, then the **first** occurrence of each name wins — a 1:1 port of Pi's
+    /// `resolved.sort((a,b) => rank(a) - rank(b))` followed by first-wins dedup
+    /// (package-manager.ts:2474-2482, `resourcePrecedenceRank` 184-188). A stable sort preserves
+    /// insertion order within a rank, so e.g. a project-scope package (rank 4) inserted before a
+    /// global-scope package (also rank 4) wins the tie. The explicit `--skill` CLI tier sits at
+    /// rank 5 (below every package), reproducing Pi's append-after-sort order in which a same-name
+    /// package wins over an appended `additionalSkillPaths` entry (resource-loader.ts:421).
+    pub fn build(all: Vec<T>) -> Self {
+        // `sort_by_key` is a *stable* sort: equal ranks keep their original (insertion) order, so
+        // first-wins over this ordering reproduces Pi's project-package-first rank-4 tie.
+        let mut ordered: Vec<&T> = all.iter().collect();
+        ordered.sort_by_key(|c| c.scope().precedence_rank());
+        let mut by_key: HashMap<ResourceKey, T> = HashMap::new();
+        for c in ordered {
+            by_key.entry(c.key().clone()).or_insert_with(|| c.clone());
         }
         Self { by_key, all }
     }
@@ -103,6 +115,22 @@ pub struct DiscoveredPaths {
     pub theme_paths: Vec<PathBuf>,
 }
 
+/// Settings-level override-pattern lists that selectively enable/disable *auto-discovered loose*
+/// resources (1:1 with Pi's `globalSettings`/`projectSettings` `skills`/`prompts`/`themes` arrays,
+/// applied via `isEnabledByOverrides`/`addAutoDiscoveredResources`, package-manager.ts:700-717,
+/// 2241-2304). Each list holds `!`/`+`/`-` override patterns (plain/glob includes are ignored here);
+/// an empty list disables nothing. Populated by cyrup-config; defaults to empty (no filtering).
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceOverrides {
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub prompts: Vec<String>,
+    #[serde(default)]
+    pub themes: Vec<String>,
+}
+
 /// Everything discovery needs, passed in (keeps `cyrup-resources` core-only).
 #[derive(Clone, Debug)]
 pub struct DiscoveryConfig {
@@ -121,6 +149,11 @@ pub struct DiscoveryConfig {
     pub extra: DiscoveredPaths,
     /// Top-level per-resource enable/disable state.
     pub disabled: DisabledSet,
+    /// Settings override patterns for global (user-scope) auto-discovered loose resources
+    /// (package-manager.ts:700-717, 2271-2278).
+    pub global_overrides: ResourceOverrides,
+    /// Settings override patterns for project-scope auto-discovered loose resources.
+    pub project_overrides: ResourceOverrides,
 }
 
 impl DiscoveryConfig {
@@ -142,8 +175,22 @@ impl DiscoveryConfig {
             installed: InstalledPackages::default(),
             extra: DiscoveredPaths::default(),
             disabled: DisabledSet::default(),
+            global_overrides: ResourceOverrides::default(),
+            project_overrides: ResourceOverrides::default(),
         }
     }
+}
+
+/// Whether an auto-discovered loose resource file is enabled by a settings override list. The match
+/// base is the parent of the conventional `skills`/`prompts`/`themes` directory (`root.parent()`), so
+/// a settings pattern like `!skills/internal` filters by the conventional-relative path, matching
+/// Pi's `projectBaseDir`/`globalBaseDir`-relative matching (package-manager.ts:2271-2304).
+fn override_enabled(path: &Path, patterns: &[String], root: &Path) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let base = root.parent().unwrap_or(root);
+    crate::package::manifest::is_enabled_by_overrides(base, path, patterns)
 }
 
 /// The immutable snapshot the rest of the app reads (swapped atomically on `/reload`).
@@ -198,29 +245,85 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     }
 
     // --- global loose resources (R-09-002/008/012) ---
+    // Settings override patterns (Pi `globalSettings.{skills,prompts,themes}`) selectively
+    // enable/disable these auto-discovered loose resources (package-manager.ts:2271-2304).
     if cfg.enable_skills {
         for root in [cfg.global_dir.join("skills"), cfg.global_agents_dir.join("skills")] {
+            let mut buf = Vec::new();
             scan_skill_root(
                 &root,
                 ResourceScope::Global,
                 &root,
-                &mut skills,
+                &mut buf,
                 &mut warnings,
                 &mut diagnostics,
             );
+            buf.retain(|s| override_enabled(&s.skill_md, &cfg.global_overrides.skills, &root));
+            skills.extend(buf);
         }
     }
     if cfg.enable_prompts {
         let root = cfg.global_dir.join("prompts");
-        scan_prompt_root(&root, ResourceScope::Global, &root, &mut prompts, &mut warnings);
+        let mut buf = Vec::new();
+        scan_prompt_root(&root, ResourceScope::Global, &root, &mut buf, &mut warnings);
+        buf.retain(|p| override_enabled(&p.path, &cfg.global_overrides.prompts, &root));
+        prompts.extend(buf);
     }
     if cfg.enable_themes {
         let root = cfg.global_dir.join("themes");
-        scan_theme_root(&root, ResourceScope::Global, &root, &mut themes, &mut warnings);
+        let mut buf = Vec::new();
+        scan_theme_root(&root, ResourceScope::Global, &root, &mut buf, &mut warnings);
+        buf.retain(|t| {
+            t.origin_path
+                .as_deref()
+                .is_none_or(|p| override_enabled(p, &cfg.global_overrides.themes, &root))
+        });
+        themes.extend(buf);
     }
 
+    // --- settings positive listings (Pi `resolveLocalEntries`, package-manager.ts:906-928) ---
+    // Plain paths listed in the project/global settings `skills`/`prompts`/`themes` arrays are
+    // loaded as `source:"local"` entries, which Pi ranks *above* auto-discovered files of the same
+    // scope (`resourcePrecedenceRank` 184-188). Project entries are trust-gated and resolve relative
+    // to `<cwd>/.cyrup` (Pi `projectBaseDir = join(cwd, CONFIG_DIR)`, 900); global entries resolve
+    // relative to the global config dir (Pi `globalBaseDir = agentDir`, 899).
+    if cfg.trusted_project {
+        let project_base = cfg.cwd.join(".cyrup");
+        add_local_entries(
+            &project_base,
+            &cfg.project_overrides,
+            ResourceScope::ProjectSettings,
+            cfg,
+            &mut skills,
+            &mut prompts,
+            &mut themes,
+            &mut warnings,
+            &mut diagnostics,
+        );
+    }
+    add_local_entries(
+        &cfg.global_dir,
+        &cfg.global_overrides,
+        ResourceScope::GlobalSettings,
+        cfg,
+        &mut skills,
+        &mut prompts,
+        &mut themes,
+        &mut warnings,
+        &mut diagnostics,
+    );
+
     // --- installed packages (R-09-015/016/017/018) ---
-    for pkg in &cfg.installed.packages {
+    // All packages share precedence rank 4 (Pi `resourcePrecedenceRank`, package-manager.ts:185).
+    // Pi pushes project-scope packages before global ones (allPackages, 887-893), so under that
+    // shared rank a project-local package wins a same-name tie with a global one. Stable-order the
+    // installed packages project-first to reproduce that (config order is preserved within a scope).
+    let mut ordered_pkgs: Vec<&InstalledPackage> = cfg.installed.packages.iter().collect();
+    ordered_pkgs.sort_by_key(|p| match p.scope {
+        InstallScope::Project => 0u8,
+        InstallScope::Global => 1u8,
+    });
+    for pkg in ordered_pkgs {
         if pkg.scope == InstallScope::Project && !cfg.trusted_project {
             continue; // fail-closed trust gate
         }
@@ -333,35 +436,52 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 if cfg.enable_skills {
                     for sub in [".cyrup/skills", ".agents/skills"] {
                         let root = base.join(sub);
+                        let mut buf = Vec::new();
                         scan_skill_root(
                             &root,
                             ResourceScope::Project,
                             &root,
-                            &mut skills,
+                            &mut buf,
                             &mut warnings,
                             &mut diagnostics,
                         );
+                        buf.retain(|s| {
+                            override_enabled(&s.skill_md, &cfg.project_overrides.skills, &root)
+                        });
+                        skills.extend(buf);
                     }
                 }
                 if cfg.enable_prompts {
                     let root = base.join(".cyrup/prompts");
+                    let mut buf = Vec::new();
                     scan_prompt_root(
                         &root,
                         ResourceScope::Project,
                         &root,
-                        &mut prompts,
+                        &mut buf,
                         &mut warnings,
                     );
+                    buf.retain(|p| {
+                        override_enabled(&p.path, &cfg.project_overrides.prompts, &root)
+                    });
+                    prompts.extend(buf);
                 }
                 if cfg.enable_themes {
                     let root = base.join(".cyrup/themes");
+                    let mut buf = Vec::new();
                     scan_theme_root(
                         &root,
                         ResourceScope::Project,
                         &root,
-                        &mut themes,
+                        &mut buf,
                         &mut warnings,
                     );
+                    buf.retain(|t| {
+                        t.origin_path.as_deref().is_none_or(|p| {
+                            override_enabled(p, &cfg.project_overrides.themes, &root)
+                        })
+                    });
+                    themes.extend(buf);
                 }
             }
         }
@@ -390,7 +510,10 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         }
     }
 
-    // --- explicit CLI flags (highest precedence) (R-09-002/008/012) ---
+    // --- explicit CLI flags (Pi `source:"cli", scope:"temporary"`; Pi appends `additionalSkillPaths`
+    // after the entire sorted accumulator, resource-loader.ts:421, so under first-wins they lose to a
+    // same-name resource of any rank, including a rank-4 package — modeled as rank 5)
+    // (R-09-002/008/012) ---
     if cfg.enable_skills {
         for p in &cfg.cli.skills {
             add_skill_path(
@@ -634,6 +757,52 @@ fn build_ignore(root: &Path, patterns: &[String]) -> ignore::gitignore::Gitignor
         let _ = builder.add_line(None, pattern);
     }
     builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
+/// Load the plain-path positive listings from a settings `skills`/`prompts`/`themes` array at the
+/// settings tier (`scope`), via [`resolve_local_entries`] (Pi `resolveLocalEntries`,
+/// package-manager.ts:2218-2239). The pattern subset of each array has already selected the enabled
+/// files; everything returned here is loaded. Resource-kind enable flags are honored.
+#[allow(clippy::too_many_arguments)]
+fn add_local_entries(
+    base: &Path,
+    overrides: &ResourceOverrides,
+    scope: ResourceScope,
+    cfg: &DiscoveryConfig,
+    skills: &mut Vec<Skill>,
+    prompts: &mut Vec<PromptTemplate>,
+    themes: &mut Vec<Theme>,
+    warnings: &mut Vec<ResourceWarning>,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) {
+    if cfg.enable_skills {
+        for md in resolve_local_entries(base, &overrides.skills, ManifestResourceType::Skills) {
+            let root = md.parent().unwrap_or(&md).to_path_buf();
+            load_one_skill(&md, scope, &root, skills, warnings, diagnostics);
+        }
+    }
+    if cfg.enable_prompts {
+        for p in resolve_local_entries(base, &overrides.prompts, ManifestResourceType::Prompts) {
+            let origin =
+                ResourceOrigin::LooseFile { scope, root: p.parent().unwrap_or(&p).to_path_buf() };
+            match PromptTemplate::load(&p, scope, origin) {
+                Ok(t) => prompts.push(t),
+                Err(e) => {
+                    warnings.push(ResourceWarning::new(ResourceKind::Prompt, p, e.to_string()))
+                }
+            }
+        }
+    }
+    if cfg.enable_themes {
+        for t in resolve_local_entries(base, &overrides.themes, ManifestResourceType::Themes) {
+            let origin =
+                ResourceOrigin::LooseFile { scope, root: t.parent().unwrap_or(&t).to_path_buf() };
+            match Theme::load(&t, scope, origin) {
+                Ok(th) => themes.push(th),
+                Err(e) => warnings.push(ResourceWarning::new(ResourceKind::Theme, t, e.to_string())),
+            }
+        }
+    }
 }
 
 fn load_one_skill(

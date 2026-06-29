@@ -1,6 +1,7 @@
 //! Packages — manifest-declared bundles of skills/prompts/themes/extensions, installed global or
 //! project-local, with pinning/update/enable-disable (arch-09 §3.6, R-09-015..021).
 
+pub mod git_url;
 pub mod install;
 pub mod lock;
 pub mod manifest;
@@ -11,6 +12,7 @@ use std::collections::BTreeSet;
 
 use cyrup_core::PackageId;
 
+pub use git_url::{ParsedGitUrl, has_unsafe_git_install_part, parse_git_url};
 pub use manifest::{ManifestKind, ManifestResources, ResolvedManifest, resolve_manifest};
 pub use source::{PackageSource, PinRef};
 pub use store::PackageStore;

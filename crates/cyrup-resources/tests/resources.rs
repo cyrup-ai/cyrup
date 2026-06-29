@@ -18,10 +18,10 @@ use cyrup_core::CancelToken;
 use cyrup_resources::package::lock;
 use cyrup_resources::{
     DiagnosticType, DiscoveryConfig, InstallScope, InstalledPackage, InstalledPackages,
-    PackageManager, PackageSource, PackageStore, PinRef, ResourceHandle, ResourceScope,
-    ResourceSelector, SECURITY_CAVEAT, Skill, Theme, ThemeWatcher, UpdateTarget, builtin_themes,
-    discover, expand_prompt_template, parse_command_args, resolve_manifest, substitute_args,
-    validate_name,
+    PackageManager, PackageSource, PackageStore, ParsedGitUrl, PinRef, ResourceHandle,
+    ResourceOverrides, ResourceScope, ResourceSelector, SECURITY_CAVEAT, Skill, Theme, ThemeWatcher,
+    UpdateTarget, builtin_themes, discover, expand_prompt_template, has_unsafe_git_install_part,
+    parse_command_args, parse_git_url, resolve_manifest, substitute_args, validate_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -1083,4 +1083,603 @@ fn make_local_git_repo_two_commits() -> Option<(tempfile::TempDir, PathBuf)> {
         return None;
     }
     Some((tmp, dir))
+}
+
+// ===========================================================================
+// Manifest override patterns: `!` exclude, `+` force-include, `-` force-exclude (G2)
+// ===========================================================================
+
+#[test]
+fn manifest_override_exclude_drops_matching_source() {
+    // A `!` pattern excludes matching members of the resolved source set instead of being treated
+    // as a literal source path that matches nothing (package-manager.ts:2154-2159, 696-717).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(&dir.join("skills/public/SKILL.md"), &skill_md("public", "public skill"));
+    write(&dir.join("skills/internal/SKILL.md"), &skill_md("internal", "internal skill"));
+    write(&dir.join("skills/secret/SKILL.md"), &skill_md("secret", "secret skill"));
+    // Source glob enumerates all three; `!skills/internal` excludes one by its SKILL.md parent dir.
+    write(
+        &dir.join("package.json"),
+        r#"{"name":"pack","pi":{"skills":["skills/*/SKILL.md","!skills/internal"]}}"#,
+    );
+    let m = resolve_manifest(dir).unwrap();
+    let names: Vec<String> =
+        m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    assert!(names.iter().any(|n| n.ends_with("skills/public/SKILL.md")), "public kept: {names:?}");
+    assert!(names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")), "secret kept: {names:?}");
+    assert!(
+        !names.iter().any(|n| n.ends_with("skills/internal/SKILL.md")),
+        "internal excluded by `!`: {names:?}"
+    );
+}
+
+#[test]
+fn manifest_override_force_include_and_force_exclude() {
+    // `!` excludes all, `+` force-includes one back (overriding the exclude), `-` force-excludes
+    // another even though it would otherwise be present (package-manager.ts:718-771).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(&dir.join("skills/a/SKILL.md"), &skill_md("a", "skill a"));
+    write(&dir.join("skills/b/SKILL.md"), &skill_md("b", "skill b"));
+    write(&dir.join("skills/c/SKILL.md"), &skill_md("c", "skill c"));
+    write(
+        &dir.join("package.json"),
+        r#"{"name":"pack","pi":{"skills":["skills/*/SKILL.md","!skills/*","+skills/b","-skills/c"]}}"#,
+    );
+    let m = resolve_manifest(dir).unwrap();
+    let names: Vec<String> =
+        m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    assert!(names.iter().any(|n| n.ends_with("skills/b/SKILL.md")), "b force-included: {names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("skills/a/SKILL.md")), "a stays excluded: {names:?}");
+    assert!(
+        !names.iter().any(|n| n.ends_with("skills/c/SKILL.md")),
+        "c force-excluded: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_override_patterns_surface_filtered_set_in_discovery() {
+    // End-to-end: an installed package whose manifest uses `!` must materialize only the enabled
+    // resources in discovery (package-manager.ts:2144-2163 collectManifestFiles enabledByManifest).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pkg_dir = root.join("pkgtree");
+    write(&pkg_dir.join("themes/keep.json"), &full_theme_json("keep", &[], &[]));
+    write(&pkg_dir.join("themes/drop.json"), &full_theme_json("drop", &[], &[]));
+    write(
+        &pkg_dir.join("package.json"),
+        r#"{"name":"pack","pi":{"themes":["themes/*.json","!themes/drop.json"]}}"#,
+    );
+
+    let mut c = cfg(root);
+    c.installed = InstalledPackages {
+        packages: vec![InstalledPackage {
+            id: cyrup_core::PackageId::from("path:pkg".to_string()),
+            source: PackageSource::Path { path: pkg_dir.clone() },
+            scope: InstallScope::Global,
+            resolved_commit: None,
+            installed_at: "0".to_string(),
+            disabled: Default::default(),
+        }],
+    };
+    let report = run_discover(&c).await;
+    assert!(report.registry.themes.contains("keep"), "non-excluded theme surfaces");
+    assert!(
+        !report.registry.themes.contains("drop"),
+        "`!themes/drop.json` excludes the theme from discovery"
+    );
+}
+
+// ===========================================================================
+// Theme malformed color value rejection + "Other errors" section (G3)
+// ===========================================================================
+
+#[test]
+fn theme_out_of_range_int_color_rejected_with_other_errors() {
+    // Pi's ColorValueSchema is `String | Integer(0..255)`; an integer > 255 fails the union
+    // (theme.ts:23-26) and is reported in the "Other errors" section (theme.ts:528-545). cyrup
+    // must reject it rather than silently coerce it to inherit.
+    let json = full_theme_json("oor", &[], &[("accent", "300")]);
+    let err = Theme::parse(
+        &json,
+        None,
+        ResourceScope::Builtin,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .expect_err("out-of-range color index must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("Other errors:"), "other-errors section present: {msg}");
+    assert!(msg.contains("/colors/accent"), "offending path reported: {msg}");
+    assert!(
+        !msg.contains("Missing required color tokens"),
+        "no tokens missing — only the malformed value is reported: {msg}"
+    );
+}
+
+#[test]
+fn theme_non_scalar_color_value_rejected_with_combined_message() {
+    // A boolean color value is neither string nor integer → rejected. Because only `accent` is
+    // present, the message carries BOTH the missing-token section and the "Other errors" section,
+    // mirroring Pi's combined error assembly (theme.ts:533-545).
+    let json = r#"{"name":"bad","colors":{"accent":true}}"#;
+    let err = Theme::parse(
+        json,
+        None,
+        ResourceScope::Builtin,
+        cyrup_resources::ResourceOrigin::Builtin,
+    )
+    .expect_err("non-scalar color value must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("Missing required color tokens"), "missing section present: {msg}");
+    assert!(msg.contains("Other errors:"), "other section present: {msg}");
+    assert!(msg.contains("/colors/accent: Expected union value"), "bad value path + message: {msg}");
+}
+
+#[test]
+fn theme_valid_int_and_string_colors_still_accepted() {
+    // Regression guard: in-range integer indices and hex/var strings remain valid (theme.ts:23-26).
+    let json = full_theme_json("ok", &[("v", "12")], &[("accent", "196"), ("text", "$v")]);
+    assert!(
+        Theme::parse(&json, None, ResourceScope::Builtin, cyrup_resources::ResourceOrigin::Builtin)
+            .is_ok(),
+        "valid int + string color values accepted"
+    );
+}
+
+// ===========================================================================
+// G2 — git source-URL parsing + security validation (utils/git.ts)
+// ===========================================================================
+
+#[test]
+fn git_url_parse_protocol_scp_and_shorthand() {
+    // Explicit HTTPS URL → host/path extracted, `.git` stripped, no ref (git.ts:126-163).
+    let p = parse_git_url("https://github.com/user/repo.git").expect("https url parses");
+    assert_eq!(p.host, "github.com");
+    assert_eq!(p.path, "user/repo");
+    assert_eq!(p.repo, "https://github.com/user/repo.git");
+    assert_eq!(p.reff, None);
+    assert!(!p.pinned);
+
+    // scp-like `git@host:path@ref` → ref split off, repo rebuilt without the ref (git.ts:21-36).
+    let s = parse_git_url("git:git@github.com:user/repo@v1.0").expect("scp form parses via git:");
+    assert_eq!(s.host, "github.com");
+    assert_eq!(s.path, "user/repo");
+    assert_eq!(s.repo, "git@github.com:user/repo");
+    assert_eq!(s.reff.as_deref(), Some("v1.0"));
+    assert!(s.pinned, "an explicit ref pins (git.ts:117)");
+
+    // `git:` host-qualified shorthand resolves through the generic parser, prefixing https.
+    let g = parse_git_url("git:github.com/user/repo").expect("git: host-qualified parses");
+    assert_eq!(g.repo, "https://github.com/user/repo");
+    assert_eq!(g.path, "user/repo");
+
+    // Without a git: prefix, a bare host/path is NOT a git URL (no protocol) — returns None so the
+    // caller treats it as a local path (git.ts:165-170).
+    assert!(parse_git_url("github.com/user/repo").is_none());
+    assert!(parse_git_url("just-a-name").is_none());
+}
+
+#[test]
+fn git_url_hosted_shorthand_and_committish() {
+    // hosted-git-info resolution path (git.ts:181-223). All values verified 1:1 against the real
+    // npm `hosted-git-info@9.0.3` (the version Pi pins, package.json:51).
+
+    // Bare GitHub shorthand `git:owner/repo` → https clone URL, github.com host, no ref.
+    let bare = parse_git_url("git:owner/repo").expect("bare shorthand resolves via hosted-git-info");
+    assert_eq!(bare.repo, "https://owner/repo");
+    assert_eq!(bare.host, "github.com");
+    assert_eq!(bare.path, "owner/repo");
+    assert_eq!(bare.reff, None);
+
+    // Host-shortcut + multi-segment user resolves through the gitlab table.
+    let gl = parse_git_url("git:gitlab.com/group/sub/proj").expect("gitlab host-qualified resolves");
+    assert_eq!(gl.repo, "https://gitlab.com/group/sub/proj");
+    assert_eq!(gl.host, "gitlab.com");
+    assert_eq!(gl.path, "group/sub/proj");
+
+    // A `#committish` fragment on a known host becomes the (pinned) ref; the fragment stays on the
+    // clone URL exactly as Pi keeps `split.repo` verbatim (repo includes `#v2`).
+    let frag = parse_git_url("https://github.com/u/r#v2").expect("#committish resolves");
+    assert_eq!(frag.repo, "https://github.com/u/r#v2");
+    assert_eq!(frag.path, "u/r");
+    assert_eq!(frag.reff.as_deref(), Some("v2"));
+    assert!(frag.pinned, "an explicit #committish pins (git.ts:202/220)");
+}
+
+#[test]
+fn git_url_security_rejects_traversal_and_injection() {
+    // hasUnsafeGitInstallPart: path-traversal, leading-slash, NUL, and backslash are unsafe
+    // (git.ts:84-102) — a SECURITY control.
+    assert!(has_unsafe_git_install_part("..", true), ".. segment is unsafe");
+    assert!(has_unsafe_git_install_part("a/../b", true), "embedded .. is unsafe");
+    assert!(has_unsafe_git_install_part("/abs", true), "leading slash is unsafe");
+    assert!(has_unsafe_git_install_part("a\\b", true), "backslash is unsafe");
+    assert!(has_unsafe_git_install_part("%00", true), "encoded NUL is unsafe");
+    assert!(has_unsafe_git_install_part("%2e%2e/x", true), "encoded .. is unsafe");
+    assert!(has_unsafe_git_install_part("a/b", false), "slash disallowed when allow_slash=false");
+    assert!(!has_unsafe_git_install_part("user", false), "plain segment is safe");
+    assert!(!has_unsafe_git_install_part("user/repo", true), "user/repo path is safe");
+
+    // The validator is wired into the parser. A *percent-encoded* `..` survives URL parsing as a
+    // literal `..` segment and is rejected by hasUnsafeGitInstallPart → None (verified against Pi).
+    assert!(parse_git_url("https://github.com/%2e%2e/secrets").is_none());
+    // A *raw* `../` is collapsed by the WHATWG URL path machine BEFORE validation (new URL
+    // normalizes `/../etc/passwd` → `/etc/passwd`), so Pi accepts it with a normalized, safe path —
+    // there is no surviving `..` segment to reject (verified 1:1 against hosted-git-info@9.0.3).
+    let normalized = parse_git_url("https://github.com/../etc/passwd").expect("raw .. normalized");
+    assert_eq!(normalized.path, "etc/passwd", "raw .. collapsed by URL normalization, path is safe");
+    assert_eq!(normalized.host, "github.com");
+}
+
+#[test]
+fn package_source_parse_routes_git_local_and_npm() {
+    // Git URL → Git source carrying the clone URL (package-manager.ts:1417-1421).
+    match PackageSource::parse("https://github.com/u/r").unwrap() {
+        PackageSource::Git { url, reff } => {
+            assert_eq!(url, "https://github.com/u/r");
+            assert_eq!(reff, PinRef::Default);
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
+    // A hex ref pins as a commit; a named ref pins as a tag (both is_pinned, R-09-020 / git.ts:117).
+    match PackageSource::parse("https://github.com/u/r@abc1234").unwrap() {
+        PackageSource::Git { reff, .. } => {
+            assert_eq!(reff, PinRef::Commit("abc1234".into()));
+            assert!(reff.is_pinned());
+        }
+        other => panic!("expected Git commit pin, got {other:?}"),
+    }
+    match PackageSource::parse("https://github.com/u/r@release-1").unwrap() {
+        PackageSource::Git { reff, .. } => assert_eq!(reff, PinRef::Tag("release-1".into())),
+        other => panic!("expected Git tag pin, got {other:?}"),
+    }
+    // Bare names / relative paths → local Path (isLocalPath, paths.ts:41-55).
+    assert!(matches!(PackageSource::parse("./pkg").unwrap(), PackageSource::Path { .. }));
+    assert!(matches!(PackageSource::parse("some-pkg").unwrap(), PackageSource::Path { .. }));
+    // npm channel dropped (R-09-021).
+    assert!(matches!(
+        PackageSource::parse("npm:foo@1.2.3"),
+        Err(cyrup_resources::ResourceError::Unsupported)
+    ));
+
+    // ParsedGitUrl::into_source round-trips (sanity for the public type).
+    let parsed: ParsedGitUrl = parse_git_url("https://github.com/u/r").unwrap();
+    assert!(matches!(parsed.into_source(), PackageSource::Git { .. }));
+}
+
+// ===========================================================================
+// G3 — manifest override patterns filter at resolved-file granularity (plain dirs)
+// ===========================================================================
+
+#[test]
+fn manifest_plain_dir_override_excludes_subdir() {
+    // A PLAIN DIRECTORY source entry plus `!skills/internal`: Pi expands `skills/` to its SKILL.md
+    // files via collectFilesFromPaths BEFORE applyPatterns (package-manager.ts:2201-2215), so the
+    // exclude drops `skills/internal/SKILL.md`. (Previously cyrup applied the `!` to the raw dir
+    // entry, which matched nothing.)
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(&dir.join("skills/public/SKILL.md"), &skill_md("public", "public skill"));
+    write(&dir.join("skills/internal/SKILL.md"), &skill_md("internal", "internal skill"));
+    write(&dir.join("skills/secret/SKILL.md"), &skill_md("secret", "secret skill"));
+    write(
+        &dir.join("package.json"),
+        r#"{"name":"pack","pi":{"skills":["skills","!skills/internal"]}}"#,
+    );
+    let m = resolve_manifest(dir).unwrap();
+    let names: Vec<String> = m.skills.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    assert!(names.iter().any(|n| n.ends_with("skills/public/SKILL.md")), "public kept: {names:?}");
+    assert!(names.iter().any(|n| n.ends_with("skills/secret/SKILL.md")), "secret kept: {names:?}");
+    assert!(
+        !names.iter().any(|n| n.ends_with("skills/internal/SKILL.md")),
+        "internal dropped by `!skills/internal` after dir expansion: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_plain_dir_override_surfaces_filtered_skills_in_discovery() {
+    // End-to-end: the directory-expanded + override-filtered skills surface in discovery (the
+    // excluded one does not).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pkg_dir = root.join("pkgtree");
+    write(&pkg_dir.join("skills/keep/SKILL.md"), &skill_md("keepme", "kept skill"));
+    write(&pkg_dir.join("skills/internal/SKILL.md"), &skill_md("dropme", "internal skill"));
+    write(&pkg_dir.join("package.json"), r#"{"name":"pack","pi":{"skills":["skills","!skills/internal"]}}"#);
+
+    let mut c = cfg(root);
+    c.installed = InstalledPackages {
+        packages: vec![InstalledPackage {
+            id: cyrup_core::PackageId::from("path:pkg".to_string()),
+            source: PackageSource::Path { path: pkg_dir.clone() },
+            scope: InstallScope::Global,
+            resolved_commit: None,
+            installed_at: "0".to_string(),
+            disabled: Default::default(),
+        }],
+    };
+    let report = run_discover(&c).await;
+    assert!(report.registry.skills.contains("keepme"), "kept skill surfaces");
+    assert!(!report.registry.skills.contains("dropme"), "excluded skill is filtered out");
+}
+
+// ===========================================================================
+// G4 — settings override patterns filter auto-discovered loose resources
+// ===========================================================================
+
+#[tokio::test]
+async fn settings_override_filters_loose_global_skills() {
+    // Pi filters auto-discovered loose resources against the settings skills/prompts/themes arrays
+    // via isEnabledByOverrides (package-manager.ts:700-717, 2271-2304). A `!skills/drop` override
+    // disables one discovered global skill while leaving the other (and a `-` force-exclude works).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let global = root.join("global");
+    write(&global.join("skills/keep/SKILL.md"), &skill_md("keepskill", "kept"));
+    write(&global.join("skills/drop/SKILL.md"), &skill_md("dropskill", "dropped"));
+
+    // Baseline: both discovered with no overrides.
+    let baseline = run_discover(&DiscoveryConfig::new(root, &global)).await;
+    assert!(
+        baseline.registry.skills.contains("keepskill")
+            && baseline.registry.skills.contains("dropskill"),
+        "both loose skills discovered without overrides"
+    );
+
+    // With a `!skills/drop` settings override, only `keep` survives.
+    let mut c = DiscoveryConfig::new(root, &global);
+    c.global_overrides = ResourceOverrides {
+        skills: vec!["!skills/drop".to_string()],
+        ..Default::default()
+    };
+    let report = run_discover(&c).await;
+    assert!(report.registry.skills.contains("keepskill"), "keep retained under override");
+    assert!(
+        !report.registry.skills.contains("dropskill"),
+        "drop excluded by settings `!skills/drop` override"
+    );
+}
+
+// ===========================================================================
+// G1 — install from a git URL via gix's real clone (file:// transport, hermetic)
+// ===========================================================================
+
+#[tokio::test]
+async fn git_clone_from_file_url_uses_real_gix_clone() {
+    // A `file://` URL is NOT the bare-directory copy fast path — it goes through gix's real clone
+    // machinery (prepare_clone + fetch_then_checkout + main_worktree), the same code path remote
+    // https/ssh/git URLs use. This exercises the transport end-to-end without a network.
+    let Some((_tmp, repo_dir)) = make_local_git_repo() else {
+        eprintln!("skipping file:// gix-clone test: `git` CLI not available");
+        return;
+    };
+    let url = format!("file://{}", repo_dir.display());
+
+    let global = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(global.path().to_path_buf(), None);
+    let mgr = PackageManager::new(store.clone());
+    let (rec, _notice) = mgr
+        .install(
+            PackageSource::Git { url, reff: PinRef::Default },
+            InstallScope::Global,
+            true,
+            CancelToken::new(),
+        )
+        .await
+        .expect("install via real gix clone over file:// transport");
+    assert!(rec.resolved_commit.is_some(), "HEAD commit resolved by gix clone");
+
+    // The working tree was actually checked out (the fixture's SKILL.md is present).
+    let store_dir = store.package_dir(InstallScope::Global, &rec.id).expect("package dir");
+    assert!(
+        store_dir.join("skills/alpha/SKILL.md").exists(),
+        "gix checked out the worktree at {}",
+        store_dir.display()
+    );
+}
+
+// ===========================================================================
+// G1 — resource precedence-rank model (1:1 with Pi `resourcePrecedenceRank`,
+// package-manager.ts:172-188): lower rank wins under first-wins same-name dedup.
+//   0 project+settings  1 project+auto  2 user+settings  3 user+auto  4 ANY package.
+//   The explicit --skill/--prompt-template/--theme CLI tier is appended AFTER the sorted
+//   accumulator (resource-loader.ts:421/436/455), so it loses to every package — modeled rank 5.
+//   cyrup-only tiers: Discovered 6, Builtin 7.
+// ===========================================================================
+
+/// An installed package backed by a path tree containing a single named skill.
+fn pkg_with_skill(dir: &Path, id: &str, scope: InstallScope, name: &str, desc: &str) -> InstalledPackage {
+    write(&dir.join(format!("skills/{name}/SKILL.md")), &skill_md(name, desc));
+    InstalledPackage {
+        id: cyrup_core::PackageId::from(id.to_string()),
+        source: PackageSource::Path { path: dir.to_path_buf() },
+        scope,
+        resolved_commit: None,
+        installed_at: "0".to_string(),
+        disabled: Default::default(),
+    }
+}
+
+#[test]
+fn g1_precedence_rank_matches_pi() {
+    // package-manager.ts:184-188 — exact rank table; lower wins.
+    assert_eq!(ResourceScope::ProjectSettings.precedence_rank(), 0);
+    assert_eq!(ResourceScope::Project.precedence_rank(), 1);
+    assert_eq!(ResourceScope::GlobalSettings.precedence_rank(), 2);
+    assert_eq!(ResourceScope::Global.precedence_rank(), 3);
+    assert_eq!(ResourceScope::ProjectPackage.precedence_rank(), 4, "all packages rank 4");
+    assert_eq!(ResourceScope::GlobalPackage.precedence_rank(), 4);
+    assert_eq!(
+        ResourceScope::Cli.precedence_rank(),
+        5,
+        "CLI appended after the sorted accumulator (resource-loader.ts:421), so it loses to packages"
+    );
+    assert_eq!(ResourceScope::Discovered.precedence_rank(), 6, "[CYRUP-DELTA] below CLI + packages");
+    assert_eq!(ResourceScope::Builtin.precedence_rank(), 7, "[CYRUP-DELTA] lowest");
+}
+
+#[tokio::test]
+async fn g1_cli_loses_to_project_resource() {
+    // Pi appends the explicit `--skill` paths after the sorted accumulator (resource-loader.ts:421),
+    // so under first-wins a project resource (rank 1) wins the same-name collision over the CLI path
+    // (rank 5) (package-manager.ts:184-188).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(&root.join(".cyrup/skills/dup/SKILL.md"), &skill_md("dup", "project one"));
+    let cli = root.join("cli/dup/SKILL.md");
+    write(&cli, &skill_md("dup", "cli one"));
+
+    let mut c = cfg(root);
+    c.trusted_project = true;
+    c.cli.skills = vec![cli];
+    let report = run_discover(&c).await;
+    let w = report.registry.skills.get_name("dup").expect("dup present");
+    assert_eq!(w.scope, ResourceScope::Project, "project (rank 1) beats CLI (rank 5)");
+    assert_eq!(w.front.description.as_deref(), Some("project one"));
+}
+
+#[tokio::test]
+async fn g1_cli_loses_to_global_auto_and_to_package() {
+    // Pi appends the explicit `--skill` paths (`additionalSkillPaths`) AFTER the entire sorted
+    // accumulator — `mergePaths([...cliEnabledSkills, ...enabledSkills], additionalSkillPaths)`
+    // (resource-loader.ts:421) — so under first-wins the CLI path loses to a same-name resource of
+    // ANY rank. Here a global auto-discovered loose file (rank 3) wins over the CLI path (rank 5).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global auto"));
+    let cli = root.join("cli/dup/SKILL.md");
+    write(&cli, &skill_md("dup", "cli one"));
+
+    let mut c = cfg(root);
+    c.cli.skills = vec![cli.clone()];
+    let report = run_discover(&c).await;
+    let w = report.registry.skills.get_name("dup").expect("dup present");
+    assert_eq!(w.scope, ResourceScope::Global, "global auto (rank 3) beats CLI (rank 5)");
+    assert_eq!(w.front.description.as_deref(), Some("global auto"));
+
+    // Now collide the CLI path with a *package* (rank 4): the package wins, because Pi appends the
+    // CLI path after the rank-4 package in `enabledSkills` (resource-loader.ts:421). CLI loses.
+    let pkgdir = root.join("pkg");
+    let pkg = pkg_with_skill(&pkgdir, "path:p", InstallScope::Global, "only", "pkg one");
+    let clip = root.join("cli2/only/SKILL.md");
+    write(&clip, &skill_md("only", "cli loses"));
+    let mut c2 = cfg(root);
+    c2.installed = InstalledPackages { packages: vec![pkg] };
+    c2.cli.skills = vec![clip];
+    let r2 = run_discover(&c2).await;
+    let w2 = r2.registry.skills.get_name("only").expect("only present");
+    assert_eq!(w2.scope, ResourceScope::GlobalPackage, "package (rank 4) beats CLI (rank 5)");
+    assert_eq!(w2.front.description.as_deref(), Some("pkg one"));
+}
+
+#[tokio::test]
+async fn g1_global_loose_beats_project_package() {
+    // Inversion (c): Pi puts ALL packages at rank 4, below user-auto (rank 3), so a global loose
+    // file beats a project-local package on a same-name collision (package-manager.ts:185).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global loose"));
+    let pkgdir = root.join("ppkg");
+    let pkg = pkg_with_skill(&pkgdir, "path:pp", InstallScope::Project, "dup", "project package");
+
+    let mut c = cfg(root);
+    c.trusted_project = true;
+    c.installed = InstalledPackages { packages: vec![pkg] };
+    let report = run_discover(&c).await;
+    let w = report.registry.skills.get_name("dup").expect("dup present");
+    assert_eq!(w.scope, ResourceScope::Global, "global loose (rank 3) beats project package (rank 4)");
+    assert_eq!(w.front.description.as_deref(), Some("global loose"));
+}
+
+#[tokio::test]
+async fn g1_project_package_beats_global_package() {
+    // Both packages rank 4; Pi inserts project-scope packages first (allPackages, 887-893), so the
+    // project-local package wins the same-rank tie.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let gdir = root.join("gpkg");
+    let pdir = root.join("ppkg");
+    // Register global first to prove the project-first re-ordering (not input order) decides.
+    let gpkg = pkg_with_skill(&gdir, "path:g", InstallScope::Global, "dup", "global package");
+    let ppkg = pkg_with_skill(&pdir, "path:p", InstallScope::Project, "dup", "project package");
+
+    let mut c = cfg(root);
+    c.trusted_project = true;
+    c.installed = InstalledPackages { packages: vec![gpkg, ppkg] };
+    let report = run_discover(&c).await;
+    let w = report.registry.skills.get_name("dup").expect("dup present");
+    assert_eq!(w.scope, ResourceScope::ProjectPackage, "project package wins the rank-4 tie");
+    assert_eq!(w.front.description.as_deref(), Some("project package"));
+}
+
+#[tokio::test]
+async fn g1_settings_entry_outranks_auto_in_same_scope() {
+    // Inversion (b): a settings-listed plain entry (source:"local") outranks an auto-discovered
+    // file of the same scope (package-manager.ts:184-188, resolveLocalEntries 2218-2239). Global:
+    // rank 2 beats rank 3; project: rank 0 beats rank 1.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Global: auto-discovered under global/skills, settings entry under global/extra.
+    write(&root.join("global/skills/dup/SKILL.md"), &skill_md("dup", "global auto"));
+    write(&root.join("global/extra/dup/SKILL.md"), &skill_md("dup", "global settings"));
+    // Project: auto under .cyrup/skills, settings entry under .cyrup/extra (base = <cwd>/.cyrup).
+    write(&root.join(".cyrup/skills/pdup/SKILL.md"), &skill_md("pdup", "project auto"));
+    write(&root.join(".cyrup/extra/pdup/SKILL.md"), &skill_md("pdup", "project settings"));
+
+    let mut c = cfg(root);
+    c.trusted_project = true;
+    c.global_overrides = ResourceOverrides { skills: vec!["extra/dup".to_string()], ..Default::default() };
+    c.project_overrides = ResourceOverrides { skills: vec!["extra/pdup".to_string()], ..Default::default() };
+    let report = run_discover(&c).await;
+
+    let g = report.registry.skills.get_name("dup").expect("dup present");
+    assert_eq!(g.scope, ResourceScope::GlobalSettings, "global settings (rank 2) beats auto (rank 3)");
+    assert_eq!(g.front.description.as_deref(), Some("global settings"));
+
+    let p = report.registry.skills.get_name("pdup").expect("pdup present");
+    assert_eq!(p.scope, ResourceScope::ProjectSettings, "project settings (rank 0) beats auto (rank 1)");
+    assert_eq!(p.front.description.as_deref(), Some("project settings"));
+}
+
+#[tokio::test]
+async fn g1_settings_entry_loads_prompt_and_theme_positive_listings() {
+    // resolveLocalEntries loads plain entries that are NOT in a conventional dir, across all three
+    // resource families; a `!`-pattern entry in the same array still only filters (never loads).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(&root.join("global/extra/hello.md"), "Say hi to {{who}}");
+    write(&root.join("global/extra/cool.json"), &full_theme_json("cool", &[], &[]));
+    // A second prompt that the `!` pattern must keep filtering out of *auto-discovery*.
+    write(&root.join("global/prompts/dropme.md"), "drop");
+
+    let mut c = cfg(root);
+    c.global_overrides = ResourceOverrides {
+        prompts: vec!["extra/hello.md".to_string(), "!prompts/dropme.md".to_string()],
+        themes: vec!["extra/cool.json".to_string()],
+        ..Default::default()
+    };
+    let report = run_discover(&c).await;
+    let pr = report.registry.prompts.get_name("hello").expect("settings prompt loaded");
+    assert_eq!(pr.scope, ResourceScope::GlobalSettings);
+    let th = report.registry.themes.get_name("cool").expect("settings theme loaded");
+    assert_eq!(th.scope, ResourceScope::GlobalSettings);
+    assert!(!report.registry.prompts.contains("dropme"), "`!` pattern still filters auto-discovery");
+}
+
+#[tokio::test]
+async fn g1_project_settings_entry_trust_gated() {
+    // Project settings positive listings are trust-gated (fail-closed) like project loose files.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(&root.join(".cyrup/extra/secret/SKILL.md"), &skill_md("secret", "project settings skill"));
+
+    let mut c = cfg(root);
+    c.project_overrides = ResourceOverrides { skills: vec!["extra/secret".to_string()], ..Default::default() };
+
+    c.trusted_project = false;
+    assert!(!run_discover(&c).await.registry.skills.contains("secret"), "untrusted hides settings entry");
+
+    c.trusted_project = true;
+    assert!(run_discover(&c).await.registry.skills.contains("secret"), "trusted surfaces settings entry");
 }

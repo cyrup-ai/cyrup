@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use cyrup_core::PackageId;
 
+use crate::error::ResourceError;
+use crate::package::git_url::parse_git_url;
+
 /// Where a package is fetched from. Git is the primary channel; local path for dev; OCI deferred.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -50,7 +53,42 @@ impl PinRef {
     }
 }
 
+/// True if `value` is a local path rather than a package source / remote URL (1:1 with Pi
+/// `isLocalPath`, utils/paths.ts:41-55): `npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:` prefixes are
+/// non-local; bare names, relative paths, and `file:` URLs are local.
+pub fn is_local_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !(trimmed.starts_with("npm:")
+        || trimmed.starts_with("git:")
+        || trimmed.starts_with("github:")
+        || trimmed.starts_with("http:")
+        || trimmed.starts_with("https:")
+        || trimmed.starts_with("ssh:"))
+}
+
 impl PackageSource {
+    /// Parse a user-supplied source string into a validated [`PackageSource`] (1:1 with Pi
+    /// `parseSource`, package-manager.ts:1399-1423, minus the dropped npm channel R-09-021).
+    ///
+    /// Routing matches Pi: an `npm:` spec is unsupported (`Err(Unsupported)`); a [`is_local_path`]
+    /// string is a [`PackageSource::Path`]; otherwise the string is parsed as a git URL via
+    /// [`parse_git_url`] (which applies the `hasUnsafeGitInstallPart` security validator); anything
+    /// that is neither falls back to a local [`PackageSource::Path`].
+    pub fn parse(source: &str) -> Result<PackageSource, ResourceError> {
+        let trimmed = source.trim();
+        if trimmed.starts_with("npm:") {
+            // npm channel dropped in the Rust port (R-09-021): no JS runtime.
+            return Err(ResourceError::Unsupported);
+        }
+        if is_local_path(trimmed) {
+            return Ok(PackageSource::Path { path: PathBuf::from(trimmed) });
+        }
+        if let Some(parsed) = parse_git_url(trimmed) {
+            return Ok(parsed.into_source());
+        }
+        Ok(PackageSource::Path { path: PathBuf::from(trimmed) })
+    }
+
     /// The pin ref, if this source carries one (only Git does).
     pub fn pin(&self) -> PinRef {
         match self {

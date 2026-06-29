@@ -65,6 +65,114 @@ where
         .collect())
 }
 
+/// Validate a single color value against Pi's `ColorValueSchema`
+/// (`Type.Union([Type.String(), Type.Integer({minimum:0,maximum:255})])`, theme.ts:23-26).
+///
+/// A string is always valid (hex / var-ref / empty). A number is valid only if it is a non-negative
+/// integer `<= 255`; a float, a negative, or an out-of-range integer fails the union, as does any
+/// non-string/non-number value (bool/object/array/null). Returns the typebox-style error message
+/// for the "Other errors" section when invalid.
+fn bad_color(val: &serde_json::Value) -> Option<&'static str> {
+    match val {
+        serde_json::Value::String(_) => None,
+        serde_json::Value::Number(n) if n.as_u64().is_some_and(|u| u <= 255) => None,
+        _ => Some("Expected union value"),
+    }
+}
+
+/// Validate every value in an optional color record (`vars`, `export`) and push any malformed value
+/// to `other` as `  - {prefix}/{key}: {message}` (theme.ts:528-531).
+fn validate_color_record(
+    prefix: &str,
+    value: &serde_json::Value,
+    other: &mut Vec<String>,
+) {
+    if let Some(obj) = value.as_object() {
+        for (k, val) in obj {
+            if let Some(msg) = bad_color(val) {
+                other.push(format!("  - {prefix}/{k}: {msg}"));
+            }
+        }
+    }
+}
+
+/// Collect the schema violations Pi reports together (theme.ts:514-548): the set of missing
+/// required `colors` tokens, and the "Other errors" list of malformed color values across
+/// `vars`/`colors`/`export`. Iteration order mirrors the schema declaration order (`vars` →
+/// `colors` (required tokens, then extras) → `export`) so the "Other errors" lines come out in a
+/// stable, Pi-like order.
+fn collect_theme_errors(
+    value: &serde_json::Value,
+    missing: &mut Vec<String>,
+    other: &mut Vec<String>,
+) {
+    let Some(obj) = value.as_object() else { return };
+
+    if let Some(vars) = obj.get("vars") {
+        validate_color_record("/vars", vars, other);
+    }
+
+    match obj.get("colors").and_then(|c| c.as_object()) {
+        Some(colors) => {
+            for token in REQUIRED_COLOR_TOKENS {
+                if !colors.contains_key(token) {
+                    missing.push(token.to_string());
+                }
+            }
+            // Required tokens first (schema order), then any extra keys.
+            for token in REQUIRED_COLOR_TOKENS {
+                if let Some(val) = colors.get(token)
+                    && let Some(msg) = bad_color(val)
+                {
+                    other.push(format!("  - /colors/{token}: {msg}"));
+                }
+            }
+            for (k, val) in colors {
+                if !REQUIRED_COLOR_TOKENS.contains(&k.as_str())
+                    && let Some(msg) = bad_color(val)
+                {
+                    other.push(format!("  - /colors/{k}: {msg}"));
+                }
+            }
+        }
+        None => {
+            // `colors` absent or not an object → every required token is missing.
+            for token in REQUIRED_COLOR_TOKENS {
+                missing.push(token.to_string());
+            }
+        }
+    }
+
+    if let Some(export) = obj.get("export") {
+        validate_color_record("/export", export, other);
+    }
+}
+
+/// Assemble Pi's combined theme-validation error message (theme.ts:533-547): the
+/// "Missing required color tokens" section (sorted) followed, when present, by the "Other errors"
+/// section.
+fn build_theme_error(label: &str, missing: &mut Vec<String>, other: &[String]) -> String {
+    let mut msg = format!("Invalid theme \"{label}\":\n");
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        let list = missing
+            .iter()
+            .map(|color| format!("  - {color}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        msg.push_str("\nMissing required color tokens:\n");
+        msg.push_str(&list);
+        msg.push_str("\n\nPlease add these colors to your theme's \"colors\" object.");
+        msg.push_str("\nSee the built-in themes (dark.json, light.json) for reference values.");
+    }
+    if !other.is_empty() {
+        msg.push_str("\n\nOther errors:\n");
+        msg.push_str(&other.join("\n"));
+    }
+    msg
+}
+
 /// A discovered theme: parsed data plus discovery provenance.
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -173,42 +281,42 @@ impl Theme {
         scope: ResourceScope,
         origin: ResourceOrigin,
     ) -> Result<Theme, ResourceError> {
-        let data: ThemeData =
+        // Parse into a generic value first so the full `colors` schema can be validated the way
+        // Pi's typebox validator does (theme.ts:514-548): collect *both* the missing required
+        // tokens and the "Other errors" (malformed color values) and report them in one combined
+        // message, before deserializing into the typed `ThemeData`.
+        let value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| ResourceError::Theme {
                 path: path.clone().unwrap_or_default(),
                 reason: e.to_string(),
             })?;
-        // Validate the fixed `colors` schema: every required token must be present. Pi rejects a
-        // theme that omits any token with a precise, sorted "Missing required color tokens" error
-        // (theme.ts:514-548). Validation runs before the name check, matching Pi's order
-        // (parseThemeJson → assertThemeNameIsValid).
-        let missing: Vec<&str> = REQUIRED_COLOR_TOKENS
-            .iter()
-            .copied()
-            .filter(|token| !data.colors.contains_key(*token))
-            .collect();
-        if !missing.is_empty() {
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut other: Vec<String> = Vec::new();
+        collect_theme_errors(&value, &mut missing, &mut other);
+        if !missing.is_empty() || !other.is_empty() {
             let label = path
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| data.name.clone());
-            let mut sorted = missing;
-            sorted.sort_unstable();
-            let list = sorted
-                .iter()
-                .map(|color| format!("  - {color}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let reason = format!(
-                "Invalid theme \"{label}\":\n\nMissing required color tokens:\n{list}\n\n\
-                 Please add these colors to your theme's \"colors\" object.\n\
-                 See the built-in themes (dark.json, light.json) for reference values."
-            );
+                .unwrap_or_else(|| {
+                    value
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                });
+            let reason = build_theme_error(&label, &mut missing, &other);
             return Err(ResourceError::Theme {
                 path: path.unwrap_or_default(),
                 reason,
             });
         }
+
+        let data: ThemeData =
+            serde_json::from_value(value).map_err(|e| ResourceError::Theme {
+                path: path.clone().unwrap_or_default(),
+                reason: e.to_string(),
+            })?;
         // Theme name must not contain `/` — reserved for the `light/dark` auto-theme setting
         // (theme.ts:506-512,551).
         if data.name.contains('/') {
