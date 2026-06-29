@@ -57,6 +57,13 @@ fn branch_contribution(entry: &Entry) -> Option<(Vec<Message>, u32, bool)> {
     }
 }
 
+/// Placeholder summary Pi returns when an abandoned branch yields no summarizable messages (every
+/// entry filtered out / over budget). Byte-1:1 with Pi `generateBranchSummary`'s
+/// `{ summary: "No content to summarize" }` early return (`branch-summarization.ts:309-311`). The
+/// agent-session caller still appends it (Pi's `if (summaryText)` is truthy), so an explored-but-empty
+/// branch is recorded rather than silently dropped.
+pub const BRANCH_SUMMARY_EMPTY_PLACEHOLDER: &str = "No content to summarize";
+
 /// Preamble prepended to a branch summary so it reads as abandoned-branch context. Byte-1:1 with Pi
 /// `BRANCH_SUMMARY_PREAMBLE` (`branch-summarization.ts:247-250`).
 pub const BRANCH_SUMMARY_PREAMBLE: &str =
@@ -182,6 +189,11 @@ pub async fn generate_branch_summary<S: Summarizer>(
     model: &Model,
     cancel: CancelToken,
 ) -> Result<String, CompactionError> {
+    // Pi short-circuits BEFORE the model call when there is nothing to summarize, returning the
+    // placeholder string (`branch-summarization.ts:309-311`). The caller decides whether to append.
+    if prep.messages.is_empty() {
+        return Ok(BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string());
+    }
     let transcript = serialize_conversation(&prep.messages);
     let prompt =
         format!("<conversation>\n{transcript}\n</conversation>\n\n{BRANCH_SUMMARY_PROMPT}");

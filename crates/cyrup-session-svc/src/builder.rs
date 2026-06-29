@@ -269,7 +269,7 @@ impl SessionBuilder {
                 if cfg.persist {
                     SessionManager::create(&cwd, &layout, NewSessionOpts::default())?
                 } else {
-                    SessionManager::in_memory(&cwd, NewSessionOpts::default())
+                    SessionManager::in_memory(&cwd, NewSessionOpts::default())?
                 }
             }
             SessionTarget::Resume(path) => SessionManager::open(path)?,

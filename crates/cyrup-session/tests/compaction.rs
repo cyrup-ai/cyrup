@@ -19,8 +19,11 @@ use cyrup_session::compaction::hooks::{
 use cyrup_session::compaction::summarize::{
     ProviderSummarizer, SummarizationRequest, Summarizer,
 };
-use cyrup_session::compaction::tokens::TokenCache;
-use cyrup_session::compaction::{branch, CompactionError};
+use cyrup_session::compaction::tokens::{estimate_context_tokens, TokenCache};
+use cyrup_session::compaction::{
+    branch, prepare_compaction, CompactionError, BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
+};
+use cyrup_session::context::build_context_messages;
 use cyrup_session::agent_message::AgentMessage;
 use cyrup_session::{
     BranchSummarySettings, Compactor, CompactionSettings, Entry, EntryBase, KnownEntry,
@@ -300,7 +303,7 @@ async fn a05_3_split_turn_two_summaries_merged() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_3");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("first turn question short")).unwrap();
     m.append_message(assistant("first turn answer short")).unwrap();
     // A single oversized final turn (user + a very large assistant reply).
@@ -338,7 +341,7 @@ async fn a05_4_compact_custom_instructions_in_request() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_4");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     for i in 0..3 {
         m.append_message(user(&format!("auth question {i} with enough words here to matter"))).unwrap();
         m.append_message(assistant(&format!("auth answer {i} with enough words here to matter"))).unwrap();
@@ -390,7 +393,7 @@ async fn a05_5_overflow_recovery_then_retry() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_5");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     for i in 0..4 {
         m.append_message(user(&format!("overflow question {i} with enough words to matter"))).unwrap();
         m.append_message(assistant(&format!("overflow answer {i} with enough words to matter"))).unwrap();
@@ -428,7 +431,7 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_6");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
 
     // First batch: read a.rs, edit c.rs.
     m.append_message(user("first batch start with enough words to matter here now")).unwrap();
@@ -478,7 +481,7 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
 
     let cwd = PathBuf::from("/proj/a05_7");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("shared question")).unwrap();
     let shared_a = m.append_message(assistant("shared answer")).unwrap();
     let b1q = m.append_message(user("branch one question")).unwrap();
@@ -544,7 +547,7 @@ async fn a05_8_before_compact_cancel_and_custom() {
         let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
         let cwd = PathBuf::from("/proj/a05_8a");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
         m.append_message(user("q one with enough words to matter here now")).unwrap();
         m.append_message(assistant("a one with enough words to matter here now")).unwrap();
         m.append_message(user("q two with enough words to matter here now")).unwrap();
@@ -576,7 +579,7 @@ async fn a05_8_before_compact_cancel_and_custom() {
         let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
         let cwd = PathBuf::from("/proj/a05_8b");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
         m.append_message(user("q one with enough words to matter here now")).unwrap();
         m.append_message(assistant("a one with enough words to matter here now")).unwrap();
         m.append_message(user("q two with enough words to matter here now")).unwrap();
@@ -612,7 +615,7 @@ async fn a05_9_before_tree_cancel_and_replace() {
         let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
 
         let cwd = PathBuf::from("/proj/a05_9a");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
         m.append_message(user("shared")).unwrap();
         let shared = m.append_message(assistant("shared-a")).unwrap();
         let l1 = m.append_message(assistant("branch-one")).unwrap();
@@ -640,7 +643,7 @@ async fn a05_9_before_tree_cancel_and_replace() {
         let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
 
         let cwd = PathBuf::from("/proj/a05_9b");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
         m.append_message(user("shared")).unwrap();
         let shared = m.append_message(assistant("shared-a")).unwrap();
         let l1 = m.append_message(assistant("branch-one")).unwrap();
@@ -670,7 +673,7 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_10");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("start with enough words to matter here now okay then")).unwrap();
     m.append_message(assistant_tool("read", "src/lib.rs")).unwrap();
     m.append_message(tool_result("read", "src/lib.rs", "code")).unwrap();
@@ -703,4 +706,78 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     assert!(s.contains("</read-files>"));
     assert!(s.contains("<modified-files>"), "machine modified-files block present");
     assert!(s.contains("src/main.rs"), "modified file listed");
+}
+
+// ----------------------------------------------------------------- G-1 tokensBefore -----------
+
+#[test]
+fn g1_tokens_before_is_estimated_over_rendered_context() {
+    // Pi sets CompactionEntry.tokensBefore to
+    //   estimateContextTokens(buildSessionContext(pathEntries).messages).tokens   (compaction.ts:678)
+    // i.e. the RENDERED LLM context, NOT a raw per-entry sum. cyrup matches: prepare.rs builds the
+    // context with build_context_messages and runs estimate_context_tokens. This pins the exact
+    // value for a known transcript and proves the equivalence with Pi's basis.
+    let cwd = PathBuf::from("/proj/g1");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    // 4 turns, no assistant usage (Usage::default → all zero) so estimate_context_tokens has no
+    // provider-usage anchor and sums chars/4 ceil over every rendered message.
+    for _ in 0..4 {
+        m.append_message(user("uuuuuuuu")).unwrap(); //  8 chars → ceil(8/4)  = 2
+        m.append_message(assistant("aaaaaaaaaaaa")).unwrap(); // 12 chars → ceil(12/4) = 3
+    }
+    let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();
+
+    let cache = TokenCache::default();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let prep = prepare_compaction(&path, &cache, &settings).expect("history to summarize");
+
+    // 4 × (2 + 3) = 20 tokens over the full rendered context.
+    assert_eq!(prep.tokens_before, 20, "tokensBefore pins the rendered-context estimate");
+
+    // Exact equivalence with Pi's basis: estimateContextTokens(buildSessionContext(...).messages).
+    let refs: Vec<&Entry> = path.iter().collect();
+    let rendered = build_context_messages(&refs);
+    assert_eq!(prep.tokens_before, estimate_context_tokens(&rendered).tokens);
+}
+
+// ----------------------------------------------------------------- G-3/G-8 empty branch -------
+
+#[tokio::test]
+async fn g3_empty_branch_appends_no_content_placeholder() {
+    // Pi generateBranchSummary returns "No content to summarize" when the abandoned branch yields
+    // no summarizable messages (branch-summarization.ts:309-311), and navigateTree's caller still
+    // APPENDS it because `if (summaryText)` is truthy (agent-session.ts:2844). cyrup must not drop
+    // the branch: it appends the placeholder entry too.
+    let faux = Arc::new(FauxProvider::new()); // no scripted response needed: short-circuits the model
+    let model = faux.model().clone();
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
+
+    let cwd = PathBuf::from("/proj/g3");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("shared question")).unwrap();
+    let shared_a = m.append_message(assistant("shared answer")).unwrap();
+    // Abandoned branch off shared_a that filters to NO messages (a lone tool result is dropped).
+    let abandoned = m.append_message(tool_result("read", "x.rs", "data")).unwrap();
+
+    let entry = compactor
+        .run_branch_summary(
+            &mut m,
+            &model,
+            shared_a.clone(),
+            Some(abandoned.clone()),
+            true,
+            &settings,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the placeholder summary is appended, not dropped");
+
+    assert_eq!(entry.summary, BRANCH_SUMMARY_EMPTY_PLACEHOLDER);
+    assert_eq!(entry.summary, "No content to summarize");
+    assert_eq!(entry.from_id, abandoned, "from_id is the abandoned leaf navigated from");
+    assert_eq!(entry.parent_id.as_ref(), Some(&shared_a), "appended at the navigation target");
+    // The abandoned branch is never deleted (R-05-017).
+    assert!(m.entry(&abandoned).is_some());
 }

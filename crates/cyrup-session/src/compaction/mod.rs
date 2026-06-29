@@ -26,7 +26,8 @@ use crate::manager::SessionManager;
 
 pub use branch::{
     collect_entries_for_branch_summary, generate_branch_summary, prepare_branch_entries,
-    BranchCollection, BranchPreparation, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
+    BranchCollection, BranchPreparation, BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE,
+    BRANCH_SUMMARY_PROMPT,
 };
 pub use cutpoint::{find_cut_point, find_turn_start, find_valid_cut_points, CutPoint};
 pub use error::CompactionError;
@@ -227,6 +228,10 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 BeforeTreeDecision::Proceed | BeforeTreeDecision::CustomSummary { .. } => {
                     if !user_wants_summary && settings.skip_prompt {
                         (None, false) // R-05-018: skip generation
+                    } else if collection.entries.is_empty() {
+                        // Pi gates the default summarizer on `entriesToSummarize.length > 0`
+                        // (`agent-session.ts:2787`): with NO abandoned entries, produce nothing.
+                        (None, false)
                     } else {
                         // Budget = model context window − reserve (Pi `branch-summarization.ts:304-307`),
                         // NOT a flat reserve_tokens — this keeps far more branch history than a bare
@@ -235,20 +240,21 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                             .unwrap_or(u32::MAX)
                             .saturating_sub(settings.reserve_tokens);
                         let prep = prepare_branch_entries(&collection.entries, budget);
-                        if prep.messages.is_empty() {
-                            (None, false)
-                        } else {
-                            let summary = generate_branch_summary(
-                                &self.summarizer,
-                                &prep,
-                                model,
-                                cancel.clone(),
-                            )
-                            .await?;
-                            let details = serde_json::to_value(prep.file_ops.to_details())
-                                .unwrap_or_else(|_| serde_json::json!({}));
-                            (Some((summary, details)), false)
-                        }
+                        // `generate_branch_summary` returns the "No content to summarize" placeholder
+                        // when the abandoned branch filtered to no messages (all `toolResult` / over
+                        // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
+                        // non-empty placeholder (`agent-session.ts:2844`) — so we append it too rather
+                        // than silently dropping an explored branch.
+                        let summary = generate_branch_summary(
+                            &self.summarizer,
+                            &prep,
+                            model,
+                            cancel.clone(),
+                        )
+                        .await?;
+                        let details = serde_json::to_value(prep.file_ops.to_details())
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        (Some((summary, details)), false)
                     }
                 }
             };

@@ -125,20 +125,12 @@ impl SessionManager {
         }
     }
 
-    /// An ephemeral session with no file persistence (R-04-027). Infallible convenience that takes
-    /// `opts.id` verbatim; use [`Self::try_in_memory`] for Pi's id validation.
-    pub fn in_memory(cwd: &Path, opts: NewSessionOpts) -> Self {
-        let id = opts.id.unwrap_or_else(gen_session_id);
-        let mut header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
-        header.parent_session = opts.parent_session;
-        Self::assemble(header, cwd.to_path_buf(), Box::new(MemStore), Vec::new(), false)
-    }
-
-    /// An ephemeral session that validates a caller-supplied id, matching Pi: `inMemory` routes
-    /// through the constructor's `assertValidSessionId` (`session-manager.ts:830-831,1437-1439`), so
-    /// a malformed id is rejected for an ephemeral session exactly as for a persisted one. A `None`
-    /// id is generated. Prefer this over [`Self::in_memory`] when the id is caller-supplied.
-    pub fn try_in_memory(cwd: &Path, opts: NewSessionOpts) -> Result<Self, SessionError> {
+    /// An ephemeral session with no file persistence (R-04-027), validating a caller-supplied id
+    /// 1:1 with Pi: `inMemory` constructs through the same constructor as a persisted session, whose
+    /// `newSession` runs `assertValidSessionId` whenever an id is supplied
+    /// (`session-manager.ts:830-831,1437-1439`) — so a malformed id is rejected for an ephemeral
+    /// session exactly as for a persisted one. A `None` id is generated and never fails.
+    pub fn in_memory(cwd: &Path, opts: NewSessionOpts) -> Result<Self, SessionError> {
         let id = match opts.id {
             Some(id) => {
                 validate_session_id(id.as_str()).map_err(SessionError::InvalidSessionId)?;
@@ -182,15 +174,25 @@ impl SessionManager {
         Ok(Self::assemble(header, target_cwd.to_path_buf(), store, entries, true))
     }
 
-    /// Clone the current active path through the current leaf into a new file (R-04-021).
-    /// `Label` entries are dropped and the retained path re-chained, then labels for retained
-    /// targets re-attached as trailing entries (so removing labels never orphans a subtree).
-    pub fn clone_session(&self, layout: &SessionLayout) -> Result<Self, SessionError> {
-        let path_entries: Vec<Entry> = self.branch_path(None).into_iter().cloned().collect();
+    /// Re-root this session onto the path from root through an EXPLICIT `leaf_id` and switch this
+    /// manager to it IN PLACE — Pi `createBranchedSession(leafId)`
+    /// (`session-manager.ts:1292-1392`). The manager is mutated in place (Pi assigns `this.fileEntries`/
+    /// `this.sessionId`/`this.sessionFile` and rebuilds its index), the previous file is never
+    /// touched, and `parentSession` records the previous file only when persisting
+    /// (`session-manager.ts:1321`). `Label` entries are dropped and the retained path re-chained, then
+    /// labels for retained targets re-attached as trailing entries (so removing labels never orphans
+    /// a subtree). Returns the new session-file path when persisting, or `None` for an in-memory
+    /// session (Pi returns `string | undefined`).
+    pub fn create_branched_session(
+        &mut self,
+        leaf_id: &EntryId,
+        layout: &SessionLayout,
+    ) -> Result<Option<PathBuf>, SessionError> {
+        let path_entries: Vec<Entry> =
+            self.branch_path(Some(leaf_id)).into_iter().cloned().collect();
         if path_entries.is_empty() {
-            return Err(SessionError::EmptyFork(
-                self.session_file().map(Path::to_path_buf).unwrap_or_default(),
-            ));
+            // Pi: `throw new Error(`Entry ${leafId} not found`)` (`session-manager.ts:1295-1297`).
+            return Err(SessionError::EntryNotFound(leaf_id.clone()));
         }
 
         // Re-chain the non-label entries linearly.
@@ -229,37 +231,53 @@ impl SessionManager {
                 }
         }
 
+        let previous_session_file = self.session_file().map(|p| p.to_string_lossy().into_owned());
+        let persisted = self.store.is_persisted();
         let id = gen_session_id();
         let ts = now_ts();
         let mut header = SessionHeader::new(id.clone(), self.cwd.to_string_lossy(), ts.clone());
-        header.parent_session =
-            self.session_file().map(|p| p.to_string_lossy().into_owned());
+        // Pi: `parentSession: this.persist ? previousSessionFile : undefined`
+        // (`session-manager.ts:1321`).
+        header.parent_session = if persisted { previous_session_file } else { None };
 
-        // Pi `createBranchedSession(leafId, { persist:false })` clones WITHOUT touching the disk
-        // (`session-manager.ts:1292-1392`). Mirror that for an in-memory source: produce a
-        // `MemStore`-backed clone with no file write at all (`flushed = false`).
-        if !self.store.is_persisted() {
-            return Ok(Self::assemble(
-                header,
-                self.cwd.clone(),
-                Box::new(MemStore),
-                retained,
-                false,
-            ));
+        // Pi `createBranchedSession` in-memory branch (`session-manager.ts:1373-1391`): replace the
+        // entries + id, rebuild the index, and return `undefined` — no disk write.
+        if !persisted {
+            self.adopt_branch(header, Box::new(MemStore), retained, false);
+            return Ok(None);
         }
 
         let path = layout.new_file_path(&ts, id.as_str());
-        let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
+        let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path.clone()));
         // Pi `createBranchedSession` defers the file write until an assistant message exists
         // (`session-manager.ts:1362-1368`, explicitly to avoid the duplicate-header bug): write
         // eagerly only when the retained path already contains an assistant, otherwise leave the
         // file uncreated and let the first assistant append flush it (`flushed = false`).
-        if entries_have_assistant(&retained) {
+        let flushed = if entries_have_assistant(&retained) {
             store.rewrite(&header, &retained)?;
-            Ok(Self::assemble(header, self.cwd.clone(), store, retained, true))
+            true
         } else {
-            Ok(Self::assemble(header, self.cwd.clone(), store, retained, false))
-        }
+            false
+        };
+        self.adopt_branch(header, store, retained, flushed);
+        Ok(Some(path))
+    }
+
+    /// Replace this manager's header/store/entries in place (Pi `createBranchedSession` mutation),
+    /// rebuilding the index and resetting the leaf to the new last entry. `cwd` is preserved.
+    fn adopt_branch(
+        &mut self,
+        header: SessionHeader,
+        store: Box<dyn SessionStore>,
+        entries: Vec<Entry>,
+        flushed: bool,
+    ) {
+        self.header = header;
+        self.store = store;
+        self.entries = entries;
+        self.flushed = flushed;
+        self.rebuild_index();
+        self.leaf = self.entries.last().map(Entry::id);
     }
 
     // ---------------------------------------------------------- internal construction --------

@@ -182,7 +182,7 @@ mod smoke {
         // same JSONL shape — header line + entry lines).
         use cyrup_session::manager::{NewSessionOpts, SessionManager};
         let dir = TestTempDir::new().unwrap();
-        let mut mgr = SessionManager::in_memory(dir.path(), NewSessionOpts::default());
+        let mut mgr = SessionManager::in_memory(dir.path(), NewSessionOpts::default()).unwrap();
         mgr.append_message(user_msg("hello")).unwrap();
         mgr.append_message(assistant_msg("hi there")).unwrap();
         let mut buf = Vec::new();
@@ -197,7 +197,7 @@ mod smoke {
     fn tree_builder_branches() {
         use cyrup_session::manager::{NewSessionOpts, SessionManager};
         let dir = TestTempDir::new().unwrap();
-        let mut mgr = SessionManager::in_memory(dir.path(), NewSessionOpts::default());
+        let mut mgr = SessionManager::in_memory(dir.path(), NewSessionOpts::default()).unwrap();
         let structure = TreeStructure::new(vec![
             TreeMessage::user("u1"),
             TreeMessage::assistant("a1"),

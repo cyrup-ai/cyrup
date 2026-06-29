@@ -58,7 +58,7 @@ fn gap1_bash_and_custom_role_entries_survive_into_context() {
     // Pi stores bashExecution/custom roles inside type:"message" entries and convertToLlm renders
     // them as user messages (messages.ts:152-168, session-manager.ts:389-399).
     let cwd = PathBuf::from("/proj/gap1");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("hello")).unwrap();
     m.append_agent_message(bash("ls", "a.txt")).unwrap();
     m.append_agent_message(AgentMessage::Custom(CustomRoleMessage {
@@ -468,15 +468,16 @@ fn write_header_only(dir: &std::path::Path, fname: &str, id: &str, cwd: &str) ->
 // ---------------------------------------------------------------- gap 12 -----------------------
 
 #[test]
-fn gap12_try_in_memory_validates_caller_id() {
+fn gap12_in_memory_validates_caller_id() {
     // Pi inMemory routes through the constructor's assertValidSessionId
     // (session-manager.ts:830-831,1437-1439): a malformed id is rejected even for an ephemeral
-    // session, exactly as for a persisted one.
+    // session, exactly as for a persisted one. cyrup's `in_memory` adopts the validating signature
+    // 1:1 (returns `Result`).
     let cwd = PathBuf::from("/proj/gap12");
 
     // A bad id (leading dot / illegal char) is rejected.
     let bad = NewSessionOpts { id: Some(SessionId::from(".bad/id")), parent_session: None };
-    match SessionManager::try_in_memory(&cwd, bad) {
+    match SessionManager::in_memory(&cwd, bad) {
         Err(SessionError::InvalidSessionId(_)) => {}
         Err(e) => panic!("wrong error: {e:?}"),
         Ok(_) => panic!("malformed id should be rejected"),
@@ -484,11 +485,11 @@ fn gap12_try_in_memory_validates_caller_id() {
 
     // A valid id is accepted and preserved verbatim.
     let good = NewSessionOpts { id: Some(SessionId::from("good-1.0_x")), parent_session: None };
-    let m = SessionManager::try_in_memory(&cwd, good).unwrap();
+    let m = SessionManager::in_memory(&cwd, good).unwrap();
     assert_eq!(m.session_id().as_str(), "good-1.0_x");
 
     // None → a fresh id is generated (no error).
-    assert!(SessionManager::try_in_memory(&cwd, NewSessionOpts::default()).is_ok());
+    assert!(SessionManager::in_memory(&cwd, NewSessionOpts::default()).is_ok());
 }
 
 // ---------------------------------------------------------------- gap 21 -----------------------
@@ -611,13 +612,16 @@ fn gap24_clone_defers_write_until_assistant_exists() {
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     m.append_message(user("just a question")).unwrap(); // no assistant yet
 
-    // Clone the assistant-less path: the new session must NOT have written a file.
-    let mut cloned = m.clone_session(&lay).unwrap();
-    let cloned_path = cloned.session_file().unwrap().to_path_buf();
+    // Branch the assistant-less path in place: the new session must NOT have written a file.
+    let leaf = m.leaf_id().cloned().unwrap();
+    let cloned_path = m
+        .create_branched_session(&leaf, &lay)
+        .unwrap()
+        .expect("persisted branch returns a path");
     assert!(!cloned_path.exists(), "branched session with no assistant defers its file");
 
     // Once an assistant message arrives, the deferred buffer is flushed via create_exclusive.
-    cloned.append_message(asst()).unwrap();
+    m.append_message(asst()).unwrap();
     assert!(cloned_path.exists(), "deferred branched file is created on the first assistant message");
     // The retained user message survived into the new file.
     let reopened = SessionManager::open(&cloned_path).unwrap();
@@ -638,8 +642,12 @@ fn gap24_clone_with_assistant_writes_eagerly() {
     m.append_message(user("q")).unwrap();
     m.append_message(asst()).unwrap();
 
-    let cloned = m.clone_session(&lay).unwrap();
-    assert!(cloned.session_file().unwrap().exists(), "assistant-bearing clone is written eagerly");
+    let leaf = m.leaf_id().cloned().unwrap();
+    let cloned_path = m
+        .create_branched_session(&leaf, &lay)
+        .unwrap()
+        .expect("persisted branch returns a path");
+    assert!(cloned_path.exists(), "assistant-bearing clone is written eagerly");
 }
 
 // ================================================================================================
@@ -775,7 +783,7 @@ fn g4_session_name_is_sanitized_on_write_and_trimmed_on_read() {
     // Pi appendSessionInfo: name.replace(/[\r\n]+/g," ").trim() (session-manager.ts:1031);
     // getSessionName trims and maps empty → undefined (session-manager.ts:1052).
     let cwd = PathBuf::from("/proj/g4");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_session_info("  Hello\r\n\nWorld  ").unwrap();
     assert_eq!(m.session_name().as_deref(), Some("Hello World"), "newline run collapsed + trimmed");
 
@@ -840,7 +848,7 @@ fn g6_tree_leaves_roots_in_insertion_order() {
     // (session-manager.ts:1210-1234). Two self-parent roots inserted newest-first must NOT be
     // re-sorted by timestamp.
     let cwd = PathBuf::from("/proj/g6");
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     // First root (later timestamp), then reset and add a second root (earlier-looking).
     m.append_message(user("root A inserted first")).unwrap();
     m.reset_leaf();
@@ -869,17 +877,56 @@ fn g7_clone_of_in_memory_session_writes_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = PathBuf::from("/proj/g7");
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("q")).unwrap();
     m.append_message(asst()).unwrap(); // assistant present → would force eager write on disk
 
+    let leaf = m.leaf_id().cloned().unwrap();
     let before = std::fs::read_dir(dir.path()).unwrap().count();
-    let cloned = m.clone_session(&lay).unwrap();
+    let path = m.create_branched_session(&leaf, &lay).unwrap();
     let after = std::fs::read_dir(dir.path()).unwrap().count();
 
-    assert!(!cloned.is_persisted(), "in-memory clone stays in memory");
-    assert!(cloned.session_file().is_none(), "no backing file path");
+    assert!(path.is_none(), "in-memory branch returns no path (Pi returns undefined)");
+    assert!(!m.is_persisted(), "in-memory clone stays in memory");
+    assert!(m.session_file().is_none(), "no backing file path");
     assert_eq!(before, after, "no file created on disk for an in-memory clone");
     // The retained path still carries the messages in memory.
-    assert!(!cloned.entries().is_empty(), "retained entries are present in memory");
+    assert!(!m.entries().is_empty(), "retained entries are present in memory");
+}
+
+// ---------------------------------------------------------------- G-2 explicit-leaf branch -----
+
+#[test]
+fn g2_create_branched_session_explicit_leaf_in_place() {
+    // Pi createBranchedSession(leafId) takes an EXPLICIT leaf and mutates the manager IN PLACE
+    // (session-manager.ts:1292-1392): the manager re-roots onto root→leafId only, the previous file
+    // is untouched, and parentSession records it. Here we branch at an earlier (non-leaf) entry.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/g2");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("q0")).unwrap();
+    let a0 = m.append_message(asst()).unwrap();
+    m.append_message(user("q1")).unwrap();
+    m.append_message(asst()).unwrap();
+    let old_file = m.session_file().unwrap().to_path_buf();
+    let old_count = m.entries().len(); // 4
+
+    // Branch at the explicit, non-leaf entry a0 → keep only [q0, a0].
+    let new_path = m
+        .create_branched_session(&a0, &lay)
+        .unwrap()
+        .expect("a persisted branch returns the new file path");
+
+    assert_ne!(new_path, old_file, "branched session lives in a new file");
+    assert_eq!(m.session_file(), Some(new_path.as_path()), "manager mutated in place to the branch");
+    assert_eq!(m.entries().len(), 2, "only the root→a0 path is retained");
+    assert_eq!(m.leaf_id().cloned(), m.entries().last().map(Entry::id));
+    assert_eq!(m.header().parent_session.as_deref(), Some(old_file.to_string_lossy().as_ref()));
+    // a0 is an assistant → the branch is written eagerly.
+    assert!(new_path.exists(), "assistant-bearing branch is written eagerly");
+
+    // The previous file is untouched on disk (Pi never rewrites it): all 4 entries remain.
+    let reopened = SessionManager::open(&old_file).unwrap();
+    assert_eq!(reopened.entries().len(), old_count);
 }

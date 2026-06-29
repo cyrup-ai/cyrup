@@ -186,14 +186,16 @@ fn a04_4_fork_and_clone() {
     let src_reopened = SessionManager::open(&src_path).unwrap();
     assert_eq!(src_reopened.entries().len(), src_entry_count);
 
-    // Clone duplicates the active path at the current position.
-    let cloned = src.clone_session(&lay).unwrap();
-    let cloned_path = cloned.session_file().unwrap().to_path_buf();
+    // Clone (createBranchedSession) re-roots the active path through the current leaf into a new
+    // file IN PLACE; the previous file (src_path) is untouched on disk.
+    let leaf = src.leaf_id().cloned().unwrap();
+    let cloned_path =
+        src.create_branched_session(&leaf, &lay).unwrap().expect("persisted branch returns a path");
     assert!(cloned_path.exists());
     assert_ne!(cloned_path, src_path);
-    assert_eq!(cloned.header().parent_session.as_deref(), Some(src_path.to_string_lossy().as_ref()));
-    assert_eq!(cloned.entries().len(), src_entry_count);
-    assert_eq!(first_text_of_leaf(&cloned), "a");
+    assert_eq!(src.header().parent_session.as_deref(), Some(src_path.to_string_lossy().as_ref()));
+    assert_eq!(src.entries().len(), src_entry_count);
+    assert_eq!(first_text_of_leaf(&src), "a");
 }
 
 fn first_text_of_leaf(m: &SessionManager) -> String {
@@ -235,7 +237,7 @@ fn a04_6_ephemeral_writes_no_file() {
     let root = tempfile::tempdir().unwrap();
     let cwd = PathBuf::from("/proj/ephemeral");
 
-    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default());
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_message(user("q")).unwrap();
     m.append_message(assistant("a")).unwrap();
 

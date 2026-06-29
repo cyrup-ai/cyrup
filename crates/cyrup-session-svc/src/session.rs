@@ -230,9 +230,16 @@ impl AgentSession {
             Some(dir) => cyrup_session::SessionLayout::new(dir, guard.cwd().to_path_buf()),
             None => cyrup_session::SessionLayout::for_cwd(guard.cwd().to_path_buf()),
         };
-        let forked = guard.clone_session(&layout)?;
-        let id = forked.session_id().clone();
-        *guard = forked;
+        // Pi forks at an explicit leaf and mutates the manager in place
+        // (`createBranchedSession(leafId)`, session-manager.ts:1292-1392). Fork-at-current-position
+        // passes the current leaf; an empty session has nothing to fork.
+        let leaf = guard.leaf_id().cloned().ok_or_else(|| {
+            cyrup_session::SessionError::EmptyFork(
+                guard.session_file().map(Path::to_path_buf).unwrap_or_default(),
+            )
+        })?;
+        guard.create_branched_session(&leaf, &layout)?;
+        let id = guard.session_id().clone();
         Ok(id)
     }
 
