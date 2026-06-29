@@ -1,9 +1,12 @@
+{"_note":"SELF-recorded golden from cyrup's harness (NOT a real Pi-runtime capture; a true cross-impl Pi capture is still pending). Mirrors Pi agent-loop.ts:109-366: each content-block stream event (text_start/text_delta/text_end) is re-emitted as a distinct message_update, so one text block => three message_updates. Lines without a 'type' field are ignored by the differential test."}
 {"type":"agent_start"}
 {"type":"turn_start"}
 {"type":"message_start","message":{"role":"user"}}
 {"type":"message_end","message":{"role":"user"}}
 {"type":"message_start","message":{"role":"assistant"}}
-{"type":"message_update"}
+{"type":"message_update","streamEvent":"text_start"}
+{"type":"message_update","streamEvent":"text_delta"}
+{"type":"message_update","streamEvent":"text_end"}
 {"type":"message_end","message":{"role":"assistant"}}
 {"type":"turn_end"}
 {"type":"agent_end"}

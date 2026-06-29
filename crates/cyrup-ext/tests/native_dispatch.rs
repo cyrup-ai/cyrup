@@ -3,7 +3,9 @@
 //! Maps to acceptance criteria A-08-1..5, R-08-034 (gated dispatch), and R-08-036 (containment).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use cyrup_agent::{AfterToolCall, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall};
+use cyrup_agent::{
+    AfterToolCall, AgentContextView, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
+};
 use cyrup_core::{CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use cyrup_ext::{
     CommandDescriptor, EventKind, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx,
@@ -15,6 +17,45 @@ use std::sync::{Arc, Mutex};
 
 fn cfg() -> HostConfig {
     HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+}
+
+/// Build the triggering assistant message + standalone `ToolCall` (same id/name/arguments as the
+/// hook under test) that the enriched `BeforeToolCall`/`AfterToolCall` contexts now carry. Returns
+/// both so each is borrowed into the context and outlives that borrow.
+fn tool_call_msg(
+    tool_name: &str,
+    tool_call_id: &ToolCallId,
+    args: &Value,
+) -> (cyrup_core::AssistantMessage, cyrup_core::ToolCall) {
+    let arguments = match args {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let tc = cyrup_core::ToolCall {
+        id: tool_call_id.clone(),
+        name: tool_name.to_string(),
+        arguments,
+        thought_signature: None,
+    };
+    let msg = cyrup_core::AssistantMessage {
+        content: vec![Content::ToolCall(tc.clone())],
+        provider: "faux".into(),
+        model: "faux-1".into(),
+        api: "faux".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: cyrup_core::Usage::default(),
+        stop_reason: cyrup_core::StopReason::ToolUse,
+        error_message: None,
+        timestamp: 0,
+    };
+    (msg, tc)
+}
+
+/// An empty read-only context view (no system prompt / messages / tools) for hook-context fields.
+fn empty_view() -> AgentContextView<'static> {
+    AgentContextView { system_prompt: "", messages: &[], tools: &[] }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,11 +145,15 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
 
     let mut args = json!({"command": "rm -rf /"});
     let id: ToolCallId = "tc1".into();
+    let (msg, tc) = tool_call_msg("bash", &id, &args);
     let ctx = BeforeToolCall {
         tool_name: "bash",
         tool_call_id: &id,
         args: &mut args,
         messages: &[],
+        assistant_message: &msg,
+        tool_call: &tc,
+        context: empty_view(),
     };
     let outcome = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
     match outcome {
@@ -118,8 +163,16 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
 
     // A non-bash tool proceeds untouched.
     let mut a2 = json!({"path": "x"});
-    let ctx2 =
-        BeforeToolCall { tool_name: "read", tool_call_id: &id, args: &mut a2, messages: &[] };
+    let (msg2, tc2) = tool_call_msg("read", &id, &a2);
+    let ctx2 = BeforeToolCall {
+        tool_name: "read",
+        tool_call_id: &id,
+        args: &mut a2,
+        messages: &[],
+        assistant_message: &msg2,
+        tool_call: &tc2,
+        context: empty_view(),
+    };
     assert!(matches!(
         hooks.before_tool_call(ctx2, CancelToken::new()).await.unwrap(),
         BeforeOutcome::Proceed
@@ -167,7 +220,16 @@ async fn tool_call_mutate_chains_in_load_order() {
 
     let mut args = json!({});
     let id: ToolCallId = "tc1".into();
-    let ctx = BeforeToolCall { tool_name: "x", tool_call_id: &id, args: &mut args, messages: &[] };
+    let (msg, tc) = tool_call_msg("x", &id, &args);
+    let ctx = BeforeToolCall {
+        tool_name: "x",
+        tool_call_id: &id,
+        args: &mut args,
+        messages: &[],
+        assistant_message: &msg,
+        tool_call: &tc,
+        context: empty_view(),
+    };
     let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
     assert!(matches!(out, BeforeOutcome::Proceed));
     assert_eq!(args, json!({"a": "1", "b": "2"}));
@@ -224,6 +286,7 @@ async fn a08_3_tool_result_patch_chains() {
     let id: ToolCallId = "tc1".into();
     let content = vec![Content::text("base")];
     let args = json!({});
+    let (msg, tc) = tool_call_msg("x", &id, &args);
     let ctx = AfterToolCall {
         tool_name: "x",
         tool_call_id: &id,
@@ -232,6 +295,9 @@ async fn a08_3_tool_result_patch_chains() {
         details: None,
         is_error: false,
         terminate: false,
+        assistant_message: &msg,
+        tool_call: &tc,
+        context: empty_view(),
     };
     let over = hooks.after_tool_call(ctx, CancelToken::new()).await.unwrap();
     let over = over.expect("expected override");
@@ -463,11 +529,15 @@ async fn r08_036_panicking_handler_is_contained() {
 
     let mut args = json!({});
     let id: ToolCallId = "tc1".into();
+    let (msg, tc) = tool_call_msg("bash", &id, &args);
     let ctx = BeforeToolCall {
         tool_name: "bash",
         tool_call_id: &id,
         args: &mut args,
         messages: &[],
+        assistant_message: &msg,
+        tool_call: &tc,
+        context: empty_view(),
     };
     // The panic is caught and skipped; the later gate still blocks. Host alive.
     let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();

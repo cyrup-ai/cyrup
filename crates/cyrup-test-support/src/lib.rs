@@ -336,9 +336,16 @@ mod smoke {
         assert_eq!(event_kind_sequence(&events).first().map(String::as_str), Some("agent_start"));
     }
 
-    /// Pi-captured differential fixture (func-00 R-00-012): the harness's emitted event-kind
-    /// ordering for a plain text turn matches the committed Pi-derived sequence
-    /// (`fixtures/pi/text-turn.events.jsonl`, mirroring Pi `agent-loop.ts:109-366`).
+    /// Differential fixture (func-00 R-00-012): the harness's emitted event-kind ordering for a
+    /// plain text turn matches the committed golden sequence (`fixtures/pi/text-turn.events.jsonl`),
+    /// which mirrors Pi `agent-loop.ts:109-366`. The text turn streams Start → text_start →
+    /// text_delta → text_end → Done, and the agent re-emits the refreshed partial on a *distinct*
+    /// `message_update` for each content-block event (Pi emits one `AssistantMessageEvent` per block
+    /// event; agent-loop.ts:319-340), so a single text block yields three `message_update`s.
+    ///
+    /// NOTE: this golden is SELF-recorded from cyrup's own harness, not a real cross-impl Pi-runtime
+    /// capture — capturing against a live Pi runtime remains test-support's known open gap. Treat it
+    /// as a regression anchor for cyrup's Pi-faithful ordering, not as proof of Pi-runtime equality.
     #[tokio::test]
     async fn differential_matches_pi_captured_fixture() {
         let fixture = include_str!("../fixtures/pi/text-turn.events.jsonl");
@@ -348,7 +355,7 @@ mod smoke {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
             .collect();
-        assert_eq!(expected.len(), 9, "fixture event count");
+        assert_eq!(expected.len(), 11, "fixture event count");
 
         let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text("hi")]))
             .await

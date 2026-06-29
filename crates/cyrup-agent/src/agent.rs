@@ -6,31 +6,35 @@
 //! never held across a subscriber `await` (deadlock-freedom, arch-02 §5.5).
 //
 // KNOWN GAPS (tracked):
-// - R-02-056: a low-level free-fn loop layer for embedders is not provided; the high-level `Agent`
-//   covers front-ends/extensions today. Revisit if an embedder needs the bare loop primitive.
-// - R-02-020: DONE — JSON-Schema argument validation + coercion now runs in preflight via
-//   `cyrup_provider::validate_tool_call` (func-01 R-01-034): args are validated/coerced before
-//   `before_tool_call`, and a validation failure yields an immediate isError tool-result (the model
-//   retries) without executing the tool. Args mutated by `before_tool_call` still run as-is, without
-//   re-validation (R-02-022). STILL DEFERRED: the optional `Tool::prepare_arguments` compat shim
-//   (an optional future cyrup-core `Tool` trait addition) is not implemented.
-// - R-02-055 (partial): `thinking_level` / `thinkingBudgets` are stored on state but not forwarded to
-//   the provider; blocked until `cyrup_provider::StreamOptions` gains thinking fields.
+// - R-02-020: DONE — JSON-Schema argument validation + coercion runs in preflight via
+//   `cyrup_provider::validate_tool_call` (func-01 R-01-034): raw args are first normalized by the
+//   tool's `prepare_arguments` compat shim (Pi `prepareToolCallArguments`, agent-loop.ts:548-560),
+//   then validated/coerced before `before_tool_call`, and a validation failure yields an immediate
+//   isError tool-result (the model retries) without executing the tool. Args mutated by
+//   `before_tool_call` still run as-is, without re-validation (R-02-022).
 // - A-02-10 (second half): no mutable-aliasing state getter is exposed (snapshots are copies and
 //   setters copy-on-assign). Intentional Rust `[CYRUP-DELTA]` from the TS source.
+// - thinkingBudgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112): NOT forwarded — blocked on a
+//   `cyrup_provider::StreamOptions.thinking_budgets` field (cross-crate). The unified `reasoning`
+//   level IS forwarded; per-level token budgets need the provider surface. Tracked as a blocker.
+// - Proxy `StreamFn` (Pi `streamProxy`, proxy.ts): PORTED in `proxy.rs` — the wire enum
+//   (`ProxyAssistantMessageEvent`), client-side partial rebuild (`ProxyMessageBuilder`, Pi
+//   `processProxyEvent`), options/body (`ProxyStreamOptions`/`buildProxyRequestOptions`), and the
+//   `POST {proxyUrl}/api/stream` bearer-SSE transport (`stream_proxy`/`ProxyStreamFn`). Transport
+//   reuses cyrup-provider's existing SSE client (`open_sse`) — no new dependency.
 
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentMessage, ToolResultMessage};
 use crate::hooks::{
-    AfterToolCall, BeforeOutcome, BeforeToolCall, DefaultHooks, Hooks, PostTurn, TurnUpdate,
+    AfterToolCall, AgentContextView, BeforeOutcome, BeforeToolCall, DefaultHooks, Hooks, PostTurn,
 };
 use crate::queue::{PendingQueue, QueueMode, ToolExecution};
-use crate::state::{reduce, AgentStateSnapshot, StateInner};
+use crate::state::{reduce, AgentStateSnapshot, GenerationConfig, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{
-    ApiId, AssistantMessage, Content, ExecMode, ModelRef, RunCancel, SessionId, StopReason,
-    ModelThinkingLevel, Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate,
+    ApiId, AssistantMessage, CancelToken, Content, ExecMode, ModelRef, RunCancel, SessionId,
+    StopReason, ModelThinkingLevel, Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate,
     ToolUpdateSink, Usage, UNRESOLVED_API,
 };
 use cyrup_provider::{validate_tool_call, Context, StreamEvent, StreamOptions};
@@ -73,12 +77,46 @@ fn tool_calls(a: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-fn result_value_of(content: &[Content], details: &Option<Value>) -> Value {
-    serde_json::json!({ "content": content, "details": details })
+/// The `tool_execution_end.result` payload — Pi emits the full `AgentToolResult`
+/// (`{content, details, terminate}`) including the early-termination hint (agent-loop.ts:723-731).
+fn result_value_of(content: &[Content], details: &Option<Value>, terminate: bool) -> Value {
+    serde_json::json!({ "content": content, "details": details, "terminate": terminate })
 }
 
 fn update_value(u: &ToolUpdate) -> Value {
     serde_json::json!({ "content": u.content, "details": u.details })
+}
+
+/// Emit one event without a [`RunCtx`] — the same reduce-then-await-subscribers path as
+/// [`RunCtx::emit`], used by the catch-all failure path (Pi `handleRunFailure`, agent.ts:476-492)
+/// after the run task has unwound and `RunCtx` is gone. Subscriber panics are contained.
+async fn emit_standalone(
+    subscribers: &Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
+    state: &Arc<Mutex<StateInner>>,
+    ev: AgentEvent,
+) {
+    {
+        let mut st = lock(state);
+        reduce(&mut st, &ev);
+    }
+    let subs = { lock(subscribers).clone() };
+    for s in subs.iter() {
+        let _ = std::panic::AssertUnwindSafe(s.on_event(&ev)).catch_unwind().await;
+    }
+}
+
+/// Recover a human-readable message from a caught panic payload (Pi
+/// `error instanceof Error ? error.message : String(error)`, agent.ts:485). A `panic!`/`unwrap`
+/// payload is typically a `&str` or `String`, which we downcast to recover the real text; any other
+/// payload type falls back to a generic label.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "run task failed".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +126,25 @@ fn update_value(u: &ToolUpdate) -> Value {
 /// Input to [`Agent::prompt`]. Convertible from `&str`/`String`/`AgentMessage`/`Vec<AgentMessage>`.
 pub struct PromptInput {
     pub messages: Vec<AgentMessage>,
+}
+
+impl PromptInput {
+    /// A single user message carrying `text` followed by image attachments (Pi
+    /// `normalizePromptInput`, agent.ts:379-383): `[{type:"text"}, ...images]`.
+    pub fn text_with_images(text: impl Into<String>, images: Vec<Content>) -> Self {
+        let mut content = vec![Content::text(text)];
+        content.extend(images);
+        Self { messages: vec![AgentMessage::User { content, timestamp: None }] }
+    }
+
+    /// The single message this input wraps (panics-free: returns an empty user message if empty).
+    fn into_one(mut self) -> AgentMessage {
+        if self.messages.is_empty() {
+            AgentMessage::user_text("")
+        } else {
+            self.messages.remove(0)
+        }
+    }
 }
 
 impl From<&str> for PromptInput {
@@ -152,7 +209,7 @@ struct Batch {
     terminate: bool,
 }
 
-enum EntryStart {
+pub(crate) enum EntryStart {
     Prompt(Vec<AgentMessage>),
     Continue,
 }
@@ -161,7 +218,7 @@ enum EntryStart {
 // The run context (owns one run's working state; lives on the run task)
 // ---------------------------------------------------------------------------
 
-struct RunCtx {
+pub(crate) struct RunCtx {
     state: Arc<Mutex<StateInner>>,
     subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
     steering: Arc<Mutex<PendingQueue>>,
@@ -172,15 +229,68 @@ struct RunCtx {
     tool_execution: ToolExecution,
     session_id: Option<SessionId>,
     system_prompt: String,
+    /// Running model baseline; a `prepare_next_turn` model override updates it stickily
+    /// (Pi `config.model`, agent.ts:425 / agent-loop.ts:228-238).
     model: ModelRef,
+    /// Running thinking level; a `prepare_next_turn` `thinking_level` override updates it stickily
+    /// (Pi `config.reasoning`, agent.ts:426 / agent-loop.ts:228-238).
+    thinking_level: ModelThinkingLevel,
+    /// Generation params + telemetry forwarded into `StreamOptions` (Pi `AgentLoopConfig`).
+    gen_config: GenerationConfig,
     tools: Vec<Arc<dyn Tool>>,
     cancel: RunCancel,
     new_messages: Vec<AgentMessage>,
-    next_override: Option<TurnUpdate>,
     turn_index: usize,
+    /// On continue-from-assistant, the first `getSteeringMessages` poll returns `[]` so a second
+    /// queued steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
+    /// agent.ts:351,440-446).
+    skip_initial_steering_poll: bool,
 }
 
 impl RunCtx {
+    /// Assemble a run context from already-built shared handles. Used by [`Agent::start_run`] and by
+    /// the low-level free-function loop (`crate::loop_fn`) so both drive the identical, tested loop.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        state: Arc<Mutex<StateInner>>,
+        subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
+        steering: Arc<Mutex<PendingQueue>>,
+        follow_up: Arc<Mutex<PendingQueue>>,
+        hooks: Arc<dyn Hooks>,
+        stream_fn: Arc<dyn StreamFn>,
+        key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+        tool_execution: ToolExecution,
+        session_id: Option<SessionId>,
+        system_prompt: String,
+        model: ModelRef,
+        thinking_level: ModelThinkingLevel,
+        gen_config: GenerationConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        cancel: RunCancel,
+        skip_initial_steering_poll: bool,
+    ) -> Self {
+        Self {
+            state,
+            subscribers,
+            steering,
+            follow_up,
+            hooks,
+            stream_fn,
+            key_resolver,
+            tool_execution,
+            session_id,
+            system_prompt,
+            model,
+            thinking_level,
+            gen_config,
+            tools,
+            cancel,
+            new_messages: Vec::new(),
+            turn_index: 0,
+            skip_initial_steering_poll,
+        }
+    }
+
     /// The sole emission path (arch-02 §5.1): reduce managed state (lock released BEFORE awaiting),
     /// then await each subscriber in registration order before returning.
     async fn emit(&self, ev: AgentEvent) {
@@ -212,7 +322,7 @@ impl RunCtx {
         self.tools.iter().find(|t| t.name() == name).cloned()
     }
 
-    async fn run(&mut self, entry: EntryStart) -> Vec<AgentMessage> {
+    pub(crate) async fn run(&mut self, entry: EntryStart) -> Vec<AgentMessage> {
         self.emit(AgentEvent::AgentStart).await;
         match entry {
             EntryStart::Prompt(prompts) => {
@@ -233,7 +343,16 @@ impl RunCtx {
     }
 
     async fn run_loop(&mut self, mut turn_started: bool) {
-        let mut pending = self.poll_steering();
+        // Pi polls steering at the very top (agent-loop.ts:167), but a continue-from-assistant run
+        // already drained one steering message and passes it as the prompt; `skipInitialSteeringPoll`
+        // makes this first poll return `[]` so the next queued steering message is not drained a turn
+        // too early under `one-at-a-time` (agent.ts:351,440-446).
+        let mut pending = if self.skip_initial_steering_poll {
+            self.skip_initial_steering_poll = false;
+            Vec::new()
+        } else {
+            self.poll_steering()
+        };
         loop {
             let mut has_more_tools = true;
             while has_more_tools || !pending.is_empty() {
@@ -264,32 +383,70 @@ impl RunCtx {
                 let calls = tool_calls(&asst);
                 let mut tool_results = Vec::new();
                 has_more_tools = false;
-                let mut terminated = false;
                 if !calls.is_empty() {
-                    let batch = self.execute_tool_calls(&calls).await;
+                    let batch = self.execute_tool_calls(&asst, &calls).await;
                     tool_results = batch.messages;
-                    terminated = batch.terminate;
-                    has_more_tools = !terminated;
+                    // `terminate` ends only TOOL-driven continuation (the whole batch must set it,
+                    // `shouldTerminateToolBatch`, agent-loop.ts:210,544-546); queued steering /
+                    // follow-up still flow through the post-turn path below.
+                    has_more_tools = !batch.terminate;
                     for r in &tool_results {
                         self.new_messages.push(AgentMessage::ToolResult(r.clone()));
                     }
                 }
 
-                self.emit(AgentEvent::TurnEnd { message: AgentMessage::Assistant(asst), tool_results })
-                    .await;
+                self.emit(AgentEvent::TurnEnd {
+                    message: AgentMessage::Assistant(asst.clone()),
+                    tool_results: tool_results.clone(),
+                })
+                .await;
                 self.turn_index += 1;
 
-                if terminated {
-                    self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await;
-                    return;
-                }
+                // NOTE: there is NO early return on terminate. Pi still runs the post-turn path —
+                // `prepareNextTurn`, `shouldStopAfterTurn`, then the steering poll — and continues
+                // if any steering / follow-up is queued (agent-loop.ts:210,218-262). So a terminating
+                // turn still fires both post-turn hooks and still drains any queued steering /
+                // follow-up; absent a queue the inner loop simply exits (`has_more_tools` is false)
+                // and the run ends via the normal `agent_end` below.
 
+                // Post-turn hook context: the completed assistant message, this turn's tool results,
+                // the live context (system prompt + tools + full transcript), and the new-message
+                // accumulator (Pi `ShouldStopAfterTurnContext`/`PrepareNextTurnContext`,
+                // types.ts:116-138).
+                let ctx_messages = lock(&self.state).messages.clone();
                 let prep = {
-                    let ctx = PostTurn { messages: &self.new_messages, turn_index: self.turn_index };
+                    let ctx = PostTurn {
+                        messages: &self.new_messages,
+                        turn_index: self.turn_index,
+                        message: &asst,
+                        tool_results: &tool_results,
+                        context: AgentContextView {
+                            system_prompt: &self.system_prompt,
+                            messages: &ctx_messages,
+                            tools: &self.tools,
+                        },
+                    };
                     self.hooks.prepare_next_turn(ctx).await
                 };
                 match prep {
-                    Ok(Some(u)) => self.next_override = Some(u),
+                    Ok(Some(u)) => {
+                        // Overrides are STICKY: Pi reassigns the running `config`/`currentContext`
+                        // so a model / reasoning / context override returned once becomes the new
+                        // baseline for EVERY later turn in the run (agent-loop.ts:226-239), not a
+                        // one-shot. We fold each provided field into the run baseline here.
+                        if let Some(m) = u.model {
+                            self.model = m;
+                        }
+                        if let Some(t) = u.thinking_level {
+                            self.thinking_level = t;
+                        }
+                        if let Some(ctx) = u.context {
+                            // `currentContext = snapshot.context ?? currentContext`: the override
+                            // replaces the working transcript; this turn's `message_end`s have
+                            // already been appended, and subsequent turns append onto the override.
+                            lock(&self.state).messages = ctx;
+                        }
+                    }
                     Ok(None) => {}
                     Err(_) => {
                         self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await;
@@ -297,8 +454,22 @@ impl RunCtx {
                     }
                 }
 
+                // Pi passes the UPDATED `currentContext` to `shouldStopAfterTurn` (it runs AFTER the
+                // `prepareNextTurn` reassignment, agent-loop.ts:241-251), so re-snapshot the (possibly
+                // overridden) transcript for this hook's context view.
+                let ctx_messages_after = lock(&self.state).messages.clone();
                 let stop = {
-                    let ctx = PostTurn { messages: &self.new_messages, turn_index: self.turn_index };
+                    let ctx = PostTurn {
+                        messages: &self.new_messages,
+                        turn_index: self.turn_index,
+                        message: &asst,
+                        tool_results: &tool_results,
+                        context: AgentContextView {
+                            system_prompt: &self.system_prompt,
+                            messages: &ctx_messages_after,
+                            tools: &self.tools,
+                        },
+                    };
                     self.hooks.should_stop_after_turn(ctx).await
                 };
                 match stop {
@@ -328,15 +499,16 @@ impl RunCtx {
 
     /// The LLM boundary (arch-02 §6.2). Always emits the assistant `message_start..message_end`
     /// (including on hook error / abort) so the caller's closing sequence is complete.
-    async fn stream_assistant(&mut self) -> AssistantMessage {
-        let over = self.next_override.take();
-        let model = over.as_ref().and_then(|u| u.model.clone()).unwrap_or_else(|| self.model.clone());
-        let ctx_override = over.and_then(|u| u.context);
-
-        let base_messages = match ctx_override {
-            Some(m) => m,
-            None => lock(&self.state).messages.clone(),
-        };
+    async fn stream_assistant(&self) -> AssistantMessage {
+        // The running baseline. `prepare_next_turn` overrides are STICKY: a returned
+        // model/reasoning/context override is folded into the run's baseline (`self.model`,
+        // `self.thinking_level`, and the live `state.messages`) in `run_loop`, so it persists for
+        // ALL later turns in the run (Pi `config = {...config, model, reasoning}` /
+        // `currentContext = snapshot.context ?? currentContext`, agent-loop.ts:226-239). A
+        // non-reasoning model silently ignores the level (func-01 R-01-041).
+        let model = self.model.clone();
+        let effective_thinking = self.thinking_level;
+        let base_messages = lock(&self.state).messages.clone();
 
         let transformed =
             match self.hooks.transform_context(base_messages, self.cancel.child()).await {
@@ -348,25 +520,42 @@ impl RunCtx {
             Err(_) => return self.emit_error_assistant("convertToLlm failed", &model).await,
         };
 
+        // Dynamic key wins; fall back to the run's static key (Pi `... || config.apiKey`,
+        // agent-loop.ts:301-302).
         let api_key = match &self.key_resolver {
             Some(r) => r.get_api_key(&model.provider).await,
             None => None,
-        };
+        }
+        .or_else(|| self.gen_config.api_key.clone());
 
+        // Forward each tool's `description` to the model (Pi `Context.tools`, agent-loop.ts:289-296;
+        // spec §4.3) — an empty description left the model unable to use the tool.
         let tool_defs: Vec<cyrup_provider::ToolDef> = self
             .tools
             .iter()
             .map(|t| cyrup_provider::ToolDef {
                 name: t.name().to_string(),
-                description: String::new(),
+                description: t.description().to_string(),
                 parameters: t.parameters().clone(),
             })
             .collect();
 
+        // Forward the generation params + telemetry + reasoning level (Pi `AgentLoopConfig` →
+        // `streamSimple`, agent-loop.ts:298-308 / agent.ts:421-447).
         let opts = StreamOptions {
             cancel: Some(self.cancel.child()),
             api_key,
             session_id: self.session_id.clone(),
+            reasoning: effective_thinking,
+            temperature: self.gen_config.temperature,
+            max_tokens: self.gen_config.max_tokens,
+            cache_retention: self.gen_config.cache_retention,
+            headers: self.gen_config.headers.clone(),
+            transport: self.gen_config.transport,
+            max_retry_delay_ms: self.gen_config.max_retry_delay_ms,
+            max_retries: self.gen_config.max_retries,
+            on_payload: self.gen_config.on_payload.clone(),
+            on_response: self.gen_config.on_response.clone(),
             ..Default::default()
         };
         let ctx = Context {
@@ -378,7 +567,10 @@ impl RunCtx {
         let mut stream = self.stream_fn.stream(&model, &ctx, &opts);
         let cancel_tok = self.cancel.token();
         let mut started = false;
-        let mut acc = String::new();
+        // The structured partial assistant message, kept in lockstep with the provider's per-event
+        // `partial` snapshot (Pi `event.partial`, agent-loop.ts:313-340): distinct text / thinking /
+        // toolCall content blocks (with signatures) and streaming tool-call args — NOT a single
+        // collapsed text block. The provider exposes this via `StreamEvent::partial()` (stream.rs).
         let mut partial = empty_assistant(&model);
         let mut final_msg: Option<AssistantMessage> = None;
 
@@ -406,41 +598,42 @@ impl RunCtx {
                     return aborted;
                 }
                 ev = stream.next() => {
-                    match ev {
+                    let e = match ev {
                         None => break,
-                        Some(e) => match &e {
-                            StreamEvent::Start { .. } => {
-                                started = true;
-                                self.emit(AgentEvent::MessageStart {
-                                    message: AgentMessage::Assistant(partial.clone()),
-                                })
-                                .await;
-                            }
-                            StreamEvent::TextDelta { delta, .. }
-                            | StreamEvent::ThinkingDelta { delta, .. } => {
-                                acc.push_str(delta);
-                                partial.content = vec![Content::text(acc.clone())];
+                        Some(e) => e,
+                    };
+                    // Refresh the structured partial from the event's own snapshot for every
+                    // non-terminal event (Pi assigns `partialMessage = event.partial`).
+                    if let Some(p) = e.partial() {
+                        partial = p.clone();
+                    }
+                    match &e {
+                        StreamEvent::Start { .. } => {
+                            started = true;
+                            self.emit(AgentEvent::MessageStart {
+                                message: AgentMessage::Assistant(partial.clone()),
+                            })
+                            .await;
+                        }
+                        StreamEvent::Done { message, .. } => {
+                            final_msg = Some(message.clone());
+                        }
+                        StreamEvent::Error { error, .. } => {
+                            final_msg = Some(error.clone());
+                        }
+                        // Every other event is a content-block start/delta/end (text, thinking, OR
+                        // tool-call): re-emit the refreshed partial on `message_update` (Pi emits
+                        // `message_update` for all nine block events once the partial exists,
+                        // agent-loop.ts:319-340).
+                        _ => {
+                            if started {
                                 self.emit(AgentEvent::MessageUpdate {
                                     message: AgentMessage::Assistant(partial.clone()),
                                     assistant_message_event: Box::new(e.clone()),
                                 })
                                 .await;
                             }
-                            StreamEvent::ToolCallDelta { .. } => {
-                                self.emit(AgentEvent::MessageUpdate {
-                                    message: AgentMessage::Assistant(partial.clone()),
-                                    assistant_message_event: Box::new(e.clone()),
-                                })
-                                .await;
-                            }
-                            StreamEvent::Done { message, .. } => {
-                                final_msg = Some(message.clone());
-                            }
-                            StreamEvent::Error { error, .. } => {
-                                final_msg = Some(error.clone());
-                            }
-                            _ => {}
-                        },
+                        }
                     }
                 }
             }
@@ -480,21 +673,29 @@ impl RunCtx {
         asst
     }
 
-    async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Batch {
+    async fn execute_tool_calls(&self, assistant: &AssistantMessage, calls: &[ToolCall]) -> Batch {
         let any_seq = calls.iter().any(|c| {
             self.find_tool(&c.name).map(|t| t.execution_mode() == ExecMode::Sequential).unwrap_or(false)
         });
         let sequential = any_seq || matches!(self.tool_execution, ToolExecution::Sequential);
+        // Snapshot the live transcript once for the per-call hook context view (Pi
+        // `currentContext.messages`).
+        let ctx_messages = lock(&self.state).messages.clone();
         if sequential {
-            self.execute_sequential(calls).await
+            self.execute_sequential(assistant, &ctx_messages, calls).await
         } else {
-            self.execute_parallel(calls).await
+            self.execute_parallel(assistant, &ctx_messages, calls).await
         }
     }
 
-    /// Preflight: locate tool → validate/coerce arguments → `before_tool_call`. Returns an
-    /// immediate (finalized) error result or a prepared executor (func-02 R-02-019/020/021/022).
-    async fn prepare(&self, call: &ToolCall) -> Prep {
+    /// Preflight: locate tool → normalize args (`prepare_arguments`) → validate/coerce → `before_tool_call`.
+    /// Returns an immediate (finalized) error result or a prepared executor (func-02 R-02-019/020/021/022).
+    async fn prepare(
+        &self,
+        assistant: &AssistantMessage,
+        ctx_messages: &[AgentMessage],
+        call: &ToolCall,
+    ) -> Prep {
         let tool = match self.find_tool(&call.name) {
             Some(t) => t,
             None => {
@@ -503,11 +704,14 @@ impl RunCtx {
                 )
             }
         };
-        // Validate AND coerce the model-emitted arguments against the tool's JSON-Schema
-        // `parameters` (R-02-020 / func-01 R-01-034). On failure we surface an immediate isError
-        // tool-result so the model can retry on the next turn, and the tool is NOT executed.
-        // (`prepare_arguments` remains an optional future cyrup-core addition — still deferred.)
-        let mut args = match validate_tool_call(tool.parameters(), Value::Object(call.arguments.clone())) {
+        // Normalize the raw model-emitted arguments via the tool's `prepare_arguments` compat shim
+        // BEFORE schema validation (Pi `prepareToolCallArguments` → `validateToolArguments`,
+        // agent-loop.ts:548-560,578-579). Default impl is identity.
+        let prepared = tool.prepare_arguments(Value::Object(call.arguments.clone())).await;
+        // Validate AND coerce against the tool's JSON-Schema `parameters` (R-02-020 / func-01
+        // R-01-034). On failure surface an immediate isError tool-result so the model can retry on
+        // the next turn; the tool is NOT executed.
+        let mut args = match validate_tool_call(tool.parameters(), prepared) {
             Ok(coerced) => coerced,
             Err(e) => return Prep::Immediate(self.immediate_error(call, e.to_string())),
         };
@@ -520,6 +724,13 @@ impl RunCtx {
                 tool_call_id: &call.id,
                 args: &mut args,
                 messages: &self.new_messages,
+                assistant_message: assistant,
+                tool_call: call,
+                context: AgentContextView {
+                    system_prompt: &self.system_prompt,
+                    messages: ctx_messages,
+                    tools: &self.tools,
+                },
             };
             self.hooks.before_tool_call(ctx, self.cancel.child()).await
         };
@@ -553,7 +764,7 @@ impl RunCtx {
             source_index: 0,
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
-            result_value: result_value_of(&message.content, &message.details),
+            result_value: result_value_of(&message.content, &message.details, false),
             is_error: true,
             terminate: false,
             message,
@@ -562,14 +773,18 @@ impl RunCtx {
 
     /// Apply `after_tool_call` (replace-not-merge per field, R-02-025) and build the finalized
     /// result. On hook `Err`: error result, `terminate` ignored (R-02-025/050).
+    #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
-        call_id: ToolCallId,
-        tool_name: String,
+        assistant: &AssistantMessage,
+        ctx_messages: &[AgentMessage],
+        call: &ToolCall,
         source_index: usize,
         args: Value,
         outcome: Result<ToolResult, ToolError>,
     ) -> Finalized {
+        let call_id = call.id.clone();
+        let tool_name = call.name.clone();
         let (mut content, mut details, mut terminate, mut is_error) = match outcome {
             Ok(r) => (r.content, r.details, r.terminate, false),
             Err(e) => (vec![Content::text(e.to_string())], None, false, true),
@@ -584,6 +799,13 @@ impl RunCtx {
                 details: details.as_ref(),
                 is_error,
                 terminate,
+                assistant_message: assistant,
+                tool_call: call,
+                context: AgentContextView {
+                    system_prompt: &self.system_prompt,
+                    messages: ctx_messages,
+                    tools: &self.tools,
+                },
             };
             self.hooks.after_tool_call(ctx, self.cancel.child()).await
         };
@@ -623,7 +845,7 @@ impl RunCtx {
             source_index,
             tool_call_id: call_id,
             tool_name,
-            result_value: result_value_of(&message.content, &message.details),
+            result_value: result_value_of(&message.content, &message.details, terminate),
             is_error,
             terminate,
             message,
@@ -632,7 +854,12 @@ impl RunCtx {
 
     /// Parallel batch: `tool_execution_start` in source order, `tool_execution_end` in completion
     /// order, tool-result messages + `turn_end.toolResults` in source order (R-02-015/016/017).
-    async fn execute_parallel(&self, calls: &[ToolCall]) -> Batch {
+    async fn execute_parallel(
+        &self,
+        assistant: &AssistantMessage,
+        ctx_messages: &[AgentMessage],
+        calls: &[ToolCall],
+    ) -> Batch {
         let n = calls.len();
         let mut finalized: Vec<Option<Finalized>> = (0..n).map(|_| None).collect();
         let (tx, mut rx) = mpsc::channel::<ToolRuntimeMsg>(64);
@@ -646,7 +873,7 @@ impl RunCtx {
                 args: Value::Object(call.arguments.clone()),
             })
             .await;
-            match self.prepare(call).await {
+            match self.prepare(assistant, ctx_messages, call).await {
                 Prep::Immediate(mut fin) => {
                     fin.source_index = idx;
                     self.emit(AgentEvent::ToolExecutionEnd {
@@ -716,12 +943,21 @@ impl RunCtx {
                     .await;
                 }
                 Some(ToolRuntimeMsg::Finished { call_id, source_index, tool_name, outcome }) => {
-                    let args = calls
+                    let (args, call) = calls
                         .iter()
                         .find(|c| c.id == call_id)
-                        .map(|c| Value::Object(c.arguments.clone()))
-                        .unwrap_or(Value::Null);
-                    let fin = self.finalize(call_id.clone(), tool_name.clone(), source_index, args, outcome).await;
+                        .map(|c| (Value::Object(c.arguments.clone()), c.clone()))
+                        .unwrap_or_else(|| {
+                            // Defensive: the id always matches a source call; synthesize a stand-in.
+                            (Value::Null, ToolCall {
+                                id: call_id.clone(),
+                                name: tool_name.clone(),
+                                arguments: serde_json::Map::new(),
+                                thought_signature: None,
+                            })
+                        });
+                    let fin =
+                        self.finalize(assistant, ctx_messages, &call, source_index, args, outcome).await;
                     self.emit(AgentEvent::ToolExecutionEnd {
                         tool_call_id: call_id,
                         tool_name,
@@ -758,7 +994,12 @@ impl RunCtx {
     }
 
     /// Sequential batch: each call fully processed before the next; abort breaks the loop (R-02-018).
-    async fn execute_sequential(&self, calls: &[ToolCall]) -> Batch {
+    async fn execute_sequential(
+        &self,
+        assistant: &AssistantMessage,
+        ctx_messages: &[AgentMessage],
+        calls: &[ToolCall],
+    ) -> Batch {
         let mut tool_results = Vec::new();
         let mut all_terminate = !calls.is_empty();
         let mut produced = 0usize;
@@ -771,7 +1012,7 @@ impl RunCtx {
             })
             .await;
 
-            let fin = match self.prepare(call).await {
+            let fin = match self.prepare(assistant, ctx_messages, call).await {
                 Prep::Immediate(mut fin) => {
                     fin.source_index = idx;
                     fin
@@ -806,7 +1047,7 @@ impl RunCtx {
                         }
                     };
                     accepting.store(false, Ordering::Release);
-                    self.finalize(call.id.clone(), call.name.clone(), idx, args, outcome).await
+                    self.finalize(assistant, ctx_messages, call, idx, args, outcome).await
                 }
             };
 
@@ -890,6 +1131,7 @@ pub struct Agent {
     running_rx: watch::Receiver<bool>,
     tool_execution: ToolExecution,
     session_id: Option<SessionId>,
+    gen_config: GenerationConfig,
 }
 
 impl Agent {
@@ -974,10 +1216,22 @@ impl Agent {
         }
     }
 
+    /// Active run's abort signal, if one is active (Pi `agent.signal`, agent.ts:294-297). Callers can
+    /// observe cancellation without holding the agent's internal slot.
+    pub fn signal(&self) -> Option<CancelToken> {
+        lock(&self.cancel_slot).as_ref().map(|c| c.token())
+    }
+
+    /// `true` when either queue still holds pending messages (Pi `hasQueuedMessages`,
+    /// agent.ts:289-292).
+    pub fn has_queued_messages(&self) -> bool {
+        !lock(&self.steering).is_empty() || !lock(&self.follow_up).is_empty()
+    }
+
+    /// Clear transcript, runtime state, and queued messages — unconditionally, even mid-run (Pi
+    /// `reset`, agent.ts:313-322). The `Result` is retained for signature back-compat and is always
+    /// `Ok`.
     pub async fn reset(&self) -> Result<(), AgentError> {
-        if *lock(&self.active) {
-            return Err(AgentError::RunActive);
-        }
         {
             let mut st = lock(&self.state);
             st.messages.clear();
@@ -994,7 +1248,18 @@ impl Agent {
     // --- run entry points (R-02-001..006) ---
     pub async fn prompt(&self, input: impl Into<PromptInput>) -> Result<RunHandle, AgentError> {
         let input = input.into();
-        self.start_run(EntryStart::Prompt(input.messages)).await
+        self.start_run(EntryStart::Prompt(input.messages), false).await
+    }
+
+    /// Start a prompt from text plus image attachments (Pi `prompt(input, images?)`,
+    /// agent.ts:326,379-383): the images are appended to the user message content after the text.
+    pub async fn prompt_with_images(
+        &self,
+        text: impl Into<String>,
+        images: Vec<Content>,
+    ) -> Result<RunHandle, AgentError> {
+        self.start_run(EntryStart::Prompt(vec![PromptInput::text_with_images(text, images).into_one()]), false)
+            .await
     }
 
     pub async fn continue_run(&self) -> Result<RunHandle, AgentError> {
@@ -1005,19 +1270,27 @@ impl Agent {
         let last_is_assistant = messages.last().map(|m| m.is_assistant()).unwrap_or(false);
         if last_is_assistant {
             // R-02-005: drain steering, else follow-up, treat as a fresh prompt; else error.
-            let mut drained = lock(&self.steering).drain();
-            if drained.is_empty() {
-                drained = lock(&self.follow_up).drain();
+            // A steering-drain continuation skips the loop's FIRST steering poll so a second queued
+            // steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
+            // agent.ts:349-352); a follow-up-drain continuation does NOT skip (agent.ts:354-357).
+            let steering = lock(&self.steering).drain();
+            if !steering.is_empty() {
+                return self.start_run(EntryStart::Prompt(steering), true).await;
             }
-            if drained.is_empty() {
+            let follow = lock(&self.follow_up).drain();
+            if follow.is_empty() {
                 return Err(AgentError::ContinueFromAssistant);
             }
-            return self.start_run(EntryStart::Prompt(drained)).await;
+            return self.start_run(EntryStart::Prompt(follow), false).await;
         }
-        self.start_run(EntryStart::Continue).await
+        self.start_run(EntryStart::Continue, false).await
     }
 
-    async fn start_run(&self, entry: EntryStart) -> Result<RunHandle, AgentError> {
+    async fn start_run(
+        &self,
+        entry: EntryStart,
+        skip_initial_steering_poll: bool,
+    ) -> Result<RunHandle, AgentError> {
         {
             let mut a = lock(&self.active);
             if *a {
@@ -1027,39 +1300,47 @@ impl Agent {
         }
         let cancel = RunCancel::new();
         *lock(&self.cancel_slot) = Some(cancel.clone());
+        // A clone kept for the catch-all failure path so it can distinguish an aborted run from a
+        // genuine error after `RunCtx` (which owns the run's `cancel`) has unwound (Pi
+        // `handleRunFailure(error, signal.aborted)`, agent.ts:470,476-492).
+        let fail_cancel = cancel.clone();
 
-        let (system_prompt, model, tools) = {
+        let (system_prompt, model, thinking_level, tools) = {
             let mut st = lock(&self.state);
             st.error_message = None;
             st.is_streaming = true;
-            (st.system_prompt.clone(), st.model.clone(), st.tools.clone())
+            (st.system_prompt.clone(), st.model.clone(), st.thinking_level, st.tools.clone())
         };
         let _ = self.running_tx.send(true);
 
-        let mut rc = RunCtx {
-            state: self.state.clone(),
-            subscribers: self.subscribers.clone(),
-            steering: self.steering.clone(),
-            follow_up: self.follow_up.clone(),
-            hooks: self.hooks.clone(),
-            stream_fn: self.stream_fn.clone(),
-            key_resolver: self.key_resolver.clone(),
-            tool_execution: self.tool_execution,
-            session_id: self.session_id.clone(),
+        let mut rc = RunCtx::new(
+            self.state.clone(),
+            self.subscribers.clone(),
+            self.steering.clone(),
+            self.follow_up.clone(),
+            self.hooks.clone(),
+            self.stream_fn.clone(),
+            self.key_resolver.clone(),
+            self.tool_execution,
+            self.session_id.clone(),
             system_prompt,
             model,
+            thinking_level,
+            self.gen_config.clone(),
             tools,
             cancel,
-            new_messages: Vec::new(),
-            next_override: None,
-            turn_index: 0,
-        };
+            skip_initial_steering_poll,
+        );
 
         let (tx, rx) = oneshot::channel();
         let state = self.state.clone();
         let running_tx = self.running_tx.clone();
         let active = self.active.clone();
         let cancel_slot = self.cancel_slot.clone();
+        // Independent handles for the catch-all failure path (Pi `handleRunFailure`,
+        // agent.ts:476-492): they must outlive the unwound `RunCtx`.
+        let fail_state = self.state.clone();
+        let fail_subs = self.subscribers.clone();
 
         tokio::spawn(async move {
             // The guard settles on scope exit no matter how this task ends (normal return OR an
@@ -1072,8 +1353,59 @@ impl Agent {
                 result_tx: Some(tx),
                 new_messages: Vec::new(),
             };
-            let new = rc.run(entry).await;
-            guard.complete(new);
+            // Run the loop; if its task UNWINDS (an uncontained panic in a hook/executor), synthesize
+            // Pi's closing sequence — an error assistant message + `message_start/message_end/
+            // turn_end/agent_end` — so subscribers always see a complete, well-formed termination
+            // (Pi `handleRunFailure`, agent.ts:476-492), then settle with that message.
+            match std::panic::AssertUnwindSafe(rc.run(entry)).catch_unwind().await {
+                Ok(new) => guard.complete(new),
+                Err(payload) => {
+                    let model = { lock(&fail_state).model.clone() };
+                    // Pi: `stopReason = aborted ? "aborted" : "error"` (agent.ts:484). An aborted run
+                    // that unwinds is reported as aborted, everything else as error.
+                    let aborted = fail_cancel.is_cancelled();
+                    let stop_reason =
+                        if aborted { StopReason::Aborted } else { StopReason::Error };
+                    // Pi: `errorMessage = error instanceof Error ? error.message : String(error)`
+                    // (agent.ts:485). Rust `catch_unwind` cannot recover an arbitrary error value,
+                    // but a `panic!`/`unwrap` payload is a `&str`/`String` we can downcast to recover
+                    // the real message; otherwise fall back to a generic string.
+                    let error_message = panic_message(payload.as_ref());
+                    let failure = AssistantMessage::errored(
+                        model.provider.clone(),
+                        model.model.as_str(),
+                        model.api.clone(),
+                        stop_reason,
+                        error_message,
+                    );
+                    let fm = AgentMessage::Assistant(failure);
+                    emit_standalone(
+                        &fail_subs,
+                        &fail_state,
+                        AgentEvent::MessageStart { message: fm.clone() },
+                    )
+                    .await;
+                    emit_standalone(
+                        &fail_subs,
+                        &fail_state,
+                        AgentEvent::MessageEnd { message: fm.clone() },
+                    )
+                    .await;
+                    emit_standalone(
+                        &fail_subs,
+                        &fail_state,
+                        AgentEvent::TurnEnd { message: fm.clone(), tool_results: Vec::new() },
+                    )
+                    .await;
+                    emit_standalone(
+                        &fail_subs,
+                        &fail_state,
+                        AgentEvent::AgentEnd { messages: vec![fm.clone()] },
+                    )
+                    .await;
+                    guard.complete(vec![fm]);
+                }
+            }
         });
 
         Ok(RunHandle { new_messages: rx })
@@ -1094,6 +1426,7 @@ pub struct AgentBuilder {
     follow_up_mode: QueueMode,
     tool_execution: ToolExecution,
     session_id: Option<SessionId>,
+    gen_config: GenerationConfig,
 }
 
 impl AgentBuilder {
@@ -1111,6 +1444,12 @@ impl AgentBuilder {
             follow_up_mode: QueueMode::OneAtATime,
             tool_execution: ToolExecution::Parallel,
             session_id: None,
+            // Pi defaults `transport` to `"auto"` (agent.ts:217); every other gen param is unset so
+            // the provider keeps its own defaults.
+            gen_config: GenerationConfig {
+                transport: Some(cyrup_provider::Transport::Auto),
+                ..GenerationConfig::default()
+            },
         }
     }
 
@@ -1155,6 +1494,62 @@ impl AgentBuilder {
         self
     }
 
+    // --- generation params + telemetry (Pi `AgentOptions`, agent.ts:96-116) ---
+
+    /// Sampling temperature forwarded to the provider (Pi `SimpleStreamOptions.temperature`).
+    pub fn temperature(mut self, t: f32) -> Self {
+        self.gen_config.temperature = Some(t);
+        self
+    }
+    /// Max output tokens forwarded to the provider (Pi `SimpleStreamOptions.maxTokens`).
+    pub fn max_tokens(mut self, n: u64) -> Self {
+        self.gen_config.max_tokens = Some(n);
+        self
+    }
+    /// Prompt-cache retention preference (Pi `SimpleStreamOptions.cacheRetention`).
+    pub fn cache_retention(mut self, r: cyrup_provider::CacheRetention) -> Self {
+        self.gen_config.cache_retention = Some(r);
+        self
+    }
+    /// Per-request header overlay (Pi `SimpleStreamOptions.headers`).
+    pub fn headers(mut self, h: cyrup_provider::HeaderMap) -> Self {
+        self.gen_config.headers = Some(h);
+        self
+    }
+    /// Preferred transport (Pi `AgentOptions.transport`, agent.ts:113).
+    pub fn transport(mut self, t: cyrup_provider::Transport) -> Self {
+        self.gen_config.transport = Some(t);
+        self
+    }
+    /// Cap (ms) on server-requested retry delays (Pi `AgentOptions.maxRetryDelayMs`, agent.ts:114).
+    pub fn max_retry_delay_ms(mut self, ms: u64) -> Self {
+        self.gen_config.max_retry_delay_ms = Some(ms);
+        self
+    }
+    /// Max client-side retry attempts (Pi `SimpleStreamOptions.maxRetries`).
+    pub fn max_retries(mut self, n: u32) -> Self {
+        self.gen_config.max_retries = Some(n);
+        self
+    }
+    /// Static API-key fallback used when no dynamic [`ApiKeyResolver`] yields one (Pi `config.apiKey`
+    /// fallback, agent-loop.ts:301-302).
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.gen_config.api_key = Some(key.into());
+        self
+    }
+    /// Telemetry: inspect/replace the provider payload before sending (Pi `AgentOptions.onPayload`,
+    /// agent.ts:102).
+    pub fn on_payload(mut self, f: cyrup_provider::OnPayload) -> Self {
+        self.gen_config.on_payload = Some(f);
+        self
+    }
+    /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi
+    /// `AgentOptions.onResponse`, agent.ts:103).
+    pub fn on_response(mut self, f: cyrup_provider::OnResponseHook) -> Self {
+        self.gen_config.on_response = Some(f);
+        self
+    }
+
     pub fn build(self) -> Agent {
         let (running_tx, running_rx) = watch::channel(false);
         let state = StateInner {
@@ -1182,6 +1577,7 @@ impl AgentBuilder {
             running_rx,
             tool_execution: self.tool_execution,
             session_id: self.session_id,
+            gen_config: self.gen_config,
         }
     }
 }

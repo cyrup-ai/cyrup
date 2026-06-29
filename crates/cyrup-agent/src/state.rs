@@ -2,8 +2,39 @@
 
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{ModelRef, StopReason, ModelThinkingLevel, Tool, ToolCallId};
+use cyrup_provider::{CacheRetention, OnPayload, OnResponseHook, Transport};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// The per-run model-call configuration the agent forwards into `cyrup_provider::StreamOptions`
+/// (Pi `AgentOptions`/`AgentLoopConfig` generation params, agent.ts:96-116). All fields are
+/// `None`/default unless the builder sets them, so the provider keeps its own defaults (additive,
+/// backward-compatible). Captured once at run start (Pi `createLoopConfig`, agent.ts:421-447).
+#[derive(Clone, Default)]
+pub struct GenerationConfig {
+    /// Sampling temperature (Pi `SimpleStreamOptions.temperature`).
+    pub temperature: Option<f32>,
+    /// Max output tokens (Pi `SimpleStreamOptions.maxTokens`).
+    pub max_tokens: Option<u64>,
+    /// Prompt-cache retention preference (Pi `SimpleStreamOptions.cacheRetention`).
+    pub cache_retention: Option<CacheRetention>,
+    /// Per-request header overlay (Pi `SimpleStreamOptions.headers`).
+    pub headers: Option<cyrup_provider::HeaderMap>,
+    /// Preferred transport (Pi `AgentOptions.transport`, agent.ts:113/430). Pi defaults to `auto`.
+    pub transport: Option<Transport>,
+    /// Cap (ms) on server-requested retry delays (Pi `AgentOptions.maxRetryDelayMs`, agent.ts:114).
+    pub max_retry_delay_ms: Option<u64>,
+    /// Max client-side retry attempts (Pi `SimpleStreamOptions.maxRetries`).
+    pub max_retries: Option<u32>,
+    /// Static API key fallback used when no dynamic resolver yields one (Pi `config.apiKey`
+    /// fallback, agent-loop.ts:301-302).
+    pub api_key: Option<String>,
+    /// Telemetry: inspect/replace the provider payload before sending (Pi `onPayload`, agent.ts:102).
+    pub on_payload: Option<OnPayload>,
+    /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi `onResponse`,
+    /// agent.ts:103).
+    pub on_response: Option<OnResponseHook>,
+}
 
 /// Live agent state (arch-02 §4.1). Mutated only by the loop's reducer ([`reduce`]) and the
 /// `Agent` setters; the state lock is never held across a subscriber `await`.
