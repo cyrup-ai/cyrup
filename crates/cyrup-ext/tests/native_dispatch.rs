@@ -8,8 +8,8 @@ use cyrup_agent::{
 };
 use cyrup_core::{CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use cyrup_ext::{
-    CommandDescriptor, EventKind, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx,
-    HostEvent, InitApi, NativeExtension,
+    CommandDescriptor, EventKind, ExtMode, ExtensionError, ExtensionHost, HookOutcome, HostConfig,
+    HostCtx, HostEvent, InitApi, NativeExtension, Reduced,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -542,6 +542,39 @@ async fn r08_036_panicking_handler_is_contained() {
     // The panic is caught and skipped; the later gate still blocks. Host alive.
     let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
     assert!(matches!(out, BeforeOutcome::Block { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// R-08-036 + Pi `onError`: a contained fault is surfaced to registered error listeners with the
+// typed {extension, event, error} payload (ExtensionError listener registry).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn error_listener_captures_contained_fault() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(PanicExt { id: "panic".into() })).await.unwrap();
+
+    let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    host.add_error_listener(Arc::new(move |e: &ExtensionError| {
+        if let Ok(mut g) = sink.lock() {
+            g.push((e.extension.to_string(), e.event.to_string()));
+        }
+    }));
+
+    // The panicking handler faults; the chain proceeds (no block) and the listener is notified.
+    let reduced = host
+        .dispatcher()
+        .dispatch_block_mutate(
+            HostEvent::ToolCall { call_id: "t".into(), name: "bash".into(), input: json!({}) },
+            &CancelToken::new(),
+        )
+        .await;
+    assert!(matches!(reduced, Reduced::Pass(_)), "fault skipped, action proceeds");
+
+    let got = captured.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "one fault captured");
+    assert_eq!(got[0].0, "panic", "attributed to the faulting extension");
+    assert_eq!(got[0].1, "tool_call", "carries the event name (Pi ExtensionError.event)");
 }
 
 // ---------------------------------------------------------------------------

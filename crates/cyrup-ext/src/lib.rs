@@ -19,6 +19,7 @@
 //! `#[allow(...)]` where unwrap/expect is acceptable.
 #![forbid(unsafe_code)]
 
+pub mod aggregate;
 pub mod build;
 pub mod contract;
 pub mod dispatch;
@@ -27,8 +28,10 @@ pub mod event;
 pub mod extension;
 pub mod facade;
 pub mod hooks;
+pub mod loader;
 pub mod manifest;
 pub mod native;
+pub mod provider;
 pub mod registry;
 pub mod subscriber;
 
@@ -38,21 +41,37 @@ pub mod host;
 pub mod host_runtime;
 
 // --- Re-exports: the load-bearing surface (arch-08 §3). ---
+pub use aggregate::{
+    fold_project_trust, fold_resources, ProjectTrustDecision, ResourcesAggregate,
+};
 pub use contract::{EventPatch, HandledValue, HookOutcome, Reduced};
-pub use dispatch::Dispatcher;
+pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 pub use error::ExtError;
 pub use event::{EventKind, HostEvent, Subscriptions};
 pub use extension::{ExtKind, Extension};
 pub use facade::{ExtensionHost, HostConfig};
+pub use build::build_component;
 pub use hooks::ExtHooks;
+pub use loader::{
+    discover, resolve_component_bytes, DiscoveredExtension, DiscoveryRoots, ExtOrigin, LoadError,
+    LoadExtensionsResult,
+};
 pub use manifest::{Capabilities, ExtensionManifest, HOST_WORLD};
-pub use native::{CtxTier, ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
+pub use native::{CtxTier, ExtMode, HostCtx, HostCtxRich, InitApi, NativeExtension, NativeHandle};
+pub use provider::{
+    resolve_api_key, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,
+    ProviderRegistration,
+};
 pub use registry::{
     CommandDescriptor, ExecModeWire, ExtensionRegistry, ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
 
 #[cfg(feature = "wasm-host")]
-pub use host::{EpochDriver, InstancePool, StoreLimits, WasmExtension};
+pub use host::{
+    CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
+    GuestState, HostServices, InstancePool, LiveExtension, OAuthEvent, RecordingServices,
+    StoreLimits, UiChrome, WasmExtension, WasmTool,
+};
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

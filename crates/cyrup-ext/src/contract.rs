@@ -61,14 +61,38 @@ impl HostEvent {
                 }
             }
             (HostEvent::Context { messages }, EventPatch::Context { messages: m }) => *messages = m,
-            (HostEvent::MessageEnd { message }, EventPatch::Message(m)) => *message = *m,
+            // `message_end` (Pi runner.ts:785): a replacement message MUST keep the same role; a
+            // mismatched role is rejected (the replacement is dropped, the original kept) — no panic.
+            (HostEvent::MessageEnd { message }, EventPatch::Message(m)) => {
+                if message_role(message) == message_role(&m) {
+                    *message = *m;
+                }
+            }
+            // `before_agent_start` (Pi runner.ts:980): replace the system prompt AND/OR accumulate
+            // an injected message across the handler chain.
             (
-                HostEvent::BeforeAgentStart { system_prompt, .. },
-                EventPatch::SystemPromptAndInject { system: Some(s), .. },
-            ) => *system_prompt = s,
+                HostEvent::BeforeAgentStart { system_prompt, injected, .. },
+                EventPatch::SystemPromptAndInject { system, inject },
+            ) => {
+                if let Some(s) = system {
+                    *system_prompt = s;
+                }
+                if let Some(m) = inject {
+                    injected.push(*m);
+                }
+            }
             // Shape mismatch: ignore (degrade gracefully).
             _ => {}
         }
+    }
+}
+
+/// The role discriminant of an LLM message (for the `message_end` same-role rule, R-08-011).
+fn message_role(m: &Message) -> &'static str {
+    match m {
+        Message::User { .. } => "user",
+        Message::Assistant(_) => "assistant",
+        Message::ToolResult { .. } => "toolResult",
     }
 }
 

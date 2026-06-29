@@ -41,17 +41,71 @@ pub struct HostCtx {
     pub has_ui: bool,
     pub cwd: PathBuf,
     tier: CtxTier,
+    /// Rich native-ctx fields (Pi `ExtensionContext`, types.ts:300-333). On the wasm path these are
+    /// served by the `session`/`models`/`ui` capability imports; the native built-in path carries
+    /// them inline so a built-in reaches the same surface without crossing a boundary (gap-08 #6).
+    rich: HostCtxRich,
+}
+
+/// The richer fields a native built-in's [`HostCtx`] exposes (Pi `ExtensionContext`, types.ts:300-333):
+/// the current model, idle/trust flags, the context-usage snapshot, and the active system prompt.
+/// (`sessionManager`/`modelRegistry` remain seam-injected handles — arch-08 §5.6 — so they are not
+/// inlined here; the data fields a built-in actually reads are.)
+#[derive(Clone, Debug, Default)]
+pub struct HostCtxRich {
+    /// The current model ref (Pi `ctx.model`).
+    pub model: Option<String>,
+    /// Whether the agent is idle (Pi `ctx.isIdle`).
+    pub is_idle: bool,
+    /// Whether the project is trusted (Pi `ctx.isProjectTrusted`).
+    pub is_project_trusted: bool,
+    /// The context-usage snapshot (Pi `ctx.getContextUsage()`).
+    pub context_usage: Option<serde_json::Value>,
+    /// The active system prompt (Pi `ctx.getSystemPrompt()`).
+    pub system_prompt: Option<String>,
 }
 
 impl HostCtx {
     /// An event-tier context (inside the agent/session flow): NO session mutation.
     pub fn event(mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
-        Self { mode, has_ui, cwd, tier: CtxTier::Event }
+        Self { mode, has_ui, cwd, tier: CtxTier::Event, rich: HostCtxRich::default() }
     }
 
     /// A command-tier context (user-initiated, outside the loop): session mutation allowed.
     pub fn command(mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
-        Self { mode, has_ui, cwd, tier: CtxTier::Command }
+        Self { mode, has_ui, cwd, tier: CtxTier::Command, rich: HostCtxRich::default() }
+    }
+
+    /// Attach the rich native-ctx fields (Pi `ExtensionContext`, gap-08 #6).
+    pub fn with_rich(mut self, rich: HostCtxRich) -> Self {
+        self.rich = rich;
+        self
+    }
+
+    /// The rich native-ctx fields (model/idle/trust/usage/system-prompt).
+    pub fn rich(&self) -> &HostCtxRich {
+        &self.rich
+    }
+
+    /// The current model ref (Pi `ctx.model`).
+    pub fn model(&self) -> Option<&str> {
+        self.rich.model.as_deref()
+    }
+    /// Whether the agent is idle (Pi `ctx.isIdle`).
+    pub fn is_idle(&self) -> bool {
+        self.rich.is_idle
+    }
+    /// Whether the project is trusted (Pi `ctx.isProjectTrusted`).
+    pub fn is_project_trusted(&self) -> bool {
+        self.rich.is_project_trusted
+    }
+    /// The context-usage snapshot (Pi `ctx.getContextUsage()`).
+    pub fn context_usage(&self) -> Option<&serde_json::Value> {
+        self.rich.context_usage.as_ref()
+    }
+    /// The active system prompt (Pi `ctx.getSystemPrompt()`).
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.rich.system_prompt.as_deref()
     }
 
     pub fn tier(&self) -> CtxTier {

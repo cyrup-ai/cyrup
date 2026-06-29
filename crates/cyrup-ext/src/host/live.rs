@@ -1,0 +1,1055 @@
+//! Live WASM-guest dispatch (arch-08b, gap-08 #1). Binds the `cyrup:ext` world with
+//! `wasmtime::component::bindgen!`, implements every host-import interface against [`GuestState`],
+//! and exposes [`LiveExtension`] — a real loaded `.wasm` component that implements the unified
+//! [`Extension`] trait. The loader calls the guest's `init` export once (R-08-001), reads back the
+//! subscriptions/registrations it declared, then dispatches each subscribed event to the matching
+//! `on-*` export, decoding the guest's `hook-outcome` into the host block/mutate/notify reduction.
+//!
+//! Containment (R-08-036): every guest call is run inside the epoch deadline and any trap/OOM/epoch
+//! timeout is mapped to a typed `ExtError` and surfaced — the host never crashes.
+
+use crate::contract::{EventPatch, HandledValue, HookOutcome};
+use crate::error::ExtError;
+use crate::event::{EventKind, HostEvent, Subscriptions};
+use crate::extension::{ExtKind, Extension};
+use crate::host::engine::map_wasm_error;
+use crate::host::limits::StoreLimits;
+use crate::host::services::{ControlOp, DialogOptions, ExecOutput, GuestState, OAuthEvent};
+use crate::host::store_state::HostState;
+use crate::native::CtxTier;
+use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
+use cyrup_core::{
+    CancelToken, Content, ExtensionId, Message, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdate, ToolUpdateSink,
+};
+use serde_json::Value;
+use std::sync::Arc;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Engine, Store};
+
+/// The generated `cyrup:ext` bindings. Wrapped in a module so the world struct (`Extension`) does
+/// not collide with our [`crate::Extension`] trait.
+pub mod bindings {
+    wasmtime::component::bindgen!({
+        world: "extension",
+        path: "wit",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+use bindings::cyrup::ext::types as wit_types;
+
+// ---------------------------------------------------------------------------
+// Host-import implementations: the guest's registration + capability calls land here.
+// ---------------------------------------------------------------------------
+
+/// Helper: fetch the guest backing or surface a trap-free error string (imports never panic).
+fn guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
+    state.guest.as_ref().ok_or_else(|| "no guest state in store".to_string())
+}
+
+// The `types` interface carries only type definitions; its (empty) Host trait still needs an impl.
+impl bindings::cyrup::ext::types::Host for HostState {}
+
+impl bindings::cyrup::ext::registration::Host for HostState {
+    async fn register_tool(&mut self, t: wit_types::ToolDescriptor) {
+        let Ok(guest) = guest_of(self) else { return };
+        let parameters: Value = serde_json::from_str(&t.parameters_json).unwrap_or(Value::Null);
+        let desc = ToolDescriptor {
+            name: t.name,
+            label: t.label,
+            description: t.description,
+            parameters,
+            execution_mode: t.exec_mode.map(|m| match m {
+                wit_types::ExecMode::Parallel => ExecModeWire::Parallel,
+                wit_types::ExecMode::Sequential => ExecModeWire::Sequential,
+            }),
+            prompt_snippet: t.prompt_snippet,
+            prompt_guidelines: t.prompt_guidelines,
+            has_renderer: t.has_renderer,
+        };
+        // A guest tool is dispatched back across the boundary; register it via the registry's
+        // descriptor table so the active-tool set can surface it (R-08-012/014).
+        let _ = guest.registry.register_guest_tool(guest.owner.clone(), desc);
+    }
+
+    async fn register_command(&mut self, name: String, desc_json: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let desc: CommandDescriptor = serde_json::from_str(&desc_json).unwrap_or_default();
+        guest.push_command(name, desc);
+    }
+
+    async fn register_shortcut(&mut self, key: String, _desc: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.register_shortcut(guest.owner.clone(), key);
+    }
+
+    async fn register_flag(&mut self, name: String, spec_json: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
+        guest.set_flag(name.clone(), spec.clone());
+        let _ = guest.registry.set_flag(name, spec);
+    }
+
+    async fn get_flag(&mut self, name: String) -> Option<String> {
+        let guest = guest_of(self).ok()?;
+        guest.get_flag(&name)
+    }
+
+    async fn register_provider(&mut self, id: String, config_json: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let config: Value = serde_json::from_str(&config_json).unwrap_or(Value::Null);
+        let _ = guest.registry.register_provider(guest.owner.clone(), id, config);
+    }
+
+    async fn unregister_provider(&mut self, id: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.unregister_provider(&id);
+    }
+
+    async fn register_message_renderer(&mut self, custom_type: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        guest.add_renderer(custom_type);
+    }
+
+    async fn add_autocomplete(&mut self, command: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        guest.add_autocomplete(command);
+    }
+
+    async fn add_autocomplete_provider(&mut self) {
+        if let Ok(guest) = guest_of(self) {
+            guest.add_autocomplete_provider();
+        }
+    }
+
+    async fn subscribe(&mut self, event_kinds: Vec<u8>) {
+        let Ok(guest) = guest_of(self) else { return };
+        for k in event_kinds {
+            if let Some(kind) = EventKind::from_u8(k) {
+                guest.add_subscription(kind);
+            }
+        }
+    }
+}
+
+impl bindings::cyrup::ext::ui::Host for HostState {
+    async fn notify(&mut self, message: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.notify(message);
+        }
+    }
+    async fn set_status(&mut self, message: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.set_status(message);
+        }
+    }
+    async fn confirm(&mut self, prompt: String, opts_json: String) -> bool {
+        let opts = DialogOptions::parse(&opts_json);
+        guest_of(self).map(|g| g.services.confirm(&prompt, &opts)).unwrap_or(false)
+    }
+    async fn input(&mut self, prompt: String, opts_json: String) -> Option<String> {
+        let opts = DialogOptions::parse(&opts_json);
+        guest_of(self).ok().and_then(|g| g.services.input(&prompt, &opts))
+    }
+    async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<u32> {
+        let guest = guest_of(self).ok()?;
+        let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
+        let opts = DialogOptions::parse(&opts_json);
+        guest.services.select(&prompt, &options, &opts)
+    }
+    async fn editor(&mut self, initial: String) -> Option<String> {
+        guest_of(self).ok().and_then(|g| g.services.editor(&initial))
+    }
+    async fn set_widget(&mut self, widget_json: String) {
+        if let Ok(guest) = guest_of(self) {
+            let v: Value = serde_json::from_str(&widget_json).unwrap_or(Value::Null);
+            guest.set_widget(v);
+        }
+    }
+    async fn set_header(&mut self, content: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.set_header(content);
+        }
+    }
+    async fn set_footer(&mut self, content: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.set_footer(content);
+        }
+    }
+    async fn set_title(&mut self, title: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.set_title(title);
+        }
+    }
+    async fn custom(&mut self, spec_json: String) -> Option<String> {
+        let guest = guest_of(self).ok()?;
+        let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
+        guest.services.custom(&spec)
+    }
+    async fn get_editor_text(&mut self) -> String {
+        guest_of(self).map(|g| g.services.editor_text()).unwrap_or_default()
+    }
+    async fn set_editor_text(&mut self, text: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.editor_write(text, false);
+        }
+    }
+    async fn paste_editor_text(&mut self, text: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.editor_write(text, true);
+        }
+    }
+    async fn theme_get(&mut self) -> Option<String> {
+        guest_of(self).ok().and_then(|g| g.services.theme())
+    }
+    async fn theme_list(&mut self) -> String {
+        guest_of(self).map(|g| g.services.theme_list().to_string()).unwrap_or_else(|_| "[]".into())
+    }
+    async fn theme_set(&mut self, name: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.services.set_theme(&name)?;
+        guest.theme_set(name);
+        Ok(())
+    }
+    async fn working_start(&mut self, label: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.working(Some(label));
+        }
+    }
+    async fn working_stop(&mut self) {
+        if let Ok(guest) = guest_of(self) {
+            guest.working(None);
+        }
+    }
+    async fn get_tools_expanded(&mut self) -> bool {
+        guest_of(self).map(|g| g.services.tools_expanded()).unwrap_or(false)
+    }
+    async fn set_tools_expanded(&mut self, expanded: bool) {
+        if let Ok(guest) = guest_of(self) {
+            guest.set_tools_expanded(expanded);
+        }
+    }
+}
+
+impl bindings::cyrup::ext::session::Host for HostState {
+    async fn entries_json(&mut self) -> String {
+        guest_of(self).map(|g| g.services.entries().to_string()).unwrap_or_else(|_| "[]".into())
+    }
+    async fn branch_json(&mut self) -> String {
+        guest_of(self).map(|g| g.services.branch().to_string()).unwrap_or_else(|_| "[]".into())
+    }
+    async fn tree_json(&mut self) -> String {
+        guest_of(self).map(|g| g.services.tree().to_string()).unwrap_or_else(|_| "null".into())
+    }
+    async fn append_entry(&mut self, custom_type: String, data_json: String) -> Result<String, String> {
+        let guest = guest_of(self)?;
+        let data: Value = serde_json::from_str(&data_json).map_err(|e| e.to_string())?;
+        guest.services.append_entry(&custom_type, &data)
+    }
+    async fn set_session_name(&mut self, _name: String) {
+        // Recorded via services in a full host; no-op in the default backend.
+    }
+    async fn get_session_name(&mut self) -> Option<String> {
+        guest_of(self).ok().and_then(|g| g.services.session_name())
+    }
+    async fn set_label(&mut self, _entry_id: String, _label: String) {}
+}
+
+impl bindings::cyrup::ext::models::Host for HostState {
+    async fn list_models(&mut self) -> String {
+        guest_of(self).map(|g| g.services.models().to_string()).unwrap_or_else(|_| "[]".into())
+    }
+    async fn current(&mut self) -> Option<String> {
+        guest_of(self).ok().and_then(|g| g.services.current_model())
+    }
+    async fn set_model(&mut self, model_json: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        // COMMAND-only (deadlock rule): silently dropped from an event handler.
+        if guest.require_command_tier().is_err() {
+            return;
+        }
+        let v: Value = serde_json::from_str(&model_json).unwrap_or(Value::Null);
+        let _ = guest.services.control(ControlOp::SetModel(v));
+    }
+    async fn context_usage(&mut self) -> String {
+        guest_of(self).map(|g| g.services.context_usage().to_string()).unwrap_or_else(|_| "{}".into())
+    }
+    async fn thinking_level(&mut self) -> Option<String> {
+        guest_of(self).ok().and_then(|g| g.services.thinking_level())
+    }
+    async fn set_thinking_level(&mut self, level: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        if guest.require_command_tier().is_err() {
+            return;
+        }
+        let _ = guest.services.control(ControlOp::SetThinkingLevel(level));
+    }
+}
+
+impl bindings::cyrup::ext::exec::Host for HostState {
+    async fn run(
+        &mut self,
+        cmd: String,
+        args: Vec<String>,
+        opts_json: String,
+    ) -> Result<wit_types::ExecResult, String> {
+        let guest = guest_of(self)?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        let ExecOutput { code, stdout, stderr } = guest.services.exec(&cmd, &args, &opts)?;
+        Ok(wit_types::ExecResult { code, stdout, stderr })
+    }
+}
+
+impl bindings::cyrup::ext::ext_fs::Host for HostState {
+    async fn read_file(&mut self, path: String) -> Result<Vec<u8>, String> {
+        let guest = guest_of(self)?;
+        let resolved = guest.fs.resolve(&path)?;
+        std::fs::read(&resolved).map_err(|e| e.to_string())
+    }
+    async fn write_file(&mut self, path: String, data: Vec<u8>) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        let resolved = guest.fs.resolve(&path)?;
+        std::fs::write(&resolved, data).map_err(|e| e.to_string())
+    }
+}
+
+impl bindings::cyrup::ext::bus::Host for HostState {
+    async fn emit(&mut self, topic: String, payload_json: String) {
+        if let Ok(guest) = guest_of(self) {
+            let v: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+            guest.bus_emit(topic, v);
+        }
+    }
+}
+
+impl bindings::cyrup::ext::host_tool::Host for HostState {
+    async fn emit_update(&mut self, call_id: String, chunk_json: String) {
+        if let Ok(guest) = guest_of(self) {
+            let chunk: Value = serde_json::from_str(&chunk_json).unwrap_or(Value::Null);
+            guest.push_tool_update(call_id, chunk);
+        }
+    }
+}
+
+impl bindings::cyrup::ext::oauth::Host for HostState {
+    async fn on_auth(&mut self, url: String, instructions: Option<String>) {
+        if let Ok(guest) = guest_of(self) {
+            guest.record_oauth_event(OAuthEvent::Auth { url, instructions });
+        }
+    }
+    async fn on_device_code(
+        &mut self,
+        user_code: String,
+        verification_uri: String,
+        _interval_seconds: Option<u32>,
+        _expires_in_seconds: Option<u32>,
+    ) {
+        if let Ok(guest) = guest_of(self) {
+            guest.record_oauth_event(OAuthEvent::DeviceCode { user_code, verification_uri });
+        }
+    }
+    async fn on_prompt(
+        &mut self,
+        message: String,
+        placeholder: Option<String>,
+        allow_empty: bool,
+    ) -> Result<String, String> {
+        let guest = guest_of(self)?;
+        guest.record_oauth_event(OAuthEvent::Prompt { message: message.clone() });
+        guest.services.oauth_prompt(&message, placeholder.as_deref(), allow_empty)
+    }
+    async fn on_progress(&mut self, message: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.record_oauth_event(OAuthEvent::Progress { message });
+        }
+    }
+    async fn on_select(&mut self, message: String, options_json: String) -> Option<String> {
+        let guest = guest_of(self).ok()?;
+        guest.record_oauth_event(OAuthEvent::Select { message: message.clone() });
+        let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
+        guest.services.oauth_select(&message, &options)
+    }
+}
+
+impl bindings::cyrup::ext::provider_stream::Host for HostState {
+    async fn emit_event(&mut self, stream_id: String, event_json: String) {
+        if let Ok(guest) = guest_of(self) {
+            let event: Value = serde_json::from_str(&event_json).unwrap_or(Value::Null);
+            guest.push_stream_event(stream_id, event);
+        }
+    }
+}
+
+impl bindings::cyrup::ext::ext_tools::Host for HostState {
+    async fn get_active_tools(&mut self) -> String {
+        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        // Honour the guest's restriction if set; else surface every registered extension/guest tool.
+        let names: Vec<String> = match guest.active_tools_restriction() {
+            Some(r) => r,
+            None => guest.registry.all_registered_tool_names().unwrap_or_default(),
+        };
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+    }
+    async fn get_all_tools(&mut self) -> String {
+        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        serde_json::to_string(&guest.registry.tool_info().unwrap_or_default())
+            .unwrap_or_else(|_| "[]".into())
+    }
+    async fn set_active_tools(&mut self, names_json: String) {
+        if let Ok(guest) = guest_of(self) {
+            let names: Vec<String> = serde_json::from_str(&names_json).unwrap_or_default();
+            guest.set_active_tools_restriction(names);
+        }
+    }
+    async fn get_commands(&mut self) -> String {
+        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        let names = guest.registry.command_names().unwrap_or_default();
+        let infos: Vec<Value> = names.into_iter().map(|n| serde_json::json!({ "name": n })).collect();
+        serde_json::to_string(&infos).unwrap_or_else(|_| "[]".into())
+    }
+}
+
+impl bindings::cyrup::ext::control::Host for HostState {
+    async fn new_session(&mut self, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::NewSession { opts })
+    }
+    async fn switch(&mut self, session_id: String, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::Switch { session_id, opts })
+    }
+    async fn fork(&mut self, entry_id: String, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::Fork { entry_id, opts })
+    }
+    async fn navigate(&mut self, entry_id: String, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::Navigate { entry_id, opts })
+    }
+    async fn reload(&mut self) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        guest.services.control(ControlOp::Reload)
+    }
+    async fn compact(&mut self) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        guest.services.control(ControlOp::Compact)
+    }
+    async fn wait_idle(&mut self) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        guest.services.control(ControlOp::WaitIdle)
+    }
+    async fn send_message(&mut self, message_json: String, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let message: Value = serde_json::from_str(&message_json).unwrap_or(Value::Null);
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::SendMessage { message, opts })
+    }
+    async fn send_user_message(&mut self, content: String, opts_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
+        guest.services.control(ControlOp::SendUserMessage { content, opts })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiveExtension: a loaded `.wasm` component as a unified Extension.
+// ---------------------------------------------------------------------------
+
+/// A live loaded WASM extension (arch-08b). Holds the instantiated component + its `Store` behind an
+/// async `Mutex` (single-thread-per-Store, R-ARCH-EXT-013) and the `GuestState` that backs its
+/// imports. Implements [`Extension`]; the dispatcher treats it identically to a native built-in.
+pub struct LiveExtension {
+    id: ExtensionId,
+    subs: Subscriptions,
+    epoch_ticks: u64,
+    guest: Arc<GuestState>,
+    inner: tokio::sync::Mutex<LiveInner>,
+}
+
+struct LiveInner {
+    store: Store<HostState>,
+    instance: bindings::Extension,
+}
+
+impl LiveExtension {
+    /// Load + instantiate a component and run its `init` export (R-08-001). After `init` returns,
+    /// the declared subscriptions are read back and the registered commands are flushed into the
+    /// registry. The `services` backend supplies interactive capabilities (default: deny-all).
+    pub async fn load(
+        engine: &Engine,
+        id: ExtensionId,
+        bytes: &[u8],
+        limits: StoreLimits,
+        guest: Arc<GuestState>,
+        epoch_ticks: u64,
+    ) -> Result<Self, ExtError> {
+        let component =
+            Component::from_binary(engine, bytes).map_err(|e| ExtError::Component(e.to_string()))?;
+
+        let mut linker = Linker::<HostState>::new(engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(|e| ExtError::Engine(e.to_string()))?;
+        bindings::Extension::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+            &mut linker,
+            |s| s,
+        )
+        .map_err(|e| ExtError::Engine(e.to_string()))?;
+
+        let mut store = Store::new(engine, HostState::with_guest(limits, guest.clone()));
+        store.limiter(|s| &mut s.limits);
+        store.set_epoch_deadline(epoch_ticks);
+
+        // init runs at command tier (load time): control ops would be legal here (R-08-008).
+        guest.set_tier(CtxTier::Command);
+        let instance = bindings::Extension::instantiate_async(&mut store, &component, &linker)
+            .await
+            .map_err(|e| map_wasm_error(&e))?;
+
+        match instance.call_init(&mut store).await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => return Err(ExtError::Component(format!("init failed: {msg}"))),
+            Err(e) => return Err(map_wasm_error(&e)),
+        }
+
+        // Flush command registrations declared during init into the registry (R-08-016).
+        for (name, desc) in guest.take_commands() {
+            guest.registry.register_command(guest.owner.clone(), name, desc)?;
+        }
+
+        let subs = guest.subscriptions();
+        Ok(Self {
+            id,
+            subs,
+            epoch_ticks,
+            guest,
+            inner: tokio::sync::Mutex::new(LiveInner { store, instance }),
+        })
+    }
+
+    /// Read-only access to the guest backing (notifications, bus emits, etc.) for tests/diagnostics.
+    pub fn guest(&self) -> &Arc<GuestState> {
+        &self.guest
+    }
+
+    /// Execute a guest-registered tool (R-08-015). Mirrors Pi's `ToolDefinition.execute`: passes the
+    /// `call_id`/`params`, races against `cancel` (the `signal`), and replays the streamed `onUpdate`
+    /// chunks into `on_update` once the call settles. A guest fault is contained as a `ToolError`.
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        call_id: &ToolCallId,
+        params: &Value,
+        cancel: &CancelToken,
+        on_update: &mut ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let params_s = params.to_string();
+        let api = inner.instance.cyrup_ext_events();
+        let call = api.call_execute_tool(&mut inner.store, name, call_id.as_str(), &params_s);
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ToolError::new("tool execution cancelled")),
+            r = call => r,
+        };
+        // Replay streamed updates (Pi onUpdate) into the runtime sink.
+        for (_cid, chunk) in self.guest.take_tool_updates() {
+            let content = chunk
+                .get("content")
+                .cloned()
+                .and_then(|c| serde_json::from_value::<Vec<Content>>(c).ok())
+                .unwrap_or_default();
+            on_update(ToolUpdate { content, details: chunk.get("details").cloned() });
+        }
+        match res {
+            Ok(Ok(out)) => {
+                let content = serde_json::from_str::<Vec<Content>>(&out.content_json)
+                    .unwrap_or_else(|_| vec![Content::text(out.content_json.clone())]);
+                let details = out
+                    .details_json
+                    .and_then(|d| serde_json::from_str::<Value>(&d).ok());
+                Ok(ToolResult { content, details, terminate: out.terminate })
+            }
+            Ok(Err(msg)) => Err(ToolError::new(msg)),
+            Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
+        }
+    }
+
+    /// Execute a guest-registered slash command (R-08-016). Mirrors Pi's
+    /// `RegisteredCommand.handler(args, ctx)` (types.ts:1109): runs at COMMAND tier (session-control
+    /// ops are legal), passes the raw `args` string, returns the optional text result. A guest fault
+    /// is contained as a typed `ExtError`.
+    pub async fn execute_command(
+        &self,
+        name: &str,
+        args: &str,
+        cancel: &CancelToken,
+    ) -> Result<Option<String>, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        // Command tier: control ops are legal from a command handler (R-08-008).
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        let call = api.call_execute_command(&mut inner.store, name, args);
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ExtError::Cancelled),
+            r = call => r,
+        };
+        match res {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions(prefix)`,
+    /// types.ts:1108). A fault is surfaced as a typed `ExtError`.
+    pub async fn argument_completions(
+        &self,
+        name: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_get_argument_completions(&mut inner.store, name, prefix).await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`, types.ts:472).
+    /// Returns the serialized widget tree, or `None` to fall back to the default renderer.
+    pub async fn render_call(
+        &self,
+        custom_type: &str,
+        call: &Value,
+    ) -> Result<Option<Value>, ExtError> {
+        self.render(custom_type, call, true).await
+    }
+
+    /// Render a tool result via a guest-registered renderer (Pi `renderResult`, types.ts:481).
+    pub async fn render_result(
+        &self,
+        custom_type: &str,
+        result: &Value,
+    ) -> Result<Option<Value>, ExtError> {
+        self.render(custom_type, result, false).await
+    }
+
+    /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at
+    /// COMMAND tier (user-initiated `/login`); during it the guest drives the `oauth` host imports.
+    /// Returns the credentials JSON to persist. A guest fault is contained as a typed `ExtError`.
+    pub async fn provider_login(&self, id: &str) -> Result<Value, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_provider_login(&mut inner.store, id).await {
+            Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Refresh a guest provider's expired credentials (Pi `oauth.refreshToken`).
+    pub async fn provider_refresh_token(
+        &self,
+        id: &str,
+        credentials: &Value,
+    ) -> Result<Value, ExtError> {
+        let creds = credentials.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_provider_refresh_token(&mut inner.store, id, &creds).await {
+            Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Derive a guest provider's API key from its credentials (Pi `oauth.getApiKey`).
+    pub async fn provider_get_api_key(
+        &self,
+        id: &str,
+        credentials: &Value,
+    ) -> Result<String, ExtError> {
+        let creds = credentials.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_provider_get_api_key(&mut inner.store, id, &creds).await {
+            Ok(Ok(key)) => Ok(key),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Rewrite a guest provider's models given its credentials (Pi optional `oauth.modifyModels`).
+    pub async fn provider_modify_models(
+        &self,
+        id: &str,
+        models: &Value,
+        credentials: &Value,
+    ) -> Result<Value, ExtError> {
+        let models_s = models.to_string();
+        let creds = credentials.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_provider_modify_models(&mut inner.store, id, &models_s, &creds).await {
+            Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Run a guest provider's custom `streamSimple` (Pi `streamSimple`, host gap #1). The guest
+    /// pushes assistant-message events via the `provider-stream` import (recorded in `GuestState`);
+    /// this returns once the stream ends. `stream_id` keys the emitted events.
+    pub async fn provider_stream_simple(
+        &self,
+        id: &str,
+        stream_id: &str,
+        model: &Value,
+        context: &Value,
+        options: &Value,
+    ) -> Result<(), ExtError> {
+        let model_s = model.to_string();
+        let context_s = context.to_string();
+        let options_s = options.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api
+            .call_provider_stream_simple(&mut inner.store, id, stream_id, &model_s, &context_s, &options_s)
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    /// Fold the guest's stacked autocomplete providers over the host's built-in suggestions (Pi the
+    /// `AutocompleteProviderFactory` chain, host gap #3). `base` = the built-in `AutocompleteSuggestions`
+    /// (none = the host had no suggestion), `query` = `{lines, cursorLine, cursorCol, force}`. Returns
+    /// the final suggestions after every stacked provider.
+    pub async fn autocomplete_suggest(
+        &self,
+        base: Option<&Value>,
+        query: &Value,
+    ) -> Result<Value, ExtError> {
+        let base_s = base.map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+        let query_s = query.to_string();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        match api.call_autocomplete_suggest(&mut inner.store, &base_s, &query_s).await {
+            Ok(s) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
+    async fn render(
+        &self,
+        custom_type: &str,
+        payload: &Value,
+        is_call: bool,
+    ) -> Result<Option<Value>, ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let payload_s = payload.to_string();
+        let api = inner.instance.cyrup_ext_events();
+        let res = if is_call {
+            api.call_render_call(&mut inner.store, custom_type, &payload_s).await
+        } else {
+            api.call_render_result(&mut inner.store, custom_type, &payload_s).await
+        };
+        match res {
+            Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+}
+
+/// A guest-registered tool surfaced to the agent's active-tool set (R-08-012/014). Executing it
+/// dispatches `execute-tool` across the boundary into the live component instance.
+pub struct WasmTool {
+    ext: Arc<LiveExtension>,
+    descriptor: ToolDescriptor,
+}
+
+impl WasmTool {
+    pub fn new(ext: Arc<LiveExtension>, descriptor: ToolDescriptor) -> Self {
+        Self { ext, descriptor }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WasmTool {
+    fn name(&self) -> &str {
+        &self.descriptor.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.descriptor.parameters
+    }
+    fn execution_mode(&self) -> cyrup_core::ExecMode {
+        match self.descriptor.execution_mode {
+            Some(ExecModeWire::Sequential) => cyrup_core::ExecMode::Sequential,
+            _ => cyrup_core::ExecMode::Parallel,
+        }
+    }
+    fn description(&self) -> &str {
+        &self.descriptor.description
+    }
+    async fn execute(
+        &self,
+        call_id: ToolCallId,
+        params: Value,
+        cancel: CancelToken,
+        mut on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.ext
+            .execute_tool(&self.descriptor.name, &call_id, &params, &cancel, &mut on_update)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Extension for LiveExtension {
+    fn id(&self) -> &ExtensionId {
+        &self.id
+    }
+    fn kind(&self) -> ExtKind {
+        ExtKind::Wasm
+    }
+    fn subscriptions(&self) -> &Subscriptions {
+        &self.subs
+    }
+
+    async fn invoke_event(
+        &self,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
+        let mut guard = self.inner.lock().await;
+        // Re-arm the epoch deadline for this call and run at event tier (control ops illegal).
+        guard.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+
+        let kind = ev.kind();
+        let call = invoke(&mut guard, ev);
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ExtError::Cancelled),
+            r = call => r,
+        };
+        match outcome {
+            Ok(wit) => Ok(decode_outcome(kind, wit)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+}
+
+/// Dispatch one event into the matching guest `on-*` export. Notify-only events return `Noop`.
+async fn invoke(
+    inner: &mut LiveInner,
+    ev: &HostEvent,
+) -> Result<wit_types::HookOutcome, wasmtime::Error> {
+    let store = &mut inner.store;
+    let api = inner.instance.cyrup_ext_events();
+    let noop = || Ok(wit_types::HookOutcome::Noop);
+    match ev {
+        HostEvent::ToolCall { call_id, name, input } => {
+            api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string()).await
+        }
+        HostEvent::ToolResult { call_id, name, content, is_error, .. } => {
+            let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".into());
+            api.call_on_tool_result(store, call_id.as_str(), name, &content_json, *is_error).await
+        }
+        HostEvent::Context { messages } => {
+            let msgs = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
+            api.call_on_context(store, &msgs).await
+        }
+        HostEvent::MessageEnd { message } => {
+            let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
+            api.call_on_message_end(store, &m).await
+        }
+        HostEvent::BeforeAgentStart { prompt, images, system_prompt, options, .. } => {
+            api.call_on_before_agent_start(
+                store,
+                prompt,
+                &images.to_string(),
+                system_prompt,
+                &options.to_string(),
+            )
+            .await
+        }
+        HostEvent::Input { text } => api.call_on_input(store, text).await,
+        HostEvent::UserBash { command, operations } => {
+            api.call_on_user_bash(store, command, &operations.to_string()).await
+        }
+        HostEvent::BeforeProviderRequest { payload } => {
+            api.call_on_before_provider_request(store, &payload.to_string()).await
+        }
+        HostEvent::ResourcesDiscover => api.call_on_resources_discover(store).await,
+        HostEvent::ProjectTrust => api.call_on_project_trust(store).await,
+        HostEvent::SessionBeforeSwitch { target_id } => {
+            api.call_on_session_before_switch(store, target_id).await
+        }
+        HostEvent::SessionBeforeFork { entry_id } => {
+            api.call_on_session_before_fork(store, entry_id).await
+        }
+        HostEvent::SessionBeforeCompact => api.call_on_session_before_compact(store).await,
+        HostEvent::SessionBeforeTree => api.call_on_session_before_tree(store).await,
+        // ---- notify-only: fire-and-forget, return Noop ----
+        HostEvent::AgentStart => api.call_on_agent_start(store).await.and_then(|()| noop()),
+        HostEvent::AgentEnd { messages } => {
+            let m = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
+            api.call_on_agent_end(store, &m).await.and_then(|()| noop())
+        }
+        HostEvent::TurnStart { turn_index } => {
+            api.call_on_turn_start(store, *turn_index).await.and_then(|()| noop())
+        }
+        HostEvent::TurnEnd { turn_index, message, .. } => {
+            let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
+            api.call_on_turn_end(store, *turn_index, &m).await.and_then(|()| noop())
+        }
+        HostEvent::MessageStart { role } => {
+            api.call_on_message_start(store, role).await.and_then(|()| noop())
+        }
+        HostEvent::MessageUpdate { delta } => {
+            api.call_on_message_update(store, &delta.to_string()).await.and_then(|()| noop())
+        }
+        HostEvent::ToolExecStart { call_id, name, args } => api
+            .call_on_tool_exec_start(store, call_id.as_str(), name, &args.to_string())
+            .await
+            .and_then(|()| noop()),
+        HostEvent::ToolExecUpdate { call_id, chunk } => api
+            .call_on_tool_exec_update(store, call_id.as_str(), &chunk.to_string())
+            .await
+            .and_then(|()| noop()),
+        HostEvent::ToolExecEnd { call_id, result, is_error } => api
+            .call_on_tool_exec_end(store, call_id.as_str(), &result.to_string(), *is_error)
+            .await
+            .and_then(|()| noop()),
+        HostEvent::SessionStart { reason } => {
+            api.call_on_session_start(store, reason).await.and_then(|()| noop())
+        }
+        HostEvent::SessionShutdown { reason } => {
+            api.call_on_session_shutdown(store, reason).await.and_then(|()| noop())
+        }
+        HostEvent::AfterProviderResponse { status, headers } => api
+            .call_on_after_provider_response(store, *status, &headers.to_string())
+            .await
+            .and_then(|()| noop()),
+        HostEvent::ModelSelect { model } => {
+            api.call_on_model_select(store, &model.to_string()).await.and_then(|()| noop())
+        }
+        HostEvent::ThinkingLevelSelect { level } => {
+            api.call_on_thinking_level_select(store, level).await.and_then(|()| noop())
+        }
+        HostEvent::SessionCompact { summary } => {
+            api.call_on_session_compact(store, summary).await.and_then(|()| noop())
+        }
+        HostEvent::SessionTree { tree } => {
+            api.call_on_session_tree(store, &tree.to_string()).await.and_then(|()| noop())
+        }
+    }
+}
+
+/// Decode a guest `hook-outcome` into the host reduction, interpreting the mutate/handled JSON patch
+/// by the event kind (the §3.3 reducer contract). An unparseable/shape-mismatched patch degrades to
+/// `Noop` (never a panic).
+fn decode_outcome(kind: EventKind, wit: wit_types::HookOutcome) -> HookOutcome {
+    match wit {
+        wit_types::HookOutcome::Noop => HookOutcome::Noop,
+        wit_types::HookOutcome::Block(reason) => HookOutcome::Block { reason },
+        wit_types::HookOutcome::Handled(s) => {
+            let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+            HookOutcome::Handled(HandledValue(v))
+        }
+        wit_types::HookOutcome::Mutate(s) => {
+            let v: Value = match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => return HookOutcome::Noop,
+            };
+            match decode_patch(kind, v) {
+                Some(p) => HookOutcome::Mutate(p),
+                None => HookOutcome::Noop,
+            }
+        }
+    }
+}
+
+/// Interpret a guest mutate-payload as a typed [`EventPatch`] for `kind`.
+fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
+    match kind {
+        EventKind::ToolCall => Some(EventPatch::ToolInput(v)),
+        EventKind::ToolResult => {
+            let content = v
+                .get("content")
+                .cloned()
+                .and_then(|c| serde_json::from_value::<Vec<Content>>(c).ok());
+            let details = v.get("details").cloned();
+            let is_error = v.get("isError").and_then(|b| b.as_bool());
+            Some(EventPatch::ToolResult { content, details, is_error })
+        }
+        EventKind::Context => {
+            let messages = serde_json::from_value(v).ok()?;
+            Some(EventPatch::Context { messages })
+        }
+        EventKind::MessageEnd => {
+            let m: Message = serde_json::from_value(v).ok()?;
+            Some(EventPatch::Message(Box::new(m)))
+        }
+        EventKind::BeforeAgentStart => {
+            let system = v.get("systemPrompt").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let inject = v
+                .get("message")
+                .cloned()
+                .and_then(|m| serde_json::from_value::<Message>(m).ok())
+                .map(Box::new);
+            Some(EventPatch::SystemPromptAndInject { system, inject })
+        }
+        // Other kinds have no typed patch shape yet (notify or producer-pending); ignore.
+        _ => None,
+    }
+}

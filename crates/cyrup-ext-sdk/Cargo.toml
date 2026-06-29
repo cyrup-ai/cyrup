@@ -12,12 +12,17 @@ authors.workspace = true
 workspace = true
 
 # Guest crate. Built for wasm32-wasip2 (NOT the host target); excluded from the workspace
-# default-members. The real guest links wit-bindgen against the cyrup:ext WIT world (arch-08).
+# default-members. `cdylib` so `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` emits a
+# `cyrup:ext` COMPONENT directly (the wasm32-wasip2 linker componentizes); `rlib` so the ergonomic
+# layer (events, descriptors, outcomes, dispatch) is unit-testable on the host target.
 [lib]
-crate-type = ["rlib"]   # becomes ["cdylib"] for component builds during arch-08
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The WIT bindings are only generated for the wasm guest target; on the host target the crate is a
+# plain rlib (no wasm import/export intrinsics to link).
 wit-bindgen = "0.58.0"
-# wit-bindgen (+ the generated cyrup:ext bindings) added during arch-08 implementation.

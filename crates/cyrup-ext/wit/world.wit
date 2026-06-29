@@ -4,6 +4,9 @@
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
+//
+// The `events` interface mirrors Pi's 30-event catalog 1:1 (extensions/types.ts:1133-1171):
+// the host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 package cyrup:ext@0.1.0;
 
 // ---------------------------------------------------------------------------
@@ -14,7 +17,8 @@ interface types {
   enum ext-mode  { tui, rpc, json, print }
 
   // What a single event handler contributes to the block/mutate/notify reduction
-  // (arch-08 §3.3). `mutate` and `handled` carry serde_json patch payloads as strings.
+  // (arch-08 §3.3). `mutate`/`handled` carry serde_json patch payloads as strings; the host
+  // interprets the patch shape per the event kind (Pi extensions/runner.ts emit* reducers).
   variant hook-outcome {
     noop,
     block(option<string>),
@@ -41,38 +45,130 @@ interface types {
     stdout: string,
     stderr: string,
   }
+
+  // Result of executing a guest-registered tool (R-08-015, Pi types.ts:1043 AgentToolResult).
+  // `content-json` is a serde_json array of (text|image) content blocks; `terminate` ends the
+  // agent loop after this result.
+  record tool-output {
+    content-json: string,
+    details-json: option<string>,
+    is-error: bool,
+    terminate: bool,
+  }
+
+  // A single autocomplete suggestion (Pi `AutocompleteItem`, tui/autocomplete.ts:219).
+  record autocomplete-item {
+    value: string,
+    label: string,
+    description: option<string>,
+  }
+
+  // The suggestions a provider returns (Pi `AutocompleteSuggestions`, tui/autocomplete.ts:236):
+  // the matched items + the prefix they match against.
+  record autocomplete-suggestions {
+    items: list<autocomplete-item>,
+    prefix: string,
+  }
 }
 
 // ---------------------------------------------------------------------------
 // host -> guest: the §5 event catalog (exports the guest may implement).
-// The host only calls events the guest subscribed to (subscription gate).
+// The host only calls events the guest subscribed to (subscription gate, R-08-034).
+// All 30 Pi events (extensions/types.ts:1133-1171) are represented here.
 // ---------------------------------------------------------------------------
 interface events {
-  use types.{hook-outcome};
+  use types.{hook-outcome, tool-output};
 
-  // 5.4 tools — the mutating seams.
+  // --- provider OAuth + custom streaming (Pi ProviderConfig.oauth/streamSimple, types.ts:1373-1392) ---
+  // The host invokes these on a guest that registered a provider carrying OAuth/`streamSimple`
+  // callbacks. Credentials/models/model/context/options cross as serde_json strings (open-shaped,
+  // arch-08 §4.1). `provider-login` runs the guest's `login(callbacks)` flow — during it the guest
+  // calls the `oauth` host imports (onAuth/onPrompt/onSelect/…) — and returns the credentials to
+  // persist. `provider-stream-simple` runs the guest's custom stream: it pushes assistant-message
+  // stream events back via the `provider-stream` host import, then returns when the stream ends.
+  provider-login:         func(id: string) -> result<string, string>;
+  provider-refresh-token: func(id: string, credentials-json: string) -> result<string, string>;
+  provider-get-api-key:   func(id: string, credentials-json: string) -> result<string, string>;
+  provider-modify-models: func(id: string, models-json: string, credentials-json: string) -> result<string, string>;
+  provider-stream-simple: func(id: string, stream-id: string, model-json: string, context-json: string, options-json: string) -> result<_, string>;
+
+  // --- global autocomplete provider stacking (Pi addAutocompleteProvider, types.ts:218) ---
+  // The host folds the guest's stacked `AutocompleteProviderFactory` chain over its own built-in
+  // suggestions: `base-json` is the built-in `autocomplete-suggestions` (the wrapped "current"),
+  // `query-json` carries `{lines, cursorLine, cursorCol, force}`. The guest returns the final
+  // suggestions after applying every stacked provider in registration order.
+  autocomplete-suggest:   func(base-json: string, query-json: string) -> string;
+
+  // --- guest tool execution (R-08-015) ---
+  // The host invokes a guest-registered tool. Mirrors Pi's ToolDefinition.execute
+  // (types.ts:464): `call-id` = toolCallId, `params-json` = arguments; cancellation (signal)
+  // is delivered by the host epoch/cancel; streaming updates go back via host-tool.emit-update;
+  // `ctx` is reconstructed guest-side from the capability imports.
+  execute-tool: func(name: string, call-id: string, params-json: string) -> result<tool-output, string>;
+
+  // --- guest slash-command execution (R-08-016) ---
+  // The host invokes a guest-registered command at COMMAND tier (session ops legal). `args` is the
+  // raw argument string (Pi RegisteredCommand.handler(args, ctx), types.ts:1109); the optional text
+  // result is surfaced to the user. `get-argument-completions` is Pi's dynamic getArgumentCompletions
+  // (types.ts:1108): given a prefix, the guest returns the completion items (replacing static lists).
+  execute-command:          func(name: string, args: string) -> result<option<string>, string>;
+  get-argument-completions: func(name: string, prefix: string) -> list<string>;
+
+  // --- message renderer dispatch (R-08-020; Pi renderCall/renderResult, types.ts:472-481) ---
+  // A guest that registered a renderer for `custom-type` renders a tool call / result into a
+  // serialized widget tree (none = fall back to the runtime's default renderer).
+  render-call:   func(custom-type: string, call-json: string) -> option<string>;
+  render-result: func(custom-type: string, result-json: string) -> option<string>;
+
+  // --- 5.4 tools — the mutating seams ---
+  // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
   on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
   on-tool-result:  func(call-id: string, name: string, content-json: string, is-error: bool) -> hook-outcome;
 
-  // 5.3 agent & turn / 5.6 provider — context + notify.
-  on-context:      func(messages-json: string) -> hook-outcome;
-  on-message-end:  func(message-json: string) -> hook-outcome;
-  on-before-agent-start: func(system-prompt: string, options-json: string) -> hook-outcome;
+  // --- 5.3 agent & turn ---
+  // context [mutate] (types.ts:1144), message_end [mutate] (types.ts:1143),
+  // before_agent_start [mutate] (types.ts:1135).
+  on-context:            func(messages-json: string) -> hook-outcome;
+  on-message-end:        func(message-json: string) -> hook-outcome;
+  on-before-agent-start: func(prompt: string, images-json: string, system-prompt: string, options-json: string) -> hook-outcome;
 
-  // notify-only (return ignored); high-frequency ones are subscription-gated.
+  // input [block/mutate/handled] (types.ts:1158), user_bash [block/mutate/handled] (types.ts:1159).
+  on-input:        func(text: string) -> hook-outcome;
+  on-user-bash:    func(command: string, operations-json: string) -> hook-outcome;
+
+  // --- 5.6 provider ---
+  // before_provider_request [mutate] (types.ts:1160), after_provider_response [notify] (types.ts:1161).
+  on-before-provider-request: func(payload-json: string) -> hook-outcome;
+  on-after-provider-response: func(status: u32, headers-json: string);
+
+  // model_select [notify] (types.ts:1162), thinking_level_select [notify] (types.ts:1163).
+  on-model-select:          func(model-json: string);
+  on-thinking-level-select: func(level: string);
+
+  // --- notify-only (return ignored); high-frequency ones are subscription-gated ---
   on-agent-start:           func();
   on-agent-end:             func(messages-json: string);
   on-turn-start:            func(turn-index: u32);
   on-turn-end:              func(turn-index: u32, message-json: string);
   on-message-start:         func(role: string);
   on-message-update:        func(delta-json: string);   // HIGH-FREQ, gated
-  on-tool-exec-start:       func(call-id: string, name: string);
+  on-tool-exec-start:       func(call-id: string, name: string, args-json: string);
   on-tool-exec-update:      func(call-id: string, chunk-json: string); // HIGH-FREQ, gated
   on-tool-exec-end:         func(call-id: string, result-json: string, is-error: bool);
+
+  // --- 5.1/5.2 startup & session lifecycle ---
   on-session-start:         func(reason: string);
   on-session-shutdown:      func(reason: string);
-  on-resources-discover:    func() -> hook-outcome;
-  on-project-trust:         func() -> hook-outcome;
+  on-resources-discover:    func() -> hook-outcome;   // provide skill/prompt/theme paths
+  on-project-trust:         func() -> hook-outcome;    // decide {trusted, remember}
+
+  // session control hooks (types.ts:1148-1156): before_* are block/mutate, the rest notify.
+  on-session-before-switch:  func(target-id: string) -> hook-outcome;
+  on-session-before-fork:    func(entry-id: string) -> hook-outcome;
+  on-session-before-compact: func() -> hook-outcome;
+  on-session-compact:        func(summary: string);
+  on-session-before-tree:    func() -> hook-outcome;
+  on-session-tree:           func(tree-json: string);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +184,10 @@ interface registration {
   register-provider:         func(id: string, config-json: string);
   unregister-provider:       func(id: string);
   register-message-renderer: func(custom-type: string);
-  add-autocomplete:          func();
+  add-autocomplete:          func(command: string);
+  // global autocomplete provider stacking (Pi addAutocompleteProvider, types.ts:218): records that
+  // the guest contributes one more stacked provider; the host folds them via `autocomplete-suggest`.
+  add-autocomplete-provider: func();
   // declares the subscription bitset: which §5 event kinds this guest handles.
   subscribe:                 func(event-kinds: list<u8>);
 }
@@ -99,21 +198,57 @@ interface registration {
 interface ui {
   notify:     func(message: string);
   set-status: func(message: string);
-  confirm:    func(prompt: string) -> bool;
-  input:      func(prompt: string) -> option<string>;
+  // `opts-json` is the Pi `ExtensionUIDialogOptions` bag (types.ts:89): `{timeoutMs, signal}` —
+  // a live-countdown timeout and/or a programmatic-dismiss signal id (none = `{}`).
+  confirm:    func(prompt: string, opts-json: string) -> bool;
+  input:      func(prompt: string, opts-json: string) -> option<string>;
+  // single-choice select over a json array of options; returns the chosen index.
+  select:     func(prompt: string, options-json: string, opts-json: string) -> option<u32>;
+  // multiline editor seeded with `initial`; returns the edited text (none = cancelled).
+  editor:     func(initial: string) -> option<string>;
+  set-widget: func(widget-json: string);
+
+  // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---
+  set-header: func(content: string);
+  set-footer: func(content: string);
+  set-title:  func(title: string);
+  // custom overlay component; returns an optional serialized result (Pi custom(), types.ts:175).
+  custom:     func(spec-json: string) -> option<string>;
+  // --- editor buffer access (Pi getEditorText/setEditorText/pasteEditorText, types.ts:200-230) ---
+  get-editor-text:   func() -> string;
+  set-editor-text:   func(text: string);
+  paste-editor-text: func(text: string);
+  // --- theme get/list/set (Pi getTheme/listThemes/setTheme, types.ts:240-260) ---
+  theme-get:  func() -> option<string>;
+  theme-list: func() -> string;          // json array of theme names
+  theme-set:  func(name: string) -> result<_, string>;
+  // --- working-indicator controls (Pi startWorking/stopWorking, types.ts:265-275) ---
+  working-start: func(label: string);
+  working-stop:  func();
+  // --- tools-expanded get/set (Pi getToolsExpanded/setToolsExpanded) ---
+  get-tools-expanded: func() -> bool;
+  set-tools-expanded: func(expanded: bool);
 }
 
 interface session {
   // read-only session view (arch-04) over the boundary.
   entries-json: func() -> string;
   branch-json:  func() -> string;
+  tree-json:    func() -> string;
+  // R-08-026 state persistence: append a non-LLM custom entry.
+  append-entry: func(custom-type: string, data-json: string) -> result<string, string>;
+  set-session-name: func(name: string);
+  get-session-name: func() -> option<string>;
+  set-label:        func(entry-id: string, label: string);
 }
 
 interface models {
-  list:          func() -> string;          // json array of model refs
-  current:       func() -> option<string>;
-  set-model:     func(model-json: string);  // COMMAND-only at the host
-  context-usage: func() -> string;
+  list-models:        func() -> string;          // json array of model refs
+  current:            func() -> option<string>;
+  set-model:          func(model-json: string);  // COMMAND-only at the host
+  context-usage:      func() -> string;
+  thinking-level:     func() -> option<string>;
+  set-thinking-level: func(level: string);       // COMMAND-only at the host
 }
 
 interface exec {
@@ -128,20 +263,60 @@ interface ext-fs {
 }
 
 interface bus {
+  // inter-extension event bus (R-08-029): emit a topic the host fans out to subscribers.
   emit: func(topic: string, payload-json: string);
+}
+
+// streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:467).
+interface host-tool {
+  emit-update: func(call-id: string, chunk-json: string);
+}
+
+// OAuth login callbacks (Pi `OAuthLoginCallbacks`, pi-ai oauth/types.ts): the host-side handlers a
+// guest's `login(callbacks)` flow drives during `provider-login`. The host renders the auth URL /
+// device code / prompts and returns the user's answers (the interactive half of `/login`).
+interface oauth {
+  on-auth:        func(url: string, instructions: option<string>);
+  on-device-code: func(user-code: string, verification-uri: string, interval-seconds: option<u32>, expires-in-seconds: option<u32>);
+  // prompt for a value (e.g. "Paste the callback URL"); err = cancelled.
+  on-prompt:      func(message: string, placeholder: option<string>, allow-empty: bool) -> result<string, string>;
+  on-progress:    func(message: string);
+  // interactive selector over a json array of {id,label}; returns the chosen id (none = cancel).
+  on-select:      func(message: string, options-json: string) -> option<string>;
+}
+
+// streamSimple output (Pi `createAssistantMessageEventStream`, types.ts:1373): the guest's custom
+// stream pushes assistant-message stream events keyed by `stream-id`; the host forwards them to the
+// provider pipeline (the streaming analog of `host-tool.emit-update`).
+interface provider-stream {
+  emit-event: func(stream-id: string, event-json: string);
+}
+
+// Active-tool / command introspection (Pi getActiveTools/getAllTools/setActiveTools/getCommands,
+// types.ts:1257-1266): the plan-mode active-tool restriction surface. `set-active-tools` is the only
+// mutating one; the host enforces the merge (arch-08 §3.5).
+interface ext-tools {
+  get-active-tools: func() -> string;   // json array of active tool names
+  get-all-tools:    func() -> string;   // json array of ToolInfo {name, source, parameters, …}
+  set-active-tools: func(names-json: string);
+  get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description}
 }
 
 // COMMAND-ONLY (arch-08 §6.3, deadlock rule): session/runtime mutation. Calling any of
 // these from an event handler returns a host-side deadlock error (surfaced, never a hang).
 interface control {
-  new-session:   func() -> result<_, string>;
-  switch:        func(session-id: string) -> result<_, string>;
-  fork:          func(entry-id: string) -> result<_, string>;
-  navigate:      func(entry-id: string) -> result<_, string>;
+  // opts-json carries the typed Pi option bags (newSession{parentSession,withSession},
+  // fork{position,withSession}, switchSession{withSession}, navigateTree{summarize,…}, types.ts:346-368).
+  new-session:   func(opts-json: string) -> result<_, string>;
+  switch:        func(session-id: string, opts-json: string) -> result<_, string>;
+  fork:          func(entry-id: string, opts-json: string) -> result<_, string>;
+  navigate:      func(entry-id: string, opts-json: string) -> result<_, string>;
   reload:        func() -> result<_, string>;
   compact:       func() -> result<_, string>;
   wait-idle:     func() -> result<_, string>;
-  send-message:  func(message-json: string) -> result<_, string>;
+  // send-message (types.ts:1223): opts-json carries {triggerTurn, deliverAs}.
+  send-message:      func(message-json: string, opts-json: string) -> result<_, string>;
+  send-user-message: func(content: string, opts-json: string) -> result<_, string>;
 }
 
 world extension {
@@ -152,6 +327,10 @@ world extension {
   import exec;
   import ext-fs;
   import bus;
+  import host-tool;
+  import oauth;
+  import provider-stream;
+  import ext-tools;
   import control;
 
   export events;

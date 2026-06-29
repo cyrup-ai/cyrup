@@ -31,11 +31,26 @@ pub enum EventKind {
     ToolExecEnd = 15,
     SessionStart = 16,
     SessionShutdown = 17,
+    // input / provider / model — mutating + notify (Pi types.ts:1158-1163)
+    Input = 18,
+    UserBash = 19,
+    BeforeProviderRequest = 20,
+    AfterProviderResponse = 21,
+    ModelSelect = 22,
+    ThinkingLevelSelect = 23,
+    // session control lifecycle (Pi types.ts:1148-1156)
+    SessionBeforeSwitch = 24,
+    SessionBeforeFork = 25,
+    SessionBeforeCompact = 26,
+    SessionCompact = 27,
+    SessionBeforeTree = 28,
+    SessionTree = 29,
 }
 
 impl EventKind {
-    /// The number of distinct kinds (must stay <= 64 for the bitset).
-    pub const COUNT: u8 = 18;
+    /// The number of distinct kinds (must stay <= 64 for the bitset). 1:1 with Pi's 30-event
+    /// catalog (extensions/types.ts:1133-1171).
+    pub const COUNT: u8 = 30;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -59,8 +74,57 @@ impl EventKind {
             15 => ToolExecEnd,
             16 => SessionStart,
             17 => SessionShutdown,
+            18 => Input,
+            19 => UserBash,
+            20 => BeforeProviderRequest,
+            21 => AfterProviderResponse,
+            22 => ModelSelect,
+            23 => ThinkingLevelSelect,
+            24 => SessionBeforeSwitch,
+            25 => SessionBeforeFork,
+            26 => SessionBeforeCompact,
+            27 => SessionCompact,
+            28 => SessionBeforeTree,
+            29 => SessionTree,
             _ => return None,
         })
+    }
+
+    /// The snake_case event name (Pi extensions/types.ts:1133-1171; used in `ExtensionError.event`).
+    pub fn name(&self) -> &'static str {
+        use EventKind::*;
+        match self {
+            ToolCall => "tool_call",
+            ToolResult => "tool_result",
+            Context => "context",
+            MessageEnd => "message_end",
+            BeforeAgentStart => "before_agent_start",
+            ResourcesDiscover => "resources_discover",
+            ProjectTrust => "project_trust",
+            AgentStart => "agent_start",
+            AgentEnd => "agent_end",
+            TurnStart => "turn_start",
+            TurnEnd => "turn_end",
+            MessageStart => "message_start",
+            MessageUpdate => "message_update",
+            ToolExecStart => "tool_execution_start",
+            ToolExecUpdate => "tool_execution_update",
+            ToolExecEnd => "tool_execution_end",
+            SessionStart => "session_start",
+            SessionShutdown => "session_shutdown",
+            Input => "input",
+            UserBash => "user_bash",
+            BeforeProviderRequest => "before_provider_request",
+            AfterProviderResponse => "after_provider_response",
+            ModelSelect => "model_select",
+            ThinkingLevelSelect => "thinking_level_select",
+            SessionBeforeSwitch => "session_before_switch",
+            SessionBeforeFork => "session_before_fork",
+            SessionBeforeCompact => "session_before_compact",
+            SessionCompact => "session_compact",
+            SessionBeforeTree => "session_before_tree",
+            SessionTree => "session_tree",
+        }
     }
 
     /// Map a notify-only `cyrup_agent::AgentEvent` to its kind (mutating kinds come via `Hooks`).
@@ -139,14 +203,24 @@ pub enum HostEvent {
     // 5.3 agent & turn — mutating + notify
     Context { messages: Vec<AgentMessage> },
     MessageEnd { message: Message },
-    BeforeAgentStart { system_prompt: String, options: Value },
+    /// `before_agent_start` (Pi types.ts:665): the user prompt + images + the (chainable)
+    /// system prompt and its options. A handler may inject a message and/or replace the prompt;
+    /// injected messages ACCUMULATE across handlers (Pi `runner.ts:980` `messages.push`).
+    BeforeAgentStart {
+        prompt: String,
+        images: Value,
+        system_prompt: String,
+        options: Value,
+        /// Messages injected by handlers so far (folded across the chain, R-08-011).
+        injected: Vec<Message>,
+    },
     AgentStart,
     AgentEnd { messages: Vec<AgentMessage> },
     TurnStart { turn_index: u32 },
     TurnEnd { turn_index: u32, message: AgentMessage, tool_results: Vec<ToolResultMessage> },
     MessageStart { role: String },
     MessageUpdate { delta: Value },
-    ToolExecStart { call_id: ToolCallId, name: String },
+    ToolExecStart { call_id: ToolCallId, name: String, args: Value },
     ToolExecUpdate { call_id: ToolCallId, chunk: Value },
     ToolExecEnd { call_id: ToolCallId, result: Value, is_error: bool },
     // 5.1/5.2 startup & session
@@ -154,6 +228,20 @@ pub enum HostEvent {
     SessionShutdown { reason: String },
     ResourcesDiscover,
     ProjectTrust,
+    // 5.5 input / 5.6 provider / model (Pi types.ts:1158-1163)
+    Input { text: String },
+    UserBash { command: String, operations: Value },
+    BeforeProviderRequest { payload: Value },
+    AfterProviderResponse { status: u32, headers: Value },
+    ModelSelect { model: Value },
+    ThinkingLevelSelect { level: String },
+    // session control lifecycle (Pi types.ts:1148-1156)
+    SessionBeforeSwitch { target_id: String },
+    SessionBeforeFork { entry_id: String },
+    SessionBeforeCompact,
+    SessionCompact { summary: String },
+    SessionBeforeTree,
+    SessionTree { tree: Value },
 }
 
 impl HostEvent {
@@ -178,6 +266,18 @@ impl HostEvent {
             HostEvent::SessionShutdown { .. } => K::SessionShutdown,
             HostEvent::ResourcesDiscover => K::ResourcesDiscover,
             HostEvent::ProjectTrust => K::ProjectTrust,
+            HostEvent::Input { .. } => K::Input,
+            HostEvent::UserBash { .. } => K::UserBash,
+            HostEvent::BeforeProviderRequest { .. } => K::BeforeProviderRequest,
+            HostEvent::AfterProviderResponse { .. } => K::AfterProviderResponse,
+            HostEvent::ModelSelect { .. } => K::ModelSelect,
+            HostEvent::ThinkingLevelSelect { .. } => K::ThinkingLevelSelect,
+            HostEvent::SessionBeforeSwitch { .. } => K::SessionBeforeSwitch,
+            HostEvent::SessionBeforeFork { .. } => K::SessionBeforeFork,
+            HostEvent::SessionBeforeCompact => K::SessionBeforeCompact,
+            HostEvent::SessionCompact { .. } => K::SessionCompact,
+            HostEvent::SessionBeforeTree => K::SessionBeforeTree,
+            HostEvent::SessionTree { .. } => K::SessionTree,
         }
     }
 
@@ -196,8 +296,12 @@ impl HostEvent {
             AgentEvent::MessageEnd { message } => {
                 HostEvent::MessageEnd { message: to_llm_message(message)? }
             }
-            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, .. } => {
-                HostEvent::ToolExecStart { call_id: tool_call_id.clone(), name: tool_name.clone() }
+            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+                HostEvent::ToolExecStart {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
+                }
             }
             AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
                 HostEvent::ToolExecUpdate {

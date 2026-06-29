@@ -17,10 +17,26 @@ use std::time::Duration;
 /// deadline (R-ARCH-EXT-012). A cooperatively-yielding runaway handler is preempted and skipped.
 const DEFAULT_INVOKE_BUDGET: Duration = Duration::from_secs(5);
 
+/// A contained extension fault, surfaced to registered error listeners (Pi `ExtensionError`,
+/// types.ts:1609; `extensionPath`/`event`/`error`). The host turns each skipped fault into one of
+/// these for UI surfacing / diagnostics (R-08-036).
+#[derive(Clone, Debug)]
+pub struct ExtensionError {
+    pub extension: cyrup_core::ExtensionId,
+    /// The event kind during which the fault occurred (`"tool_call"`, `"agent_start"`, …).
+    pub event: &'static str,
+    pub error: String,
+}
+
+/// A registered error listener (Pi `onError`). `Send + Sync` so it can be shared across the host.
+pub type ErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
+
 /// The subscription-gated, load-ordered dispatcher (arch-08 §3.1 / §6.1).
 pub struct Dispatcher {
     inner: RwLock<DispatchInner>,
     budget: Duration,
+    /// Error listeners notified when a guest fault is contained + skipped (Pi `onError`, R-08-036).
+    error_listeners: RwLock<Vec<ErrorListener>>,
 }
 
 #[derive(Default)]
@@ -39,11 +55,39 @@ impl Default for Dispatcher {
 
 impl Dispatcher {
     pub fn new() -> Self {
-        Self { inner: RwLock::new(DispatchInner::default()), budget: DEFAULT_INVOKE_BUDGET }
+        Self {
+            inner: RwLock::new(DispatchInner::default()),
+            budget: DEFAULT_INVOKE_BUDGET,
+            error_listeners: RwLock::new(Vec::new()),
+        }
     }
 
     pub fn with_budget(budget: Duration) -> Self {
-        Self { inner: RwLock::new(DispatchInner::default()), budget }
+        Self {
+            inner: RwLock::new(DispatchInner::default()),
+            budget,
+            error_listeners: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register an error listener (Pi `onError`, types.ts:1609): notified with a typed
+    /// [`ExtensionError`] each time a guest fault is contained and the handler skipped (R-08-036).
+    pub fn add_error_listener(&self, listener: ErrorListener) {
+        if let Ok(mut g) = self.error_listeners.write() {
+            g.push(listener);
+        }
+    }
+
+    /// Surface a contained fault to every registered listener + tracing (never propagates).
+    fn report(&self, event: &'static str, id: &cyrup_core::ExtensionId, err: &ExtError) {
+        tracing::warn!(extension = %id, event, error = %err, "extension call contained (skipped)");
+        let payload =
+            ExtensionError { extension: id.clone(), event, error: err.to_string() };
+        if let Ok(g) = self.error_listeners.read() {
+            for l in g.iter() {
+                l(&payload);
+            }
+        }
     }
 
     /// Add an extension at the end of the load order and fold its subscriptions into the aggregate.
@@ -51,6 +95,14 @@ impl Dispatcher {
         let mut g = self.lock_write()?;
         g.aggregate = g.aggregate.union(*ext.subscriptions());
         g.exts.push(ext);
+        Ok(())
+    }
+
+    /// Drop every loaded extension and reset the aggregate gate (hot-reload, R-08-005). After this
+    /// the dispatcher has no subscribers; the loader re-adds the freshly-discovered set.
+    pub fn clear(&self) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        *g = DispatchInner::default();
         Ok(())
     }
 
@@ -88,9 +140,34 @@ impl Dispatcher {
         for ext in self.subscribers_for(kind) {
             // Fault-contained: an error is reported and skipped (R-08-036).
             if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
-                report(ext.id(), &e);
+                self.report(kind.name(), ext.id(), &e);
             }
         }
+    }
+
+    /// Collect EVERY subscribed extension's `handled` contribution for a discovery/aggregation event
+    /// (Pi `resources_discover`/`project_trust`, runner.ts:197/1046). Unlike `dispatch_block_mutate`
+    /// this does NOT short-circuit on the first `Handled`: it runs all subscribers in load order and
+    /// returns each `(extension, value)` so the caller can fold them into a typed decision/aggregate
+    /// (gap-08 #4). Faults are contained + skipped (R-08-036).
+    pub async fn dispatch_collect_handled(
+        &self,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Vec<(cyrup_core::ExtensionId, HandledValue)> {
+        let kind = ev.kind();
+        let mut out = Vec::new();
+        if self.no_subscribers(kind) {
+            return out;
+        }
+        for ext in self.subscribers_for(kind) {
+            match self.invoke_contained(&ext, ev, cancel).await {
+                Ok(HookOutcome::Handled(v)) => out.push((ext.id().clone(), v)),
+                Ok(_) => {}
+                Err(e) => self.report(kind.name(), ext.id(), &e),
+            }
+        }
+        out
     }
 
     /// Subscription-gated, load-ordered block/mutate chaining (arch-08 §6.1). First `Block` wins;
@@ -110,7 +187,7 @@ impl Dispatcher {
                 // A faulting hook degrades to no-mutation (the action proceeds) + a surfaced
                 // warning (arch-08 §8). Never aborts the chain, never crashes the host.
                 Err(e) => {
-                    report(ext.id(), &e);
+                    self.report(kind.name(), ext.id(), &e);
                     continue;
                 }
             };
@@ -149,9 +226,4 @@ impl Dispatcher {
     fn lock_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, DispatchInner>, ExtError> {
         self.inner.write().map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
     }
-}
-
-/// Surface a contained fault. Diagnostics only (off by default, R-00-001) — never propagates.
-fn report(id: &cyrup_core::ExtensionId, err: &ExtError) {
-    tracing::warn!(extension = %id, error = %err, "extension call contained (skipped)");
 }

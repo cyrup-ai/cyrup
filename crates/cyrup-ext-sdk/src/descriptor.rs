@@ -2,18 +2,29 @@
 //! host-side registration records; `parameters` stays JSON-Schema (Pi-interop, R-ARCH-EXT-008).
 //! camelCase per arch-00 §4.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Per-tool execution mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ExecMode {
     Parallel,
     Sequential,
 }
 
-/// What a guest sends to register a tool (R-08-012/013).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// How a tool's execution row is framed (Pi `ToolDefinition.renderShell`, types.ts:448-449).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderShell {
+    #[default]
+    Default,
+    #[serde(rename = "self")]
+    SelfRendered,
+}
+
+/// What a guest sends to register a tool (R-08-012/013; Pi `ToolDefinition`, types.ts:435-482).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
     pub name: String,
@@ -29,6 +40,13 @@ pub struct ToolDescriptor {
     pub prompt_guidelines: Vec<String>,
     #[serde(default)]
     pub has_renderer: bool,
+    /// `renderShell` (types.ts:449): runtime-drawn shell vs. self-rendered.
+    #[serde(default)]
+    pub render_shell: RenderShell,
+    /// Whether the tool supplies a `prepareArguments` shim (types.ts:452); the host coerces args
+    /// before validation when set.
+    #[serde(default)]
+    pub prepare_arguments: bool,
 }
 
 impl ToolDescriptor {
@@ -44,6 +62,8 @@ impl ToolDescriptor {
             prompt_snippet: None,
             prompt_guidelines: Vec::new(),
             has_renderer: false,
+            render_shell: RenderShell::Default,
+            prepare_arguments: false,
         }
     }
 
@@ -52,17 +72,185 @@ impl ToolDescriptor {
         self
     }
 
+    pub fn label(mut self, l: impl Into<String>) -> Self {
+        self.label = l.into();
+        self
+    }
+
     pub fn prompt_snippet(mut self, s: impl Into<String>) -> Self {
         self.prompt_snippet = Some(s.into());
         self
     }
+
+    pub fn execution_mode(mut self, m: ExecMode) -> Self {
+        self.execution_mode = Some(m);
+        self
+    }
 }
 
-/// What a guest sends to register a command (R-08-016).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// What a guest sends to register a command (R-08-016; Pi types.ts:1105-1111).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandDescriptor {
     pub description: String,
+    /// Static completions; dynamic completions use the command handler's `getArgumentCompletions`.
     #[serde(default)]
     pub completions: Vec<String>,
+}
+
+impl CommandDescriptor {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self { description: description.into(), completions: Vec::new() }
+    }
+}
+
+/// Options for [`crate::Ctx::exec`] (Pi `ExecOptions`, types.ts:1254).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// UI dialog options for `confirm`/`input`/`select` (Pi `ExtensionUIDialogOptions`, types.ts:89;
+/// sdk gap #4): a live-countdown `timeout_ms` and/or a programmatic-dismiss `signal_id` (the host
+/// maps the id to an abort token). Both optional; the default `{}` is an indefinite dialog.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DialogOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_id: Option<String>,
+}
+
+impl DialogOptions {
+    /// A dialog that auto-dismisses after `ms` with a live countdown (Pi `{timeout}`).
+    pub fn timeout(ms: u64) -> Self {
+        Self { timeout_ms: Some(ms), signal_id: None }
+    }
+    /// A dialog dismissible via the named programmatic signal (Pi `{signal}`).
+    pub fn signal(id: impl Into<String>) -> Self {
+        Self { timeout_ms: None, signal_id: Some(id.into()) }
+    }
+}
+
+/// CLI flag spec (Pi `registerFlag`, types.ts:1199-1209).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlagSpec {
+    /// `"boolean"` | `"string"`.
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default)]
+    pub description: String,
+}
+
+// --- Provider registration (Pi `ProviderConfig`, types.ts:1363-1421; R-08-019) ---
+
+/// A custom LLM provider configuration registered via `register_provider`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// The wire API family (e.g. `"anthropic"`, `"openai"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// API key, supporting Pi's env interpolation / `!command` resolution (resolved host-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub models: Vec<ProviderModelConfig>,
+    /// OAuth metadata (`{name}`): a static marker that this provider authenticates via OAuth. The
+    /// dynamic `login`/`refreshToken`/`getApiKey`/`modifyModels` callbacks live guest-side in
+    /// [`crate::ProviderHandlers`] and are invoked across the `provider-*` exports (sdk gap #1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<Value>,
+    /// Whether the guest supplied a custom `streamSimple` handler (drives the host to invoke the
+    /// `provider-stream-simple` export rather than a built-in API stream).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_stream_simple: bool,
+}
+
+/// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1396).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+// --- Command-tier option bags (Pi `ExtensionCommandContext`, types.ts:339-390; sdk gap #5) ---
+
+/// Where a [`crate::CommandCtx::fork_with`] inserts (Pi `fork({position})`, types.ts:355).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForkPosition {
+    /// Fork the session BEFORE the entry (the entry is excluded).
+    Before,
+    /// Fork AT the entry (the entry is included).
+    #[default]
+    At,
+}
+
+/// Options for `fork` (Pi types.ts:355). `with_session` requests the host re-bind the new session
+/// and invoke the guest `with-session` re-binding callback after the switch (the `ReplacedSessionContext`
+/// flow, types.ts:382).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<ForkPosition>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_session: bool,
+}
+
+/// Options for `navigateTree` (Pi types.ts:362): summarize the skipped span, with custom/replacement
+/// instructions and an optional label.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigateOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summarize: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_instructions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Options for `newSession` (Pi types.ts:346): an optional parent session + the `with_session`
+/// re-binding request (the `setup`/`withSession` closures map to the host re-binding flow).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSessionOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_session: bool,
+}
+
+/// Options for `switchSession` (Pi types.ts:368): the `with_session` re-binding request.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchSessionOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_session: bool,
 }

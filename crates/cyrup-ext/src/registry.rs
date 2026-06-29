@@ -3,6 +3,7 @@
 //! of the same name (R-08-012); the merged active set is handed to the agent each run (R-08-014).
 
 use crate::error::ExtError;
+use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration};
 use cyrup_core::{ExecMode, ExtensionId, Tool};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -88,7 +89,14 @@ struct RegistryInner {
     commands: HashMap<String, (ExtensionId, CommandDescriptor)>,
     shortcuts: HashMap<String, ExtensionId>,
     flags: HashMap<String, Value>,
-    providers: HashMap<String, (ExtensionId, Value)>,
+    /// Custom-provider registrations: typed, api-key-resolved, deferred→bind→flush (A-08-7).
+    provider_hub: ProviderHub,
+    /// Which extension owns each provider id (for diagnostics / unload).
+    provider_owner: HashMap<String, ExtensionId>,
+    /// Guest (WASM) tool descriptors keyed by name. A guest tool executes back across the boundary
+    /// (gap-08 #28), so it is held as a descriptor here rather than as an `Arc<dyn Tool>`.
+    guest_tool_order: Vec<String>,
+    guest_tools: HashMap<String, (ExtensionId, ToolDescriptor)>,
 }
 
 impl ExtensionRegistry {
@@ -107,6 +115,86 @@ impl ExtensionRegistry {
         g.tool_owner.insert(name.clone(), owner);
         g.tools.insert(name, tool);
         Ok(())
+    }
+
+    /// Register a guest (WASM) tool by descriptor (R-08-012). Last insert wins (override); insertion
+    /// order is preserved for stable active-set surfacing.
+    pub fn register_guest_tool(
+        &self,
+        owner: ExtensionId,
+        desc: ToolDescriptor,
+    ) -> Result<(), ExtError> {
+        desc.validate()?;
+        let name = desc.name.clone();
+        let mut g = self.lock_write()?;
+        if !g.guest_tools.contains_key(&name) {
+            g.guest_tool_order.push(name.clone());
+        }
+        g.guest_tools.insert(name, (owner, desc));
+        Ok(())
+    }
+
+    /// All registered tool names with Pi's **first-registration-wins** ordering (`getAllRegisteredTools`,
+    /// runner.ts:417; gap-08 #7). `tool_order`/`guest_tool_order` are both first-insert order (a later
+    /// override updates the value but keeps the original position), so the union — extension tools
+    /// then guest-only tools, de-duplicated first-wins — is exactly Pi's getter order. (Execution
+    /// still resolves last-wins via the `tools` map; only the *getter* is first-wins.)
+    pub fn all_registered_tool_names(&self) -> Result<Vec<String>, ExtError> {
+        let g = self.lock_read()?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for n in g.tool_order.iter().chain(g.guest_tool_order.iter()) {
+            if seen.insert(n.as_str()) {
+                out.push(n.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, types.ts:1260): name + source +
+    /// parameter schema. First-registration-wins order (matches [`Self::all_registered_tool_names`]).
+    pub fn tool_info(&self) -> Result<Vec<Value>, ExtError> {
+        let g = self.lock_read()?;
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for n in &g.tool_order {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if let Some(t) = g.tools.get(n) {
+                out.push(serde_json::json!({
+                    "name": t.name(),
+                    "source": "extension",
+                    "description": t.description(),
+                    "parameters": t.parameters(),
+                }));
+            }
+        }
+        for n in &g.guest_tool_order {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if let Some((_, d)) = g.guest_tools.get(n) {
+                out.push(serde_json::json!({
+                    "name": d.name,
+                    "source": "guest",
+                    "description": d.description,
+                    "parameters": d.parameters,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// All guest tool descriptors in registration order.
+    pub fn guest_tool_descriptors(&self) -> Result<Vec<ToolDescriptor>, ExtError> {
+        let g = self.lock_read()?;
+        Ok(g.guest_tool_order.iter().filter_map(|n| g.guest_tools.get(n).map(|(_, d)| d.clone())).collect())
+    }
+
+    /// Whether a guest tool with this name is registered.
+    pub fn has_guest_tool(&self, name: &str) -> Result<bool, ExtError> {
+        Ok(self.lock_read()?.guest_tools.contains_key(name))
     }
 
     pub fn register_command(
@@ -136,20 +224,43 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.shortcuts.keys().cloned().collect())
     }
 
+    /// Register a custom LLM provider (R-08-019; A-08-7). Parses the typed config, resolves the API
+    /// key (env / `!command` / literal), and routes it through the [`ProviderHub`] (immediate upsert
+    /// if the model registry is bound, else queued for the next bind). A parse/resolution failure is
+    /// surfaced as a typed error, never a panic.
     pub fn register_provider(
         &self,
         owner: ExtensionId,
         id: impl Into<String>,
         config: Value,
     ) -> Result<(), ExtError> {
+        let id = id.into();
         let mut g = self.lock_write()?;
-        g.providers.insert(id.into(), (owner, config));
+        g.provider_hub.register(id.clone(), &config).map_err(ExtError::Component)?;
+        g.provider_owner.insert(id, owner);
         Ok(())
     }
 
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
         let mut g = self.lock_write()?;
-        Ok(g.providers.remove(id).is_some())
+        g.provider_owner.remove(id);
+        Ok(g.provider_hub.unregister(id))
+    }
+
+    /// Bind the model-registry sink and flush queued provider registrations (Pi `bindCore`).
+    pub fn bind_model_registry(&self, sink: Arc<dyn ModelRegistrySink>) -> Result<(), ExtError> {
+        self.lock_write()?.provider_hub.bind(sink);
+        Ok(())
+    }
+
+    /// Provider ids still queued for the next [`Self::bind_model_registry`] (not yet flushed).
+    pub fn provider_pending_ids(&self) -> Result<Vec<String>, ExtError> {
+        Ok(self.lock_read()?.provider_hub.pending_ids().to_vec())
+    }
+
+    /// A resolved provider registration by id (typed config + resolved api key).
+    pub fn provider_registration(&self, id: &str) -> Result<Option<ProviderRegistration>, ExtError> {
+        Ok(self.lock_read()?.provider_hub.get(id).cloned())
     }
 
     pub fn set_flag(&self, name: impl Into<String>, spec: Value) -> Result<(), ExtError> {
@@ -177,8 +288,25 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.commands.contains_key(name))
     }
 
+    /// The extension that owns a registered command (for slash-command routing, R-08-016).
+    pub fn command_owner(&self, name: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.commands.get(name).map(|(owner, _)| owner.clone()))
+    }
+
+    /// All registered command names (diagnostics / `getCommands`).
+    pub fn command_names(&self) -> Result<Vec<String>, ExtError> {
+        Ok(self.lock_read()?.commands.keys().cloned().collect())
+    }
+
+    /// Drop every registration (hot-reload cache-bust, R-08-005). The dispatcher is reset separately.
+    pub fn clear(&self) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        *g = RegistryInner::default();
+        Ok(())
+    }
+
     pub fn provider_ids(&self) -> Result<Vec<String>, ExtError> {
-        Ok(self.lock_read()?.providers.keys().cloned().collect())
+        Ok(self.lock_read()?.provider_hub.ids())
     }
 
     /// Merge a base tool set (built-ins) with extension tools; extension tools override by name

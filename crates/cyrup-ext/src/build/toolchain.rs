@@ -24,6 +24,14 @@ impl ToolchainStatus {
         matches!(self, ToolchainStatus::Ready)
     }
 
+    /// Whether a Tier-1 `cargo build` can proceed (R-08-031). The `wasm32-wasip2` linker
+    /// componentizes directly, so a build needs only `cargo` + the target; the optional
+    /// componentization tooling (`wasm-tools`/`cargo-component`) is for validation/inspection and
+    /// must NOT gate the build (gap-08 #6: "not environment-blocked").
+    pub fn can_build(&self) -> bool {
+        matches!(self, ToolchainStatus::Ready | ToolchainStatus::NoComponentTooling)
+    }
+
     /// An actionable, user-facing message for a missing-toolchain condition (R-ARCH-EXT-015).
     pub fn actionable(&self) -> Option<String> {
         match self {
@@ -112,6 +120,18 @@ pub fn require_ready(tc: &Toolchain) -> Result<(), ExtError> {
     } else {
         Err(ExtError::Toolchain(
             tc.status.actionable().unwrap_or_else(|| "toolchain not ready".into()),
+        ))
+    }
+}
+
+/// Guard used by [`crate::build::build_component`]: a build only needs `cargo` + the `wasm32-wasip2`
+/// target (the linker componentizes directly). Missing optional component tooling does NOT gate.
+pub fn require_buildable(tc: &Toolchain) -> Result<(), ExtError> {
+    if tc.status.can_build() {
+        Ok(())
+    } else {
+        Err(ExtError::Toolchain(
+            tc.status.actionable().unwrap_or_else(|| "toolchain cannot build".into()),
         ))
     }
 }

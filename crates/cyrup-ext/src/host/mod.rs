@@ -11,6 +11,8 @@ pub mod engine;
 pub mod epoch;
 pub mod instance;
 pub mod limits;
+pub mod live;
+pub mod services;
 pub mod store_state;
 pub mod testkit;
 
@@ -18,4 +20,9 @@ pub use engine::{build_engine, build_engine_on_demand, map_wasm_error};
 pub use epoch::EpochDriver;
 pub use instance::{InstancePool, WasmExtension};
 pub use limits::StoreLimits;
+pub use live::{LiveExtension, WasmTool};
+pub use services::{
+    CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
+    HostServices, OAuthEvent, RecordingServices, UiChrome,
+};
 pub use store_state::HostState;
