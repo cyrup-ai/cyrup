@@ -1,0 +1,209 @@
+//! The built-in provider registry — the L1 aggregator (1:1 port of Pi
+//! `packages/ai/src/providers/all.ts`, `builtinProviders()` / `builtinModels()`).
+//!
+//! Pi's `all.ts` constructs EVERY built-in provider ([`all.ts:70-108`]) and registers each into a
+//! `Models` collection ([`all.ts:111-117`]); the model pattern then resolves to the owning provider.
+//! This module mirrors that for the providers actually implemented in this crate today.
+//!
+//! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:71-107`):
+//!
+//! | Pi line | provider id              | here                                   |
+//! |---------|--------------------------|----------------------------------------|
+//! | 72      | `amazon-bedrock`         | **pending** (bedrock-converse-stream)  |
+//! | 73      | `ant-ling`               | ✓ fleet                                |
+//! | 74      | `anthropic`              | ✓                                      |
+//! | 75      | `azure-openai-responses` | ✓                                      |
+//! | 76      | `cerebras`               | ✓ fleet                                |
+//! | 77      | `cloudflare-ai-gateway`  | ✓                                      |
+//! | 78      | `cloudflare-workers-ai`  | ✓                                      |
+//! | 79      | `deepseek`               | ✓ fleet                                |
+//! | 80      | `fireworks`              | ✓                                      |
+//! | 81      | `github-copilot`         | **pending** (oauth/device flow)        |
+//! | 82      | `google`                 | ✓                                      |
+//! | 83      | `google-vertex`          | **pending** (vertex auth)              |
+//! | 84      | `groq`                   | ✓ fleet                                |
+//! | 85      | `huggingface`            | ✓ fleet                                |
+//! | 86      | `kimi-coding`            | ✓ anthropic-compat fleet               |
+//! | 87      | `minimax`                | ✓ anthropic-compat fleet               |
+//! | 88      | `minimax-cn`             | ✓ anthropic-compat fleet               |
+//! | 89      | `mistral`                | ✓                                      |
+//! | 90      | `moonshotai`             | ✓ fleet                                |
+//! | 91      | `moonshotai-cn`          | ✓ fleet                                |
+//! | 92      | `nvidia`                 | ✓ fleet                                |
+//! | 93      | `openai`                 | ✓                                      |
+//! | 94      | `openai-codex`           | **pending** (codex oauth)              |
+//! | 95      | `opencode`               | ✓                                      |
+//! | 96      | `opencode-go`            | ✓                                      |
+//! | 97      | `openrouter`             | ✓ fleet                                |
+//! | 98      | `together`               | ✓                                      |
+//! | 99      | `vercel-ai-gateway`      | ✓ anthropic-compat fleet               |
+//! | 100     | `xai`                    | ✓ fleet                                |
+//! | 101     | `xiaomi`                 | ✓ fleet                                |
+//! | 102-104 | `xiaomi-token-plan-*`    | ✓ fleet                                |
+//! | 105     | `zai`                    | ✓ fleet                                |
+//! | 106     | `zai-coding-cn`          | ✓ fleet                                |
+//!
+//! Pending (NOT registered — no fabrication, they slot in when their auth/wire lands):
+//! `amazon-bedrock`, `github-copilot`, `google-vertex`, `openai-codex`.
+//!
+//! Provider ids are unique, so the [`Models`] collection holds them in a `BTreeMap`; the `Vec`
+//! ordering returned by [`all_providers`] is therefore informational only (grouped by constructor
+//! for clarity) — resolution is by id, not by position.
+
+use crate::api::{builtin_registry, ApiRegistry};
+use crate::auth::{CredentialStore, InMemoryCredentialStore};
+use crate::collection::{create_models, CreateModelsOptions, Models};
+use crate::provider::Provider;
+use crate::providers::anthropic::anthropic_fleet_providers_with;
+use crate::providers::fleet::fleet_providers_with;
+use crate::providers::{
+    anthropic_provider_with, azure_openai_responses_provider_with,
+    cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
+    fireworks_provider_with, google_provider_with, mistral_provider_with, opencode_go_provider_with,
+    opencode_provider_with, openai_provider_with, together_provider_with,
+};
+use std::sync::Arc;
+
+/// Every built-in provider that is implemented in this crate, freshly constructed over a shared
+/// credential store + the built-in api registry (Pi `builtinProviders()`, `all.ts:70-108`).
+///
+/// The store defaults to an empty in-memory store and each [`crate::wire::WireProvider`] defaults to
+/// the real-env auth context, so env API keys resolve when the provider is streamed directly.
+pub fn all_providers() -> Vec<Arc<dyn Provider>> {
+    all_providers_with(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+    )
+}
+
+/// [`all_providers`] over an explicit credential store + shared api registry — so the whole registry
+/// shares one catalog-parsing api registry (Pi constructs each provider fresh; we additionally share
+/// the registry/store for cost).
+pub fn all_providers_with(
+    store: Arc<dyn CredentialStore>,
+    registry: Arc<ApiRegistry>,
+) -> Vec<Arc<dyn Provider>> {
+    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
+
+    // openai-completions fleet: ant-ling, cerebras, deepseek, groq, huggingface, moonshotai,
+    // moonshotai-cn, nvidia, openrouter, xai, xiaomi, xiaomi-token-plan-{ams,cn,sgp}, zai,
+    // zai-coding-cn (Pi `all.ts` lines 73,76,79,84,85,90,91,92,97,100,101,102-104,105,106).
+    for p in fleet_providers_with(store.clone(), registry.clone()) {
+        providers.push(Arc::new(p));
+    }
+
+    // anthropic (Pi `all.ts:74`).
+    providers.push(Arc::new(anthropic_provider_with(store.clone(), registry.clone())));
+
+    // azure-openai-responses (Pi `all.ts:75`).
+    providers.push(Arc::new(azure_openai_responses_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+
+    // cloudflare-ai-gateway / cloudflare-workers-ai (Pi `all.ts:77-78`).
+    providers.push(Arc::new(cloudflare_ai_gateway_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(cloudflare_workers_ai_provider_with(store.clone(), registry.clone())));
+
+    // fireworks (Pi `all.ts:80`).
+    providers.push(Arc::new(fireworks_provider_with(store.clone(), registry.clone())));
+
+    // google (Pi `all.ts:82`).
+    providers.push(Arc::new(google_provider_with(store.clone(), registry.clone())));
+
+    // anthropic-compatible fleet: kimi-coding, minimax, minimax-cn, vercel-ai-gateway
+    // (Pi `all.ts` lines 86,87,88,99).
+    for p in anthropic_fleet_providers_with(store.clone(), registry.clone()) {
+        providers.push(Arc::new(p));
+    }
+
+    // mistral (Pi `all.ts:89`).
+    providers.push(Arc::new(mistral_provider_with(store.clone(), registry.clone())));
+
+    // openai (Pi `all.ts:93`).
+    providers.push(Arc::new(openai_provider_with(store.clone(), registry.clone())));
+
+    // opencode / opencode-go (Pi `all.ts:95-96`).
+    providers.push(Arc::new(opencode_provider_with(store.clone(), registry.clone())));
+    providers.push(Arc::new(opencode_go_provider_with(store.clone(), registry.clone())));
+
+    // together (Pi `all.ts:98`).
+    providers.push(Arc::new(together_provider_with(store, registry)));
+
+    providers
+}
+
+/// A [`Models`] collection with every implemented built-in provider registered (Pi `builtinModels`,
+/// `all.ts:111-117`). Takes the same [`CreateModelsOptions`] as [`create_models`]; the default
+/// (`CreateModelsOptions::default()`) uses the env-backed auth context so env API keys resolve.
+pub fn default_models(options: CreateModelsOptions) -> Models {
+    let mut models = create_models(options);
+    for provider in all_providers() {
+        models.set_provider(provider);
+    }
+    models
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// The registry must contain every implemented built-in id and none of the pending ones.
+    #[test]
+    fn registry_contains_implemented_provider_ids() {
+        let models = default_models(CreateModelsOptions::default());
+        let ids: Vec<String> =
+            models.get_providers().iter().map(|p| p.id().as_str().to_string()).collect();
+
+        // A representative cross-section of every constructor group.
+        for expected in [
+            "together",
+            "anthropic",
+            "google",
+            "openai",
+            "mistral",
+            "opencode",
+            "opencode-go",
+            "azure-openai-responses",
+            "cloudflare-ai-gateway",
+            "cloudflare-workers-ai",
+            "fireworks",
+            // openai-completions fleet
+            "groq",
+            "xai",
+            "deepseek",
+            "openrouter",
+            "moonshotai",
+            // anthropic-compatible fleet
+            "kimi-coding",
+            "minimax",
+            "vercel-ai-gateway",
+        ] {
+            assert!(ids.iter().any(|id| id == expected), "missing built-in provider '{expected}'");
+        }
+
+        // Pending providers are intentionally NOT registered (no fabrication).
+        for pending in ["amazon-bedrock", "github-copilot", "google-vertex", "openai-codex"] {
+            assert!(!ids.iter().any(|id| id == pending), "pending provider '{pending}' must not be registered");
+        }
+
+        // The count matches what `all_providers()` returns and has no duplicate ids.
+        assert_eq!(ids.len(), all_providers().len());
+    }
+
+    /// Together's `moonshotai/Kimi-K2.6` resolves through the registry to the together provider.
+    #[test]
+    fn together_kimi_k2_6_resolves_through_registry() {
+        let models = default_models(CreateModelsOptions::default());
+
+        let together = models.get_provider("together").expect("together provider registered");
+        assert_eq!(together.id().as_str(), "together");
+
+        let kimi = models
+            .get_model("together", "moonshotai/Kimi-K2.6")
+            .expect("Kimi-K2.6 resolvable via the together provider catalog");
+        assert_eq!(kimi.provider.as_str(), "together");
+        assert_eq!(kimi.id.as_str(), "moonshotai/Kimi-K2.6");
+    }
+}

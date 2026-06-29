@@ -85,6 +85,7 @@ pub use collection::{
     clamp_thinking_level, create_models, get_supported_thinking_levels, has_api, models_are_equal,
     CreateModelsOptions, Models, EXTENDED_THINKING_LEVELS,
 };
+pub use providers::all::{all_providers, all_providers_with, default_models};
 pub use env_api_keys::{
     api_key_env_vars, find_env_keys, get_env_api_key, get_provider_env_value, AUTHENTICATED_SENTINEL,
 };
