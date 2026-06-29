@@ -14,16 +14,55 @@ use crate::key::ResourceKey;
 use crate::scope::{ResourceOrigin, ResourceScope};
 
 /// Parsed theme JSON (shape per Pi's `theme-schema.json`: name/vars/colors/export).
+///
+/// Color values may be hex strings, var references, **or 256-color integer indices** (0-255,
+/// theme.ts:23-28). Integer values are mapped to their truecolor RGB via the standard xterm-256
+/// palette at parse time and stored as `#rrggbb`, so downstream consumers see a uniform string map.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeData {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_color_map")]
     pub vars: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_color_map")]
     pub colors: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_color_map")]
     pub export: std::collections::BTreeMap<String, String>,
+}
+
+/// A raw theme color value: a string (hex / var-ref / "") or a 256-color integer index.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ColorValueRaw {
+    Int(i64),
+    Str(String),
+}
+
+/// Deserialize a color map accepting string or integer values (theme.ts ColorValueSchema). Integer
+/// indices 0-255 are converted to `#rrggbb` via the xterm-256 palette; out-of-range integers become
+/// the empty (inherit) value.
+fn de_color_map<'de, D>(
+    de: D,
+) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: std::collections::BTreeMap<String, ColorValueRaw> =
+        serde::Deserialize::deserialize(de)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let s = match v {
+                ColorValueRaw::Str(s) => s,
+                ColorValueRaw::Int(n) if (0..=255).contains(&n) => {
+                    let (r, g, b) = index_to_rgb(n as u8);
+                    format!("#{r:02x}{g:02x}{b:02x}")
+                }
+                ColorValueRaw::Int(_) => String::new(),
+            };
+            (k, s)
+        })
+        .collect())
 }
 
 /// A discovered theme: parsed data plus discovery provenance.
@@ -38,8 +77,9 @@ pub struct Theme {
 }
 
 /// A color role resolved through `vars`. `""` / unknown means inherit (terminal default).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ColorSpec {
+    #[default]
     Inherit,
     Rgb { r: u8, g: u8, b: u8 },
 }
@@ -48,6 +88,81 @@ pub enum ColorSpec {
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedTheme {
     pub roles: std::collections::BTreeMap<String, ColorSpec>,
+}
+
+/// The fixed set of required `colors` tokens every theme must define (theme.ts:34-93).
+///
+/// Pi compiles `colors` as a closed `Type.Object` of these ~51 keys; a theme that omits any of
+/// them fails validation with a precise "Missing required color tokens" error (theme.ts:514-548).
+/// Order here matches the schema declaration (Core UI → Backgrounds/Content → Markdown → Tool
+/// Diffs → Syntax → Thinking borders → Bash mode).
+pub const REQUIRED_COLOR_TOKENS: [&str; 51] = [
+    // Core UI
+    "accent",
+    "border",
+    "borderAccent",
+    "borderMuted",
+    "success",
+    "error",
+    "warning",
+    "muted",
+    "dim",
+    "text",
+    "thinkingText",
+    // Backgrounds & Content Text
+    "selectedBg",
+    "userMessageBg",
+    "userMessageText",
+    "customMessageBg",
+    "customMessageText",
+    "customMessageLabel",
+    "toolPendingBg",
+    "toolSuccessBg",
+    "toolErrorBg",
+    "toolTitle",
+    "toolOutput",
+    // Markdown
+    "mdHeading",
+    "mdLink",
+    "mdLinkUrl",
+    "mdCode",
+    "mdCodeBlock",
+    "mdCodeBlockBorder",
+    "mdQuote",
+    "mdQuoteBorder",
+    "mdHr",
+    "mdListBullet",
+    // Tool Diffs
+    "toolDiffAdded",
+    "toolDiffRemoved",
+    "toolDiffContext",
+    // Syntax Highlighting
+    "syntaxComment",
+    "syntaxKeyword",
+    "syntaxFunction",
+    "syntaxVariable",
+    "syntaxString",
+    "syntaxNumber",
+    "syntaxType",
+    "syntaxOperator",
+    "syntaxPunctuation",
+    // Thinking Level Borders
+    "thinkingOff",
+    "thinkingMinimal",
+    "thinkingLow",
+    "thinkingMedium",
+    "thinkingHigh",
+    "thinkingXhigh",
+    // Bash Mode
+    "bashMode",
+];
+
+/// The three typed export colors (HTML export, theme.ts:94-100), resolved through `vars`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportColors {
+    pub page_bg: ColorSpec,
+    pub card_bg: ColorSpec,
+    pub info_bg: ColorSpec,
 }
 
 impl Theme {
@@ -63,6 +178,45 @@ impl Theme {
                 path: path.clone().unwrap_or_default(),
                 reason: e.to_string(),
             })?;
+        // Validate the fixed `colors` schema: every required token must be present. Pi rejects a
+        // theme that omits any token with a precise, sorted "Missing required color tokens" error
+        // (theme.ts:514-548). Validation runs before the name check, matching Pi's order
+        // (parseThemeJson → assertThemeNameIsValid).
+        let missing: Vec<&str> = REQUIRED_COLOR_TOKENS
+            .iter()
+            .copied()
+            .filter(|token| !data.colors.contains_key(*token))
+            .collect();
+        if !missing.is_empty() {
+            let label = path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| data.name.clone());
+            let mut sorted = missing;
+            sorted.sort_unstable();
+            let list = sorted
+                .iter()
+                .map(|color| format!("  - {color}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let reason = format!(
+                "Invalid theme \"{label}\":\n\nMissing required color tokens:\n{list}\n\n\
+                 Please add these colors to your theme's \"colors\" object.\n\
+                 See the built-in themes (dark.json, light.json) for reference values."
+            );
+            return Err(ResourceError::Theme {
+                path: path.unwrap_or_default(),
+                reason,
+            });
+        }
+        // Theme name must not contain `/` — reserved for the `light/dark` auto-theme setting
+        // (theme.ts:506-512,551).
+        if data.name.contains('/') {
+            return Err(ResourceError::Theme {
+                path: path.unwrap_or_default(),
+                reason: format!("theme name must not contain '/': {}", data.name),
+            });
+        }
         let mut key = ResourceKey::normalize(&data.name);
         if key.is_empty() {
             // Fall back to the file stem.
@@ -99,6 +253,23 @@ impl Theme {
         }
         ResolvedTheme { roles }
     }
+
+    /// Resolve the typed `export` section (`pageBg`/`cardBg`/`infoBg`) through `vars` for HTML
+    /// export (theme.ts:94-100; arch-12). Absent keys degrade to `Inherit`.
+    pub fn resolve_export(&self) -> ExportColors {
+        let get = |k: &str| {
+            self.data
+                .export
+                .get(k)
+                .map(|raw| resolve_value(raw, &self.data.vars))
+                .unwrap_or(ColorSpec::Inherit)
+        };
+        ExportColors {
+            page_bg: get("pageBg"),
+            card_bg: get("cardBg"),
+            info_bg: get("infoBg"),
+        }
+    }
 }
 
 impl Named for Theme {
@@ -110,19 +281,76 @@ impl Named for Theme {
     }
 }
 
-/// Resolve a `colors` value: empty -> inherit; `$var` or bare var name -> look up `vars`; else
-/// parse as a hex color.
+/// Resolve a `colors` value **recursively** through `vars` (theme.ts:290-306).
+///
+/// Empty → inherit. A value starting with `#` is a terminal hex color. Otherwise it is treated as a
+/// var reference (an optional leading `$` is accepted for cyrup compatibility; Pi uses the bare
+/// name) and resolved recursively. Circular references and unknown vars degrade to `Inherit` (Pi
+/// throws; cyrup's `resolve()` is total and never panics, R-00-009).
 fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> ColorSpec {
+    resolve_value_inner(raw, vars, &mut std::collections::BTreeSet::new())
+}
+
+fn resolve_value_inner(
+    raw: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> ColorSpec {
     let v = raw.trim();
     if v.is_empty() {
         return ColorSpec::Inherit;
     }
-    // Indirection: a value naming a var (with or without a leading `$`).
-    let var_name = v.strip_prefix('$').unwrap_or(v);
-    if let Some(hex) = vars.get(var_name) {
-        return parse_hex(hex);
+    if v.starts_with('#') {
+        return parse_hex(v);
     }
+    // Var reference (with or without a leading `$`).
+    let var_name = v.strip_prefix('$').unwrap_or(v);
+    if seen.contains(var_name) {
+        return ColorSpec::Inherit; // circular reference
+    }
+    if let Some(next) = vars.get(var_name) {
+        seen.insert(var_name.to_string());
+        return resolve_value_inner(next, vars, seen);
+    }
+    // Not a known var: last-resort hex parse (e.g. `rrggbb` without `#`).
     parse_hex(v)
+}
+
+/// Map a 256-color palette index to truecolor RGB (standard xterm-256 palette).
+fn index_to_rgb(idx: u8) -> (u8, u8, u8) {
+    const SYSTEM: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match idx {
+        0..=15 => SYSTEM.get(idx as usize).copied().unwrap_or((0, 0, 0)),
+        16..=231 => {
+            let i = idx - 16;
+            let r = CUBE.get((i / 36) as usize).copied().unwrap_or(0);
+            let g = CUBE.get(((i / 6) % 6) as usize).copied().unwrap_or(0);
+            let b = CUBE.get((i % 6) as usize).copied().unwrap_or(0);
+            (r, g, b)
+        }
+        232..=255 => {
+            let gray = 8u8.saturating_add((idx - 232).saturating_mul(10));
+            (gray, gray, gray)
+        }
+    }
 }
 
 /// Parse `#rrggbb` / `rrggbb` / `#rgb`. Anything malformed -> `Inherit`.
@@ -168,37 +396,176 @@ fn hex_pair(hi: Option<&u8>, lo: Option<&u8>) -> Option<u8> {
     h.checked_mul(16)?.checked_add(l)
 }
 
-/// The compiled-in `dark` theme (R-09-011).
+/// The compiled-in `dark` theme (R-09-011), ported verbatim from Pi's `dark.json` (all 51 tokens).
 pub const BUILTIN_DARK_JSON: &str = r##"{
   "name": "dark",
   "vars": {
-    "bg": "#1e1e1e",
-    "fg": "#d4d4d4",
-    "accent": "#569cd6",
-    "error": "#f44747"
+    "cyan": "#00d7ff",
+    "blue": "#5f87ff",
+    "green": "#b5bd68",
+    "red": "#cc6666",
+    "yellow": "#ffff00",
+    "text": "#d4d4d4",
+    "gray": "#808080",
+    "dimGray": "#666666",
+    "darkGray": "#505050",
+    "accent": "#8abeb7",
+    "selectedBg": "#3a3a4a",
+    "userMsgBg": "#343541",
+    "toolPendingBg": "#282832",
+    "toolSuccessBg": "#283228",
+    "toolErrorBg": "#3c2828",
+    "customMsgBg": "#2d2838"
   },
   "colors": {
-    "background": "$bg",
-    "foreground": "$fg",
-    "accent": "$accent",
-    "error": "$error"
+    "accent": "accent",
+    "border": "blue",
+    "borderAccent": "cyan",
+    "borderMuted": "darkGray",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "muted": "gray",
+    "dim": "dimGray",
+    "text": "text",
+    "thinkingText": "gray",
+
+    "selectedBg": "selectedBg",
+    "userMessageBg": "userMsgBg",
+    "userMessageText": "text",
+    "customMessageBg": "customMsgBg",
+    "customMessageText": "text",
+    "customMessageLabel": "#9575cd",
+    "toolPendingBg": "toolPendingBg",
+    "toolSuccessBg": "toolSuccessBg",
+    "toolErrorBg": "toolErrorBg",
+    "toolTitle": "text",
+    "toolOutput": "gray",
+
+    "mdHeading": "#f0c674",
+    "mdLink": "#81a2be",
+    "mdLinkUrl": "dimGray",
+    "mdCode": "accent",
+    "mdCodeBlock": "green",
+    "mdCodeBlockBorder": "gray",
+    "mdQuote": "gray",
+    "mdQuoteBorder": "gray",
+    "mdHr": "gray",
+    "mdListBullet": "accent",
+
+    "toolDiffAdded": "green",
+    "toolDiffRemoved": "red",
+    "toolDiffContext": "gray",
+
+    "syntaxComment": "#6A9955",
+    "syntaxKeyword": "#569CD6",
+    "syntaxFunction": "#DCDCAA",
+    "syntaxVariable": "#9CDCFE",
+    "syntaxString": "#CE9178",
+    "syntaxNumber": "#B5CEA8",
+    "syntaxType": "#4EC9B0",
+    "syntaxOperator": "#D4D4D4",
+    "syntaxPunctuation": "#D4D4D4",
+
+    "thinkingOff": "darkGray",
+    "thinkingMinimal": "#6e6e6e",
+    "thinkingLow": "#5f87af",
+    "thinkingMedium": "#81a2be",
+    "thinkingHigh": "#b294bb",
+    "thinkingXhigh": "#d183e8",
+
+    "bashMode": "green"
+  },
+  "export": {
+    "pageBg": "#18181e",
+    "cardBg": "#1e1e24",
+    "infoBg": "#3c3728"
   }
 }"##;
 
-/// The compiled-in `light` theme (R-09-011).
+/// The compiled-in `light` theme (R-09-011), ported verbatim from Pi's `light.json` (all 51 tokens).
 pub const BUILTIN_LIGHT_JSON: &str = r##"{
   "name": "light",
   "vars": {
-    "bg": "#ffffff",
-    "fg": "#1e1e1e",
-    "accent": "#0000ff",
-    "error": "#cd3131"
+    "teal": "#5a8080",
+    "blue": "#547da7",
+    "green": "#588458",
+    "red": "#aa5555",
+    "yellow": "#9a7326",
+    "text": "#1f2328",
+    "mediumGray": "#6c6c6c",
+    "dimGray": "#767676",
+    "lightGray": "#b0b0b0",
+    "selectedBg": "#d0d0e0",
+    "userMsgBg": "#e8e8e8",
+    "toolPendingBg": "#e8e8f0",
+    "toolSuccessBg": "#e8f0e8",
+    "toolErrorBg": "#f0e8e8",
+    "customMsgBg": "#ede7f6"
   },
   "colors": {
-    "background": "$bg",
-    "foreground": "$fg",
-    "accent": "$accent",
-    "error": "$error"
+    "accent": "teal",
+    "border": "blue",
+    "borderAccent": "teal",
+    "borderMuted": "lightGray",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "muted": "mediumGray",
+    "dim": "dimGray",
+    "text": "text",
+    "thinkingText": "mediumGray",
+
+    "selectedBg": "selectedBg",
+    "userMessageBg": "userMsgBg",
+    "userMessageText": "text",
+    "customMessageBg": "customMsgBg",
+    "customMessageText": "text",
+    "customMessageLabel": "#7e57c2",
+    "toolPendingBg": "toolPendingBg",
+    "toolSuccessBg": "toolSuccessBg",
+    "toolErrorBg": "toolErrorBg",
+    "toolTitle": "text",
+    "toolOutput": "mediumGray",
+
+    "mdHeading": "yellow",
+    "mdLink": "blue",
+    "mdLinkUrl": "dimGray",
+    "mdCode": "teal",
+    "mdCodeBlock": "green",
+    "mdCodeBlockBorder": "mediumGray",
+    "mdQuote": "mediumGray",
+    "mdQuoteBorder": "mediumGray",
+    "mdHr": "mediumGray",
+    "mdListBullet": "green",
+
+    "toolDiffAdded": "green",
+    "toolDiffRemoved": "red",
+    "toolDiffContext": "mediumGray",
+
+    "syntaxComment": "#008000",
+    "syntaxKeyword": "#0000FF",
+    "syntaxFunction": "#795E26",
+    "syntaxVariable": "#001080",
+    "syntaxString": "#A31515",
+    "syntaxNumber": "#098658",
+    "syntaxType": "#267F99",
+    "syntaxOperator": "#000000",
+    "syntaxPunctuation": "#000000",
+
+    "thinkingOff": "lightGray",
+    "thinkingMinimal": "#767676",
+    "thinkingLow": "blue",
+    "thinkingMedium": "teal",
+    "thinkingHigh": "#875f87",
+    "thinkingXhigh": "#8b008b",
+
+    "bashMode": "green"
+  },
+  "export": {
+    "pageBg": "#f8f8f8",
+    "cardBg": "#ffffff",
+    "infoBg": "#fffae6"
   }
 }"##;
 
@@ -313,8 +680,18 @@ fn reload(inner: &Arc<std::sync::Mutex<WatcherInner>>) {
     let path = guard.path.clone();
     let tx = guard.tx.clone();
     drop(guard);
+    // Re-validate through `Theme::parse` so an incomplete/invalid edit (missing required tokens,
+    // bad name) keeps the last good theme instead of publishing a broken one — matching Pi's
+    // watch handler, which re-parses via `parseThemeJsonContent` and keeps the prior theme on
+    // failure (theme.ts watch path; G1). Only `.data` is published, so scope/origin are nominal.
     if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(data) = serde_json::from_str::<ThemeData>(&text) {
-            let _ = tx.send(Arc::new(data));
-        }
+        && let Ok(theme) = Theme::parse(
+            &text,
+            Some(path.clone()),
+            ResourceScope::Cli,
+            ResourceOrigin::Builtin,
+        )
+    {
+        let _ = tx.send(Arc::new(theme.data));
+    }
 }

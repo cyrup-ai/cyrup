@@ -1,5 +1,13 @@
-//! Prompt templates — markdown expanded by `/name` with `{{placeholder}}` substitution
-//! (arch-09 §3.4, R-09-007..010).
+//! Prompt templates — markdown expanded by `/name args` with shell-style positional argument
+//! substitution (arch-09 §3.4, R-09-007..010).
+//!
+//! Ports Pi's `prompt-templates.ts` 1:1: `parseCommandArgs` (quote-aware tokenizer,
+//! prompt-templates.ts:24-55), `substituteArgs` (`$1 $2 $@ $ARGUMENTS ${N:-default} ${@:N}
+//! ${@:N:L}`, prompt-templates.ts:69-101), and `expandPromptTemplate` (`/name args` entry point,
+//! prompt-templates.ts:268-284). The template `name` is the file basename minus `.md` with case
+//! preserved (prompt-templates.ts:108); `description` comes from frontmatter or the first non-empty
+//! body line truncated to 60 chars (prompt-templates.ts:110-119); `argument-hint` is read from
+//! frontmatter (prompt-templates.ts:124).
 
 use std::path::{Path, PathBuf};
 
@@ -7,76 +15,79 @@ use crate::discovery::Named;
 use crate::error::ResourceError;
 use crate::key::ResourceKey;
 use crate::scope::{ResourceOrigin, ResourceScope};
+use crate::skill::split_front_matter;
+
+/// Frontmatter description truncation limit (prompt-templates.ts:116).
+const DESCRIPTION_TRUNCATE: usize = 60;
 
 /// A markdown prompt template. Bodies are small and eagerly cached (R-09-025).
 #[derive(Clone, Debug)]
 pub struct PromptTemplate {
-    /// Expanded by `/name` (R-09-007).
+    /// Normalized registry key (lower-cased) used for precedence/collision (R-09-024).
     pub key: ResourceKey,
+    /// The command name = file basename minus `.md`, **case preserved**
+    /// (prompt-templates.ts:108). `/name` matching is case-sensitive on this.
+    pub name: String,
+    /// From frontmatter `description`, or the first non-empty body line truncated to 60 chars +
+    /// `...` (prompt-templates.ts:110-119).
+    pub description: String,
+    /// Frontmatter `argument-hint` field, surfaced in the command list (prompt-templates.ts:124).
+    pub argument_hint: Option<String>,
     pub path: PathBuf,
+    /// Body with frontmatter stripped — the template content that gets `substituteArgs` applied.
     pub body: String,
-    /// Discovered `{{names}}` (for argument prompting).
-    pub placeholders: Vec<String>,
     pub scope: ResourceScope,
     pub origin: ResourceOrigin,
 }
 
-/// Arguments supplied at expansion time, keyed by placeholder name.
-#[derive(Default, Debug, Clone)]
-pub struct PlaceholderArgs(std::collections::BTreeMap<String, String>);
-
-impl PlaceholderArgs {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) -> &mut Self {
-        self.0.insert(name.into(), value.into());
-        self
-    }
-
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(String::as_str)
-    }
-}
-
-impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for PlaceholderArgs {
-    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        Self(iter.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
-    }
-}
-
-/// The result of expanding a template (R-09-009). Unknown placeholders are left literal and
-/// reported in `unresolved` — deterministic, no panic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Expansion {
-    pub text: String,
-    pub unresolved: Vec<String>,
-}
-
 impl PromptTemplate {
-    /// Load a template from a markdown file. `key` defaults to the file stem.
+    /// Load a template from a markdown file (prompt-templates.ts:103-132).
     pub fn load(
         path: &Path,
         scope: ResourceScope,
         origin: ResourceOrigin,
     ) -> Result<PromptTemplate, ResourceError> {
-        let body = std::fs::read_to_string(path)?;
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let key = ResourceKey::normalize(stem);
+        let raw = std::fs::read_to_string(path)?;
+        let (frontmatter, body) = parse_frontmatter(&raw);
+
+        // name = basename minus `.md`, case preserved (prompt-templates.ts:108).
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|f| f.strip_suffix(".md").unwrap_or(f).to_string())
+            .unwrap_or_default();
+        let key = ResourceKey::normalize(&name);
         if key.is_empty() {
             return Err(ResourceError::Manifest(format!(
                 "prompt template has no usable name: {}",
                 path.display()
             )));
         }
-        let placeholders = scan_placeholders(&body);
-        Ok(PromptTemplate { key, path: path.to_path_buf(), body, placeholders, scope, origin })
+
+        // description: frontmatter, else first non-empty body line (truncated) (…ts:110-119).
+        let description = match frontmatter_str(&frontmatter, "description") {
+            Some(d) if !d.is_empty() => d,
+            _ => first_line_description(&body),
+        };
+        let argument_hint = frontmatter_str(&frontmatter, "argument-hint").filter(|s| !s.is_empty());
+
+        Ok(PromptTemplate {
+            key,
+            name,
+            description,
+            argument_hint,
+            path: path.to_path_buf(),
+            body,
+            scope,
+            origin,
+        })
     }
 
-    /// Expand at input-pipeline time (R-09-009). Single linear scan, no regex.
-    pub fn expand(&self, args: &PlaceholderArgs) -> Expansion {
-        expand_str(&self.body, args)
+    /// Expand this template against a raw args string (everything after `/name `), tokenizing it
+    /// with [`parse_command_args`] then applying [`substitute_args`] (prompt-templates.ts:279-280).
+    pub fn expand(&self, args_string: &str) -> String {
+        let args = parse_command_args(args_string);
+        substitute_args(&self.body, &args)
     }
 }
 
@@ -89,90 +100,253 @@ impl Named for PromptTemplate {
     }
 }
 
-/// Discover every `{{name}}` placeholder, de-duplicated, in first-seen order.
-pub(crate) fn scan_placeholders(body: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (name, _, _) in placeholder_iter(body) {
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
+/// Expand a `/name args` line against a set of templates (prompt-templates.ts:268-284).
+///
+/// Returns the substituted content when `text` is `^/<name>(\s+<args>)?$` and `<name>` matches a
+/// template (case-sensitive); otherwise returns `text` unchanged.
+pub fn expand_prompt_template<'a, I>(text: &str, templates: I) -> String
+where
+    I: IntoIterator<Item = &'a PromptTemplate>,
+{
+    let Some((name, args_string)) = split_command(text) else {
+        return text.to_string();
+    };
+    for t in templates {
+        if t.name == name {
+            let args = parse_command_args(args_string);
+            return substitute_args(&t.body, &args);
         }
+    }
+    text.to_string()
+}
+
+/// Split `/name args` into `(name, args_string)`, mirroring the regex
+/// `^/([^\s]+)(?:\s+([\s\S]*))?$` (prompt-templates.ts:271). Returns `None` when `text` does not
+/// start with `/` or has no non-whitespace name.
+fn split_command(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix('/')?;
+    // name = leading run of non-whitespace chars.
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = rest.get(..name_end)?;
+    if name.is_empty() {
+        return None;
+    }
+    // `(?:\s+([\s\S]*))?` — skip the whitespace run, rest is the args string.
+    let after = rest.get(name_end..).unwrap_or("");
+    let args = after.trim_start_matches(char::is_whitespace);
+    Some((name, args))
+}
+
+/// Tokenize an args string respecting single/double quotes (prompt-templates.ts:24-55).
+///
+/// Quotes group whitespace-separated tokens; the quote characters themselves are dropped. There is
+/// no escape handling (Pi has none) and unterminated quotes simply absorb the remainder.
+pub fn parse_command_args(args_string: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+
+    for ch in args_string.chars() {
+        match in_quote {
+            Some(q) => {
+                if ch == q {
+                    in_quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    in_quote = Some(ch);
+                } else if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+/// Substitute positional argument placeholders in `content` (prompt-templates.ts:69-101).
+///
+/// Supported forms:
+/// - `$1`, `$2`, … — positional args (1-indexed; missing → empty)
+/// - `$@`, `$ARGUMENTS` — all args joined by a space
+/// - `${N:-default}` — positional N, or `default` when missing/empty
+/// - `${@:N}` — args from the Nth onward (1-indexed, bash slice)
+/// - `${@:N:L}` — `L` args starting from the Nth
+///
+/// Substitution applies to the template only; argument/default values are not re-scanned.
+pub fn substitute_args(content: &str, args: &[String]) -> String {
+    let all_args = args.join(" ");
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes.get(i) != Some(&b'$') {
+            // Copy the next UTF-8 char intact.
+            push_char_at(content, &mut out, &mut i);
+            continue;
+        }
+        // We are at a `$`. Try the `${...}` forms first, then the simple `$X` forms.
+        if bytes.get(i + 1) == Some(&b'{') {
+            if let Some((repl, consumed)) = match_brace_form(content, i, args) {
+                out.push_str(&repl);
+                i += consumed;
+                continue;
+            }
+            // Unrecognized `${...}` — emit the `$` literally and continue.
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        if let Some((repl, consumed)) = match_simple_form(content, i, args, &all_args) {
+            out.push_str(&repl);
+            i += consumed;
+            continue;
+        }
+        // A lone `$` not starting any placeholder.
+        out.push('$');
+        i += 1;
     }
     out
 }
 
-/// Linear-scan expansion. Unknown placeholders are preserved literally and recorded.
-fn expand_str(body: &str, args: &PlaceholderArgs) -> Expansion {
-    let mut text = String::with_capacity(body.len());
-    let mut unresolved: Vec<String> = Vec::new();
-    let mut cursor = 0usize;
-    for (name, start, end) in placeholder_iter(body) {
-        // Copy the literal segment before this placeholder.
-        if let Some(seg) = body.get(cursor..start) {
-            text.push_str(seg);
-        }
-        match args.get(name) {
-            Some(val) => text.push_str(val),
-            None => {
-                if let Some(raw) = body.get(start..end) {
-                    text.push_str(raw);
-                }
-                if !unresolved.iter().any(|n| n == name) {
-                    unresolved.push(name.to_string());
-                }
-            }
-        }
-        cursor = end;
+/// Copy one UTF-8 char starting at byte `*i`, advancing `*i` past it.
+fn push_char_at(s: &str, out: &mut String, i: &mut usize) {
+    if let Some(ch) = s.get(*i..).and_then(|t| t.chars().next()) {
+        out.push(ch);
+        *i += ch.len_utf8();
+    } else {
+        *i += 1;
     }
-    if let Some(rest) = body.get(cursor..) {
-        text.push_str(rest);
-    }
-    Expansion { text, unresolved }
 }
 
-/// Iterate `{{name}}` occurrences, yielding `(name, start_byte, end_byte)` of the whole `{{…}}`
-/// span. Names are trimmed; empty or whitespace-only braces are ignored.
-fn placeholder_iter(body: &str) -> impl Iterator<Item = (&str, usize, usize)> {
-    let bytes = body.as_bytes();
-    let mut i = 0usize;
-    std::iter::from_fn(move || {
-        while i + 1 < bytes.len() {
-            if bytes.get(i) == Some(&b'{') && bytes.get(i + 1) == Some(&b'{') {
-                let inner_start = i + 2;
-                // Find closing `}}`.
-                let mut j = inner_start;
-                let mut found = None;
-                while j + 1 < bytes.len() {
-                    if bytes.get(j) == Some(&b'}') && bytes.get(j + 1) == Some(&b'}') {
-                        found = Some(j);
-                        break;
-                    }
-                    j += 1;
-                }
-                match found {
-                    Some(close) => {
-                        let end = close + 2;
-                        let inner = body.get(inner_start..close).unwrap_or("").trim();
-                        let start = i;
-                        i = end;
-                        if !inner.is_empty() && inner.chars().all(is_placeholder_char) {
-                            // Re-locate the trimmed name span is unnecessary; expose trimmed name.
-                            return Some((inner, start, end));
-                        }
-                        // Not a valid placeholder; continue scanning past it.
-                        continue;
-                    }
-                    None => {
-                        i = bytes.len();
-                        return None;
-                    }
-                }
-            }
-            i += 1;
+/// Match `${N:-default}`, `${@:N}`, or `${@:N:L}` at byte `start`. Returns `(replacement,
+/// bytes_consumed)` or `None` if the `${...}` is not one of these forms.
+fn match_brace_form(content: &str, start: usize, args: &[String]) -> Option<(String, usize)> {
+    let open = start + 2; // past `${`
+    let rest = content.get(open..)?;
+    let close_rel = rest.find('}')?;
+    let inner = rest.get(..close_rel)?;
+    let consumed = 2 + close_rel + 1; // `${` + inner + `}`
+
+    // `${N:-default}`
+    if let Some((num, default)) = inner.split_once(":-")
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+    {
+        let idx = num.parse::<usize>().ok()?.checked_sub(1)?;
+        let value = args.get(idx).filter(|v| !v.is_empty());
+        return Some((value.cloned().unwrap_or_else(|| default.to_string()), consumed));
+    }
+
+    // `${@:N}` / `${@:N:L}`
+    if let Some(slice) = inner.strip_prefix("@:") {
+        let (start_str, len_str) = match slice.split_once(':') {
+            Some((a, b)) => (a, Some(b)),
+            None => (slice, None),
+        };
+        if start_str.is_empty() || !start_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
-        None
-    })
+        let n: usize = start_str.parse().ok()?;
+        // 1-indexed → 0-indexed; bash treats 0 as 1 (prompt-templates.ts:82-84).
+        let begin = n.saturating_sub(1);
+        let joined = match len_str {
+            Some(l) => {
+                if !l.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let length: usize = l.parse().ok()?;
+                let end = begin.saturating_add(length).min(args.len());
+                args.get(begin..end).unwrap_or(&[]).join(" ")
+            }
+            None => args.get(begin..).unwrap_or(&[]).join(" "),
+        };
+        return Some((joined, consumed));
+    }
+
+    None
 }
 
-fn is_placeholder_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+/// Match `$ARGUMENTS`, `$@`, or `$<digits>` at byte `start`. Returns `(replacement,
+/// bytes_consumed)`.
+fn match_simple_form(
+    content: &str,
+    start: usize,
+    args: &[String],
+    all_args: &str,
+) -> Option<(String, usize)> {
+    let rest = content.get(start + 1..)?;
+    if let Some(after) = rest.strip_prefix("ARGUMENTS") {
+        let consumed = 1 + "ARGUMENTS".len();
+        let _ = after;
+        return Some((all_args.to_string(), consumed));
+    }
+    if rest.starts_with('@') {
+        return Some((all_args.to_string(), 2));
+    }
+    // `$<digits>`
+    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let num = rest.get(..digits_len)?;
+    let idx = num.parse::<usize>().ok()?.checked_sub(1);
+    let value = idx.and_then(|i| args.get(i)).cloned().unwrap_or_default();
+    Some((value, 1 + digits_len))
+}
+
+// ---------------------------------------------------------------------------
+// frontmatter parsing for prompt templates (utils/frontmatter.ts)
+// ---------------------------------------------------------------------------
+
+/// Parse the leading `---` YAML frontmatter block, returning `(frontmatter_map, body)`. Mirrors
+/// `parseFrontmatter` (utils/frontmatter.ts): no fence → empty map + whole content as body.
+fn parse_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, serde_yml::Value>, String) {
+    let (yaml, body) = split_front_matter(raw);
+    match yaml {
+        Some(front) => {
+            // Pi silently treats a YAML parse fault as `{}` (prompt-templates.ts:129-131).
+            let map = serde_yml::from_str::<std::collections::BTreeMap<String, serde_yml::Value>>(
+                &front,
+            )
+            .unwrap_or_default();
+            (map, body)
+        }
+        // No fence → empty frontmatter + the normalized whole content (frontmatter.ts:14,19,33).
+        None => (std::collections::BTreeMap::new(), body),
+    }
+}
+
+/// Read a frontmatter key as a trimmed string (scalar values only).
+fn frontmatter_str(
+    map: &std::collections::BTreeMap<String, serde_yml::Value>,
+    key: &str,
+) -> Option<String> {
+    let v = map.get(key)?;
+    v.as_str().map(|s| s.to_string())
+}
+
+/// First non-empty body line, truncated to 60 chars with `...` appended when longer
+/// (prompt-templates.ts:112-118).
+fn first_line_description(body: &str) -> String {
+    let Some(line) = body.lines().find(|l| !l.trim().is_empty()) else {
+        return String::new();
+    };
+    if line.chars().count() > DESCRIPTION_TRUNCATE {
+        let truncated: String = line.chars().take(DESCRIPTION_TRUNCATE).collect();
+        format!("{truncated}...")
+    } else {
+        line.to_string()
+    }
 }

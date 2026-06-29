@@ -60,3 +60,83 @@ impl ResourceWarning {
         Self { kind, path: path.into(), reason: reason.into() }
     }
 }
+
+/// Diagnostic severity, 1:1 with Pi's `ResourceDiagnostic.type` (diagnostics.ts;
+/// resource-loader.ts:8). `collision` carries winner/loser detail in [`ResourceDiagnostic::collision`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticType {
+    Warning,
+    Error,
+    Collision,
+}
+
+/// Winner/loser detail for a same-name `collision` diagnostic (skills.ts:415-424;
+/// resource-loader.ts:939-964). `winner_path` is the resource kept; `loser_path` is shadowed.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Collision {
+    pub resource_type: ResourceKind,
+    pub name: String,
+    pub winner_path: PathBuf,
+    pub loser_path: PathBuf,
+}
+
+/// A structured diagnostic, mirroring Pi's `ResourceDiagnostic` (warning | error | collision).
+///
+/// Richer than [`ResourceWarning`]: distinguishes `error` (e.g. a configured path that does not
+/// exist) from `warning`, and carries structured `collision` detail so the UI can print the
+/// `name "X" collision (winner/loser)` feedback Pi shows at startup and on `/reload`.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceDiagnostic {
+    #[serde(rename = "type")]
+    pub diagnostic_type: DiagnosticType,
+    pub message: String,
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collision: Option<Collision>,
+}
+
+impl ResourceDiagnostic {
+    pub fn warning(kind: ResourceKind, path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+        let _ = kind;
+        Self {
+            diagnostic_type: DiagnosticType::Warning,
+            message: message.into(),
+            path: path.into(),
+            collision: None,
+        }
+    }
+
+    pub fn error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+        Self {
+            diagnostic_type: DiagnosticType::Error,
+            message: message.into(),
+            path: path.into(),
+            collision: None,
+        }
+    }
+
+    /// A `collision` diagnostic: `loser` was shadowed by `winner` (first-wins, skills.ts:410-427).
+    pub fn collision(
+        resource_type: ResourceKind,
+        name: impl Into<String>,
+        winner_path: impl Into<PathBuf>,
+        loser_path: impl Into<PathBuf>,
+    ) -> Self {
+        let name = name.into();
+        let loser = loser_path.into();
+        Self {
+            diagnostic_type: DiagnosticType::Collision,
+            message: format!("name \"{name}\" collision"),
+            path: loser.clone(),
+            collision: Some(Collision {
+                resource_type,
+                name,
+                winner_path: winner_path.into(),
+                loser_path: loser,
+            }),
+        }
+    }
+}

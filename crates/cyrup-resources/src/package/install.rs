@@ -210,17 +210,22 @@ fn refresh(
     }
 }
 
-/// Materialize a git package working tree at `dir` and return the resolved HEAD commit (hex).
+/// Materialize a git package working tree at `dir` and return the resolved commit (hex).
 ///
 /// **Channel note (§7.6, §12):** network fetch over the wire is fixture-gated — it needs gix's
 /// `blocking-network-client` feature, which is off by default to keep print-mode builds lean. The
 /// supported, deterministic path is a **local git repo** (a `file://` URL or a filesystem path to a
-/// real repo, e.g. a local fixture): its working tree is copied into the store and HEAD is read
-/// with `gix` (no network). `_ref_name` checkout is deferred (§12); the cloned HEAD is recorded.
+/// real repo, e.g. a local fixture): its tree is copied into the store and the requested ref is
+/// checked out with `gix` (no network).
+///
+/// When `ref_name` is set (a branch/tag/commit pin, utils/git.ts:6-19), the named ref is resolved
+/// against the local object database and its tree is materialized over the working copy so the pin
+/// is actually applied (R-09-018/020) — the recorded commit is the ref's commit, not default HEAD.
+/// When it is absent, the cloned HEAD is used.
 fn git_clone(
     url: &str,
     dir: &std::path::Path,
-    _ref_name: Option<String>,
+    ref_name: Option<String>,
 ) -> Result<String, ResourceError> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -229,12 +234,63 @@ fn git_clone(
     let src = std::path::Path::new(local);
     if src.is_dir() {
         copy_tree(src, dir)?;
-        return git_head(dir);
+        return match ref_name {
+            Some(reff) => checkout_ref(dir, &reff),
+            None => git_head(dir),
+        };
     }
     Err(ResourceError::Git(format!(
         "network git fetch is fixture-gated (build gix with `blocking-network-client`); \
          use a local repo path/file:// URL: {url}"
     )))
+}
+
+/// Resolve `reff` (branch/tag/commit) in the local clone at `dir`, materialize its tree over the
+/// working copy, and return the resolved commit (hex). No network — object-database access only.
+fn checkout_ref(dir: &std::path::Path, reff: &str) -> Result<String, ResourceError> {
+    let repo = gix::open(dir).map_err(|e| ResourceError::Git(e.to_string()))?;
+    let id = repo
+        .rev_parse_single(reff)
+        .map_err(|e| ResourceError::Git(format!("ref `{reff}` not found: {e}")))?;
+    let commit = id
+        .object()
+        .map_err(|e| ResourceError::Git(e.to_string()))?
+        .try_into_commit()
+        .map_err(|e| ResourceError::Git(e.to_string()))?;
+    let commit_hex = commit.id().to_hex().to_string();
+    let tree = commit.tree().map_err(|e| ResourceError::Git(e.to_string()))?;
+    materialize_tree(&tree, dir)?;
+    Ok(commit_hex)
+}
+
+/// Recursively write a git tree's blobs to `dst`, overwriting the working copy so it matches the
+/// checked-out ref. Submodule (`Commit`) entries and non-UTF-8 names are skipped; symlinks are
+/// written as regular files carrying the link target (sufficient for resource materialization).
+fn materialize_tree(tree: &gix::Tree<'_>, dst: &std::path::Path) -> Result<(), ResourceError> {
+    use gix::object::tree::EntryKind;
+    std::fs::create_dir_all(dst)?;
+    for entry in tree.iter() {
+        let entry = entry.map_err(|e| ResourceError::Git(e.to_string()))?;
+        let Ok(name) = std::str::from_utf8(entry.filename()) else { continue };
+        let path = dst.join(name);
+        match entry.mode().kind() {
+            EntryKind::Tree => {
+                let object =
+                    entry.object().map_err(|e| ResourceError::Git(e.to_string()))?;
+                let subtree = object
+                    .try_into_tree()
+                    .map_err(|e| ResourceError::Git(e.to_string()))?;
+                materialize_tree(&subtree, &path)?;
+            }
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                let object =
+                    entry.object().map_err(|e| ResourceError::Git(e.to_string()))?;
+                std::fs::write(&path, &object.into_blob().data)?;
+            }
+            EntryKind::Commit => {}
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy a directory tree (used to materialize a local git repo into the store).

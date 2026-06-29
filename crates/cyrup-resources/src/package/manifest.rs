@@ -102,14 +102,69 @@ pub fn resolve_manifest(dir: &Path) -> Result<ResolvedManifest, ResourceError> {
 }
 
 fn absolutize(dir: &Path, kind: ManifestKind, res: ManifestResources) -> ResolvedManifest {
-    let join = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
-        paths.into_iter().map(|p| if p.is_absolute() { p } else { dir.join(p) }).collect()
-    };
     ResolvedManifest {
         kind,
-        extensions: join(res.extensions),
-        skills: join(res.skills),
-        prompts: join(res.prompts),
-        themes: join(res.themes),
+        extensions: resolve_entries(dir, res.extensions),
+        skills: resolve_entries(dir, res.skills),
+        prompts: resolve_entries(dir, res.prompts),
+        themes: resolve_entries(dir, res.themes),
+    }
+}
+
+/// Resolve manifest entries to absolute paths, glob-expanding any entry containing `*`/`?` against
+/// the package root (Pi `collectFilesFromManifestEntries`, package-manager.ts:2201-2215, which
+/// `globSync`s glob entries and `resolve`s plain ones). A plain entry resolves literally; a glob
+/// entry expands to every path under the package tree whose root-relative path matches.
+fn resolve_entries(dir: &Path, entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let s = entry.to_string_lossy();
+        if s.contains('*') || s.contains('?') {
+            expand_glob(dir, &s, &mut out);
+        } else if entry.is_absolute() {
+            out.push(entry);
+        } else {
+            out.push(dir.join(entry));
+        }
+    }
+    out
+}
+
+/// Expand a glob `pattern` (relative to `dir`) into absolute matches over the package tree. A
+/// leading `./` is stripped (Pi `normalizeExactPattern`). `*`/`?` do not cross `/`; `**` does
+/// (globset default), matching Pi's glob semantics. Both files and directories match (`nodir:false`).
+fn expand_glob(dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+    let normalized = pattern.strip_prefix("./").unwrap_or(pattern);
+    let Ok(glob) = globset::Glob::new(normalized) else { return };
+    let matcher = glob.compile_matcher();
+    let mut matches: Vec<PathBuf> = Vec::new();
+    walk_tree(dir, dir, &matcher, &mut matches);
+    matches.sort();
+    out.extend(matches);
+}
+
+/// Recursively collect every path under `root` whose root-relative path matches `matcher`.
+/// Dot-directories and `node_modules` are skipped (consistent with the skill/resource walk).
+fn walk_tree(
+    root: &Path,
+    dir: &Path,
+    matcher: &globset::GlobMatcher,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root)
+            && matcher.is_match(rel)
+        {
+            out.push(path.clone());
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            walk_tree(root, &path, matcher, out);
+        }
     }
 }

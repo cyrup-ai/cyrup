@@ -4,7 +4,8 @@
 //! extensions, plus the package model that bundles them:
 //!
 //! - **Skills** ([`Skill`]) — Agent Skills standard `SKILL.md` directories, lazy-bodied.
-//! - **Prompt templates** ([`PromptTemplate`]) — markdown expanded by `/name` with `{{placeholder}}`.
+//! - **Prompt templates** ([`PromptTemplate`]) — markdown expanded by `/name args` with shell-style
+//!   positional substitution (`$1 $@ $ARGUMENTS ${N:-default} ${@:N:L}`).
 //! - **Themes** ([`Theme`]) — JSON TUI color schemes, hot-reloadable ([`ThemeWatcher`]).
 //! - **Packages** ([`PackageManager`]) — manifest-declared bundles, git/local-path installs.
 //!
@@ -39,7 +40,9 @@ pub use discovery::{
     CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceRegistry,
     ResourceSet, discover,
 };
-pub use error::{ResourceError, ResourceKind, ResourceWarning};
+pub use error::{
+    Collision, DiagnosticType, ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning,
+};
 pub use key::ResourceKey;
 pub use package::install::{PackageManager, security_notice_for};
 pub use package::source::{PackageSource, PinRef};
@@ -48,12 +51,17 @@ pub use package::{
     ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice, UpdateReport,
     UpdateTarget, resolve_manifest,
 };
-pub use prompt::{Expansion, PlaceholderArgs, PromptTemplate};
+pub use prompt::{
+    PromptTemplate, expand_prompt_template, parse_command_args, substitute_args,
+};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};
-pub use skill::{Skill, SkillFrontMatter, SkillPointer};
+pub use skill::{
+    MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, Skill, SkillFrontMatter, SkillPointer,
+    validate_description, validate_name,
+};
 pub use theme::{
-    BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON, ColorSpec, ResolvedTheme, Theme, ThemeData,
-    ThemeWatcher, builtin_themes,
+    BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON, ColorSpec, ExportColors, REQUIRED_COLOR_TOKENS,
+    ResolvedTheme, Theme, ThemeData, ThemeWatcher, builtin_themes,
 };
 
 /// The lock-free, atomically-swappable holder of the active [`ResourceRegistry`].

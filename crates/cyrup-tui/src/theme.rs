@@ -16,13 +16,15 @@ pub struct UiTheme {
     pub name: String,
     /// Bumped on hot-reload so caches can invalidate (R-10-026 / arch-10 §3.4).
     pub generation: u64,
-    /// `foreground` role — default text color. `None` ⇒ inherit terminal default.
+    /// Pi `text` token — default foreground text (theme.ts:45). `None` ⇒ inherit terminal default.
     pub foreground: Option<Color>,
-    /// `background` role.
+    /// Background. Pi has **no** global background token — backgrounds are per-component
+    /// (`selectedBg` / `userMessageBg` / `toolPendingBg` / …, theme.ts:48-55), to be wired as the
+    /// TUI grows. So this stays `None` (terminal default) for the built-ins.
     pub background: Option<Color>,
-    /// `accent` role — assistant / emphasis / focus.
+    /// Pi `accent` token — focus / assistant emphasis (theme.ts:36).
     pub accent: Option<Color>,
-    /// `error` role — errors and failed tool calls.
+    /// Pi `error` token — errors and failed tool calls (theme.ts:41).
     pub error: Option<Color>,
 }
 
@@ -39,8 +41,9 @@ impl UiTheme {
         UiTheme {
             name: name.into(),
             generation,
-            foreground: role("foreground"),
-            background: role("background"),
+            foreground: role("text"),
+            // Pi has no global background token; per-component backgrounds are wired separately.
+            background: None,
             accent: role("accent"),
             error: role("error"),
         }
@@ -58,19 +61,30 @@ impl UiTheme {
         UiTheme::dark()
     }
 
-    /// The compiled-in `dark` theme.
+    /// The compiled-in `dark` theme (Pi `dark.json`: text `#d4d4d4`, accent `#8abeb7`, error `#cc6666`).
     pub fn dark() -> Self {
-        UiTheme::builtin_or_static("dark", Color::Rgb(0x1e, 0x1e, 0x1e), Color::Rgb(0xd4, 0xd4, 0xd4))
+        UiTheme::builtin_or_static(
+            "dark",
+            Color::Rgb(0xd4, 0xd4, 0xd4),
+            Color::Rgb(0x8a, 0xbe, 0xb7),
+            Color::Rgb(0xcc, 0x66, 0x66),
+        )
     }
 
-    /// The compiled-in `light` theme.
+    /// The compiled-in `light` theme (Pi `light.json`: text `#1f2328`, accent `#5a8080`, error `#aa5555`).
     pub fn light() -> Self {
-        UiTheme::builtin_or_static("light", Color::Rgb(0xff, 0xff, 0xff), Color::Rgb(0x1e, 0x1e, 0x1e))
+        UiTheme::builtin_or_static(
+            "light",
+            Color::Rgb(0x1f, 0x23, 0x28),
+            Color::Rgb(0x5a, 0x80, 0x80),
+            Color::Rgb(0xaa, 0x55, 0x55),
+        )
     }
 
-    /// Look up a built-in by name, or synthesize a minimal palette if the resource layer somehow
-    /// cannot supply it (keeps zero-disk-I/O availability, R-10-027).
-    fn builtin_or_static(name: &str, bg: Color, fg: Color) -> Self {
+    /// Look up a built-in by name, or synthesize a minimal palette from the given Pi `text`/`accent`/
+    /// `error` colors if the resource layer somehow cannot supply it (keeps zero-disk-I/O
+    /// availability, R-10-027). Background stays terminal-default (Pi has no global background token).
+    fn builtin_or_static(name: &str, text: Color, accent: Color, error: Color) -> Self {
         for theme in builtin_themes() {
             if theme.key.as_str() == name {
                 let resolved = theme.resolve();
@@ -80,10 +94,10 @@ impl UiTheme {
         UiTheme {
             name: name.to_string(),
             generation: 0,
-            foreground: Some(fg),
-            background: Some(bg),
-            accent: Some(Color::Rgb(0x56, 0x9c, 0xd6)),
-            error: Some(Color::Rgb(0xf4, 0x47, 0x47)),
+            foreground: Some(text),
+            background: None,
+            accent: Some(accent),
+            error: Some(error),
         }
     }
 
@@ -96,8 +110,9 @@ impl UiTheme {
         UiTheme {
             name: data.name.clone(),
             generation,
-            foreground: role("foreground"),
-            background: role("background"),
+            foreground: role("text"),
+            // Pi has no global background token; per-component backgrounds are wired separately.
+            background: None,
             accent: role("accent"),
             error: role("error"),
         }

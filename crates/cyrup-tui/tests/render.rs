@@ -108,16 +108,16 @@ fn ingest_events_drive_status_and_transcript() {
 
 #[test]
 fn theme_colors_reach_rendered_cells() {
-    // Dark theme accent (#569cd6) styles the active streaming label; assert it lands on real
-    // viewport cells (an in-flight turn stays in the viewport, unlike committed entries).
-    let accent = Color::Rgb(0x56, 0x9c, 0xd6);
+    // Dark theme accent (Pi `accent` token = #8abeb7) styles the active streaming label; assert it
+    // lands on real viewport cells (an in-flight turn stays in the viewport, unlike committed entries).
+    let accent = Color::Rgb(0x8a, 0xbe, 0xb7);
     let mut app = App::new(TestBackend::new(40, 12), UiTheme::dark()).unwrap();
     app.transcript_mut().push_assistant_delta("colored");
     app.draw().unwrap();
     assert!(has_fg(&app, accent), "dark accent color did not reach any cell");
 
-    // A different theme yields a different accent on the cells.
-    let light_accent = Color::Rgb(0x00, 0x00, 0xff);
+    // A different theme yields a different accent on the cells (Pi light `accent` = teal #5a8080).
+    let light_accent = Color::Rgb(0x5a, 0x80, 0x80);
     let mut light = App::new(TestBackend::new(40, 12), UiTheme::light()).unwrap();
     light.transcript_mut().push_assistant_delta("colored");
     light.draw().unwrap();
@@ -172,9 +172,13 @@ fn committed_entries_flush_exactly_once() {
 fn builtin_themes_resolve_known_colors() {
     let dark = UiTheme::builtin("dark");
     assert_eq!(dark.name, "dark");
-    assert_eq!(dark.accent, Some(Color::Rgb(0x56, 0x9c, 0xd6)));
+    // Pi dark `accent` token resolves through `vars.accent` to #8abeb7; `text` to #d4d4d4.
+    assert_eq!(dark.accent, Some(Color::Rgb(0x8a, 0xbe, 0xb7)));
+    assert_eq!(dark.foreground, Some(Color::Rgb(0xd4, 0xd4, 0xd4)));
     let light = UiTheme::builtin("light");
     assert_eq!(light.name, "light");
+    // Pi light `accent` token resolves through `vars.teal` to #5a8080.
+    assert_eq!(light.accent, Some(Color::Rgb(0x5a, 0x80, 0x80)));
     // Unknown names fall back to the dark palette (never panics).
     let fallback = UiTheme::builtin("does-not-exist");
     assert_eq!(fallback.accent, dark.accent);
