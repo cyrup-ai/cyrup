@@ -20,14 +20,6 @@ fn default_api() -> ApiId {
     ApiId::from(UNRESOLVED_API)
 }
 
-/// `skip_serializing_if` predicate for an optional-on-the-wire `bool` that defaults to `false`
-/// (e.g. [`Content::Thinking::redacted`], Pi `redacted?: boolean`, types.ts:335): omit the key when
-/// `false` so the absence/`false` JSON shapes match Pi byte-for-byte.
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde `skip_serializing_if` requires `fn(&T) -> bool`
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 /// Reasoning effort *level* (Pi `ThinkingLevel`, types.ts:74) — the "on" levels only, with NO
 /// `off`. This is the per-request reasoning intensity (Pi `SimpleStreamOptions.reasoning?:
 /// ThinkingLevel`); the *absence* of a level (or [`ModelThinkingLevel::Off`]) means reasoning is
@@ -144,7 +136,15 @@ impl TextSignatureV1 {
 }
 
 /// A model-issued tool call (func-01 §4.4).
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Pi's `ToolCall` data type ALWAYS carries `type: "toolCall"` (types.ts:344-345). cyrup makes the
+/// bare struct self-tag via a manual [`serde::Serialize`] that emits `type` first, in Pi's
+/// declaration order (`type`, `id`, `name`, `arguments`, `thoughtSignature?`). This is the single
+/// source of truth for the discriminant: [`Content::ToolCall`] delegates here (so it does NOT
+/// inject a second `type` — no duplicate key), and `StreamEvent::ToolCallEnd.tool_call` serializes
+/// the bare struct directly. [`serde::Deserialize`] is derived (it tolerates the extra `type` key
+/// present in Pi input — no field binds it — keeping read 1:1 with Pi).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: ToolCallId,
@@ -159,6 +159,32 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
+impl serde::Serialize for ToolCall {
+    /// Self-tagging serializer: emits `type: "toolCall"` first (Pi `ToolCall.type`, types.ts:345),
+    /// then `id`, `name`, `arguments`, and `thoughtSignature` (only when present) — byte-1:1 with
+    /// Pi's `ToolCall` interface (types.ts:344-350). Single source of the discriminant: callers that
+    /// embed a `ToolCall` (the [`Content::ToolCall`] variant, `StreamEvent::ToolCallEnd.tool_call`)
+    /// delegate here rather than injecting their own `type`, so the key is never duplicated.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let has_sig = self.thought_signature.is_some();
+        let len = 4 + usize::from(has_sig);
+        let mut st = serializer.serialize_struct("ToolCall", len)?;
+        st.serialize_field("type", "toolCall")?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("arguments", &self.arguments)?;
+        match &self.thought_signature {
+            Some(sig) => st.serialize_field("thoughtSignature", sig)?,
+            None => st.skip_field("thoughtSignature")?,
+        }
+        st.end()
+    }
+}
+
 /// A typed content block (func-01 §4.4).
 ///
 /// Per-role typing (gap 9): Pi types content per role — assistant = `Text|Thinking|ToolCall`,
@@ -168,7 +194,7 @@ pub struct ToolCall {
 /// an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is
 /// REJECTED on deserialize, exactly as Pi's typed unions reject it. Producers still build the right
 /// variants by construction.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Content {
     Text {
@@ -185,9 +211,10 @@ pub enum Content {
         /// Pi `redacted?: boolean` (types.ts:335) — OMITTED when unset. Pi only ever emits
         /// `redacted: true` (a safety-redacted block); an un-redacted block leaves the key
         /// `undefined`, so `JSON.stringify` drops it. cyrup keeps the field a plain `bool`
-        /// (`false` = not redacted) and skips serializing the `false` default, so a non-redacted
-        /// block emits no `redacted` key — byte-1:1 with Pi — while `redacted: true` still writes.
-        #[serde(default, skip_serializing_if = "is_false")]
+        /// (`false` = not redacted); the manual [`Content`] serializer omits the `false` default, so
+        /// a non-redacted block emits no `redacted` key — byte-1:1 with Pi — while `redacted: true`
+        /// still writes.
+        #[serde(default)]
         redacted: bool,
     },
     ToolCall(ToolCall),
@@ -196,6 +223,61 @@ pub enum Content {
         data: String,
         mime_type: String,
     },
+}
+
+impl serde::Serialize for Content {
+    /// Internally-tagged serializer (`tag = "type"`, camelCase fields) written by hand so the
+    /// `ToolCall` variant can DELEGATE to [`ToolCall`]'s own self-tagging serializer — the single
+    /// source of the `type:"toolCall"` discriminant. A derived internally-tagged serializer would
+    /// inject its own `type` on top of `ToolCall`'s, producing a duplicate key; delegating avoids
+    /// that while keeping the other variants byte-1:1 with the prior derived output.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        match self {
+            Content::Text { text, text_signature } => {
+                let mut st = serializer
+                    .serialize_struct("Content", 2 + usize::from(text_signature.is_some()))?;
+                st.serialize_field("type", "text")?;
+                st.serialize_field("text", text)?;
+                match text_signature {
+                    Some(sig) => st.serialize_field("textSignature", sig)?,
+                    None => st.skip_field("textSignature")?,
+                }
+                st.end()
+            }
+            Content::Thinking { thinking, thinking_signature, redacted } => {
+                let len =
+                    2 + usize::from(thinking_signature.is_some()) + usize::from(*redacted);
+                let mut st = serializer.serialize_struct("Content", len)?;
+                st.serialize_field("type", "thinking")?;
+                st.serialize_field("thinking", thinking)?;
+                match thinking_signature {
+                    Some(sig) => st.serialize_field("thinkingSignature", sig)?,
+                    None => st.skip_field("thinkingSignature")?,
+                }
+                if *redacted {
+                    st.serialize_field("redacted", &true)?;
+                } else {
+                    st.skip_field("redacted")?;
+                }
+                st.end()
+            }
+            // Single source of the `type:"toolCall"` discriminant: delegate to `ToolCall` so the tag
+            // is emitted exactly once (no duplicate key), with `id`/`name`/`arguments`/
+            // `thoughtSignature?` flattened — byte-1:1 with Pi's tool-call content.
+            Content::ToolCall(tool_call) => tool_call.serialize(serializer),
+            Content::Image { data, mime_type } => {
+                let mut st = serializer.serialize_struct("Content", 3)?;
+                st.serialize_field("type", "image")?;
+                st.serialize_field("data", data)?;
+                st.serialize_field("mimeType", mime_type)?;
+                st.end()
+            }
+        }
+    }
 }
 
 impl Content {
@@ -648,6 +730,56 @@ mod tests {
         let rv = serde_json::to_value(&redacted).expect("serialize");
         assert_eq!(rv["redacted"], true);
         assert_eq!(serde_json::from_value::<Content>(rv).expect("deserialize"), redacted);
+    }
+
+    #[test]
+    fn bare_tool_call_self_tags_with_exactly_one_type_key() {
+        // Req 1 + 4: Pi's `ToolCall` always carries `type:"toolCall"` (types.ts:344-345). The bare
+        // struct self-tags exactly once, in Pi field order, and round-trips.
+        let tc = ToolCall {
+            id: "tc1".into(),
+            name: "read".into(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+        };
+        let s = serde_json::to_string(&tc).expect("serialize");
+        assert_eq!(s.matches("\"type\"").count(), 1, "exactly one type key: {s}");
+        let v = serde_json::to_value(&tc).expect("serialize");
+        assert_eq!(v["type"], "toolCall");
+        assert_eq!(v["id"], "tc1");
+        assert_eq!(v["name"], "read");
+        assert!(v["arguments"].is_object());
+        assert!(v.get("thoughtSignature").is_none(), "omitted when None: {v}");
+        // Round-trip (req 4).
+        assert_eq!(serde_json::from_value::<ToolCall>(v).expect("deserialize"), tc);
+        // thoughtSignature is emitted (camelCase) when present and still round-trips.
+        let tc_sig = ToolCall { thought_signature: Some("sig".into()), ..tc.clone() };
+        let vs = serde_json::to_value(&tc_sig).expect("serialize");
+        assert_eq!(vs["thoughtSignature"], "sig");
+        assert_eq!(serde_json::from_value::<ToolCall>(vs).expect("deserialize"), tc_sig);
+    }
+
+    #[test]
+    fn content_tool_call_flattens_single_type_key_no_duplicate() {
+        // Req 2 + 4: `Content::ToolCall` delegates to `ToolCall`'s self-tag — exactly ONE
+        // `type:"toolCall"` (no duplicate key), fields flattened, byte-1:1 with Pi tool-call content.
+        let tc = ToolCall {
+            id: "t".into(),
+            name: "n".into(),
+            arguments: serde_json::Map::new(),
+            thought_signature: Some("g".into()),
+        };
+        let c = Content::ToolCall(tc);
+        let s = serde_json::to_string(&c).expect("serialize");
+        assert_eq!(s.matches("\"type\"").count(), 1, "no duplicate type key: {s}");
+        assert!(s.starts_with("{\"type\":\"toolCall\""), "type emitted first: {s}");
+        let v = serde_json::to_value(&c).expect("serialize");
+        assert_eq!(v["type"], "toolCall");
+        assert_eq!(v["id"], "t");
+        assert_eq!(v["name"], "n");
+        assert_eq!(v["thoughtSignature"], "g");
+        // Round-trip (req 4): Pi input (with `type` present) deserializes back to an equal value.
+        assert_eq!(serde_json::from_value::<Content>(v).expect("deserialize"), c);
     }
 
     #[test]

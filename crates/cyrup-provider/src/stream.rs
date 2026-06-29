@@ -110,47 +110,18 @@ pub enum StreamEvent {
     ToolCallStart { content_index: usize, partial: AssistantMessage },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta { content_index: usize, delta: String, partial: AssistantMessage },
-    /// Pi `toolcall_end` (types.ts:463). The `tool_call` field serializes with Pi's
-    /// `type:"toolCall"` discriminant first (Pi `ToolCall.type`, types.ts:345) via
-    /// [`serialize_tagged_tool_call`] — a standalone `ToolCall` is otherwise tagged only by the
-    /// `Content::ToolCall` enum and would emit no discriminant here. Deserialize uses `ToolCall`'s
-    /// own impl, which ignores the extra `type` key.
+    /// Pi `toolcall_end` (types.ts:463). The `tool_call` field carries Pi's `type:"toolCall"`
+    /// discriminant first (Pi `ToolCall.type`, types.ts:345) because [`ToolCall`] now self-tags via
+    /// its own [`serde::Serialize`] impl — the single source of the discriminant. Deserialize uses
+    /// `ToolCall`'s derived impl, which tolerates the extra `type` key.
     #[serde(rename = "toolcall_end")]
-    ToolCallEnd {
-        content_index: usize,
-        #[serde(serialize_with = "serialize_tagged_tool_call")]
-        tool_call: ToolCall,
-        partial: AssistantMessage,
-    },
+    ToolCallEnd { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
     /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse}; `message.stop_reason` matches.
     #[serde(rename = "done")]
     Done { reason: StopReason, message: AssistantMessage },
     /// Terminal: error/abort. `reason` ∈ {error, aborted}; the final message is keyed `error` (Pi).
     #[serde(rename = "error")]
     Error { reason: StopReason, error: AssistantMessage },
-}
-
-/// Serialize a standalone [`ToolCall`] with Pi's `type:"toolCall"` discriminant first, then its
-/// fields in Pi declaration order (`id`, `name`, `arguments`, `thoughtSignature?`) — byte-1:1 with
-/// Pi's `ToolCall` interface (types.ts:344-350). Used for `StreamEvent::ToolCallEnd.tool_call`,
-/// where the `ToolCall` is serialized bare (outside the `Content::ToolCall` enum that would
-/// otherwise supply the tag), matching Pi's `toolcall_end.toolCall` (types.ts:463).
-fn serialize_tagged_tool_call<S>(tool_call: &ToolCall, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeStruct as _;
-    let has_sig = tool_call.thought_signature.is_some();
-    let len = 4 + usize::from(has_sig);
-    let mut st = serializer.serialize_struct("ToolCall", len)?;
-    st.serialize_field("type", "toolCall")?;
-    st.serialize_field("id", &tool_call.id)?;
-    st.serialize_field("name", &tool_call.name)?;
-    st.serialize_field("arguments", &tool_call.arguments)?;
-    if let Some(sig) = &tool_call.thought_signature {
-        st.serialize_field("thoughtSignature", sig)?;
-    }
-    st.end()
 }
 
 impl StreamEvent {
