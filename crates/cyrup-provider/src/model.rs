@@ -34,12 +34,10 @@ pub struct Model {
     pub name: String,
     pub api: ApiId,
     pub provider: ProviderId,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub base_url: Option<String>,
+    /// Required base URL for the provider endpoint (Pi `Model.baseUrl: string`, types.ts:671).
+    pub base_url: String,
     pub reasoning: bool,
     pub input: Vec<Modality>,
-    #[serde(default)]
-    pub output: Vec<Modality>,
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,

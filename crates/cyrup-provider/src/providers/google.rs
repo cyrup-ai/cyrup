@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(models.len(), 16);
         assert!(models.iter().all(|m| m.api.as_str() == GOOGLE_GENERATIVE_AI));
         assert!(models.iter().all(|m| m.provider.as_str() == "google"));
-        assert!(models.iter().all(|m| m.base_url.as_deref() == Some(GOOGLE_BASE_URL)));
+        assert!(models.iter().all(|m| m.base_url == GOOGLE_BASE_URL));
         // Every Gemini model accepts image input.
         assert!(models.iter().all(|m| m.supports_image_input()));
     }
@@ -128,7 +128,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(env));
         let mut model = provider.get_model("gemini-2.5-pro").unwrap().clone();
-        model.base_url = Some("http://127.0.0.1:1".to_string());
+        model.base_url = "http://127.0.0.1:1".to_string();
         let msg = collect_message(provider.stream(
             &model,
             &Context::default(),

@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(models.len(), 30);
         assert!(models.iter().all(|m| m.api.as_str() == MISTRAL_CONVERSATIONS));
         assert!(models.iter().all(|m| m.provider.as_str() == "mistral"));
-        assert!(models.iter().all(|m| m.base_url.as_deref() == Some(MISTRAL_BASE_URL)));
+        assert!(models.iter().all(|m| m.base_url == MISTRAL_BASE_URL));
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(env));
         let mut model = provider.get_model("codestral-latest").unwrap().clone();
-        model.base_url = Some("http://127.0.0.1:1".to_string());
+        model.base_url = "http://127.0.0.1:1".to_string();
         let msg = collect_message(provider.stream(
             &model,
             &Context::default(),

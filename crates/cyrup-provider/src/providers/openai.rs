@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(models.len(), 42);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_RESPONSES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openai"));
-        assert!(models.iter().all(|m| m.base_url.as_deref() == Some(OPENAI_BASE_URL)));
+        assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));
     }
 
     #[test]
@@ -107,7 +107,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(env));
         let mut model = provider.get_model("gpt-4").unwrap().clone();
-        model.base_url = Some("http://127.0.0.1:1/v1".to_string());
+        model.base_url = "http://127.0.0.1:1/v1".to_string();
         let msg = collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();

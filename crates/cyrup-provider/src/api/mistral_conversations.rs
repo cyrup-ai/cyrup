@@ -136,7 +136,7 @@ impl ApiImpl for MistralConversationsApi {
 /// mistral-conversations.ts:65-68). An auth base-url override wins over `model.base_url`. The
 /// endpoint is `{base}/v1/chat/completions`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
     Some(chat_url(base))
 }
 
@@ -1023,10 +1023,9 @@ mod tests {
             name: id.into(),
             api: API_ID.into(),
             provider: "mistral".into(),
-            base_url: Some("https://api.mistral.ai".to_string()),
+            base_url: "https://api.mistral.ai".to_string(),
             reasoning,
             input: vec![Modality::Text],
-            output: Vec::new(),
             cost: ModelCost { input: 0.4, output: 2.0, cache_read: 0.04, cache_write: 0.0 },
             context_window: 256_000,
             max_tokens: 4096,

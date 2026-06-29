@@ -209,10 +209,9 @@ mod tests {
             name: "M1".into(),
             api: api.into(),
             provider: "p".into(),
-            base_url: None,
+            base_url: String::new(),
             reasoning: false,
             input: vec![Modality::Text],
-            output: Vec::new(),
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 100,
@@ -430,7 +429,7 @@ mod tests {
         ) {
             let provider = model.provider.clone();
             let model_id = model.id.as_str().to_string();
-            let url = model.base_url.clone().unwrap_or_default();
+            let url = model.base_url.clone();
 
             let client = match crate::stream::sse::build_client() {
                 Ok(c) => c,
@@ -520,7 +519,7 @@ mod tests {
 
     fn sse_provider(base_url: String) -> (WireProvider, Model) {
         let mut model = test_model("sse-echo");
-        model.base_url = Some(base_url);
+        model.base_url = base_url;
         let registry = ApiRegistry::new();
         registry.register_impl(Arc::new(SseEchoApi { api: ApiId::from("sse-echo") }));
         (provider_with(registry, &model), model)
@@ -595,7 +594,7 @@ mod tests {
 
         let cancel = CancelToken::new();
         let mut model = test_model("sse-echo");
-        model.base_url = Some(format!("http://{addr}/v1/stream"));
+        model.base_url = format!("http://{addr}/v1/stream");
         let registry = ApiRegistry::new();
         registry.register_impl(Arc::new(SseEchoApi { api: ApiId::from("sse-echo") }));
         let provider = provider_with(registry, &model);

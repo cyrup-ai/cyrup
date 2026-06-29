@@ -125,7 +125,7 @@ impl ApiImpl for OpenAiCompletionsApi {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/chat/completions` (appended unless `base` already names it).
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
     Some(chat_completions_url(base))
 }
 
@@ -256,7 +256,7 @@ pub(crate) fn build_body_with_env(
     let cache = resolve_cache_retention(opts.cache_retention, env);
     let mut messages = convert_messages(model, ctx, &compat);
     let cache_control = compat_cache_control(&compat, cache);
-    let base_url = model.base_url.as_deref().unwrap_or("");
+    let base_url = model.base_url.as_str();
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(model.id.as_str()));
@@ -1770,10 +1770,9 @@ mod tests {
             name: "GPT OSS".into(),
             api: API_ID.into(),
             provider: "together".into(),
-            base_url: Some("https://api.together.ai/v1".to_string()),
+            base_url: "https://api.together.ai/v1".to_string(),
             reasoning: true,
             input: vec![Modality::Text],
-            output: vec![Modality::Text],
             cost: ModelCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.0 },
             context_window: 131072,
             max_tokens: 131072,
@@ -1967,7 +1966,7 @@ mod tests {
         let mut m = model();
         m.id = "gpt-5".into();
         m.provider = "openai".into();
-        m.base_url = Some("https://api.openai.com/v1".to_string());
+        m.base_url = "https://api.openai.com/v1".to_string();
         m
     }
 

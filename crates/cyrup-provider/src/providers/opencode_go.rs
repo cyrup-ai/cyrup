@@ -92,7 +92,7 @@ mod tests {
         // minimax-m3: anthropic-messages, no compat block (rides anthropic defaults).
         let mm = find("minimax-m3");
         assert_eq!(mm.api.as_str(), ANTHROPIC_MESSAGES);
-        assert_eq!(mm.base_url.as_deref(), Some("https://opencode.ai/zen/go"));
+        assert_eq!(mm.base_url, "https://opencode.ai/zen/go");
         assert!(mm.compat.is_none());
 
         // qwen3.6-plus: openai-completions, qwen thinking format.

@@ -137,7 +137,7 @@ impl ApiImpl for OpenAiResponsesApi {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/responses` (the OpenAI SDK's `client.responses.create` path).
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/responses") {
         Some(trimmed.to_string())
@@ -1108,10 +1108,9 @@ mod tests {
             name: "GPT-5".into(),
             api: API_ID.into(),
             provider: "openai".into(),
-            base_url: Some("https://api.openai.com/v1".to_string()),
+            base_url: "https://api.openai.com/v1".to_string(),
             reasoning: true,
             input: vec![Modality::Text],
-            output: vec![Modality::Text],
             cost: ModelCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.0 },
             context_window: 400_000,
             max_tokens: 128_000,

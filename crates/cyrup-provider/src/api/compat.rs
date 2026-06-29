@@ -244,7 +244,7 @@ pub fn off_value_or(map: Option<&ThinkingLevelMap>, fallback: &str) -> String {
 /// 1:1 port of Pi `detectCompat` (openai-completions.ts L1173-1254).
 pub fn detect_compat(model: &Model) -> ResolvedCompat {
     let provider = model.provider.as_str();
-    let base_url = model.base_url.as_deref().unwrap_or("");
+    let base_url = model.base_url.as_str();
     let id = model.id.as_str();
 
     let is_zai = provider == "zai"
@@ -428,10 +428,9 @@ mod tests {
             name: "M".into(),
             api: crate::known_api::OPENAI_COMPLETIONS.into(),
             provider: provider.into(),
-            base_url: Some(base_url.to_string()),
+            base_url: base_url.to_string(),
             reasoning: true,
             input: vec![Modality::Text],
-            output: vec![Modality::Text],
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 1000,

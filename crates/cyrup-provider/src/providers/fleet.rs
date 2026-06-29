@@ -143,7 +143,7 @@ mod tests {
             assert!(models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS), "{id} api");
             assert!(models.iter().all(|m| m.provider.as_str() == *id), "{id} provider tag");
             // baseUrl is always present in the generated catalog.
-            assert!(models.iter().all(|m| m.base_url.is_some()), "{id} baseUrl");
+            assert!(models.iter().all(|m| !m.base_url.is_empty()), "{id} baseUrl");
         }
     }
 

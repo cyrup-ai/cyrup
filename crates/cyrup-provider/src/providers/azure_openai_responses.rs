@@ -134,7 +134,7 @@ mod tests {
         )]))));
         let mut model = provider.models().first().expect("model").clone();
         // A concrete (unroutable) base URL so normalization + the /responses route are exercised.
-        model.base_url = Some("http://127.0.0.1:1".to_string());
+        model.base_url = "http://127.0.0.1:1".to_string();
         let msg =
             collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
                 .await;
@@ -158,7 +158,7 @@ mod tests {
         )]))));
         // Catalog models carry an empty baseUrl, so no Azure endpoint can be resolved.
         let model = provider.models().first().expect("model").clone();
-        assert_eq!(model.base_url.as_deref(), Some(""));
+        assert_eq!(model.base_url, "");
         let msg =
             collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
                 .await;

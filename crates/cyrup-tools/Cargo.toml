@@ -31,6 +31,7 @@ ignore = { workspace = true }
 similar = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-normalization = { workspace = true }
+feruca = { workspace = true }
 image = { workspace = true, optional = true }
 
 [features]

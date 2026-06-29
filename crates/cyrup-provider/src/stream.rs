@@ -97,6 +97,12 @@ pub struct StreamOptions {
     /// Unified reasoning level (func-01 R-01-040). Additive, backward-compatible (defaulted to
     /// `Off`); a non-reasoning model silently ignores it (R-01-041).
     pub reasoning: ModelThinkingLevel,
+    /// Per-level custom thinking token budgets for token-budget providers (Pi
+    /// `SimpleStreamOptions.thinkingBudgets`, types.ts:293). `build_base_options` threads the unified
+    /// `SimpleStreamOptions.thinking_budgets` here so the API wire (e.g. anthropic-messages'
+    /// `adjustMaxTokensForThinking`, anthropic-messages.ts:792-797) can honor it. A non-budget
+    /// provider ignores it. Additive, backward-compatible (defaults to `None`).
+    pub thinking_budgets: Option<crate::utils::simple_options::ThinkingBudgets>,
     /// Per-request header overlay; a `None` value suppresses a default header (func-01 §4.1).
     pub headers: Option<crate::HeaderMap>,
     /// Optional tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`). Additive,

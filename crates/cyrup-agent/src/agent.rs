@@ -14,9 +14,10 @@
 //   `before_tool_call` still run as-is, without re-validation (R-02-022).
 // - A-02-10 (second half): no mutable-aliasing state getter is exposed (snapshots are copies and
 //   setters copy-on-assign). Intentional Rust `[CYRUP-DELTA]` from the TS source.
-// - thinkingBudgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112): NOT forwarded — blocked on a
-//   `cyrup_provider::StreamOptions.thinking_budgets` field (cross-crate). The unified `reasoning`
-//   level IS forwarded; per-level token budgets need the provider surface. Tracked as a blocker.
+// - thinkingBudgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112): DONE — forwarded via
+//   `GenerationConfig.thinking_budgets` into `cyrup_provider::StreamOptions.thinking_budgets`
+//   (anthropic-messages.ts:792-797 lowers it per-level). The unified `reasoning` level is forwarded
+//   alongside it.
 // - Proxy `StreamFn` (Pi `streamProxy`, proxy.ts): PORTED in `proxy.rs` — the wire enum
 //   (`ProxyAssistantMessageEvent`), client-side partial rebuild (`ProxyMessageBuilder`, Pi
 //   `processProxyEvent`), options/body (`ProxyStreamOptions`/`buildProxyRequestOptions`), and the
@@ -554,6 +555,7 @@ impl RunCtx {
             transport: self.gen_config.transport,
             max_retry_delay_ms: self.gen_config.max_retry_delay_ms,
             max_retries: self.gen_config.max_retries,
+            thinking_budgets: self.gen_config.thinking_budgets,
             on_payload: self.gen_config.on_payload.clone(),
             on_response: self.gen_config.on_response.clone(),
             ..Default::default()
@@ -1529,6 +1531,13 @@ impl AgentBuilder {
     /// Max client-side retry attempts (Pi `SimpleStreamOptions.maxRetries`).
     pub fn max_retries(mut self, n: u32) -> Self {
         self.gen_config.max_retries = Some(n);
+        self
+    }
+    /// Per-level custom thinking token budgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112).
+    /// Forwarded into `cyrup_provider::StreamOptions.thinking_budgets`; budget-based providers honor
+    /// it, others ignore it.
+    pub fn thinking_budgets(mut self, b: cyrup_provider::ThinkingBudgets) -> Self {
+        self.gen_config.thinking_budgets = Some(b);
         self
     }
     /// Static API-key fallback used when no dynamic [`ApiKeyResolver`] yields one (Pi `config.apiKey`

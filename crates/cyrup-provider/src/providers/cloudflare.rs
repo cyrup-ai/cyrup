@@ -96,8 +96,6 @@ impl ApiKeyAuth for CloudflareWorkersAiAuth {
         // `resolveCloudflareBaseUrl`: replace every `{CLOUDFLARE_ACCOUNT_ID}` placeholder.
         let base_url = model
             .base_url
-            .clone()
-            .unwrap_or_default()
             .replace(&format!("{{{CLOUDFLARE_ACCOUNT_ID}}}"), &account_id);
 
         let mut env = ProviderEnv::new();
@@ -167,8 +165,6 @@ impl ApiKeyAuth for CloudflareAiGatewayAuth {
         // `resolveCloudflareBaseUrl`: replace every `{CLOUDFLARE_ACCOUNT_ID}` + `{CLOUDFLARE_GATEWAY_ID}`.
         let base_url = model
             .base_url
-            .clone()
-            .unwrap_or_default()
             .replace(&format!("{{{CLOUDFLARE_ACCOUNT_ID}}}"), &account_id)
             .replace(&format!("{{{CLOUDFLARE_GATEWAY_ID}}}"), &gateway_id);
 
@@ -283,9 +279,7 @@ mod tests {
         // Every catalog entry carries the unresolved account-id placeholder in its base URL.
         assert!(models
             .iter()
-            .all(|m| m.base_url.as_deref() == Some(
-                "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
-            )));
+            .all(|m| m.base_url == "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"));
         // The shared compat block (Pi: store/developer/long-cache off, session-affinity on).
         let m = models.iter().find(|m| m.id.as_str() == "@cf/openai/gpt-oss-120b").expect("gpt-oss");
         let c = m.compat.as_ref().expect("compat");
@@ -393,7 +387,7 @@ mod tests {
         ]))));
         let mut model = provider.get_model("@cf/openai/gpt-oss-120b").expect("model").clone();
         // Replace the catalog base URL with one whose placeholder yields an unroutable address.
-        model.base_url = Some("http://127.0.0.1:1/{CLOUDFLARE_ACCOUNT_ID}/v1".to_string());
+        model.base_url = "http://127.0.0.1:1/{CLOUDFLARE_ACCOUNT_ID}/v1".to_string();
         let msg =
             collect_message(provider.stream(&model, &Context::default(), &StreamOptions::default()))
                 .await;
@@ -442,7 +436,7 @@ mod tests {
         assert_eq!(count(OPENAI_COMPLETIONS), 4);
         assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 16);
         assert!(models.iter().all(|m| {
-            let b = m.base_url.as_deref().unwrap_or_default();
+            let b = m.base_url.as_str();
             b.contains("{CLOUDFLARE_ACCOUNT_ID}") && b.contains("{CLOUDFLARE_GATEWAY_ID}")
         }));
     }
@@ -567,7 +561,7 @@ mod tests {
                 (CLOUDFLARE_GATEWAY_ID.to_string(), "gw".to_string()),
             ]))));
             let mut model = provider.get_model(id).expect("model").clone();
-            model.base_url = Some("http://127.0.0.1:1/v1".to_string());
+            model.base_url = "http://127.0.0.1:1/v1".to_string();
             let msg = collect_message(provider.stream(
                 &model,
                 &Context::default(),

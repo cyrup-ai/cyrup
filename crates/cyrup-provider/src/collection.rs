@@ -333,7 +333,7 @@ impl AuthHelper {
         let auth = &resolution.auth;
         let mut request_model = model.clone();
         if let Some(base_url) = &auth.base_url {
-            request_model.base_url = Some(base_url.clone());
+            request_model.base_url = base_url.clone();
         }
         let mut request_options = options.clone();
         request_options.api_key = options.api_key.clone().or_else(|| auth.api_key.clone());
@@ -472,10 +472,9 @@ mod tests {
             name: id.into(),
             api: OPENAI_COMPLETIONS.into(),
             provider: provider.into(),
-            base_url: Some("https://example.test/v1".into()),
+            base_url: "https://example.test/v1".into(),
             reasoning,
             input: vec![Modality::Text],
-            output: vec![Modality::Text],
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 1000,
@@ -576,7 +575,7 @@ mod tests {
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let mut m = models.get_models(Some("groq")).into_iter().next().expect("groq model");
-        m.base_url = Some("http://127.0.0.1:1/v1".to_string());
+        m.base_url = "http://127.0.0.1:1/v1".to_string();
         let msg = collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
             .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
@@ -609,7 +608,7 @@ mod tests {
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let mut m = models.get_models(Some("groq")).into_iter().next().expect("groq model");
-        m.base_url = Some("http://127.0.0.1:1/v1".to_string());
+        m.base_url = "http://127.0.0.1:1/v1".to_string();
         let opts = SimpleStreamOptions { reasoning: Some(cyrup_core::ThinkingLevel::Low), ..Default::default() };
         let msg = collect_message(models.stream_simple(&m, &Context::default(), &opts)).await;
         assert_eq!(msg.stop_reason, StopReason::Error);

@@ -89,6 +89,9 @@ pub fn build_base_options(
         // Carried through so a downstream collection can map the unified level to provider thinking.
         reasoning: options.base.reasoning,
         tool_choice: options.base.tool_choice.clone(),
+        // Per-level custom thinking budgets ride through to budget-based providers (Pi
+        // `streamSimple` forwards `options.thinkingBudgets`, anthropic-messages.ts:792-797).
+        thinking_budgets: options.thinking_budgets,
     }
 }
 
@@ -154,10 +157,9 @@ mod tests {
             name: "M".into(),
             api: "openai-completions".into(),
             provider: "openai".into(),
-            base_url: None,
+            base_url: String::new(),
             reasoning: true,
             input: vec![Modality::Text],
-            output: Vec::new(),
             cost: ModelCost::default(),
             context_window,
             max_tokens,

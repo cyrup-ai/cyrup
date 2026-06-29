@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(models.len(), 25);
         assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "anthropic"));
-        assert!(models.iter().all(|m| m.base_url.as_deref() == Some(ANTHROPIC_BASE_URL)));
+        assert!(models.iter().all(|m| m.base_url == ANTHROPIC_BASE_URL));
         // All Claude models accept image input.
         assert!(models.iter().all(|m| m.supports_image_input()));
     }
@@ -235,7 +235,7 @@ mod tests {
             assert_eq!(models.len(), count, "catalog count mismatch for {id}");
             assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES), "{id} api");
             assert!(models.iter().all(|m| m.provider.as_str() == id), "{id} provider tag");
-            assert!(models.iter().all(|m| m.base_url.is_some()), "{id} baseUrl");
+            assert!(models.iter().all(|m| !m.base_url.is_empty()), "{id} baseUrl");
             // Every fleet provider has an env-key mapping in env-api-keys.
             let vars = crate::env_api_keys::api_key_env_vars(id)
                 .unwrap_or_else(|| panic!("no env mapping for {id}"));
@@ -285,7 +285,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(env));
         let mut model = provider.get_model("claude-opus-4-5").unwrap().clone();
-        model.base_url = Some("http://127.0.0.1:1".to_string());
+        model.base_url = "http://127.0.0.1:1".to_string();
         let msg = collect_message(provider.stream(
             &model,
             &Context::default(),

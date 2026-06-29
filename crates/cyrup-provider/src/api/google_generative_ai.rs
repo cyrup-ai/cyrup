@@ -136,7 +136,7 @@ impl ApiImpl for GoogleGenerativeAiApi {
 /// An auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/models/{model}:streamGenerateContent?alt=sse`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
     Some(stream_url(base, model.id.as_str()))
 }
 
@@ -1035,10 +1035,9 @@ mod tests {
             name: id.into(),
             api: API_ID.into(),
             provider: "google".into(),
-            base_url: Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             reasoning,
             input: vec![Modality::Text, Modality::Image],
-            output: Vec::new(),
             cost: ModelCost { input: 0.3, output: 2.5, cache_read: 0.03, cache_write: 0.0 },
             context_window: 1_048_576,
             max_tokens: 65_536,

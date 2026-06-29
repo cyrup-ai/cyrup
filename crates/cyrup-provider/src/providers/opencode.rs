@@ -81,7 +81,7 @@ mod tests {
         let models = opencode_models();
         assert_eq!(models.len(), 45);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode"));
-        assert!(models.iter().all(|m| m.base_url.is_some()));
+        assert!(models.iter().all(|m| !m.base_url.is_empty()));
         // The catalog spans all four wire protocols this provider declares (Pi opencode.ts:8-23).
         let apis: BTreeSet<&str> = models.iter().map(|m| m.api.as_str()).collect();
         assert!(apis.contains(ANTHROPIC_MESSAGES));
@@ -139,7 +139,7 @@ mod tests {
             .find(|m| m.api.as_str() == GOOGLE_GENERATIVE_AI)
             .expect("a google-tagged opencode model")
             .clone();
-        model.base_url = Some("http://127.0.0.1:1".to_string());
+        model.base_url = "http://127.0.0.1:1".to_string();
         let msg = collect_message(provider.stream(
             &model,
             &Context::default(),

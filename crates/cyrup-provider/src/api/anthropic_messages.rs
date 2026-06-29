@@ -274,7 +274,7 @@ fn is_oauth_token(api_key: &str) -> bool {
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/v1/messages`.
 fn resolve_url(model: &Model, auth: &AuthResult) -> Option<String> {
-    let base = auth.auth.base_url.as_deref().or(model.base_url.as_deref())?;
+    let base = auth.auth.base_url.as_deref().unwrap_or(model.base_url.as_str());
     Some(messages_url(base))
 }
 
@@ -416,8 +416,12 @@ pub(crate) fn build_params(
     let mut budget_tokens: u64 = 1024;
     let max_tokens: u64 = if thinking_enabled && !adaptive {
         let level = opts.reasoning.level().unwrap_or(ThinkingLevel::High);
-        let (adjusted, budget) =
-            adjust_max_tokens_for_thinking(opts.max_tokens, model.max_tokens, level, None);
+        let (adjusted, budget) = adjust_max_tokens_for_thinking(
+            opts.max_tokens,
+            model.max_tokens,
+            level,
+            opts.thinking_budgets.as_ref(),
+        );
         let mt = clamp_max_tokens_to_context(model, ctx, adjusted);
         budget_tokens = budget.min(mt.saturating_sub(1024));
         mt
@@ -1369,10 +1373,9 @@ mod tests {
             name: "Claude Opus 4.5".into(),
             api: API_ID.into(),
             provider: "anthropic".into(),
-            base_url: Some("https://api.anthropic.com".to_string()),
+            base_url: "https://api.anthropic.com".to_string(),
             reasoning: true,
             input: vec![Modality::Text, Modality::Image],
-            output: vec![Modality::Text],
             cost: ModelCost { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25 },
             context_window: 200_000,
             max_tokens: 64_000,
@@ -1438,6 +1441,30 @@ mod tests {
         assert!(body["thinking"]["budget_tokens"].as_u64().unwrap() > 0);
         // temperature omitted while thinking is enabled.
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn custom_thinking_budgets_override_default_budget_tokens() {
+        // Pi `streamSimple` forwards `options.thinkingBudgets` into `adjustMaxTokensForThinking`
+        // (anthropic-messages.ts:792-797). A custom `high` budget must override the built-in default
+        // (16_384) in the emitted `thinking.budget_tokens`.
+        let m = model(); // not adaptive, max_tokens 64_000, window 200_000
+        let custom = crate::utils::simple_options::ThinkingBudgets {
+            high: Some(30_000),
+            ..Default::default()
+        };
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            thinking_budgets: Some(custom),
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("think"), &opts);
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64().unwrap(), 30_000);
+        // Sanity: without the override the default (16_384) is used, proving the field threads.
+        let default_opts =
+            StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
+        let default_body = build_body(&m, &user_ctx("think"), &default_opts);
+        assert_eq!(default_body["thinking"]["budget_tokens"].as_u64().unwrap(), 16_384);
     }
 
     #[test]

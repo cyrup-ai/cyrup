@@ -2,7 +2,7 @@
 
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{ModelRef, StopReason, ModelThinkingLevel, Tool, ToolCallId};
-use cyrup_provider::{CacheRetention, OnPayload, OnResponseHook, Transport};
+use cyrup_provider::{CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, Transport};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -26,6 +26,10 @@ pub struct GenerationConfig {
     pub max_retry_delay_ms: Option<u64>,
     /// Max client-side retry attempts (Pi `SimpleStreamOptions.maxRetries`).
     pub max_retries: Option<u32>,
+    /// Per-level custom thinking token budgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112).
+    /// Forwarded into `cyrup_provider::StreamOptions.thinking_budgets`; budget-based providers
+    /// (e.g. anthropic-messages) honor it, others ignore it.
+    pub thinking_budgets: Option<ThinkingBudgets>,
     /// Static API key fallback used when no dynamic resolver yields one (Pi `config.apiKey`
     /// fallback, agent-loop.ts:301-302).
     pub api_key: Option<String>,

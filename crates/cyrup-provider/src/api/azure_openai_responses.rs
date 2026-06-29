@@ -227,7 +227,7 @@ fn resolve_azure_config(
     }
 
     if resolved.is_none()
-        && let Some(base) = model.base_url.as_deref().filter(|s| !s.is_empty())
+        && let Some(base) = Some(model.base_url.as_str()).filter(|s| !s.is_empty())
     {
         resolved = Some(base.to_string());
     }
@@ -344,10 +344,9 @@ mod tests {
             name: "M".into(),
             api: API_ID.into(),
             provider: "azure-openai-responses".into(),
-            base_url: Some(String::new()),
+            base_url: String::new(),
             reasoning,
             input: vec![Modality::Text],
-            output: vec![Modality::Text],
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 1000,

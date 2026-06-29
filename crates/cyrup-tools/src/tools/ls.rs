@@ -68,7 +68,21 @@ impl Tool for LsTool {
         }
 
         let mut entries = self.fs.read_dir(&abs).await?;
-        entries.sort_by_key(|e| e.name.to_lowercase());
+        // Pi: `entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))` (ls.ts:150) —
+        // case-insensitive, locale-aware Unicode collation (ICU-backed in the JS engine). Rust std
+        // orders by Unicode scalar value, which diverges for accented/punctuation-adjacent names
+        // (e.g. `é` collates near `e` under UCA but after `z` by scalar value). `feruca` is a
+        // pure-Rust Unicode Collation Algorithm impl. We mirror the JS engine's default
+        // `localeCompare` (CLDR root collation, "non-ignorable" variable handling, so leading
+        // punctuation like a dotfile's `.` keeps a real primary weight and sorts BEFORE letters —
+        // matching Node's `".dot".localeCompare("a.txt") === -1`). `feruca`'s default `Collator`
+        // uses "shifted" handling, which would IGNORE that dot; so we build a non-ignorable
+        // collator: `Collator::new(Tailoring::default() /* CLDR Root */, false /* shifting */,
+        // true /* byte-value tiebreak */)`. We lower-case both keys first to mirror Pi's
+        // `.toLowerCase()` pre-step exactly.
+        let mut collator =
+            feruca::Collator::new(feruca::Tailoring::default(), false, true);
+        entries.sort_by(|a, b| collator.collate(&a.name.to_lowercase(), &b.name.to_lowercase()));
 
         let limit = input.limit.unwrap_or(self.opts.limit);
         let mut lines: Vec<String> = Vec::new();
@@ -148,5 +162,31 @@ impl ToolMeta for LsTool {
     }
     fn prompt_snippet(&self) -> Option<&str> {
         Some("List directory contents")
+    }
+}
+
+#[cfg(test)]
+mod collation_tests {
+    // Ground truth captured from Node.js (the JS engine Pi runs on), reproducing ls.ts:150:
+    //   const a = [".dot","a.txt","B.txt","zdir","é","e","z","Z","apple","Apple","2","10","1"];
+    //   a.sort((x, y) => x.toLowerCase().localeCompare(y.toLowerCase()));
+    //   // => [".dot","1","10","2","a.txt","apple","Apple","B.txt","e","é","z","Z","zdir"]
+    // This pins the exact `feruca` configuration (non-ignorable variable handling) that matches the
+    // engine's default `localeCompare`: leading punctuation (`.dot`) sorts BEFORE letters, accents
+    // collate adjacent to their base letter (`e` < `é` < `z`), and case is a tertiary tiebreak.
+    #[test]
+    fn collation_matches_node_localecompare() {
+        let mut names = vec![
+            ".dot", "a.txt", "B.txt", "zdir", "é", "e", "z", "Z", "apple", "Apple", "2", "10", "1",
+        ];
+        let mut collator = feruca::Collator::new(feruca::Tailoring::default(), false, true);
+        names.sort_by(|a, b| collator.collate(&a.to_lowercase(), &b.to_lowercase()));
+        assert_eq!(
+            names,
+            vec![
+                ".dot", "1", "10", "2", "a.txt", "apple", "Apple", "B.txt", "e", "é", "z", "Z",
+                "zdir"
+            ]
+        );
     }
 }

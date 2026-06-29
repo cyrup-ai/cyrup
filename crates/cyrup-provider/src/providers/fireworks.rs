@@ -89,7 +89,7 @@ mod tests {
         // glm-5p2 is the openai-completions model with a /v1 base URL + thinking level map.
         let glm = find("accounts/fireworks/models/glm-5p2");
         assert_eq!(glm.api.as_str(), OPENAI_COMPLETIONS);
-        assert_eq!(glm.base_url.as_deref(), Some("https://api.fireworks.ai/inference/v1"));
+        assert_eq!(glm.base_url, "https://api.fireworks.ai/inference/v1");
         let gc = glm.compat.as_ref().expect("compat");
         assert_eq!(gc.supports_store, Some(false));
         assert_eq!(gc.supports_developer_role, Some(false));
@@ -101,7 +101,7 @@ mod tests {
         // deepseek-v4-flash is anthropic-messages with session-affinity + no-eager-tool-streaming.
         let ds = find("accounts/fireworks/models/deepseek-v4-flash");
         assert_eq!(ds.api.as_str(), ANTHROPIC_MESSAGES);
-        assert_eq!(ds.base_url.as_deref(), Some("https://api.fireworks.ai/inference"));
+        assert_eq!(ds.base_url, "https://api.fireworks.ai/inference");
         let dc = ds.compat.as_ref().expect("compat");
         assert_eq!(dc.send_session_affinity_headers, Some(true));
         assert_eq!(dc.supports_eager_tool_input_streaming, Some(false));

@@ -70,10 +70,9 @@ fn model(
         name: name.into(),
         api: OPENAI_COMPLETIONS.into(),
         provider: TOGETHER_PROVIDER_ID.into(),
-        base_url: Some(TOGETHER_BASE_URL.to_string()),
+        base_url: TOGETHER_BASE_URL.to_string(),
         reasoning,
         input,
-        output: vec![Modality::Text],
         cost,
         context_window,
         max_tokens,
@@ -377,7 +376,7 @@ mod tests {
         assert!(models.len() >= 5);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS));
         assert!(models.iter().all(|m| m.provider.as_str() == "together"));
-        assert!(models.iter().all(|m| m.base_url.as_deref() == Some(TOGETHER_BASE_URL)));
+        assert!(models.iter().all(|m| m.base_url == TOGETHER_BASE_URL));
         assert!(p.get_model("openai/gpt-oss-120b").is_some());
     }
 
@@ -495,7 +494,7 @@ mod tests {
 
         let mut model = provider.get_model("openai/gpt-oss-120b").unwrap().clone();
         // Point at an unroutable address so connect fails fast.
-        model.base_url = Some("http://127.0.0.1:1/v1".to_string());
+        model.base_url = "http://127.0.0.1:1/v1".to_string();
 
         let msg = collect_message(provider.stream(
             &model,
