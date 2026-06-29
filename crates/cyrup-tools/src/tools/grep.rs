@@ -10,7 +10,7 @@ use crate::{error, path, ToolMeta};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -53,42 +53,24 @@ impl GrepTool {
     }
 }
 
-struct GrepSink<'a> {
-    rel: String,
-    out: &'a mut Vec<String>,
+/// Collects the 1-based line number of every match in a file, capping the GLOBAL match count at
+/// `limit`. Pi counts each rg `match` event (one per matching line) and stops the child once
+/// `matchCount >= effectiveLimit` (grep.ts:280-292). Context is NOT gathered here — Pi re-reads the
+/// file and formats an INDEPENDENT block per match afterwards (grep.ts:250-268,316-331), so
+/// overlapping context windows DUPLICATE shared lines (one copy per block) rather than merging.
+struct MatchSink<'a> {
+    lines: &'a mut Vec<u64>,
     count: &'a mut usize,
     limit: usize,
-    any_line_truncated: &'a mut bool,
 }
 
-fn clean(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim_end_matches(['\r', '\n']).to_string()
-}
-
-impl Sink for GrepSink<'_> {
+impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
-        let line_no = m.line_number().unwrap_or(0);
-        let text = clean(m.bytes());
-        let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
-        if tr {
-            *self.any_line_truncated = true;
-        }
-        self.out.push(format!("{}:{}: {}", self.rel, line_no, capped));
+        self.lines.push(m.line_number().unwrap_or(0));
         *self.count += 1;
         Ok(*self.count < self.limit)
-    }
-
-    fn context(&mut self, _s: &Searcher, c: &SinkContext<'_>) -> Result<bool, std::io::Error> {
-        let line_no = c.line_number().unwrap_or(0);
-        let text = clean(c.bytes());
-        let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
-        if tr {
-            *self.any_line_truncated = true;
-        }
-        self.out.push(format!("{}-{}- {}", self.rel, line_no, capped));
-        Ok(true)
     }
 }
 
@@ -116,7 +98,8 @@ impl Tool for GrepTool {
             .fs
             .metadata(&search_root)
             .await
-            .map_err(|_| error::not_found(format!("Search path not found: {}", error::show(&search_root))))?;
+            // Pi: `Path not found: ${searchPath}` (grep.ts:186).
+            .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&search_root))))?;
 
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(input.ignore_case.unwrap_or(false))
@@ -125,7 +108,10 @@ impl Tool for GrepTool {
             .map_err(|e| error::invalid(format!("grep: invalid pattern: {e}")))?;
 
         let context = input.context.unwrap_or(0);
-        let limit = input.limit.unwrap_or(self.opts.limit);
+        // Pi: `effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT)` (grep.ts:189). The JSON-schema
+        // `minimum:1` is advisory only, so an explicit `limit: 0` must still yield up to one match
+        // rather than short-circuiting to "No matches found".
+        let limit = input.limit.unwrap_or(self.opts.limit).max(1);
 
         let glob = match input.glob.as_deref() {
             Some(g) => Some(PatternMatcher::build(g)?),
@@ -172,11 +158,10 @@ impl Tool for GrepTool {
             files.sort_by(|a, b| a.1.cmp(&b.1));
         }
 
-        let mut searcher: Searcher = SearcherBuilder::new()
-            .line_number(true)
-            .before_context(context)
-            .after_context(context)
-            .build();
+        // Pi gathers raw matches first (no context in the searcher), then formats each match as an
+        // independent re-read block; mirror that so overlapping windows duplicate shared context
+        // lines exactly as Pi does (grep.ts:250-268).
+        let mut searcher: Searcher = SearcherBuilder::new().line_number(true).build();
 
         let mut out: Vec<String> = Vec::new();
         let mut count = 0usize;
@@ -193,14 +178,42 @@ impl Tool for GrepTool {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let sink = GrepSink {
-                rel: rel.clone(),
-                out: &mut out,
-                count: &mut count,
-                limit,
-                any_line_truncated: &mut any_line_truncated,
-            };
-            let _ = searcher.search_slice(&matcher, &bytes, sink);
+            let mut match_lines: Vec<u64> = Vec::new();
+            {
+                let sink = MatchSink { lines: &mut match_lines, count: &mut count, limit };
+                let _ = searcher.search_slice(&matcher, &bytes, sink);
+            }
+            if match_lines.is_empty() {
+                continue;
+            }
+            // Pi: `content.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n")` then a per-line
+            // `replace(/\r/g,"")` (grep.ts:206,259). Splitting the same bytes the searcher numbered
+            // on `\n` keeps line numbers aligned; CR removal happens per output line below.
+            let content = String::from_utf8_lossy(&bytes);
+            let src_lines: Vec<&str> = content.split('\n').collect();
+            for &ln in &match_lines {
+                let l = ln as usize;
+                // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
+                // context > 0, else just the single match line (grep.ts:255-256).
+                let (start, end) = if context > 0 {
+                    (l.saturating_sub(context).max(1), (l + context).min(src_lines.len()))
+                } else {
+                    (l, l)
+                };
+                for current in start..=end {
+                    let raw = src_lines.get(current.saturating_sub(1)).copied().unwrap_or("");
+                    let text = raw.replace('\r', "");
+                    let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
+                    if tr {
+                        any_line_truncated = true;
+                    }
+                    if current == l {
+                        out.push(format!("{rel}:{current}: {capped}"));
+                    } else {
+                        out.push(format!("{rel}-{current}- {capped}"));
+                    }
+                }
+            }
         }
 
         if out.is_empty() {

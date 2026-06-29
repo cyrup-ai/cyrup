@@ -61,7 +61,8 @@ impl Tool for LsTool {
             .fs
             .metadata(&abs)
             .await
-            .map_err(|_| error::not_found(format!("Directory not found: {}", error::show(&abs))))?;
+            // Pi: `Path not found: ${dirPath}` (ls.ts:129).
+            .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&abs))))?;
         if !meta.is_dir {
             return Err(error::invalid(format!("Not a directory: {}", error::show(&abs))));
         }

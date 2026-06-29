@@ -30,6 +30,7 @@ grep-searcher = { workspace = true }
 ignore = { workspace = true }
 similar = { workspace = true }
 unicode-segmentation = { workspace = true }
+unicode-normalization = { workspace = true }
 image = { workspace = true, optional = true }
 
 [features]

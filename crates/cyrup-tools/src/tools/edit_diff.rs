@@ -1,6 +1,7 @@
 //! Line-ending/BOM handling + diff/patch generation for `edit` (R-03-018/019, arch-03 §6.4).
 
 use similar::TextDiff;
+use unicode_normalization::UnicodeNormalization;
 
 const BOM: &str = "\u{feff}";
 
@@ -221,10 +222,10 @@ pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
 // fuzzily, replacements are computed in the normalized buffer and overlaid back onto the original
 // content line-block by line-block so untouched lines keep their original bytes.
 //
-// [CYRUP-DELTA]: Pi additionally runs `text.normalize("NFKC")` first (edit-diff.ts:36). That needs
-// a Unicode-normalization dependency that has not been ratified for this crate, so NFKC is omitted
-// and reported as a blocker. The explicit transforms below (trailing-whitespace strip, smart
-// quotes, Unicode dashes, Unicode spaces) cover the cases the gap analysis calls out.
+// Like Pi (edit-diff.ts:36), `normalize_for_fuzzy` runs `NFKC` first via the workspace-declared
+// `unicode-normalization` crate, then applies the explicit transforms (trailing-whitespace strip,
+// smart quotes, Unicode dashes, Unicode spaces). This makes compatibility-form text — ligatures
+// (`ﬁ` → `fi`), full-width Latin, etc. — fuzzy-match its ASCII equivalents exactly as Pi does.
 // ---------------------------------------------------------------------------------------------
 
 /// An edit error, carrying Pi's exact model-facing message text (edit-diff.ts:257-293).
@@ -253,9 +254,13 @@ pub struct AppliedEdits {
     pub new_content: String,
 }
 
-/// `normalizeForFuzzyMatch` (edit-diff.ts:33-54), minus NFKC (see module note).
+/// `normalizeForFuzzyMatch` (edit-diff.ts:33-54): NFKC first (edit-diff.ts:36), then strip trailing
+/// whitespace per line, then fold smart quotes / Unicode dashes / Unicode spaces.
 fn normalize_for_fuzzy(text: &str) -> String {
-    let stripped: Vec<&str> = text.split('\n').map(str::trim_end).collect();
+    // Pi leads with `text.normalize("NFKC")` (edit-diff.ts:36). NFKC never inserts/removes `\n`, so
+    // the per-line split below and the overlay's line-count invariant are preserved.
+    let nfkc: String = text.nfkc().collect();
+    let stripped: Vec<&str> = nfkc.split('\n').map(str::trim_end).collect();
     stripped
         .join("\n")
         .chars()
@@ -612,6 +617,16 @@ mod tests {
         // edited lines are rewritten from the normalized base.
         assert!(r.new_content.contains("let x = 'bye';"), "got: {:?}", r.new_content);
         assert!(r.new_content.contains("val - z"), "got: {:?}", r.new_content);
+    }
+
+    #[test]
+    fn fuzzy_nfkc_ligature_and_fullwidth() {
+        // Disk has the `ﬁ` ligature (U+FB01) and a full-width digit `２` (U+FF12); the model sends
+        // the plain ASCII forms. NFKC (edit-diff.ts:36) folds both so the fuzzy pass matches.
+        let content = "const \u{FB01}le2 = \u{FF12};\n";
+        let edits = vec![("const file2 = 2;".to_string(), "const file2 = 9;".to_string())];
+        let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
+        assert!(r.new_content.contains("const file2 = 9;"), "got: {:?}", r.new_content);
     }
 
     #[test]

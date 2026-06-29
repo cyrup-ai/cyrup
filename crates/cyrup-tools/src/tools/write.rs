@@ -1,7 +1,6 @@
 //! `write` — atomic create-or-overwrite with parent-dir creation + per-file lock (R-03-015/016).
 
 use crate::config::WriteOpts;
-use crate::details::WriteDetails;
 use crate::lock::FileMutationLocks;
 use crate::ops::FsOps;
 use crate::{error, path, ToolMeta};
@@ -84,7 +83,9 @@ impl Tool for WriteTool {
                 "Successfully wrote {len_utf16} bytes to {}",
                 input.path
             ))],
-            details: serde_json::to_value(WriteDetails { bytes_written: len_utf16 }).ok(),
+            // Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
+            // (write.ts:223) — it never emits write details. Mirror that with `None`.
+            details: None,
             terminate: false,
         })
     }

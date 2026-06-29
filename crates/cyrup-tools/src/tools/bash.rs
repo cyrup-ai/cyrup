@@ -215,6 +215,8 @@ impl Tool for BashTool {
 
         match status {
             // Pi treats a signal-killed process (exitCode null) as success with output preserved.
+            // Both this arm and the non-zero-exit arm go through `formatOutput`, whose `emptyText`
+            // defaults to `"(no output)"` (bash.ts:357,375).
             ExitStatus::Exited(0) | ExitStatus::Signaled => {
                 let body = if text.is_empty() { "(no output)".to_string() } else { text };
                 Ok(ToolResult {
@@ -223,15 +225,31 @@ impl Tool for BashTool {
                     terminate: false,
                 })
             }
+            // Non-zero exit: `formatOutput(snapshot)` uses the `"(no output)"` default for empty
+            // output, then `appendStatus` joins it (bash.ts:404-406).
             ExitStatus::Exited(code) => {
-                Err(error::invalid(format!("{text}\n\nCommand exited with code {code}")))
+                let body = if text.is_empty() { "(no output)".to_string() } else { text };
+                Err(error::invalid(append_status(&body, &format!("Command exited with code {code}"))))
             }
+            // Catch path (abort/timeout): `formatOutput(snapshot, "")` — `emptyText` is `""`, so an
+            // empty output yields just the status with NO leading `\n\n` (bash.ts:375,388-396).
             ExitStatus::TimedOut => {
                 let secs = input.timeout.unwrap_or(0);
-                Err(error::invalid(format!("{text}\n\nCommand timed out after {secs} seconds")))
+                Err(error::invalid(append_status(&text, &format!("Command timed out after {secs} seconds"))))
             }
-            ExitStatus::Killed => Err(error::invalid(format!("{text}\n\nCommand aborted"))),
+            ExitStatus::Killed => Err(error::invalid(append_status(&text, "Command aborted"))),
         }
+    }
+}
+
+/// Pi's `appendStatus = (text, status) => ${text ? `${text}\n\n` : ""}${status}` (bash.ts:377):
+/// the `\n\n` separator is inserted ONLY when there is preceding text, so an empty body produces
+/// the bare status with no leading newlines.
+fn append_status(text: &str, status: &str) -> String {
+    if text.is_empty() {
+        status.to_string()
+    } else {
+        format!("{text}\n\n{status}")
     }
 }
 

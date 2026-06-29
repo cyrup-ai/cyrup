@@ -66,7 +66,8 @@ impl Tool for FindTool {
         self.fs
             .metadata(&search_root)
             .await
-            .map_err(|_| error::not_found(format!("Search path not found: {}", error::show(&search_root))))?;
+            // Pi: `Path not found: ${searchPath}` (find.ts:158).
+            .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&search_root))))?;
 
         let matcher = PatternMatcher::build(&input.pattern)?;
         let limit = input.limit.unwrap_or(self.opts.limit);

@@ -618,6 +618,14 @@ async fn ls_sorted_dotfiles_dirs_and_errors() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Not a directory"));
+
+    // gap #8 — missing path uses Pi's exact literal `Path not found: ${dirPath}` (ls.ts:129),
+    // not the prior `Directory not found:`.
+    let err = ls
+        .execute(cid(), serde_json::json!({ "path": "nope" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("Path not found:"), "got: {err}");
 }
 
 // ---------------------------------------------------------------- A-03-7 availability
@@ -885,6 +893,9 @@ async fn write_reports_utf16_length() {
         .await
         .unwrap();
     assert!(first_text(&r).contains("Successfully wrote 3 bytes to u.txt"), "got: {}", first_text(&r));
+    // gap #6 — Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
+    // (write.ts:223); cyrup must emit `None`, never a `{bytesWritten}` payload.
+    assert!(r.details.is_none(), "write must emit no details: {:?}", r.details);
 }
 
 // gap #11 — a small directory with no truncation and no limit-hit emits NO `details` object (ls.ts).
@@ -951,4 +962,209 @@ async fn read_image_oversized_is_resized_with_dimension_note() {
     let text = first_text(&r);
     assert!(text.contains("Image: original 2400x10, displayed at 2000x"), "got: {text}");
     assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
+}
+
+// gap #5 — a non-zero exit with NO captured output labels the empty body `(no output)` and joins it
+// via Pi's `appendStatus` (bash.ts:357,377,404-406): result is `"(no output)\n\nCommand exited with
+// code 1"`, NOT a spurious leading `\n\n`.
+#[tokio::test]
+async fn bash_nonzero_exit_empty_output_labels_no_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(cid(), serde_json::json!({ "command": "exit 1" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(msg, "(no output)\n\nCommand exited with code 1", "got: {msg}");
+}
+
+// gap #5 — a timeout with NO captured output goes through the catch-path `formatOutput(snapshot, "")`
+// (emptyText = ""), so `appendStatus` emits the bare status with NO leading `\n\n` (bash.ts:375,388).
+#[tokio::test]
+async fn bash_timeout_empty_output_has_no_leading_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "sleep 30", "timeout": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(msg, "Command timed out after 1 seconds", "got: {msg}");
+}
+
+// gap #10 — a matched line carrying an embedded CR is sanitized: Pi's `lineText.replace(/\r/g, "")`
+// strips EVERY interior `\r` (grep.ts:259), not just a trailing one.
+#[tokio::test]
+async fn grep_strips_interior_carriage_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // A single logical line with an interior CR (e.g. progress-bar output captured to a file).
+    std::fs::write(cwd.join("cr.txt"), "foo\rNEEDLE\rbar\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
+    let r = grep
+        .execute(cid(), serde_json::json!({ "pattern": "NEEDLE" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(!text.contains('\r'), "interior CR must be stripped: {text:?}");
+    assert!(text.contains("cr.txt:1: fooNEEDLEbar"), "got: {text:?}");
+}
+
+// gap #9 — the edit access-error literal ends with a trailing period: Pi throws
+// `Could not edit file: ${path}. ${errorMessage}.` (edit.ts:329).
+#[tokio::test]
+async fn edit_access_error_has_trailing_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let edit = edit_tool(dir.path().to_path_buf());
+    let err = edit
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "missing.txt", "edits": [{ "oldText": "a", "newText": "b" }] }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.starts_with("Could not edit file: missing.txt. "), "got: {msg}");
+    assert!(msg.ends_with('.'), "missing trailing period: {msg}");
+}
+
+// gap #7 — every non-bash tool's abort surfaces Pi's exact `"Operation aborted"` (capital O)
+// literal (write.ts:209, edit.ts:319, ls.ts, read.ts:226, grep.ts, find.ts).
+#[tokio::test]
+async fn abort_message_is_capitalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let write = WriteTool::new(fs(), Arc::new(FileMutationLocks::new()), cwd, Default::default());
+    let err = write
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "x.txt", "content": "hi" }),
+            cancel,
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Operation aborted", "got: {err}");
+}
+
+// gap #2 — grep formats each match as an INDEPENDENT re-read block (grep.ts:250-268,316-331), so a
+// context line shared by two matches within `2*context` lines is DUPLICATED (one copy per block),
+// not merged. Two matches one line apart with context=1 share their middle line.
+#[tokio::test]
+async fn grep_context_blocks_duplicate_overlapping_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // Matches on lines 2 and 4; line 3 ("shared") is context for BOTH blocks.
+    std::fs::write(cwd.join("f.txt"), "alpha\nNEEDLE one\nshared\nNEEDLE two\nomega\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
+    let r = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    // Block for line 2: `f.txt-1- alpha`, `f.txt:2: NEEDLE one`, `f.txt-3- shared`.
+    // Block for line 4: `f.txt-3- shared`, `f.txt:4: NEEDLE two`, `f.txt-5- omega`.
+    let shared = text.matches("f.txt-3- shared").count();
+    assert_eq!(shared, 2, "overlapping context line must appear once per block: {text:?}");
+    assert!(text.contains("f.txt:2: NEEDLE one"), "got: {text:?}");
+    assert!(text.contains("f.txt:4: NEEDLE two"), "got: {text:?}");
+}
+
+// gap #3 — Pi clamps `effectiveLimit = Math.max(1, limit ?? 100)` (grep.ts:189); the JSON-schema
+// `minimum:1` is advisory only. An explicit `limit: 0` must still return up to one match, never
+// short-circuit to "No matches found".
+#[tokio::test]
+async fn grep_limit_zero_clamps_to_one_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("f.txt"), "hit1\nhit2\nhit3\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
+    let r = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hit", "limit": 0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert_ne!(text, "No matches found", "limit:0 must clamp to 1, not short-circuit");
+    assert!(text.contains("f.txt:1: hit1"), "got: {text:?}");
+    assert!(!text.contains("hit2"), "only one match expected: {text:?}");
+    // count >= effectiveLimit(1) ⇒ the match-limit notice fires with `Use limit=2`.
+    assert!(text.contains("1 matches limit reached. Use limit=2"), "got: {text:?}");
+}
+
+// gap #4 — `read` prechecks EFFECTIVE `R_OK` (read.ts:54): an existing-but-unreadable candidate is
+// skipped (not selected then failed at read time), yielding the synthesized "not found / unreadable"
+// message. Skipped when the process bypasses `R_OK` (e.g. running as root), where the precheck is
+// intentionally a no-op — matching Node's `fs.access` semantics.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_effective_access_skips_unreadable_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let p = cwd.join("secret.txt");
+    std::fs::write(&p, "top secret\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // If the test process can still read it, R_OK is bypassed (root); skip — same as Pi for root.
+    if std::fs::read(&p).is_ok() {
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+        return;
+    }
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let err = read
+        .execute(cid(), serde_json::json!({ "path": "secret.txt" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("File not found or unreadable"), "got: {err}");
+    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+}
+
+// gap #4 — `edit` prechecks EFFECTIVE `R_OK | W_OK` (edit.ts:86). A write-only file (mode 0o222) has
+// its readonly BIT unset, so the old `permissions().readonly()` precheck would PASS and fail later
+// at read time with a different message; the effective `R_OK` check now fails the precheck with Pi's
+// `Could not edit file: {path}. {e}.`. Skipped when the process bypasses `R_OK` (root).
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_effective_access_precheck_rejects_write_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let p = cwd.join("wo.txt");
+    std::fs::write(&p, "hello\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o222)).unwrap();
+    if std::fs::read(&p).is_ok() {
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+        return;
+    }
+    let edit = edit_tool(cwd);
+    let err = edit
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "wo.txt", "edits": [{ "oldText": "hello", "newText": "bye" }] }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("Could not edit file: wo.txt. "), "got: {err}");
+    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
 }

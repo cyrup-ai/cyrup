@@ -23,9 +23,12 @@ pub(crate) fn io(context: &str, e: &std::io::Error) -> ToolError {
     ToolError::new(format!("{context}: {e}"))
 }
 
-/// Cancellation (R-03-009). Message kept stable so callers/tests can detect it.
+/// Cancellation (R-03-009). Pi throws `new Error("Operation aborted")` (capital O) on every
+/// non-bash tool's abort path — read.ts:226, edit.ts:319, ls.ts:115/119, write.ts:209, grep.ts:158,
+/// find.ts — so the model-observed literal must match exactly. (bash uses Pi's distinct
+/// `"Command aborted"`, matched at bash.rs via the `Killed` arm — it never routes through here.)
 pub(crate) fn aborted() -> ToolError {
-    ToolError::new("operation aborted")
+    ToolError::new("Operation aborted")
 }
 
 /// Policy / isolation denial (arch-12 R-12-006/R-03-006). Surfaced as a normal `Err`, which the

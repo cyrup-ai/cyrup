@@ -4,11 +4,12 @@
 //! trimming, normalizing Unicode spaces, stripping a leading `@`, and expanding a leading `~`.
 //! `resolve_read_path` adds Pi's macOS filename variants as fallbacks. Traversal sandboxing is
 //! deliberately NOT enforced here (Pi parity, DI-5); it is provided as an `FsOps` policy decorator
-//! by arch-12. [CYRUP-DELTA]: the NFD/NFD+curly variants (path-utils.ts:11-14,99-103) require a
-//! Unicode-normalization dependency that has not been ratified, so they are reported as a blocker;
-//! the AM/PM-NBSP and curly-quote variants are implemented.
+//! by arch-12. The full Pi fallback set — AM/PM-NBSP, NFD, curly-quote, and NFD+curly
+//! (path-utils.ts:53-83) — is implemented; NFD uses the workspace-declared `unicode-normalization`
+//! crate.
 
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 /// Pi's `UNICODE_SPACES` set (paths.ts:6): NBSP, U+2000-U+200A, narrow NBSP, medium-math, ideographic.
 fn normalize_unicode_spaces(s: &str) -> String {
@@ -100,22 +101,37 @@ pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-/// Candidate read paths in priority order (R-03-006, path-utils.ts:86-118): the resolved path
-/// first, then the macOS AM/PM narrow-NBSP screenshot variant, then the curly-quote (`'` ⇄ U+2019)
-/// variants. The `read` tool tries each via the `FsOps` seam and uses the first that exists.
-/// [CYRUP-DELTA]: the NFD and NFD+curly variants need a Unicode-normalization dep (reported blocker).
+/// Candidate read paths in priority order (R-03-006, path-utils.ts:53-83): the resolved path first,
+/// then the macOS AM/PM narrow-NBSP screenshot variant, then the NFD (decomposed) variant, then the
+/// curly-quote (`'` → U+2019) variant, then the combined NFD+curly variant. Each non-primary variant
+/// is emitted only when it differs from the resolved path, matching Pi's `!== resolved` guard. The
+/// `read` tool tries each via the `FsOps` seam and uses the first that exists. A reverse curly→`'`
+/// variant is appended as an additive cyrup-only fallback (never resolves a path Pi's set already
+/// covers).
 pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
     let primary = resolve_to_cwd(path, cwd);
-    let mut out = vec![primary.clone()];
+    let s = primary.to_string_lossy().into_owned();
+    let mut out = vec![primary];
 
-    let s = primary.to_string_lossy();
-    // macOS screenshot AM/PM variant (narrow no-break space before AM/PM).
+    // macOS screenshot AM/PM variant: narrow no-break space before AM/PM (path-utils.ts:7-9,57-61).
     if let Some(v) = try_am_pm(&s) {
         out.push(PathBuf::from(v));
     }
+    // NFD variant: macOS stores filenames in decomposed form (path-utils.ts:11-14,63-67).
+    let nfd: String = s.nfd().collect();
+    if nfd != s {
+        out.push(PathBuf::from(&nfd));
+    }
+    // Curly-quote variant: straight `'` → U+2019 (path-utils.ts:16-20,69-73).
     if s.contains('\'') {
         out.push(PathBuf::from(s.replace('\'', "\u{2019}")));
     }
+    // Combined NFD + curly-quote variant for French macOS screenshots (path-utils.ts:75-79).
+    let nfd_curly = nfd.replace('\'', "\u{2019}");
+    if nfd_curly != s {
+        out.push(PathBuf::from(nfd_curly));
+    }
+    // [CYRUP extra] reverse curly U+2019 → straight `'` (additive fallback beyond Pi's set).
     if s.contains('\u{2019}') {
         out.push(PathBuf::from(s.replace('\u{2019}', "'")));
     }
@@ -160,6 +176,33 @@ mod tests {
         assert_eq!(
             resolve_to_cwd("a\u{00A0}b.txt", cwd),
             PathBuf::from("/work/a b.txt")
+        );
+    }
+
+    #[test]
+    fn read_path_adds_nfd_variant() {
+        let cwd = Path::new("/work");
+        // Composed "é" (U+00E9). macOS stores it decomposed as "e" + U+0301 (combining acute).
+        let v = resolve_read_path("caf\u{00E9}.txt", cwd);
+        assert_eq!(v[0], PathBuf::from("/work/caf\u{00E9}.txt"));
+        assert!(
+            v.iter().any(|p| p.to_string_lossy().contains("cafe\u{0301}.txt")),
+            "variants: {v:?}"
+        );
+    }
+
+    #[test]
+    fn read_path_adds_nfd_curly_variant() {
+        let cwd = Path::new("/work");
+        // French screenshot "Capture d'écran": straight apostrophe + composed "é". The combined
+        // NFD+curly fallback decomposes "é" AND swaps the apostrophe to U+2019 (path-utils.ts:75-79).
+        let v = resolve_read_path("d'\u{00E9}cran.txt", cwd);
+        assert!(
+            v.iter().any(|p| {
+                let s = p.to_string_lossy();
+                s.contains('\u{2019}') && s.contains("e\u{0301}")
+            }),
+            "variants: {v:?}"
         );
     }
 

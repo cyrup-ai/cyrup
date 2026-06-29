@@ -65,14 +65,42 @@ impl FsOps for LocalFs {
         Ok(())
     }
 
+    #[allow(unsafe_code)]
     async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError> {
-        let meta = tokio::fs::metadata(path)
-            .await
-            .map_err(|e| error::io(&error::show(path), &e))?;
-        if mode == Access::ReadWrite && meta.permissions().readonly() {
-            return Err(error::invalid(format!("{} is not writable", error::show(path))));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            // Pi prechecks EFFECTIVE access via Node's `fs.access`: `read` uses `R_OK`
+            // (read.ts:54) and `edit` uses `R_OK | W_OK` (edit.ts:86). Mirror that with the
+            // `access(2)` syscall so the precheck reflects the caller's effective permissions
+            // (uid/gid/ACL), not merely the coarse `permissions().readonly()` bit which can pass
+            // for a file the process cannot actually read/write across owners.
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| error::invalid(format!("invalid path: {}", error::show(path))))?;
+            let amode = match mode {
+                Access::Read => libc::R_OK,
+                Access::ReadWrite => libc::R_OK | libc::W_OK,
+            };
+            // SAFETY: `access(2)` only reads the NUL-terminated path buffer we own; it performs no
+            // writes and touches no parent memory. Returns 0 on success, or -1 with `errno` set.
+            let rc = unsafe { libc::access(c_path.as_ptr(), amode) };
+            if rc != 0 {
+                return Err(error::io(&error::show(path), &std::io::Error::last_os_error()));
+            }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            // No portable effective-access syscall here: fall back to metadata existence + the
+            // readonly bit (the pre-`access(2)` behavior).
+            let meta = tokio::fs::metadata(path)
+                .await
+                .map_err(|e| error::io(&error::show(path), &e))?;
+            if mode == Access::ReadWrite && meta.permissions().readonly() {
+                return Err(error::invalid(format!("{} is not writable", error::show(path))));
+            }
+            Ok(())
+        }
     }
 
     async fn metadata(&self, path: &Path) -> Result<Meta, ToolError> {

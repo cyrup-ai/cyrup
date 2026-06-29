@@ -121,8 +121,10 @@ impl Tool for EditTool {
         let _guard = self.locks.guard(&abs, &cancel).await?;
 
         // R-03-021: validate writable before reading.
+        // Pi: `Could not edit file: ${path}. ${errorMessage}.` — note the trailing period
+        // (edit.ts:329). The `${errorMessage}` body itself (a Node errno string) is irreducible.
         self.fs.access(&abs, Access::ReadWrite).await.map_err(|e| {
-            error::invalid(format!("Could not edit file: {}. {e}", input.path))
+            error::invalid(format!("Could not edit file: {}. {e}.", input.path))
         })?;
 
         let bytes = self.fs.read(&abs).await?;

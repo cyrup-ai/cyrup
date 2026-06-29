@@ -57,8 +57,5 @@ pub struct LsDetails {
     pub entry_limit_reached: Option<usize>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct WriteDetails {
-    pub bytes_written: usize,
-}
+// NOTE: `write` has no `details` payload. Pi declares `ToolDefinition<…, undefined>` and returns
+// `details: undefined` (write.ts:223), so there is intentionally no `WriteDetails` type here.
