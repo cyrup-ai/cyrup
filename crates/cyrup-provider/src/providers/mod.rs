@@ -1,6 +1,7 @@
 //! Concrete vendor providers (arch-01 §5). Each is a [`crate::wire::WireProvider`] = a catalog + an
 //! auth strategy + an api mapping over the shared [`crate::api::ApiRegistry`].
 
+pub mod fleet;
 pub mod together;
 
 pub use together::{

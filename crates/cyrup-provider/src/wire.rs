@@ -79,6 +79,10 @@ impl Provider for WireProvider {
         &self.models
     }
 
+    fn provider_auth(&self) -> Option<&ProviderAuth> {
+        Some(&self.auth)
+    }
+
     fn stream(
         &self,
         model: &Model,

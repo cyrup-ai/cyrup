@@ -15,13 +15,16 @@
 pub mod api;
 pub mod auth;
 pub mod catalog;
+pub mod collection;
 pub mod context;
+pub mod env_api_keys;
 pub mod error;
 pub mod model;
 pub mod provider;
 pub mod providers;
 pub mod stream;
 pub mod usage;
+pub mod utils;
 pub mod validate;
 pub mod wire;
 
@@ -33,6 +36,14 @@ pub use api::{
     builtin_registry, channel, register_builtins, ApiFactory, ApiImpl, ApiRegistry, EventSink,
 };
 pub use providers::{together_models, together_provider, together_provider_with, TOGETHER_BASE_URL};
+pub use providers::fleet::{fleet_spec, fleet_providers_with, FleetSpec, FLEET};
+pub use collection::{
+    clamp_thinking_level, create_models, get_supported_thinking_levels, has_api, models_are_equal,
+    CreateModelsOptions, Models, EXTENDED_THINKING_LEVELS,
+};
+pub use env_api_keys::{
+    api_key_env_vars, find_env_keys, get_env_api_key, get_provider_env_value, AUTHENTICATED_SENTINEL,
+};
 pub use auth::{
     env_key, keyless_local, resolve_provider_auth, ApiKeyAuth, AuthContext, AuthOverrides,
     AuthResult, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore, ModelAuth,
@@ -47,7 +58,21 @@ pub use provider::Provider;
 pub use stream::sse::{build_client, decode_sse_bytes, open_sse, OnRequest, OnResponse, SseFrame, SseRequest};
 pub use stream::{
     collect_message, create_assistant_message_event_stream, AssistantMessageEventSink,
-    AssistantMessageEventStream, CacheRetention, StreamEvent, StreamOptions, ToolChoice,
+    AssistantMessageEventStream, CacheRetention, OnPayload, OnResponseHook, ProviderResponse,
+    StreamEvent, StreamOptions, ToolChoice, Transport,
+};
+pub use utils::estimate::{
+    calculate_context_tokens, estimate_context_tokens, estimate_message_tokens,
+    estimate_text_tokens, ContextUsageEstimate,
+};
+pub use utils::json_parse::{
+    parse_streaming_json, parse_streaming_json_object, repair_json,
+};
+pub use utils::overflow::{is_context_overflow, overflow_patterns};
+pub use utils::retry::is_retryable_assistant_error;
+pub use utils::simple_options::{
+    adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context, clamp_reasoning,
+    SimpleStreamOptions, ThinkingBudgets,
 };
 pub use usage::{apply_cost, compute_cost};
 pub use validate::{validate_named_tool_call, validate_tool_call, ToolValidationError};

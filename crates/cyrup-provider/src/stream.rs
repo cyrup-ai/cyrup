@@ -19,6 +19,40 @@ pub enum CacheRetention {
     Long,
 }
 
+/// Preferred transport for providers that support multiple transports (Pi `Transport`,
+/// types.ts:98). Providers that do not support the option ignore it. `kebab-case` makes the wire
+/// bytes byte-1:1 with Pi: `"sse"`, `"websocket"`, `"websocket-cached"`, `"auto"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    Sse,
+    Websocket,
+    WebsocketCached,
+    Auto,
+}
+
+/// The HTTP response metadata handed to [`StreamOptions::on_response`] before the body is consumed
+/// (Pi `ProviderResponse`, types.ts:104-107).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderResponse {
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+/// Inspect or replace a provider payload before sending (Pi `StreamOptions.onPayload`,
+/// types.ts:130-134). Returning `None` keeps the payload unchanged.
+pub type OnPayload =
+    std::sync::Arc<dyn Fn(&serde_json::Value, &crate::model::Model) -> Option<serde_json::Value> + Send + Sync>;
+
+/// Invoked after an HTTP response is received and before its body stream is consumed (Pi
+/// `StreamOptions.onResponse`, types.ts:135-139).
+pub type OnResponseHook =
+    std::sync::Arc<dyn Fn(&ProviderResponse, &crate::model::Model) + Send + Sync>;
+
+/// Provider-scoped environment overrides (Pi `ProviderEnv`, types.ts:100-101). Values take
+/// precedence over the process environment for provider configuration.
+pub type ProviderEnv = std::collections::BTreeMap<String, String>;
+
 /// Caller-specified tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`:
 /// `"auto" | "none" | "required" | { type: "function"; function: { name } }`). When `None`, the
 /// wire impl omits `tool_choice` entirely (matching Pi's default — it never auto-injects `"auto"`).
@@ -68,6 +102,33 @@ pub struct StreamOptions {
     /// Optional tool-choice constraint (Pi `OpenAICompletionsOptions.toolChoice`). Additive,
     /// backward-compatible (defaults to `None`, which omits the `tool_choice` field).
     pub tool_choice: Option<ToolChoice>,
+    /// Preferred transport for providers that support multiple transports (Pi
+    /// `StreamOptions.transport`, types.ts:118). Providers that do not support it ignore it.
+    pub transport: Option<Transport>,
+    /// HTTP request timeout in milliseconds for providers/SDKs that support it (Pi
+    /// `StreamOptions.timeoutMs`, types.ts:153).
+    pub timeout_ms: Option<u64>,
+    /// WebSocket connect (handshake) timeout in milliseconds for WebSocket transports (Pi
+    /// `StreamOptions.websocketConnectTimeoutMs`, types.ts:159).
+    pub websocket_connect_timeout_ms: Option<u64>,
+    /// Maximum retry attempts for providers/SDKs that support client-side retries (Pi
+    /// `StreamOptions.maxRetries`, types.ts:164).
+    pub max_retries: Option<u32>,
+    /// Maximum delay (ms) to wait for a server-requested retry before failing immediately (Pi
+    /// `StreamOptions.maxRetryDelayMs`, types.ts:172). `Some(0)` disables the cap.
+    pub max_retry_delay_ms: Option<u64>,
+    /// Provider-extracted request metadata; providers take the fields they understand and ignore
+    /// the rest (Pi `StreamOptions.metadata`, types.ts:178 — e.g. Anthropic `user_id`).
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Provider-scoped environment overrides, taking precedence over the process environment (Pi
+    /// `StreamOptions.env`, types.ts:184).
+    pub env: Option<ProviderEnv>,
+    /// Inspect or replace the provider payload before sending (Pi `StreamOptions.onPayload`,
+    /// types.ts:130). Additive; defaults to `None`.
+    pub on_payload: Option<OnPayload>,
+    /// Invoked after an HTTP response is received, before its body is consumed (Pi
+    /// `StreamOptions.onResponse`, types.ts:135). Additive; defaults to `None`.
+    pub on_response: Option<OnResponseHook>,
 }
 
 /// Terminal-`done` reason. Pi narrows the `done` event's `reason` to

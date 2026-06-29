@@ -1704,14 +1704,10 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
 /// non-object input yields an empty object `{}` rather than a scalar, so the decoder always produces
 /// a well-typed object.
 fn parse_partial_json(s: &str) -> Map<String, Value> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Map::new();
-    }
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(Value::Object(map)) => map,
-        _ => Map::new(),
-    }
+    // Best-effort recovery of truncated/streamed tool-call args (Pi `parseStreamingJson`,
+    // utils/json-parse.ts): a strict parse first, then repair, then a tolerant partial parse that
+    // preserves a truncated string/number/array instead of discarding the whole object (#28).
+    crate::utils::json_parse::parse_streaming_json_object(Some(s))
 }
 
 /// Current unix time in milliseconds (0 on a clock error — never panics).
