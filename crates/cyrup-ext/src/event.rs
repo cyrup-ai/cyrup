@@ -216,7 +216,10 @@ pub enum HostEvent {
     },
     AgentStart,
     AgentEnd { messages: Vec<AgentMessage> },
-    TurnStart { turn_index: u32 },
+    /// `turn_start` (Pi `TurnStartEvent`, types.ts:688-693): the turn index AND a wall-clock
+    /// `timestamp` (Pi `Date.now()`, agent-session.ts:624). `turn_index` is derived in the
+    /// `ExtSubscriber` fan-out layer (mirroring Pi's `AgentSession._turnIndex`), not on the raw event.
+    TurnStart { turn_index: u32, timestamp: u64 },
     TurnEnd { turn_index: u32, message: AgentMessage, tool_results: Vec<ToolResultMessage> },
     MessageStart { role: String },
     MessageUpdate { delta: Value },
@@ -286,7 +289,10 @@ impl HostEvent {
     pub fn from_agent(ev: &AgentEvent) -> Option<HostEvent> {
         Some(match ev {
             AgentEvent::AgentStart => HostEvent::AgentStart,
-            AgentEvent::TurnStart => HostEvent::TurnStart { turn_index: 0 },
+            // `turn_index` is a placeholder here; the `ExtSubscriber` fan-out layer overwrites it
+            // with the derived counter value (Pi `AgentSession._turnIndex`). `timestamp` is the
+            // wall-clock at emit (Pi `Date.now()`, agent-session.ts:624).
+            AgentEvent::TurnStart => HostEvent::TurnStart { turn_index: 0, timestamp: now_millis() },
             AgentEvent::MessageStart { message } => {
                 HostEvent::MessageStart { role: role_of(message) }
             }
@@ -324,6 +330,15 @@ impl HostEvent {
             AgentEvent::AgentEnd { messages } => HostEvent::AgentEnd { messages: messages.clone() },
         })
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch (Pi `Date.now()`). A clock before the epoch
+/// degrades to `0` (never a panic).
+pub(crate) fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn role_of(m: &AgentMessage) -> String {

@@ -113,6 +113,89 @@ async fn a08_1_event_fires_with_payload_notify() {
 }
 
 // ---------------------------------------------------------------------------
+// A-08-1b: turn_start/turn_end carry the DERIVED turn index (Pi `_turnIndex`,
+// agent-session.ts:615-635) — the `ExtSubscriber` fan-out layer maintains the counter even though
+// the upstream `AgentEvent::{TurnStart,TurnEnd}` are payload-less. The index resets on agent_start,
+// is shared by a turn's start+end, increments after each turn_end, and turn_start carries a
+// non-zero wall-clock timestamp (Pi `Date.now()`).
+// ---------------------------------------------------------------------------
+/// `(label, turn_index, timestamp)` recorded for each delivered turn event.
+type TurnLog = Arc<Mutex<Vec<(&'static str, u32, u64)>>>;
+
+struct TurnProbe {
+    id: ExtensionId,
+    seen: TurnLog,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for TurnProbe {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[EventKind::TurnStart, EventKind::TurnEnd]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::TurnStart { turn_index, timestamp } => {
+                self.seen.lock().unwrap().push(("turn_start", *turn_index, *timestamp));
+            }
+            HostEvent::TurnEnd { turn_index, .. } => {
+                self.seen.lock().unwrap().push(("turn_end", *turn_index, 0));
+            }
+            _ => {}
+        }
+        HookOutcome::Noop
+    }
+}
+
+#[tokio::test]
+async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
+    let host = ExtensionHost::new(cfg());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    host.load_native(Arc::new(TurnProbe { id: "turns".into(), seen: seen.clone() }))
+        .await
+        .unwrap();
+
+    let sub = host.subscriber(CancelToken::new());
+
+    // Two turns, then a fresh agent run that resets the index, then one more turn. The probe is NOT
+    // subscribed to agent_start, but the counter must still reset (the gate runs AFTER the counter).
+    let turn_end = || {
+        let (msg, _tc) = tool_call_msg("read", &"tc".into(), &json!({}));
+        AgentEvent::TurnEnd { message: AgentMessage::Assistant(msg), tool_results: vec![] }
+    };
+    sub.on_event(&AgentEvent::AgentStart).await;
+    sub.on_event(&AgentEvent::TurnStart).await;
+    sub.on_event(&turn_end()).await;
+    sub.on_event(&AgentEvent::TurnStart).await;
+    sub.on_event(&turn_end()).await;
+    sub.on_event(&AgentEvent::AgentStart).await; // reset back to 0
+    sub.on_event(&AgentEvent::TurnStart).await;
+
+    let got = seen.lock().unwrap().clone();
+    // start+end of a turn share the index; it increments after each end; agent_start resets it.
+    let indices: Vec<(&str, u32)> = got.iter().map(|(l, i, _)| (*l, *i)).collect();
+    assert_eq!(
+        indices,
+        vec![
+            ("turn_start", 0),
+            ("turn_end", 0),
+            ("turn_start", 1),
+            ("turn_end", 1),
+            ("turn_start", 0), // reset by the second agent_start
+        ]
+    );
+    // Every turn_start carries a real wall-clock timestamp (Pi `Date.now()`), never 0.
+    for (label, _, ts) in &got {
+        if *label == "turn_start" {
+            assert!(*ts > 0, "turn_start timestamp must be a real wall-clock ms value");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A-08-2: tool_call blocks a bash call with a reason (R-08-010).
 // ---------------------------------------------------------------------------
 struct BashGate {

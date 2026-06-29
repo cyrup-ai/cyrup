@@ -88,10 +88,12 @@ pub struct AgentEndEvent {
     pub messages: Value,
 }
 
-/// `turn_start` (Pi types.ts:1139).
+/// `turn_start` (Pi `TurnStartEvent`, types.ts:688-693).
 #[derive(Clone, Debug)]
 pub struct TurnStartEvent {
     pub turn_index: u32,
+    /// Wall-clock milliseconds at emit (Pi `Date.now()`, agent-session.ts:624).
+    pub timestamp: u64,
 }
 
 /// `turn_end` (Pi types.ts:1140).

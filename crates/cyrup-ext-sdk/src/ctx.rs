@@ -14,8 +14,10 @@
 use crate::descriptor::{
     DialogOptions, ExecOptions, ForkOptions, NavigateOptions, NewSessionOptions, SwitchSessionOptions,
 };
+use core::cell::RefCell;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// The capability context handed to every handler (event tier: no session mutation).
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,22 +124,65 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
+/// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
+/// [`NotifyKind::Info`] is Pi's default when the argument is omitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotifyKind {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl NotifyKind {
+    fn to_wit(self) -> crate::guest::bindings::cyrup::ext::ui::NotifyKind {
+        use crate::guest::bindings::cyrup::ext::ui::NotifyKind as Wit;
+        match self {
+            NotifyKind::Info => Wit::Info,
+            NotifyKind::Warning => Wit::Warning,
+            NotifyKind::Error => Wit::Error,
+        }
+    }
+}
+
 /// The UI capability surface (Pi `ExtensionUIContext`, types.ts:124-275).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ui;
 
 impl Ui {
+    /// Show an `info`-severity notification (Pi `notify(message)`; the `type` defaults to `"info"`).
     pub fn notify(&self, message: &str) {
-        #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::ui::notify(message);
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = message;
+        self.notify_with(message, NotifyKind::Info);
     }
-    pub fn set_status(&self, message: &str) {
+    /// Show a notification with an explicit severity (Pi `notify(message, type)`, types.ts:135).
+    pub fn notify_with(&self, message: &str, kind: NotifyKind) {
         #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::ui::set_status(message);
+        crate::guest::bindings::cyrup::ext::ui::notify(message, kind.to_wit());
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = message;
+        let _ = (message, kind);
+    }
+    /// Set a keyed status segment (Pi `setStatus(key, text)`, types.ts:141). Pass [`None`] for
+    /// `text` to clear that segment (Pi `setStatus(key, undefined)`).
+    pub fn set_status(&self, key: &str, text: Option<&str>) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::set_status(key, text);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (key, text);
+    }
+    /// Clear a keyed status segment (Pi `setStatus(key, undefined)`).
+    pub fn clear_status(&self, key: &str) {
+        self.set_status(key, None);
+    }
+    /// Programmatically dismiss any dialog bound to `signal_id` (Pi `ExtensionUIDialogOptions.signal`
+    /// `AbortSignal.abort()`, types.ts:89-94; sdk gap #2). A dialog subsequently opened via
+    /// [`Self::confirm_with`]/[`Self::input_with`]/[`Self::select_with`] carrying that signal id
+    /// returns cancelled.
+    pub fn abort_signal(&self, signal_id: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::abort_signal(signal_id);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = signal_id;
     }
     /// Confirmation dialog (Pi `confirm`). Indefinite; use [`Self::confirm_with`] for a timeout/signal.
     pub fn confirm(&self, prompt: &str) -> bool {
@@ -492,6 +537,45 @@ impl CommandCtx {
         let opts = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         control(Control::Fork(entry_id, &opts))
     }
+
+    // --- withSession re-binding callbacks (Pi ReplacedSessionContext, types.ts:346-390; sdk gap #3) ---
+
+    /// Start a new session, then run `with_session` against the re-bound session (Pi
+    /// `newSession({withSession})`, types.ts:346). The closure is stored guest-side and invoked by the
+    /// host's `with-session` export after the replacement completes and the command body returns —
+    /// move post-replacement work here (Pi: a captured `ctx` is stale after `newSession`, runner.ts:511).
+    pub fn new_session_with_callback(
+        &self,
+        opts: &NewSessionOptions,
+        with_session: impl Fn(&ReplacedSessionContext) -> Result<(), String> + 'static,
+    ) -> Result<(), String> {
+        let opts_json = opts_with_callback(opts, Box::new(with_session));
+        control(Control::NewSession(&opts_json))
+    }
+
+    /// Fork, then run `with_session` against the re-bound session (Pi `fork(entryId, {withSession})`,
+    /// types.ts:355).
+    pub fn fork_with_callback(
+        &self,
+        entry_id: &str,
+        opts: &ForkOptions,
+        with_session: impl Fn(&ReplacedSessionContext) -> Result<(), String> + 'static,
+    ) -> Result<(), String> {
+        let opts_json = opts_with_callback(opts, Box::new(with_session));
+        control(Control::Fork(entry_id, &opts_json))
+    }
+
+    /// Switch sessions, then run `with_session` against the re-bound session (Pi
+    /// `switchSession({withSession})`, types.ts:368).
+    pub fn switch_session_with_callback(
+        &self,
+        session_id: &str,
+        opts: &SwitchSessionOptions,
+        with_session: impl Fn(&ReplacedSessionContext) -> Result<(), String> + 'static,
+    ) -> Result<(), String> {
+        let opts_json = opts_with_callback(opts, Box::new(with_session));
+        control(Control::Switch(session_id, &opts_json))
+    }
     pub fn navigate(&self, entry_id: &str, opts: impl Serialize) -> Result<(), String> {
         let opts = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".into());
         control(Control::Navigate(entry_id, &opts))
@@ -569,19 +653,124 @@ fn control(op: Control<'_>) -> Result<(), String> {
     }
 }
 
+// --- withSession re-binding (Pi ReplacedSessionContext, types.ts:374-390; sdk gap #3) ---
+
+/// A guest `withSession(ctx)` re-binding closure (Pi types.ts:382).
+pub type WithSessionFn = Box<dyn Fn(&ReplacedSessionContext) -> Result<(), String> + 'static>;
+
+thread_local! {
+    /// `(next_id, id -> closure)` — the pending `withSession` closures (single-threaded wasm guest).
+    static WITH_SESSION: RefCell<(u64, HashMap<String, WithSessionFn>)> =
+        RefCell::new((0, HashMap::new()));
+}
+
+/// Store a `withSession` closure, returning the id embedded in the `control.*` opts so the host can
+/// schedule the matching `with-session` export call after re-binding the session (sdk gap #3).
+#[doc(hidden)]
+pub fn register_with_session(f: WithSessionFn) -> String {
+    WITH_SESSION.with(|c| {
+        let mut g = c.borrow_mut();
+        g.0 += 1;
+        let id = format!("ws-{}", g.0);
+        g.1.insert(id.clone(), f);
+        id
+    })
+}
+
+/// Run (and consume) the stored `withSession` closure for `id` against a freshly-bound
+/// [`ReplacedSessionContext`] — the host calls this via the `with-session` export after the session
+/// is re-bound. An unknown id is a no-op (never an error).
+#[doc(hidden)]
+pub fn run_with_session(id: &str) -> Result<(), String> {
+    let f = WITH_SESSION.with(|c| c.borrow_mut().1.remove(id));
+    match f {
+        Some(f) => f(&ReplacedSessionContext::new()),
+        None => Ok(()),
+    }
+}
+
+/// Serialize `opts` and inject the registered `withSession` callback id (sdk gap #3).
+fn opts_with_callback(opts: impl Serialize, with_session: WithSessionFn) -> String {
+    let id = register_with_session(with_session);
+    let mut v = serde_json::to_value(&opts).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("withSessionCallbackId".into(), json!(id));
+    }
+    v.to_string()
+}
+
+/// A fresh command-capable context bound to the replacement session after `newSession`/`fork`/
+/// `switchSession` (Pi `ReplacedSessionContext extends ExtensionCommandContext`, types.ts:374-390;
+/// sdk gap #3). Passed to the `withSession` closure. Derefs to [`CommandCtx`], so every command-tier
+/// op (incl. `send_message`/`send_user_message`) is available on the re-bound session.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplacedSessionContext {
+    cmd: CommandCtx,
+}
+
+impl ReplacedSessionContext {
+    pub fn new() -> Self {
+        Self { cmd: CommandCtx::new() }
+    }
+    /// The underlying command-tier context bound to the replacement session.
+    pub fn command(&self) -> &CommandCtx {
+        &self.cmd
+    }
+}
+
+impl core::ops::Deref for ReplacedSessionContext {
+    type Target = CommandCtx;
+    fn deref(&self) -> &CommandCtx {
+        &self.cmd
+    }
+}
+
+/// The tool `execute` cancellation signal (Pi `ToolDefinition.execute` `signal: AbortSignal`,
+/// types.ts:466; sdk gap #1). A long-running tool polls [`Self::is_aborted`] to cooperatively stop;
+/// it reads the host's live cancellation state for this `call_id` (the run `CancelToken`, the epoch
+/// deadline, or a named `ui.abort-signal` matching the call id). The host epoch is the hard backstop.
+#[derive(Clone, Debug, Default)]
+pub struct Signal {
+    // Read only by the wasm32 `is_aborted` import call; inert on the host target.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    call_id: String,
+}
+
+impl Signal {
+    pub fn new(call_id: impl Into<String>) -> Self {
+        Self { call_id: call_id.into() }
+    }
+    /// Whether cancellation has been requested for this tool call (Pi `signal.aborted`).
+    pub fn is_aborted(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::host_tool::is_cancelled(&self.call_id);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        false
+    }
+}
+
 /// The call passed to a guest tool's `execute` (Pi `ToolDefinition.execute` args, types.ts:464).
-/// Carries the `toolCallId`, parsed `params`, and a [`Ctx`]; `emit_update` streams partial output
-/// back to the runtime (Pi `onUpdate`).
+/// Carries the `toolCallId`, parsed `params`, the cancellation [`Signal`], and a [`Ctx`];
+/// `emit_update` streams partial output back to the runtime (Pi `onUpdate`).
 #[derive(Clone, Debug)]
 pub struct ToolCall {
     pub call_id: String,
     pub params: Value,
     pub ctx: Ctx,
+    /// The cancellation signal (Pi `signal`): poll [`Signal::is_aborted`] inside a long `execute`.
+    pub signal: Signal,
 }
 
 impl ToolCall {
     pub fn new(call_id: impl Into<String>, params: Value) -> Self {
-        Self { call_id: call_id.into(), params, ctx: Ctx }
+        let call_id = call_id.into();
+        Self { signal: Signal::new(call_id.clone()), call_id, params, ctx: Ctx }
+    }
+    /// The cancellation signal for this call (Pi `signal` param).
+    pub fn signal(&self) -> &Signal {
+        &self.signal
     }
     /// Stream a partial-output chunk (Pi `onUpdate`).
     pub fn emit_update(&self, chunk: impl Serialize) {

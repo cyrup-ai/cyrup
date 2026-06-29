@@ -6,6 +6,7 @@
 #![cfg(feature = "wasm-host")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
+use cyrup_core::{CancelToken, Content};
 use cyrup_ext::{
     CannedResponses, ExtMode, ExtensionHost, HostConfig, OAuthEvent, RecordingServices,
 };
@@ -125,8 +126,68 @@ async fn live_guest_provider_oauth_stream_autocomplete_activetools() {
 
     // 7) the planmode command restricts the active tools via ext-tools.set-active-tools, then reads
     //    them back via get-active-tools — the plan-mode active-tool restriction, end to end.
-    let cancel = cyrup_core::CancelToken::new();
+    let cancel = CancelToken::new();
     let out = host.run_command("planmode", "", &cancel).await.expect("planmode runs");
     assert_eq!(out.as_deref(), Some("active tools: read"));
     assert_eq!(ext.guest().active_tools_restriction().as_deref(), Some(&["read".to_string()][..]));
+
+    // 8) tool `signal` (Pi `ToolDefinition.execute` `signal`, sdk gap #1): the guest `signal_probe`
+    //    tool polls `host-tool.is-cancelled`. With no abort it reads false; after a named
+    //    `ui.abort-signal` matching the call id it reads true — cooperative cancellation across wasm.
+    let probe = {
+        let active = host.active_tools(&[]).expect("active tools");
+        active.into_iter().find(|t| t.name() == "signal_probe").expect("signal_probe surfaced")
+    };
+    let noop_sink = || -> cyrup_core::ToolUpdateSink { Box::new(|_u| {}) };
+    let live = probe
+        .execute("probe-live".into(), json!({}), CancelToken::new(), noop_sink())
+        .await
+        .expect("signal_probe executes");
+    assert!(
+        matches!(live.content.first(), Some(Content::Text { text, .. }) if text == "aborted: false"),
+        "uncancelled tool sees signal not aborted: {:?}",
+        live.content
+    );
+    // Pre-abort the named signal for this call id, then a fresh (uncancelled) execute observes it.
+    ext.guest().abort_signal("probe-aborted".into());
+    let aborted = probe
+        .execute("probe-aborted".into(), json!({}), CancelToken::new(), noop_sink())
+        .await
+        .expect("signal_probe executes");
+    assert!(
+        matches!(aborted.content.first(), Some(Content::Text { text, .. }) if text == "aborted: true"),
+        "tool polls the aborted signal across the boundary: {:?}",
+        aborted.content
+    );
+
+    // 9) programmatic dialog dismiss (Pi `ExtensionUIDialogOptions.signal`, sdk gap #2): the
+    //    `signaldemo` command aborts a named signal then opens a `confirm` bound to it. Despite the
+    //    backend's canned `confirm = true`, the dismissed dialog returns false.
+    let out = host.run_command("signaldemo", "", &cancel).await.expect("signaldemo runs");
+    assert_eq!(out.as_deref(), Some("confirmed: false"), "dialog bound to an aborted signal cancels");
+    assert!(
+        ext.guest().aborted_signals().iter().any(|s| s == "demo-dialog"),
+        "guest aborted the named dialog signal: {:?}",
+        ext.guest().aborted_signals()
+    );
+
+    // 10) withSession re-binding callback (Pi `ReplacedSessionContext`, sdk gap #3): the
+    //     `withsessiondemo` command starts a new session; the host re-binds and then invokes the guest
+    //     `with-session` export, whose closure notifies on the replacement session.
+    let before = ext.guest().notifications().len();
+    let out = host.run_command("withsessiondemo", "", &cancel).await.expect("withsessiondemo runs");
+    assert_eq!(out.as_deref(), Some("new session scheduled"));
+    assert!(
+        ext.guest().notifications()[before..]
+            .iter()
+            .any(|n| n.contains("withSession ran on the replacement session")),
+        "the withSession closure ran on the re-bound session: {:?}",
+        ext.guest().notifications()
+    );
+    // The new-session control op was requested (Pi `finishSessionReplacement` runs after replacement).
+    assert!(
+        rec.control_ops().iter().any(|op| matches!(op, cyrup_ext::ControlOp::NewSession { .. })),
+        "the command issued a new-session control op: {:?}",
+        rec.control_ops()
+    );
 }

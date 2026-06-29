@@ -469,7 +469,7 @@ impl ExtensionApi {
     }
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TURN_START, notify(move |a, c| {
-            f(TurnStartEvent { turn_index: arg(a, 0).parse().unwrap_or(0) }, c)
+            f(TurnStartEvent { turn_index: arg(a, 0).parse().unwrap_or(0), timestamp: arg(a, 1).parse().unwrap_or(0) }, c)
         }));
     }
     pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) {

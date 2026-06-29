@@ -239,6 +239,13 @@ pub fn provider_stream_simple(
     })
 }
 
+/// `with-session` export body (Pi `ReplacedSessionContext` re-binding, sdk gap #3): run the stored
+/// `withSession` closure for `callback_id` against a freshly-bound command-tier context. The host
+/// calls this after re-binding the session that a `control.*` op replaced.
+pub fn with_session(callback_id: String) -> Result<(), String> {
+    crate::ctx::run_with_session(&callback_id)
+}
+
 /// `autocomplete-suggest` export body (Pi the `AutocompleteProviderFactory` chain): fold the stacked
 /// providers over the host's built-in suggestions, returning the final serialized suggestions.
 pub fn autocomplete_suggest(base_json: String, query_json: String) -> String {

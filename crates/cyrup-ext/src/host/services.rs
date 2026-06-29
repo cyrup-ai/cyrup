@@ -7,9 +7,9 @@
 use crate::event::{EventKind, Subscriptions};
 use crate::native::CtxTier;
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
-use cyrup_core::ExtensionId;
+use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -365,10 +365,12 @@ pub struct GuestState {
     autocomplete: Mutex<Vec<String>>,
     /// Message renderers registered via `register-message-renderer` (custom types).
     renderers: Mutex<Vec<String>>,
-    /// `ui.notify` log — observable host effect (used by tests + diagnostics).
-    notifications: Mutex<Vec<String>>,
-    /// `ui.set-status` log.
-    statuses: Mutex<Vec<String>>,
+    /// `ui.notify` log — observable host effect (used by tests + diagnostics). Each entry carries
+    /// the Pi `type` severity (`info`|`warning`|`error`, types.ts:135).
+    notifications: Mutex<Vec<(String, NotifyKind)>>,
+    /// `ui.set-status` log: keyed status segments (Pi `setStatus(key, text?)`, types.ts:141). A
+    /// `None` text clears that key (Pi `setStatus(key, undefined)`).
+    statuses: Mutex<Vec<(String, Option<String>)>>,
     /// `ui.set-widget` payloads.
     widgets: Mutex<Vec<Value>>,
     /// Extended UI chrome effects (header/footer/title/editor/theme/working/tools-expanded).
@@ -386,6 +388,27 @@ pub struct GuestState {
     stream_events: Mutex<Vec<(String, Value)>>,
     /// The active-tool restriction set via `ext-tools.set-active-tools` (Pi `setActiveTools`).
     active_tools_restriction: Mutex<Option<Vec<String>>>,
+    /// Named abort signals dismissed via `ui.abort-signal` (Pi `ExtensionUIDialogOptions.signal`,
+    /// sdk gap #2): a dialog opened carrying an aborted signal id returns cancelled; a tool whose
+    /// `call-id` matches polls `is-cancelled` true (Pi `ToolDefinition.execute` `signal`, sdk gap #1).
+    aborted_signals: Mutex<HashSet<String>>,
+    /// The `CancelToken` of the currently-executing guest tool, backing the `host-tool.is-cancelled`
+    /// poll (Pi `signal` param). Set before `execute-tool`, cleared after (sdk gap #1).
+    tool_cancel: Mutex<Option<CancelToken>>,
+    /// `withSession` callback ids the guest scheduled via a `control.*` op carrying a
+    /// `withSessionCallbackId`; the host invokes the `with-session` export for each after the command
+    /// body returns (Pi `finishSessionReplacement`, agent-session-runtime.ts:184; sdk gap #3).
+    pending_with_session: Mutex<Vec<String>>,
+}
+
+/// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
+/// `info` is Pi's default when the guest omits the argument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotifyKind {
+    #[default]
+    Info,
+    Warning,
+    Error,
 }
 
 /// An OAuth login-flow callback the guest invoked during `provider-login` (Pi `OAuthLoginCallbacks`).
@@ -429,6 +452,9 @@ impl GuestState {
             oauth_events: Mutex::new(Vec::new()),
             stream_events: Mutex::new(Vec::new()),
             active_tools_restriction: Mutex::new(None),
+            aborted_signals: Mutex::new(HashSet::new()),
+            tool_cancel: Mutex::new(None),
+            pending_with_session: Mutex::new(Vec::new()),
         }
     }
 
@@ -509,24 +535,46 @@ impl GuestState {
         self.renderers.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    pub fn notify(&self, message: String) {
+    pub fn notify(&self, message: String, kind: NotifyKind) {
         if let Ok(mut g) = self.notifications.lock() {
-            g.push(message);
+            g.push((message, kind));
         }
     }
 
+    /// Recorded notification messages (severity-agnostic; back-compat for message-text assertions).
     pub fn notifications(&self) -> Vec<String> {
+        self.notifications
+            .lock()
+            .map(|g| g.iter().map(|(m, _)| m.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Recorded notifications with their Pi `type` severity (types.ts:135).
+    pub fn notifications_with_kind(&self) -> Vec<(String, NotifyKind)> {
         self.notifications.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    pub fn set_status(&self, message: String) {
+    /// Record a keyed status update (Pi `setStatus(key, text?)`, types.ts:141). A `None` `text`
+    /// clears that key.
+    pub fn set_status(&self, key: String, text: Option<String>) {
         if let Ok(mut g) = self.statuses.lock() {
-            g.push(message);
+            g.push((key, text));
         }
     }
 
-    pub fn statuses(&self) -> Vec<String> {
+    /// Recorded status segments as `(key, text)` pairs (`text` `None` = a clear of that key).
+    pub fn statuses(&self) -> Vec<(String, Option<String>)> {
         self.statuses.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// The current resolved value of keyed status segment `key` after replaying the recorded
+    /// `setStatus` calls (Pi keeps a per-key map; a `None` text clears the key). `None` means the
+    /// key is unset/cleared.
+    pub fn status_for(&self, key: &str) -> Option<String> {
+        self.statuses
+            .lock()
+            .ok()
+            .and_then(|g| g.iter().rfind(|(k, _)| k == key).and_then(|(_, t)| t.clone()))
     }
 
     pub fn set_widget(&self, widget: Value) {
@@ -639,5 +687,109 @@ impl GuestState {
     /// The active-tool restriction the guest set, if any (the merge is applied host-side).
     pub fn active_tools_restriction(&self) -> Option<Vec<String>> {
         self.active_tools_restriction.lock().ok().and_then(|g| g.clone())
+    }
+
+    // --- named abort signals (Pi ExtensionUIDialogOptions.signal / execute signal; sdk gap #1/#2) ---
+
+    /// Mark a named signal aborted (Pi `signal.abort()`): the guest called `ui.abort-signal`.
+    pub fn abort_signal(&self, id: String) {
+        if let Ok(mut g) = self.aborted_signals.lock() {
+            g.insert(id);
+        }
+    }
+
+    /// Whether a named signal id has been aborted (drives dialog dismissal + tool cancellation).
+    pub fn is_signal_aborted(&self, id: &str) -> bool {
+        self.aborted_signals.lock().map(|g| g.contains(id)).unwrap_or(false)
+    }
+
+    /// The set of aborted signal ids (tests/diagnostics).
+    pub fn aborted_signals(&self) -> Vec<String> {
+        self.aborted_signals.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Whether a dialog opened with `opts` is already dismissed by a programmatic signal (sdk gap #2).
+    pub fn dialog_dismissed(&self, opts: &DialogOptions) -> bool {
+        opts.signal_id.as_deref().is_some_and(|id| self.is_signal_aborted(id))
+    }
+
+    /// Bind the currently-executing tool's `CancelToken` for the `is-cancelled` poll (sdk gap #1).
+    pub fn set_tool_cancel(&self, token: Option<CancelToken>) {
+        if let Ok(mut g) = self.tool_cancel.lock() {
+            *g = token;
+        }
+    }
+
+    /// The tool `signal` poll (Pi `signal.aborted`): true if the active tool's `CancelToken` is
+    /// cancelled OR a named signal matching this `call_id` was aborted (sdk gap #1).
+    pub fn tool_is_cancelled(&self, call_id: &str) -> bool {
+        let token_cancelled =
+            self.tool_cancel.lock().map(|g| g.as_ref().is_some_and(|t| t.is_cancelled())).unwrap_or(false);
+        token_cancelled || self.is_signal_aborted(call_id)
+    }
+
+    // --- withSession re-binding callbacks (Pi finishSessionReplacement; sdk gap #3) ---
+
+    /// Schedule a guest `with-session` callback id to run after the current command body returns.
+    pub fn push_pending_with_session(&self, id: String) {
+        if let Ok(mut g) = self.pending_with_session.lock() {
+            g.push(id);
+        }
+    }
+
+    /// Drain the scheduled `with-session` callback ids (the loader invokes the export for each).
+    pub fn take_pending_with_session(&self) -> Vec<String> {
+        self.pending_with_session.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn state() -> GuestState {
+        GuestState::new(ExtensionId::from("test"), Arc::new(ExtensionRegistry::new()))
+    }
+
+    #[test]
+    fn notify_records_pi_severity() {
+        let s = state();
+        s.notify("plain".into(), NotifyKind::Info);
+        s.notify("careful".into(), NotifyKind::Warning);
+        s.notify("boom".into(), NotifyKind::Error);
+
+        // Message-text view is back-compat (severity-agnostic).
+        assert_eq!(s.notifications(), vec!["plain", "careful", "boom"]);
+        // Severity is preserved 1:1 with Pi's notify `type` (types.ts:135).
+        assert_eq!(
+            s.notifications_with_kind(),
+            vec![
+                ("plain".into(), NotifyKind::Info),
+                ("careful".into(), NotifyKind::Warning),
+                ("boom".into(), NotifyKind::Error),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_status_addresses_and_clears_keyed_segments() {
+        let s = state();
+        // Two independent keyed segments (Pi `setStatus(key, text)`, types.ts:141).
+        s.set_status("lint".into(), Some("12 warnings".into()));
+        s.set_status("build".into(), Some("compiling".into()));
+        // Update one key, then clear it (Pi `setStatus(key, undefined)`).
+        s.set_status("build".into(), Some("done".into()));
+        s.set_status("lint".into(), None);
+
+        // The raw log keeps every keyed write (incl. the clear).
+        let log = s.statuses();
+        assert_eq!(log.len(), 4);
+        assert!(log.contains(&("lint".into(), None)));
+
+        // Replay resolves each key to its last value; a None clears it.
+        assert_eq!(s.status_for("build"), Some("done".into()));
+        assert_eq!(s.status_for("lint"), None); // cleared
+        assert_eq!(s.status_for("absent"), None); // never set
     }
 }

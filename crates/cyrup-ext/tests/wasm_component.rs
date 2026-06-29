@@ -13,7 +13,8 @@
 
 use cyrup_core::{CancelToken, Content};
 use cyrup_ext::{
-    DenyServices, EventKind, ExtMode, Extension, ExtensionHost, HostConfig, HostEvent, Reduced,
+    DenyServices, EventKind, ExtMode, Extension, ExtensionHost, HostConfig, HostEvent, NotifyKind,
+    Reduced,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -90,6 +91,16 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         "guest UI notification recorded: {:?}",
         ext.guest().notifications()
     );
+    // ...and it carried Pi's `type: "error"` severity across the WIT boundary (types.ts:135): the
+    // gate used `notify_with(.., NotifyKind::Error)`, recorded host-side with the kind intact.
+    assert!(
+        ext.guest()
+            .notifications_with_kind()
+            .iter()
+            .any(|(m, k)| m.contains("blocked a bash call") && *k == NotifyKind::Error),
+        "blocked-bash notification recorded with error severity: {:?}",
+        ext.guest().notifications_with_kind()
+    );
 
     // 2) tool_call(read) -> NOT blocked: the (possibly folded) event passes.
     let reduced = host
@@ -142,6 +153,19 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         ext.guest().notifications().iter().any(|n| n.contains("greet command ran")),
         "command handler's ctx.ui().notify ran"
     );
+    // The command addressed a KEYED status segment then cleared it (Pi `setStatus(key, text)` /
+    // `setStatus(key, undefined)`, types.ts:141) — both calls recorded with their key across the WIT.
+    let statuses = ext.guest().statuses();
+    assert!(
+        statuses.iter().any(|(k, t)| k == "greet" && t.as_deref() == Some("greeting…")),
+        "keyed status set recorded: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().any(|(k, t)| k == "greet" && t.is_none()),
+        "keyed status clear (text=None) recorded: {statuses:?}"
+    );
+    // Replaying the keyed segment resolves to cleared (the clear was last).
+    assert_eq!(ext.guest().status_for("greet"), None, "greet status segment resolves cleared");
     let comps = ext.argument_completions("greet", "te").await.expect("completions");
     assert_eq!(comps, vec!["team".to_string()], "dynamic getArgumentCompletions filtered by prefix");
 

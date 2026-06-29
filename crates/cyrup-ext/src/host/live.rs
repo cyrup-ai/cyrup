@@ -14,7 +14,9 @@ use crate::event::{EventKind, HostEvent, Subscriptions};
 use crate::extension::{ExtKind, Extension};
 use crate::host::engine::map_wasm_error;
 use crate::host::limits::StoreLimits;
-use crate::host::services::{ControlOp, DialogOptions, ExecOutput, GuestState, OAuthEvent};
+use crate::host::services::{
+    ControlOp, DialogOptions, ExecOutput, GuestState, NotifyKind, OAuthEvent,
+};
 use crate::host::store_state::HostState;
 use crate::native::CtxTier;
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
@@ -47,6 +49,17 @@ use bindings::cyrup::ext::types as wit_types;
 /// Helper: fetch the guest backing or surface a trap-free error string (imports never panic).
 fn guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
     state.guest.as_ref().ok_or_else(|| "no guest state in store".to_string())
+}
+
+/// Map the WIT `notify-kind` severity onto the host-owned [`NotifyKind`] (keeps bindgen types out
+/// of [`GuestState`]'s public surface).
+fn notify_kind_from_wit(kind: bindings::cyrup::ext::ui::NotifyKind) -> NotifyKind {
+    use bindings::cyrup::ext::ui::NotifyKind as Wit;
+    match kind {
+        Wit::Info => NotifyKind::Info,
+        Wit::Warning => NotifyKind::Warning,
+        Wit::Error => NotifyKind::Error,
+    }
 }
 
 // The `types` interface carries only type definitions; its (empty) Host trait still needs an impl.
@@ -135,28 +148,45 @@ impl bindings::cyrup::ext::registration::Host for HostState {
 }
 
 impl bindings::cyrup::ext::ui::Host for HostState {
-    async fn notify(&mut self, message: String) {
+    async fn notify(&mut self, message: String, kind: bindings::cyrup::ext::ui::NotifyKind) {
         if let Ok(guest) = guest_of(self) {
-            guest.notify(message);
+            guest.notify(message, notify_kind_from_wit(kind));
         }
     }
-    async fn set_status(&mut self, message: String) {
+    async fn set_status(&mut self, key: String, text: Option<String>) {
         if let Ok(guest) = guest_of(self) {
-            guest.set_status(message);
+            guest.set_status(key, text);
+        }
+    }
+    async fn abort_signal(&mut self, signal_id: String) {
+        if let Ok(guest) = guest_of(self) {
+            guest.abort_signal(signal_id);
         }
     }
     async fn confirm(&mut self, prompt: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
-        guest_of(self).map(|g| g.services.confirm(&prompt, &opts)).unwrap_or(false)
+        let Ok(guest) = guest_of(self) else { return false };
+        // Programmatic dismiss (Pi `signal`): a dialog bound to an aborted signal returns cancelled.
+        if guest.dialog_dismissed(&opts) {
+            return false;
+        }
+        guest.services.confirm(&prompt, &opts)
     }
     async fn input(&mut self, prompt: String, opts_json: String) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
-        guest_of(self).ok().and_then(|g| g.services.input(&prompt, &opts))
+        let guest = guest_of(self).ok()?;
+        if guest.dialog_dismissed(&opts) {
+            return None;
+        }
+        guest.services.input(&prompt, &opts)
     }
     async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<u32> {
         let guest = guest_of(self).ok()?;
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         let opts = DialogOptions::parse(&opts_json);
+        if guest.dialog_dismissed(&opts) {
+            return None;
+        }
         guest.services.select(&prompt, &options, &opts)
     }
     async fn editor(&mut self, initial: String) -> Option<String> {
@@ -331,6 +361,11 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
             guest.push_tool_update(call_id, chunk);
         }
     }
+    async fn is_cancelled(&mut self, call_id: String) -> bool {
+        // The tool `signal` poll (Pi `signal.aborted`): the executing tool's `CancelToken` fired, or
+        // a named signal for this `call-id` was aborted (sdk gap #1).
+        guest_of(self).map(|g| g.tool_is_cancelled(&call_id)).unwrap_or(false)
+    }
 }
 
 impl bindings::cyrup::ext::oauth::Host for HostState {
@@ -411,24 +446,40 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
     }
 }
 
+/// Extract a `withSessionCallbackId` from a `control.*` opts payload and schedule the guest
+/// `with-session` re-binding callback to run after the command body returns (Pi
+/// `finishSessionReplacement` runs `withSession` after the replacement, agent-session-runtime.ts:184;
+/// sdk gap #3). Wasm single-instance reentrancy forbids invoking the export synchronously here.
+fn schedule_with_session(guest: &GuestState, opts: &Value) {
+    if let Some(id) = opts.get("withSessionCallbackId").and_then(|v| v.as_str()) {
+        guest.push_pending_with_session(id.to_string());
+    }
+}
+
 impl bindings::cyrup::ext::control::Host for HostState {
     async fn new_session(&mut self, opts_json: String) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::NewSession { opts })
+        guest.services.control(ControlOp::NewSession { opts: opts.clone() })?;
+        schedule_with_session(guest, &opts);
+        Ok(())
     }
     async fn switch(&mut self, session_id: String, opts_json: String) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::Switch { session_id, opts })
+        guest.services.control(ControlOp::Switch { session_id, opts: opts.clone() })?;
+        schedule_with_session(guest, &opts);
+        Ok(())
     }
     async fn fork(&mut self, entry_id: String, opts_json: String) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::Fork { entry_id, opts })
+        guest.services.control(ControlOp::Fork { entry_id, opts: opts.clone() })?;
+        schedule_with_session(guest, &opts);
+        Ok(())
     }
     async fn navigate(&mut self, entry_id: String, opts_json: String) -> Result<(), String> {
         let guest = guest_of(self)?;
@@ -561,14 +612,21 @@ impl LiveExtension {
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
+        // Bind this call's CancelToken so the guest's `signal` poll (`host-tool.is-cancelled`) reads
+        // the live cancellation state during a long `execute` (Pi `signal` param, sdk gap #1).
+        self.guest.set_tool_cancel(Some(cancel.clone()));
         let params_s = params.to_string();
         let api = inner.instance.cyrup_ext_events();
         let call = api.call_execute_tool(&mut inner.store, name, call_id.as_str(), &params_s);
         let res = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(ToolError::new("tool execution cancelled")),
+            _ = cancel.cancelled() => {
+                self.guest.set_tool_cancel(None);
+                return Err(ToolError::new("tool execution cancelled"));
+            }
             r = call => r,
         };
+        self.guest.set_tool_cancel(None);
         // Replay streamed updates (Pi onUpdate) into the runtime sink.
         for (_cid, chunk) in self.guest.take_tool_updates() {
             let content = chunk
@@ -614,11 +672,32 @@ impl LiveExtension {
             _ = cancel.cancelled() => return Err(ExtError::Cancelled),
             r = call => r,
         };
-        match res {
-            Ok(Ok(out)) => Ok(out),
-            Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+        let out = match res {
+            Ok(Ok(out)) => out,
+            Ok(Err(msg)) => return Err(ExtError::Component(msg)),
+            Err(e) => return Err(map_wasm_error(&e)),
+        };
+        // Run any `withSession` re-binding callbacks the command scheduled via a `control.*` op (Pi
+        // `finishSessionReplacement`, sdk gap #3). Each is a FRESH top-level `with-session` export call
+        // at command tier — reentrancy forbids invoking it inside the `control.*` import. A faulting
+        // callback is contained as a typed `ExtError` (the command's output is preserved on success).
+        for callback_id in self.guest.take_pending_with_session() {
+            inner.store.set_epoch_deadline(self.epoch_ticks);
+            self.guest.set_tier(CtxTier::Command);
+            let api = inner.instance.cyrup_ext_events();
+            let cb = api.call_with_session(&mut inner.store, &callback_id);
+            let r = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ExtError::Cancelled),
+                r = cb => r,
+            };
+            match r {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => return Err(ExtError::Component(msg)),
+                Err(e) => return Err(map_wasm_error(&e)),
+            }
         }
+        Ok(out)
     }
 
     /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions(prefix)`,
@@ -945,8 +1024,8 @@ async fn invoke(
             let m = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
             api.call_on_agent_end(store, &m).await.and_then(|()| noop())
         }
-        HostEvent::TurnStart { turn_index } => {
-            api.call_on_turn_start(store, *turn_index).await.and_then(|()| noop())
+        HostEvent::TurnStart { turn_index, timestamp } => {
+            api.call_on_turn_start(store, *turn_index, *timestamp).await.and_then(|()| noop())
         }
         HostEvent::TurnEnd { turn_index, message, .. } => {
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());

@@ -337,6 +337,21 @@ fn example_registers_oauth_provider_and_autocomplete() {
 }
 
 #[test]
+fn turn_start_decodes_index_and_timestamp() {
+    // The host's `on-turn-start(turn-index, timestamp)` export lowers to ordered string args
+    // `[turn_index, timestamp]` (Pi `TurnStartEvent`, types.ts:688-693). Prove the guest decodes
+    // BOTH — the `timestamp` (Pi `Date.now()`) is a real second field, not dropped.
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let seen: Rc<Cell<(u32, u64)>> = Rc::new(Cell::new((0, 0)));
+    let sink = seen.clone();
+    let mut api = ExtensionApi::new();
+    api.on_turn_start(move |ev, _| sink.set((ev.turn_index, ev.timestamp)));
+    api.dispatch(9, &["4", "1700000000000"], &Ctx::new());
+    assert_eq!(seen.get(), (4, 1_700_000_000_000));
+}
+
+#[test]
 fn all_thirty_events_are_registerable() {
     // Register one handler per event kind and assert the bitset reports all 30 discriminants.
     let mut api = ExtensionApi::new();
@@ -375,4 +390,54 @@ fn all_thirty_events_are_registerable() {
     assert_eq!(kinds.len(), 30, "all 30 Pi events registerable, got {kinds:?}");
     assert_eq!(kinds.first(), Some(&0));
     assert_eq!(kinds.last(), Some(&29));
+}
+
+#[test]
+fn tool_call_carries_a_cancellation_signal() {
+    // The tool `execute` call now bundles a `signal` (Pi `ToolDefinition.execute` signal param,
+    // sdk gap #1). On the host target the poll is inert (false); the live wasm E2E proves the real
+    // host-backed poll across the boundary.
+    let call = ToolCall::new("c1", json!({ "text": "hi" }));
+    assert_eq!(call.call_id, "c1");
+    assert!(!call.signal().is_aborted(), "host-target signal poll is inert");
+}
+
+#[test]
+fn with_session_closure_registers_runs_once_and_is_consumed() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // The `withSession` re-binding plumbing (Pi `ReplacedSessionContext`, sdk gap #3): a closure is
+    // stored under an id (embedded in the `control.*` opts) and the host runs it via `with-session`.
+    let ran = Rc::new(Cell::new(0u32));
+    let r2 = ran.clone();
+    let id = cyrup_ext_sdk::ctx::register_with_session(Box::new(move |_rsc: &ReplacedSessionContext| {
+        r2.set(r2.get() + 1);
+        Ok(())
+    }));
+
+    // An unknown id is a no-op (never an error).
+    assert!(cyrup_ext_sdk::ctx::run_with_session("no-such-id").is_ok());
+    assert_eq!(ran.get(), 0);
+
+    // The registered id runs the closure exactly once...
+    cyrup_ext_sdk::ctx::run_with_session(&id).expect("withSession closure runs");
+    assert_eq!(ran.get(), 1);
+
+    // ...and is consumed: a second invocation is a no-op (the closure does not re-run).
+    cyrup_ext_sdk::ctx::run_with_session(&id).expect("consumed id is a no-op");
+    assert_eq!(ran.get(), 1);
+}
+
+#[test]
+fn new_session_with_callback_is_command_tier_and_ok_on_host() {
+    // The closure-accepting session ops compile + return Ok on the host target (the control op is
+    // inert here; the live E2E proves the host schedules + invokes the `with-session` export).
+    let ctx = CommandCtx::new();
+    let out = ctx.new_session_with_callback(&NewSessionOptions::default(), |_rsc| Ok(()));
+    assert!(out.is_ok());
+    let out = ctx.fork_with_callback("e1", &ForkOptions::default(), |_rsc| Ok(()));
+    assert!(out.is_ok());
+    let out = ctx.switch_session_with_callback("s1", &SwitchSessionOptions::default(), |_rsc| Ok(()));
+    assert!(out.is_ok());
 }

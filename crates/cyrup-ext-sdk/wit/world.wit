@@ -99,6 +99,15 @@ interface events {
   // suggestions after applying every stacked provider in registration order.
   autocomplete-suggest:   func(base-json: string, query-json: string) -> string;
 
+  // --- withSession re-binding callback (Pi ReplacedSessionContext, types.ts:346-390) ---
+  // After a command-tier `control.new-session`/`switch`/`fork` carrying a `withSessionCallbackId`,
+  // the host re-binds the replacement session then invokes THIS export with that id — a fresh
+  // top-level call, because wasm single-instance reentrancy forbids calling it synchronously inside
+  // the `control.*` import (Pi `finishSessionReplacement`, agent-session-runtime.ts:184-189). The
+  // guest looks up the stored `withSession(ctx)` closure and runs it against a freshly-bound
+  // command-tier `ReplacedSessionContext`.
+  with-session: func(callback-id: string) -> result<_, string>;
+
   // --- guest tool execution (R-08-015) ---
   // The host invokes a guest-registered tool. Mirrors Pi's ToolDefinition.execute
   // (types.ts:464): `call-id` = toolCallId, `params-json` = arguments; cancellation (signal)
@@ -148,7 +157,7 @@ interface events {
   // --- notify-only (return ignored); high-frequency ones are subscription-gated ---
   on-agent-start:           func();
   on-agent-end:             func(messages-json: string);
-  on-turn-start:            func(turn-index: u32);
+  on-turn-start:            func(turn-index: u32, timestamp: u64);
   on-turn-end:              func(turn-index: u32, message-json: string);
   on-message-start:         func(role: string);
   on-message-update:        func(delta-json: string);   // HIGH-FREQ, gated
@@ -196,8 +205,15 @@ interface registration {
 // guest -> host: capabilities (arch-08 §3.6, caps/*).
 // ---------------------------------------------------------------------------
 interface ui {
-  notify:     func(message: string);
-  set-status: func(message: string);
+  // notification severity (Pi notify `type`: "info" | "warning" | "error", types.ts:135); info is the default.
+  enum notify-kind { info, warning, error }
+  notify:     func(message: string, kind: notify-kind);
+  // Pi setStatus(key, text?: string), types.ts:141: a keyed status segment; a none `text` clears that key.
+  set-status: func(key: string, text: option<string>);
+  // programmatically dismiss any dialog bound to `signal-id` (Pi `ExtensionUIDialogOptions.signal`
+  // AbortSignal, types.ts:89-94): a dialog subsequently opened carrying that signal id returns
+  // cancelled (`confirm` -> false, `input`/`select` -> none).
+  abort-signal: func(signal-id: string);
   // `opts-json` is the Pi `ExtensionUIDialogOptions` bag (types.ts:89): `{timeoutMs, signal}` —
   // a live-countdown timeout and/or a programmatic-dismiss signal id (none = `{}`).
   confirm:    func(prompt: string, opts-json: string) -> bool;
@@ -270,6 +286,10 @@ interface bus {
 // streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:467).
 interface host-tool {
   emit-update: func(call-id: string, chunk-json: string);
+  // the tool's AbortSignal (Pi `ToolDefinition.execute` `signal` param, types.ts:466): the guest
+  // polls this during a long `execute` to cooperatively stop. True once the host cancels the call
+  // (epoch/`CancelToken`) or a named signal for this `call-id` was aborted (`ui.abort-signal`).
+  is-cancelled: func(call-id: string) -> bool;
 }
 
 // OAuth login callbacks (Pi `OAuthLoginCallbacks`, pi-ai oauth/types.ts): the host-side handlers a

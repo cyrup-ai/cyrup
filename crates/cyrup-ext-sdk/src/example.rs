@@ -7,8 +7,9 @@
 //! dynamically-registered streaming tool (`demo_echo`).
 
 use crate::{
-    AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, ExtensionApi, MessageRenderer,
-    OAuthProvider, Outcome, ProviderConfig, ProviderHandlers, ToolCall, ToolDescriptor, ToolOutput,
+    AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, DialogOptions, ExtensionApi,
+    MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider, Outcome, ProviderConfig,
+    ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor, ToolOutput,
 };
 use serde_json::{json, Value};
 
@@ -31,7 +32,8 @@ pub fn build() -> ExtensionApi {
     // Permission gate (R-08-010): block any `bash` tool call with a reason.
     api.on_tool_call(|ev, ctx| {
         if ev.name == "bash" {
-            ctx.ui().notify("permission-gate: blocked a bash call");
+            // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:135).
+            ctx.ui().notify_with("permission-gate: blocked a bash call", NotifyKind::Error);
             Outcome::block("bash is disabled by the demo extension")
         } else {
             Outcome::noop()
@@ -67,6 +69,10 @@ pub fn build() -> ExtensionApi {
         CommandDescriptor::new("Greet someone by name (demo command)."),
         |args: &str, ctx: &crate::CommandCtx| {
             ctx.ui().notify("greet command ran");
+            // Address a keyed status segment (Pi `setStatus(key, text)`, types.ts:141), then clear
+            // it (Pi `setStatus(key, undefined)`) — proves keyed set + clear over the boundary.
+            ctx.ui().set_status("greet", Some("greeting…"));
+            ctx.ui().clear_status("greet");
             // A COMMAND-tier control op (R-08-008): legal here, recorded by the host backend.
             let _ = ctx.compact();
             Ok(Some(format!("hello, {}!", args.trim())))
@@ -153,6 +159,45 @@ pub fn build() -> ExtensionApi {
             ctx.ctx().set_active_tools(&["read"]);
             let active = ctx.ctx().get_active_tools();
             Ok(Some(format!("active tools: {}", active.join(","))))
+        },
+    );
+
+    // A tool that polls its cancellation `signal` (Pi `ToolDefinition.execute` `signal`, sdk gap #1):
+    // a long tool would loop and bail when aborted; this demo just reports the current state.
+    api.register_tool(
+        ToolDescriptor::new("signal_probe", json!({ "type": "object", "properties": {} }))
+            .description("Report whether the host has requested cancellation (demo signal)."),
+        |call: ToolCall| Ok(ToolOutput::text(format!("aborted: {}", call.signal().is_aborted()))),
+    );
+
+    // A command exercising the programmatic dialog-dismiss signal (Pi `ExtensionUIDialogOptions.signal`,
+    // sdk gap #2): abort the named signal, then a dialog bound to it returns cancelled (here `confirm`
+    // -> false) even though the backend's canned answer is `true`.
+    api.register_command(
+        "signaldemo",
+        CommandDescriptor::new("Dismiss a dialog via a named signal, then confirm (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            ctx.ui().abort_signal("demo-dialog");
+            let ok = ctx.ui().confirm_with("proceed?", &DialogOptions::signal("demo-dialog"));
+            Ok(Some(format!("confirmed: {ok}")))
+        },
+    );
+
+    // A command exercising the `withSession` re-binding callback (Pi `ReplacedSessionContext`,
+    // sdk gap #3): start a new session and move post-replacement work into the closure, which the host
+    // invokes against the re-bound session after the command returns.
+    api.register_command(
+        "withsessiondemo",
+        CommandDescriptor::new("Start a new session and notify on the re-bound session (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            ctx.new_session_with_callback(
+                &NewSessionOptions::default(),
+                |rsc: &ReplacedSessionContext| {
+                    rsc.ui().notify("withSession ran on the replacement session");
+                    Ok(())
+                },
+            )?;
+            Ok(Some("new session scheduled".into()))
         },
     );
 

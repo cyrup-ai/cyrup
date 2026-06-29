@@ -118,6 +118,11 @@ macro_rules! export_extension {
                 ) -> ::std::string::String {
                     $crate::guest::autocomplete_suggest(base_json, query_json)
                 }
+                fn with_session(
+                    callback_id: ::std::string::String,
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    $crate::guest::with_session(callback_id)
+                }
 
                 // --- block/mutate/handled hooks ---
                 fn on_tool_call(
@@ -187,8 +192,8 @@ macro_rules! export_extension {
                 fn on_agent_end(messages_json: ::std::string::String) {
                     $crate::guest::notify(8, &[&messages_json]);
                 }
-                fn on_turn_start(turn_index: u32) {
-                    $crate::guest::notify(9, &[&turn_index.to_string()]);
+                fn on_turn_start(turn_index: u32, timestamp: u64) {
+                    $crate::guest::notify(9, &[&turn_index.to_string(), &timestamp.to_string()]);
                 }
                 fn on_turn_end(turn_index: u32, message_json: ::std::string::String) {
                     $crate::guest::notify(10, &[&turn_index.to_string(), &message_json]);

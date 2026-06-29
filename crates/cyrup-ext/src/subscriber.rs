@@ -7,30 +7,59 @@ use crate::dispatch::Dispatcher;
 use crate::event::{EventKind, HostEvent};
 use cyrup_agent::{AgentEvent, EventSubscriber};
 use cyrup_core::CancelToken;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// The notify-only subscriber handed to the agent (arch-08 §3.1).
 pub struct ExtSubscriber {
     dispatcher: Arc<Dispatcher>,
     cancel: CancelToken,
+    /// Turn counter mirroring Pi's `AgentSession._turnIndex` (agent-session.ts:302/616/635). The
+    /// upstream `AgentEvent::{TurnStart, TurnEnd}` are payload-less, so — exactly like Pi's
+    /// `_emitExtensionEvent` — the turn index a `turn_start`/`turn_end` carries is DERIVED in this
+    /// fan-out layer: reset to 0 on `agent_start`, read for both turn events, incremented after each
+    /// `turn_end`. Single-instance + sequential (the agent awaits each `on_event`), so `Relaxed` is
+    /// sufficient; the counter advances even when nobody subscribed so the index never drifts.
+    turn_index: AtomicU32,
 }
 
 impl ExtSubscriber {
     pub fn new(dispatcher: Arc<Dispatcher>, cancel: CancelToken) -> Self {
-        Self { dispatcher, cancel }
+        Self { dispatcher, cancel, turn_index: AtomicU32::new(0) }
     }
 }
 
 #[async_trait::async_trait]
 impl EventSubscriber for ExtSubscriber {
     async fn on_event(&self, event: &AgentEvent) {
-        // Cheap gate FIRST: map to kind and bail before any serialization if nobody subscribed
+        // Maintain the Pi turn counter BEFORE the subscription gate so the index stays correct even
+        // when the intervening events have no subscribers (Pi agent-session.ts:615-635). `agent_start`
+        // resets; `turn_end` reads-then-increments (fetch_add returns the pre-increment value, which
+        // is the index Pi emits with the `turn_end`).
+        let turn_index = match event {
+            AgentEvent::AgentStart => {
+                self.turn_index.store(0, Ordering::Relaxed);
+                0
+            }
+            AgentEvent::TurnEnd { .. } => self.turn_index.fetch_add(1, Ordering::Relaxed),
+            _ => self.turn_index.load(Ordering::Relaxed),
+        };
+
+        // Cheap gate: map to kind and bail before any serialization if nobody subscribed
         // (R-08-034 / R-ARCH-EXT-014).
         let Some(kind) = EventKind::from_agent(event) else { return };
         if self.dispatcher.no_subscribers(kind) {
             return;
         }
         let Some(host_ev) = HostEvent::from_agent(event) else { return };
+        // Inject the derived turn index into the turn events (the raw upstream events omit it).
+        let host_ev = match host_ev {
+            HostEvent::TurnStart { timestamp, .. } => HostEvent::TurnStart { turn_index, timestamp },
+            HostEvent::TurnEnd { message, tool_results, .. } => {
+                HostEvent::TurnEnd { turn_index, message, tool_results }
+            }
+            other => other,
+        };
         self.dispatcher.dispatch_notify(&host_ev, &self.cancel).await;
     }
 }
