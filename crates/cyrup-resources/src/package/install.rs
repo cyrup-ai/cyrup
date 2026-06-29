@@ -289,8 +289,14 @@ fn git_clone_url(
     if dir.exists() {
         let _ = std::fs::remove_dir_all(dir);
     }
-    let mut prepare =
+    let prepare =
         gix::prepare_clone(url, dir).map_err(|e| ResourceError::Git(e.to_string()))?;
+    // `prepare_clone` creates a FRESH repo whose config does NOT include the user's
+    // ~/.gitconfig (credential helper, SSH command). Inject that auth config now — between
+    // prepare_clone and fetch — so a PRIVATE https/ssh install authenticates with the user's
+    // configured credentials exactly as Pi (system `git clone`) would. Best-effort: a no-op
+    // when nothing relevant is configured, harmless for public/`file://` clones.
+    let mut prepare = configure_clone(prepare);
     if let Some(reff) = ref_name.as_deref() {
         prepare = prepare
             .with_ref_name(Some(reff))
@@ -319,6 +325,105 @@ fn git_clone_url(
         None => git_head_repo(&repo)?,
     };
     Ok(commit_hex)
+}
+
+// ============================================================================
+// Git auth / credential injection for remote clones
+// ----------------------------------------------------------------------------
+// Ported 1:1 from the proven cyrup-ai gix facade in
+// kodegen-workspace/packages/kodegen-tools-git/src/operations/auth.rs
+// (`GitConfig::read` + `to_gix_overrides` + `configure_clone`). `gix::prepare_clone`
+// creates a fresh repo whose config does NOT include the user's ~/.gitconfig (credential
+// helpers, ssh settings); we read the user's *effective* config via the `git` binary
+// (so includes / system+global+local all resolve, mirroring Pi's reliance on system git)
+// and feed it back as in-memory config overrides. gix 0.85's
+// `PrepareFetch::with_in_memory_config_overrides` is API-identical to 0.75's, so the port
+// is a straight copy with no behavioral change.
+// ============================================================================
+
+/// Cached, read-once user git auth config (mirrors kodegen's `GIT_CONFIG` `OnceLock`).
+static GIT_AUTH_CONFIG: std::sync::OnceLock<GitAuthConfig> = std::sync::OnceLock::new();
+
+/// User git configuration relevant to authenticating a clone (kodegen `GitConfig`).
+#[derive(Debug, Clone, Default)]
+struct GitAuthConfig {
+    /// `core.sshCommand` — custom SSH program/flags for ssh:// and git@ remotes.
+    ssh_command: Option<String>,
+    /// `ssh.variant` — SSH program variant gix uses to shape its arguments.
+    ssh_variant: Option<String>,
+    /// `credential.helper` — credential helper that supplies https usernames/passwords/tokens.
+    credential_helper: Option<String>,
+}
+
+impl GitAuthConfig {
+    /// Read auth-relevant git config via the `git` binary (kodegen `GitConfig::read`).
+    fn read() -> Self {
+        let mut config = GitAuthConfig::default();
+        if !git_available() {
+            return config;
+        }
+        config.ssh_command = git_config_get("core.sshCommand");
+        config.ssh_variant = git_config_get("ssh.variant");
+        config.credential_helper = git_config_get("credential.helper");
+        config
+    }
+
+    /// Render as gix in-memory override strings `key=value` (kodegen `to_gix_overrides`).
+    fn to_gix_overrides(&self) -> Vec<String> {
+        let mut overrides = Vec::new();
+        if let Some(v) = &self.ssh_command {
+            overrides.push(format!("core.sshCommand={v}"));
+        }
+        if let Some(v) = &self.ssh_variant {
+            overrides.push(format!("ssh.variant={v}"));
+        }
+        // credential.helper drives https auth; gix invokes the helper during fetch.
+        if let Some(v) = &self.credential_helper {
+            overrides.push(format!("credential.helper={v}"));
+        }
+        overrides
+    }
+}
+
+/// Cached accessor for the user's git auth config (kodegen `get_config`).
+fn get_auth_config() -> &'static GitAuthConfig {
+    GIT_AUTH_CONFIG.get_or_init(GitAuthConfig::read)
+}
+
+/// Whether a `git` binary is callable (kodegen `git_available`).
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Read a single effective git config value (kodegen `git_config_get`).
+fn git_config_get(key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Inject the user's git auth config into a fresh `PrepareFetch` (kodegen `configure_clone`).
+///
+/// Best-effort: when the user has nothing relevant configured the override list is empty and
+/// `prepare` is returned untouched, so public and `file://` clones are unaffected.
+fn configure_clone(prepare: gix::clone::PrepareFetch) -> gix::clone::PrepareFetch {
+    let overrides = get_auth_config().to_gix_overrides();
+    if overrides.is_empty() {
+        prepare
+    } else {
+        prepare.with_in_memory_config_overrides(overrides)
+    }
 }
 
 /// Resolve `reff` (branch/tag/commit) in the local clone at `dir`, materialize its tree over the
