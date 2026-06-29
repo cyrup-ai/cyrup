@@ -33,6 +33,7 @@ pub fn faux_model() -> Model {
         max_tokens: 16_384,
         thinking_level_map: None,
         compat: None,
+        headers: None,
     }
 }
 
@@ -65,6 +66,7 @@ pub fn faux_model_from_def(def: &FauxModelDefinition) -> Model {
         max_tokens: def.max_tokens,
         thinking_level_map: None,
         compat: None,
+        headers: None,
     }
 }
 

@@ -92,6 +92,7 @@ grep-searcher        = { version = "0.1.16" }
 similar              = { version = "3.1.1" }
 dashmap              = { version = "6.2.1" }
 unicode-segmentation = { version = "1.13.3" }
+unicode-normalization = { version = "0.1.24" }   # tools NFKC/NFD normalization (arch-03)
 image                = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc                 = { version = "0.2.186" }
 tempfile             = { version = "3.27.0" }

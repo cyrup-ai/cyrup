@@ -29,7 +29,9 @@ pub use message::{
     AssistantMessage, Content, Cost, Message, ModelThinkingLevel, StopReason, TextPhase,
     TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
 };
-pub use tool::{ExecMode, Tool, ToolError, ToolResult, ToolUpdate, ToolUpdateSink};
+pub use tool::{
+    ExecMode, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate, ToolUpdateSink,
+};
 
 /// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).
 ///

@@ -455,6 +455,7 @@ mod tests {
             max_tokens: 1000,
             thinking_level_map: map,
             compat: None,
+            headers: None,
         }
     }
 

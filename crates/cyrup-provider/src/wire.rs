@@ -105,9 +105,12 @@ impl Provider for WireProvider {
         tokio::spawn(async move {
             let model_id = model.id.as_str().to_string();
 
-            // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018).
-            let overrides = AuthOverrides { api_key: options.api_key.as_deref(), env: None };
-            let auth_result = match resolve_provider_auth(
+            // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018). The
+            // provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
+            // base-url (Pi `applyAuth`, models.ts:240-241).
+            let overrides =
+                AuthOverrides { api_key: options.api_key.as_deref(), env: options.env.as_ref() };
+            let mut auth_result = match resolve_provider_auth(
                 &id,
                 &auth,
                 &model,
@@ -136,6 +139,16 @@ impl Provider for WireProvider {
                     return;
                 }
             };
+
+            // Merge the per-request env overlay into the resolved env so the request path
+            // (cache-retention / base-url resolution) sees it, with `options.env` winning per key
+            // (Pi `applyAuth`, models.ts:252: `{ ...(resolution.env ?? {}), ...(options.env ?? {}) }`).
+            if let Some(req_env) = &options.env {
+                let merged = auth_result.env.get_or_insert_with(Default::default);
+                for (k, v) in req_env {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
 
             // 2. Look up the ApiImpl for model.api (missing → terminal Error — R-01-008).
             let api_impl = match registry.get(&model.api) {
@@ -205,6 +218,7 @@ mod tests {
             max_tokens: 100,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 

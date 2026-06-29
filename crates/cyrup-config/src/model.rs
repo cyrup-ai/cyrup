@@ -349,6 +349,7 @@ mod tests {
             max_tokens: 8192,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 

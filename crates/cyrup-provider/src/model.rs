@@ -1,6 +1,7 @@
 //! Model + capability/cost metadata (arch-01 §4.2 / func-01 §4.2).
 
 use crate::api::compat::OpenAiCompletionsCompat;
+use crate::HeaderMap;
 use cyrup_core::{ApiId, ModelId, ProviderId};
 
 /// Maps pi thinking levels (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) to provider/model
@@ -49,6 +50,12 @@ pub struct Model {
     /// auto-detects from `provider` + `base_url`. Additive, defaulted.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compat: Option<OpenAiCompletionsCompat>,
+    /// Top-level per-provider request headers (Pi `Model.headers`, types.ts). Merged into the
+    /// outgoing request below the per-request `StreamOptions.headers` overlay (auth overlay <
+    /// `model.headers` < `opts.headers`); a `None` value suppresses a default header. Additive,
+    /// defaulted to `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub headers: Option<HeaderMap>,
 }
 
 impl Model {

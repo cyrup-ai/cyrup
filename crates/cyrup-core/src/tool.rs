@@ -36,6 +36,18 @@ pub struct ToolUpdate {
 /// tool's execution settles (func-02 R-02-023).
 pub type ToolUpdateSink = Box<dyn FnMut(ToolUpdate) + Send + 'static>;
 
+/// How a tool's execution row is framed in the UI (Pi `ToolDefinition.renderShell`,
+/// extensions/types.ts:448-449: `"default" | "self"`). `Default` = the runtime draws the standard
+/// colored shell; `Selfish` = the tool renders its own framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ToolRenderKind {
+    /// The runtime renders the standard colored shell (Pi `"default"`).
+    #[default]
+    Default,
+    /// The tool renders its own framing (Pi `"self"`).
+    SelfRendered,
+}
+
 /// Tool failure (arch-03 §8). Re-exported by `cyrup-tools` as its `ToolError`.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -57,6 +69,54 @@ pub trait Tool: Send + Sync {
     fn execution_mode(&self) -> ExecMode {
         ExecMode::Parallel
     }
+
+    /// Description shown to the model (Pi `ToolDefinition.description`, extensions/types.ts:441).
+    /// Defaulted to `""` so existing impls compile unchanged; per-tool values land in `cyrup-tools`.
+    fn description(&self) -> &str {
+        ""
+    }
+
+    /// Human-readable label for the UI (Pi `ToolDefinition.label`, extensions/types.ts:438-439).
+    /// Default `None` = the runtime falls back to the tool `name` (today's behavior).
+    fn label(&self) -> Option<&str> {
+        None
+    }
+
+    /// One-line snippet for the "Available tools" section of the default system prompt (Pi
+    /// `ToolDefinition.promptSnippet`, extensions/types.ts:442-443). Default `None` omits the tool
+    /// from that section (today's behavior).
+    fn prompt_snippet(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether the runtime draws the standard tool shell or the tool renders its own framing (Pi
+    /// `ToolDefinition.renderShell`, extensions/types.ts:448-449). Defaulted to
+    /// [`ToolRenderKind::Default`] (today's behavior).
+    fn render_kind(&self) -> ToolRenderKind {
+        ToolRenderKind::Default
+    }
+
+    /// Compatibility shim to normalize raw tool-call arguments before schema validation (Pi
+    /// `ToolDefinition.prepareArguments`, extensions/types.ts:451-452). Default: identity
+    /// passthrough — the arguments are returned unchanged (today's behavior).
+    async fn prepare_arguments(&self, args: serde_json::Value) -> serde_json::Value {
+        args
+    }
+
+    /// Custom rendering of a tool *call* for the UI (Pi `ToolDefinition.renderCall`,
+    /// extensions/types.ts:472-473). The returned string is the rendered representation; `None` =
+    /// the runtime uses its standard call framing (today's behavior).
+    fn render_call(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
+
+    /// Custom rendering of a tool *result* for the UI (Pi `ToolDefinition.renderResult`,
+    /// extensions/types.ts:475-481). The returned string is the rendered representation; `None` =
+    /// the runtime uses its standard result framing (today's behavior).
+    fn render_result(&self, _result: &ToolResult) -> Option<String> {
+        None
+    }
+
     async fn execute(
         &self,
         call_id: ToolCallId,
@@ -64,4 +124,51 @@ pub trait Tool: Send + Sync {
         cancel: CancelToken,
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError>;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A tool that overrides only the required methods, so every new surface method exercises its
+    /// default — proving the additive trait surface preserves today's behavior.
+    struct BareTool {
+        params: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BareTool {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.params
+        }
+        async fn execute(
+            &self,
+            _call_id: ToolCallId,
+            _params: serde_json::Value,
+            _cancel: CancelToken,
+            _on_update: ToolUpdateSink,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn defaulted_surface_preserves_behavior() {
+        let t = BareTool { params: serde_json::json!({}) };
+        assert_eq!(t.description(), "");
+        assert_eq!(t.label(), None);
+        assert_eq!(t.prompt_snippet(), None);
+        assert_eq!(t.render_kind(), ToolRenderKind::Default);
+        assert_eq!(t.render_call(&serde_json::json!({"a": 1})), None);
+        assert_eq!(t.render_result(&ToolResult::default()), None);
+        // prepare_arguments is an identity passthrough.
+        let args = serde_json::json!({"x": [1, 2, 3]});
+        assert_eq!(t.prepare_arguments(args.clone()).await, args);
+        // The pre-existing defaults are unchanged.
+        assert_eq!(t.execution_mode(), ExecMode::Parallel);
+    }
 }

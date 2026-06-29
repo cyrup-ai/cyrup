@@ -29,10 +29,22 @@ pub async fn resolve_provider_auth(
     ctx: &dyn AuthContext,
     overrides: AuthOverrides<'_>,
 ) -> Result<Option<AuthResult>, AuthError> {
+    // The provider-scoped env overlay (Pi `options.env`) wins over the ambient env for env-key
+    // resolution (Pi `overlayEnvAuthContext`, auth/resolve.ts:47/73-78). When no overlay is given
+    // the ambient context is used verbatim — identical to the previous behavior.
+    let overlay;
+    let req_ctx: &dyn AuthContext = match overrides.env {
+        Some(env) => {
+            overlay = OverlayEnvContext { base: ctx, env };
+            &overlay
+        }
+        None => ctx,
+    };
+
     // 1. Explicit per-request key (highest precedence, R-01-011 #1).
     if let (Some(key), Some(api_key_auth)) = (overrides.api_key, auth.api_key.as_ref()) {
         let cred = Credential::ApiKey { key: Some(key.to_string()), env: overrides.env.cloned() };
-        return api_key_auth.resolve(model, ctx, Some(&cred)).await;
+        return api_key_auth.resolve(model, req_ctx, Some(&cred)).await;
     }
 
     // 2. Stored credential — a stored credential owns the provider (R-01-012).
@@ -45,20 +57,60 @@ pub async fn resolve_provider_auth(
             {
                 return resolve_stored_oauth(provider_id, oauth, store, cred).await;
             }
-            // API-key credential: resolve with the stored credential (env not consulted, R-01-012).
+            // API-key credential: resolve with the stored credential. The stored env merges with
+            // the per-request overlay, overlay winning per key (Pi auth/resolve.ts:63:
+            // `{ ...stored, env: { ...stored.env, ...overrides.env } }`).
             if let Credential::ApiKey { .. } = &cred
                 && let Some(api_key_auth) = auth.api_key.as_ref()
             {
-                return api_key_auth.resolve(model, ctx, Some(&cred)).await;
+                let cred = merge_credential_env(cred, overrides.env);
+                return api_key_auth.resolve(model, req_ctx, Some(&cred)).await;
             }
             // Stored credential type with no matching handler → treat as not configured.
             Ok(None)
         }
         // 3. Ambient (env). Only reached when nothing is stored (R-01-011 #3 / R-01-012).
         Ok(None) => match auth.api_key.as_ref() {
-            Some(api_key_auth) => api_key_auth.resolve(model, ctx, None).await,
+            Some(api_key_auth) => api_key_auth.resolve(model, req_ctx, None).await,
             None => Ok(None),
         },
+    }
+}
+
+/// Merge a per-request env overlay into an API-key credential's env, overlay winning per key (Pi
+/// auth/resolve.ts:63). A `None` overlay (or a non-API-key credential) returns the credential
+/// unchanged — preserving the previous behavior when no overlay is supplied.
+fn merge_credential_env(cred: Credential, overlay: Option<&ProviderEnv>) -> Credential {
+    match (cred, overlay) {
+        (Credential::ApiKey { key, env }, Some(overlay)) => {
+            let mut merged = env.unwrap_or_default();
+            for (k, v) in overlay {
+                merged.insert(k.clone(), v.clone());
+            }
+            Credential::ApiKey { key, env: Some(merged) }
+        }
+        (cred, _) => cred,
+    }
+}
+
+/// Wrap an [`AuthContext`] so a non-empty provider-scoped env overlay wins over the ambient env
+/// (Pi `overlayEnvAuthContext`, auth/resolve.ts:73-78: `env[name] || base.env(name)` — JS `||`
+/// skips empty overlay values, so an empty string falls through to the ambient value).
+struct OverlayEnvContext<'a> {
+    base: &'a dyn AuthContext,
+    env: &'a ProviderEnv,
+}
+
+#[async_trait::async_trait]
+impl AuthContext for OverlayEnvContext<'_> {
+    async fn env(&self, name: &str) -> Option<String> {
+        match self.env.get(name) {
+            Some(v) if !v.is_empty() => Some(v.clone()),
+            _ => self.base.env(name).await,
+        }
+    }
+    async fn file_exists(&self, path: &str) -> bool {
+        self.base.file_exists(path).await
     }
 }
 
@@ -152,6 +204,7 @@ mod tests {
             max_tokens: 100,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 
@@ -206,6 +259,106 @@ mod tests {
         .unwrap();
         assert_eq!(r.auth.api_key.as_deref(), Some("env-key"));
         assert_eq!(r.source.as_deref(), Some("env"));
+    }
+
+    /// The per-request env overlay (Pi `options.env`) participates in env-key resolution: with
+    /// nothing stored and the ambient context empty, the overlay supplies the key var (Pi
+    /// `overlayEnvAuthContext`, auth/resolve.ts:47/73-78).
+    #[tokio::test]
+    async fn overlay_env_participates_in_env_key_resolution() {
+        let store = InMemoryCredentialStore::new();
+        // Ambient context has NO API_KEY — only the overlay does.
+        let ctx = MapCtx(BTreeMap::new());
+        let overlay = BTreeMap::from([("API_KEY".to_string(), "overlay-key".to_string())]);
+        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let r = resolve_provider_auth(
+            &ProviderId::from("p"),
+            &auth,
+            &test_model(),
+            &store,
+            &ctx,
+            AuthOverrides { api_key: None, env: Some(&overlay) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.auth.api_key.as_deref(), Some("overlay-key"));
+        assert_eq!(r.source.as_deref(), Some("env"));
+    }
+
+    /// A non-empty overlay value wins over the ambient env for env-key resolution; an EMPTY overlay
+    /// value falls through to the ambient value (Pi `env[name] || base.env(name)`).
+    #[tokio::test]
+    async fn overlay_env_precedence_and_empty_fallthrough() {
+        let store = InMemoryCredentialStore::new();
+        let ctx = MapCtx(BTreeMap::from([("API_KEY".to_string(), "ambient-key".to_string())]));
+        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+
+        // Non-empty overlay wins.
+        let overlay = BTreeMap::from([("API_KEY".to_string(), "overlay-key".to_string())]);
+        let r = resolve_provider_auth(
+            &ProviderId::from("p"),
+            &auth,
+            &test_model(),
+            &store,
+            &ctx,
+            AuthOverrides { api_key: None, env: Some(&overlay) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.auth.api_key.as_deref(), Some("overlay-key"));
+
+        // Empty overlay value → ambient value used.
+        let empty = BTreeMap::from([("API_KEY".to_string(), String::new())]);
+        let r = resolve_provider_auth(
+            &ProviderId::from("p"),
+            &auth,
+            &test_model(),
+            &store,
+            &ctx,
+            AuthOverrides { api_key: None, env: Some(&empty) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.auth.api_key.as_deref(), Some("ambient-key"));
+    }
+
+    /// A stored API-key credential merges its env with the per-request overlay, overlay winning per
+    /// key (Pi auth/resolve.ts:63). The merged env is carried on the resolved [`AuthResult`].
+    #[tokio::test]
+    async fn stored_credential_env_merges_with_overlay() {
+        let store = InMemoryCredentialStore::new().with_credential(
+            ProviderId::from("p"),
+            Credential::ApiKey {
+                key: Some("stored-key".to_string()),
+                env: Some(BTreeMap::from([
+                    ("A".to_string(), "stored-a".to_string()),
+                    ("B".to_string(), "stored-b".to_string()),
+                ])),
+            },
+        );
+        let ctx = MapCtx(BTreeMap::new());
+        let auth = ProviderAuth::with_api_key(env_key(["API_KEY"]));
+        let overlay =
+            BTreeMap::from([("B".to_string(), "overlay-b".to_string()), ("C".to_string(), "overlay-c".to_string())]);
+        let r = resolve_provider_auth(
+            &ProviderId::from("p"),
+            &auth,
+            &test_model(),
+            &store,
+            &ctx,
+            AuthOverrides { api_key: None, env: Some(&overlay) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.auth.api_key.as_deref(), Some("stored-key"));
+        let env = r.env.expect("merged env present");
+        assert_eq!(env.get("A").map(String::as_str), Some("stored-a")); // stored-only
+        assert_eq!(env.get("B").map(String::as_str), Some("overlay-b")); // overlay wins
+        assert_eq!(env.get("C").map(String::as_str), Some("overlay-c")); // overlay-only
     }
 
     #[tokio::test]

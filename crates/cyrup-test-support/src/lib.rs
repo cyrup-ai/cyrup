@@ -483,6 +483,7 @@ mod smoke {
             max_tokens: 1_024,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         };
         let opts = HarnessOptions { model: Some(custom), ..Default::default() };
         let harness = create_harness(opts).await.expect("build harness");

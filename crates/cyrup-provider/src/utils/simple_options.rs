@@ -163,6 +163,7 @@ mod tests {
             max_tokens,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 

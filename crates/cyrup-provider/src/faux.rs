@@ -94,6 +94,7 @@ impl FauxModelDefinition {
             max_tokens: self.max_tokens,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 }

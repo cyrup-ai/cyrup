@@ -79,6 +79,7 @@ fn model(
         max_tokens,
         thinking_level_map,
         compat: Some(compat),
+        headers: None,
     }
 }
 

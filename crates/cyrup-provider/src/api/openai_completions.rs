@@ -94,7 +94,7 @@ impl ApiImpl for OpenAiCompletionsApi {
         };
 
         let body = build_body_with_env(model, ctx, opts, auth.env.as_ref());
-        let headers = build_headers(auth, opts, &compat, cache_session_id);
+        let headers = build_headers(model, auth, opts, &compat, cache_session_id);
         let req = SseRequest { method: reqwest::Method::POST, url, headers, body: Some(body) };
 
         let client = match build_client() {
@@ -139,16 +139,20 @@ pub(crate) fn chat_completions_url(base: &str) -> String {
     }
 }
 
-/// Build the request headers: `Authorization: Bearer <key>` plus the auth/opts header overlay
-/// (a `None` value suppresses a default; opts win over auth, auth over the default).
+/// Build the request headers: `Authorization: Bearer <key>` plus the auth / model / opts header
+/// overlays (a `None` value suppresses a default). Precedence (lowest → highest): auth overlay <
+/// `model.headers` < session-affinity < `opts.headers` — matching Pi `createClient`
+/// (openai-completions.ts:505-524), which seeds `{ ...model.headers }`, then layers session
+/// affinity, then merges `optionsHeaders` last so per-request headers win.
 ///
 /// `cache_session_id` is the cache-gated session id (Pi `cacheSessionId`): when the resolved
 /// `send_session_affinity_headers` compat flag is set and a session id is available, the
 /// `session_id` / `x-client-request-id` / `x-session-affinity` headers are injected (Pi
-/// `createClient`, openai-completions.ts:515-519). They are placed after the auth overlay but
+/// `createClient`, openai-completions.ts:515-519). They are placed after `model.headers` but
 /// before the opts overlay so per-request headers can still override them (matching Pi, which
 /// merges `optionsHeaders` last).
 pub(crate) fn build_headers(
+    model: &Model,
     auth: &AuthResult,
     opts: &StreamOptions,
     compat: &ResolvedCompat,
@@ -159,6 +163,14 @@ pub(crate) fn build_headers(
         headers.insert("Authorization".to_string(), Some(format!("Bearer {key}")));
     }
     if let Some(overlay) = &auth.auth.headers {
+        for (name, value) in overlay {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    // Top-level per-provider headers (Pi `createClient` seeds `{ ...model.headers }`,
+    // openai-completions.ts:505). Layered above the auth overlay and below session affinity / opts
+    // so a `None` value suppresses a default header.
+    if let Some(overlay) = &model.headers {
         for (name, value) in overlay {
             headers.insert(name.clone(), value.clone());
         }
@@ -1743,6 +1755,7 @@ mod tests {
             max_tokens: 131072,
             thinking_level_map: None,
             compat: None,
+            headers: None,
         }
     }
 
@@ -1776,10 +1789,47 @@ mod tests {
     fn headers_set_bearer_auth() {
         let compat = get_compat(&model());
         let headers =
-            build_headers(&auth_with_key(), &StreamOptions::default(), &compat, None);
+            build_headers(&model(), &auth_with_key(), &StreamOptions::default(), &compat, None);
         assert_eq!(headers.get("Authorization"), Some(&Some("Bearer sk-xyz".to_string())));
         // No session-affinity headers: the flag is false for `together` and there is no session id.
         assert!(!headers.contains_key("session_id"));
+    }
+
+    /// `model.headers` merge precedence (Pi `createClient`, openai-completions.ts:505-524):
+    /// auth overlay < `model.headers` < `opts.headers`, and a `None` value suppresses a default.
+    #[test]
+    fn model_headers_merge_precedence_and_suppression() {
+        let compat = get_compat(&model());
+        let mut auth = auth_with_key();
+        auth.auth.headers = Some(crate::HeaderMap::from([
+            ("X-All".to_string(), Some("auth".to_string())),
+            ("X-AM".to_string(), Some("auth".to_string())),
+            ("X-Auth".to_string(), Some("a".to_string())),
+            ("X-Drop".to_string(), Some("keep".to_string())),
+        ]));
+        let mut m = model();
+        m.headers = Some(crate::HeaderMap::from([
+            ("X-All".to_string(), Some("model".to_string())),
+            ("X-AM".to_string(), Some("model".to_string())),
+            ("X-Model".to_string(), Some("m".to_string())),
+            ("X-Drop".to_string(), None), // suppress the auth default
+        ]));
+        let opts = StreamOptions {
+            headers: Some(crate::HeaderMap::from([("X-All".to_string(), Some("opts".to_string()))])),
+            ..Default::default()
+        };
+        let headers = build_headers(&m, &auth, &opts, &compat, None);
+        // opts wins the key present at all three layers.
+        assert_eq!(headers.get("X-All"), Some(&Some("opts".to_string())));
+        // model overrides auth on a key present at both (and not in opts).
+        assert_eq!(headers.get("X-AM"), Some(&Some("model".to_string())));
+        // Layer-exclusive keys survive.
+        assert_eq!(headers.get("X-Auth"), Some(&Some("a".to_string())));
+        assert_eq!(headers.get("X-Model"), Some(&Some("m".to_string())));
+        // `None` from model.headers suppresses the auth default (carried as `Some(None)`).
+        assert_eq!(headers.get("X-Drop"), Some(&None));
+        // Bearer auth still present.
+        assert_eq!(headers.get("Authorization"), Some(&Some("Bearer sk-xyz".to_string())));
     }
 
     #[test]
@@ -2279,19 +2329,24 @@ mod tests {
         });
         let compat = get_compat(&m);
         let headers =
-            build_headers(&auth_with_key(), &StreamOptions::default(), &compat, Some("sess-7"));
+            build_headers(&m, &auth_with_key(), &StreamOptions::default(), &compat, Some("sess-7"));
         assert_eq!(headers.get("session_id"), Some(&Some("sess-7".to_string())));
         assert_eq!(headers.get("x-client-request-id"), Some(&Some("sess-7".to_string())));
         assert_eq!(headers.get("x-session-affinity"), Some(&Some("sess-7".to_string())));
 
         // Flag off (default for every provider) => not emitted even with a session id present.
         let compat_off = get_compat(&model());
-        let headers =
-            build_headers(&auth_with_key(), &StreamOptions::default(), &compat_off, Some("sess-7"));
+        let headers = build_headers(
+            &model(),
+            &auth_with_key(),
+            &StreamOptions::default(),
+            &compat_off,
+            Some("sess-7"),
+        );
         assert!(!headers.contains_key("session_id"));
 
         // Flag on but no session id => not emitted.
-        let headers = build_headers(&auth_with_key(), &StreamOptions::default(), &compat, None);
+        let headers = build_headers(&m, &auth_with_key(), &StreamOptions::default(), &compat, None);
         assert!(!headers.contains_key("session_id"));
     }
 
