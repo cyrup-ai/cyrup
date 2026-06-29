@@ -93,6 +93,12 @@ impl ArtifactCache {
         self.dir_for(key).join("extension.component.wasm")
     }
 
+    /// An isolated cargo `--target-dir` for this key's Tier-1 build, so the nested `cargo build`
+    /// never contends with the workspace target dir (e.g. when invoked under `cargo test`).
+    pub fn build_dir(&self, key: &CacheKey) -> PathBuf {
+        self.dir_for(key).join("build")
+    }
+
     /// True iff a built artifact exists for this key (a hit skips `cargo`, R-ARCH-EXT-016).
     pub fn is_hit(&self, key: &CacheKey) -> bool {
         self.artifact_for(key).is_file()

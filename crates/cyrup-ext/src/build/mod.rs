@@ -51,12 +51,18 @@ pub fn build_component_in(crate_dir: &Path, cache: &ArtifactCache) -> Result<Vec
     toolchain::require_buildable(&toolchain)?;
 
     let target = toolchain.target; // "wasm32-wasip2"
+    // Build into a dedicated, per-key target dir so the nested `cargo build` never contends with
+    // the workspace target lock (e.g. when this runs under `cargo test --workspace`).
+    let build_dir = cache.build_dir(&key);
+    std::fs::create_dir_all(&build_dir).map_err(ExtError::from)?;
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest_path)
         .arg("--target")
         .arg(target)
+        .arg("--target-dir")
+        .arg(&build_dir)
         .output()
         .map_err(|e| ExtError::Build(format!("failed to spawn cargo: {e}")))?;
 
@@ -69,7 +75,7 @@ pub fn build_component_in(crate_dir: &Path, cache: &ArtifactCache) -> Result<Vec
         )));
     }
 
-    let artifact = locate_artifact(crate_dir, &manifest_path, target)?;
+    let artifact = locate_artifact(&build_dir, &manifest_path, target)?;
     let bytes = std::fs::read(&artifact).map_err(ExtError::from)?;
     validate_component(&bytes)?;
     cache.store(&key, &bytes)?;
@@ -77,10 +83,7 @@ pub fn build_component_in(crate_dir: &Path, cache: &ArtifactCache) -> Result<Vec
 }
 
 /// Locate the `.wasm` artifact a build produced under `<target-dir>/<triple>/debug/<crate>.wasm`.
-fn locate_artifact(crate_dir: &Path, manifest_path: &Path, triple: &str) -> Result<PathBuf, ExtError> {
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("target"));
+fn locate_artifact(target_dir: &Path, manifest_path: &Path, triple: &str) -> Result<PathBuf, ExtError> {
     let out_dir = target_dir.join(triple).join("debug");
 
     // Prefer the crate-named artifact; else fall back to any single `.wasm` in the dir.

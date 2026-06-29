@@ -26,17 +26,17 @@ fn fixture_component() -> PathBuf {
         return PathBuf::from(p);
     }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    // Build into a dedicated target dir so this nested build never contends with the outer
+    // `cargo test --workspace` target lock.
+    let build_dir = std::env::temp_dir().join("cyrup-ext-fixture-target");
     let status = Command::new(&cargo)
-        .args(["build", "-p", "cyrup-ext-sdk", "--target", "wasm32-wasip2"])
+        .args(["build", "-p", "cyrup-ext-sdk", "--target", "wasm32-wasip2", "--target-dir"])
+        .arg(&build_dir)
         .status()
         .expect("spawn cargo to build the wasm32-wasip2 fixture component");
     assert!(status.success(), "building cyrup-ext-sdk fixture component failed");
 
-    // Resolve the target dir (honour CARGO_TARGET_DIR; else the workspace `target/`).
-    let target_dir = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
-    });
-    let wasm = target_dir.join("wasm32-wasip2/debug/cyrup_ext_sdk.wasm");
+    let wasm = build_dir.join("wasm32-wasip2/debug/cyrup_ext_sdk.wasm");
     assert!(wasm.exists(), "fixture component not found at {}", wasm.display());
     wasm
 }
