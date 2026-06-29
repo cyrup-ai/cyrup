@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_core::ThinkingLevel;
+use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value};
 
 use crate::error::{ConfigError, ScopedError};
@@ -158,10 +158,10 @@ impl EffectiveSettings {
         self.merged.get_str("defaultModel")
     }
 
-    pub fn default_thinking_level(&self) -> ThinkingLevel {
+    pub fn default_thinking_level(&self) -> ModelThinkingLevel {
         self.merged
-            .get("defaultThinkingLevel")
-            .and_then(|v| serde_json::from_value::<ThinkingLevel>(v.clone()).ok())
+            .get("defaultModelThinkingLevel")
+            .and_then(|v| serde_json::from_value::<ModelThinkingLevel>(v.clone()).ok())
             .unwrap_or_default()
     }
 

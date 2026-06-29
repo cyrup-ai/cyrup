@@ -29,8 +29,9 @@ use crate::state::{reduce, AgentStateSnapshot, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{
-    AssistantMessage, Content, ExecMode, ModelRef, RunCancel, SessionId, StopReason, ThinkingLevel,
-    Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink, Usage,
+    ApiId, AssistantMessage, Content, ExecMode, ModelRef, RunCancel, SessionId, StopReason,
+    ModelThinkingLevel, Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate,
+    ToolUpdateSink, Usage, UNRESOLVED_API,
 };
 use cyrup_provider::{validate_tool_call, Context, StreamEvent, StreamOptions};
 use futures::future::FutureExt;
@@ -52,9 +53,12 @@ fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         content: Vec::new(),
         provider: model.provider.clone(),
         model: model.model.to_string(),
-        api: model.api.clone(),
+        // Pi: AssistantMessage.api is required (types.ts:386). A ModelRef built from a not-yet-
+        // resolved user selection may carry no api; fall back to the sentinel so the field is set.
+        api: model.api.clone().unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
         response_model: None,
         response_id: None,
+        diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
@@ -391,6 +395,7 @@ impl RunCtx {
                     let aborted = AssistantMessage::errored(
                         model.provider.clone(),
                         model.model.as_str(),
+                        model.api.clone(),
                         StopReason::Aborted,
                         "aborted",
                     );
@@ -404,7 +409,7 @@ impl RunCtx {
                     match ev {
                         None => break,
                         Some(e) => match &e {
-                            StreamEvent::Start => {
+                            StreamEvent::Start { .. } => {
                                 started = true;
                                 self.emit(AgentEvent::MessageStart {
                                     message: AgentMessage::Assistant(partial.clone()),
@@ -428,8 +433,11 @@ impl RunCtx {
                                 })
                                 .await;
                             }
-                            StreamEvent::Done { message } | StreamEvent::Error { message } => {
+                            StreamEvent::Done { message, .. } => {
                                 final_msg = Some(message.clone());
+                            }
+                            StreamEvent::Error { error, .. } => {
+                                final_msg = Some(error.clone());
                             }
                             _ => {}
                         },
@@ -442,6 +450,7 @@ impl RunCtx {
             AssistantMessage::errored(
                 model.provider.clone(),
                 model.model.as_str(),
+                model.api.clone(),
                 StopReason::Error,
                 "stream ended without a terminal event",
             )
@@ -461,6 +470,7 @@ impl RunCtx {
         let asst = AssistantMessage::errored(
             model.provider.clone(),
             model.model.as_str(),
+            model.api.clone(),
             StopReason::Error,
             msg,
         );
@@ -497,7 +507,7 @@ impl RunCtx {
         // `parameters` (R-02-020 / func-01 R-01-034). On failure we surface an immediate isError
         // tool-result so the model can retry on the next turn, and the tool is NOT executed.
         // (`prepare_arguments` remains an optional future cyrup-core addition — still deferred.)
-        let mut args = match validate_tool_call(tool.parameters(), call.arguments.clone()) {
+        let mut args = match validate_tool_call(tool.parameters(), Value::Object(call.arguments.clone())) {
             Ok(coerced) => coerced,
             Err(e) => return Prep::Immediate(self.immediate_error(call, e.to_string())),
         };
@@ -633,7 +643,7 @@ impl RunCtx {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                args: call.arguments.clone(),
+                args: Value::Object(call.arguments.clone()),
             })
             .await;
             match self.prepare(call).await {
@@ -695,7 +705,7 @@ impl RunCtx {
                     let (tn, ar) = calls
                         .iter()
                         .find(|c| c.id == call_id)
-                        .map(|c| (c.name.clone(), c.arguments.clone()))
+                        .map(|c| (c.name.clone(), Value::Object(c.arguments.clone())))
                         .unwrap_or_default();
                     self.emit(AgentEvent::ToolExecutionUpdate {
                         tool_call_id: call_id,
@@ -709,7 +719,7 @@ impl RunCtx {
                     let args = calls
                         .iter()
                         .find(|c| c.id == call_id)
-                        .map(|c| c.arguments.clone())
+                        .map(|c| Value::Object(c.arguments.clone()))
                         .unwrap_or(Value::Null);
                     let fin = self.finalize(call_id.clone(), tool_name.clone(), source_index, args, outcome).await;
                     self.emit(AgentEvent::ToolExecutionEnd {
@@ -757,7 +767,7 @@ impl RunCtx {
             self.emit(AgentEvent::ToolExecutionStart {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                args: call.arguments.clone(),
+                args: Value::Object(call.arguments.clone()),
             })
             .await;
 
@@ -786,7 +796,7 @@ impl RunCtx {
                                     self.emit(AgentEvent::ToolExecutionUpdate {
                                         tool_call_id: call.id.clone(),
                                         tool_name: call.name.clone(),
-                                        args: call.arguments.clone(),
+                                        args: Value::Object(call.arguments.clone()),
                                         partial_result: update_value(&u),
                                     })
                                     .await;
@@ -903,7 +913,7 @@ impl Agent {
     pub async fn set_model(&self, m: ModelRef) {
         lock(&self.state).model = m;
     }
-    pub async fn set_thinking_level(&self, t: ThinkingLevel) {
+    pub async fn set_thinking_level(&self, t: ModelThinkingLevel) {
         lock(&self.state).thinking_level = t;
     }
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
@@ -1074,7 +1084,7 @@ impl Agent {
 pub struct AgentBuilder {
     system_prompt: String,
     model: ModelRef,
-    thinking_level: ThinkingLevel,
+    thinking_level: ModelThinkingLevel,
     tools: Vec<Arc<dyn Tool>>,
     messages: Vec<AgentMessage>,
     hooks: Option<Arc<dyn Hooks>>,
@@ -1091,7 +1101,7 @@ impl AgentBuilder {
         Self {
             system_prompt: String::new(),
             model,
-            thinking_level: ThinkingLevel::Off,
+            thinking_level: ModelThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
             hooks: None,
@@ -1108,7 +1118,7 @@ impl AgentBuilder {
         self.system_prompt = s.into();
         self
     }
-    pub fn thinking_level(mut self, t: ThinkingLevel) -> Self {
+    pub fn thinking_level(mut self, t: ModelThinkingLevel) -> Self {
         self.thinking_level = t;
         self
     }

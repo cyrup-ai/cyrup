@@ -12,7 +12,7 @@ use crate::compaction::summarize::{
 };
 use crate::compaction::tokens::estimate_tokens;
 use crate::entry::{Entry, KnownEntry};
-use cyrup_core::{ModelRef, ThinkingLevel};
+use cyrup_core::{ModelRef, ModelThinkingLevel};
 use cyrup_provider::Model;
 
 /// Preamble prepended to a branch summary so it reads as abandoned-branch context.
@@ -109,7 +109,7 @@ pub async fn generate_branch_summary<S: Summarizer>(
             api: Some(model.api.clone()),
             model: model.id.clone(),
         },
-        thinking: ThinkingLevel::Off,
+        thinking: ModelThinkingLevel::Off,
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {

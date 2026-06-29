@@ -118,15 +118,17 @@ impl Provider for WireProvider {
                     let msg = AssistantMessage::errored(
                         id.clone(),
                         &model_id,
+                        Some(model.api.clone()),
                         StopReason::Error,
                         format!("provider '{id}' is not configured (no credential or env key)"),
                     );
-                    sink.send(StreamEvent::Error { message: msg }).await;
+                    sink.send(StreamEvent::Error { reason: msg.stop_reason, error: msg }).await;
                     return;
                 }
                 Err(e) => {
                     let pe = ProviderError::from(e);
-                    sink.send(pe.into_error_event(id.clone(), &model_id)).await;
+                    sink.send(pe.into_error_event(id.clone(), &model_id, Some(model.api.clone())))
+                        .await;
                     return;
                 }
             };
@@ -136,7 +138,8 @@ impl Provider for WireProvider {
                 Some(imp) => imp,
                 None => {
                     let pe = ProviderError::NoApiImpl(model.api.clone());
-                    sink.send(pe.into_error_event(id.clone(), &model_id)).await;
+                    sink.send(pe.into_error_event(id.clone(), &model_id, Some(model.api.clone())))
+                        .await;
                     return;
                 }
             };
@@ -165,6 +168,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// A neutral non-terminal `partial` snapshot for scripted test events.
+    fn test_partial() -> AssistantMessage {
+        AssistantMessage {
+            content: Vec::new(),
+            provider: ProviderId::from("p"),
+            model: "m1".into(),
+            api: ApiId::from("scripted"),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
 
     fn test_model(api: &str) -> Model {
         Model {
@@ -238,41 +258,62 @@ mod tests {
             if let Ok(mut g) = self.seen_key.lock() {
                 *g = auth.auth.api_key.clone();
             }
-            sink.send(StreamEvent::Start).await;
-            sink.send(StreamEvent::TextStart { content_index: 0 }).await;
-            sink.send(StreamEvent::TextDelta { content_index: 0, delta: "hi".into() }).await;
-            sink.send(StreamEvent::TextEnd { content_index: 0, content: "hi".into() }).await;
-            sink.send(StreamEvent::ToolCallStart { content_index: 1 }).await;
-            sink.send(StreamEvent::ToolCallDelta { content_index: 1, delta: "{\"x\":1}".into() })
+            sink.send(StreamEvent::Start { partial: test_partial() }).await;
+            sink.send(StreamEvent::TextStart { content_index: 0, partial: test_partial() }).await;
+            sink.send(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "hi".into(),
+                partial: test_partial(),
+            })
+            .await;
+            sink.send(StreamEvent::TextEnd {
+                content_index: 0,
+                content: "hi".into(),
+                partial: test_partial(),
+            })
+            .await;
+            sink.send(StreamEvent::ToolCallStart { content_index: 1, partial: test_partial() })
                 .await;
+            sink.send(StreamEvent::ToolCallDelta {
+                content_index: 1,
+                delta: "{\"x\":1}".into(),
+                partial: test_partial(),
+            })
+            .await;
             let tc = ToolCall {
                 id: ToolCallId::from("c1"),
                 name: "echo".into(),
-                arguments: serde_json::json!({"x": 1}),
+                arguments: serde_json::json!({"x": 1}).as_object().cloned().expect("object"),
                 thought_signature: None,
             };
-            sink.send(StreamEvent::ToolCallEnd { content_index: 1, tool_call: tc }).await;
+            sink.send(StreamEvent::ToolCallEnd {
+                content_index: 1,
+                tool_call: tc,
+                partial: test_partial(),
+            })
+            .await;
             let msg = AssistantMessage {
                 content: vec![
                     Content::text("hi"),
                     Content::ToolCall(ToolCall {
                         id: ToolCallId::from("c1"),
                         name: "echo".into(),
-                        arguments: serde_json::json!({"x": 1}),
+                        arguments: serde_json::json!({"x": 1}).as_object().cloned().expect("object"),
                         thought_signature: None,
                     }),
                 ],
                 provider: ProviderId::from("p"),
                 model: "m1".into(),
-                api: Some(ApiId::from("scripted")),
+                api: ApiId::from("scripted"),
                 response_model: None,
                 response_id: None,
+                diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
                 error_message: None,
                 timestamp: 0,
             };
-            sink.send(StreamEvent::Done { message: msg }).await;
+            sink.send(StreamEvent::Done { reason: StopReason::ToolUse, message: msg }).await;
         }
     }
 
@@ -294,7 +335,7 @@ mod tests {
             events.push(ev);
         }
 
-        assert!(matches!(events.first(), Some(StreamEvent::Start)));
+        assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
         assert!(events
             .iter()
@@ -376,7 +417,8 @@ mod tests {
             let client = match crate::stream::sse::build_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    sink.send(e.into_error_event(provider, &model_id)).await;
+                    sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                        .await;
                     return;
                 }
             };
@@ -385,34 +427,42 @@ mod tests {
                 Ok(s) => s,
                 Err(e) => {
                     // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
-                    sink.send(e.into_error_event(provider, &model_id)).await;
+                    sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                        .await;
                     return;
                 }
             };
 
-            sink.send(StreamEvent::Start).await;
+            sink.send(StreamEvent::Start { partial: test_partial() }).await;
             let mut idx = 0usize;
             let mut text = String::new();
             while let Some(frame) = frames.next().await {
                 match frame {
                     Ok(f) if f.data == "[DONE]" => break,
                     Ok(f) => {
-                        sink.send(StreamEvent::TextStart { content_index: idx }).await;
+                        sink.send(StreamEvent::TextStart {
+                            content_index: idx,
+                            partial: test_partial(),
+                        })
+                        .await;
                         sink.send(StreamEvent::TextDelta {
                             content_index: idx,
                             delta: f.data.clone(),
+                            partial: test_partial(),
                         })
                         .await;
                         sink.send(StreamEvent::TextEnd {
                             content_index: idx,
                             content: f.data.clone(),
+                            partial: test_partial(),
                         })
                         .await;
                         text.push_str(&f.data);
                         idx += 1;
                     }
                     Err(e) => {
-                        sink.send(e.into_error_event(provider, &model_id)).await;
+                        sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                            .await;
                         return;
                     }
                 }
@@ -421,15 +471,16 @@ mod tests {
                 content: vec![Content::text(text)],
                 provider,
                 model: model_id,
-                api: Some(self.api.clone()),
+                api: self.api.clone(),
                 response_model: None,
                 response_id: None,
+                diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 timestamp: 0,
             };
-            sink.send(StreamEvent::Done { message: msg }).await;
+            sink.send(StreamEvent::Done { reason: StopReason::Stop, message: msg }).await;
         }
     }
 
@@ -469,7 +520,7 @@ mod tests {
         while let Some(ev) = stream.next().await {
             match ev {
                 StreamEvent::TextDelta { delta, .. } => deltas.push(delta),
-                StreamEvent::Done { message } => terminal = Some(message),
+                StreamEvent::Done { message, .. } => terminal = Some(message),
                 _ => {}
             }
         }

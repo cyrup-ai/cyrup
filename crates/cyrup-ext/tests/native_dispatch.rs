@@ -373,6 +373,7 @@ async fn a08_5_context_hook_filters_messages() {
         AgentMessage::Assistant(cyrup_core::AssistantMessage::errored(
             "faux".into(),
             "m",
+            Some("faux".into()),
             cyrup_core::StopReason::Stop,
             "x",
         )),

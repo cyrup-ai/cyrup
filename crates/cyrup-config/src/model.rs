@@ -4,20 +4,20 @@
 
 use std::path::Path;
 
-use cyrup_core::{ProviderId, ThinkingLevel};
+use cyrup_core::{ProviderId, ModelThinkingLevel};
 use cyrup_provider::Model;
 
 use crate::error::ConfigError;
 
 /// Parse a thinking-level token (`off|minimal|low|medium|high|xhigh`).
-pub fn parse_thinking_level(s: &str) -> Option<ThinkingLevel> {
+pub fn parse_thinking_level(s: &str) -> Option<ModelThinkingLevel> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "off" => Some(ThinkingLevel::Off),
-        "minimal" => Some(ThinkingLevel::Minimal),
-        "low" => Some(ThinkingLevel::Low),
-        "medium" => Some(ThinkingLevel::Medium),
-        "high" => Some(ThinkingLevel::High),
-        "xhigh" => Some(ThinkingLevel::Xhigh),
+        "off" => Some(ModelThinkingLevel::Off),
+        "minimal" => Some(ModelThinkingLevel::Minimal),
+        "low" => Some(ModelThinkingLevel::Low),
+        "medium" => Some(ModelThinkingLevel::Medium),
+        "high" => Some(ModelThinkingLevel::High),
+        "xhigh" => Some(ModelThinkingLevel::Xhigh),
         _ => None,
     }
 }
@@ -26,14 +26,14 @@ pub fn parse_thinking_level(s: &str) -> Option<ThinkingLevel> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopedModel {
     pub model: Model,
-    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_level: Option<ModelThinkingLevel>,
 }
 
 /// Outcome of parsing a model pattern (arch-07 §3.6). `warning` is surfaced, never panics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModel {
     pub model: Option<Model>,
-    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_level: Option<ModelThinkingLevel>,
     pub warning: Option<String>,
     pub ambiguous: bool,
 }
@@ -213,7 +213,7 @@ impl<'a> ModelResolver<'a> {
     pub fn resolve_scope(&self, patterns: &[String]) -> Vec<ScopedModel> {
         let mut out: Vec<ScopedModel> = Vec::new();
         let mut seen: Vec<(String, String)> = Vec::new();
-        let push = |model: Model, level: Option<ThinkingLevel>, seen: &mut Vec<(String, String)>, out: &mut Vec<ScopedModel>| {
+        let push = |model: Model, level: Option<ModelThinkingLevel>, seen: &mut Vec<(String, String)>, out: &mut Vec<ScopedModel>| {
             let key = (model.provider.as_str().to_string(), model.id.as_str().to_string());
             if !seen.contains(&key) {
                 seen.push(key);
@@ -291,7 +291,7 @@ impl ModelCycler {
 
     /// Advance to the next candidate, reporting (model, current thinking level).
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(&Model, ThinkingLevel)> {
+    pub fn next(&mut self) -> Option<(&Model, ModelThinkingLevel)> {
         if self.candidates.is_empty() {
             return None;
         }
@@ -299,7 +299,7 @@ impl ModelCycler {
         self.current()
     }
 
-    pub fn prev(&mut self) -> Option<(&Model, ThinkingLevel)> {
+    pub fn prev(&mut self) -> Option<(&Model, ModelThinkingLevel)> {
         if self.candidates.is_empty() {
             return None;
         }
@@ -307,7 +307,7 @@ impl ModelCycler {
         self.current()
     }
 
-    pub fn current(&self) -> Option<(&Model, ThinkingLevel)> {
+    pub fn current(&self) -> Option<(&Model, ModelThinkingLevel)> {
         self.candidates
             .get(self.idx)
             .map(|sm| (&sm.model, sm.thinking_level.unwrap_or_default()))
@@ -359,7 +359,7 @@ mod tests {
         let r = ModelResolver::new(&models);
         let parsed = r.parse_pattern("claude-opus:high", true);
         assert_eq!(parsed.model.as_ref().unwrap().id.as_str(), "claude-opus-4-latest");
-        assert_eq!(parsed.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(parsed.thinking_level, Some(ModelThinkingLevel::High));
     }
 
     #[test]
@@ -445,7 +445,7 @@ mod tests {
         let id1 = m1.id.as_str().to_string();
         let (m2, lvl) = cycler.next().unwrap();
         assert_ne!(m2.id.as_str(), id1);
-        assert_eq!(lvl, ThinkingLevel::Off);
+        assert_eq!(lvl, ModelThinkingLevel::Off);
         // wraps around
         cycler.next();
         let (m_wrap, _) = cycler.current().unwrap();

@@ -7,7 +7,7 @@
 
 use crate::error::HookError;
 use crate::event::AgentMessage;
-use cyrup_core::{CancelToken, Content, Message, ModelRef, ThinkingLevel, ToolCallId};
+use cyrup_core::{CancelToken, Content, Message, ModelRef, ModelThinkingLevel, ToolCallId};
 use serde_json::Value;
 
 /// Per-call context for [`Hooks::before_tool_call`]. `args` is mutable so a hook may rewrite the
@@ -57,7 +57,7 @@ pub struct PostTurn<'a> {
 pub struct TurnUpdate {
     pub context: Option<Vec<AgentMessage>>,
     pub model: Option<ModelRef>,
-    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_level: Option<ModelThinkingLevel>,
 }
 
 /// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`, drop `Custom`

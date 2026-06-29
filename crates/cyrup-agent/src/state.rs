@@ -1,7 +1,7 @@
 //! In-memory agent state + the event reducer (arch-02 §4.1 / func-02 §10).
 
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{ModelRef, StopReason, ThinkingLevel, Tool, ToolCallId};
+use cyrup_core::{ModelRef, StopReason, ModelThinkingLevel, Tool, ToolCallId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub struct StateInner {
     pub system_prompt: String,
     pub model: ModelRef,
-    pub thinking_level: ThinkingLevel,
+    pub thinking_level: ModelThinkingLevel,
     pub tools: Vec<Arc<dyn Tool>>,
     pub messages: Vec<AgentMessage>,
     pub is_streaming: bool,
@@ -41,7 +41,7 @@ impl StateInner {
 pub struct AgentStateSnapshot {
     pub system_prompt: String,
     pub model: ModelRef,
-    pub thinking_level: ThinkingLevel,
+    pub thinking_level: ModelThinkingLevel,
     pub messages: Vec<AgentMessage>,
     pub tool_count: usize,
     pub is_streaming: bool,

@@ -142,7 +142,14 @@ mod tests {
             _cancel: CancelToken,
             sink: EventSink,
         ) {
-            sink.send(StreamEvent::Start).await;
+            let partial = cyrup_core::AssistantMessage::errored(
+                _model.provider.clone(),
+                _model.id.as_str(),
+                Some(_model.api.clone()),
+                cyrup_core::StopReason::Stop,
+                "",
+            );
+            sink.send(StreamEvent::Start { partial }).await;
         }
     }
 

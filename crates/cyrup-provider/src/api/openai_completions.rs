@@ -23,7 +23,7 @@ use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::HeaderMap;
 use cyrup_core::{
-    ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
+    ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ModelThinkingLevel, ToolCall,
     ToolCallId, Usage,
 };
 use futures::{Stream, StreamExt};
@@ -78,7 +78,7 @@ impl ApiImpl for OpenAiCompletionsApi {
             Some(url) => url,
             None => {
                 let e = ProviderError::Transport("no base URL configured for model".into());
-                sink.send(e.into_error_event(provider, &model_id)).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
                 return;
             }
         };
@@ -100,7 +100,7 @@ impl ApiImpl for OpenAiCompletionsApi {
         let client = match build_client() {
             Ok(c) => c,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id)).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
                 return;
             }
         };
@@ -109,7 +109,7 @@ impl ApiImpl for OpenAiCompletionsApi {
             Ok(s) => s,
             Err(e) => {
                 // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
-                sink.send(e.into_error_event(provider, &model_id)).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
                 return;
             }
         };
@@ -181,15 +181,15 @@ pub(crate) fn build_headers(
     headers
 }
 
-/// Map a unified [`ThinkingLevel`] to the OpenAI `reasoning_effort` value (None for `Off`).
-fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+/// Map a unified [`ModelThinkingLevel`] to the OpenAI `reasoning_effort` value (None for `Off`).
+fn reasoning_effort(level: ModelThinkingLevel) -> Option<&'static str> {
     match level {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Xhigh => Some("xhigh"),
+        ModelThinkingLevel::Off => None,
+        ModelThinkingLevel::Minimal => Some("minimal"),
+        ModelThinkingLevel::Low => Some("low"),
+        ModelThinkingLevel::Medium => Some("medium"),
+        ModelThinkingLevel::High => Some("high"),
+        ModelThinkingLevel::Xhigh => Some("xhigh"),
     }
 }
 
@@ -636,7 +636,7 @@ const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: model does
 /// `true` if `am` was produced by exactly this model (Pi `isSameModel`).
 fn is_same_model(am: &AssistantMessage, model: &Model) -> bool {
     am.provider == model.provider
-        && am.api.as_ref() == Some(&model.api)
+        && am.api == model.api
         && am.model == model.id.as_str()
 }
 
@@ -1180,6 +1180,52 @@ struct Decoder {
     saw_finish_reason: bool,
 }
 
+impl Decoder {
+    /// Build the live `partial` snapshot (Pi `output`, the mutated AssistantMessage attached to
+    /// every non-terminal event, openai-completions.ts:158-175 + `partial: output`). Mirrors
+    /// [`build_final_message`] but borrows (the stream is still in progress, so `stop_reason`
+    /// defaults to `Stop` until a `finish_reason` arrives — Pi inits `output.stopReason = "stop"`).
+    fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+        let mut usage = self.usage.clone().unwrap_or_default();
+        apply_cost(&model.cost, &mut usage);
+        AssistantMessage {
+            content: blocks_to_content(&self.blocks),
+            provider: model.provider.clone(),
+            model: model.id.as_str().to_string(),
+            api: api.clone(),
+            response_model: self.response_model.clone(),
+            response_id: self.response_id.clone(),
+            diagnostics: None,
+            usage,
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            error_message: self.error_message.clone(),
+            timestamp: now_millis(),
+        }
+    }
+}
+
+/// Convert in-progress decoder blocks to content (shared by the live `partial` snapshot and the
+/// terminal message). Tool args are parsed best-effort (`{}` for incomplete/invalid JSON).
+fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Text(text) => Content::text(text.clone()),
+            Block::Thinking { text, signature } => Content::Thinking {
+                thinking: text.clone(),
+                thinking_signature: signature.clone(),
+                redacted: false,
+            },
+            Block::Tool { id, name, args, thought_signature } => Content::ToolCall(ToolCall {
+                id: ToolCallId::from(id.as_str()),
+                name: name.clone(),
+                arguments: parse_partial_json(args),
+                thought_signature: thought_signature.clone(),
+            }),
+        })
+        .collect()
+}
+
 /// Reasoning delta field names emitted by OpenAI-compatible endpoints (first non-empty wins).
 const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
@@ -1192,18 +1238,18 @@ where
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
-    if !sink.send(StreamEvent::Start).await {
+    let mut dec = Decoder::default();
+
+    if !sink.send(StreamEvent::Start { partial: dec.snapshot(model, api) }).await {
         return;
     }
-
-    let mut dec = Decoder::default();
 
     while let Some(frame) = frames.next().await {
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
                 // transport/decode/abort mid-stream → terminal Error (R-01-018/044/045)
-                sink.send(e.into_error_event(provider, &model_id)).await;
+                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone()))).await;
                 return;
             }
         };
@@ -1219,21 +1265,24 @@ where
             // Be robust to keep-alive / non-JSON comment frames.
             Err(_) => continue,
         };
-        if !process_chunk(&chunk, &mut dec, model, sink).await {
+        if !process_chunk(&chunk, &mut dec, model, api, sink).await {
             return; // consumer dropped
         }
     }
 
-    // Finalize each open block in appearance order.
-    for (idx, block) in dec.blocks.iter().enumerate() {
-        let ev = match block {
-            Block::Text(text) => {
-                StreamEvent::TextEnd { content_index: idx, content: text.clone() }
+    // Finalize each open block in appearance order. The `partial` snapshot reflects all assembled
+    // blocks (Pi `finishBlock` pushes `*_end` with `partial: output`, openai-completions.ts:214-246).
+    let block_count = dec.blocks.len();
+    for idx in 0..block_count {
+        let partial = dec.snapshot(model, api);
+        let ev = match dec.blocks.get(idx) {
+            Some(Block::Text(text)) => {
+                StreamEvent::TextEnd { content_index: idx, content: text.clone(), partial }
             }
-            Block::Thinking { text, .. } => {
-                StreamEvent::ThinkingEnd { content_index: idx, content: text.clone() }
+            Some(Block::Thinking { text, .. }) => {
+                StreamEvent::ThinkingEnd { content_index: idx, content: text.clone(), partial }
             }
-            Block::Tool { id, name, args, thought_signature } => StreamEvent::ToolCallEnd {
+            Some(Block::Tool { id, name, args, thought_signature }) => StreamEvent::ToolCallEnd {
                 content_index: idx,
                 tool_call: ToolCall {
                     id: ToolCallId::from(id.as_str()),
@@ -1241,7 +1290,9 @@ where
                     arguments: parse_partial_json(args),
                     thought_signature: thought_signature.clone(),
                 },
+                partial,
             },
+            None => continue,
         };
         if !sink.send(ev).await {
             return;
@@ -1262,10 +1313,10 @@ where
         message.error_message = Some("Stream ended without finish_reason".to_string());
     }
 
-    let terminal = if message.stop_reason == StopReason::Error {
-        StreamEvent::Error { message }
+    let terminal = if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+        StreamEvent::Error { reason: message.stop_reason, error: message }
     } else {
-        StreamEvent::Done { message }
+        StreamEvent::Done { reason: message.stop_reason, message }
     };
     sink.send(terminal).await;
 }
@@ -1275,6 +1326,7 @@ async fn process_chunk(
     chunk: &Value,
     dec: &mut Decoder,
     model: &Model,
+    api: &ApiId,
     sink: &EventSink,
 ) -> bool {
     if dec.response_id.is_none()
@@ -1345,15 +1397,16 @@ async fn process_chunk(
     if let Some(text) = delta.get("content").and_then(Value::as_str)
         && !text.is_empty()
     {
-        let idx = match ensure_text_block(dec, sink).await {
+        let idx = match ensure_text_block(dec, model, api, sink).await {
             Some(idx) => idx,
             None => return false,
         };
         if let Some(Block::Text(buf)) = dec.blocks.get_mut(idx) {
             buf.push_str(text);
         }
+        let partial = dec.snapshot(model, api);
         if !sink
-            .send(StreamEvent::TextDelta { content_index: idx, delta: text.to_string() })
+            .send(StreamEvent::TextDelta { content_index: idx, delta: text.to_string(), partial })
             .await
         {
             return false;
@@ -1371,15 +1424,20 @@ async fn process_chunk(
         } else {
             field
         };
-        let idx = match ensure_thinking_block(dec, signature, sink).await {
+        let idx = match ensure_thinking_block(dec, signature, model, api, sink).await {
             Some(idx) => idx,
             None => return false,
         };
         if let Some(Block::Thinking { text, .. }) = dec.blocks.get_mut(idx) {
             text.push_str(reason_text);
         }
+        let partial = dec.snapshot(model, api);
         if !sink
-            .send(StreamEvent::ThinkingDelta { content_index: idx, delta: reason_text.to_string() })
+            .send(StreamEvent::ThinkingDelta {
+                content_index: idx,
+                delta: reason_text.to_string(),
+                partial,
+            })
             .await
         {
             return false;
@@ -1389,7 +1447,7 @@ async fn process_chunk(
     // 3. Streamed tool calls.
     if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc in tool_calls {
-            if !process_tool_call_delta(tc, dec, sink).await {
+            if !process_tool_call_delta(tc, dec, model, api, sink).await {
                 return false;
             }
         }
@@ -1428,14 +1486,20 @@ fn encrypted_reasoning_detail_id(detail: &Value) -> Option<&str> {
 
 /// Ensure a text block exists, emitting `TextStart` on first appearance. Returns its index, or
 /// `None` if the consumer dropped the stream.
-async fn ensure_text_block(dec: &mut Decoder, sink: &EventSink) -> Option<usize> {
+async fn ensure_text_block(
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> Option<usize> {
     if let Some(idx) = dec.text_idx {
         return Some(idx);
     }
     let idx = dec.blocks.len();
     dec.blocks.push(Block::Text(String::new()));
     dec.text_idx = Some(idx);
-    if !sink.send(StreamEvent::TextStart { content_index: idx }).await {
+    let partial = dec.snapshot(model, api);
+    if !sink.send(StreamEvent::TextStart { content_index: idx, partial }).await {
         return None;
     }
     Some(idx)
@@ -1446,6 +1510,8 @@ async fn ensure_text_block(dec: &mut Decoder, sink: &EventSink) -> Option<usize>
 async fn ensure_thinking_block(
     dec: &mut Decoder,
     signature: &str,
+    model: &Model,
+    api: &ApiId,
     sink: &EventSink,
 ) -> Option<usize> {
     if let Some(idx) = dec.thinking_idx {
@@ -1457,14 +1523,21 @@ async fn ensure_thinking_block(
         signature: Some(signature.to_string()),
     });
     dec.thinking_idx = Some(idx);
-    if !sink.send(StreamEvent::ThinkingStart { content_index: idx }).await {
+    let partial = dec.snapshot(model, api);
+    if !sink.send(StreamEvent::ThinkingStart { content_index: idx, partial }).await {
         return None;
     }
     Some(idx)
 }
 
 /// Apply one `tool_calls[]` delta fragment, assembling id/name/arguments across chunks.
-async fn process_tool_call_delta(tc: &Value, dec: &mut Decoder, sink: &EventSink) -> bool {
+async fn process_tool_call_delta(
+    tc: &Value,
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
     let stream_index = tc.get("index").and_then(Value::as_i64);
     let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
     let name = tc
@@ -1499,7 +1572,8 @@ async fn process_tool_call_delta(tc: &Value, dec: &mut Decoder, sink: &EventSink
             if let Some(i) = id {
                 dec.tool_by_id.insert(i.to_string(), idx);
             }
-            if !sink.send(StreamEvent::ToolCallStart { content_index: idx }).await {
+            let partial = dec.snapshot(model, api);
+            if !sink.send(StreamEvent::ToolCallStart { content_index: idx, partial }).await {
                 return false;
             }
             idx
@@ -1535,9 +1609,11 @@ async fn process_tool_call_delta(tc: &Value, dec: &mut Decoder, sink: &EventSink
         dec.tool_by_id.entry(i.to_string()).or_insert(idx);
     }
 
+    let partial = dec.snapshot(model, api);
     sink.send(StreamEvent::ToolCallDelta {
         content_index: idx,
         delta: args_fragment.to_string(),
+        partial,
     })
     .await
 }
@@ -1556,25 +1632,7 @@ fn first_reasoning_delta(delta: &Value) -> Option<(&'static str, &str)> {
 
 /// Build the terminal [`AssistantMessage`] from accumulated decoder state.
 fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> AssistantMessage {
-    let mut content: Vec<Content> = Vec::new();
-    for block in dec.blocks {
-        match block {
-            Block::Text(text) => content.push(Content::text(text)),
-            Block::Thinking { text, signature } => content.push(Content::Thinking {
-                thinking: text,
-                thinking_signature: signature,
-                redacted: false,
-            }),
-            Block::Tool { id, name, args, thought_signature } => {
-                content.push(Content::ToolCall(ToolCall {
-                    id: ToolCallId::from(id.as_str()),
-                    name,
-                    arguments: parse_partial_json(&args),
-                    thought_signature,
-                }))
-            }
-        }
-    }
+    let content = blocks_to_content(&dec.blocks);
 
     let mut usage = dec.usage.unwrap_or_default();
     apply_cost(&model.cost, &mut usage);
@@ -1585,9 +1643,10 @@ fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> AssistantMes
         content,
         provider: model.provider.clone(),
         model: model.id.as_str().to_string(),
-        api: Some(api.clone()),
+        api: api.clone(),
         response_model: dec.response_model,
         response_id: dec.response_id,
+        diagnostics: None,
         usage,
         stop_reason,
         error_message: dec.error_message,
@@ -1643,12 +1702,19 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
 
 /// Best-effort parse of accumulated tool-call argument JSON. An empty/incomplete buffer yields an
 /// empty object so a truncated stream still produces a valid (if empty) tool call.
-fn parse_partial_json(s: &str) -> Value {
+/// Parse a (possibly partial / streaming) tool-call argument string into the JSON object Pi's
+/// `ToolCall.arguments: Record<string, any>` requires (types.ts:348). Incomplete, invalid, or
+/// non-object input yields an empty object `{}` rather than a scalar, so the decoder always produces
+/// a well-typed object.
+fn parse_partial_json(s: &str) -> Map<String, Value> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Value::Object(Map::new());
+        return Map::new();
     }
-    serde_json::from_str(trimmed).unwrap_or_else(|_| Value::Object(Map::new()))
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    }
 }
 
 /// Current unix time in milliseconds (0 on a clock error — never panics).
@@ -1733,14 +1799,15 @@ mod tests {
                     content: vec![Content::ToolCall(ToolCall {
                         id: ToolCallId::from("call_1"),
                         name: "get_weather".into(),
-                        arguments: json!({ "city": "Paris" }),
+                        arguments: json!({ "city": "Paris" }).as_object().cloned().expect("object"),
                         thought_signature: None,
                     })],
                     provider: "together".into(),
                     model: "m".into(),
-                    api: None,
+                    api: "openai-completions".into(),
                     response_model: None,
                     response_id: None,
+                    diagnostics: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
                     error_message: None,
@@ -1769,7 +1836,7 @@ mod tests {
         let opts = StreamOptions {
             max_tokens: Some(256),
             temperature: Some(0.5),
-            reasoning: ThinkingLevel::High,
+            reasoning: ModelThinkingLevel::High,
             ..Default::default()
         };
 
@@ -1823,7 +1890,7 @@ mod tests {
     fn reasoning_effort_omitted_for_non_reasoning_model() {
         let mut m = model();
         m.reasoning = false;
-        let opts = StreamOptions { reasoning: ThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
         let body = build_body(&m, &Context::default(), &opts);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoning").is_none());
@@ -1842,7 +1909,7 @@ mod tests {
         let m = openai_model();
         let opts = StreamOptions {
             max_tokens: Some(100),
-            reasoning: ThinkingLevel::Medium,
+            reasoning: ModelThinkingLevel::Medium,
             ..Default::default()
         };
         let body = build_body(&m, &Context::default(), &opts);
@@ -1860,7 +1927,7 @@ mod tests {
         // Map "high" -> "xhigh" wire value (Pi `thinkingLevelMap`).
         m.thinking_level_map =
             Some(crate::model::ThinkingLevelMap::from([("high".to_string(), Some("xhigh".to_string()))]));
-        let opts = StreamOptions { reasoning: ThinkingLevel::High, ..Default::default() };
+        let opts = StreamOptions { reasoning: ModelThinkingLevel::High, ..Default::default() };
         let body = build_body(&m, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "xhigh");
     }
@@ -1958,8 +2025,8 @@ mod tests {
         );
         let events = collect_events(raw).await;
 
-        assert!(matches!(events.first(), Some(StreamEvent::Start)));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextStart { content_index: 0 })));
+        assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextStart { content_index: 0, .. })));
         let deltas: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -1970,7 +2037,7 @@ mod tests {
         assert_eq!(deltas, vec!["Hel", "lo"]);
 
         match events.last() {
-            Some(StreamEvent::Done { message }) => {
+            Some(StreamEvent::Done { message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Stop);
                 assert_eq!(message.content, vec![Content::text("Hello")]);
                 assert_eq!(message.response_id.as_deref(), Some("chatcmpl-1"));
@@ -1983,6 +2050,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_terminal_events_carry_running_partial() {
+        // Pi parity (R-01-022): every non-terminal event carries a `partial` snapshot that grows
+        // as deltas arrive, so consumers never reconstruct from deltas.
+        let raw = concat!(
+            "data: {\"id\":\"resp-1\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect_events(raw).await;
+
+        // Start's partial is empty; every non-terminal carries a partial (the terminal does not).
+        assert!(matches!(&events[0], StreamEvent::Start { partial } if partial.content.is_empty()));
+        for ev in &events {
+            match ev {
+                StreamEvent::Done { .. } | StreamEvent::Error { .. } => assert!(ev.partial().is_none()),
+                _ => assert!(ev.partial().is_some(), "non-terminal must carry partial: {ev:?}"),
+            }
+        }
+
+        // The last text_delta's partial reflects the full accumulated text + the response id.
+        let last_delta = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { partial, .. } => Some(partial),
+                _ => None,
+            })
+            .next_back()
+            .expect("a text_delta");
+        assert_eq!(last_delta.content, vec![Content::text("Hello")]);
+        assert_eq!(last_delta.response_id.as_deref(), Some("resp-1"));
+        // Still streaming → partial keeps the default stop reason until the terminal arrives.
+        assert_eq!(last_delta.stop_reason, StopReason::Stop);
+    }
+
+    #[tokio::test]
     async fn decodes_multichunk_tool_call() {
         let raw = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"add\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
@@ -1992,7 +2095,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
 
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { content_index: 0 })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { content_index: 0, .. })));
         let delta_count =
             events.iter().filter(|e| matches!(e, StreamEvent::ToolCallDelta { .. })).count();
         assert_eq!(delta_count, 2);
@@ -2004,10 +2107,10 @@ mod tests {
         let tc = tc_end.expect("toolcall_end");
         assert_eq!(tc.id.as_str(), "call_9");
         assert_eq!(tc.name, "add");
-        assert_eq!(tc.arguments, json!({ "a": 1, "b": 2 }));
+        assert_eq!(serde_json::Value::Object(tc.arguments), json!({ "a": 1, "b": 2 }));
 
         match events.last() {
-            Some(StreamEvent::Done { message }) => {
+            Some(StreamEvent::Done { message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::ToolUse);
                 assert_eq!(message.content.len(), 1);
             }
@@ -2053,7 +2156,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
 
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0 })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0, .. })));
         let think: String = events
             .iter()
             .filter_map(|e| match e {
@@ -2064,7 +2167,7 @@ mod tests {
         assert_eq!(think, "think hard");
 
         match events.last() {
-            Some(StreamEvent::Done { message }) => {
+            Some(StreamEvent::Done { message, .. }) => {
                 // The thinking block records which reasoning field carried it (`reasoning_content`).
                 assert_eq!(
                     message.content,
@@ -2091,7 +2194,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
         match events.last() {
-            Some(StreamEvent::Done { message }) => {
+            Some(StreamEvent::Done { message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Length)
             }
             other => panic!("expected Done terminal, got {other:?}"),
@@ -2106,7 +2209,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
         match events.last() {
-            Some(StreamEvent::Error { message }) => {
+            Some(StreamEvent::Error { error: message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Error);
                 assert!(message
                     .error_message
@@ -2130,7 +2233,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
         match events.last() {
-            Some(StreamEvent::Error { message }) => {
+            Some(StreamEvent::Error { error: message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Error);
                 assert_eq!(
                     message.error_message.as_deref(),
@@ -2209,7 +2312,7 @@ mod tests {
         );
         let events = collect_events(raw).await;
         match events.last() {
-            Some(StreamEvent::Error { message }) => {
+            Some(StreamEvent::Error { error: message, .. }) => {
                 assert_eq!(message.stop_reason, StopReason::Error);
                 let em = message.error_message.as_deref().unwrap();
                 assert!(em.contains("upstream failed"), "got: {em}");

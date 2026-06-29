@@ -432,10 +432,10 @@ mod tests {
     fn catalog_models_encode_reasoning_per_pi() {
         use crate::api::openai_completions::build_body;
         use crate::context::Context;
-        use cyrup_core::ThinkingLevel;
+        use cyrup_core::ModelThinkingLevel;
         let models = together_models();
         let opts =
-            StreamOptions { reasoning: ThinkingLevel::High, max_tokens: Some(50), ..Default::default() };
+            StreamOptions { reasoning: ModelThinkingLevel::High, max_tokens: Some(50), ..Default::default() };
 
         // A `together` thinkingFormat model => reasoning: { enabled }, never reasoning_effort.
         let glm = models.iter().find(|m| m.id.as_str() == "zai-org/GLM-5").unwrap();
@@ -539,7 +539,7 @@ mod tests {
         // the full compat-driven body (`max_tokens`, no `store`) against the real API.
         let opts = StreamOptions {
             max_tokens: Some(256),
-            reasoning: cyrup_core::ThinkingLevel::High,
+            reasoning: cyrup_core::ModelThinkingLevel::High,
             ..Default::default()
         };
         let msg = collect_message(provider.stream(&model, &ctx, &opts)).await;

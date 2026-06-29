@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_agent::{Agent, ProviderStreamFn};
-use cyrup_core::{CancelToken, ModelRef, RunCancel, ThinkingLevel};
+use cyrup_core::{CancelToken, ModelRef, RunCancel, ModelThinkingLevel};
 use cyrup_config::{
     decide_trust, has_trust_requiring_resources, AppMode, AuthStore, InMemorySettingsStore,
     ModelResolver, Settings, SettingsManager, SettingsStore, TrustInputs, TrustOutcome,
@@ -63,7 +63,7 @@ pub struct SessionConfig {
     /// Model selection pattern (`provider/id[:level]`); `None` ⇒ settings default ⇒ first catalog.
     pub model_pattern: Option<String>,
     /// Thinking level override (`None` ⇒ pattern `:level` ⇒ settings default).
-    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_level: Option<ModelThinkingLevel>,
     /// `--approve` (Some(true)) / `--no-approve` (Some(false)).
     pub trust_override: Option<bool>,
     /// `--no-context-files` / `-nc`.
@@ -344,12 +344,12 @@ impl SessionBuilder {
     }
 }
 
-/// Resolve `(Model, ModelRef, ThinkingLevel)` from the pattern / settings / catalog (R-07-019).
+/// Resolve `(Model, ModelRef, ModelThinkingLevel)` from the pattern / settings / catalog (R-07-019).
 fn resolve_model(
     provider: &dyn Provider,
     cfg: &SessionConfig,
     settings: &SettingsManager,
-) -> Result<(Model, ModelRef, ThinkingLevel), SessionServiceError> {
+) -> Result<(Model, ModelRef, ModelThinkingLevel), SessionServiceError> {
     let available = provider.models();
     if available.is_empty() {
         return Err(SessionServiceError::NoModels(provider.id().to_string()));

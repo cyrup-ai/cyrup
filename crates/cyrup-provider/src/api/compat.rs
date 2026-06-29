@@ -9,7 +9,7 @@
 //! This module reproduces that matrix verbatim (it is data, ported faithfully).
 
 use crate::model::{Model, ThinkingLevelMap};
-use cyrup_core::ThinkingLevel;
+use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value};
 
 /// Which request field carries the max-tokens cap.
@@ -123,15 +123,15 @@ pub struct ResolvedCompat {
     pub supports_long_cache_retention: bool,
 }
 
-/// The `thinkingLevelMap` key for a [`ThinkingLevel`] (Pi `ModelThinkingLevel`).
-pub fn thinking_level_key(level: ThinkingLevel) -> &'static str {
+/// The `thinkingLevelMap` key for a [`ModelThinkingLevel`] (Pi `ModelThinkingLevel`).
+pub fn thinking_level_key(level: ModelThinkingLevel) -> &'static str {
     match level {
-        ThinkingLevel::Off => "off",
-        ThinkingLevel::Minimal => "minimal",
-        ThinkingLevel::Low => "low",
-        ThinkingLevel::Medium => "medium",
-        ThinkingLevel::High => "high",
-        ThinkingLevel::Xhigh => "xhigh",
+        ModelThinkingLevel::Off => "off",
+        ModelThinkingLevel::Minimal => "minimal",
+        ModelThinkingLevel::Low => "low",
+        ModelThinkingLevel::Medium => "medium",
+        ModelThinkingLevel::High => "high",
+        ModelThinkingLevel::Xhigh => "xhigh",
     }
 }
 
@@ -145,7 +145,7 @@ pub fn level_map_lookup<'a>(
 }
 
 /// `model.thinkingLevelMap?.[level] ?? <fallback>` — both `undefined` and `null` fall back.
-pub fn mapped_effort_or(map: Option<&ThinkingLevelMap>, level: ThinkingLevel, fallback: &str) -> String {
+pub fn mapped_effort_or(map: Option<&ThinkingLevelMap>, level: ModelThinkingLevel, fallback: &str) -> String {
     match level_map_lookup(map, thinking_level_key(level)) {
         Some(Some(s)) => s.clone(),
         _ => fallback.to_string(),
@@ -410,11 +410,11 @@ mod tests {
         map.insert("high".to_string(), Some("high".to_string()));
         map.insert("low".to_string(), None);
         // present string
-        assert_eq!(mapped_effort_or(Some(&map), ThinkingLevel::High, "fb"), "high");
+        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::High, "fb"), "high");
         // present null -> fallback
-        assert_eq!(mapped_effort_or(Some(&map), ThinkingLevel::Low, "fb"), "fb");
+        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::Low, "fb"), "fb");
         // absent -> fallback
-        assert_eq!(mapped_effort_or(Some(&map), ThinkingLevel::Medium, "fb"), "fb");
+        assert_eq!(mapped_effort_or(Some(&map), ModelThinkingLevel::Medium, "fb"), "fb");
     }
 
     #[test]

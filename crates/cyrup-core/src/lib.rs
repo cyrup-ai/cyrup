@@ -9,14 +9,25 @@
 use std::sync::Arc;
 
 pub mod cancel;
+pub mod diagnostics;
 pub mod error;
+pub mod event_stream;
 pub mod message;
 pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
+pub use diagnostics::{
+    append_assistant_message_diagnostic, create_assistant_message_diagnostic,
+    create_assistant_message_diagnostic_from, extract_diagnostic_error, format_thrown_value,
+    AssistantMessageDiagnostic, DiagnosticCode, DiagnosticErrorInfo,
+};
 pub use error::CoreError;
+pub use event_stream::{
+    finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
+};
 pub use message::{
-    AssistantMessage, Content, Cost, Message, StopReason, ThinkingLevel, ToolCall, Usage,
+    AssistantMessage, Content, Cost, Message, ModelThinkingLevel, StopReason, TextPhase,
+    TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,
 };
 pub use tool::{ExecMode, Tool, ToolError, ToolResult, ToolUpdate, ToolUpdateSink};
 

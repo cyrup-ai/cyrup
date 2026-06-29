@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use cyrup_core::{
-    AssistantMessage, CancelToken, Content, Message, ModelRef, StopReason, ThinkingLevel,
+    AssistantMessage, CancelToken, Content, Message, ModelRef, StopReason, ModelThinkingLevel,
 };
 use cyrup_provider::{collect_message, Context, Model, Provider, StreamOptions};
 
@@ -43,7 +43,7 @@ pub struct SummarizationRequest<'a> {
     pub prompt_text: String,
     pub max_tokens: u32,
     pub model: ModelRef,
-    pub thinking: ThinkingLevel,
+    pub thinking: ModelThinkingLevel,
 }
 
 /// The summarization seam: a single completion used for summaries (R-05-008).
@@ -158,7 +158,7 @@ pub async fn generate_summary<S: Summarizer>(
         prompt_text: prompt,
         max_tokens: compute_max_tokens(reserve, u32::try_from(model.max_tokens).unwrap_or(u32::MAX)),
         model: model_ref(model),
-        thinking: ThinkingLevel::Off,
+        thinking: ModelThinkingLevel::Off,
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
@@ -186,7 +186,7 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
         prompt_text: prompt,
         max_tokens: compute_max_tokens(reserve, u32::try_from(model.max_tokens).unwrap_or(u32::MAX)),
         model: model_ref(model),
-        thinking: ThinkingLevel::Off,
+        thinking: ModelThinkingLevel::Off,
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {

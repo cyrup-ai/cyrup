@@ -116,17 +116,30 @@ impl ProviderError {
     }
 
     /// Build the terminal error `AssistantMessage` for this failure (func-01 R-01-045). Aborts use
-    /// `StopReason::Aborted`; every other failure uses `StopReason::Error`. The message is a valid,
-    /// appendable assistant turn (func-01 R-01-046).
-    pub fn into_error_message(&self, provider: ProviderId, model: &str) -> AssistantMessage {
+    /// `StopReason::Aborted`; every other failure uses `StopReason::Error`. `api` is the producing
+    /// wire-protocol id (Pi sets `output.api = model.api` even on the error path). The message is a
+    /// valid, appendable assistant turn (func-01 R-01-046).
+    pub fn into_error_message(
+        &self,
+        provider: ProviderId,
+        model: &str,
+        api: Option<ApiId>,
+    ) -> AssistantMessage {
         let stop = if self.is_aborted() { StopReason::Aborted } else { StopReason::Error };
-        AssistantMessage::errored(provider, model, stop, self.to_string())
+        AssistantMessage::errored(provider, model, api, stop, self.to_string())
     }
 
     /// Build the terminal [`StreamEvent::Error`] for this failure (func-01 R-01-018/045). This is the
-    /// ONLY way request/stream failures reach a consumer — they are never thrown.
-    pub fn into_error_event(&self, provider: ProviderId, model: &str) -> StreamEvent {
-        StreamEvent::Error { message: self.into_error_message(provider, model) }
+    /// ONLY way request/stream failures reach a consumer — they are never thrown. The `reason`
+    /// discriminant mirrors the message's `stop_reason` (Pi `{type:"error", reason, error}`).
+    pub fn into_error_event(
+        &self,
+        provider: ProviderId,
+        model: &str,
+        api: Option<ApiId>,
+    ) -> StreamEvent {
+        let error = self.into_error_message(provider, model, api);
+        StreamEvent::Error { reason: error.stop_reason, error }
     }
 }
 
@@ -147,11 +160,13 @@ mod tests {
 
     #[test]
     fn aborted_maps_to_aborted_terminal() {
-        let ev = ProviderError::Aborted.into_error_event("p".into(), "m");
+        let ev = ProviderError::Aborted.into_error_event("p".into(), "m", Some("test-api".into()));
         match ev {
-            StreamEvent::Error { message } => {
-                assert_eq!(message.stop_reason, StopReason::Aborted);
-                assert_eq!(message.error_message.as_deref(), Some("aborted"));
+            StreamEvent::Error { reason, error } => {
+                assert_eq!(reason, StopReason::Aborted);
+                assert_eq!(error.stop_reason, StopReason::Aborted);
+                assert_eq!(error.api.to_string(), "test-api");
+                assert_eq!(error.error_message.as_deref(), Some("aborted"));
             }
             _ => panic!("expected error terminal"),
         }
@@ -159,10 +174,16 @@ mod tests {
 
     #[test]
     fn http_maps_to_error_terminal() {
-        let ev = ProviderError::Http { status: 503, message: "down".into() }
-            .into_error_event("p".into(), "m");
+        let ev = ProviderError::Http { status: 503, message: "down".into() }.into_error_event(
+            "p".into(),
+            "m",
+            None,
+        );
         match ev {
-            StreamEvent::Error { message } => assert_eq!(message.stop_reason, StopReason::Error),
+            StreamEvent::Error { reason, error } => {
+                assert_eq!(reason, StopReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+            }
             _ => panic!("expected error terminal"),
         }
     }

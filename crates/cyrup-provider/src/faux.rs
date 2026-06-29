@@ -132,6 +132,7 @@ impl Provider for FauxProvider {
             AssistantMessage::errored(
                 self.id.clone(),
                 self.default_model.id.as_str(),
+                Some(self.default_model.api.clone()),
                 StopReason::Error,
                 "No more faux responses queued",
             )
@@ -150,35 +151,96 @@ impl Provider for FauxProvider {
 }
 
 fn events_for(message: AssistantMessage) -> Vec<StreamEvent> {
-    let mut events = vec![StreamEvent::Start];
+    // A `proto` partial carries the message metadata with a still-streaming `stop_reason: Stop`
+    // (Pi inits `output.stopReason = "stop"`); each non-terminal event attaches a snapshot whose
+    // `content` grows as blocks complete (Pi `partial: output`).
+    let proto = AssistantMessage {
+        content: Vec::new(),
+        provider: message.provider.clone(),
+        model: message.model.clone(),
+        api: message.api.clone(),
+        response_model: message.response_model.clone(),
+        response_id: message.response_id.clone(),
+        diagnostics: None,
+        usage: message.usage.clone(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        timestamp: message.timestamp,
+    };
+    let mk = |content: Vec<Content>| {
+        let mut p = proto.clone();
+        p.content = content;
+        p
+    };
+
+    let mut events = vec![StreamEvent::Start { partial: mk(Vec::new()) }];
+    let mut acc: Vec<Content> = Vec::new();
     for (i, block) in message.content.iter().enumerate() {
         match block {
             Content::Text { text, .. } => {
-                events.push(StreamEvent::TextStart { content_index: i });
-                events.push(StreamEvent::TextDelta { content_index: i, delta: text.clone() });
-                events.push(StreamEvent::TextEnd { content_index: i, content: text.clone() });
+                let mut cur = acc.clone();
+                cur.push(block.clone());
+                events.push(StreamEvent::TextStart { content_index: i, partial: mk(cur.clone()) });
+                events.push(StreamEvent::TextDelta {
+                    content_index: i,
+                    delta: text.clone(),
+                    partial: mk(cur.clone()),
+                });
+                events.push(StreamEvent::TextEnd {
+                    content_index: i,
+                    content: text.clone(),
+                    partial: mk(cur.clone()),
+                });
+                acc = cur;
             }
             Content::Thinking { thinking, .. } => {
-                events.push(StreamEvent::ThinkingStart { content_index: i });
-                events
-                    .push(StreamEvent::ThinkingDelta { content_index: i, delta: thinking.clone() });
-                events.push(StreamEvent::ThinkingEnd { content_index: i, content: thinking.clone() });
+                let mut cur = acc.clone();
+                cur.push(block.clone());
+                events.push(StreamEvent::ThinkingStart {
+                    content_index: i,
+                    partial: mk(cur.clone()),
+                });
+                events.push(StreamEvent::ThinkingDelta {
+                    content_index: i,
+                    delta: thinking.clone(),
+                    partial: mk(cur.clone()),
+                });
+                events.push(StreamEvent::ThinkingEnd {
+                    content_index: i,
+                    content: thinking.clone(),
+                    partial: mk(cur.clone()),
+                });
+                acc = cur;
             }
             Content::ToolCall(tc) => {
-                events.push(StreamEvent::ToolCallStart { content_index: i });
+                let mut cur = acc.clone();
+                cur.push(block.clone());
+                events.push(StreamEvent::ToolCallStart {
+                    content_index: i,
+                    partial: mk(cur.clone()),
+                });
                 let delta = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                events.push(StreamEvent::ToolCallDelta { content_index: i, delta });
-                events.push(StreamEvent::ToolCallEnd { content_index: i, tool_call: tc.clone() });
+                events.push(StreamEvent::ToolCallDelta {
+                    content_index: i,
+                    delta,
+                    partial: mk(cur.clone()),
+                });
+                events.push(StreamEvent::ToolCallEnd {
+                    content_index: i,
+                    tool_call: tc.clone(),
+                    partial: mk(cur.clone()),
+                });
+                acc = cur;
             }
             // Images are carried only in the terminal message (faux does not chunk them).
             Content::Image { .. } => {}
         }
     }
-    let is_error = matches!(message.stop_reason, StopReason::Error | StopReason::Aborted);
-    if is_error {
-        events.push(StreamEvent::Error { message });
+    let reason = message.stop_reason;
+    if matches!(reason, StopReason::Error | StopReason::Aborted) {
+        events.push(StreamEvent::Error { reason, error: message });
     } else {
-        events.push(StreamEvent::Done { message });
+        events.push(StreamEvent::Done { reason, message });
     }
     events
 }
@@ -198,7 +260,11 @@ pub fn faux_tool_call(name: impl Into<String>, arguments: serde_json::Value) -> 
     Content::ToolCall(ToolCall {
         id: ToolCallId::from(format!("faux-call-{n}")),
         name: name.into(),
-        arguments,
+        // Pi `ToolCall.arguments` is always an object (types.ts:348); coerce a non-object to `{}`.
+        arguments: match arguments {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        },
         thought_signature: None,
     })
 }
@@ -210,9 +276,10 @@ pub fn faux_assistant_message(content: Vec<Content>, stop_reason: StopReason) ->
         content,
         provider: ProviderId::from("faux"),
         model: "faux-1".to_string(),
-        api: Some("faux".into()),
+        api: "faux".into(),
         response_model: None,
         response_id: None,
+        diagnostics: None,
         usage: Usage { output, total_tokens: output, ..Default::default() },
         stop_reason,
         error_message: None,
@@ -265,10 +332,12 @@ mod tests {
         while let Some(ev) = stream.next().await {
             events.push(ev);
         }
-        assert!(matches!(events.first(), Some(StreamEvent::Start)));
+        assert!(matches!(events.first(), Some(StreamEvent::Start { .. })));
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
         // thinking block before tool-call block, each start→delta→end
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0 })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ThinkingStart { content_index: 0, .. })));
         assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { content_index: 1, .. })));
     }
 

@@ -82,7 +82,7 @@ impl FileOps {
 }
 
 /// Pull a filesystem path from common tool-call argument keys.
-fn extract_path(args: &Value) -> Option<String> {
+fn extract_path(args: &serde_json::Map<String, Value>) -> Option<String> {
     for key in ["path", "file_path", "filePath", "absolutePath", "absolute_path"] {
         if let Some(s) = args.get(key).and_then(Value::as_str) {
             return Some(s.to_string());

@@ -25,6 +25,9 @@ pub struct EntryBase {
 
 /// The set of entry types cyrup interprets. Tags are snake_case (`message`, `model_change`, …);
 /// payload fields are camelCase (`modelId`, `firstKeptEntryId`, …), matching Pi.
+// `Message` dominates allocations and is serde-`flatten`ed; boxing it would force `box`-patterns
+// (unstable) at every match site — same rationale as `Entry` below.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum KnownEntry {

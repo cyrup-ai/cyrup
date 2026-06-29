@@ -45,7 +45,10 @@ pub use error::{AuthError, BoxErr, ProviderError};
 pub use model::{Modality, Model, ModelCost};
 pub use provider::Provider;
 pub use stream::sse::{build_client, decode_sse_bytes, open_sse, OnRequest, OnResponse, SseFrame, SseRequest};
-pub use stream::{collect_message, CacheRetention, StreamEvent, StreamOptions, ToolChoice};
+pub use stream::{
+    collect_message, create_assistant_message_event_stream, AssistantMessageEventSink,
+    AssistantMessageEventStream, CacheRetention, StreamEvent, StreamOptions, ToolChoice,
+};
 pub use usage::{apply_cost, compute_cost};
 pub use validate::{validate_named_tool_call, validate_tool_call, ToolValidationError};
 pub use wire::WireProvider;

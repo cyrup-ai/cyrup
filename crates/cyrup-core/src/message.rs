@@ -3,12 +3,52 @@
 //! Serde follows arch-00 §4: structs use `rename_all = "camelCase"`; tagged enums add
 //! `rename_all_fields = "camelCase"` so payload fields are camelCase for Pi-interop (R-00-013).
 
+use crate::diagnostics::AssistantMessageDiagnostic;
 use crate::{ApiId, ModelId, ModelRef, ProviderId, ToolCallId};
 
-/// Unified reasoning level (func-01 §12).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// Sentinel [`ApiId`] used when an [`AssistantMessage`] must be synthesized before any concrete
+/// wire api is resolvable (a catalog miss, or a stream that terminated before a model was bound).
+/// Pi declares `AssistantMessage.api: Api` as required (types.ts:386); rather than weaken the field
+/// to `Option`, cyrup materialises these rare unresolved cases as this sentinel so the field is
+/// always populated. It never participates in cross-provider handoff equality (those messages are
+/// terminal errors, not appendable replay turns).
+pub const UNRESOLVED_API: &str = "unknown";
+
+/// serde default for [`AssistantMessage::api`]: the [`UNRESOLVED_API`] sentinel, used only when a
+/// deserialized message omits `api` (legacy/foreign data — Pi's runtime accepts the same).
+fn default_api() -> ApiId {
+    ApiId::from(UNRESOLVED_API)
+}
+
+/// `skip_serializing_if` predicate for an optional-on-the-wire `bool` that defaults to `false`
+/// (e.g. [`Content::Thinking::redacted`], Pi `redacted?: boolean`, types.ts:335): omit the key when
+/// `false` so the absence/`false` JSON shapes match Pi byte-for-byte.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde `skip_serializing_if` requires `fn(&T) -> bool`
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Reasoning effort *level* (Pi `ThinkingLevel`, types.ts:74) — the "on" levels only, with NO
+/// `off`. This is the per-request reasoning intensity (Pi `SimpleStreamOptions.reasoning?:
+/// ThinkingLevel`); the *absence* of a level (or [`ModelThinkingLevel::Off`]) means reasoning is
+/// disabled. Kept distinct from [`ModelThinkingLevel`] so an `off`-bearing selection cannot be
+/// confused with an on-level (func-01 §12).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+/// A model's selectable reasoning level (Pi `ModelThinkingLevel = "off" | ThinkingLevel`,
+/// types.ts:75) — the [`ThinkingLevel`] set PLUS `off`. This is the user-facing / session-local
+/// selection and the key space of `ThinkingLevelMap`. `Off` is the default (reasoning disabled).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelThinkingLevel {
     #[default]
     Off,
     Minimal,
@@ -16,6 +56,37 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Xhigh,
+}
+
+impl ModelThinkingLevel {
+    /// The on-level [`ThinkingLevel`], or `None` when `Off` (Pi: `reasoning` is `undefined` for off).
+    pub fn level(self) -> Option<ThinkingLevel> {
+        match self {
+            ModelThinkingLevel::Off => None,
+            ModelThinkingLevel::Minimal => Some(ThinkingLevel::Minimal),
+            ModelThinkingLevel::Low => Some(ThinkingLevel::Low),
+            ModelThinkingLevel::Medium => Some(ThinkingLevel::Medium),
+            ModelThinkingLevel::High => Some(ThinkingLevel::High),
+            ModelThinkingLevel::Xhigh => Some(ThinkingLevel::Xhigh),
+        }
+    }
+
+    /// `true` for any on-level (reasoning enabled).
+    pub fn is_on(self) -> bool {
+        !matches!(self, ModelThinkingLevel::Off)
+    }
+}
+
+impl From<ThinkingLevel> for ModelThinkingLevel {
+    fn from(l: ThinkingLevel) -> Self {
+        match l {
+            ThinkingLevel::Minimal => ModelThinkingLevel::Minimal,
+            ThinkingLevel::Low => ModelThinkingLevel::Low,
+            ThinkingLevel::Medium => ModelThinkingLevel::Medium,
+            ThinkingLevel::High => ModelThinkingLevel::High,
+            ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+        }
+    }
 }
 
 /// How a generation ended (func-01 §9).
@@ -29,24 +100,81 @@ pub enum StopReason {
     Aborted,
 }
 
+/// The reasoning phase of a structured text signature (Pi `TextSignatureV1.phase`, types.ts:319):
+/// distinguishes commentary from the final answer for OpenAI-responses replay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPhase {
+    Commentary,
+    FinalAnswer,
+}
+
+/// Structured text-signature payload (Pi `TextSignatureV1`, types.ts:316-320). A
+/// [`Content::Text`]'s `text_signature` is EITHER a legacy opaque id string OR a JSON-encoded
+/// `TextSignatureV1`; use [`TextSignatureV1::parse`]/[`TextSignatureV1::encode`] to round-trip the
+/// structured form through that string field.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSignatureV1 {
+    /// Schema version — always `1` (Pi `v: 1`).
+    pub v: u8,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub phase: Option<TextPhase>,
+}
+
+impl TextSignatureV1 {
+    /// Build a V1 signature (`v` fixed to 1).
+    pub fn new(id: impl Into<String>, phase: Option<TextPhase>) -> Self {
+        Self { v: 1, id: id.into(), phase }
+    }
+
+    /// Parse a structured V1 signature from a `text_signature` string, or `None` for a legacy id
+    /// string / non-V1 JSON (Pi reads `textSignature` as `legacy id string or TextSignatureV1 JSON`,
+    /// types.ts:325).
+    pub fn parse(text_signature: &str) -> Option<Self> {
+        let parsed: TextSignatureV1 = serde_json::from_str(text_signature).ok()?;
+        (parsed.v == 1).then_some(parsed)
+    }
+
+    /// Encode to the JSON string stored in `text_signature` (never panics; falls back to the id).
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.id.clone())
+    }
+}
+
 /// A model-issued tool call (func-01 §4.4).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: String,
-    pub arguments: serde_json::Value,
+    /// Tool arguments. Pi types this as `Record<string, any>` — always a JSON object (types.ts:348);
+    /// cyrup mirrors that exactly with `serde_json::Map<String, Value>`, so the type can no longer
+    /// hold a non-object (array/string/number/null). Decoders that tolerate streaming partial-JSON
+    /// yield an empty object (`{}`) for incomplete/invalid input rather than a scalar.
+    pub arguments: serde_json::Map<String, serde_json::Value>,
     /// Provider-opaque (Google); stripped on cross-provider handoff (func-01 R-01-030).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub thought_signature: Option<String>,
 }
 
 /// A typed content block (func-01 §4.4).
+///
+/// Per-role typing (gap 9): Pi types content per role — assistant = `Text|Thinking|ToolCall`,
+/// user/toolResult = `Text|Image` (types.ts:379/385/402). cyrup keeps one ergonomic `Content` enum
+/// but enforces Pi's per-role unions at the wire boundary with validating deserializers
+/// ([`de_assistant_content`], [`de_user_content`], [`de_tool_result_content`]): a payload carrying
+/// an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is
+/// REJECTED on deserialize, exactly as Pi's typed unions reject it. Producers still build the right
+/// variants by construction.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Content {
     Text {
         text: String,
+        /// Legacy opaque id string OR a JSON-encoded [`TextSignatureV1`] (Pi `textSignature`,
+        /// types.ts:325). Use [`TextSignatureV1::parse`]/`encode` for the structured form.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text_signature: Option<String>,
     },
@@ -54,7 +182,12 @@ pub enum Content {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         thinking_signature: Option<String>,
-        #[serde(default)]
+        /// Pi `redacted?: boolean` (types.ts:335) — OMITTED when unset. Pi only ever emits
+        /// `redacted: true` (a safety-redacted block); an un-redacted block leaves the key
+        /// `undefined`, so `JSON.stringify` drops it. cyrup keeps the field a plain `bool`
+        /// (`false` = not redacted) and skips serializing the `false` default, so a non-redacted
+        /// block emits no `redacted` key — byte-1:1 with Pi — while `redacted: true` still writes.
+        #[serde(default, skip_serializing_if = "is_false")]
         redacted: bool,
     },
     ToolCall(ToolCall),
@@ -71,6 +204,10 @@ impl Content {
     }
     pub fn thinking(s: impl Into<String>) -> Self {
         Content::Thinking { thinking: s.into(), thinking_signature: None, redacted: false }
+    }
+    /// A text block carrying a (legacy or [`TextSignatureV1`]-encoded) signature.
+    pub fn text_with_signature(s: impl Into<String>, signature: impl Into<String>) -> Self {
+        Content::Text { text: s.into(), text_signature: Some(signature.into()) }
     }
 }
 
@@ -107,15 +244,31 @@ pub struct Cost {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
+    #[serde(deserialize_with = "de_assistant_content")]
     pub content: Vec<Content>,
     pub provider: ProviderId,
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub api: Option<ApiId>,
+    /// The wire-protocol api that produced this turn. Pi declares `api: Api` as REQUIRED
+    /// (types.ts:386): a produced assistant turn always knows the concrete wire api that generated
+    /// it. cyrup matches that exactly — `api: ApiId` is a required field. The not-yet-resolved
+    /// user-facing selection (whose api is reconstructed at model-resolution time) is modelled
+    /// separately by [`crate::ModelRef::api`] (`Option<ApiId>`), not here. `api` is the
+    /// handoff-equality key (func-01 R-01-029).
+    ///
+    /// It ALWAYS serializes (Pi emits it on every assistant turn). On READ it tolerates an absent
+    /// `api` — defaulting to the [`UNRESOLVED_API`] sentinel — because Pi's runtime (erased TS
+    /// types, no schema validation) likewise accepts a legacy/foreign message that omits it; this
+    /// keeps v1 session migration interpretable without weakening the in-memory type to `Option`.
+    #[serde(default = "default_api")]
+    pub api: ApiId,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
+    /// Redacted provider/runtime diagnostics for failures and recoveries (Pi
+    /// `diagnostics?: AssistantMessageDiagnostic[]`, types.ts:391). Skipped when empty/none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
     pub usage: Usage,
     pub stop_reason: StopReason,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -127,15 +280,21 @@ impl AssistantMessage {
     pub fn model_ref(&self) -> ModelRef {
         ModelRef {
             provider: self.provider.clone(),
-            api: self.api.clone(),
+            api: Some(self.api.clone()),
             model: ModelId::from(self.model.as_str()),
         }
     }
 
-    /// Build a terminal error/aborted assistant message (func-01 R-01-045).
+    /// Build a terminal error/aborted assistant message (func-01 R-01-045). `api` is the producing
+    /// wire-protocol id (Pi always sets `output.api = model.api`, even on the error path). Callers
+    /// pass `Some(model.api)`; `None` is reserved for the few synthetic paths where no api is
+    /// resolvable (a catalog miss, or a stream that ended before any model was bound) and is
+    /// materialised as the sentinel api [`UNRESOLVED_API`] so `AssistantMessage.api` stays the
+    /// required field Pi declares (types.ts:386).
     pub fn errored(
         provider: ProviderId,
         model: impl Into<String>,
+        api: Option<ApiId>,
         stop_reason: StopReason,
         message: impl Into<String>,
     ) -> Self {
@@ -143,14 +302,21 @@ impl AssistantMessage {
             content: Vec::new(),
             provider,
             model: model.into(),
-            api: None,
+            api: api.unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
             response_model: None,
             response_id: None,
+            diagnostics: None,
             usage: Usage::default(),
             stop_reason,
             error_message: Some(message.into()),
             timestamp: 0,
         }
+    }
+
+    /// Append a redacted diagnostic to this message (Pi `appendAssistantMessageDiagnostic`,
+    /// diagnostics.ts:40-45).
+    pub fn append_diagnostic(&mut self, diagnostic: AssistantMessageDiagnostic) {
+        crate::diagnostics::append_assistant_message_diagnostic(&mut self.diagnostics, diagnostic);
     }
 }
 
@@ -160,6 +326,12 @@ impl AssistantMessage {
 #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Message {
     User {
+        /// Pi `UserMessage.content: string | (TextContent | ImageContent)[]` (types.ts:379). On
+        /// READ, a bare JSON string is accepted and promoted to a single text block, and the array
+        /// form is validated to `Text|Image` only (gap 5/9 / R-00-013). On WRITE, a single
+        /// signature-less text block is serialized back to the bare-string shorthand for byte
+        /// parity with Pi (gap 16); anything else serializes as the content array.
+        #[serde(deserialize_with = "de_user_content", serialize_with = "se_user_content")]
         content: Vec<Content>,
         timestamp: i64,
     },
@@ -167,6 +339,9 @@ pub enum Message {
     ToolResult {
         tool_call_id: ToolCallId,
         tool_name: String,
+        /// Pi `ToolResultMessage.content: (TextContent | ImageContent)[]` (types.ts:402): validated
+        /// to `Text|Image` only on deserialize (gap 9).
+        #[serde(deserialize_with = "de_tool_result_content")]
         content: Vec<Content>,
         #[serde(default)]
         is_error: bool,
@@ -174,6 +349,103 @@ pub enum Message {
         details: Option<serde_json::Value>,
         timestamp: i64,
     },
+}
+
+/// The variant name of a [`Content`] block, for per-role validation error messages.
+fn content_kind(c: &Content) -> &'static str {
+    match c {
+        Content::Text { .. } => "text",
+        Content::Thinking { .. } => "thinking",
+        Content::ToolCall(_) => "toolCall",
+        Content::Image { .. } => "image",
+    }
+}
+
+/// Reject any block whose variant is not permitted for `role` (Pi types content per role,
+/// types.ts:379/385/402); `allowed` is the human-readable union for the error message.
+fn validate_role_content<E: serde::de::Error>(
+    content: &[Content],
+    role: &str,
+    allowed: &str,
+    permitted: impl Fn(&Content) -> bool,
+) -> Result<(), E> {
+    for c in content {
+        if !permitted(c) {
+            return Err(E::custom(format!(
+                "{role} content may only contain {allowed}, found `{}`",
+                content_kind(c)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Deserialize `UserMessage.content` accepting Pi's bare-string shorthand OR the content array, and
+/// validating the array to `Text|Image` only (Pi `content: string | (TextContent | ImageContent)[]`,
+/// types.ts:379). A bare string becomes a single [`Content::Text`]; a `Thinking`/`ToolCall` block is
+/// rejected.
+fn de_user_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        Str(String),
+        Arr(Vec<Content>),
+    }
+    let content = match StringOrArray::deserialize(deserializer)? {
+        StringOrArray::Str(s) => vec![Content::text(s)],
+        StringOrArray::Arr(v) => v,
+    };
+    validate_role_content(&content, "user", "text or image", |c| {
+        matches!(c, Content::Text { .. } | Content::Image { .. })
+    })?;
+    Ok(content)
+}
+
+/// Serialize `UserMessage.content` back to Pi's bare-string shorthand when it is exactly one
+/// signature-less [`Content::Text`] (Pi may emit `content: "hi"` directly, types.ts:379 — gap 16);
+/// otherwise emit the content array. Fully round-trips through [`de_user_content`].
+fn se_user_content<S>(content: &[Content], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let [Content::Text { text, text_signature: None }] = content {
+        serializer.serialize_str(text)
+    } else {
+        serializer.collect_seq(content)
+    }
+}
+
+/// Deserialize `ToolResultMessage.content`, validating to `Text|Image` only (Pi
+/// `content: (TextContent | ImageContent)[]`, types.ts:402).
+fn de_tool_result_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let content = Vec::<Content>::deserialize(deserializer)?;
+    validate_role_content(&content, "toolResult", "text or image", |c| {
+        matches!(c, Content::Text { .. } | Content::Image { .. })
+    })?;
+    Ok(content)
+}
+
+/// Deserialize `AssistantMessage.content`, validating to `Text|Thinking|ToolCall` only (Pi
+/// `content: (TextContent | ThinkingContent | ToolCall)[]`, types.ts:385); an `Image` block is
+/// rejected.
+fn de_assistant_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let content = Vec::<Content>::deserialize(deserializer)?;
+    validate_role_content(&content, "assistant", "text, thinking or toolCall", |c| {
+        matches!(c, Content::Text { .. } | Content::Thinking { .. } | Content::ToolCall(_))
+    })?;
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -217,9 +489,10 @@ mod tests {
             content: vec![Content::text("hi")],
             provider: "faux".into(),
             model: "faux-1".into(),
-            api: Some("faux".into()),
+            api: "faux".into(),
             response_model: None,
             response_id: None,
+            diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -228,7 +501,167 @@ mod tests {
         let v = serde_json::to_value(&m).expect("serialize");
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["stopReason"], "stop");
+        assert!(v.get("diagnostics").is_none()); // skipped when None
         let back: Message = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn user_content_accepts_bare_string_shorthand() {
+        // Pi-interop: a user message whose `content` is a bare JSON string.
+        let json = serde_json::json!({ "role": "user", "content": "hello", "timestamp": 7 });
+        let m: Message = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(m, Message::User { content: vec![Content::text("hello")], timestamp: 7 });
+        // The array form still deserializes.
+        let json2 = serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "hi" }],
+            "timestamp": 0,
+        });
+        let m2: Message = serde_json::from_value(json2).expect("deserialize");
+        assert_eq!(m2, Message::User { content: vec![Content::text("hi")], timestamp: 0 });
+    }
+
+    #[test]
+    fn text_signature_v1_roundtrips_through_string_field() {
+        let sig = TextSignatureV1::new("resp_123", Some(TextPhase::FinalAnswer));
+        let encoded = sig.encode();
+        // Encodes camelCase + snake_case phase, v:1.
+        let v: serde_json::Value = serde_json::from_str(&encoded).expect("json");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["id"], "resp_123");
+        assert_eq!(v["phase"], "final_answer");
+        // Parses back; a legacy id string yields None.
+        assert_eq!(TextSignatureV1::parse(&encoded), Some(sig));
+        assert_eq!(TextSignatureV1::parse("legacy-opaque-id"), None);
+    }
+
+    #[test]
+    fn model_thinking_level_splits_off_from_levels() {
+        assert_eq!(ModelThinkingLevel::default(), ModelThinkingLevel::Off);
+        assert_eq!(ModelThinkingLevel::Off.level(), None);
+        assert_eq!(ModelThinkingLevel::High.level(), Some(ThinkingLevel::High));
+        assert!(ModelThinkingLevel::Minimal.is_on());
+        assert_eq!(ModelThinkingLevel::from(ThinkingLevel::Low), ModelThinkingLevel::Low);
+    }
+
+    #[test]
+    fn user_content_serializes_single_text_as_bare_string() {
+        // gap 16: a single signature-less text block round-trips to Pi's bare-string shorthand.
+        let m = Message::User { content: vec![Content::text("hi")], timestamp: 7 };
+        let v = serde_json::to_value(&m).expect("serialize");
+        assert_eq!(v["content"], serde_json::json!("hi"));
+        let back: Message = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, m);
+        // A text block carrying a signature stays the array form (the signature must survive).
+        let m2 = Message::User {
+            content: vec![Content::text_with_signature("hi", "sig")],
+            timestamp: 0,
+        };
+        let v2 = serde_json::to_value(&m2).expect("serialize");
+        assert!(v2["content"].is_array());
+        // Two blocks / an image stay the array form.
+        let m3 = Message::User {
+            content: vec![Content::text("a"), Content::text("b")],
+            timestamp: 0,
+        };
+        assert!(serde_json::to_value(&m3).expect("serialize")["content"].is_array());
+    }
+
+    #[test]
+    fn assistant_content_rejects_image_on_deserialize() {
+        // gap 9: Pi types assistant content as Text|Thinking|ToolCall — an image is rejected.
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": [{ "type": "image", "data": "x", "mimeType": "image/png" }],
+            "provider": "faux", "model": "m", "api": "faux",
+            "usage": Usage::default(), "stopReason": "stop", "timestamp": 0,
+        });
+        let err = serde_json::from_value::<Message>(json).expect_err("must reject image");
+        assert!(err.to_string().contains("assistant content"), "{err}");
+    }
+
+    #[test]
+    fn user_and_tool_result_content_reject_assistant_only_blocks() {
+        // gap 9: user/toolResult content is Text|Image — a toolCall/thinking is rejected.
+        let user = serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "toolCall", "id": "t", "name": "n", "arguments": {} }],
+            "timestamp": 0,
+        });
+        assert!(serde_json::from_value::<Message>(user).is_err());
+        let tr = serde_json::json!({
+            "role": "toolResult", "toolCallId": "t", "toolName": "n",
+            "content": [{ "type": "thinking", "thinking": "x" }],
+            "isError": false, "timestamp": 0,
+        });
+        assert!(serde_json::from_value::<Message>(tr).is_err());
+    }
+
+    #[test]
+    fn tool_call_arguments_reject_non_object() {
+        // gap 11: Pi types ToolCall.arguments as Record<string, any> — a scalar/array is rejected.
+        let ok = serde_json::json!({
+            "type": "toolCall", "id": "t", "name": "n", "arguments": { "a": 1 },
+        });
+        let tc: Content = serde_json::from_value(ok).expect("object arguments deserialize");
+        assert!(matches!(tc, Content::ToolCall(_)));
+        let bad = serde_json::json!({
+            "type": "toolCall", "id": "t", "name": "n", "arguments": [1, 2, 3],
+        });
+        assert!(serde_json::from_value::<Content>(bad).is_err());
+    }
+
+    #[test]
+    fn assistant_message_api_is_required_on_the_wire() {
+        // gap 7: Pi declares api: Api as required — it always serializes and must be present on read.
+        let m = AssistantMessage::errored(
+            "faux".into(),
+            "faux-1",
+            Some("faux".into()),
+            StopReason::Error,
+            "boom",
+        );
+        let v = serde_json::to_value(&m).expect("serialize");
+        assert_eq!(v["api"], "faux");
+        // The synthetic no-api path materialises the sentinel rather than omitting the field.
+        let synth = AssistantMessage::errored("x".into(), "y", None, StopReason::Error, "z");
+        assert_eq!(synth.api.as_str(), UNRESOLVED_API);
+    }
+
+    #[test]
+    fn thinking_redacted_omitted_when_false_emitted_when_true() {
+        // gap 3: Pi `redacted?: boolean` (types.ts:335) is omitted when unset — Pi only ever
+        // emits `redacted: true`. A non-redacted block must NOT serialize a `redacted` key.
+        let not_redacted = Content::thinking("hm");
+        let v = serde_json::to_value(&not_redacted).expect("serialize");
+        assert!(v.get("redacted").is_none(), "false must be omitted: {v}");
+        // Absent on the wire round-trips back to `false`.
+        let back: Content = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, not_redacted);
+        // A redacted block still writes `redacted: true`.
+        let redacted = Content::Thinking {
+            thinking: "x".into(),
+            thinking_signature: Some("sig".into()),
+            redacted: true,
+        };
+        let rv = serde_json::to_value(&redacted).expect("serialize");
+        assert_eq!(rv["redacted"], true);
+        assert_eq!(serde_json::from_value::<Content>(rv).expect("deserialize"), redacted);
+    }
+
+    #[test]
+    fn assistant_append_diagnostic_accumulates() {
+        use crate::diagnostics::create_assistant_message_diagnostic_from;
+        let mut m = AssistantMessage::errored(
+            "faux".into(),
+            "faux-1",
+            Some("faux".into()),
+            StopReason::Error,
+            "boom",
+        );
+        assert!(m.diagnostics.is_none());
+        m.append_diagnostic(create_assistant_message_diagnostic_from("retry", None, None));
+        assert_eq!(m.diagnostics.as_ref().map(Vec::len), Some(1));
     }
 }

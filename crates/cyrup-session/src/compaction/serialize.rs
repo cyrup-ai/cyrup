@@ -72,14 +72,13 @@ fn tool_calls_of(content: &[Content]) -> String {
         .iter()
         .filter_map(|c| match c {
             Content::ToolCall(tc) => {
-                let args = match &tc.arguments {
-                    serde_json::Value::Object(map) => map
-                        .iter()
-                        .map(|(k, v)| format!("{k}={}", render_arg(v)))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                    other => other.to_string(),
-                };
+                // Pi `ToolCall.arguments` is always an object (types.ts:348); render `k=v` pairs.
+                let args = tc
+                    .arguments
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", render_arg(v)))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 Some(format!("{}({args})", tc.name))
             }
             _ => None,
