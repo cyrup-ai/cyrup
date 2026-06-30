@@ -67,8 +67,8 @@ fn push_registrations(api: &ExtensionApi) {
         let desc_json = serde_json::to_string(&cmd.descriptor).unwrap_or_else(|_| "{}".into());
         registration::register_command(name, &desc_json);
     }
-    for (key, desc) in &api.shortcuts {
-        registration::register_shortcut(key, desc);
+    for s in &api.shortcuts {
+        registration::register_shortcut(&s.key, &s.description);
     }
     for (name, spec) in &api.flags {
         let spec_json = serde_json::to_string(spec).unwrap_or_else(|_| "{}".into());
@@ -152,6 +152,16 @@ pub fn run_command(name: String, args: String) -> Result<Option<String>, String>
     API.with(|c| match c.borrow().as_ref() {
         Some(api) => api.execute_command(&name, &args),
         None => Err(format!("no such command: {name}")),
+    })
+}
+
+/// `execute-shortcut` export body (R-08-017; Pi `registerShortcut` handler, types.ts:1199-1205): run
+/// the stored handler for `key` against a fresh [`crate::ctx::Ctx`]. An unknown key is an error.
+pub fn run_shortcut(key: String) -> Result<(), String> {
+    let ctx = crate::ctx::Ctx::new();
+    API.with(|c| match c.borrow().as_ref() {
+        Some(api) => api.execute_shortcut(&key, &ctx),
+        None => Err(format!("no such shortcut: {key}")),
     })
 }
 

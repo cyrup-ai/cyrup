@@ -6,21 +6,36 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `tool_call` (Pi types.ts:1145) — block/mutate the in-flight tool call.
-#[derive(Clone, Debug)]
+/// `tool_call` (Pi `ToolCallEventBase`, types.ts:822-865) — block/mutate the in-flight tool call.
+/// Byte-shape: `{toolCallId, toolName, input}` (the `type` discriminant is the event name).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCallEvent {
+    #[serde(rename = "toolCallId")]
     pub call_id: String,
+    #[serde(rename = "toolName")]
     pub name: String,
     pub input: Value,
 }
 
-/// `tool_result` (Pi types.ts:1146) — mutate the result.
-#[derive(Clone, Debug)]
+/// `tool_result` (Pi `ToolResultEventBase` + per-tool subtype, types.ts:883-929) — mutate the
+/// result. Byte-shape: `{toolCallId, toolName, input, content, isError, details}` — carries the
+/// executed tool `input` (arguments) and the per-tool `details` blob, not just content+isError.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolResultEvent {
+    #[serde(rename = "toolCallId")]
     pub call_id: String,
+    #[serde(rename = "toolName")]
     pub name: String,
+    /// The executed tool's arguments (Pi `ToolResultEventBase.input`, types.ts:886).
+    pub input: Value,
     pub content: Value,
     pub is_error: bool,
+    /// The per-tool structured details (Pi `BashToolDetails | … | undefined`, types.ts:891-928).
+    /// `None` (= Pi `undefined`) for tools that carry none (e.g. `write`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 /// `context` (Pi types.ts:1144) — filter/replace the LLM message list.
@@ -44,17 +59,36 @@ pub struct BeforeAgentStartEvent {
     pub options: Value,
 }
 
-/// `input` (Pi types.ts:1158) — transform/handle a user input line.
-#[derive(Clone, Debug)]
+/// `input` (Pi `InputEvent`, types.ts:800-810) — transform/handle a user input line. Byte-shape:
+/// `{text, images?, source, streamingBehavior?}`: the submission text, the attached images
+/// (`undefined` when none), the `source` ("interactive"|"rpc"|"extension"), and the in-flight
+/// `streamingBehavior` ("steer"|"followUp"; `undefined` when the agent is idle).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InputEvent {
     pub text: String,
+    /// Attached images (Pi `InputEvent.images?`, types.ts:805); `None` = Pi `undefined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Value>,
+    /// Where the input came from (Pi `InputEvent.source`, types.ts:807).
+    pub source: String,
+    /// How the input is delivered during streaming (Pi `InputEvent.streamingBehavior?`,
+    /// types.ts:809); `None` = Pi `undefined` (agent idle).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming_behavior: Option<String>,
 }
 
-/// `user_bash` (Pi types.ts:1159) — block/transform/provide a `!`/`!!` bash invocation.
-#[derive(Clone, Debug)]
+/// `user_bash` (Pi `UserBashEvent`, types.ts:782-790) — block/transform/provide a `!`/`!!` bash
+/// invocation. Byte-shape: `{command, excludeFromContext, cwd}`. The `operations`/`result` override
+/// is RETURNED via [`UserBashResult`] (Pi `UserBashEventResult`), not carried on the event.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserBashEvent {
     pub command: String,
-    pub operations: Value,
+    /// True when the `!!` prefix was used (excluded from LLM context) (Pi types.ts:787).
+    pub exclude_from_context: bool,
+    /// The current working directory (Pi types.ts:789).
+    pub cwd: String,
 }
 
 /// `before_provider_request` (Pi types.ts:1160) — mutate the outbound provider payload.
@@ -96,23 +130,33 @@ pub struct TurnStartEvent {
     pub timestamp: u64,
 }
 
-/// `turn_end` (Pi types.ts:1140).
-#[derive(Clone, Debug)]
+/// `turn_end` (Pi `TurnEndEvent`, types.ts:703-709). Byte-shape: `{turnIndex, message, toolResults}`
+/// — the finalized assistant `message` AND the `toolResults` produced this turn.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
     pub turn_index: u32,
     pub message: Value,
+    /// The tool-result messages produced this turn (Pi `TurnEndEvent.toolResults`, types.ts:708).
+    pub tool_results: Value,
 }
 
-/// `message_start` (Pi types.ts:1141).
-#[derive(Clone, Debug)]
+/// `message_start` (Pi `MessageStartEvent`, types.ts:711-715). Byte-shape: `{message}` — the full
+/// message (user|assistant|toolResult), not just its role.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageStartEvent {
-    pub role: String,
+    pub message: Value,
 }
 
-/// `message_update` (Pi types.ts:1142) — HIGH-FREQ assistant delta.
-#[derive(Clone, Debug)]
+/// `message_update` (Pi `MessageUpdateEvent`, types.ts:717-722) — HIGH-FREQ. Byte-shape:
+/// `{message, assistantMessageEvent}` — the full in-flight `message` AND the provider delta.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageUpdateEvent {
-    pub delta: Value,
+    pub message: Value,
+    /// The provider stream delta (Pi `MessageUpdateEvent.assistantMessageEvent`, types.ts:721).
+    pub assistant_message_event: Value,
 }
 
 /// `tool_execution_start` (Pi types.ts:1147).
@@ -156,10 +200,41 @@ pub struct SessionBeforeForkEvent {
     pub entry_id: String,
 }
 
-/// `session_compact` (Pi types.ts:1153).
-#[derive(Clone, Debug)]
+/// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:575-586). Byte-shape:
+/// `{branchEntries, customInstructions?, reason, willRetry}` — the serializable payload (Pi's
+/// `preparation` and the non-serializable `signal: AbortSignal` are omitted from the seam). `reason`
+/// is `"manual"|"threshold"|"overflow"`. READY but not yet host-wired (see crate docs / couldNotClose:
+/// the `on-session-before-compact` host producer lives in cyrup-session-svc).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeCompactEvent {
+    /// The session entries in scope for this compaction (Pi `branchEntries`, types.ts:579).
+    pub branch_entries: Value,
+    /// Custom summarization instructions, if any (Pi `customInstructions?`, types.ts:580).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    /// What triggered the compaction (Pi `reason`, types.ts:582).
+    pub reason: String,
+    /// True when the aborted turn is retried after compaction (Pi `willRetry`, types.ts:584).
+    pub will_retry: bool,
+}
+
+/// `session_compact` (Pi `SessionCompactEvent`, types.ts:588-597). Byte-shape:
+/// `{compactionEntry, fromExtension, reason, willRetry}` — the produced compaction entry (which
+/// carries the summary text), whether an extension drove it, and the trigger/retry flags. This is
+/// the Pi shape; the prior `{summary}` flattened `compactionEntry.summary` and dropped the rest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionCompactEvent {
-    pub summary: String,
+    /// The compaction entry written to the session (Pi `compactionEntry`, types.ts:591); its
+    /// `summary` field carries the summary text.
+    pub compaction_entry: Value,
+    /// True when an extension drove the compaction (Pi `fromExtension`, types.ts:592).
+    pub from_extension: bool,
+    /// What triggered the compaction (Pi `reason`, types.ts:594).
+    pub reason: String,
+    /// True when the aborted turn is retried after compaction (Pi `willRetry`, types.ts:596).
+    pub will_retry: bool,
 }
 
 /// `session_tree` (Pi types.ts:1156).

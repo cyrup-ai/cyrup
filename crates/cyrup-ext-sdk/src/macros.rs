@@ -63,6 +63,11 @@ macro_rules! export_extension {
                 ) -> ::std::vec::Vec<::std::string::String> {
                     $crate::guest::completions(name, prefix)
                 }
+                fn execute_shortcut(
+                    key: ::std::string::String,
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    $crate::guest::run_shortcut(key)
+                }
                 fn render_call(
                     custom_type: ::std::string::String,
                     call_json: ::std::string::String,
@@ -135,10 +140,22 @@ macro_rules! export_extension {
                 fn on_tool_result(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
+                    input_json: ::std::string::String,
                     content_json: ::std::string::String,
                     is_error: bool,
+                    details_json: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(1, &[&call_id, &name, &content_json, $crate::guest::b(is_error)])
+                    $crate::guest::hook(
+                        1,
+                        &[
+                            &call_id,
+                            &name,
+                            &input_json,
+                            &content_json,
+                            $crate::guest::b(is_error),
+                            details_json.as_deref().unwrap_or(""),
+                        ],
+                    )
                 }
                 fn on_context(messages_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(2, &[&messages_json])
@@ -154,14 +171,26 @@ macro_rules! export_extension {
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(4, &[&prompt, &images_json, &system_prompt, &options_json])
                 }
-                fn on_input(text: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(18, &[&text])
+                fn on_input(
+                    text: ::std::string::String,
+                    images_json: ::std::string::String,
+                    source: ::std::string::String,
+                    streaming_behavior: ::core::option::Option<::std::string::String>,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(
+                        18,
+                        &[&text, &images_json, &source, streaming_behavior.as_deref().unwrap_or("")],
+                    )
                 }
                 fn on_user_bash(
                     command: ::std::string::String,
-                    operations_json: ::std::string::String,
+                    exclude_from_context: bool,
+                    cwd: ::std::string::String,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(19, &[&command, &operations_json])
+                    $crate::guest::hook(
+                        19,
+                        &[&command, $crate::guest::b(exclude_from_context), &cwd],
+                    )
                 }
                 fn on_before_provider_request(payload_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(20, &[&payload_json])
@@ -195,14 +224,24 @@ macro_rules! export_extension {
                 fn on_turn_start(turn_index: u32, timestamp: u64) {
                     $crate::guest::notify(9, &[&turn_index.to_string(), &timestamp.to_string()]);
                 }
-                fn on_turn_end(turn_index: u32, message_json: ::std::string::String) {
-                    $crate::guest::notify(10, &[&turn_index.to_string(), &message_json]);
+                fn on_turn_end(
+                    turn_index: u32,
+                    message_json: ::std::string::String,
+                    tool_results_json: ::std::string::String,
+                ) {
+                    $crate::guest::notify(
+                        10,
+                        &[&turn_index.to_string(), &message_json, &tool_results_json],
+                    );
                 }
-                fn on_message_start(role: ::std::string::String) {
-                    $crate::guest::notify(11, &[&role]);
+                fn on_message_start(message_json: ::std::string::String) {
+                    $crate::guest::notify(11, &[&message_json]);
                 }
-                fn on_message_update(delta_json: ::std::string::String) {
-                    $crate::guest::notify(12, &[&delta_json]);
+                fn on_message_update(
+                    message_json: ::std::string::String,
+                    delta_json: ::std::string::String,
+                ) {
+                    $crate::guest::notify(12, &[&message_json, &delta_json]);
                 }
                 fn on_tool_exec_start(
                     call_id: ::std::string::String,

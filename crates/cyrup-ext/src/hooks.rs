@@ -66,6 +66,8 @@ impl Hooks for ExtHooks {
         let ev = HostEvent::ToolResult {
             call_id: ctx.tool_call_id.clone(),
             name: ctx.tool_name.to_string(),
+            // The executed tool's arguments (Pi `ToolResultEventBase.input`, types.ts:886).
+            input: ctx.args.clone(),
             content: orig_content.clone(),
             details: orig_details.clone(),
             is_error: orig_is_error,

@@ -334,7 +334,17 @@ impl ExtensionHost {
         command: &str,
         cancel: &CancelToken,
     ) -> UserBashReduction {
-        let ev = HostEvent::UserBash { command: command.to_string(), operations: Value::Null };
+        // `exclude_from_context` (the `!!` prefix) is decided by the submission parser at the caller
+        // (cross-crate), so it defaults to `false` here; `cwd` is the process working directory (Pi
+        // `UserBashEvent.cwd`, types.ts:789). The richer caller-supplied values flow once the
+        // submission pipeline threads them into this entry point.
+        let cwd =
+            std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let ev = HostEvent::UserBash {
+            command: command.to_string(),
+            exclude_from_context: false,
+            cwd,
+        };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by } => UserBashReduction::Blocked { reason, by },
             Reduced::Handled(HandledValue(v)) => UserBashReduction::Handled(v),

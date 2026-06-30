@@ -33,7 +33,8 @@ pub mod guest;
 
 pub use api::{
     CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, RawOutcome,
-    RegisteredCommand, RegisteredRenderer, RegisteredTool, ToolExec, ToolOutput,
+    RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec,
+    ToolExec, ToolOutput,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -56,7 +57,8 @@ pub use tool_factory::define_tool;
 /// The author-facing import surface: `use cyrup_ext_sdk::prelude::*;`.
 pub mod prelude {
     pub use crate::api::{
-        CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, ToolExec, ToolOutput,
+        CommandExec, ContentBlock, ExtensionApi, MessageRenderer, Outcome, ShortcutExec, ToolExec,
+        ToolOutput,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,

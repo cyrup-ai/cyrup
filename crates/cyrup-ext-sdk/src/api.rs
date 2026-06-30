@@ -220,6 +220,34 @@ pub struct RegisteredCommand {
     pub completions: Option<ArgCompleter>,
 }
 
+// --- keyboard shortcuts (Pi `registerShortcut`, types.ts:1198-1205; R-08-017) ---
+
+/// A keyboard-shortcut body supplied by the guest author (Pi `options.handler(ctx)`, types.ts:1203).
+/// Invoked across the `execute-shortcut` export when the registered `KeyId` fires; receives the base
+/// [`Ctx`] (Pi hands the shortcut handler the general `ExtensionContext`).
+pub trait ShortcutExec: 'static {
+    fn execute(&self, ctx: &Ctx) -> Result<(), String>;
+}
+
+impl<F> ShortcutExec for F
+where
+    F: Fn(&Ctx) -> Result<(), String> + 'static,
+{
+    fn execute(&self, ctx: &Ctx) -> Result<(), String> {
+        (self)(ctx)
+    }
+}
+
+/// A registered keyboard shortcut: its `key` (Pi `KeyId`), optional `description` (surfaced to the
+/// host for display), and its `handler`. The key+description cross the seam via the
+/// `registration.register-shortcut` import; the handler stays guest-side and runs via
+/// `execute-shortcut` (so a registered shortcut is no longer structurally inert).
+pub struct RegisteredShortcut {
+    pub key: String,
+    pub description: String,
+    pub handler: Box<dyn ShortcutExec>,
+}
+
 // --- message renderers (Pi `renderCall`/`renderResult`, types.ts:472-481; R-08-020) ---
 
 /// A custom message renderer the guest registers for a `custom_type`. Each method returns a
@@ -248,7 +276,7 @@ pub struct ExtensionApi {
     handlers: HashMap<u8, Handler>,
     pub(crate) tools: Vec<RegisteredTool>,
     pub(crate) commands: Vec<(String, RegisteredCommand)>,
-    pub(crate) shortcuts: Vec<(String, String)>,
+    pub(crate) shortcuts: Vec<RegisteredShortcut>,
     pub(crate) flags: Vec<(String, FlagSpec)>,
     pub(crate) providers: Vec<(String, ProviderConfig)>,
     /// Dynamic provider callbacks (OAuth + `streamSimple`) keyed by provider id — the non-serializable
@@ -269,6 +297,34 @@ fn arg<'a>(args: &'a [&'a str], i: usize) -> &'a str {
 /// Parse a JSON arg, degrading to `Null` (never a panic).
 fn json(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or(Value::Null)
+}
+
+/// Parse an OPTIONAL JSON arg: an empty string is Pi `undefined` (`None`); anything else parses
+/// (degrading to `Null`). Used for `option<string>` seam params (e.g. `tool_result.details`).
+fn opt_json(s: &str) -> Option<Value> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(json(s))
+    }
+}
+
+/// Parse an OPTIONAL string arg: empty = Pi `undefined` (`None`). Used for `streamingBehavior`.
+fn opt_str(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Parse the `images` arg into Pi's optional shape: an empty string or an empty array `[]` is Pi
+/// `undefined` (`None`); a non-empty array parses to `Some(array)` (Pi `InputEvent.images?`).
+fn opt_images(s: &str) -> Option<Value> {
+    match opt_json(s) {
+        Some(Value::Array(a)) if a.is_empty() => None,
+        other => other,
+    }
 }
 
 impl ExtensionApi {
@@ -321,9 +377,31 @@ impl ExtensionApi {
         ));
     }
 
-    /// Register a keyboard shortcut (R-08-017).
-    pub fn register_shortcut(&mut self, key: impl Into<String>, description: impl Into<String>) {
-        self.shortcuts.push((key.into(), description.into()));
+    /// Register a keyboard shortcut with a handler (R-08-017). Mirrors Pi's
+    /// `registerShortcut(key, {description, handler})` (types.ts:1198-1205): the `key`+`description`
+    /// cross the seam for display, the `handler` is stored guest-side and runs via the
+    /// `execute-shortcut` export when the `KeyId` fires.
+    pub fn register_shortcut(
+        &mut self,
+        key: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl ShortcutExec,
+    ) {
+        self.shortcuts.push(RegisteredShortcut {
+            key: key.into(),
+            description: description.into(),
+            handler: Box::new(handler),
+        });
+    }
+
+    /// Execute a registered shortcut's handler by key (R-08-017). The `execute-shortcut` export
+    /// routes here when the host reports the matching `KeyId` fired. Returns an error for an unknown
+    /// key (never a panic).
+    pub fn execute_shortcut(&self, key: &str, ctx: &Ctx) -> Result<(), String> {
+        match self.shortcuts.iter().find(|s| s.key == key) {
+            Some(s) => s.handler.execute(ctx),
+            None => Err(format!("no such shortcut: {key}")),
+        }
     }
 
     /// Register a CLI flag (R-08-018).
@@ -394,8 +472,10 @@ impl ExtensionApi {
             let ev = ToolResultEvent {
                 call_id: arg(a, 0).into(),
                 name: arg(a, 1).into(),
-                content: json(arg(a, 2)),
-                is_error: arg(a, 3) == "true",
+                input: json(arg(a, 2)),
+                content: json(arg(a, 3)),
+                is_error: arg(a, 4) == "true",
+                details: opt_json(arg(a, 5)),
             };
             f(ev, c).into_raw()
         }));
@@ -423,12 +503,23 @@ impl ExtensionApi {
     }
     pub fn on_input(&mut self, f: impl Fn(InputEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::INPUT, Box::new(move |a, c| {
-            f(InputEvent { text: arg(a, 0).into() }, c).into_raw()
+            let ev = InputEvent {
+                text: arg(a, 0).into(),
+                images: opt_images(arg(a, 1)),
+                source: arg(a, 2).into(),
+                streaming_behavior: opt_str(arg(a, 3)),
+            };
+            f(ev, c).into_raw()
         }));
     }
     pub fn on_user_bash(&mut self, f: impl Fn(UserBashEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::USER_BASH, Box::new(move |a, c| {
-            f(UserBashEvent { command: arg(a, 0).into(), operations: json(arg(a, 1)) }, c).into_raw()
+            let ev = UserBashEvent {
+                command: arg(a, 0).into(),
+                exclude_from_context: arg(a, 1) == "true",
+                cwd: arg(a, 2).into(),
+            };
+            f(ev, c).into_raw()
         }));
     }
     pub fn on_before_provider_request(&mut self, f: impl Fn(BeforeProviderRequestEvent, &Ctx) -> Outcome + 'static) {
@@ -474,14 +565,23 @@ impl ExtensionApi {
     }
     pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TURN_END, notify(move |a, c| {
-            f(TurnEndEvent { turn_index: arg(a, 0).parse().unwrap_or(0), message: json(arg(a, 1)) }, c)
+            f(
+                TurnEndEvent {
+                    turn_index: arg(a, 0).parse().unwrap_or(0),
+                    message: json(arg(a, 1)),
+                    tool_results: json(arg(a, 2)),
+                },
+                c,
+            )
         }));
     }
     pub fn on_message_start(&mut self, f: impl Fn(MessageStartEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::MESSAGE_START, notify(move |a, c| f(MessageStartEvent { role: arg(a, 0).into() }, c)));
+        self.handlers.insert(kind::MESSAGE_START, notify(move |a, c| f(MessageStartEvent { message: json(arg(a, 0)) }, c)));
     }
     pub fn on_message_update(&mut self, f: impl Fn(MessageUpdateEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::MESSAGE_UPDATE, notify(move |a, c| f(MessageUpdateEvent { delta: json(arg(a, 0)) }, c)));
+        self.handlers.insert(kind::MESSAGE_UPDATE, notify(move |a, c| {
+            f(MessageUpdateEvent { message: json(arg(a, 0)), assistant_message_event: json(arg(a, 1)) }, c)
+        }));
     }
     pub fn on_tool_exec_start(&mut self, f: impl Fn(ToolExecStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_START, notify(move |a, c| {
@@ -516,7 +616,19 @@ impl ExtensionApi {
         self.handlers.insert(kind::THINKING_LEVEL_SELECT, notify(move |a, c| f(ThinkingLevelSelectEvent { level: arg(a, 0).into() }, c)));
     }
     pub fn on_session_compact(&mut self, f: impl Fn(SessionCompactEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::SESSION_COMPACT, notify(move |a, c| f(SessionCompactEvent { summary: arg(a, 0).into() }, c)));
+        // The live host seam currently supplies only the summary string (the cyrup-session-svc
+        // producer is cross-crate, see couldNotClose): reconstruct the minimal Pi-shaped event with
+        // `compactionEntry = {summary}`. The struct SHAPE is Pi-correct & ready; `fromExtension`/
+        // `reason`/`willRetry` populate once the producer threads them through the seam.
+        self.handlers.insert(kind::SESSION_COMPACT, notify(move |a, c| {
+            let ev = SessionCompactEvent {
+                compaction_entry: serde_json::json!({ "summary": arg(a, 0) }),
+                from_extension: false,
+                reason: String::new(),
+                will_retry: false,
+            };
+            f(ev, c)
+        }));
     }
     pub fn on_session_tree(&mut self, f: impl Fn(SessionTreeEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::SESSION_TREE, notify(move |a, c| f(SessionTreeEvent { tree: json(arg(a, 0)) }, c)));

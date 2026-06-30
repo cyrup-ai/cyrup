@@ -10,7 +10,9 @@
 
 use crate::contract::{EventPatch, HandledValue, HookOutcome};
 use crate::error::ExtError;
-use crate::event::{EventKind, HostEvent, Subscriptions};
+use crate::event::{
+    EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions,
+};
 use crate::extension::{ExtKind, Extension};
 use crate::host::engine::map_wasm_error;
 use crate::host::limits::StoreLimits;
@@ -706,6 +708,29 @@ impl LiveExtension {
         Ok(out)
     }
 
+    /// Execute a guest-registered keyboard shortcut (R-08-017; Pi `registerShortcut` handler,
+    /// types.ts:1199-1205). The host calls this when the registered `KeyId` fires. Runs at COMMAND
+    /// tier (Pi hands the shortcut handler the full `ExtensionContext`, so session-control ops are
+    /// legal). A guest fault is contained as a typed `ExtError`.
+    pub async fn execute_shortcut(&self, key: &str, cancel: &CancelToken) -> Result<(), ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Command);
+        let api = inner.instance.cyrup_ext_events();
+        let call = api.call_execute_shortcut(&mut inner.store, key);
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ExtError::Cancelled),
+            r = call => r,
+        };
+        match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(ExtError::Component(msg)),
+            Err(e) => Err(map_wasm_error(&e)),
+        }
+    }
+
     /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions(prefix)`,
     /// types.ts:1108). A fault is surfaced as a typed `ExtError`.
     pub async fn argument_completions(
@@ -985,9 +1010,19 @@ async fn invoke(
         HostEvent::ToolCall { call_id, name, input } => {
             api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string()).await
         }
-        HostEvent::ToolResult { call_id, name, content, is_error, .. } => {
+        HostEvent::ToolResult { call_id, name, input, content, details, is_error } => {
             let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".into());
-            api.call_on_tool_result(store, call_id.as_str(), name, &content_json, *is_error).await
+            let details_json = details.as_ref().map(|d| d.to_string());
+            api.call_on_tool_result(
+                store,
+                call_id.as_str(),
+                name,
+                &input.to_string(),
+                &content_json,
+                *is_error,
+                details_json.as_deref(),
+            )
+            .await
         }
         HostEvent::Context { messages } => {
             let msgs = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
@@ -1007,9 +1042,14 @@ async fn invoke(
             )
             .await
         }
-        HostEvent::Input { text, .. } => api.call_on_input(store, text).await,
-        HostEvent::UserBash { command, operations } => {
-            api.call_on_user_bash(store, command, &operations.to_string()).await
+        HostEvent::Input { text, images, source, streaming_behavior } => {
+            let images_json = serde_json::to_string(images).unwrap_or_else(|_| "[]".into());
+            let source = input_source_str(*source);
+            let behavior = streaming_behavior.map(streaming_behavior_str);
+            api.call_on_input(store, text, &images_json, source, behavior).await
+        }
+        HostEvent::UserBash { command, exclude_from_context, cwd } => {
+            api.call_on_user_bash(store, command, *exclude_from_context, cwd).await
         }
         HostEvent::BeforeProviderRequest { payload } => {
             api.call_on_before_provider_request(store, &payload.to_string()).await
@@ -1033,16 +1073,18 @@ async fn invoke(
         HostEvent::TurnStart { turn_index, timestamp } => {
             api.call_on_turn_start(store, *turn_index, *timestamp).await.and_then(|()| noop())
         }
-        HostEvent::TurnEnd { turn_index, message, .. } => {
+        HostEvent::TurnEnd { turn_index, message, tool_results } => {
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
-            api.call_on_turn_end(store, *turn_index, &m).await.and_then(|()| noop())
+            let tr = serde_json::to_string(tool_results).unwrap_or_else(|_| "[]".into());
+            api.call_on_turn_end(store, *turn_index, &m, &tr).await.and_then(|()| noop())
         }
-        HostEvent::MessageStart { role } => {
-            api.call_on_message_start(store, role).await.and_then(|()| noop())
+        HostEvent::MessageStart { message } => {
+            api.call_on_message_start(store, &message.to_string()).await.and_then(|()| noop())
         }
-        HostEvent::MessageUpdate { delta } => {
-            api.call_on_message_update(store, &delta.to_string()).await.and_then(|()| noop())
-        }
+        HostEvent::MessageUpdate { message, delta } => api
+            .call_on_message_update(store, &message.to_string(), &delta.to_string())
+            .await
+            .and_then(|()| noop()),
         HostEvent::ToolExecStart { call_id, name, args } => api
             .call_on_tool_exec_start(store, call_id.as_str(), name, &args.to_string())
             .await
@@ -1077,6 +1119,23 @@ async fn invoke(
         HostEvent::SessionTree { tree } => {
             api.call_on_session_tree(store, &tree.to_string()).await.and_then(|()| noop())
         }
+    }
+}
+
+/// The Pi `InputSource` wire string (types.ts:797) for the `on-input` seam.
+fn input_source_str(s: InputEventSource) -> &'static str {
+    match s {
+        InputEventSource::Interactive => "interactive",
+        InputEventSource::Rpc => "rpc",
+        InputEventSource::Extension => "extension",
+    }
+}
+
+/// The Pi `streamingBehavior` wire string (types.ts:809) for the `on-input` seam.
+fn streaming_behavior_str(b: InputStreamingBehavior) -> &'static str {
+    match b {
+        InputStreamingBehavior::Steer => "steer",
+        InputStreamingBehavior::FollowUp => "followUp",
     }
 }
 

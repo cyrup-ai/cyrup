@@ -226,6 +226,8 @@ pub enum HostEvent {
     ToolResult {
         call_id: ToolCallId,
         name: String,
+        /// The executed tool's arguments (Pi `ToolResultEventBase.input`, types.ts:886).
+        input: Value,
         content: Vec<Content>,
         details: Option<Value>,
         is_error: bool,
@@ -251,8 +253,12 @@ pub enum HostEvent {
     /// `ExtSubscriber` fan-out layer (mirroring Pi's `AgentSession._turnIndex`), not on the raw event.
     TurnStart { turn_index: u32, timestamp: u64 },
     TurnEnd { turn_index: u32, message: AgentMessage, tool_results: Vec<ToolResultMessage> },
-    MessageStart { role: String },
-    MessageUpdate { delta: Value },
+    /// `message_start` (Pi `MessageStartEvent`, types.ts:711-715): the full message (user|assistant|
+    /// toolResult), serialized — not just its role.
+    MessageStart { message: Value },
+    /// `message_update` (Pi `MessageUpdateEvent`, types.ts:717-722): the in-flight `message` AND the
+    /// `assistantMessageEvent` provider delta (carried as `delta`).
+    MessageUpdate { message: Value, delta: Value },
     ToolExecStart { call_id: ToolCallId, name: String, args: Value },
     ToolExecUpdate { call_id: ToolCallId, chunk: Value },
     ToolExecEnd { call_id: ToolCallId, result: Value, is_error: bool },
@@ -273,7 +279,10 @@ pub enum HostEvent {
         source: InputEventSource,
         streaming_behavior: Option<InputStreamingBehavior>,
     },
-    UserBash { command: String, operations: Value },
+    /// `user_bash` (Pi `UserBashEvent`, types.ts:782-790): the `command`, the `exclude_from_context`
+    /// flag (true for the `!!` prefix), and the `cwd`. The `operations`/`result` override is returned
+    /// via the `handled` outcome (Pi `UserBashEventResult`), not carried inbound.
+    UserBash { command: String, exclude_from_context: bool, cwd: String },
     BeforeProviderRequest { payload: Value },
     AfterProviderResponse { status: u32, headers: Value },
     ModelSelect { model: Value },
@@ -334,11 +343,14 @@ impl HostEvent {
             // wall-clock at emit (Pi `Date.now()`, agent-session.ts:624).
             AgentEvent::TurnStart => HostEvent::TurnStart { turn_index: 0, timestamp: now_millis() },
             AgentEvent::MessageStart { message } => {
-                HostEvent::MessageStart { role: role_of(message) }
+                HostEvent::MessageStart { message: serde_json::to_value(message).unwrap_or(Value::Null) }
             }
-            AgentEvent::MessageUpdate { assistant_message_event, .. } => HostEvent::MessageUpdate {
-                delta: serde_json::to_value(assistant_message_event).unwrap_or(Value::Null),
-            },
+            AgentEvent::MessageUpdate { message, assistant_message_event } => {
+                HostEvent::MessageUpdate {
+                    message: serde_json::to_value(message).unwrap_or(Value::Null),
+                    delta: serde_json::to_value(assistant_message_event).unwrap_or(Value::Null),
+                }
+            }
             AgentEvent::MessageEnd { message } => {
                 HostEvent::MessageEnd { message: to_llm_message(message)? }
             }
@@ -379,16 +391,6 @@ pub(crate) fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn role_of(m: &AgentMessage) -> String {
-    match m {
-        AgentMessage::User { .. } => "user",
-        AgentMessage::Assistant(_) => "assistant",
-        AgentMessage::ToolResult(_) => "toolResult",
-        AgentMessage::Custom { .. } => "custom",
-    }
-    .to_string()
 }
 
 fn to_llm_message(m: &AgentMessage) -> Option<Message> {

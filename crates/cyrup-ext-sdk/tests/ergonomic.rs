@@ -393,6 +393,27 @@ fn all_thirty_events_are_registerable() {
 }
 
 #[test]
+fn registered_shortcut_handler_actually_runs() {
+    // registerShortcut is no longer structurally inert (Pi types.ts:1198-1205): the handler is
+    // stored and runs via `execute_shortcut` (the `execute-shortcut` export's routing target).
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fired = Rc::new(Cell::new(false));
+    let f = fired.clone();
+    let mut api = ExtensionApi::new();
+    api.register_shortcut("ctrl+g", "do the thing", move |_ctx: &Ctx| {
+        f.set(true);
+        Ok(())
+    });
+
+    let ctx = Ctx::new();
+    assert!(api.execute_shortcut("ctrl+g", &ctx).is_ok());
+    assert!(fired.get(), "the registered shortcut handler ran");
+    // An unknown key surfaces an error, never a panic.
+    assert!(api.execute_shortcut("ctrl+z", &ctx).is_err());
+}
+
+#[test]
 fn tool_call_carries_a_cancellation_signal() {
     // The tool `execute` call now bundles a `signal` (Pi `ToolDefinition.execute` signal param,
     // sdk gap #1). On the host target the poll is inert (false); the live wasm E2E proves the real

@@ -123,6 +123,11 @@ interface events {
   execute-command:          func(name: string, args: string) -> result<option<string>, string>;
   get-argument-completions: func(name: string, prefix: string) -> list<string>;
 
+  // --- guest keyboard-shortcut execution (R-08-017; Pi registerShortcut handler, types.ts:1199-1205) ---
+  // The host invokes the guest's stored shortcut handler (`options.handler(ctx)`) when the registered
+  // `KeyId` fires. Runs at COMMAND tier (Pi hands the shortcut handler the full `ExtensionContext`).
+  execute-shortcut:         func(key: string) -> result<_, string>;
+
   // --- message renderer dispatch (R-08-020; Pi renderCall/renderResult, types.ts:472-481) ---
   // A guest that registered a renderer for `custom-type` renders a tool call / result into a
   // serialized widget tree (none = fall back to the runtime's default renderer).
@@ -131,8 +136,11 @@ interface events {
 
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
+  // tool_result carries the FULL Pi `ToolResultEventBase` shape (types.ts:883-929): the executed
+  // tool `input` (the arguments) AND the per-tool `details` blob (`BashToolDetails | …`), not just
+  // content+isError — a `tool_result` handler inspects/patches both.
   on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
-  on-tool-result:  func(call-id: string, name: string, content-json: string, is-error: bool) -> hook-outcome;
+  on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>) -> hook-outcome;
 
   // --- 5.3 agent & turn ---
   // context [mutate] (types.ts:1144), message_end [mutate] (types.ts:1143),
@@ -142,8 +150,15 @@ interface events {
   on-before-agent-start: func(prompt: string, images-json: string, system-prompt: string, options-json: string) -> hook-outcome;
 
   // input [block/mutate/handled] (types.ts:1158), user_bash [block/mutate/handled] (types.ts:1159).
-  on-input:        func(text: string) -> hook-outcome;
-  on-user-bash:    func(command: string, operations-json: string) -> hook-outcome;
+  // `input` carries the full Pi `InputEvent` (types.ts:800-810): the submission `text`, the attached
+  // `images`, the `source` ("interactive"|"rpc"|"extension"), and the in-flight `streaming-behavior`
+  // ("steer"|"followUp"; none when the agent is idle).
+  // `user_bash` carries the Pi `UserBashEvent` (types.ts:782-790): the `command`, the
+  // `exclude-from-context` flag (true for the `!!` prefix), and the `cwd`. The `operations`/`result`
+  // override is returned via the `handled` outcome (Pi `UserBashEventResult`, types.ts:1043-1048),
+  // NOT passed in.
+  on-input:        func(text: string, images-json: string, source: string, streaming-behavior: option<string>) -> hook-outcome;
+  on-user-bash:    func(command: string, exclude-from-context: bool, cwd: string) -> hook-outcome;
 
   // --- 5.6 provider ---
   // before_provider_request [mutate] (types.ts:1160), after_provider_response [notify] (types.ts:1161).
@@ -158,9 +173,15 @@ interface events {
   on-agent-start:           func();
   on-agent-end:             func(messages-json: string);
   on-turn-start:            func(turn-index: u32, timestamp: u64);
-  on-turn-end:              func(turn-index: u32, message-json: string);
-  on-message-start:         func(role: string);
-  on-message-update:        func(delta-json: string);   // HIGH-FREQ, gated
+  // turn_end (Pi TurnEndEvent, types.ts:703-709): the turn index, the finalized assistant `message`,
+  // AND the `tool-results` produced this turn (`ToolResultMessage[]`).
+  on-turn-end:              func(turn-index: u32, message-json: string, tool-results-json: string);
+  // message_start (Pi MessageStartEvent, types.ts:711-715): the full `message` (user|assistant|
+  // toolResult), not just its role.
+  on-message-start:         func(message-json: string);
+  // message_update (Pi MessageUpdateEvent, types.ts:717-722): the full in-flight `message` AND the
+  // `assistant-message-event` delta (carried here as `delta-json`). HIGH-FREQ, gated.
+  on-message-update:        func(message-json: string, delta-json: string);   // HIGH-FREQ, gated
   on-tool-exec-start:       func(call-id: string, name: string, args-json: string);
   on-tool-exec-update:      func(call-id: string, chunk-json: string); // HIGH-FREQ, gated
   on-tool-exec-end:         func(call-id: string, result-json: string, is-error: bool);
