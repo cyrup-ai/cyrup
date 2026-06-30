@@ -196,6 +196,44 @@ fn override_enabled(path: &Path, patterns: &[String], root: &Path) -> bool {
     crate::package::manifest::is_enabled_by_overrides(base, path, patterns)
 }
 
+/// Port of Pi's `findGitRepoRoot` (package-manager.ts:426-438): walk up from `start_dir`, returning
+/// the first ancestor (inclusive) that contains a `.git` entry, or `None` at the filesystem root.
+/// Existence is tested with [`Path::exists`] exactly like Pi's `existsSync(join(dir, ".git"))`, so a
+/// `.git` directory and a git-worktree `.git` file both qualify.
+fn find_git_repo_root(start_dir: &Path) -> Option<PathBuf> {
+    let mut dir = start_dir.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// Port of Pi's `collectAncestorAgentsSkillDirs` (package-manager.ts:440-459): from `start_dir`,
+/// collect `<dir>/.agents/skills` at every ancestor, stopping at (and including) the git repo root
+/// if one exists, otherwise at the filesystem root. `start_dir` is taken as already-absolute (Pi
+/// `resolve`s it; `cfg.cwd` is the absolute analog), so no extra lexical normalization is applied.
+fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBuf> {
+    let git_repo_root = find_git_repo_root(start_dir);
+    let mut skill_dirs = Vec::new();
+    let mut dir = start_dir.to_path_buf();
+    loop {
+        skill_dirs.push(dir.join(".agents").join("skills"));
+        if git_repo_root.as_ref() == Some(&dir) {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    skill_dirs
+}
+
 /// The immutable snapshot the rest of the app reads (swapped atomically on `/reload`).
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
@@ -508,16 +546,47 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     }
 
     // --- project loose resources (trust-gated) (R-09-002/003/008/012) ---
-    // Pi loads loose project resources from a single project root only —
-    // `<cwd>/.cyrup/{skills,prompts,themes}` (skills.ts:432 `resolve(resolvedCwd, CONFIG_DIR_NAME,
-    // "skills")`; resource-loader.ts:764-768 `join(this.cwd, CONFIG_DIR_NAME, "skills")`) — never
-    // every ancestor between cwd and the project root. `cfg.cwd` is the direct analog of Pi's cwd.
-    if cfg.project_root.is_some() && cfg.trusted_project {
+    // Pi loads loose project resources from the cwd, gated on TRUST alone — it has no `project_root`
+    // precondition. Gating on `project_root.is_some()` left this block DEAD in production (the
+    // session-svc builder sets `trusted_project` but never `project_root`), so cyrup discovered ZERO
+    // project skills/prompts/themes live. `.cyrup/{skills,prompts,themes}` are read at `cwd`
+    // (skills.ts:432 `resolve(resolvedCwd, CONFIG_DIR_NAME, …)`; resource-loader.ts:764-768); the
+    // `.agents/skills` tree is walked cwd→git-root (`collectAncestorAgentsSkillDirs`,
+    // package-manager.ts:440-459). The whole block already keys off `cfg.cwd`, never `project_root`.
+    if cfg.trusted_project {
         let base = &cfg.cwd;
         {
             if cfg.enable_skills {
-                for sub in [".cyrup/skills", ".agents/skills"] {
-                    let root = base.join(sub);
+                // `.cyrup/skills` (Pi `.pi/skills`) is read at `cwd` only — `projectBaseDir =
+                // join(cwd, CONFIG_DIR_NAME)` (package-manager.ts:900), no ancestor walk.
+                {
+                    let root = base.join(".cyrup/skills");
+                    let mut buf = Vec::new();
+                    scan_skill_root(
+                        &root,
+                        ResourceScope::Project,
+                        &root,
+                        &mut buf,
+                        &mut warnings,
+                        &mut diagnostics,
+                    );
+                    buf.retain(|s| {
+                        override_enabled(&s.skill_md, &cfg.project_overrides.skills, &root)
+                    });
+                    skills.extend(buf);
+                }
+                // `.agents/skills` is walked up **every ancestor** from `cwd` to the git repo root
+                // (or the filesystem root if there is none) — Pi `collectAncestorAgentsSkillDirs`
+                // (package-manager.ts:440-459) feeding `projectAgentsSkillDirs`
+                // (package-manager.ts:2286-2290), each loaded with its own `.agents` baseDir
+                // (2326-2342). The user-tier `~/.agents/skills` (cyrup `global_agents_dir/skills`,
+                // already loaded at Global scope) is filtered out so it is not double-counted, 1:1
+                // with Pi's `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))` (2289).
+                let user_agents_skills = cfg.global_agents_dir.join("skills");
+                for root in collect_ancestor_agents_skill_dirs(&cfg.cwd) {
+                    if root == user_agents_skills {
+                        continue;
+                    }
                     let mut buf = Vec::new();
                     scan_skill_root(
                         &root,

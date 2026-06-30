@@ -170,6 +170,116 @@ async fn g1_project_loose_resources_load_from_cwd_root_only() {
 }
 
 #[tokio::test]
+async fn g1_agents_skills_walk_ancestors_to_git_root() {
+    // Pi walks `.agents/skills` up **every ancestor** from `cwd` to the git repo root (inclusive),
+    // via `collectAncestorAgentsSkillDirs` (package-manager.ts:440-459) →
+    // `findGitRepoRoot` (426-438) → `projectAgentsSkillDirs` (2286-2290). It STOPS at the dir that
+    // contains `.git`, and never ascends above it. This behaviour-checks the exact set of
+    // `.agents/skills` roots Pi's algorithm yields for `cwd = <repo>/sub/dir`:
+    //   <repo>/sub/dir/.agents/skills   (cwd)        → discovered
+    //   <repo>/sub/.agents/skills       (ancestor)   → discovered
+    //   <repo>/.agents/skills           (git root)   → discovered  (loop breaks here)
+    //   <repo-parent>/.agents/skills    (above root) → NOT discovered
+    let tmp = tempfile::tempdir().unwrap();
+    // an extra parent ABOVE the git root, to prove the walk stops at `.git`.
+    let repo_parent = tmp.path().join("workspace");
+    let repo = repo_parent.join("repo");
+    let nested = repo.join("sub/dir");
+    fs::create_dir_all(&nested).unwrap();
+    // mark `repo` as the git repo root (Pi tests existsSync(join(dir, ".git"))).
+    fs::create_dir_all(repo.join(".git")).unwrap();
+
+    write(
+        &nested.join(".agents/skills/here/SKILL.md"),
+        &skill_md("here", "cwd .agents skill"),
+    );
+    write(
+        &repo.join("sub/.agents/skills/mid/SKILL.md"),
+        &skill_md("mid", "intermediate ancestor .agents skill"),
+    );
+    write(
+        &repo.join(".agents/skills/root/SKILL.md"),
+        &skill_md("root", "git-root .agents skill"),
+    );
+    // ABOVE the git root — must never be walked.
+    write(
+        &repo_parent.join(".agents/skills/outside/SKILL.md"),
+        &skill_md("outside", "above the git root"),
+    );
+
+    let global = tmp.path().join("global");
+    fs::create_dir_all(&global).unwrap();
+    let mut c = DiscoveryConfig::new(&nested, &global);
+    // Production-realistic: trust-gated, `project_root` UNSET (the session-svc builder sets
+    // `trusted_project` but never `project_root`). Proves the `.agents/skills` walk runs LIVE.
+    c.cwd = nested.clone();
+    c.trusted_project = true;
+
+    let report = run_discover(&c).await;
+    for name in ["here", "mid", "root"] {
+        assert!(
+            report.registry.skills.contains(name),
+            "ancestor `.agents/skills` skill `{name}` must be discovered up to the git root"
+        );
+        assert_eq!(
+            report.registry.skills.get_name(name).unwrap().scope,
+            ResourceScope::Project,
+            "ancestor `.agents/skills` loads at Project scope"
+        );
+    }
+    assert!(
+        !report.registry.skills.contains("outside"),
+        "`.agents/skills` above the git repo root must NOT be walked (Pi stops at `.git`)"
+    );
+}
+
+#[tokio::test]
+async fn g1_agents_skills_user_tier_not_double_counted() {
+    // Pi filters the ancestor `.agents/skills` walk with
+    // `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))` (package-manager.ts:2289),
+    // so `~/.agents/skills` (cyrup `global_agents_dir/skills`, already loaded at Global scope) is
+    // not re-added as a Project-scope duplicate when an ancestor walk reaches it. Here the walk has
+    // no git root, so it ascends to the filesystem root and passes through `global_agents_dir`'s
+    // parent — the user-tier skill must surface exactly once, at Global scope.
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("a/b");
+    fs::create_dir_all(&cwd).unwrap();
+    // user-tier `.agents` lives directly under the temp root so the ancestor walk crosses it.
+    let global_agents = tmp.path().join(".agents");
+    write(
+        &global_agents.join("skills/shared/SKILL.md"),
+        &skill_md("shared", "user-tier agents skill"),
+    );
+
+    let global = tmp.path().join("global");
+    fs::create_dir_all(&global).unwrap();
+    let mut c = DiscoveryConfig::new(&cwd, &global);
+    c.global_agents_dir = global_agents.clone();
+    c.project_root = Some(tmp.path().to_path_buf());
+    c.cwd = cwd.clone();
+    c.trusted_project = true;
+
+    let report = run_discover(&c).await;
+    let all: Vec<&Skill> = report
+        .registry
+        .skills
+        .all()
+        .iter()
+        .filter(|s| s.name == "shared")
+        .collect();
+    assert_eq!(
+        all.len(),
+        1,
+        "user-tier `.agents/skills` must not be double-counted by the project ancestor walk"
+    );
+    assert_eq!(
+        all[0].scope,
+        ResourceScope::Global,
+        "the single `shared` candidate stays at Global scope (filtered out of the project walk)"
+    );
+}
+
+#[tokio::test]
 async fn a09_10_agent_skills_standard_format_loads_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     // A SKILL.md authored to the Agent Skills standard (extra unmodelled keys + allowed-tools).
