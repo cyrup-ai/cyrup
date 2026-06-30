@@ -59,24 +59,25 @@ use cyrup_ext::HostEvent as HostEventAlias;
 #[tokio::test]
 async fn project_trust_first_decision_wins() {
     let host = ExtensionHost::new(cfg());
-    // First ext abstains (no `trusted`), second decides trusted+remember, third would also decide.
+    // First ext is UNDECIDED (Pi tri-state "undecided" falls through, runner.ts:214); second decides
+    // "yes"+remember; third would also decide but never runs (first decided wins).
     host.load_native(Arc::new(DiscoveryExt {
         id: "abstain".into(),
-        trust: Some(json!({ "note": "no decision" })),
+        trust: Some(json!({ "trusted": "undecided" })),
         resources: None,
     }))
     .await
     .unwrap();
     host.load_native(Arc::new(DiscoveryExt {
         id: "decider".into(),
-        trust: Some(json!({ "trusted": true, "remember": true })),
+        trust: Some(json!({ "trusted": "yes", "remember": true })),
         resources: None,
     }))
     .await
     .unwrap();
     host.load_native(Arc::new(DiscoveryExt {
         id: "late".into(),
-        trust: Some(json!({ "trusted": false })),
+        trust: Some(json!({ "trusted": "no" })),
         resources: None,
     }))
     .await
@@ -86,15 +87,23 @@ async fn project_trust_first_decision_wins() {
     assert_eq!(
         decision,
         Some(ProjectTrustDecision { trusted: true, remember: true, by: "decider".into() }),
-        "the first extension that returns a parseable decision wins"
+        "the first extension that DECIDES (yes/no) wins; undecided falls through"
     );
 }
 
 #[tokio::test]
 async fn project_trust_no_decision_is_none() {
     let host = ExtensionHost::new(cfg());
+    // An "undecided" tri-state and a payload with no `trusted` both yield no decision.
     host.load_native(Arc::new(DiscoveryExt {
         id: "abstain".into(),
+        trust: Some(json!({ "trusted": "undecided" })),
+        resources: None,
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(DiscoveryExt {
+        id: "noteonly".into(),
         trust: Some(json!({ "note": "no decision" })),
         resources: None,
     }))
@@ -104,7 +113,8 @@ async fn project_trust_no_decision_is_none() {
 }
 
 #[tokio::test]
-async fn resources_discover_aggregates_union_with_attribution() {
+async fn resources_discover_concatenates_with_per_path_attribution() {
+    use cyrup_ext::AttributedPath;
     let host = ExtensionHost::new(cfg());
     host.load_native(Arc::new(DiscoveryExt {
         id: "a".into(),
@@ -116,20 +126,33 @@ async fn resources_discover_aggregates_union_with_attribution() {
     host.load_native(Arc::new(DiscoveryExt {
         id: "b".into(),
         trust: None,
-        // Overlapping theme path `/t/x` is de-duplicated; new skill + prompt added.
+        // Pi CONCATENATES (no dedup): the duplicated theme `/t/x` appears again, attributed to b.
         resources: Some(json!({ "skillPaths": ["/s/b"], "promptPaths": ["/p/b"], "themePaths": ["/t/x"] })),
     }))
     .await
     .unwrap();
 
     let agg = host.aggregate_resources(&CancelToken::new()).await;
-    assert_eq!(agg.skill_paths, vec!["/s/a".to_string(), "/s/b".to_string()]);
-    assert_eq!(agg.prompt_paths, vec!["/p/b".to_string()]);
-    assert_eq!(agg.theme_paths, vec!["/t/x".to_string()], "duplicate theme path de-duped");
-    // Attribution: a contributed (1 skill, 0 prompt, 1 theme); b contributed (1 skill, 1 prompt, 0 new theme).
-    assert_eq!(agg.by_extension.len(), 2);
-    assert_eq!(agg.by_extension[0], (ExtensionId::from("a"), 1, 0, 1));
-    assert_eq!(agg.by_extension[1], (ExtensionId::from("b"), 1, 1, 0));
+    assert_eq!(
+        agg.skill_paths,
+        vec![
+            AttributedPath { path: "/s/a".into(), extension: ExtensionId::from("a") },
+            AttributedPath { path: "/s/b".into(), extension: ExtensionId::from("b") },
+        ]
+    );
+    assert_eq!(
+        agg.prompt_paths,
+        vec![AttributedPath { path: "/p/b".into(), extension: ExtensionId::from("b") }]
+    );
+    // Both `/t/x` contributions are kept (Pi concatenates, no dedup), each attributed.
+    assert_eq!(
+        agg.theme_paths,
+        vec![
+            AttributedPath { path: "/t/x".into(), extension: ExtensionId::from("a") },
+            AttributedPath { path: "/t/x".into(), extension: ExtensionId::from("b") },
+        ],
+        "Pi concatenates resource paths (no de-dup) with per-path attribution"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +208,34 @@ fn all_registered_tool_names_is_first_registration_wins() {
     assert_eq!(info.len(), 3);
     assert_eq!(info[0]["name"], json!("alpha"));
     assert_eq!(info[0]["source"], json!("extension"));
+}
+
+// ---------------------------------------------------------------------------
+// Command invocation-name disambiguation (gap-08 #11; Pi resolveRegisteredCommands runner.ts:556).
+// ---------------------------------------------------------------------------
+#[test]
+fn command_invocation_names_are_disambiguated_in_load_order() {
+    use cyrup_ext::{CommandDescriptor, ExtensionRegistry};
+    let reg = ExtensionRegistry::new();
+    let d = CommandDescriptor::default;
+    // Two extensions register `deploy`; one registers a unique `status`. Load order: a/deploy,
+    // b/deploy, a/status.
+    reg.register_command("a".into(), "deploy", d()).unwrap();
+    reg.register_command("b".into(), "deploy", d()).unwrap();
+    reg.register_command("a".into(), "status", d()).unwrap();
+
+    let resolved = reg.resolved_commands().unwrap();
+    let names: Vec<(&str, &str)> =
+        resolved.iter().map(|r| (r.invocation_name.as_str(), r.name.as_str())).collect();
+    // Duplicated `deploy` gets `deploy:1`/`deploy:2` in load order; unique `status` stays bare.
+    assert_eq!(
+        names,
+        vec![("deploy:1", "deploy"), ("deploy:2", "deploy"), ("status", "status")]
+    );
+    // Each invocation name routes back to its registering extension.
+    assert_eq!(reg.resolved_command_owner("deploy:1").unwrap(), Some(ExtensionId::from("a")));
+    assert_eq!(reg.resolved_command_owner("deploy:2").unwrap(), Some(ExtensionId::from("b")));
+    assert_eq!(reg.resolved_command_owner("status").unwrap(), Some(ExtensionId::from("a")));
 }
 
 // ---------------------------------------------------------------------------

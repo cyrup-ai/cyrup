@@ -97,6 +97,31 @@ impl Ctx {
         Value::Array(vec![])
     }
 
+    /// Read a registered flag's resolved VALUE (Pi `getFlag(name)`, types.ts:1218; sdk gap #23). The
+    /// WIT `registration.get-flag` import returns the value (its default / CLI override) as JSON; this
+    /// wraps it. `None` when the flag is unregistered or has no value (Pi `undefined`).
+    pub fn get_flag(&self, name: &str) -> Option<Value> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::registration::get_flag(name)
+                .and_then(|s| serde_json::from_str(&s).ok());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
+    /// Unregister a custom provider previously registered by this extension (Pi `unregisterProvider`,
+    /// types.ts:1361; sdk gap #24). Wraps the existing WIT `registration.unregister-provider` import.
+    pub fn unregister_provider(&self, id: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::registration::unregister_provider(id);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = id;
+    }
+
     /// Run a capability-scoped command (R-08-030). Denied unless the host granted the exec capability.
     pub fn exec(&self, cmd: &str, args: &[&str], opts: &ExecOptions) -> Result<ExecResult, String> {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
@@ -482,6 +507,16 @@ impl Models {
         }
         #[cfg(not(target_arch = "wasm32"))]
         None
+    }
+
+    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25). COMMAND-only
+    /// host-side (silently dropped from an event handler). Wraps the existing WIT
+    /// `models.set-thinking-level` import.
+    pub fn set_thinking_level(&self, level: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::models::set_thinking_level(level);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = level;
     }
 }
 

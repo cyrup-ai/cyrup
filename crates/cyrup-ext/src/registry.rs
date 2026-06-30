@@ -64,12 +64,26 @@ impl From<ExecModeWire> for ExecMode {
 }
 
 /// A registered command descriptor (R-08-016). The handler runs with a command-tier ctx.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandDescriptor {
     pub description: String,
     #[serde(default)]
     pub completions: Vec<String>,
+}
+
+/// A command after invocation-name disambiguation (Pi `ResolvedCommand`, runner.ts:556-595). When two
+/// extensions register the same `name`, Pi assigns `name:1`/`name:2` suffixes in LOAD ORDER (the
+/// `invocation_name`) while keeping the original `name`; a unique name keeps its bare `name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedCommand {
+    /// The disambiguated name the user invokes (`name` or `name:N`).
+    pub invocation_name: String,
+    /// The original registered command name.
+    pub name: String,
+    /// The extension that registered it.
+    pub owner: ExtensionId,
+    pub descriptor: CommandDescriptor,
 }
 
 /// The registry of everything extensions contribute. `Send + Sync` (interior `RwLock`), shared via
@@ -87,6 +101,10 @@ struct RegistryInner {
     /// Which extension owns each tool name (for diagnostics / unload).
     tool_owner: HashMap<String, ExtensionId>,
     commands: HashMap<String, (ExtensionId, CommandDescriptor)>,
+    /// Every command registration in LOAD ORDER (Pi preserves load order for invocation-name
+    /// disambiguation, runner.ts:559-565). The `commands` map is the fast last-wins lookup; this Vec
+    /// retains duplicates + order so [`ExtensionRegistry::resolved_commands`] can assign `name:N`.
+    command_order: Vec<(ExtensionId, String, CommandDescriptor)>,
     shortcuts: HashMap<String, ExtensionId>,
     flags: HashMap<String, Value>,
     /// Custom-provider registrations: typed, api-key-resolved, deferred→bind→flush (A-08-7).
@@ -203,9 +221,68 @@ impl ExtensionRegistry {
         name: impl Into<String>,
         desc: CommandDescriptor,
     ) -> Result<(), ExtError> {
+        let name = name.into();
         let mut g = self.lock_write()?;
-        g.commands.insert(name.into(), (owner, desc));
+        g.commands.insert(name.clone(), (owner.clone(), desc.clone()));
+        g.command_order.push((owner, name, desc));
         Ok(())
+    }
+
+    /// Resolve every registered command with Pi's invocation-name disambiguation (Pi
+    /// `resolveRegisteredCommands`, runner.ts:556-595; gap-08 #11). Duplicate `name`s across
+    /// extensions get `name:1`/`name:2` suffixes assigned in LOAD ORDER; a unique name keeps its bare
+    /// form. A collision with an already-taken invocation name bumps the suffix until free (Pi's
+    /// `takenInvocationNames` loop).
+    pub fn resolved_commands(&self) -> Result<Vec<ResolvedCommand>, ExtError> {
+        let g = self.lock_read()?;
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for (_, name, _) in &g.command_order {
+            *counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<ResolvedCommand> = Vec::with_capacity(g.command_order.len());
+        for (owner, name, descriptor) in &g.command_order {
+            let occurrence = {
+                let c = seen.entry(name.clone()).or_insert(0);
+                *c += 1;
+                *c
+            };
+            let mut invocation_name = if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{name}:{occurrence}")
+            } else {
+                name.clone()
+            };
+            if taken.contains(&invocation_name) {
+                let mut suffix = occurrence;
+                loop {
+                    suffix += 1;
+                    invocation_name = format!("{name}:{suffix}");
+                    if !taken.contains(&invocation_name) {
+                        break;
+                    }
+                }
+            }
+            taken.insert(invocation_name.clone());
+            out.push(ResolvedCommand {
+                invocation_name,
+                name: name.clone(),
+                owner: owner.clone(),
+                descriptor: descriptor.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Route an invocation name (bare `name` OR a disambiguated `name:N`) back to its owning
+    /// extension (Pi resolves the handler from the `ResolvedCommand`, runner.ts). Falls back to the
+    /// last-wins `commands` map for a bare name with no disambiguation.
+    pub fn resolved_command_owner(&self, invocation: &str) -> Result<Option<ExtensionId>, ExtError> {
+        if let Some(r) = self.resolved_commands()?.into_iter().find(|r| r.invocation_name == invocation)
+        {
+            return Ok(Some(r.owner));
+        }
+        self.command_owner(invocation)
     }
 
     /// Register a keyboard shortcut owned by an extension (R-08-017).

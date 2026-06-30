@@ -42,14 +42,16 @@ pub mod host_runtime;
 
 // --- Re-exports: the load-bearing surface (arch-08 §3). ---
 pub use aggregate::{
-    fold_project_trust, fold_resources, ProjectTrustDecision, ResourcesAggregate,
+    fold_project_trust, fold_resources, AttributedPath, ProjectTrustDecision, ResourcesAggregate,
 };
 pub use contract::{EventPatch, HandledValue, HookOutcome, Reduced};
 pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 pub use error::ExtError;
 pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
-pub use facade::{ExtensionHost, HostConfig};
+pub use facade::{
+    BeforeAgentStartReduction, ExtensionHost, HostConfig, InputReduction, UserBashReduction,
+};
 pub use build::build_component;
 pub use hooks::ExtHooks;
 pub use loader::{
@@ -59,11 +61,11 @@ pub use loader::{
 pub use manifest::{Capabilities, ExtensionManifest, HOST_WORLD};
 pub use native::{CtxTier, ExtMode, HostCtx, HostCtxRich, InitApi, NativeExtension, NativeHandle};
 pub use provider::{
-    resolve_api_key, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,
-    ProviderRegistration,
+    resolve_api_key, ModelCost, ModelRegistrySink, ProviderConfig, ProviderHub,
+    ProviderModelConfig, ProviderRegistration,
 };
 pub use registry::{
-    CommandDescriptor, ExecModeWire, ExtensionRegistry, ToolDescriptor,
+    CommandDescriptor, ExecModeWire, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
 

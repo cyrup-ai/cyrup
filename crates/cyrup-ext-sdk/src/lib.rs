@@ -44,7 +44,7 @@ pub use ctx::{
 };
 pub use descriptor::{
     CommandDescriptor, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition,
-    NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell,
+    ModelCost, NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell,
     SwitchSessionOptions, ToolDescriptor,
 };
 pub use events::*;

@@ -511,8 +511,23 @@ impl GuestState {
         }
     }
 
+    /// Resolve a flag's VALUE (Pi `getFlag`, loader.ts:256-262): returns the registered flag's
+    /// resolved value (its `default`, the analog of Pi `runtime.flagValues.get(name)` seeded from
+    /// `options.default`), serialized as JSON — NOT the whole `{type,default,description}` spec.
+    /// `None` when the flag is unregistered OR was registered without a default (Pi: `flagValues`
+    /// only gets an entry when `options.default !== undefined`, loader.ts:259).
     pub fn get_flag(&self, name: &str) -> Option<String> {
-        self.flags.lock().ok().and_then(|g| g.get(name).map(|v| v.to_string()))
+        let g = self.flags.lock().ok()?;
+        let spec = g.get(name)?;
+        // A bare (non-object) stored value is itself the resolved value (defensive).
+        let value = match spec.as_object() {
+            Some(_) => spec.get("default")?,
+            None => spec,
+        };
+        if value.is_null() {
+            return None;
+        }
+        Some(value.to_string())
     }
 
     pub fn add_autocomplete(&self, command: String) {

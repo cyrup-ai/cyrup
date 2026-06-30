@@ -166,8 +166,10 @@ pub struct ProviderConfig {
     /// API key, supporting Pi's env interpolation / `!command` resolution (resolved host-side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Pi `authHeader?: boolean` (types.ts:1386): when true the host adds `Authorization: Bearer
+    /// <resolved key>`. (sdk gap #27 — was a stringly-typed `Option<String>`.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_header: Option<String>,
+    pub auth_header: Option<bool>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -183,17 +185,53 @@ pub struct ProviderConfig {
     pub has_stream_simple: bool,
 }
 
-/// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1396).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1422).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+/// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1404-1429). Now
+/// the FULL Pi shape (sdk gap #26): the prior 4-field struct dropped a model's cost/reasoning/
+/// modality/api/baseUrl/thinking-level map/headers/compat. Open-shaped fields (`thinkingLevelMap`,
+/// `compat`) cross as `serde_json::Value`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelConfig {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u64>,
+    pub api: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u64>,
+    pub base_url: Option<String>,
+    /// Whether the model supports extended thinking (Pi `reasoning`).
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<Value>,
+    /// Supported input modalities (Pi `input: ("text"|"image")[]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+    #[serde(default)]
+    pub cost: ModelCost,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Max output tokens (Pi `maxTokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<Value>,
 }
 
 // --- Command-tier option bags (Pi `ExtensionCommandContext`, types.ts:339-390; sdk gap #5) ---

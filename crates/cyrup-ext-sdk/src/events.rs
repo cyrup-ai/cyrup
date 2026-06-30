@@ -205,11 +205,40 @@ pub struct ResourcesResult {
     pub theme_paths: Vec<String>,
 }
 
-/// `project_trust` decision (Pi types.ts:503-525).
+/// Pi's tri-state `project_trust` decision (`ProjectTrustEventDecision`, types.ts:508): `"yes"` /
+/// `"no"` are terminal, `"undecided"` falls through to the next handler. Serializes 1:1 with Pi's
+/// string union (camelCase → lowercase single words).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectTrustDecision {
+    Yes,
+    No,
+    #[default]
+    Undecided,
+}
+
+/// `project_trust` result (Pi `ProjectTrustEventResult`, types.ts:508-513). `trusted` is Pi's
+/// tri-state (`"yes"|"no"|"undecided"`), NOT a bool (sdk gap #21): collapsing `"undecided"` to a
+/// boolean loses the fall-through semantics.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTrustResult {
-    pub trusted: bool,
-    #[serde(default)]
+    pub trusted: ProjectTrustDecision,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remember: bool,
+}
+
+impl ProjectTrustResult {
+    /// Trust the project (Pi `{trusted:"yes"}`); `remember` persists the decision.
+    pub fn trust(remember: bool) -> Self {
+        Self { trusted: ProjectTrustDecision::Yes, remember }
+    }
+    /// Distrust the project (Pi `{trusted:"no"}`).
+    pub fn distrust(remember: bool) -> Self {
+        Self { trusted: ProjectTrustDecision::No, remember }
+    }
+    /// Abstain — defer to the next handler / host prompt (Pi `{trusted:"undecided"}`).
+    pub fn undecided() -> Self {
+        Self { trusted: ProjectTrustDecision::Undecided, remember: false }
+    }
 }

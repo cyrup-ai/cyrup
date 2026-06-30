@@ -3,8 +3,10 @@
 //! `wasm-host` feature is on). Exposes the two agent seams — [`ExtSubscriber`] (notify) and
 //! [`ExtHooks`] (mutating) — plus the merged active tool set.
 
+use crate::contract::{HandledValue, Reduced};
 use crate::dispatch::Dispatcher;
 use crate::error::ExtError;
+use crate::event::{HostEvent, InputEventSource, InputStreamingBehavior};
 use crate::hooks::ExtHooks;
 use crate::loader::{DiscoveredExtension, DiscoveryRoots, LoadError, LoadExtensionsResult};
 use crate::manifest::HOST_WORLD;
@@ -12,9 +14,48 @@ use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
 use crate::registry::ExtensionRegistry;
 use crate::subscriber::ExtSubscriber;
 use cyrup_agent::{EventSubscriber, Hooks};
-use cyrup_core::{CancelToken, ExtensionId, Tool};
+use cyrup_core::{CancelToken, Content, ExtensionId, Message, Tool};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// The reduced result of [`ExtensionHost::emit_before_agent_start`] (Pi `BeforeAgentStartCombinedResult`,
+/// runner.ts:1036-1042). `None` from the emit method = no handler modified anything (Pi returns
+/// `undefined`); a `Some` carries only what changed: the (optionally) replaced system prompt and the
+/// messages injected across the handler chain (accumulated, Pi `messages.push`, runner.ts:1014).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BeforeAgentStartReduction {
+    /// The replaced system prompt, iff at least one handler changed it (Pi `systemPromptModified`).
+    pub system_prompt: Option<String>,
+    /// Messages injected by handlers, in chain order (Pi `messages`).
+    pub injected: Vec<Message>,
+}
+
+/// The reduced result of [`ExtensionHost::emit_input`] (Pi `InputEventResult`, types.ts:805-808):
+/// continue unchanged, the transformed text/images, a full short-circuit (`handled`), or a block.
+#[derive(Clone, Debug)]
+pub enum InputReduction {
+    /// No handler changed the submission (Pi `{action:"continue"}`).
+    Continue,
+    /// A handler rewrote the text and/or images (Pi `{action:"transform", text, images}`).
+    Transform { text: String, images: Vec<Content> },
+    /// A handler fully serviced the input (Pi `{action:"handled"}`) — do not submit it.
+    Handled,
+    /// A handler blocked the submission (first block wins).
+    Blocked { reason: Option<String>, by: ExtensionId },
+}
+
+/// The reduced result of [`ExtensionHost::emit_user_bash`] (Pi `UserBashEventResult`, types.ts:1043):
+/// proceed, the extension fully serviced it (`operations`/`result`), or a block.
+#[derive(Clone, Debug)]
+pub enum UserBashReduction {
+    /// No handler intercepted the `!`/`!!` command (proceed with the default bash execution).
+    Continue,
+    /// A handler fully serviced it (Pi `{operations}`/`{result}`) — carried as the open-shaped value.
+    Handled(Value),
+    /// A handler blocked the command (first block wins).
+    Blocked { reason: Option<String>, by: ExtensionId },
+}
 
 /// Configuration for the host (mode + cwd + UI availability drive the dispatch `HostCtx`).
 #[derive(Clone, Debug)]
@@ -173,6 +214,132 @@ impl ExtensionHost {
         let handled =
             self.dispatcher.dispatch_collect_handled(&HostEvent::ResourcesDiscover, cancel).await;
         crate::fold_resources(&handled)
+    }
+
+    /// Dispatch `before_agent_start` (Pi `ExtensionRunner.emitBeforeAgentStart`, runner.ts:980-1044;
+    /// gap-08 #1). Folds every subscribed handler's system-prompt replacement + message injection
+    /// across the chain (later handlers observe the running system prompt; injected messages
+    /// ACCUMULATE), returning what changed — or `None` when nothing did (Pi returns `undefined`).
+    /// This is the production seam the prior doc claimed existed: it drives the live `on-before-agent-start`
+    /// export and flows the guest's reduction back to the agent loop.
+    pub async fn emit_before_agent_start(
+        &self,
+        prompt: &str,
+        images: Value,
+        system_prompt: &str,
+        options: Value,
+        cancel: &CancelToken,
+    ) -> Option<BeforeAgentStartReduction> {
+        let ev = HostEvent::BeforeAgentStart {
+            prompt: prompt.to_string(),
+            images,
+            system_prompt: system_prompt.to_string(),
+            options,
+            injected: Vec::new(),
+        };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Pass(ev) => {
+                let HostEvent::BeforeAgentStart { system_prompt: sp, injected, .. } = *ev else {
+                    return None;
+                };
+                let changed = sp != system_prompt;
+                if changed || !injected.is_empty() {
+                    Some(BeforeAgentStartReduction {
+                        system_prompt: if changed { Some(sp) } else { None },
+                        injected,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Dispatch `input` (Pi `ExtensionRunner.emitInput`, runner.ts:1094-1134; gap-08 #2). A handler may
+    /// block, fully service (`handled`), or transform the submission text/images; transforms FOLD across
+    /// handlers. Returns the reduced [`InputReduction`] for the submission pipeline to apply.
+    pub async fn emit_input(
+        &self,
+        text: &str,
+        images: Vec<Content>,
+        source: InputEventSource,
+        streaming_behavior: Option<InputStreamingBehavior>,
+        cancel: &CancelToken,
+    ) -> InputReduction {
+        let orig_text = text.to_string();
+        let orig_images = images.clone();
+        let ev = HostEvent::Input { text: orig_text.clone(), images, source, streaming_behavior };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Blocked { reason, by } => InputReduction::Blocked { reason, by },
+            Reduced::Handled(_) => InputReduction::Handled,
+            Reduced::Pass(ev) => {
+                if let HostEvent::Input { text, images, .. } = *ev
+                    && (text != orig_text || images != orig_images)
+                {
+                    return InputReduction::Transform { text, images };
+                }
+                InputReduction::Continue
+            }
+        }
+    }
+
+    /// Dispatch `message_end` (Pi `ExtensionRunner.emitMessageEnd`, runner.ts:770-810; gap-08 #3). A
+    /// handler may return a same-role replacement message (a mismatched role is rejected — the
+    /// original is kept — inside `apply_patch`, never a panic). Returns `Some(replacement)` iff a
+    /// handler changed the message (Pi returns `undefined` when unmodified). This is the mutating seam
+    /// the prior doc wrongly listed DONE: `message_end` was notify-only.
+    pub async fn emit_message_end(
+        &self,
+        message: Message,
+        cancel: &CancelToken,
+    ) -> Option<Message> {
+        let orig = message.clone();
+        let ev = HostEvent::MessageEnd { message };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::MessageEnd { message } if message != orig => Some(message),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Dispatch `before_provider_request` (Pi `ExtensionRunner.emitBeforeProviderRequest`,
+    /// runner.ts:946-978; gap-08 #4). Each handler's return value REPLACES the outbound payload
+    /// wholesale; later handlers observe the replacement. Returns the final (possibly replaced)
+    /// payload to send to the provider.
+    pub async fn emit_before_provider_request(
+        &self,
+        payload: Value,
+        cancel: &CancelToken,
+    ) -> Value {
+        let orig = payload.clone();
+        let ev = HostEvent::BeforeProviderRequest { payload };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::BeforeProviderRequest { payload } => payload,
+                _ => orig,
+            },
+            _ => orig,
+        }
+    }
+
+    /// Dispatch `user_bash` (Pi `ExtensionRunner.emitUserBash`, runner.ts:885-912; gap-08 #5). The
+    /// FIRST handler that returns a result wins (Pi short-circuits): a block stops the command, a
+    /// `handled` result (operations/result) supplies the execution. Returns the reduced
+    /// [`UserBashReduction`].
+    pub async fn emit_user_bash(
+        &self,
+        command: &str,
+        cancel: &CancelToken,
+    ) -> UserBashReduction {
+        let ev = HostEvent::UserBash { command: command.to_string(), operations: Value::Null };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Blocked { reason, by } => UserBashReduction::Blocked { reason, by },
+            Reduced::Handled(HandledValue(v)) => UserBashReduction::Handled(v),
+            Reduced::Pass(_) => UserBashReduction::Continue,
+        }
     }
 
     pub fn registry(&self) -> &ExtensionRegistry {

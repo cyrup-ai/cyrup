@@ -1134,7 +1134,23 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .map(Box::new);
             Some(EventPatch::SystemPromptAndInject { system, inject })
         }
-        // Other kinds have no typed patch shape yet (notify or producer-pending); ignore.
+        // `input` (Pi `InputEventResult` `{action:"transform", text, images?}`, types.ts:805): the
+        // guest's transform rewrites the submission text and optionally its images. `text` is
+        // required; a missing `text` is not a transform (degrade to noop). `images` (absent =
+        // keep the folded-so-far images, Pi `result.images ?? currentImages`).
+        EventKind::Input => {
+            let text = v.get("text").and_then(|s| s.as_str())?.to_string();
+            let images = v
+                .get("images")
+                .cloned()
+                .and_then(|i| serde_json::from_value::<Vec<Content>>(i).ok());
+            Some(EventPatch::Input { text, images })
+        }
+        // `before_provider_request` (Pi runner.ts:962): the handler's return value REPLACES the
+        // payload wholesale. The guest sends the replacement payload as the mutate value.
+        EventKind::BeforeProviderRequest => Some(EventPatch::ProviderRequest(v)),
+        // Other kinds have no typed patch shape (notify, or `user_bash`/discovery which use the
+        // `handled` channel, not `mutate`); ignore.
         _ => None,
     }
 }

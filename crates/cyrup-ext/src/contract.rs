@@ -43,6 +43,10 @@ pub enum EventPatch {
     /// currentImages`); `Some(_)` replaces them. Folds across handlers — a later handler observes
     /// the rewritten text/images (R-08-011).
     Input { text: String, images: Option<Vec<Content>> },
+    /// `before_provider_request` (Pi runner.ts:946-978): a handler's return value REPLACES the
+    /// outbound payload wholesale (`currentPayload = handlerResult`); later handlers observe the
+    /// replacement. Open-shaped: the provider request body crosses as `serde_json::Value`.
+    ProviderRequest(Value),
 }
 
 impl HostEvent {
@@ -93,6 +97,11 @@ impl HostEvent {
                 if let Some(i) = i {
                     *images = i;
                 }
+            }
+            // `before_provider_request` (Pi runner.ts:962): the handler's return value REPLACES the
+            // payload wholesale; the next handler sees the replacement.
+            (HostEvent::BeforeProviderRequest { payload }, EventPatch::ProviderRequest(v)) => {
+                *payload = v;
             }
             // Shape mismatch: ignore (degrade gracefully).
             _ => {}

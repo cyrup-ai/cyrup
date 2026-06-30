@@ -43,6 +43,64 @@ pub fn build() -> ExtensionApi {
     // Notify hook: announce activation when a run starts.
     api.on_agent_start(|ctx| ctx.ui().notify("demo extension active"));
 
+    // --- the previously-dead mutating seams, now driven by the assembled host (gap-08 #1-#5) ---
+
+    // before_agent_start (gap-08 #1): when the prompt is exactly "go", inject a marker message AND
+    // replace the system prompt. Injected messages accumulate across handlers (Pi runner.ts:1014).
+    api.on_before_agent_start(|ev, _ctx| {
+        if ev.prompt == "go" {
+            Outcome::before_agent_start(crate::BeforeAgentStartResult {
+                message: Some(json!({ "role": "user", "content": "injected by demo", "timestamp": 0 })),
+                system_prompt: Some(format!("INJECTED:{}", ev.system_prompt)),
+            })
+        } else {
+            Outcome::noop()
+        }
+    });
+
+    // input (gap-08 #2): block "secret", uppercase-transform an "up:" prefix, else continue (Pi
+    // `InputEventResult` `{action:"transform"|"handled"}` / block, runner.ts:1108-1131).
+    api.on_input(|ev, _ctx| {
+        if ev.text == "secret" {
+            Outcome::block("input blocked by demo")
+        } else if let Some(rest) = ev.text.strip_prefix("up:") {
+            Outcome::mutate(json!({ "action": "transform", "text": rest.to_uppercase() }))
+        } else {
+            Outcome::noop()
+        }
+    });
+
+    // message_end (gap-08 #3): redact a user message whose text is "redact me", preserving the role
+    // (the host rejects a role change, Pi runner.ts:785).
+    api.on_message_end(|ev, _ctx| {
+        let role = ev.message.get("role").and_then(|r| r.as_str());
+        let text = ev.message.get("content").and_then(|c| c.as_str());
+        if role == Some("user") && text == Some("redact me") {
+            Outcome::replace_message(json!({ "role": "user", "content": "[redacted]", "timestamp": 0 }))
+        } else {
+            Outcome::noop()
+        }
+    });
+
+    // before_provider_request (gap-08 #4): tag the outbound payload — Pi replaces the payload
+    // wholesale with the handler's return value (runner.ts:962).
+    api.on_before_provider_request(|ev, _ctx| {
+        let mut payload = ev.payload.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("demoTag".into(), json!(true));
+        }
+        Outcome::mutate(payload)
+    });
+
+    // user_bash (gap-08 #5): block a destructive `!rm -rf` invocation; otherwise proceed.
+    api.on_user_bash(|ev, _ctx| {
+        if ev.command.contains("rm -rf") {
+            Outcome::block("user_bash blocked by demo")
+        } else {
+            Outcome::noop()
+        }
+    });
+
     // A dynamically-registered tool (R-08-013/015): echoes its `text` argument, streaming a chunk.
     api.register_tool(
         ToolDescriptor::new(
@@ -132,8 +190,13 @@ pub fn build() -> ExtensionApi {
             models: vec![crate::ProviderModelConfig {
                 id: "demo-model".into(),
                 name: Some("Demo Model".into()),
+                // Full Pi model shape (sdk gap #26): reasoning/input modalities/cost/contextWindow/maxTokens.
+                reasoning: true,
+                input: vec!["text".into(), "image".into()],
+                cost: crate::ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
                 context_window: Some(200000),
-                max_output_tokens: Some(8192),
+                max_tokens: Some(8192),
+                ..Default::default()
             }],
             oauth: None,
             has_stream_simple: false,

@@ -41,17 +41,62 @@ pub struct ProviderConfig {
     pub has_stream_simple: bool,
 }
 
-/// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1396).
+/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1422). All four
+/// rates are required by Pi (they may be `0`); kept as `f64` rates per token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+/// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1404-1429).
+/// Carries the FULL Pi shape (gap-08 #14): a host mirror that kept only `id`/`name`/`contextWindow`/
+/// `maxOutputTokens` silently dropped a registered provider's cost/reasoning/modality/api/baseUrl/
+/// thinking-level map/headers/compat before they reached the model-registry sink. Open-shaped fields
+/// (`thinkingLevelMap`, `compat`) cross as `serde_json::Value` (Pi `Model<Api>["…"]`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelConfig {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Per-model API family override (Pi `api`, types.ts:1410).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Per-model endpoint override (Pi `baseUrl`, types.ts:1412).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Whether the model supports extended thinking (Pi `reasoning`, types.ts:1414).
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Pi `thinkingLevelMap` (types.ts:1416): pi-level → provider value (`null` marks unsupported).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<Value>,
+    /// Supported input modalities (Pi `input: ("text"|"image")[]`, types.ts:1418).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+    /// Per-token cost (Pi `cost`, types.ts:1422).
+    #[serde(default)]
+    pub cost: ModelCost,
+    /// Max context window in tokens (Pi `contextWindow`, types.ts:1424).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Max output tokens (Pi `maxTokens`, types.ts:1426).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    /// Per-model custom headers (Pi `headers`, types.ts:1428).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// OpenAI-compat settings (Pi `compat`, types.ts:1430): open-shaped `Model<Api>["compat"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<Value>,
 }
 
 /// A resolved provider registration: the parsed config, the resolved API key (if any), and whether

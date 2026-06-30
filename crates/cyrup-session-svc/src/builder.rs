@@ -512,9 +512,14 @@ impl SessionBuilder {
             // `--prompt-template`/`--theme` paths (Pi `additionalSkillPaths` et al.) into the
             // discovered registry before skill-pointer + system-prompt derivation. An empty aggregate
             // (no handlers, no CLI paths) leaves the discovered registry untouched.
-            let mut skill_paths: Vec<PathBuf> = agg.skill_paths.iter().map(PathBuf::from).collect();
-            let mut prompt_paths: Vec<PathBuf> = agg.prompt_paths.iter().map(PathBuf::from).collect();
-            let mut theme_paths: Vec<PathBuf> = agg.theme_paths.iter().map(PathBuf::from).collect();
+            // The aggregate now attributes each path to its extension (gap-08 #15); for registry
+            // discovery we take the path strings in concatenated load order.
+            let mut skill_paths: Vec<PathBuf> =
+                agg.skill_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
+            let mut prompt_paths: Vec<PathBuf> =
+                agg.prompt_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
+            let mut theme_paths: Vec<PathBuf> =
+                agg.theme_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
             skill_paths.extend(cfg.extra_skill_paths.iter().cloned());
             prompt_paths.extend(cfg.extra_prompt_paths.iter().cloned());
             theme_paths.extend(cfg.extra_theme_paths.iter().cloned());
