@@ -17,7 +17,8 @@ use cyrup_ext::host::ControlOp;
 use cyrup_ext::{HostEvent, InputEventSource, InputStreamingBehavior, Reduced};
 use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model, Provider};
 use cyrup_session::compaction::{
-    BranchSummarySettings, CompactionReason, CompactionSettings, Compactor, NoHooks,
+    context_tokens_from_usage, estimate_context_tokens, BranchSummarySettings, CompactionReason,
+    CompactionSettings, Compactor, NoHooks,
 };
 use cyrup_session::context::SessionContext;
 use cyrup_session::manager::SessionManager;
@@ -839,7 +840,13 @@ impl AgentSession {
     /// Enqueue a steering message (delivered after the current tool batch, func-02 §9). Mirrors the
     /// text into the facade queue + emits `queue_update` (Pi `_queueSteer`, agent-session.ts:1249).
     pub async fn steer(&self, input: impl Into<UserInput>) -> Result<PromptAccepted, SessionServiceError> {
-        let ui = input.into();
+        let mut ui = input.into();
+        // Pi agent-session.ts:1242-1252: error on an extension command, then expand skill/template
+        // BEFORE queueing — the queued text and the mirror must carry the expanded content.
+        if ui.expand_templates {
+            self.throw_if_extension_command(&ui.text)?;
+            ui.text = self.expand_input_text(&ui.text);
+        }
         Self::lock(&self.steering_messages).push(ui.text.clone());
         self.agent.steer(ui.into_agent_message());
         self.emit_queue_update().await;
@@ -852,11 +859,29 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<PromptAccepted, SessionServiceError> {
-        let ui = input.into();
+        let mut ui = input.into();
+        // Pi agent-session.ts:1262-1272: error on an extension command, then expand skill/template
+        // BEFORE queueing.
+        if ui.expand_templates {
+            self.throw_if_extension_command(&ui.text)?;
+            ui.text = self.expand_input_text(&ui.text);
+        }
         Self::lock(&self.follow_up_messages).push(ui.text.clone());
         self.agent.follow_up(ui.into_agent_message());
         self.emit_queue_update().await;
         Ok(PromptAccepted::Queued(StreamingBehavior::FollowUp))
+    }
+
+    /// Error if `text` is a registered extension command (Pi `_throwIfExtensionCommand`,
+    /// agent-session.ts:1312-1321): extension commands cannot be queued via `steer`/`follow_up`.
+    /// Only `/`-prefixed text is checked; the registry covers native + wasm commands.
+    fn throw_if_extension_command(&self, text: &str) -> Result<(), SessionServiceError> {
+        let Some(body) = text.strip_prefix('/') else { return Ok(()) };
+        let name = body.split_once(' ').map_or(body, |(n, _)| n);
+        if self.services.ext_host.registry().has_command(name).unwrap_or(false) {
+            return Err(SessionServiceError::ExtensionCommandNotQueueable(name.to_string()));
+        }
+        Ok(())
     }
 
     /// The pending steering messages, in order (Pi `getSteeringMessages`, agent-session.ts:1408).
@@ -927,7 +952,14 @@ impl AgentSession {
                 .await;
             if matches!(reduced, Reduced::Blocked { .. }) {
                 *Self::lock(&self.compaction_cancel) = None;
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: true }).await;
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: None,
+                })
+                .await;
                 return Ok(None);
             }
         }
@@ -977,16 +1009,42 @@ impl AgentSession {
                         &notify_cancel,
                     )
                     .await;
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: false }).await;
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: Some(cr.clone()),
+                    aborted: false,
+                    will_retry: false,
+                    error_message: None,
+                })
+                .await;
                 Ok(Some(cr))
             }
             Ok(None) => {
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: false }).await;
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: None,
+                })
+                .await;
                 Ok(None)
             }
             Err(e) => {
                 let aborted = matches!(e, cyrup_session::compaction::CompactionError::Aborted);
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted }).await;
+                let error_message = if aborted {
+                    None
+                } else {
+                    Some(format!("Compaction failed: {e}"))
+                };
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted,
+                    will_retry: false,
+                    error_message,
+                })
+                .await;
                 Err(e.into())
             }
         }
@@ -2462,38 +2520,86 @@ impl AgentSession {
             assistant.provider == cur.provider && assistant.model.as_str() == cur.model.as_str()
         };
 
+        // Stale-compaction-boundary guard (Pi agent-session.ts:1859-1864): skip all checks if this
+        // assistant turn predates the latest compaction boundary, so a stale pre-compaction
+        // usage/error does not retrigger compaction on the first prompt after a compaction.
+        let compaction_ts = self.latest_compaction_ts().await;
+        if let Some(boundary_ts) = compaction_ts
+            && assistant.timestamp <= boundary_ts
+        {
+            return Ok(false);
+        }
+
         // Case 1: overflow — a context-overflow error/usage on the SAME model compacts (no retry
         // for a completed answer; the overflow-recovery flag guards an infinite loop).
         if same_model && is_context_overflow(assistant, Some(window)) {
             let will_retry = assistant.stop_reason != cyrup_core::StopReason::Stop;
             if !will_retry {
-                return self.run_auto_compaction(CompactionReason::Overflow).await;
+                return self.run_auto_compaction(CompactionReason::Overflow, false).await;
             }
             if *Self::lock(&self.overflow_recovery_attempted) {
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
+                    result: None,
                     aborted: false,
+                    will_retry: false,
+                    error_message: Some(
+                        "Context overflow recovery failed after one compact-and-retry attempt. \
+                         Try reducing context or switching to a larger-context model."
+                            .to_string(),
+                    ),
                 })
                 .await;
                 return Ok(false);
             }
             *Self::lock(&self.overflow_recovery_attempted) = true;
             self.drop_trailing_assistant().await;
-            return self.run_auto_compaction(CompactionReason::Overflow).await;
+            return self.run_auto_compaction(CompactionReason::Overflow, will_retry).await;
         }
 
-        // Case 2: threshold — the built context exceeds `window − reserve`.
-        let guard = self.manager.lock().await;
-        let path: Vec<cyrup_session::Entry> = guard.branch_path(None).into_iter().cloned().collect();
-        drop(guard);
+        // Case 2: threshold — the context is getting large (Pi agent-session.ts:1900-1927). Prefer the
+        // assistant turn's OWN reported usage; only for an error / all-zero-usage message fall back to
+        // estimating from the live context, with a post-compaction-usage verification so a kept
+        // pre-compaction usage (stale, reflecting the old larger context) cannot falsely trigger.
         let settings = self.effective_compaction_settings();
-        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
-        let compactor = Compactor::new(summarizer, NoHooks);
-        let window32 = u32::try_from(window).unwrap_or(u32::MAX);
-        if compactor.should_compact(&path, window32, &settings) {
-            return self.run_auto_compaction(CompactionReason::Threshold).await;
+        let direct_context_tokens = context_tokens_from_usage(&assistant.usage);
+        let context_tokens: u32 = if assistant.stop_reason == cyrup_core::StopReason::Error
+            || direct_context_tokens == 0
+        {
+            let messages = self.messages().await;
+            let estimate = estimate_context_tokens(&messages);
+            let Some(last_usage_index) = estimate.last_usage_index else {
+                return Ok(false); // No usage data at all.
+            };
+            // If the usage source predates the compaction boundary, its tokens are stale.
+            if let (Some(boundary_ts), Some(Message::Assistant(usage_msg))) =
+                (compaction_ts, messages.get(last_usage_index))
+                && usage_msg.timestamp <= boundary_ts
+            {
+                return Ok(false);
+            }
+            estimate.tokens
+        } else {
+            direct_context_tokens
+        };
+        // Pi `shouldCompact`: contextTokens > contextWindow − reserveTokens (compaction.ts).
+        let threshold = window.saturating_sub(u64::from(settings.reserve_tokens));
+        if u64::from(context_tokens) > threshold {
+            return self.run_auto_compaction(CompactionReason::Threshold, false).await;
         }
         Ok(false)
+    }
+
+    /// The unix-ms timestamp of the latest `compaction` entry on the current branch, or `None`
+    /// (Pi `getLatestCompactionEntry(this.sessionManager.getBranch())`, agent-session.ts:1859).
+    async fn latest_compaction_ts(&self) -> Option<i64> {
+        let guard = self.manager.lock().await;
+        guard.branch_path(None).into_iter().rev().find_map(|e| match e {
+            cyrup_session::Entry::Known(cyrup_session::KnownEntry::Compaction { base, .. }) => {
+                Some(cyrup_session::context::parse_entry_ts(&base.timestamp))
+            }
+            _ => None,
+        })
     }
 
     /// Run an auto-compaction with its own abort controller + events (Pi `_runAutoCompaction`,
@@ -2503,6 +2609,7 @@ impl AgentSession {
     async fn run_auto_compaction(
         &self,
         reason: CompactionReason,
+        will_retry: bool,
     ) -> Result<bool, SessionServiceError> {
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.auto_compaction_cancel) = Some(cancel.clone());
@@ -2522,7 +2629,15 @@ impl AgentSession {
                 .await;
             if matches!(reduced, Reduced::Blocked { .. }) {
                 *Self::lock(&self.auto_compaction_cancel) = None;
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: true }).await;
+                // Pi agent-session.ts:1984-1990: a cancelling handler emits aborted:true, willRetry:false.
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: None,
+                })
+                .await;
                 return Ok(false);
             }
         }
@@ -2535,11 +2650,24 @@ impl AgentSession {
         let result = compactor
             .run_compaction(&mut guard, &model, &settings, reason, None, false, cancel)
             .await;
-        drop(guard);
-        *Self::lock(&self.auto_compaction_cancel) = None;
-
         match result {
             Ok(Some(entry)) => {
+                // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload.
+                let estimated_tokens_after: u64 = guard
+                    .build_context()
+                    .messages
+                    .iter()
+                    .map(cyrup_provider::estimate_message_tokens)
+                    .sum();
+                drop(guard);
+                *Self::lock(&self.auto_compaction_cancel) = None;
+                let cr = crate::state::CompactionResult {
+                    summary: entry.summary.clone(),
+                    first_kept_entry_id: entry.first_kept_entry_id.to_string(),
+                    tokens_before: entry.tokens_before,
+                    estimated_tokens_after,
+                    details: entry.details.clone(),
+                };
                 let notify_cancel = self.session_cancel.child_token();
                 self.services
                     .ext_host
@@ -2549,16 +2677,51 @@ impl AgentSession {
                         &notify_cancel,
                     )
                     .await;
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: false }).await;
+                // Pi agent-session.ts:2069: result present, aborted:false, carries the run's willRetry.
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: Some(cr),
+                    aborted: false,
+                    will_retry,
+                    error_message: None,
+                })
+                .await;
                 Ok(true)
             }
             Ok(None) => {
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted: false }).await;
+                drop(guard);
+                *Self::lock(&self.auto_compaction_cancel) = None;
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: None,
+                })
+                .await;
                 Ok(false)
             }
             Err(e) => {
+                drop(guard);
+                *Self::lock(&self.auto_compaction_cancel) = None;
                 let aborted = matches!(e, cyrup_session::compaction::CompactionError::Aborted);
-                self.fanout_emit(AgentSessionEvent::CompactionEnd { reason, aborted }).await;
+                // Pi agent-session.ts:2083-2097: on a non-abort failure, emit the reason-tagged
+                // recovery/auto-compaction error message; an abort emits no errorMessage.
+                let error_message = if aborted {
+                    None
+                } else if reason == CompactionReason::Overflow {
+                    Some(format!("Context overflow recovery failed: {e}"))
+                } else {
+                    Some(format!("Auto-compaction failed: {e}"))
+                };
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted,
+                    will_retry: false,
+                    error_message,
+                })
+                .await;
                 if aborted {
                     Ok(false)
                 } else {
@@ -2590,6 +2753,16 @@ impl AgentSession {
         options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
     ) -> BashResult {
+        // `user_bash` extension event (Pi `extensionRunner.emitUserBash`,
+        // interactive-mode.ts:5616 / rpc-mode.ts:551). Fired from this submission pipeline BEFORE
+        // execution with the LIVE `{command, excludeFromContext, cwd}`. A handler that returns a full
+        // `result` override short-circuits execution (Pi handleBashCommand:5624-5651); otherwise we
+        // run normally. (Pi's `operations` remote-exec override is not honored here: cyrup has no
+        // per-call bash-backend override seam — `self.proc` is the fixed backend.)
+        if let Some(result) = self.emit_user_bash_event(command, options.exclude_from_context).await {
+            self.record_bash_result(command, &result, options).await;
+            return result;
+        }
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.bash_cancel) = Some(cancel.clone());
         let cwd = self.services.cwd.clone();
@@ -2597,6 +2770,36 @@ impl AgentSession {
         *Self::lock(&self.bash_cancel) = None;
         self.record_bash_result(command, &result, options).await;
         result
+    }
+
+    /// Emit the `user_bash` extension event and, if a handler fully serviced the command (Pi
+    /// `UserBashEventResult.result`, types.ts:1043-1048), return its [`BashResult`] override so the
+    /// caller skips local execution. Returns `None` when nobody subscribed or no result override was
+    /// supplied. Carries the live `command`, the `!!`-prefix `exclude_from_context` flag, and the
+    /// agent cwd (Pi `UserBashEvent`, types.ts:782-790).
+    async fn emit_user_bash_event(&self, command: &str, exclude_from_context: bool) -> Option<BashResult> {
+        if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::UserBash) {
+            return None;
+        }
+        let cancel = self.session_cancel.child_token();
+        let event = HostEvent::UserBash {
+            command: command.to_string(),
+            exclude_from_context,
+            cwd: self.services.cwd.display().to_string(),
+        };
+        let reduced =
+            self.services.ext_host.dispatcher().dispatch_block_mutate(event, &cancel).await;
+        // A handler that returned a `UserBashEventResult.result` (Pi types.ts:1043-1048) fully
+        // serviced the command; deserialize the override `BashResult`. Other outcomes fall through
+        // to normal execution.
+        if let Reduced::Handled(handled) = reduced {
+            return handled
+                .0
+                .get("result")
+                .cloned()
+                .and_then(|r| serde_json::from_value::<BashResult>(r).ok());
+        }
+        None
     }
 
     /// Record a bash result into the transcript + session (Pi `recordBashResult`,

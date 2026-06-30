@@ -151,9 +151,19 @@ pub enum AgentSessionEvent {
     CompactionStart {
         reason: CompactionReason,
     },
+    /// A compaction settled (Pi `compaction_end`, agent-session.ts:142-148). Carries the produced
+    /// [`CompactionResult`] (absent on cancel/abort/error), the `aborted` flag, whether the run will
+    /// be retried after the compaction (`will_retry`, only meaningful for the overflow recovery
+    /// path), and an `error_message` on the failure paths. `result`/`error_message` are omitted from
+    /// the JSON when absent, matching Pi's `JSON.stringify` of `undefined`/optional fields.
     CompactionEnd {
         reason: CompactionReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<crate::state::CompactionResult>,
         aborted: bool,
+        will_retry: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
     },
     /// A retry-after-agent-end backoff began (Pi `auto_retry_start`, agent-session.ts:2508).
     AutoRetryStart {

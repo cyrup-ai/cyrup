@@ -46,6 +46,14 @@ pub enum SessionServiceError {
     #[error("agent is streaming; specify steer or follow_up")]
     StreamingNeedsBehavior,
 
+    /// A `/command` that maps to a registered extension command was passed to `steer`/`follow_up`
+    /// (Pi `_throwIfExtensionCommand`, agent-session.ts:1312-1321). Extension commands cannot be
+    /// queued; the message carries the command name 1:1 with Pi's thrown `Error`.
+    #[error(
+        "Extension command \"/{0}\" cannot be queued. Use prompt() or execute the command when not streaming."
+    )]
+    ExtensionCommandNotQueueable(String),
+
     #[error("the session has no active run to operate on")]
     NoActiveRun,
 

@@ -127,6 +127,18 @@ impl EventSubscriber for SvcSubscriber {
             if let Some(core) = agent_message_to_core(message) {
                 // Append the finalized message to the session tree (durable across the turn).
                 let _ = self.manager.lock().await.append_message(core);
+            } else if let AgentMessage::Custom { kind, payload, .. } = message {
+                // Custom messages (queued via `send_custom_message` deliver_as steer/followUp and
+                // pulled mid-run) finalize as a `message_end` here. Pi persists them as a
+                // CustomMessageEntry (agent-session.ts:546-553 `appendCustomMessageEntry`); without
+                // this they would be silently dropped by the `Custom -> None` core mapping.
+                // `display`/`details` are not carried on `AgentMessage::Custom`, so persist with the
+                // bash-message convention (display=true, no details).
+                let _ = self
+                    .manager
+                    .lock()
+                    .await
+                    .append_custom_message(kind, payload.clone(), true, None);
             }
             // `_handleAgentEvent` tail (Pi :562-577): track the last assistant + reset retry/overflow.
             if let (Some(s), AgentMessage::Assistant(a)) = (&session, message) {
