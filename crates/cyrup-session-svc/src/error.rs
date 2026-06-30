@@ -37,6 +37,9 @@ pub enum SessionServiceError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("no configured auth for model: {0}")]
+    NoConfiguredAuth(String),
+
     #[error("no model available in provider catalog '{0}'")]
     NoModels(String),
 
@@ -45,4 +48,16 @@ pub enum SessionServiceError {
 
     #[error("the session has no active run to operate on")]
     NoActiveRun,
+
+    #[error("invalid entry id for forking: {0}")]
+    InvalidForkEntry(String),
+
+    #[error("import file not found: {0}")]
+    ImportFileNotFound(String),
+
+    #[error("the resumed session's cwd no longer exists: {0}")]
+    MissingSessionCwd(String),
+
+    #[error("session io: {0}")]
+    Io(String),
 }

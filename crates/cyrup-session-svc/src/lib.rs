@@ -16,20 +16,40 @@
 //! - [`SessionServiceError`] aggregates the subsystem errors.
 #![forbid(unsafe_code)]
 
+mod attribution;
+mod bash;
 mod builder;
+mod command;
 mod compact;
 mod error;
 mod event;
+mod factory;
+mod host_services;
 mod hooks;
+mod runtime;
 mod services;
 mod session;
+mod state;
 mod subscriber;
+mod tools;
 
-pub use builder::{SessionBuilder, SessionConfig, SessionTarget};
+pub use attribution::merge_provider_attribution_headers;
+pub use bash::{BashOptions, BashResult};
+pub use builder::{NoTools, SessionBuilder, SessionConfig, SessionTarget};
+pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
-pub use event::{AgentSessionEvent, InputSource, PromptAccepted, StreamingBehavior, UserInput};
+pub use event::{
+    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, StreamingBehavior, UserInput,
+};
+pub use factory::SessionFactory;
+pub use host_services::{ControlSink, LiveHostServices};
+pub use runtime::{AgentSessionRuntime, RuntimeForkResult, SwitchResult};
 pub use services::AgentSessionServices;
-pub use session::AgentSession;
+pub use session::{
+    AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, ScopedModel,
+};
+pub use state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
+pub use tools::ToolInfo;
 
 // Load-bearing re-exports so embedders need not depend on every subsystem directly.
 pub use cyrup_core::EventStream;

@@ -30,4 +30,8 @@ pub struct AgentSessionServices {
     pub model: Model,
     /// The assembled system prompt for this session (arch-06).
     pub system_prompt: String,
+    /// The concrete [`cyrup_ext::host::HostServices`] backend wired to this session's provider +
+    /// active model (arch-08 §5.6). A loaded WASM extension's `models`/`session`/`control` imports
+    /// resolve through this instead of the deny-all default.
+    pub host_services: Arc<crate::host_services::LiveHostServices>,
 }

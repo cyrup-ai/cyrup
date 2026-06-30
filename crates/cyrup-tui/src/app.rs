@@ -281,10 +281,33 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::CompactionEnd { .. } => {
                 self.state.transcript.push_status("compaction complete");
             }
+            AgentSessionEvent::AutoRetryStart { attempt, max_attempts, .. } => {
+                self.state.transcript.push_status(format!("retrying ({attempt}/{max_attempts})…"));
+            }
+            AgentSessionEvent::AutoRetryEnd { success, .. } => {
+                self.state
+                    .transcript
+                    .push_status(if *success { "retry succeeded" } else { "retry ended" });
+            }
             AgentSessionEvent::ModelChanged { provider, model } => {
                 let label = format!("{provider}/{model}");
                 self.state.status.set_model(label.clone());
                 self.state.transcript.push_status(format!("model → {label}"));
+            }
+            AgentSessionEvent::ThinkingLevelChanged { level } => {
+                self.state.transcript.push_status(format!("thinking → {level}"));
+            }
+            // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
+            // re-subscribes to the runtime's new generation on `SessionReplaced` (R-11-021); the
+            // re-subscription itself is driven by the app's runtime watch, not this transcript hook.
+            AgentSessionEvent::SessionStart { reason, .. } => {
+                self.state.transcript.push_status(format!("session started ({reason})"));
+            }
+            AgentSessionEvent::SessionShutdown { reason } => {
+                self.state.transcript.push_status(format!("session shutdown ({reason})"));
+            }
+            AgentSessionEvent::SessionReplaced { .. } => {
+                self.state.status.set_streaming(false);
             }
         }
     }

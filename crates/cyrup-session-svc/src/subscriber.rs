@@ -74,6 +74,15 @@ impl Fanout {
     fn end_run(&self) {
         lock(&self.run_scoped).clear();
     }
+
+    /// Invalidate every subscription on session replacement (R-11-021, arch-11 §3.2): emit a
+    /// terminal `SessionReplaced` so consumers re-subscribe against the new generation, then drop
+    /// every sender (both run-scoped and persistent) so the streams end.
+    pub(crate) async fn invalidate(&self, generation: u64) {
+        self.emit(AgentSessionEvent::SessionReplaced { generation }).await;
+        lock(&self.run_scoped).clear();
+        lock(&self.persistent).clear();
+    }
 }
 
 /// The single agent subscriber the facade registers: persists + fans out, in order (arch-11 §3.2).

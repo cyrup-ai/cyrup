@@ -76,6 +76,16 @@ pub enum StreamingBehavior {
     FollowUp,
 }
 
+/// Delivery timing for a custom message (Pi `deliverAs`, agent-session.ts:1309): `steer`/`followUp`
+/// queue onto the active run, while `nextTurn` stages the message to ride the next prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliverAs {
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
 /// The event super-set the seam exposes (arch-11 §3.2).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -129,9 +139,43 @@ pub enum AgentSessionEvent {
         reason: CompactionReason,
         aborted: bool,
     },
+    /// A retry-after-agent-end backoff began (Pi `auto_retry_start`, agent-session.ts:2508).
+    AutoRetryStart {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: String,
+    },
+    /// A retry sequence ended (Pi `auto_retry_end`, agent-session.ts:551/2528).
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_error: Option<String>,
+    },
     ModelChanged {
         provider: String,
         model: String,
+    },
+    /// The active thinking level changed (Pi `thinking_level_changed`, agent-session.ts:1566).
+    ThinkingLevelChanged {
+        level: String,
+    },
+    /// A session was started/replaced by the runtime (Pi `session_start`,
+    /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
+    SessionStart {
+        reason: String,
+        previous_session_file: Option<String>,
+    },
+    /// A session is being torn down by the runtime or disposed (Pi `session_shutdown`,
+    /// agent-session-runtime.ts:168/391). `reason` ∈ `new`/`resume`/`fork`/`quit`/`reload`.
+    SessionShutdown {
+        reason: String,
+    },
+    /// The active session was atomically replaced; every prior subscription is now invalid and the
+    /// consumer must re-subscribe against the runtime's new generation (R-11-021, arch-11 §3.2).
+    SessionReplaced {
+        generation: u64,
     },
 }
 
@@ -202,7 +246,13 @@ impl AgentSessionEvent {
             AgentSessionEvent::QueueUpdate { .. } => "queue_update",
             AgentSessionEvent::CompactionStart { .. } => "compaction_start",
             AgentSessionEvent::CompactionEnd { .. } => "compaction_end",
+            AgentSessionEvent::AutoRetryStart { .. } => "auto_retry_start",
+            AgentSessionEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentSessionEvent::ModelChanged { .. } => "model_changed",
+            AgentSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
+            AgentSessionEvent::SessionStart { .. } => "session_start",
+            AgentSessionEvent::SessionShutdown { .. } => "session_shutdown",
+            AgentSessionEvent::SessionReplaced { .. } => "session_replaced",
         }
     }
 }

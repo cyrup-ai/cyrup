@@ -13,14 +13,18 @@ use std::time::Duration;
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::{
-    CancelToken, Content, ExtensionId, Message, StopReason, Tool, ToolCallId, ToolError,
+    CancelToken, Content, EntryId, ExtensionId, Message, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdateSink,
 };
-use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
+use cyrup_ext::{
+    EventKind, EventPatch, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
+};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
 use cyrup_session_svc::{
-    AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, SessionServiceError, UserInput,
+    AgentSessionEvent, AgentSessionRuntime, ForkPosition, InputSource, SessionBuilder,
+    SessionCommand, SessionCommandOutput, SessionConfig, SessionFactory, SessionServiceError,
+    SessionTarget, UserInput,
 };
 use futures::StreamExt;
 use tempfile::TempDir;
@@ -365,4 +369,224 @@ async fn cancellation_unblocks_a_running_tool() {
         .expect("wait_for_idle must complete after abort");
     assert!(!session.is_streaming().await, "session must be idle after abort");
     assert!(*cancelled.lock().unwrap(), "sleeper tool did not observe cancellation");
+}
+
+// ----------------------------------------------------------------------------------------------
+// An extension that rewrites the system prompt and injects a message at before_agent_start.
+// ----------------------------------------------------------------------------------------------
+
+struct PromptRewriter;
+
+#[async_trait::async_trait]
+impl NativeExtension for PromptRewriter {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("prompt-rewriter")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::BeforeAgentStart]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if let HostEvent::BeforeAgentStart { .. } = ev {
+            let inject =
+                Message::User { content: vec![Content::text("INJECTED_CONTEXT")], timestamp: 0 };
+            HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                system: Some("REWRITTEN_SYSTEM_PROMPT".to_string()),
+                inject: Some(Box::new(inject)),
+            })
+        } else {
+            HookOutcome::Noop
+        }
+    }
+}
+
+/// R-06-014 / gap #3: the assembled prompt is now actually offered to `before_agent_start`, and a
+/// handler may BOTH replace the system prompt AND inject a message into the run.
+#[tokio::test]
+async fn before_agent_start_hook_is_invoked_and_applied() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .with_native_extension(Arc::new(PromptRewriter))
+        .build()
+        .await
+        .expect("build");
+
+    // Before any run the agent uses the assembled base prompt.
+    let base = session.system_prompt().to_string();
+    assert_ne!(base, "REWRITTEN_SYSTEM_PROMPT");
+
+    let stream = session.prompt("hello").await.expect("prompt accepted");
+    session.wait_for_idle().await;
+    let _ = stream.collect::<Vec<_>>().await;
+
+    // The handler's system-prompt replacement reached the agent (Pi agent-session.ts:1127).
+    assert_eq!(session.current_system_prompt().await, "REWRITTEN_SYSTEM_PROMPT");
+
+    // The injected message is part of the persisted run alongside the user prompt.
+    let texts: Vec<String> = session
+        .messages()
+        .await
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.iter().any(|t| t == "hello"), "original prompt missing: {texts:?}");
+    assert!(texts.iter().any(|t| t == "INJECTED_CONTEXT"), "injected message missing: {texts:?}");
+}
+
+/// gap #30 + #12: the queue mirrors + `queue_update` emission, exercised through the `SessionCommand`
+/// one-seam surface.
+#[tokio::test]
+async fn queue_introspection_and_command_seam() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session =
+        SessionBuilder::new(faux, base_config(&fx)).build().await.expect("build");
+
+    // Observe queue_update events on a persistent subscription.
+    let mut sub = session.subscribe();
+
+    // Route everything through the command seam (arch-11 §2.1).
+    let out = session
+        .execute(SessionCommand::Steer(UserInput::text("steer-1", InputSource::Rpc)))
+        .await
+        .expect("steer");
+    assert!(matches!(out, SessionCommandOutput::Accepted(_)));
+    session
+        .execute(SessionCommand::FollowUp(UserInput::text("follow-1", InputSource::Rpc)))
+        .await
+        .expect("follow_up");
+
+    assert_eq!(session.steering_messages(), vec!["steer-1".to_string()]);
+    assert_eq!(session.follow_up_messages(), vec!["follow-1".to_string()]);
+    assert_eq!(session.pending_message_count(), 2);
+
+    // A queue_update was emitted (at least one).
+    let mut saw_queue_update = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_millis(200), sub.next()).await {
+            Ok(Some(ev)) => {
+                if ev.kind() == "queue_update" {
+                    saw_queue_update = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_queue_update, "expected a queue_update event");
+
+    // Clear via the seam.
+    session.execute(SessionCommand::ClearQueue).await.expect("clear");
+    assert_eq!(session.pending_message_count(), 0);
+
+    // The state view reflects the cleared queue.
+    let state = session.state_view().await;
+    assert_eq!(state.pending_message_count, 0);
+    assert_eq!(state.provider, "faux");
+}
+
+/// gap #1-11 / R-11-020/021: the AgentSessionRuntime multi-session tier — `new_session` tears down,
+/// rebuilds a fresh session, bumps the generation watch, and INVALIDATES prior subscriptions.
+#[tokio::test]
+async fn runtime_new_session_invalidates_subscriptions_and_bumps_generation() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime =
+        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+
+    assert_eq!(runtime.generation().await, 0);
+    let mut gen_watch = runtime.watch_generation();
+
+    // A persistent subscription on the FIRST session.
+    let first = runtime.session().await;
+    let first_id = first.session_id().clone();
+    let mut sub = first.subscribe();
+    // Drive one prompt so the first session has content.
+    let _stream = first.prompt("first").await.expect("prompt");
+    first.wait_for_idle().await;
+    drop(first);
+
+    // Replace the session.
+    let result = runtime.new_session().await.expect("new_session");
+    assert!(!result.cancelled);
+    assert_eq!(runtime.generation().await, 1, "generation must bump on replacement");
+    assert!(gen_watch.changed().await.is_ok(), "generation watch must fire");
+    assert_eq!(*gen_watch.borrow(), 1);
+
+    // The OLD subscription terminates with a SessionReplaced terminal (R-11-021).
+    let mut saw_replaced = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+            Ok(Some(ev)) => {
+                if let AgentSessionEvent::SessionReplaced { generation } = ev {
+                    assert_eq!(generation, 1);
+                    saw_replaced = true;
+                }
+            }
+            Ok(None) => break, // stream closed after invalidation — expected
+            Err(_) => panic!("old subscription did not terminate after replacement"),
+        }
+    }
+    assert!(saw_replaced, "old subscription must receive the SessionReplaced terminal");
+
+    // The new session is fresh (different id, empty transcript).
+    let second = runtime.session().await;
+    assert_ne!(second.session_id(), &first_id, "new_session must create a distinct session");
+    assert!(second.messages().await.is_empty(), "new session must start empty");
+}
+
+/// gap #4/#6/#33: entry-anchored fork via the runtime + `getUserMessagesForForking`, plus stats.
+#[tokio::test]
+async fn runtime_fork_at_entry_and_fork_anchors() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a1")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
+    ]);
+
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime =
+        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+
+    let session = runtime.session().await;
+    let _stream = session.prompt("the first user message").await.expect("prompt");
+    session.wait_for_idle().await;
+
+    // Stats reflect the round-trip.
+    let stats = session.session_stats().await;
+    assert_eq!(stats.user_message_count, 1);
+    assert_eq!(stats.assistant_message_count, 1);
+
+    // The fork anchors enumerate the user message(s) on the branch.
+    let anchors = session.user_messages_for_forking().await;
+    assert_eq!(anchors.len(), 1, "one user message anchor");
+    assert_eq!(anchors[0].text, "the first user message");
+    let anchor_id: EntryId = anchors[0].entry_id.clone();
+    drop(session);
+
+    // Fork AT that entry through the runtime → a fresh branched session, generation bumps.
+    let fork = runtime.fork(anchor_id, ForkPosition::At).await.expect("fork");
+    assert!(!fork.cancelled);
+    assert_eq!(runtime.generation().await, 1, "fork replaces the session");
 }

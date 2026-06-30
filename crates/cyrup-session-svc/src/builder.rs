@@ -17,7 +17,7 @@ use cyrup_config::{
 };
 use cyrup_ext::{ExtMode, ExtensionHost, HostConfig, NativeExtension};
 use cyrup_provider::{Model, Provider};
-use cyrup_resources::{discover, DiscoveryConfig, SkillPointer};
+use cyrup_resources::{discover, DiscoveryConfig, ResourceOverrides, SkillPointer};
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
 use cyrup_session::prompt::{
     ContextFileLoader, DocsPointers, PromptInputs, ResolvedOverride, SystemPromptBuilder,
@@ -79,6 +79,15 @@ pub struct SessionConfig {
     pub target: SessionTarget,
     /// Model-visible tool-set control.
     pub tool_availability: Availability,
+    /// Default tool-suppression mode when no explicit `tools` allowlist is given (Pi `noTools`).
+    pub no_tools: Option<NoTools>,
+    /// Explicit allowlist of tool names; when `Some`, only these tools are active (Pi `tools`).
+    pub tools: Option<Vec<String>>,
+    /// Denylist of tool names removed after the allowlist/noTools selection (Pi `excludeTools`).
+    pub exclude_tools: Vec<String>,
+    /// Custom tools registered in addition to the built-ins (Pi `customTools`, sdk.ts:71,384). Added
+    /// to the dynamic-tool registry as enable-able tools (not auto-activated).
+    pub custom_tools: Vec<Arc<dyn cyrup_core::Tool>>,
     /// Opt-in permission policy gate (empty ⇒ YOLO default, R-12-001).
     pub permission_policy: PermissionPolicy,
     /// Wrap the fs backend in [`ProtectedFs`] (blocks writes to `.env`/`.git`/… R-12-006).
@@ -107,11 +116,52 @@ impl SessionConfig {
             persist: true,
             target: SessionTarget::New,
             tool_availability: Availability::All,
+            no_tools: None,
+            tools: None,
+            exclude_tools: Vec::new(),
+            custom_tools: Vec::new(),
             permission_policy: PermissionPolicy::new(),
             protect_paths: true,
             confine_to_cwd: false,
         }
     }
+}
+
+/// Default tool-suppression mode (Pi `noTools: "all" | "builtin"`, sdk.ts:52-59).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoTools {
+    /// Start with no tools enabled.
+    All,
+    /// Disable the default built-in tools but keep extension/custom tools (Pi default built-ins).
+    Builtin,
+}
+
+/// Pi's default active built-in tool names (sdk.ts:244).
+const DEFAULT_BUILTIN_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
+
+/// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
+/// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
+fn select_active_tools(
+    visible: &[Arc<dyn cyrup_core::Tool>],
+    cfg: &SessionConfig,
+) -> Vec<Arc<dyn cyrup_core::Tool>> {
+    let exclude: std::collections::HashSet<&str> =
+        cfg.exclude_tools.iter().map(String::as_str).collect();
+    let keep = |name: &str| -> bool {
+        match (&cfg.tools, cfg.no_tools) {
+            // Explicit allowlist wins (Pi `options.tools`).
+            (Some(allow), _) => allow.iter().any(|a| a == name),
+            (None, Some(NoTools::All)) => false,
+            (None, Some(NoTools::Builtin)) => !DEFAULT_BUILTIN_TOOLS.contains(&name),
+            (None, None) => true,
+        }
+    };
+    visible
+        .iter()
+        .filter(|t| keep(t.name()) && !exclude.contains(t.name()))
+        .cloned()
+        .collect()
 }
 
 /// Assembles an [`AgentSession`] from a [`SessionConfig`] + injected provider/services (arch-11).
@@ -122,6 +172,11 @@ pub struct SessionBuilder {
     auth: Option<Arc<AuthStore>>,
     native_extensions: Vec<Arc<dyn NativeExtension>>,
     cli_settings: Settings,
+    /// A pre-built session manager to adopt instead of opening/creating one from `config.target`
+    /// (Pi `createAgentSessionFromServices` with a caller-supplied `sessionManager`,
+    /// agent-session-services.ts:187). Used by the runtime fork path, where the branched manager is
+    /// mutated in place and handed over directly (its file write may still be deferred on disk).
+    prebuilt_manager: Option<SessionManager>,
 }
 
 impl SessionBuilder {
@@ -134,7 +189,16 @@ impl SessionBuilder {
             auth: None,
             native_extensions: Vec::new(),
             cli_settings: Settings::new(),
+            prebuilt_manager: None,
         }
+    }
+
+    /// Adopt a caller-supplied, already-constructed [`SessionManager`] (the runtime fork path),
+    /// overriding `config.target`. The builder uses the manager's cwd verbatim.
+    #[must_use]
+    pub(crate) fn with_manager(mut self, manager: SessionManager) -> Self {
+        self.prebuilt_manager = Some(manager);
+        self
     }
 
     /// Override the settings store (default: in-memory).
@@ -197,12 +261,47 @@ impl SessionBuilder {
             .auth
             .unwrap_or_else(|| Arc::new(AuthStore::at(cfg.agent_dir.join("auth.json"))));
 
+        // ---- 2b. session tree (cyrup-session arch-04) — created BEFORE model resolution so the
+        // model/thinking restore can read the resumed branch (Pi sdk.ts:178,187: the SessionManager
+        // is constructed, then `buildSessionContext()` feeds `existingSession.model`/`thinkingLevel`).
+        let sessions_root =
+            cfg.session_dir.clone().unwrap_or_else(|| cfg.agent_dir.join("sessions"));
+        let layout = SessionLayout::new(sessions_root, cwd.clone());
+        let mut manager = match self.prebuilt_manager {
+            Some(m) => m,
+            None => match &cfg.target {
+                SessionTarget::New => {
+                    if cfg.persist {
+                        SessionManager::create(&cwd, &layout, NewSessionOpts::default())?
+                    } else {
+                        SessionManager::in_memory(&cwd, NewSessionOpts::default())?
+                    }
+                }
+                SessionTarget::Resume(path) => SessionManager::open(path)?,
+                SessionTarget::Continue => SessionManager::continue_recent(&cwd, &layout)?,
+            },
+        };
+        let session_id = manager.session_id().clone();
+        let existing = manager.build_context();
+        let has_existing_session = !existing.messages.is_empty();
+        // Pi `hasThinkingEntry` (sdk.ts:189): does the resumed branch carry a thinking_level_change?
+        let has_thinking_entry = manager
+            .branch_path(None)
+            .iter()
+            .any(|e| matches!(e, cyrup_session::Entry::Known(
+                cyrup_session::entry::KnownEntry::ThinkingLevelChange { .. })));
+
         // ---- 3. model resolution (cyrup-config + cyrup-provider) -------------------------------
-        let (resolved_model, model_ref, thinking) = resolve_model(&*self.provider, &cfg, &settings)?;
+        // Restore the model + thinking level from the resumed session, seeding a fallback message
+        // when the saved model is no longer resolvable (Pi sdk.ts:191-242).
+        let (resolved_model, model_ref, thinking, model_fallback_message) =
+            resolve_model(&*self.provider, &cfg, &settings, &existing, has_existing_session, has_thinking_entry)?;
 
         // ---- 4. tools + isolation + policy (cyrup-tools) --------------------------------------
         let shell = ShellConfig::detect();
-        let base = Backend::local(shell);
+        let base = Backend::local(shell.clone());
+        // The process backend the immediate-bash seam (#8) runs against (kept past `base`'s move).
+        let bash_proc = base.proc.clone();
         let mut fs = base.fs.clone();
         if cfg.confine_to_cwd {
             fs = Arc::new(TraversalFs::new(fs, cwd.clone()));
@@ -212,13 +311,31 @@ impl SessionBuilder {
         }
         let backend = Backend { fs, proc: base.proc.clone() };
         let registry = ToolRegistry::with_builtins(cwd.clone(), backend, ToolsOptions::default());
-        let base_tools = registry.visible(&cfg.tool_availability);
+        let visible = registry.visible(&cfg.tool_availability);
+        // Tool-set selection (Pi sdk.ts:244-251): an explicit `tools` allowlist, or `noTools`
+        // ("all" ⇒ none; "builtin" ⇒ drop the default built-ins), then minus the `excludeTools`
+        // denylist. Absent all three, the Availability-visible set is kept verbatim.
+        let base_tools = select_active_tools(&visible, &cfg);
         let read_available = base_tools.iter().any(|t| t.name() == "read");
 
         // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
         disc.trusted_project = trusted;
         disc.enable_skills = !cfg.no_skills;
+        // Settings-tier resource overrides (cross-layer wiring; Pi `package-manager.ts:2265-2278`):
+        // the `skills`/`prompts`/`themes` settings lists are enable/disable patterns over the
+        // auto-discovered loose resources. Without this the resource settings-tier never activates
+        // (DiscoveryConfig left both override sets empty = unconditionally enabled). The layered
+        // `SettingsManager` exposes only the merged effective view, so both global- and project-scope
+        // overrides are sourced from it (empty lists — the default — preserve "discover everything").
+        let eff = settings.effective();
+        let overrides = ResourceOverrides {
+            skills: eff.skill_paths(),
+            prompts: eff.prompt_template_paths(),
+            themes: eff.theme_paths(),
+        };
+        disc.global_overrides = overrides.clone();
+        disc.project_overrides = overrides;
         let report = discover(&disc, cancel.token()).await?;
         let resources = Arc::new(report.registry);
         // Read-gated skill pointers (R-06-010): only when the `read` tool is available.
@@ -260,25 +377,29 @@ impl SessionBuilder {
         };
         let system_prompt = SystemPromptBuilder::new().build(&prompt_inputs);
 
-        // ---- 7. session tree (cyrup-session arch-04) ------------------------------------------
-        let sessions_root =
-            cfg.session_dir.clone().unwrap_or_else(|| cfg.agent_dir.join("sessions"));
-        let layout = SessionLayout::new(sessions_root, cwd.clone());
-        let manager = match &cfg.target {
-            SessionTarget::New => {
-                if cfg.persist {
-                    SessionManager::create(&cwd, &layout, NewSessionOpts::default())?
-                } else {
-                    SessionManager::in_memory(&cwd, NewSessionOpts::default())?
-                }
-            }
-            SessionTarget::Resume(path) => SessionManager::open(path)?,
-            SessionTarget::Continue => SessionManager::continue_recent(&cwd, &layout)?,
-        };
-        let session_id = manager.session_id().clone();
-        // Seed the agent transcript from the resumed branch (R-04-011).
+        // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool plus the
+        // caller's custom tools are enable-able; the active set starts at the build-time selection.
+        let mut registry_tools = visible.clone();
+        registry_tools.extend(cfg.custom_tools.iter().cloned());
+        let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools
+            .iter()
+            .map(|t| (t.name().to_string(), tool_contribution(t.name())))
+            .collect();
+        // The rebuilder base = the prompt inputs with the per-run tool fields cleared (re-derived
+        // from the active set on each `setActiveToolsByName`).
+        let mut rebuild_base = prompt_inputs.clone();
+        rebuild_base.selected_tools = Vec::new();
+        rebuild_base.tool_contributions = Vec::new();
+        let dynamic_tools = crate::tools::DynamicToolState::new(
+            registry_tools,
+            base_tools.clone(),
+            crate::tools::PromptRebuilder::new(rebuild_base, contributions),
+        );
+
+        // ---- 7. seed the agent transcript from the resumed branch (R-04-011). The manager was
+        // created at step 2b; `existing` already holds its context.
         let seed: Vec<cyrup_agent::AgentMessage> =
-            manager.build_context().messages.iter().map(core_message_to_agent).collect();
+            existing.messages.iter().map(core_message_to_agent).collect();
 
         // ---- 8. extension host + both seams (cyrup-ext) ---------------------------------------
         let (mode, has_ui) = ext_mode(cfg.app_mode);
@@ -293,12 +414,28 @@ impl SessionBuilder {
         let ext_hooks = ext_host.hooks();
 
         // ---- 9. agent loop: provider + tools + composed hooks + both seams --------------------
+        // `blockImages` defense-in-depth (Pi sdk.ts:254-289): the convert-to-llm seam strips image
+        // content when the setting is on, deduping consecutive placeholders. Folded into PolicyHooks
+        // so it rides the agent's single `convertToLlm` slot.
+        let block_images = settings.effective().block_images();
         let policy_hooks = Arc::new(crate::hooks::PolicyHooks::new(
             cfg.permission_policy.clone(),
             ext_hooks,
             has_ui,
+            block_images,
         ));
-        let agent = Agent::builder(
+        let eff = settings.effective();
+        // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
+        // env override (`CYRUP_TELEMETRY`/`PI_TELEMETRY`) else the `enableInstallTelemetry` setting.
+        let env = cyrup_config::EnvVars::from_process();
+        let telemetry_enabled = env.telemetry.unwrap_or_else(|| eff.enable_install_telemetry());
+        let attribution_headers = crate::attribution::merge_provider_attribution_headers(
+            &resolved_model,
+            telemetry_enabled,
+            Some(&session_id),
+            &[],
+        );
+        let mut agent_builder = Agent::builder(
             model_ref.clone(),
             Arc::new(ProviderStreamFn::new(self.provider.clone())),
         )
@@ -308,7 +445,34 @@ impl SessionBuilder {
         .messages(seed)
         .hooks(policy_hooks)
         .session_id(session_id.clone())
-        .build();
+        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + custom thinking budgets.
+        .steering_mode(parse_queue_mode(&eff.steering_mode()))
+        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()));
+        if let Some(h) = attribution_headers {
+            agent_builder = agent_builder.headers(h);
+        }
+        if let Some(budgets) = eff.thinking_budgets() {
+            // Map the config struct (`i64`) to the provider struct (`u64`); negatives clamp to 0.
+            let to_u64 = |v: Option<i64>| v.map(|n| n.max(0) as u64);
+            agent_builder = agent_builder.thinking_budgets(cyrup_provider::ThinkingBudgets {
+                minimal: to_u64(budgets.minimal),
+                low: to_u64(budgets.low),
+                medium: to_u64(budgets.medium),
+                high: to_u64(budgets.high),
+            });
+        }
+        let agent = agent_builder.build();
+
+        // Seed the model + thinking-level change entries so a future resume can restore them, and
+        // backfill a thinking entry for a resumed session that lacks one (Pi sdk.ts:363-375).
+        if has_existing_session {
+            if !has_thinking_entry {
+                manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
+            }
+        } else {
+            manager.append_model_change(resolved_model.provider.clone(), resolved_model.id.clone())?;
+            manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
+        }
 
         let manager = Arc::new(AsyncMutex::new(manager));
         let fanout = Arc::new(Fanout::new());
@@ -319,6 +483,41 @@ impl SessionBuilder {
         let agent = Arc::new(agent);
 
         // ---- 10. assemble the session --------------------------------------------------------
+        // The concrete host-services backend, seeded with the active model so a loaded extension's
+        // `models`/`current_model`/`context_usage` imports reflect live state (arch-08 §5.6).
+        let host_services =
+            Arc::new(crate::host_services::LiveHostServices::new(self.provider.clone()));
+        host_services.update_model(
+            model_ref.clone(),
+            resolved_model.context_window,
+            Some(thinking_level_to_str(thinking)),
+        );
+
+        // Resolve the settings-driven knobs for the retry / auto-compaction subsystems BEFORE the
+        // `settings` value is moved into the services bundle.
+        let eff = settings.effective();
+        let cfg_compaction = eff.compaction_settings();
+        let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
+        let extras = crate::session::SessionExtras {
+            telemetry_enabled,
+            compaction_settings: cyrup_session::compaction::CompactionSettings {
+                enabled: cfg_compaction.enabled,
+                reserve_tokens: to_u32(cfg_compaction.reserve_tokens),
+                keep_recent_tokens: to_u32(cfg_compaction.keep_recent_tokens),
+            },
+            branch_summary_settings: cyrup_session::compaction::BranchSummarySettings {
+                reserve_tokens: to_u32(eff.branch_summary_reserve_tokens()),
+                skip_prompt: eff.branch_summary_skip_prompt(),
+            },
+            auto_compaction_enabled: eff.compaction_enabled(),
+            auto_retry_enabled: eff.retry_enabled(),
+            retry_max_retries: to_u32(eff.retry_max_retries()),
+            retry_base_delay_ms: u64::try_from(eff.retry_base_delay_ms().max(0)).unwrap_or(0),
+            proc: bash_proc,
+            shell,
+            dynamic_tools,
+        };
+
         let services = AgentSessionServices {
             cwd,
             settings,
@@ -329,6 +528,7 @@ impl SessionBuilder {
             ext_host,
             model: resolved_model,
             system_prompt,
+            host_services,
         };
 
         Ok(AgentSession::from_parts(
@@ -340,49 +540,133 @@ impl SessionBuilder {
             model_ref,
             session_cancel,
             session_id,
+            model_fallback_message,
+            extras,
         ))
     }
 }
 
-/// Resolve `(Model, ModelRef, ModelThinkingLevel)` from the pattern / settings / catalog (R-07-019).
+/// Parse the settings `steeringMode`/`followUpMode` string into the agent's [`QueueMode`]
+/// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:698-710). Any non-`all` value ⇒ one-at-a-time.
+pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
+    if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
+}
+
+/// Serialize a [`ModelThinkingLevel`] to its persisted snake/camel key (`off`/`minimal`/…/`xhigh`).
+pub(crate) fn thinking_level_to_str(level: ModelThinkingLevel) -> String {
+    serde_json::to_value(level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "off".to_string())
+}
+
+/// Parse a persisted thinking-level key back into a [`ModelThinkingLevel`] (inverse of
+/// [`thinking_level_to_str`]); unknown keys ⇒ `None`.
+pub(crate) fn thinking_level_from_str(s: &str) -> Option<ModelThinkingLevel> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
+/// Resolve `(Model, ModelRef, ModelThinkingLevel, modelFallbackMessage)` from the explicit pattern,
+/// the resumed session, settings, and finally the catalog (Pi sdk.ts:191-242; R-07-019).
+///
+/// Precedence mirrors Pi: an explicit `--model` pattern wins; otherwise a resumed session's saved
+/// model is restored when it is still resolvable in the catalog (else a `modelFallbackMessage` is
+/// produced and we fall back to settings/catalog). The thinking level is likewise restored from the
+/// session's `thinking_level_change` entry, then clamped to the chosen model's capabilities.
 fn resolve_model(
     provider: &dyn Provider,
     cfg: &SessionConfig,
     settings: &SettingsManager,
-) -> Result<(Model, ModelRef, ModelThinkingLevel), SessionServiceError> {
+    existing: &cyrup_session::context::SessionContext,
+    has_existing_session: bool,
+    has_thinking_entry: bool,
+) -> Result<(Model, ModelRef, ModelThinkingLevel, Option<String>), SessionServiceError> {
     let available = provider.models();
     if available.is_empty() {
         return Err(SessionServiceError::NoModels(provider.id().to_string()));
     }
     let resolver = ModelResolver::new(available);
-    let pattern = cfg.model_pattern.clone().or_else(|| settings.effective().default_model());
+    let mut fallback: Option<String> = None;
 
-    let (model, parsed_thinking) = match pattern {
-        Some(pat) => {
-            let parsed = resolver.parse_pattern(&pat, true);
-            match parsed.model {
-                Some(m) => (m, parsed.thinking_level),
-                None => return Err(SessionServiceError::ModelNotFound(pat)),
+    // 1. An explicit `--model` pattern (Pi `options.model`) takes precedence over restore.
+    let (mut model, mut parsed_thinking): (Option<Model>, Option<ModelThinkingLevel>) =
+        match &cfg.model_pattern {
+            Some(pat) => {
+                let parsed = resolver.parse_pattern(pat, true);
+                match parsed.model {
+                    Some(m) => (Some(m), parsed.thinking_level),
+                    None => return Err(SessionServiceError::ModelNotFound(pat.clone())),
+                }
+            }
+            None => (None, None),
+        };
+
+    // 2. Restore the model from the resumed session (Pi sdk.ts:194-203). The saved model is only
+    //    honored when it still resolves in the live catalog (our auth proxy: a model the provider
+    //    exposes is usable); otherwise we record the fallback message and keep searching.
+    if model.is_none()
+        && has_existing_session
+        && let Some(saved) = existing.model.as_ref()
+    {
+        let restored = available.iter().find(|m| {
+            m.provider == saved.provider && m.id == saved.model
+        });
+        match restored {
+            Some(m) => model = Some(m.clone()),
+            None => {
+                fallback = Some(format!(
+                    "Could not restore model {}/{}",
+                    saved.provider.as_str(),
+                    saved.model.as_str()
+                ));
             }
         }
-        None => {
-            // First catalog entry (checked non-empty above).
-            let m = available.first().cloned().ok_or_else(|| {
+    }
+
+    // 3. Settings default → first catalog entry (Pi `findInitialModel`, sdk.ts:205-221).
+    if model.is_none() {
+        let pat = settings.effective().default_model();
+        let resolved = match pat {
+            Some(p) => {
+                let parsed = resolver.parse_pattern(&p, true);
+                parsed_thinking = parsed_thinking.or(parsed.thinking_level);
+                parsed.model
+            }
+            None => None,
+        };
+        let m = match resolved {
+            Some(m) => m,
+            None => available.first().cloned().ok_or_else(|| {
                 SessionServiceError::NoModels(provider.id().to_string())
-            })?;
-            (m, None)
+            })?,
+        };
+        if let Some(msg) = fallback.as_mut() {
+            msg.push_str(&format!(". Using {}/{}", m.provider.as_str(), m.id.as_str()));
         }
-    };
-    let thinking = cfg
-        .thinking_level
-        .or(parsed_thinking)
-        .unwrap_or_else(|| settings.effective().default_thinking_level());
+        model = Some(m);
+    }
+    let model = model.ok_or_else(|| SessionServiceError::NoModels(provider.id().to_string()))?;
+
+    // 4. Thinking level: explicit option → restored from session → settings default; clamped to the
+    //    chosen model's supported levels (Pi sdk.ts:223-242).
+    let mut thinking = cfg.thinking_level.or(parsed_thinking);
+    if thinking.is_none() && has_existing_session {
+        thinking = Some(if has_thinking_entry {
+            thinking_level_from_str(&existing.thinking_level)
+                .unwrap_or_else(|| settings.effective().default_thinking_level())
+        } else {
+            settings.effective().default_thinking_level()
+        });
+    }
+    let thinking = thinking.unwrap_or_else(|| settings.effective().default_thinking_level());
+    let thinking = cyrup_provider::clamp_thinking_level(&model, thinking);
+
     let model_ref = ModelRef {
         provider: model.provider.clone(),
         api: Some(model.api.clone()),
         model: model.id.clone(),
     };
-    Ok((model, model_ref, thinking))
+    Ok((model, model_ref, thinking, fallback))
 }
 
 /// Synthesize a one-line prompt snippet for a built-in tool so the "Available tools" section is
