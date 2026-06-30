@@ -8,6 +8,36 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::error::TuiError;
 
+/// Parse one binding-id JSON value (a key-spec string or an array of them) into [`Key`]s
+/// (spec/tui/07 §3.9). `"ctrl+c"` and `["esc", "ctrl+["]` are both accepted.
+fn parse_key_values(value: &serde_json::Value) -> Result<Vec<Key>, TuiError> {
+    match value {
+        serde_json::Value::String(s) => Ok(vec![Key::parse(s)?]),
+        serde_json::Value::Array(items) => {
+            let mut keys = Vec::with_capacity(items.len());
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| TuiError::Keybindings(format!("expected key string, got {item}")))?;
+                keys.push(Key::parse(s)?);
+            }
+            Ok(keys)
+        }
+        other => Err(TuiError::Keybindings(format!("expected string or array, got {other}"))),
+    }
+}
+
+/// Parse a keybindings document into the `(id, value)` entries of its top-level JSON object
+/// (spec/tui/07 §3.9; `core/keybindings.ts:14-262`). Shared by every map's `merge_json`.
+fn keybindings_object(json: &str) -> Result<serde_json::Map<String, serde_json::Value>, TuiError> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| TuiError::Keybindings(e.to_string()))?;
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        other => Err(TuiError::Keybindings(format!("expected a JSON object, got {other}"))),
+    }
+}
+
 /// A logical action the chrome reacts to (subset of arch-10 §3.7 `Action`; extended as features
 /// land). Editing actions live in the editor itself; these are the *global* bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -26,6 +56,27 @@ pub enum Action {
     PageDown,
     /// Toggle expansion of the focused tool/bash block (Ctrl+O) — `app.tools.expand`.
     ToolsExpand,
+    /// Open the editor buffer in `$VISUAL`/`$EDITOR` (Ctrl+G) — `app.editor.external`
+    /// (`openExternalEditor`, interactive-mode.ts:3611).
+    ExternalEditor,
+}
+
+impl Action {
+    /// Resolve the Pi binding id (`app.exit`, `app.interrupt`, …; `core/keybindings.ts:63-202`) to a
+    /// global [`Action`]. `None` for ids that belong to the editor/select maps or are unknown.
+    pub fn from_id(id: &str) -> Option<Action> {
+        match id {
+            "app.exit" => Some(Action::Quit),
+            "app.interrupt" => Some(Action::Interrupt),
+            "app.clear" => Some(Action::Clear),
+            "app.suspend" => Some(Action::Suspend),
+            "app.pageUp" => Some(Action::PageUp),
+            "app.pageDown" => Some(Action::PageDown),
+            "app.tools.expand" => Some(Action::ToolsExpand),
+            "app.editor.external" => Some(Action::ExternalEditor),
+            _ => None,
+        }
+    }
 }
 
 /// An editor-level action resolved from a key while the editor owns focus (spec/tui/03 §6.1; the 19
@@ -57,6 +108,39 @@ pub enum EditorAction {
     JumpBackward,
 }
 
+impl EditorAction {
+    /// Resolve an editor binding id (`editor.cursorLeft`, …; `keybindings.ts:54-134`) to an
+    /// [`EditorAction`]. `None` for ids outside the editor map.
+    pub fn from_id(id: &str) -> Option<EditorAction> {
+        use EditorAction as E;
+        Some(match id {
+            "editor.cursorLeft" => E::CursorLeft,
+            "editor.cursorRight" => E::CursorRight,
+            "editor.cursorUp" => E::CursorUp,
+            "editor.cursorDown" => E::CursorDown,
+            "editor.cursorWordLeft" => E::CursorWordLeft,
+            "editor.cursorWordRight" => E::CursorWordRight,
+            "editor.cursorLineStart" => E::CursorLineStart,
+            "editor.cursorLineEnd" => E::CursorLineEnd,
+            "editor.deleteCharBackward" => E::DeleteCharBackward,
+            "editor.deleteCharForward" => E::DeleteCharForward,
+            "editor.deleteWordBackward" => E::DeleteWordBackward,
+            "editor.deleteWordForward" => E::DeleteWordForward,
+            "editor.deleteToLineStart" => E::DeleteToLineStart,
+            "editor.deleteToLineEnd" => E::DeleteToLineEnd,
+            "editor.yank" => E::Yank,
+            "editor.yankPop" => E::YankPop,
+            "editor.undo" => E::Undo,
+            "editor.newLine" => E::NewLine,
+            "editor.submit" => E::Submit,
+            "editor.tab" => E::Tab,
+            "editor.jumpForward" => E::JumpForward,
+            "editor.jumpBackward" => E::JumpBackward,
+            _ => return None,
+        })
+    }
+}
+
 /// A selector-level action resolved from a key while a selector owns the input slot (spec/tui/05
 /// §10; `tui.select.*`). Resolved via [`SelectKeymap`] so selectors never compare keys inline
 /// (R-10-018) — the same hooks Pi's `SelectList.handleInput` reads from `getKeybindings()`
@@ -75,6 +159,21 @@ pub enum SelectAction {
     PageUp,
     /// Page the list down — `tui.select.pageDown`.
     PageDown,
+}
+
+impl SelectAction {
+    /// Resolve a `tui.select.*` binding id to a [`SelectAction`] (spec/tui/05 §10).
+    pub fn from_id(id: &str) -> Option<SelectAction> {
+        match id {
+            "tui.select.up" => Some(SelectAction::Up),
+            "tui.select.down" => Some(SelectAction::Down),
+            "tui.select.confirm" => Some(SelectAction::Confirm),
+            "tui.select.cancel" => Some(SelectAction::Cancel),
+            "tui.select.pageUp" => Some(SelectAction::PageUp),
+            "tui.select.pageDown" => Some(SelectAction::PageDown),
+            _ => None,
+        }
+    }
 }
 
 /// A parsed key spec: a base code plus modifiers (R-10-023).
@@ -140,6 +239,45 @@ impl Key {
     pub fn matches(&self, ev: &KeyEvent) -> bool {
         ev.code == self.code && ev.modifiers == self.mods
     }
+
+    /// A short human label for the key (`esc`, `ctrl+c`, `shift+tab`) — the inverse of [`Key::parse`],
+    /// used to build status-band hints like `(esc to cancel)` from the live keymap
+    /// (`keybinding-hints.ts:12-27`; spec/tui/01 §6.1: the cancel text is never hardcoded).
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        if self.mods.contains(KeyModifiers::CONTROL) {
+            s.push_str("ctrl+");
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            s.push_str("alt+");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            s.push_str("shift+");
+        }
+        if self.mods.contains(KeyModifiers::SUPER) {
+            s.push_str("cmd+");
+        }
+        let base = match self.code {
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::Tab => "tab".to_string(),
+            KeyCode::Esc => "esc".to_string(),
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::Home => "home".to_string(),
+            KeyCode::End => "end".to_string(),
+            KeyCode::Backspace => "backspace".to_string(),
+            KeyCode::Delete => "delete".to_string(),
+            KeyCode::PageUp => "pageup".to_string(),
+            KeyCode::PageDown => "pagedown".to_string(),
+            other => format!("{other:?}").to_lowercase(),
+        };
+        s.push_str(&base);
+        s
+    }
 }
 
 /// A configurable binding table (R-10-018). Pi defaults (`core/keybindings.ts:63-202`): Ctrl+D →
@@ -159,6 +297,7 @@ impl Default for Keymap {
                 (Key::plain(KeyCode::Esc), Action::Interrupt),
                 (Key::ctrl('z'), Action::Suspend),
                 (Key::ctrl('o'), Action::ToolsExpand),
+                (Key::ctrl('g'), Action::ExternalEditor),
                 (Key::plain(KeyCode::PageUp), Action::PageUp),
                 (Key::plain(KeyCode::PageDown), Action::PageDown),
             ],
@@ -181,6 +320,39 @@ impl Keymap {
     /// Resolve the global action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// All keys currently bound to `action` (the reverse of [`action_for`](Self::action_for)).
+    pub fn keys_for(&self, action: Action) -> Vec<Key> {
+        self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
+    }
+
+    /// The label of the first key bound to `action` (`esc`, `ctrl+c`), or `None` if unbound. Drives
+    /// status-band hints like `(esc to cancel)` from the live keymap (spec/tui/01 §6.1).
+    pub fn key_label(&self, action: Action) -> Option<String> {
+        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// Rebind `action` to exactly `keys`, dropping any keys it was previously bound to **and** taking
+    /// each new key away from whatever other action held it (a key maps to exactly one global action,
+    /// matching `core/keybindings.ts` where a rebind moves the key).
+    pub fn set_action(&mut self, action: Action, keys: Vec<Key>) {
+        self.bindings.retain(|(k, a)| *a != action && !keys.contains(k));
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document (spec/tui/07 §3.9; `core/keybindings.ts:14-262`): each
+    /// recognized `app.*` id **replaces** that action's key set with the listed key spec(s). Ids for
+    /// the editor/select maps (and unknown ids) are ignored here. Malformed JSON or key specs error.
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = Action::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -224,6 +396,24 @@ impl SelectKeymap {
     /// Resolve the selector action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<SelectAction> {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: SelectAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `tui.select.*` ids (spec/tui/05 §10).
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = SelectAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -301,5 +491,29 @@ impl EditorKeymap {
     /// Resolve the editor action for an event, if any.
     pub fn action_for(&self, ev: &KeyEvent) -> Option<EditorAction> {
         self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// The label of the first key bound to `action` (`enter`, `ctrl+w`), or `None` if unbound. Drives
+    /// the `/hotkeys` table from the live editor keymap (`getEditorKeyDisplay`, interactive-mode.ts).
+    pub fn key_label(&self, action: EditorAction) -> Option<String> {
+        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: EditorAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `editor.*` ids (spec/tui/03 §6.1).
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = EditorAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
     }
 }

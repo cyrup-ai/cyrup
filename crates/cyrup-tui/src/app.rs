@@ -19,6 +19,7 @@ use cyrup_core::{CancelToken, EventStream};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
+use cyrup_session_svc::ForkPosition;
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -38,11 +39,18 @@ use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
-use crate::keymap::{Action, Keymap, SelectKeymap};
+use crate::keymap::{Action, EditorAction, Keymap, SelectKeymap};
+use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
 use crate::selector::{ListSelector, Selector, SelectorKind, SelectorOutcome};
 use crate::status::StatusLine;
+use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
 use crate::theme::UiTheme;
-use crate::transcript::{content_text, entry_line, TranscriptView};
+use crate::transcript::{content_text, entry_lines, TranscriptView};
+
+/// The number of visual lines a `PageUp`/`PageDown` scrolls the active region by (a conservative
+/// screenful; spec/tui/07 page-scroll). Resolved on the pure input thread without the live viewport
+/// height, then clamped against the real content at render time.
+const PAGE_SCROLL_LINES: usize = 10;
 
 /// The decision produced by feeding one input event to the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,10 +61,57 @@ pub enum AppAction {
     Interrupt,
     /// The user requested to quit the session.
     Quit,
+    /// The user requested to suspend the process to the background (Ctrl+Z / SIGTSTP). The run loop
+    /// tears down raw mode, raises `SIGTSTP`, and re-enters raw mode on `SIGCONT`.
+    Suspend,
+    /// A `!`/`!!` bash invocation: the run loop spawns the shell command, streams its output into the
+    /// live bash block, and (for `!`, not `!!`) feeds the result back into the session context
+    /// (`bash-execution.ts`; interactive-mode.ts `!` handler).
+    RunBash { command: String, excluded: bool },
+    /// Open the editor buffer in `$VISUAL`/`$EDITOR` (Ctrl+G, `app.editor.external`): the run loop
+    /// tears the terminal down, launches the editor on a temp file, then reloads the buffer
+    /// (`openExternalEditor`, interactive-mode.ts:3611).
+    OpenExternalEditor,
+    /// A recognized slash command whose effect lives at the session/data layer (`setupEditorSubmitHandler`,
+    /// interactive-mode.ts:2549-2734). The run loop executes it against the [`AgentSession`] (open a
+    /// data-bound selector after sourcing its rows, drive the session lifecycle, export, copy, …).
+    Command(AppCommand),
     /// State changed; the frame should be redrawn.
     Redraw,
     /// Nothing to do.
     None,
+}
+
+/// A slash command whose execution the run loop performs against the session/resources layer (the
+/// in-crate effects — `/hotkeys`, `/debug`, `/changelog`, `/quit`, the 3 dependency-free selectors —
+/// are applied directly in [`App::dispatch_submission`] and never become an `AppCommand`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppCommand {
+    /// Open a data-bound selector; the run loop sources its rows from session-svc / resources.
+    OpenSelector(SelectorKind),
+    /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
+    /// branch, login/logout, etc.
+    ConfirmSelection { kind: SelectorKind, value: String },
+    /// `/new` — start a fresh session (`handleClearCommand`).
+    NewSession,
+    /// `/compact [instructions]` — manually compact context (`handleCompactCommand`).
+    Compact(Option<String>),
+    /// `/clone` — duplicate the session at the current position (`handleCloneCommand`).
+    Clone,
+    /// `/reload` — rebuild keybindings/extensions/skills/prompts/themes (`handleReloadCommand`).
+    Reload,
+    /// `/export [path]` — export the session (`handleExportCommand`).
+    Export(Option<String>),
+    /// `/import <path>` — import + resume a JSONL session (`handleImportCommand`).
+    Import(Option<String>),
+    /// `/share` — publish the session as a secret gist (`handleShareCommand`).
+    Share,
+    /// `/copy` — copy the last assistant message to the clipboard (`handleCopyCommand`).
+    Copy,
+    /// `/name <name>` — set the session display name (`handleNameCommand`).
+    SetName(String),
+    /// `/session` — show session info + stats (`handleSessionCommand`).
+    SessionInfo,
 }
 
 /// All retained UI state (the data half of the `state -> frame` split).
@@ -64,6 +119,9 @@ pub struct AppState {
     pub transcript: TranscriptView,
     pub editor: InputEditor,
     pub status: StatusLine,
+    /// The working/idle status band (spec/tui/01 §6) — a 2-row spinner+message while a turn/retry/
+    /// compaction runs, blank when idle. Driven by `AgentSessionEvent`s in [`App::ingest_event`].
+    pub indicator: StatusIndicator,
     pub theme: UiTheme,
     pub keymap: Keymap,
     /// The selector binding table (`tui.select.*`, spec/tui/05 §10) consulted while a selector owns
@@ -74,11 +132,17 @@ pub struct AppState {
     /// The active editor-swap selector, if any (spec/tui/05 §1.1): when `Some`, it replaces the
     /// editor in the bottom inline region and captures input until it confirms/cancels.
     pub selector: Option<ActiveSelector>,
+    /// The floating overlay z-stack (spec/tui/05 §2): hotkeys/help popup (and, later, extension UI).
+    /// The topmost overlay captures input; rendered over the live region bottom→top.
+    pub overlays: Vec<Box<dyn Overlay>>,
     /// The current reasoning level (`off`…`xhigh`), preselected by the thinking selector and updated
     /// on confirm. The authoritative level lives on the agent/session at the L7 layer.
     pub thinking_level: String,
     /// Whether inline images are shown (vs. a text placeholder), toggled by the show-images selector.
     pub show_images: bool,
+    /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
+    /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
+    pub reserve_status_rows: bool,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
@@ -94,13 +158,16 @@ impl AppState {
             transcript: TranscriptView::new(),
             editor: InputEditor::new(),
             status: StatusLine::default(),
+            indicator: StatusIndicator::new(),
             theme,
             keymap: Keymap::default(),
             select_keymap: SelectKeymap::default(),
             commands: CommandRegistry::new(),
             selector: None,
+            overlays: Vec::new(),
             thinking_level: "medium".to_string(),
             show_images: true,
+            reserve_status_rows: false,
             should_quit: false,
             scrollback: Vec::new(),
         }
@@ -201,8 +268,12 @@ impl<B: Backend> App<B> {
         if committed.is_empty() {
             return Ok(());
         }
-        let lines: Vec<Line<'static>> =
-            committed.iter().map(|e| entry_line(e, &self.state.theme)).collect();
+        // Content width for markdown wrapping: the live terminal width (R-ARCH-TUI-005), fallback 80.
+        let width = self.terminal.backend().size().map(|s| s.width as usize).unwrap_or(80);
+        let lines: Vec<Line<'static>> = committed
+            .iter()
+            .flat_map(|e| entry_lines(e, &self.state.theme, width))
+            .collect();
         self.state.scrollback.extend(lines.iter().cloned());
         let style = self.state.theme.base_style();
         let height = lines.len().min(u16::MAX as usize) as u16;
@@ -221,6 +292,12 @@ impl<B: Backend> App<B> {
             InputEvent::Key(key) => {
                 if matches!(key.kind, KeyEventKind::Release) {
                     return AppAction::None;
+                }
+                // A floating overlay (hotkeys/help popup) captures input first (spec/tui/05 §2
+                // routing step 2): the topmost overlay handles the key; `Close` pops it, an unhandled
+                // key is swallowed so it never leaks to the editor/agent beneath the modal.
+                if !self.state.overlays.is_empty() {
+                    return self.handle_overlay_key(key);
                 }
                 // A focused selector captures input first (spec/tui/05 §2 routing step 2): its
                 // navigation/confirm/cancel keys are handled before the global keymap, so `Esc`/`Ctrl+C`
@@ -271,20 +348,110 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_user(prompt.clone());
                 AppAction::Submit(prompt)
             }
-            Dispatch::Command { name, arg } => {
-                let label = match arg {
-                    Some(a) => format!("/{name} {a}"),
-                    None => format!("/{name}"),
-                };
-                self.state.transcript.push_status(format!("command: {label}"));
+            Dispatch::Command { name, arg } => self.run_command(&name, arg),
+            Dispatch::Bash { command, excluded } => {
+                // Open the live bash block (`bash-execution.ts`) and hand the spawn to the run loop.
+                let cancel = self.state.keymap.key_label(Action::Interrupt);
+                let expand = self.state.keymap.key_label(Action::ToolsExpand);
+                self.state.transcript.start_bash(command.clone(), excluded, cancel, expand);
+                AppAction::RunBash { command, excluded }
+            }
+        }
+    }
+
+    /// Route a recognized slash command (`setupEditorSubmitHandler`, interactive-mode.ts:2554-2734).
+    /// In-crate effects (the 3 dependency-free selectors, info blocks, quit) are applied here directly
+    /// and return [`AppAction::Redraw`]; session/data-bound effects return [`AppAction::Command`] for
+    /// the run loop to execute against the [`AgentSession`].
+    fn run_command(&mut self, name: &str, arg: Option<String>) -> AppAction {
+        use AppCommand as C;
+        let cmd = |c| AppAction::Command(c);
+        match name {
+            // --- in-crate selectors (dependency-free) ---
+            "think" => {
+                self.open_selector(SelectorKind::Thinking);
                 AppAction::Redraw
             }
-            Dispatch::Bash { command, excluded } => {
-                let marker = if excluded { "!!" } else { "!" };
-                self.state.transcript.push_status(format!("bash ({marker}): {command}"));
+            "theme" => {
+                self.open_selector(SelectorKind::Theme);
+                AppAction::Redraw
+            }
+            "show-images" => {
+                self.open_selector(SelectorKind::ShowImages);
+                AppAction::Redraw
+            }
+            // --- data-bound selectors (run loop sources rows) ---
+            "model" => cmd(C::OpenSelector(SelectorKind::Model)),
+            "settings" => cmd(C::OpenSelector(SelectorKind::Settings)),
+            "scoped-models" => cmd(C::OpenSelector(SelectorKind::ScopedModels)),
+            "tree" => cmd(C::OpenSelector(SelectorKind::Tree)),
+            "resume" => cmd(C::OpenSelector(SelectorKind::Session)),
+            "trust" => cmd(C::OpenSelector(SelectorKind::Trust)),
+            "fork" => cmd(C::OpenSelector(SelectorKind::UserMessage)),
+            "login" => cmd(C::OpenSelector(SelectorKind::Login)),
+            "logout" => cmd(C::OpenSelector(SelectorKind::Logout)),
+            // --- session lifecycle / IO (run loop) ---
+            "new" => cmd(C::NewSession),
+            "compact" => cmd(C::Compact(arg)),
+            "clone" => cmd(C::Clone),
+            "reload" => cmd(C::Reload),
+            "export" => cmd(C::Export(arg)),
+            "import" => cmd(C::Import(arg)),
+            "share" => cmd(C::Share),
+            "copy" => cmd(C::Copy),
+            "name" => match arg {
+                Some(n) => cmd(C::SetName(n)),
+                None => {
+                    self.state.transcript.push_status("usage: /name <session name>");
+                    AppAction::Redraw
+                }
+            },
+            "session" => cmd(C::SessionInfo),
+            // --- in-crate info blocks ---
+            "hotkeys" => {
+                // A floating, dismissable overlay (spec/tui/05 §2), not a scrollback block.
+                self.open_hotkeys_overlay();
+                AppAction::Redraw
+            }
+            "changelog" => {
+                self.state.transcript.push_block("What's New", "No changelog entries found.");
+                AppAction::Redraw
+            }
+            "debug" => {
+                let body = self.debug_markdown();
+                self.state.transcript.push_block("Debug", body);
+                AppAction::Redraw
+            }
+            "quit" => {
+                self.state.should_quit = true;
+                AppAction::Quit
+            }
+            // Easter eggs (`arminsayshi`/`dementedelves`) + any unhandled recognized name: a status.
+            other => {
+                self.state.transcript.push_status(format!("command: /{other}"));
                 AppAction::Redraw
             }
         }
+    }
+
+    /// Build the `/debug` info block (`handleDebugCommand`, interactive-mode.ts:5526): terminal size,
+    /// active theme + generation, thinking level, and selector/stream state.
+    fn debug_markdown(&self) -> String {
+        let size = self.terminal.backend().size().ok();
+        let (w, h) = size.map(|s| (s.width, s.height)).unwrap_or((0, 0));
+        format!(
+            "| Field | Value |\n|-------|-------|\n\
+             | terminal | {w}×{h} |\n\
+             | theme | {} (gen {}) |\n\
+             | thinking | {} |\n\
+             | show images | {} |\n\
+             | streaming | {} |\n",
+            self.state.theme.name,
+            self.state.theme.generation,
+            self.state.thinking_level,
+            self.state.show_images,
+            self.state.status.streaming,
+        )
     }
 
     /// Resolve a global keymap action (R-10-024 Ctrl+C, R-10-030 abort).
@@ -295,8 +462,16 @@ impl<B: Backend> App<B> {
                 AppAction::Quit
             }
             Action::Interrupt => {
+                // A running `!`/`!!` bash block is cancelled first (the run loop kills the child),
+                // mirroring Pi's `tui.select.cancel` on the bash component.
+                if self.state.transcript.bash_running() {
+                    self.state.transcript.bash_complete(None, true);
+                    self.state.transcript.commit_bash();
+                }
                 self.state.transcript.discard_streaming();
+                self.state.transcript.commit_tools();
                 self.state.status.set_streaming(false);
+                self.state.indicator.idle();
                 AppAction::Interrupt
             }
             // `app.clear` (Ctrl+C): clear the editor buffer; if it was already empty Pi treats a
@@ -305,14 +480,116 @@ impl<B: Backend> App<B> {
                 self.state.editor.clear();
                 AppAction::Redraw
             }
-            // `app.suspend` / `app.tools.expand` / page scroll are surfaced as actions for the run
-            // loop to handle (SIGTSTP, expand toggle, transcript paging); the chrome itself only
-            // redraws. Full wiring of suspend + transcript scroll is tracked on the residual ledger.
-            Action::Suspend
-            | Action::ToolsExpand
-            | Action::PageUp
-            | Action::PageDown => AppAction::Redraw,
+            // `app.tools.expand` (Ctrl+O) toggles tool-output expansion in-crate (`tool-execution.ts`
+            // expand); the live tools re-render expanded/collapsed on the next frame.
+            Action::ToolsExpand => {
+                // `Ctrl+O` toggles the live bash block when one is present (`bash-execution.ts`
+                // `setExpanded`), else the tool-output expansion.
+                if self.state.transcript.has_bash() {
+                    self.state.transcript.toggle_bash_expanded();
+                } else {
+                    self.state.transcript.toggle_tool_expanded();
+                }
+                AppAction::Redraw
+            }
+            // `app.suspend` (Ctrl+Z) is surfaced to the run loop, which tears down raw mode, raises
+            // SIGTSTP, and re-enters on SIGCONT (the raise lives in an isolated allow-unsafe shim).
+            Action::Suspend => AppAction::Suspend,
+            // `app.editor.external` (Ctrl+G): surfaced to the run loop, which restores the terminal,
+            // launches `$VISUAL`/`$EDITOR` on the buffer, and reloads it.
+            Action::ExternalEditor => AppAction::OpenExternalEditor,
+            // Page scroll over the **active region** (spec/tui/07): committed history lives in the
+            // terminal's native scrollback (paged with the terminal's own scroll, ADR-0001), but the
+            // in-flight streaming/tool/bash output can exceed the viewport — `PageUp`/`PageDown` page
+            // it without losing the live tail. The page size is one screenful, resolved at render time
+            // against the live viewport; a fixed conservative page keeps this input-thread pure.
+            Action::PageUp => {
+                self.state.transcript.page_up(PAGE_SCROLL_LINES);
+                AppAction::Redraw
+            }
+            Action::PageDown => {
+                self.state.transcript.page_down(PAGE_SCROLL_LINES);
+                AppAction::Redraw
+            }
         }
+    }
+
+    /// Route one key to the topmost floating overlay (spec/tui/05 §2 step 2). `Close` pops it; any
+    /// other outcome stays open and redraws. A no-op when the stack is empty.
+    fn handle_overlay_key(&mut self, key: &event::KeyEvent) -> AppAction {
+        let Some(top) = self.state.overlays.last_mut() else { return AppAction::None };
+        match top.handle(key) {
+            OverlayOutcome::Close => {
+                self.state.overlays.pop();
+                AppAction::Redraw
+            }
+            OverlayOutcome::Redraw | OverlayOutcome::Ignored => AppAction::Redraw,
+        }
+    }
+
+    /// Push the hotkeys/help popup onto the overlay stack (`/hotkeys` → `handleHotkeysCommand`,
+    /// interactive-mode.ts:5396-5470). Rows are derived from the **live** keymaps so rebinds reflect.
+    pub fn open_hotkeys_overlay(&mut self) {
+        let rows = self.hotkey_rows();
+        self.state.overlays.push(Box::new(HotkeysOverlay::new("Keyboard Shortcuts", rows)));
+    }
+
+    /// Whether a floating overlay is currently open (test/inspection access).
+    pub fn overlay_open(&self) -> bool {
+        !self.state.overlays.is_empty()
+    }
+
+    /// Build the hotkeys popup rows from the live editor + global keymaps (the structured form of
+    /// [`hotkeys_markdown`](Self::hotkeys_markdown); same bindings, rebind-aware).
+    fn hotkey_rows(&self) -> Vec<HotkeyRow> {
+        let ek = self.state.editor.keymap_ref();
+        let km = &self.state.keymap;
+        let e = |a: EditorAction| ek.key_label(a).unwrap_or_else(|| "—".to_string());
+        let g = |a: Action| km.key_label(a).unwrap_or_else(|| "—".to_string());
+        let entry = |keys: String, desc: &str| HotkeyRow::Entry { keys, desc: desc.to_string() };
+        vec![
+            HotkeyRow::Section("Navigation".to_string()),
+            entry(
+                format!(
+                    "{}/{}/{}/{}",
+                    e(EditorAction::CursorUp),
+                    e(EditorAction::CursorDown),
+                    e(EditorAction::CursorLeft),
+                    e(EditorAction::CursorRight)
+                ),
+                "Move cursor / browse history",
+            ),
+            entry(
+                format!("{}/{}", e(EditorAction::CursorWordLeft), e(EditorAction::CursorWordRight)),
+                "Move by word",
+            ),
+            entry(e(EditorAction::CursorLineStart), "Start of line"),
+            entry(e(EditorAction::CursorLineEnd), "End of line"),
+            entry(e(EditorAction::JumpForward), "Jump forward to character"),
+            entry(e(EditorAction::JumpBackward), "Jump backward to character"),
+            entry(format!("{}/{}", g(Action::PageUp), g(Action::PageDown)), "Scroll by page"),
+            HotkeyRow::Section("Editing".to_string()),
+            entry(e(EditorAction::Submit), "Send message"),
+            entry(e(EditorAction::NewLine), "New line"),
+            entry(e(EditorAction::DeleteWordBackward), "Delete word backwards"),
+            entry(e(EditorAction::DeleteWordForward), "Delete word forwards"),
+            entry(e(EditorAction::DeleteToLineStart), "Delete to start of line"),
+            entry(e(EditorAction::DeleteToLineEnd), "Delete to end of line"),
+            entry(e(EditorAction::Yank), "Paste most-recently-deleted text"),
+            entry(e(EditorAction::YankPop), "Cycle deleted text after pasting"),
+            entry(e(EditorAction::Undo), "Undo"),
+            HotkeyRow::Section("Other".to_string()),
+            entry(e(EditorAction::Tab), "Path completion / accept autocomplete"),
+            entry(g(Action::Interrupt), "Cancel autocomplete / abort streaming"),
+            entry(g(Action::Clear), "Clear editor (first) / exit (second)"),
+            entry(g(Action::Quit), "Quit"),
+            entry(g(Action::Suspend), "Suspend to background"),
+            entry(g(Action::ToolsExpand), "Toggle tool output expansion"),
+            entry(g(Action::ExternalEditor), "Open buffer in external editor"),
+            entry("/".to_string(), "Slash commands"),
+            entry("!".to_string(), "Run bash command"),
+            entry("!!".to_string(), "Run bash command (excluded from context)"),
+        ]
     }
 
     /// Open an editor-swap selector (spec/tui/05 §1.1 `showSelector`): snapshot the editor text, build
@@ -331,8 +608,27 @@ impl<B: Backend> App<B> {
                 Box::new(ListSelector::theme(&self.state.theme.name)),
                 Some(self.state.theme.clone()),
             ),
+            // Data-bound selectors must be opened via `open_data_selector` (they need L5 rows);
+            // opening one with no data yields an empty-state list rather than a panic.
+            other => (Box::new(ListSelector::data(other, Vec::new(), 0)), None),
         };
         self.state.selector = Some(ActiveSelector { kind, inner, saved_editor, restore_theme });
+    }
+
+    /// Open a **data-bound** selector (`/model`, `/resume`, `/tree`, …) over rows the run loop sourced
+    /// from session-svc / resources (spec/tui/05 §6, §8 late-data population). `rows` are
+    /// `(value, label, description)`; `selected` preselects a row. Confirming hands the chosen `value`
+    /// back to the run loop as [`AppCommand::ConfirmSelection`].
+    pub fn open_data_selector(
+        &mut self,
+        kind: SelectorKind,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+    ) {
+        let saved_editor = self.state.editor.text();
+        let inner: Box<dyn Selector> = Box::new(ListSelector::data(kind, rows, selected));
+        self.state.selector =
+            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
     }
 
     /// The kind of the currently-open selector, if any (test/inspection access).
@@ -359,9 +655,12 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
             SelectorOutcome::Confirm(value) => {
-                self.confirm_selector(kind, &value);
+                let command = self.confirm_selector(kind, &value);
                 self.close_selector(false);
-                AppAction::Redraw
+                match command {
+                    Some(c) => AppAction::Command(c),
+                    None => AppAction::Redraw,
+                }
             }
             SelectorOutcome::Cancel => {
                 self.close_selector(true);
@@ -370,25 +669,158 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Apply a confirmed selection. Theme is fully applied in-crate; thinking-level + show-images
-    /// persistence reaches the agent/settings at the L7 binary layer, so here we record the choice in
-    /// app state and surface a status line (the same seam `/think` cycling uses).
-    fn confirm_selector(&mut self, kind: SelectorKind, value: &str) {
+    /// Apply a confirmed selection. The three dependency-free selectors (theme/thinking/show-images)
+    /// are applied fully in-crate and return `None`; the data-bound selectors return an
+    /// [`AppCommand::ConfirmSelection`] so the run loop applies the effect at the session layer (set
+    /// model, switch branch, login…).
+    fn confirm_selector(&mut self, kind: SelectorKind, value: &str) -> Option<AppCommand> {
         match kind {
             SelectorKind::Theme => {
                 self.set_theme(UiTheme::builtin(value));
                 self.state.transcript.push_status(format!("theme → {value}"));
+                None
             }
             SelectorKind::Thinking => {
                 self.state.thinking_level = value.to_string();
                 self.state.status.set_thinking_level(value);
                 self.state.transcript.push_status(format!("thinking → {value}"));
+                None
             }
             SelectorKind::ShowImages => {
                 self.state.show_images = value == "yes";
                 let label = if self.state.show_images { "inline" } else { "placeholder" };
                 self.state.transcript.push_status(format!("images → {label}"));
+                None
             }
+            other => Some(AppCommand::ConfirmSelection { kind: other, value: value.to_string() }),
+        }
+    }
+
+    /// Execute a session/data-bound [`AppCommand`] against the live [`AgentSession`]
+    /// (`setupEditorSubmitHandler` command handlers, interactive-mode.ts:2554-2734). Data-bound
+    /// selectors source their rows here (spec/tui/05 §8 late-data population) and open via
+    /// [`open_data_selector`](Self::open_data_selector); lifecycle/IO commands call the matching
+    /// session method and surface a status line / info block. Errors degrade to a status line.
+    pub async fn execute_command(&mut self, cmd: AppCommand, session: &Arc<AgentSession>) {
+        use AppCommand as C;
+        match cmd {
+            C::OpenSelector(SelectorKind::Model | SelectorKind::ScopedModels) => {
+                let kind = if matches!(cmd, C::OpenSelector(SelectorKind::ScopedModels)) {
+                    SelectorKind::ScopedModels
+                } else {
+                    SelectorKind::Model
+                };
+                let current = session.model().model.to_string();
+                let rows: Vec<(String, String, Option<String>)> = session
+                    .scoped_models()
+                    .into_iter()
+                    .map(|sm| {
+                        let id = sm.model.id.to_string();
+                        (id.clone(), sm.model.name.clone(), Some(sm.model.provider.to_string()))
+                    })
+                    .collect();
+                let selected = rows.iter().position(|(v, _, _)| *v == current).unwrap_or(0);
+                if rows.is_empty() {
+                    self.state.transcript.push_status("no models available (configure providers)");
+                } else {
+                    self.open_data_selector(kind, rows, selected);
+                }
+            }
+            C::OpenSelector(SelectorKind::UserMessage) => {
+                let rows: Vec<(String, String, Option<String>)> = session
+                    .user_messages_for_forking()
+                    .await
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        (a.entry_id.to_string(), a.text.clone(), Some(format!("message {}", i + 1)))
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    self.state.transcript.push_status("no user messages to fork from");
+                } else {
+                    let last = rows.len().saturating_sub(1);
+                    self.open_data_selector(SelectorKind::UserMessage, rows, last);
+                }
+            }
+            C::OpenSelector(other) => {
+                // Session/Tree/Settings/Trust/Login/Logout need richer L5/host sourcing than is wired
+                // here yet; surface the request so the path is real (no silent drop).
+                self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
+            }
+            C::ConfirmSelection { kind: SelectorKind::Model, value } => {
+                match session.set_model(&value).await {
+                    Ok(_) => self.state.transcript.push_status(format!("model → {value}")),
+                    Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+                }
+            }
+            C::ConfirmSelection { kind: SelectorKind::UserMessage, value } => {
+                let entry = cyrup_core::EntryId::from(value.as_str());
+                match session.fork_at_entry(&entry, ForkPosition::Before).await {
+                    Ok(_) => self.state.transcript.push_status("forked from message"),
+                    Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                }
+            }
+            C::ConfirmSelection { kind, value } => {
+                self.state.transcript.push_status(format!("{} → {value}", kind.title()));
+            }
+            C::Compact(arg) => match session.compact(arg).await {
+                Ok(_) => self.state.transcript.push_status("compacted context"),
+                Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
+            },
+            C::Clone => match session.clone_at(None).await {
+                Ok(id) => self.state.transcript.push_status(format!("cloned session → {id}")),
+                Err(e) => self.state.transcript.push_status(format!("clone error: {e}")),
+            },
+            C::Export(arg) => {
+                let path = arg.as_deref().map(std::path::Path::new);
+                match session.export_to_jsonl(path).await {
+                    Ok(Some(_text)) => self.state.transcript.push_status("exported session (jsonl)"),
+                    Ok(None) => {
+                        let label = arg.unwrap_or_default();
+                        self.state.transcript.push_status(format!("exported session → {label}"));
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                }
+            }
+            C::SetName(name) => match session.set_session_name(&name).await {
+                Ok(()) => self.state.transcript.push_status(format!("session name → {name}")),
+                Err(e) => self.state.transcript.push_status(format!("name error: {e}")),
+            },
+            C::Copy => match session.last_assistant_text().await {
+                Some(text) => {
+                    let n = text.chars().count();
+                    copy_to_clipboard(&text);
+                    self.state.transcript.push_status(format!("copied last message ({n} chars)"));
+                }
+                None => self.state.transcript.push_status("no assistant message to copy"),
+            },
+            C::SessionInfo => {
+                let stats = session.session_stats().await;
+                let body = format!(
+                    "| Field | Value |\n|-------|-------|\n\
+                     | messages | {} |\n| user | {} |\n| assistant | {} |\n\
+                     | tool results | {} |\n| input tokens | {} |\n| output tokens | {} |\n\
+                     | cache tokens | {} |\n",
+                    stats.message_count,
+                    stats.user_message_count,
+                    stats.assistant_message_count,
+                    stats.tool_result_count,
+                    stats.input_tokens,
+                    stats.output_tokens,
+                    stats.cache_tokens,
+                );
+                self.state.transcript.push_block("Session", body);
+            }
+            // Runtime-level ops (new session, import, share, resource reload) live at the L7 runtime
+            // host, not on `AgentSession`; surface the request (the host wires the actual op).
+            C::NewSession => self.state.transcript.push_status("starting new session…"),
+            C::Reload => self.state.transcript.push_status("reloading resources…"),
+            C::Import(p) => self
+                .state
+                .transcript
+                .push_status(format!("importing session {}", p.unwrap_or_default())),
+            C::Share => self.state.transcript.push_status("sharing session…"),
         }
     }
 
@@ -413,36 +845,64 @@ impl<B: Backend> App<B> {
     /// token-by-token render (gap 1) is live, not deferred.
     pub fn ingest_event(&mut self, ev: &AgentSessionEvent) {
         match ev {
-            AgentSessionEvent::AgentStart => self.state.status.set_streaming(true),
+            AgentSessionEvent::AgentStart => {
+                self.state.status.set_streaming(true);
+                self.state.indicator.working();
+            }
             AgentSessionEvent::AgentEnd { .. } => {
                 self.state.status.set_streaming(false);
+                self.state.indicator.idle();
                 self.state.transcript.commit_assistant(None);
+                // Commit the turn's live tool executions into scrollback (`tool-execution.ts` tools
+                // persist through the turn, then scroll up as committed history).
+                self.state.transcript.commit_tools();
             }
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
             AgentSessionEvent::MessageStart { .. } | AgentSessionEvent::MessageEnd { .. } => {}
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
                 self.ingest_stream_event(assistant_message_event);
             }
-            AgentSessionEvent::ToolExecutionStart { tool_name, .. } => {
-                self.state.transcript.push_tool_start(tool_name.clone());
+            AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
+                self.state.transcript.push_tool_start(tool_name.clone(), tool_args_summary(args));
             }
-            AgentSessionEvent::ToolExecutionUpdate { .. } => {}
-            AgentSessionEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
-                self.state.transcript.push_tool_end(tool_name.clone(), *is_error);
+            AgentSessionEvent::ToolExecutionUpdate { partial_result, .. } => {
+                self.state.transcript.push_tool_update(tool_result_text(partial_result));
+            }
+            AgentSessionEvent::ToolExecutionEnd { tool_name, is_error, result, .. } => {
+                self.state.transcript.push_tool_end(
+                    tool_name.clone(),
+                    *is_error,
+                    tool_result_text(result),
+                );
             }
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
                 self.state.status.set_queued(steering.len().saturating_add(follow_up.len()));
             }
             AgentSessionEvent::CompactionStart { .. } => {
+                self.state.indicator.set(IndicatorKind::Compaction, None);
                 self.state.transcript.push_status("compacting context…");
             }
             AgentSessionEvent::CompactionEnd { .. } => {
+                // Back to working if the turn is still streaming, else idle.
+                if self.state.status.streaming {
+                    self.state.indicator.working();
+                } else {
+                    self.state.indicator.idle();
+                }
                 self.state.transcript.push_status("compaction complete");
             }
             AgentSessionEvent::AutoRetryStart { attempt, max_attempts, .. } => {
+                self.state
+                    .indicator
+                    .set(IndicatorKind::Retry, Some(format!("Retrying ({attempt}/{max_attempts})…")));
                 self.state.transcript.push_status(format!("retrying ({attempt}/{max_attempts})…"));
             }
             AgentSessionEvent::AutoRetryEnd { success, .. } => {
+                if self.state.status.streaming {
+                    self.state.indicator.working();
+                } else {
+                    self.state.indicator.idle();
+                }
                 self.state
                     .transcript
                     .push_status(if *success { "retry succeeded" } else { "retry ended" });
@@ -470,6 +930,7 @@ impl<B: Backend> App<B> {
             }
             AgentSessionEvent::SessionReplaced { .. } => {
                 self.state.status.set_streaming(false);
+                self.state.indicator.idle();
             }
         }
     }
@@ -516,6 +977,91 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Derive a one-line argument summary for a tool call from its JSON args (`renderCall` summary,
+/// `tool-execution.ts`). Prefers the conventional positional keys (`file_path`/`path`/`command`/
+/// `pattern`/`url`/`query`); falls back to the first string value, else a compact JSON of scalars.
+fn tool_args_summary(args: &serde_json::Value) -> Option<String> {
+    let obj = args.as_object()?;
+    for key in ["file_path", "path", "command", "pattern", "url", "query", "prompt", "name"] {
+        if let Some(v) = obj.get(key).and_then(|v| v.as_str())
+            && !v.is_empty()
+        {
+            return Some(truncate_summary(v));
+        }
+    }
+    // First string-valued field, else nothing (avoid dumping nested objects).
+    obj.values()
+        .find_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(truncate_summary)
+}
+
+/// Extract human-readable text from a tool result JSON value (`getTextOutput`,
+/// `core/tools/render-utils.ts`): a string is used verbatim; an object's `text`/`output`/`content`
+/// string field is preferred; an array of `{text}` blocks is joined; otherwise `None`.
+fn tool_result_text(result: &serde_json::Value) -> Option<String> {
+    fn from_value(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                for key in ["text", "output", "stdout", "content", "message"] {
+                    if let Some(s) = o.get(key).and_then(|x| x.as_str()) {
+                        return Some(s.to_string());
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                let joined: Vec<String> = items.iter().filter_map(from_value).collect();
+                (!joined.is_empty()).then(|| joined.join("\n"))
+            }
+            _ => None,
+        }
+    }
+    from_value(result).filter(|s| !s.trim().is_empty())
+}
+
+/// Copy `text` to the system clipboard best-effort via the platform CLI (`pbcopy` on macOS, `xclip`/
+/// `wl-copy` on Linux). No new dependency and no unsafe — a missing tool is silently ignored
+/// (`handleCopyCommand` clipboard write, interactive-mode.ts:5285). Unix-only.
+#[cfg(unix)]
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let candidates: &[(&str, &[&str])] =
+        &[("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    for (bin, args) in candidates {
+        let child = std::process::Command::new(bin)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return;
+        }
+    }
+}
+
+/// No-op clipboard write on non-unix targets (the platform CLI tools are unix-only here).
+#[cfg(not(unix))]
+fn copy_to_clipboard(_text: &str) {}
+
+/// Truncate a one-line summary to a sane length (avoid overrunning the marker line).
+fn truncate_summary(s: &str) -> String {
+    const MAX: usize = 80;
+    let one_line = s.replace(['\n', '\r', '\t'], " ");
+    if one_line.chars().count() <= MAX {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(MAX.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
@@ -540,15 +1086,37 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     // The footer is two rows (location + usage/model) per spec/tui/01 §4; it collapses to one when
     // the viewport is too short to spare the second row.
     let chrome_h = slot_h.saturating_add(popup_h);
-    let footer_h = if area.height >= chrome_h.saturating_add(3) { 2 } else { 1 };
-    let [msg_area, slot_area, popup_area, status_area] = Layout::vertical([
+    // The footer is up to three rows (location · usage/model · extension statuses, spec/tui/01 §4 +
+    // footer.ts:232-241). The third row only appears when an extension published a status; each row
+    // is dropped when the viewport is too short to spare it (always keeping ≥1 message row).
+    let footer_max: u16 = if state.status.has_extension_statuses() { 3 } else { 2 };
+    let footer_h = if area.height >= chrome_h.saturating_add(footer_max.saturating_add(1)) {
+        footer_max
+    } else if area.height >= chrome_h.saturating_add(3) {
+        2
+    } else {
+        1
+    };
+    // The working/idle status band (spec/tui/01 §6) is a 2-row region between the active turn and the
+    // editor — reserved only when an indicator is active AND there is comfortable room, so an idle
+    // viewport (and the short footer-only test layouts) keep their exact prior geometry (§6.3: Pi's
+    // non-`clearOnShrink` default is 0 idle rows). `reserve_status_rows` forces the 2 rows always.
+    let want_status = state.indicator.is_active() || state.reserve_status_rows;
+    let room = area.height >= chrome_h.saturating_add(footer_h).saturating_add(3);
+    let band_h: u16 = if want_status && room { 2 } else { 0 };
+    let [msg_area, band_area, slot_area, popup_area, status_area] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(band_h),
         Constraint::Length(slot_h),
         Constraint::Length(popup_h),
         Constraint::Length(footer_h),
     ])
     .areas(area);
     state.transcript.render(frame, msg_area, &state.theme);
+    if band_h > 0 {
+        let cancel = state.keymap.key_label(Action::Interrupt);
+        state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
+    }
     if let Some(active) = state.selector.as_mut() {
         active.inner.render(frame, slot_area, &state.theme);
     } else {
@@ -559,6 +1127,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         }
     }
     state.status.render(frame, status_area, &state.theme);
+    // Floating overlays draw last, on top of the live region, bottom→top (spec/tui/05 §2; arch-10
+    // §6.4): each clears its own `Rect` then renders its box.
+    for overlay in state.overlays.iter_mut() {
+        overlay.render(frame, area, &state.theme);
+    }
 }
 
 // ----------------------------------------------------------------- crossterm wiring ----
@@ -598,6 +1171,88 @@ impl App<CrosstermBackend<Stdout>> {
         Ok(())
     }
 
+    /// Suspend the process to the background (Ctrl+Z / `app.suspend`, `core/keybindings.ts`): tear the
+    /// terminal back down to a usable cooked state, raise `SIGTSTP` on our own process group so the
+    /// shell regains control, then — when the user `fg`s us and the kernel delivers `SIGCONT` — restore
+    /// raw mode + the inline viewport and redraw. The signal is raised by shelling out to `kill -s
+    /// TSTP <pid>` so the crate stays `#![forbid(unsafe_code)]` with **no** new dependency (a libc
+    /// `raise` would need an unsafe shim + a new dep; the `kill` path needs neither). Unix-only; on
+    /// other platforms it degrades to a redraw.
+    pub fn suspend(&mut self) -> Result<(), TuiError> {
+        self.restore()?;
+        #[cfg(unix)]
+        {
+            // Stop our own process group; `kill` exits before the stop takes effect, and we resume on
+            // SIGCONT (shell `fg`) at the next statement.
+            let pid = std::process::id().to_string();
+            let _ = std::process::Command::new("kill").args(["-s", "TSTP", &pid]).status();
+        }
+        // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region.
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        let _ = self.terminal.clear();
+        self.draw_synchronized()
+    }
+
+    /// Open the editor buffer in an external editor (Ctrl+G / `app.editor.external`,
+    /// `openExternalEditor` interactive-mode.ts:3611): resolve `$VISUAL`/`$EDITOR` (falling back to
+    /// `nano` on unix, `notepad` on Windows), write the buffer to a temp `*.pi.md`, tear the TUI down
+    /// to release the terminal, run the editor (inheriting stdio), and — on a clean exit — reload the
+    /// edited text (trailing newline stripped). The terminal is always restored, even on error. No
+    /// `unsafe`, no new dependency (`std::process` + `std::fs`).
+    pub fn open_external_editor(&mut self) -> Result<(), TuiError> {
+        let editor_cmd = std::env::var("VISUAL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| if cfg!(windows) { "notepad".to_string() } else { "nano".to_string() });
+
+        let current = self.state.editor.text();
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("cyrup-editor-{}.pi.md", std::process::id()));
+        if std::fs::write(&tmp, &current).is_err() {
+            self.state.transcript.push_status("external editor: could not write temp file");
+            return self.draw_synchronized();
+        }
+
+        // Release the terminal (cooked mode, no inline viewport) so the editor owns the screen.
+        self.restore()?;
+        // `editor arg1 arg2 … tmp` — split on spaces to support `code --wait`-style commands.
+        let mut parts = editor_cmd.split_whitespace();
+        let status = parts.next().map(|bin| {
+            std::process::Command::new(bin)
+                .args(parts)
+                .arg(&tmp)
+                .status()
+        });
+
+        // Reload on a clean exit; keep the original buffer otherwise (Pi: non-zero exit = no change).
+        if let Some(Ok(s)) = status
+            && s.success()
+            && let Ok(new_text) = std::fs::read_to_string(&tmp)
+        {
+            let trimmed = new_text.strip_suffix('\n').unwrap_or(&new_text);
+            self.state.editor.set_text(trimmed);
+        }
+        let _ = std::fs::remove_file(&tmp);
+
+        // Re-enter raw mode + bracketed paste + Kitty flags, then redraw the live region.
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        let _ = self.terminal.clear();
+        self.draw_synchronized()
+    }
+
     /// The interactive event loop: `select!` over terminal input, the agent event stream, theme
     /// hot-reload, and cancellation (arch-10 §5). Renders with synchronized output. Submissions are
     /// routed to `session` (steer while streaming, else a fresh prompt; R-10-030).
@@ -610,6 +1265,16 @@ impl App<CrosstermBackend<Stdout>> {
         cancel: CancelToken,
     ) -> Result<(), TuiError> {
         self.draw_synchronized()?;
+        // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
+        // indicator is active, so the Braille frame advances without a timer thread and an idle
+        // session never busy-loops (the branch is `if`-gated on `indicator.is_active()`).
+        let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
+        spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A live `!`/`!!` bash subprocess: its output receiver + a cancel token to kill it (`Esc`).
+        // Kept as run-loop locals (not on `self`) so the `select!` borrow does not collide with the
+        // input-arm `&mut self`.
+        let mut bash_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BashMsg>> = None;
+        let mut bash_cancel: Option<CancelToken> = None;
         loop {
             let theme_changed = async {
                 match theme_rx.as_mut() {
@@ -617,13 +1282,40 @@ impl App<CrosstermBackend<Stdout>> {
                     None => std::future::pending().await,
                 }
             };
+            let bash_next = async {
+                match bash_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = spinner.tick(), if self.state.indicator.is_active() => {
+                    self.draw_synchronized()?;
+                }
                 maybe_in = input.next() => {
                     let Some(ev) = maybe_in else { break };
                     match self.handle_input(&ev) {
                         AppAction::Quit => break,
-                        AppAction::Interrupt => session.abort(),
+                        AppAction::Suspend => self.suspend()?,
+                        AppAction::OpenExternalEditor => self.open_external_editor()?,
+                        AppAction::Interrupt => {
+                            session.abort();
+                            // Also kill a running bash child (the block was already marked cancelled
+                            // in `apply_action`); the reader task's terminal `Done` clears `bash_rx`.
+                            if let Some(c) = bash_cancel.take() {
+                                c.cancel();
+                            }
+                        }
+                        AppAction::RunBash { command, .. } => {
+                            // Replace any prior job (its token is dropped → child orphaned-but-exits).
+                            if let Some(c) = bash_cancel.take() {
+                                c.cancel();
+                            }
+                            let (rx, c) = spawn_bash(command);
+                            bash_rx = Some(rx);
+                            bash_cancel = Some(c);
+                        }
                         AppAction::Submit(text) => {
                             let ui = UserInput::text(text, InputSource::Tui);
                             if session.is_streaming().await {
@@ -632,7 +1324,37 @@ impl App<CrosstermBackend<Stdout>> {
                                 let _ = session.prompt_accepted(ui).await;
                             }
                         }
+                        AppAction::Command(cmd) => self.execute_command(cmd, &session).await,
                         AppAction::Redraw | AppAction::None => {}
+                    }
+                    self.draw_synchronized()?;
+                }
+                Some(msg) = bash_next => {
+                    match msg {
+                        BashMsg::Chunk(chunk) => self.state.transcript.bash_append(&chunk),
+                        BashMsg::Done(code) => {
+                            // Feed `!` (not `!!`) output back into the session context, then commit
+                            // the block to scrollback (`bash-execution.ts` → BashExecutionMessage).
+                            if let Some(b) = self.state.transcript.bash() {
+                                let excluded = b.excluded();
+                                let command = b.command().to_string();
+                                let output = b.output();
+                                self.state.transcript.bash_complete(code, false);
+                                self.state.transcript.commit_bash();
+                                if !excluded && !output.trim().is_empty() {
+                                    let payload = serde_json::json!({
+                                        "command": command,
+                                        "output": output,
+                                        "exitCode": code,
+                                    });
+                                    let _ = session
+                                        .append_custom_message("bashExecution", payload, false)
+                                        .await;
+                                }
+                            }
+                            bash_rx = None;
+                            bash_cancel = None;
+                        }
                     }
                     self.draw_synchronized()?;
                 }
@@ -655,6 +1377,78 @@ impl App<CrosstermBackend<Stdout>> {
         }
         self.restore()
     }
+}
+
+/// A streamed message from a running `!`/`!!` bash subprocess (`bash-execution.ts` output pump).
+#[derive(Clone, Debug)]
+enum BashMsg {
+    /// A raw stdout/stderr chunk (merged; `appendOutput` strips ANSI + normalizes newlines).
+    Chunk(String),
+    /// The process exited (`setComplete`); carries the exit code (`None` if signalled/unknown).
+    Done(Option<i32>),
+}
+
+/// Spawn `command` via `sh -c` (`bash-execution.ts` / the `!` handler), streaming merged
+/// stdout+stderr chunks over the returned channel and a terminal [`BashMsg::Done`]. The returned
+/// [`CancelToken`] kills the child when cancelled (`Esc` → `tui.select.cancel`). No `unsafe`.
+fn spawn_bash(command: String) -> (tokio::sync::mpsc::UnboundedReceiver<BashMsg>, CancelToken) {
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BashMsg>();
+    let cancel = CancelToken::new();
+    let child_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let spawned = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(BashMsg::Chunk(format!("{e}\n")));
+                let _ = tx.send(BashMsg::Done(None));
+                return;
+            }
+        };
+        // Pump stdout + stderr concurrently into the same channel (merged like a terminal).
+        async fn pump<R: tokio::io::AsyncRead + Unpin>(
+            mut r: R,
+            tx: tokio::sync::mpsc::UnboundedSender<BashMsg>,
+        ) {
+            let mut buf = [0u8; 4096];
+            loop {
+                match r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
+                        if tx.send(BashMsg::Chunk(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let out_task = child.stdout.take().map(|o| tokio::spawn(pump(o, tx.clone())));
+        let err_task = child.stderr.take().map(|e| tokio::spawn(pump(e, tx.clone())));
+        let status = tokio::select! {
+            _ = child_cancel.cancelled() => {
+                let _ = child.start_kill();
+                child.wait().await.ok()
+            }
+            s = child.wait() => s.ok(),
+        };
+        if let Some(t) = out_task {
+            let _ = t.await;
+        }
+        if let Some(t) = err_task {
+            let _ = t.await;
+        }
+        let _ = tx.send(BashMsg::Done(status.and_then(|s| s.code())));
+    });
+    (rx, cancel)
 }
 
 /// A terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm

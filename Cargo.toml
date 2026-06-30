@@ -108,6 +108,14 @@ eventsource-stream   = { version = "0.2.3" }
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
 
+# arch-10 §7 / §8 — rich-rendering stack, first used by cyrup-tui (arch-10, spec/tui/06).
+# User-ratified for the L6 round (markdown + syntax + inline images). `syntect` uses the pure-Rust
+# `fancy-regex` engine (`default-fancy`) — NO oniguruma C dep — so the workspace stays all-Rust and
+# `forbid(unsafe_code)` in cyrup-tui is unaffected (the lint is per-crate, not transitive).
+pulldown-cmark       = { version = "0.13.4", default-features = false }
+syntect              = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+ratatui-image        = { version = "11.0.6" }
+
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
 #   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,

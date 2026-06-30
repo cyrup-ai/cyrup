@@ -120,6 +120,11 @@ impl InputEditor {
         self.registry = registry;
     }
 
+    /// The editor keymap (for `/hotkeys` to resolve editor-action key labels, `getEditorKeyDisplay`).
+    pub fn keymap_ref(&self) -> &EditorKeymap {
+        &self.keymap
+    }
+
     /// Override the working directory used for path completion (defaults to the process cwd).
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = cwd;

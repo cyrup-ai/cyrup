@@ -34,6 +34,51 @@ pub enum SelectorKind {
     ShowImages,
     /// Theme picker with live preview (`theme-selector.ts`).
     Theme,
+    /// Model picker (`/model`, `model-selector.ts`) — rows sourced from the model catalog (L5).
+    Model,
+    /// Settings menu (`/settings`, `settings-selector.ts`).
+    Settings,
+    /// Scoped-models enable/order picker (`/scoped-models`, `scoped-models-selector.ts`).
+    ScopedModels,
+    /// Resume-session picker (`/resume`, `session-selector.ts`).
+    Session,
+    /// Session-tree navigator (`/tree`, `tree-selector.ts`).
+    Tree,
+    /// Project-trust picker (`/trust`, `trust-selector.ts`).
+    Trust,
+    /// Fork-from-message picker (`/fork`, `user-message-selector.ts`).
+    UserMessage,
+    /// Provider login picker (`/login`, `oauth-selector.ts`).
+    Login,
+    /// Provider logout picker (`/logout`, `oauth-selector.ts`).
+    Logout,
+}
+
+impl SelectorKind {
+    /// Whether confirming this selector applies in-crate (theme/thinking/show-images) or hands the
+    /// chosen value to the run loop as an [`crate::app::AppCommand`] (the data-bound selectors, whose
+    /// effect — set model, switch branch, login — lives at the session layer).
+    pub fn is_data_bound(self) -> bool {
+        !matches!(self, SelectorKind::Thinking | SelectorKind::ShowImages | SelectorKind::Theme)
+    }
+
+    /// The selector's title shown above the list (`*-selector.ts` headers).
+    pub fn title(self) -> &'static str {
+        match self {
+            SelectorKind::Thinking => "Thinking Level",
+            SelectorKind::ShowImages => "Show Images",
+            SelectorKind::Theme => "Theme",
+            SelectorKind::Model => "Select Model",
+            SelectorKind::Settings => "Settings",
+            SelectorKind::ScopedModels => "Scoped Models",
+            SelectorKind::Session => "Resume Session",
+            SelectorKind::Tree => "Session Tree",
+            SelectorKind::Trust => "Project Trust",
+            SelectorKind::UserMessage => "Fork from Message",
+            SelectorKind::Login => "Login",
+            SelectorKind::Logout => "Logout",
+        }
+    }
 }
 
 /// The routing outcome of feeding one key to the active selector (spec/tui/05 §3.1
@@ -79,6 +124,8 @@ pub struct ListSelector {
     values: Vec<String>,
     /// Whether a selection move emits [`SelectorOutcome::Preview`] (theme live preview only).
     preview: bool,
+    /// An optional bold title rendered between the top rule and the list (`*-selector.ts` headers).
+    title: Option<String>,
 }
 
 impl ListSelector {
@@ -100,7 +147,30 @@ impl ListSelector {
         let mut list = SelectList::new(items, ColumnLayout::SLASH);
         list.set_max_visible(max_visible);
         list.set_selected(selected);
-        ListSelector { list, values, preview }
+        ListSelector { list, values, preview, title: None }
+    }
+
+    /// A data-bound selector (`model`/`session`/`tree`/… — `*-selector.ts`): build the windowed list
+    /// from `(value, label, description)` rows sourced from an L5 service (model catalog, session list,
+    /// branch tree), with a bold `title` header and a `no_match` empty-state line. Confirming yields the
+    /// row's `value` for the run loop to apply (set model, switch branch, login…). `maxVisible = 10`
+    /// matches the data selectors (`model-selector.ts:244`, `session-selector.ts`).
+    pub fn data(
+        kind: SelectorKind,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+    ) -> Self {
+        let empty = format!("No {} available", kind.title().to_lowercase());
+        let mut values = Vec::with_capacity(rows.len());
+        let mut items = Vec::with_capacity(rows.len());
+        for (value, label, desc) in rows {
+            values.push(value);
+            items.push(SelectItem::new(label, desc));
+        }
+        let mut list = SelectList::new(items, ColumnLayout::SLASH).with_no_match(empty);
+        list.set_max_visible(10);
+        list.set_selected(selected);
+        ListSelector { list, values, preview: false, title: Some(kind.title().to_string()) }
     }
 
     /// The value of the currently-highlighted row (empty string if the list is empty — never panics).
@@ -167,18 +237,28 @@ impl ListSelector {
 
 impl Selector for ListSelector {
     fn desired_height(&self, _width: u16) -> u16 {
-        // Top `DynamicBorder` + list body + bottom `DynamicBorder` (spec/tui/05 §3, §11).
-        self.list.rendered_height().saturating_add(2)
+        // Top `DynamicBorder` + optional title + list body + bottom `DynamicBorder` (spec/tui/05 §3).
+        let title_h = u16::from(self.title.is_some());
+        self.list.rendered_height().saturating_add(2).saturating_add(title_h)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let [top, body, bottom] = Layout::vertical([
+        let title_h = u16::from(self.title.is_some());
+        let [top, title_area, body, bottom] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(title_h),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .areas(area);
         frame.render_widget(border_rule(top.width, theme), top);
+        if let Some(title) = &self.title {
+            let styled = Span::styled(
+                format!(" {title}"),
+                theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD),
+            );
+            frame.render_widget(Paragraph::new(Line::from(styled)), title_area);
+        }
         let lines = self.list.lines(body.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);
         frame.render_widget(border_rule(bottom.width, theme), bottom);

@@ -24,6 +24,10 @@ pub enum TuiError {
     #[error("invalid key spec: {0}")]
     KeySpec(String),
 
+    /// A JSON keybindings document was malformed (spec/tui/07 §3.9; `core/keybindings.ts:14-262`).
+    #[error("invalid keybindings json: {0}")]
+    Keybindings(String),
+
     /// The run loop was cancelled (maps to `CoreError::Cancelled`).
     #[error("cancelled")]
     Cancelled,

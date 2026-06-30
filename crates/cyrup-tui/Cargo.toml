@@ -24,6 +24,11 @@ ratatui = "0.30.2"
 tokio.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
+# Rich rendering (spec/tui/06): markdown parse + syntax highlight. Both pure-Rust.
+pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
+# JSON keybindings loader (spec/tui/07 §3.9; core/keybindings.ts:14-262) + theme-data hot-reload.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }

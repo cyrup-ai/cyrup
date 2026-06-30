@@ -22,6 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::bash::BashExecution;
 use crate::component::Component;
 use crate::theme::UiTheme;
 
@@ -32,12 +33,35 @@ pub enum Entry {
     User(String),
     /// A finalized assistant message.
     Assistant(String),
-    /// A tool began executing.
-    ToolStart { name: String },
-    /// A tool finished (`is_error` failed).
-    ToolEnd { name: String, is_error: bool },
+    /// A finished tool execution (`tool-execution.ts`): name + an optional one-line argument summary
+    /// + an optional result body (rendered as a unified diff when it looks like one) + error flag.
+    Tool(ToolRun),
     /// A status / notification line (model change, compaction, queue, …).
     Status(String),
+    /// A bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`): a top `DynamicBorder`,
+    /// a bold-accent `title`, a blank, the `markdown` body, then a bottom `DynamicBorder`
+    /// (interactive-mode.ts:5502-5507).
+    Block { title: String, markdown: String },
+    /// A finished `!`/`!!` bash execution (`bash-execution.ts`): the command header + output block,
+    /// committed to scrollback when the process exits.
+    Bash(BashExecution),
+}
+
+/// One tool execution, shown live in the viewport while it runs (`tool-execution.ts` pending box) and
+/// committed to scrollback when the turn ends. `expanded` rendering shows the full result body; the
+/// collapsed form shows only the marker line + a truncated preview (`Ctrl+O` toggles, `app.tools.expand`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolRun {
+    /// Tool name (`read`, `bash`, `edit`, …).
+    pub name: String,
+    /// A one-line argument summary (e.g. a file path or command), if derivable.
+    pub args_summary: Option<String>,
+    /// The result/output body (multi-line allowed). `None` while still running.
+    pub result: Option<String>,
+    /// Whether the tool failed.
+    pub is_error: bool,
+    /// Whether the execution has finished (drives the `⚙ …`-running vs `✓/✗`-done marker).
+    pub done: bool,
 }
 
 /// The scrolling conversation history.
@@ -53,6 +77,24 @@ pub struct TranscriptView {
     pending: Vec<Entry>,
     /// The assistant turn currently streaming, if any (the only entry the viewport renders).
     streaming: Option<String>,
+    /// Tool executions for the active turn, rendered live in the viewport until the turn ends, then
+    /// committed (`tool-execution.ts` keeps tool components live in the message region). Honors the
+    /// shared `tool_expanded` flag so `Ctrl+O` visibly expands/collapses in-flight tool output.
+    active_tools: Vec<ToolRun>,
+    /// Whether tool output renders expanded (full result) vs collapsed (`Ctrl+O`, `app.tools.expand`).
+    pub tool_expanded: bool,
+    /// The live `!`/`!!` bash execution, if one is running/just-finished and not yet committed
+    /// (`bash-execution.ts` — the component stays live in the message region, then scrolls up).
+    bash: Option<BashExecution>,
+    /// Live key labels (`Esc` / `Ctrl+O`) for the bash block's cancel + expand hints, set by the app
+    /// from the keymap so rebinds reflect. `None` falls back to the Pi defaults.
+    bash_cancel_hint: Option<String>,
+    bash_expand_hint: Option<String>,
+    /// How many visual lines the user has paged **up** from the tail of the active region
+    /// (`PageUp`/`PageDown`, spec/tui/07). `0` keeps the newest text pinned to the bottom (the
+    /// default auto-scroll); paging up reveals earlier streamed/tool/bash output before it commits to
+    /// native scrollback. Reset to `0` whenever new content lands so live streaming stays visible.
+    scroll_offset: usize,
 }
 
 impl TranscriptView {
@@ -71,9 +113,69 @@ impl TranscriptView {
         self.streaming.as_deref()
     }
 
-    /// True while an assistant turn is actively streaming (the viewport's only conversation content).
+    /// True while an assistant turn is actively streaming **or** a tool/bash run is live in the viewport.
     pub fn has_active(&self) -> bool {
-        self.streaming.is_some()
+        self.streaming.is_some() || !self.active_tools.is_empty() || self.bash.is_some()
+    }
+
+    /// Start a live `!`/`!!` bash execution block (replaces any prior uncommitted one). `cancel_hint`
+    /// / `expand_hint` are the live key labels for the running + expand hints.
+    pub fn start_bash(
+        &mut self,
+        command: impl Into<String>,
+        excluded: bool,
+        cancel_hint: Option<String>,
+        expand_hint: Option<String>,
+    ) {
+        self.bash = Some(BashExecution::new(command, excluded));
+        self.bash_cancel_hint = cancel_hint;
+        self.bash_expand_hint = expand_hint;
+    }
+
+    /// Append a streamed chunk to the live bash block (`appendOutput`). No-op if none is live.
+    pub fn bash_append(&mut self, chunk: &str) {
+        if let Some(b) = self.bash.as_mut() {
+            b.append_output(chunk);
+        }
+    }
+
+    /// Mark the live bash block finished (`setComplete`). No-op if none is live.
+    pub fn bash_complete(&mut self, exit_code: Option<i32>, cancelled: bool) {
+        if let Some(b) = self.bash.as_mut() {
+            b.set_complete(exit_code, cancelled);
+        }
+    }
+
+    /// Whether a bash block is live (running or finished-but-uncommitted).
+    pub fn has_bash(&self) -> bool {
+        self.bash.is_some()
+    }
+
+    /// Whether the live bash block is still running.
+    pub fn bash_running(&self) -> bool {
+        self.bash.as_ref().is_some_and(BashExecution::is_running)
+    }
+
+    /// The live bash block (test/inspection access).
+    pub fn bash(&self) -> Option<&BashExecution> {
+        self.bash.as_ref()
+    }
+
+    /// Toggle the live bash block's expansion (`Ctrl+O`); returns the new state if a block is live.
+    pub fn toggle_bash_expanded(&mut self) -> Option<bool> {
+        self.bash.as_mut().map(|b| {
+            let next = !b.expanded();
+            b.set_expanded(next);
+            next
+        })
+    }
+
+    /// Commit the live bash block to scrollback (called once it has finished). A still-running block
+    /// is committed as-is (e.g. on interrupt). No-op when none is live.
+    pub fn commit_bash(&mut self) {
+        if let Some(b) = self.bash.take() {
+            self.pending.push(Entry::Bash(b));
+        }
     }
 
     /// Take every committed entry, leaving the pending buffer empty. The shell renders the returned
@@ -86,6 +188,24 @@ impl TranscriptView {
     /// Append a user message.
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::User(text.into()));
+        // A fresh prompt jumps the active region back to the tail (spec/tui/07 auto-scroll).
+        self.scroll_offset = 0;
+    }
+
+    /// Page the active region up by `page` visual lines (`PageUp`): reveal earlier streamed/tool/bash
+    /// output. Clamped against the content height at render time.
+    pub fn page_up(&mut self, page: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(page.max(1));
+    }
+
+    /// Page the active region down by `page` visual lines (`PageDown`); `0` is the pinned tail.
+    pub fn page_down(&mut self, page: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(page.max(1));
+    }
+
+    /// The current page-scroll offset from the tail (test/inspection access).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
     }
 
     /// Append a chunk of assistant text to the in-flight streaming buffer (R-10-028 streaming).
@@ -113,14 +233,68 @@ impl TranscriptView {
         self.streaming = None;
     }
 
-    /// Record a tool starting.
-    pub fn push_tool_start(&mut self, name: impl Into<String>) {
-        self.pending.push(Entry::ToolStart { name: name.into() });
+    /// Record a tool starting (live in the viewport): name + optional one-line argument summary.
+    pub fn push_tool_start(&mut self, name: impl Into<String>, args_summary: Option<String>) {
+        self.active_tools.push(ToolRun {
+            name: name.into(),
+            args_summary,
+            result: None,
+            is_error: false,
+            done: false,
+        });
     }
 
-    /// Record a tool finishing.
-    pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool) {
-        self.pending.push(Entry::ToolEnd { name: name.into(), is_error });
+    /// Update the latest still-running tool's partial result (`ToolExecutionUpdate`).
+    pub fn push_tool_update(&mut self, partial: Option<String>) {
+        if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done)
+            && partial.is_some()
+        {
+            run.result = partial;
+        }
+    }
+
+    /// Record a tool finishing: attach the result/error to the matching live run (the latest run with
+    /// that name still running, else a fresh done entry so a missed start never drops the result).
+    pub fn push_tool_end(
+        &mut self,
+        name: impl Into<String>,
+        is_error: bool,
+        result: Option<String>,
+    ) {
+        let name = name.into();
+        if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name) {
+            run.done = true;
+            run.is_error = is_error;
+            run.result = result;
+        } else {
+            self.active_tools.push(ToolRun {
+                name,
+                args_summary: None,
+                result,
+                is_error,
+                done: true,
+            });
+        }
+    }
+
+    /// Commit the active turn's tool executions into scrollback (called when the turn ends). Each
+    /// becomes an [`Entry::Tool`]; still-running tools are committed as-is (marked done).
+    pub fn commit_tools(&mut self) {
+        for mut run in self.active_tools.drain(..) {
+            run.done = true;
+            self.pending.push(Entry::Tool(run));
+        }
+    }
+
+    /// The active (live) tool executions for the current turn (test/inspection access).
+    pub fn active_tools(&self) -> &[ToolRun] {
+        &self.active_tools
+    }
+
+    /// Toggle the tool-output expansion (`Ctrl+O`); returns the new state.
+    pub fn toggle_tool_expanded(&mut self) -> bool {
+        self.tool_expanded = !self.tool_expanded;
+        self.tool_expanded
     }
 
     /// Record a status / notification line.
@@ -128,40 +302,183 @@ impl TranscriptView {
         self.pending.push(Entry::Status(text.into()));
     }
 
-    /// Build the styled lines the inline viewport renders: **only** the active streaming partial.
-    /// Committed entries live in native scrollback (see [`drain_committed`](Self::drain_committed)).
+    /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).
+    pub fn push_block(&mut self, title: impl Into<String>, markdown: impl Into<String>) {
+        self.pending.push(Entry::Block { title: title.into(), markdown: markdown.into() });
+    }
+
+    /// Build the styled lines the inline viewport renders: **only** the active streaming partial,
+    /// rendered as markdown (spec/tui/06 §8). Committed entries live in native scrollback (see
+    /// [`drain_committed`](Self::drain_committed)).
     ///
     /// Pi renders the in-flight assistant message **inline** with no surrounding box/title
     /// (`assistant-message.ts:84-93`); a dim soft cursor `▌` trails the last grapheme while the turn
-    /// streams (spec/tui/01 §3) — the hardware cursor stays on the editor.
-    fn lines(&self, theme: &UiTheme) -> Vec<Line<'static>> {
+    /// streams (spec/tui/01 §3) — the hardware cursor stays on the editor. The buffer is run through
+    /// [`trim_partial_closing_fence`](crate::markdown::trim_partial_closing_fence) so a streaming code
+    /// fence does not flicker open/closed (`markdown.ts:25-48`).
+    fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(partial) = &self.streaming {
-            lines.push(Line::from(vec![
-                Span::styled("assistant: ", theme.accent_style()),
-                Span::styled(partial.clone(), theme.assistant_style()),
-                Span::styled("▌", theme.dim_style()),
-            ]));
+            let body = crate::markdown::trim_partial_closing_fence(partial);
+            let mut md = crate::markdown::render(&body, width.saturating_sub(11).max(1), theme);
+            if md.is_empty() {
+                md.push(Line::default());
+            }
+            if let Some(first) = md.first_mut() {
+                first.spans.insert(0, Span::styled("assistant: ", theme.accent_style()));
+            }
+            if let Some(last) = md.last_mut() {
+                last.spans.push(Span::styled("▌", theme.dim_style()));
+            }
+            lines.extend(md);
+        }
+        // Live tool executions render below the streaming partial, honoring the expand flag so
+        // `Ctrl+O` toggles their result body in the viewport before the turn commits.
+        for run in &self.active_tools {
+            lines.extend(tool_lines(run, self.tool_expanded, width, theme));
+        }
+        // The live `!`/`!!` bash block renders last (`bash-execution.ts` sits in the message region).
+        if let Some(b) = &self.bash {
+            lines.extend(b.render_lines(
+                width,
+                theme,
+                self.bash_cancel_hint.as_deref(),
+                self.bash_expand_hint.as_deref(),
+            ));
         }
         lines
     }
 }
 
-/// Render a single committed [`Entry`] into one styled scrollback line (R-ARCH-TUI-003). Used by the
-/// shell to feed drained entries into `Terminal::insert_before`.
-pub(crate) fn entry_line(entry: &Entry, theme: &UiTheme) -> Line<'static> {
+/// Render one tool execution into styled lines (`tool-execution.ts`): a marker line
+/// (`⚙ name(args)…` running · `✓ name(args)` ok · `✗ name(args)` error) plus, when there is a result,
+/// either the full body (`expanded`) or a one-line preview (collapsed). A result that looks like a
+/// unified diff is rendered via [`crate::diff::render_diff`] (`renderResult` diff path, `diff.ts`).
+pub(crate) fn tool_lines(
+    run: &ToolRun,
+    expanded: bool,
+    width: usize,
+    theme: &UiTheme,
+) -> Vec<Line<'static>> {
+    let header_style = if run.is_error {
+        theme.error_style()
+    } else if run.done {
+        theme.success_style()
+    } else {
+        theme.dim_style()
+    };
+    let mark = if !run.done {
+        "⚙"
+    } else if run.is_error {
+        "✗"
+    } else {
+        "✓"
+    };
+    let mut head = match &run.args_summary {
+        Some(args) => format!("  {mark} {}({args})", run.name),
+        None => format!("  {mark} {}", run.name),
+    };
+    if !run.done {
+        head.push('…');
+    }
+    let mut out = vec![Line::styled(head, header_style)];
+    if let Some(result) = run.result.as_deref().filter(|r| !r.trim().is_empty()) {
+        if looks_like_diff(result) {
+            // Diffs always render in full (the change set is the point), 2-space indented.
+            for mut line in crate::diff::render_diff(result, theme) {
+                line.spans.insert(0, Span::styled("    ".to_string(), theme.dim_style()));
+                out.push(line);
+            }
+        } else if expanded {
+            for raw in result.split('\n') {
+                out.push(Line::styled(format!("    {raw}"), theme.muted_style()));
+            }
+        } else {
+            // Collapsed: first non-empty line, width-truncated, with a `(N more lines)` hint.
+            let mut iter = result.split('\n').filter(|l| !l.trim().is_empty());
+            if let Some(first) = iter.next() {
+                let avail = width.saturating_sub(6).max(1);
+                let preview: String = first.chars().take(avail).collect();
+                out.push(Line::styled(format!("    {preview}"), theme.muted_style()));
+            }
+            let remaining = result.split('\n').count().saturating_sub(1);
+            if remaining > 0 {
+                out.push(Line::styled(
+                    format!("    … {remaining} more lines (ctrl+o)"),
+                    theme.dim_style(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Heuristic: does `text` look like a pre-formatted unified diff (a majority of non-empty lines start
+/// with `+`/`-`/space followed by a line-number column)? Mirrors the edit-tool `renderResult` diff
+/// detection (`diff.ts` operates on exactly this shape).
+fn looks_like_diff(text: &str) -> bool {
+    let mut diffish = 0usize;
+    let mut total = 0usize;
+    for line in text.split('\n').filter(|l| !l.trim().is_empty()) {
+        total += 1;
+        let mut chars = line.chars();
+        if let Some(c) = chars.next()
+            && matches!(c, '+' | '-')
+            && chars.next().map(|n| n == ' ' || n.is_ascii_digit()).unwrap_or(false)
+        {
+            diffish += 1;
+        }
+    }
+    total > 0 && diffish * 2 >= total
+}
+
+/// Render a single committed [`Entry`] into its styled scrollback line(s) at content `width`
+/// (R-ARCH-TUI-003). Used by the shell to feed drained entries into `Terminal::insert_before`.
+///
+/// Assistant bodies render as **markdown** (spec/tui/06 §2) — multiple lines — with an `assistant: `
+/// accent label prefixed onto the first line so the conversation stays grep-legible. User/tool/status
+/// entries stay one line each.
+pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<Line<'static>> {
     match entry {
-        Entry::User(text) => label_line("you", text, theme.user_style(), theme.base_style()),
+        Entry::User(text) => {
+            vec![label_line("you", text, theme.user_style(), theme.base_style())]
+        }
         Entry::Assistant(text) => {
-            label_line("assistant", text, theme.accent_style(), theme.assistant_style())
+            let mut md = crate::markdown::render(text, width.saturating_sub(11).max(1), theme);
+            if md.is_empty() {
+                md.push(Line::default());
+            }
+            if let Some(first) = md.first_mut() {
+                first.spans.insert(0, Span::styled("assistant: ", theme.accent_style()));
+            }
+            md
         }
-        Entry::ToolStart { name } => Line::styled(format!("  ⚙ {name}…"), theme.dim_style()),
-        Entry::ToolEnd { name, is_error } => {
-            let style = if *is_error { theme.error_style() } else { theme.dim_style() };
-            let mark = if *is_error { "✗" } else { "✓" };
-            Line::styled(format!("  {mark} {name}"), style)
+        Entry::Tool(run) => {
+            // Committed tools render in their last (expanded-at-commit) form; a diff result always
+            // renders in full. We commit with the at-the-time expand flag captured by the caller —
+            // here we always show the full body so finalized scrollback keeps the complete record.
+            tool_lines(run, true, width, theme)
         }
-        Entry::Status(text) => Line::styled(format!("• {text}"), theme.dim_style()),
+        Entry::Bash(b) => {
+            // Committed bash blocks render in full (the complete record), like committed tools.
+            let mut full = b.clone();
+            full.set_expanded(true);
+            full.render_lines(width, theme, None, None)
+        }
+        Entry::Status(text) => vec![Line::styled(format!("• {text}"), theme.dim_style())],
+        Entry::Block { title, markdown } => {
+            let rule = "─".repeat(width.max(1));
+            let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
+            let mut out: Vec<Line<'static>> = vec![
+                Line::default(),
+                Line::styled(rule.clone(), theme.border_style()),
+                Line::styled(title.clone(), bold),
+                Line::default(),
+            ];
+            out.extend(crate::markdown::render(markdown, width.max(1), theme));
+            out.push(Line::styled(rule, theme.border_style()));
+            out
+        }
     }
 }
 
@@ -183,11 +500,14 @@ impl Component for TranscriptView {
     /// the streaming partial is a wrapped `Paragraph` filling the region, tail-anchored so the newest
     /// text stays visible as it grows (spec/tui/01 §3 overflow).
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let lines = self.lines(theme);
-        // Auto-scroll: keep the tail (newest text) visible when content exceeds the region height.
+        let lines = self.lines(area.width as usize, theme);
+        // Auto-scroll: keep the tail (newest text) visible when content exceeds the region height,
+        // minus any user page-up offset (clamped so it can never scroll past the top).
         let inner_h = area.height as usize;
         let total = lines.len();
-        let scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+        let max_scroll = total.saturating_sub(inner_h);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        let scroll = max_scroll.saturating_sub(self.scroll_offset).min(u16::MAX as usize) as u16;
         let para = Paragraph::new(lines)
             .style(theme.base_style())
             .wrap(Wrap { trim: false })

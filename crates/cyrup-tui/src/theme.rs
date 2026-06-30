@@ -36,6 +36,11 @@ pub struct UiTheme {
     pub warning: Option<Color>,
     /// Pi `bashMode` token — green editor border + `$ cmd` header while in bash mode (theme.ts).
     pub bash_mode: Option<Color>,
+    /// Every resolved color role keyed by Pi token name (`syntaxComment`, `mdHeading`, `toolDiffAdded`,
+    /// …). Populated from `ResolvedTheme`/`ThemeData` so the rich-rendering layer (markdown + syntax,
+    /// spec/tui/06 §11) can resolve the full ~51-token role set (`REQUIRED_COLOR_TOKENS`) without a
+    /// field per role. Empty for the synthetic static fallback (the role helpers then use defaults).
+    pub roles: std::collections::BTreeMap<String, Color>,
 }
 
 impl Default for UiTheme {
@@ -48,6 +53,11 @@ impl UiTheme {
     /// Project a `ResolvedTheme` (color roles already resolved through `vars`) into a `UiTheme`.
     pub fn from_resolved(name: impl Into<String>, resolved: &ResolvedTheme, generation: u64) -> Self {
         let role = |key: &str| resolved.roles.get(key).copied().and_then(color_of);
+        let roles = resolved
+            .roles
+            .iter()
+            .filter_map(|(k, spec)| color_of(*spec).map(|c| (k.clone(), c)))
+            .collect();
         UiTheme {
             name: name.into(),
             generation,
@@ -61,6 +71,7 @@ impl UiTheme {
             success: role("success"),
             warning: role("warning"),
             bash_mode: role("bashMode"),
+            roles,
         }
     }
 
@@ -118,6 +129,7 @@ impl UiTheme {
             success: None,
             warning: None,
             bash_mode: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -127,6 +139,11 @@ impl UiTheme {
     /// reconstructing a `Theme`. Bad/empty values inherit the terminal default (no panic).
     pub fn from_theme_data(data: &ThemeData, generation: u64) -> Self {
         let role = |key: &str| data.colors.get(key).and_then(|raw| resolve_value(raw, &data.vars));
+        let roles = data
+            .colors
+            .keys()
+            .filter_map(|k| role(k).map(|c| (k.clone(), c)))
+            .collect();
         UiTheme {
             name: data.name.clone(),
             generation,
@@ -140,6 +157,7 @@ impl UiTheme {
             success: role("success"),
             warning: role("warning"),
             bash_mode: role("bashMode"),
+            roles,
         }
     }
 
@@ -219,6 +237,127 @@ impl UiTheme {
     /// Bash-mode style (green editor border + `$ cmd` header) — Pi `bashMode` (theme.ts).
     pub fn bash_mode_style(&self) -> Style {
         Style::default().fg(self.bash_mode.or(self.success).unwrap_or(Color::Green))
+    }
+
+    // --- rich-rendering roles (spec/tui/06 §11) -------------------------------------------------
+
+    /// Resolve a Pi color-token role by name (`syntaxKeyword`, `mdHeading`, …), falling back to the
+    /// given hex default (the `dark.json` value from spec/tui/06 §3.2) when the live theme omits it —
+    /// so the markdown/syntax layer is total even under the synthetic static fallback theme.
+    pub fn role_color(&self, key: &str, default_hex: &str) -> Color {
+        self.roles.get(key).copied().or_else(|| parse_hex(default_hex)).unwrap_or(Color::Reset)
+    }
+
+    /// `fg`-only style for a role with a hex default (spec/tui/06 §3.2 dark hexes).
+    fn role_style(&self, key: &str, default_hex: &str) -> Style {
+        Style::default().fg(self.role_color(key, default_hex))
+    }
+
+    /// Markdown heading — `mdHeading`, bold (`markdown.ts:336-362`).
+    pub fn md_heading_style(&self) -> Style {
+        self.role_style("mdHeading", "#f0c674").add_modifier(Modifier::BOLD)
+    }
+    /// Inline code span — `mdCode` (= accent), no backticks (`markdown.ts:512-516`).
+    pub fn md_code_style(&self) -> Style {
+        Style::default().fg(self.roles.get("mdCode").copied().or(self.accent).unwrap_or(Color::Cyan))
+    }
+    /// Flat (unknown-language) fenced-code body — `mdCodeBlock` (`markdown.ts:378-398`).
+    pub fn md_code_block_style(&self) -> Style {
+        self.role_style("mdCodeBlock", "#b5bd68")
+    }
+    /// Fence border lines (```` ``` ````) — `mdCodeBlockBorder` (`markdown.ts:380,393`).
+    pub fn md_code_block_border_style(&self) -> Style {
+        self.role_style("mdCodeBlockBorder", "#666666")
+    }
+    /// Blockquote body — `mdQuote`, italic (`markdown.ts:414-461`).
+    pub fn md_quote_style(&self) -> Style {
+        self.role_style("mdQuote", "#969896").add_modifier(Modifier::ITALIC)
+    }
+    /// Blockquote `│ ` border — `mdQuoteBorder` (`markdown.ts:414-461`).
+    pub fn md_quote_border_style(&self) -> Style {
+        self.role_style("mdQuoteBorder", "#666666")
+    }
+    /// Horizontal rule — `mdHr` (`markdown.ts:463-468`).
+    pub fn md_hr_style(&self) -> Style {
+        self.role_style("mdHr", "#666666")
+    }
+    /// List bullet marker — `mdListBullet` (= accent) (`markdown.ts:604-654`).
+    pub fn md_list_bullet_style(&self) -> Style {
+        Style::default()
+            .fg(self.roles.get("mdListBullet").copied().or(self.accent).unwrap_or(Color::Cyan))
+    }
+    /// Link text — `mdLink`, underlined (`markdown.ts:537-556`).
+    pub fn md_link_style(&self) -> Style {
+        self.role_style("mdLink", "#81a2be").add_modifier(Modifier::UNDERLINED)
+    }
+    /// Trailing `(url)` — `mdLinkUrl`, dim (`markdown.ts:548-556`).
+    pub fn md_link_url_style(&self) -> Style {
+        self.role_style("mdLinkUrl", "#5f819d").add_modifier(Modifier::DIM)
+    }
+
+    /// Diff added (`+`) line — `toolDiffAdded`, green (`diff.ts` `theme.fg("toolDiffAdded")`).
+    pub fn tool_diff_added_style(&self) -> Style {
+        Style::default().fg(self.role_color("toolDiffAdded", "#b5bd68"))
+    }
+    /// Diff removed (`-`) line — `toolDiffRemoved`, red.
+    pub fn tool_diff_removed_style(&self) -> Style {
+        Style::default().fg(self.role_color("toolDiffRemoved", "#cc6666"))
+    }
+    /// Diff context (unchanged) line — `toolDiffContext`, gray.
+    pub fn tool_diff_context_style(&self) -> Style {
+        Style::default().fg(self.role_color("toolDiffContext", "#808080"))
+    }
+    /// Intra-line changed-token emphasis — reversed video (`theme.inverse`, `diff.ts:renderIntraLineDiff`).
+    pub fn inverse_style(&self) -> Style {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+
+    /// Resolve a `syntect` scope (top-of-stack) to a syntax-highlight style by the prefix table in
+    /// spec/tui/06 §3.2 (`theme.ts:1083-1113`). Unknown scopes return `None` so the caller renders the
+    /// run flat in `mdCodeBlock` (auto-detect-off parity, §3.1).
+    pub fn syntax_style_for_scope(&self, scope: &str) -> Option<Style> {
+        // Most-specific prefixes first; the first match wins.
+        let (role, default_hex, modifier) = if scope.starts_with("comment") {
+            ("syntaxComment", "#6A9955", None)
+        } else if scope.starts_with("string") {
+            ("syntaxString", "#CE9178", None)
+        } else if scope.starts_with("constant.numeric") {
+            ("syntaxNumber", "#B5CEA8", None)
+        } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function") {
+            ("syntaxFunction", "#DCDCAA", None)
+        } else if scope.starts_with("entity.name.type")
+            || scope.starts_with("support.type")
+            || scope.starts_with("support.class")
+            || scope.starts_with("entity.name.class")
+        {
+            ("syntaxType", "#4EC9B0", None)
+        } else if scope.starts_with("keyword.operator") {
+            ("syntaxOperator", "#D4D4D4", None)
+        } else if scope.starts_with("keyword") || scope.starts_with("storage") {
+            ("syntaxKeyword", "#569CD6", None)
+        } else if scope.starts_with("variable")
+            || scope.starts_with("entity.other.attribute-name")
+            || scope.starts_with("meta.attribute")
+        {
+            ("syntaxVariable", "#9CDCFE", None)
+        } else if scope.starts_with("punctuation") {
+            ("syntaxPunctuation", "#D4D4D4", None)
+        } else if scope.starts_with("markup.inserted") {
+            ("toolDiffAdded", "#b5bd68", None)
+        } else if scope.starts_with("markup.deleted") {
+            ("toolDiffRemoved", "#cc6666", None)
+        } else if scope.starts_with("markup.italic") {
+            ("text", "#d4d4d4", Some(Modifier::ITALIC))
+        } else if scope.starts_with("markup.bold") {
+            ("text", "#d4d4d4", Some(Modifier::BOLD))
+        } else {
+            return None;
+        };
+        let mut s = self.role_style(role, default_hex);
+        if let Some(m) = modifier {
+            s = s.add_modifier(m);
+        }
+        Some(s)
     }
 }
 

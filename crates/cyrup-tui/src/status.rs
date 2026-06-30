@@ -100,6 +100,10 @@ pub struct StatusLine {
     pub using_subscription: bool,
     /// Experimental features enabled → trailing `• xp` marker (`footer.ts:163-165`).
     pub experimental: bool,
+    /// Extension-published status texts, keyed by extension id (`footer.ts:233-242`). Rendered as a
+    /// **third** footer line, the values sorted by key, sanitized (control chars → space, collapsed),
+    /// space-joined, width-truncated with a dim `...` ellipsis. Empty ⇒ no third line.
+    pub extension_statuses: std::collections::BTreeMap<String, String>,
 }
 
 impl StatusLine {
@@ -172,6 +176,34 @@ impl StatusLine {
     /// Set whether experimental features are enabled (the trailing `• xp` marker).
     pub fn set_experimental(&mut self, on: bool) {
         self.experimental = on;
+    }
+    /// Publish (or replace) one extension's footer status text (`footer.ts:233`). An empty/whitespace
+    /// value removes the entry, matching Pi's clear semantics.
+    pub fn set_extension_status(&mut self, id: impl Into<String>, text: impl Into<String>) {
+        let id = id.into();
+        let text = text.into();
+        if text.trim().is_empty() {
+            self.extension_statuses.remove(&id);
+        } else {
+            self.extension_statuses.insert(id, text);
+        }
+    }
+    /// Remove one extension's footer status.
+    pub fn clear_extension_status(&mut self, id: &str) {
+        self.extension_statuses.remove(id);
+    }
+    /// Whether a third (extension-status) footer line is present.
+    pub fn has_extension_statuses(&self) -> bool {
+        !self.extension_statuses.is_empty()
+    }
+    /// The third footer line as plain text: extension statuses sorted by key (the `BTreeMap` is already
+    /// key-ordered), each sanitized, space-joined (`footer.ts:235-240`). Not width-truncated here.
+    pub fn extension_status_text(&self) -> String {
+        self.extension_statuses
+            .values()
+            .map(|t| sanitize_status_text(t))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Footer **line 1**: `~/path (branch) • session` (`footer.ts:116-130`).
@@ -318,9 +350,35 @@ impl Component for StatusLine {
             lines.push(Line::styled(loc, theme.muted_style()));
         }
         lines.push(self.usage_line(width, theme));
+        // Third line: extension statuses, only when present and the area has a spare row
+        // (`footer.ts:232-241`). Width-truncated with a dim `...` ellipsis to match footer style.
+        if area.height >= 3 && self.has_extension_statuses() {
+            let status = truncate_to_width(&self.extension_status_text(), width, "...");
+            lines.push(Line::styled(status, theme.dim_style()));
+        }
         let para = Paragraph::new(lines).style(theme.base_style());
         frame.render_widget(para, area);
     }
+}
+
+/// Sanitize an extension status for single-line display (`footer.ts:12-18`): CR/LF/Tab → space,
+/// collapse runs of spaces, trim. Keeps the third footer line stable regardless of extension output.
+fn sanitize_status_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        let c = if matches!(ch, '\r' | '\n' | '\t') { ' ' } else { ch };
+        if c == ' ' {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 impl StatusLine {
