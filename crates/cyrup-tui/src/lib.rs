@@ -55,6 +55,7 @@ mod selector;
 mod session_search;
 mod session_selector;
 mod settings_selector;
+mod startup_selector;
 mod status;
 mod status_indicator;
 mod theme;
@@ -99,6 +100,7 @@ pub use session_search::{
 };
 pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 pub use settings_selector::{SettingRow, SettingsSelector, TrustSelector, FIELD_SEP};
+pub use startup_selector::run_startup_selector;
 pub use status::{format_tokens, StatusLine};
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};

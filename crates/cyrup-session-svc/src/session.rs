@@ -1635,6 +1635,13 @@ impl AgentSession {
         &self.services
     }
 
+    /// The captured extension CLI flag values threaded from the CLI (Pi `extensionFlagValues`,
+    /// main.ts:634). A loaded extension consumes these via `applyExtensionFlagValues`; the read-only
+    /// seam is surfaced here so the threading is observable end-to-end.
+    pub fn extension_flag_values(&self) -> &[(String, crate::builder::ExtensionFlagValue)] {
+        &self.services.extension_flag_values
+    }
+
     /// The `trust.json` store path for this session (`agent_dir/trust.json`, Pi
     /// `EnvVars::trustPath`). The additive data seam the `/trust` selector writes through.
     pub fn trust_store_path(&self) -> std::path::PathBuf {

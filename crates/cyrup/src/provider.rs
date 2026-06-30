@@ -93,6 +93,67 @@ pub fn select_provider(
     }
 }
 
+/// The Pi `resolveCliModel` **unknown-model diagnostic** (model-resolver.ts:494-500): when a
+/// `--model` targets a *known* provider (explicit `--provider`, or a `provider/…` prefix that is a
+/// built-in) but no catalog model matches the requested id, Pi still builds a custom-id model and
+/// **warns** `Model "<pattern>" not found for provider "<provider>". Using custom model id.`. Returns
+/// that warning string, or `None` when the model resolves (or the provider can't be determined — an
+/// *unknown* provider is a hard error raised earlier by [`select_provider`], not a warning).
+///
+/// Matching is case-insensitive and lenient (exact id, full `provider/id`, or an id substring) so it
+/// never false-warns on a resolvable model — e.g. `together/moonshotai/kimi-k2.6` matches the
+/// catalog's `moonshotai/Kimi-K2.6`.
+pub fn unknown_model_warning(
+    provider_override: Option<&str>,
+    model_pattern: Option<&str>,
+    catalog: &[cyrup_provider::Model],
+) -> Option<String> {
+    let pattern = model_pattern?;
+    let known = |name: &str| {
+        catalog
+            .iter()
+            .find(|m| m.provider.as_str().eq_ignore_ascii_case(name))
+            .map(|m| m.provider.as_str().to_string())
+    };
+
+    // Determine the (canonical) provider + the provider-stripped pattern, exactly as Pi does.
+    let (provider, rest) = match provider_override.filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let canonical = known(p)?; // an unknown explicit provider is select_provider's error
+            let prefix = format!("{canonical}/");
+            let rest = if pattern.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+                pattern[prefix.len()..].to_string()
+            } else {
+                pattern.to_string()
+            };
+            (canonical, rest)
+        }
+        None => {
+            // Infer from a `provider/…` prefix; a non-provider prefix maps to faux (ledgered) — no warn.
+            let (prefix, after) = pattern.split_once('/')?;
+            (known(prefix)?, after.to_string())
+        }
+    };
+
+    // Drop a trailing `:level` so the displayed pattern matches Pi's `fallbackPattern`.
+    let (base, _level) = crate::cli::split_model_level(&rest);
+    if base.is_empty() {
+        return None;
+    }
+    let base_lc = base.to_ascii_lowercase();
+    let found = catalog.iter().any(|m| {
+        m.provider.as_str().eq_ignore_ascii_case(&provider)
+            && (m.id.as_str().eq_ignore_ascii_case(&base)
+                || m.id.as_str().to_ascii_lowercase().contains(&base_lc)
+                || format!("{}/{}", m.provider.as_str(), m.id.as_str()).eq_ignore_ascii_case(pattern))
+    });
+    if found {
+        None
+    } else {
+        Some(format!("Model \"{base}\" not found for provider \"{provider}\". Using custom model id."))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -151,6 +212,35 @@ mod tests {
             .expect("together is built-in");
         assert_eq!(together.id().as_str(), "together");
         assert!(together.models().iter().any(|m| m.id.as_str() == "moonshotai/Kimi-K2.6"));
+    }
+
+    #[test]
+    fn unknown_model_within_known_provider_warns_but_resolvable_does_not() {
+        let catalog = all_available_models();
+        // A real catalog model on a known provider → NO warning (the live path must not false-warn).
+        assert_eq!(
+            unknown_model_warning(None, Some("together/moonshotai/Kimi-K2.6"), &catalog),
+            None
+        );
+        // Case-insensitive: the lowercased live-path spelling still resolves → no warning.
+        assert_eq!(
+            unknown_model_warning(None, Some("together/moonshotai/kimi-k2.6"), &catalog),
+            None
+        );
+        // A bogus model id on a KNOWN provider → Pi's "Using custom model id." warning.
+        let warn = unknown_model_warning(None, Some("openai/totally-made-up-9000"), &catalog)
+            .expect("a warning for an unknown model on a known provider");
+        assert!(warn.contains("totally-made-up-9000"));
+        assert!(warn.contains("not found for provider \"openai\""));
+        assert!(warn.contains("Using custom model id."));
+        // Explicit `--provider` + a bogus id (no prefix) → same warning.
+        let warn2 = unknown_model_warning(Some("openai"), Some("nope-model"), &catalog)
+            .expect("explicit-provider warning");
+        assert!(warn2.contains("not found for provider \"openai\""));
+        // No `provider/` prefix and no `--provider` → faux-mapped, ledgered → NO warning.
+        assert_eq!(unknown_model_warning(None, Some("gpt-4o"), &catalog), None);
+        // No `--model` at all → nothing to diagnose.
+        assert_eq!(unknown_model_warning(Some("openai"), None, &catalog), None);
     }
 
     #[test]

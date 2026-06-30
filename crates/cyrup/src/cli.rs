@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use cyrup_config::{AppMode, ConfigDirs};
 use cyrup_sdk::core::ModelThinkingLevel;
-use cyrup_session_svc::{NoTools, SessionConfig, SessionTarget};
+use cyrup_session_svc::{
+    ExtensionFlagValue as SvcExtensionFlagValue, NoTools, SessionConfig, SessionTarget,
+};
 
 /// Pi's primary output selector `--mode <text|json|rpc>` (args.ts:78-82).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -366,6 +368,9 @@ impl Cli {
         config.session_dir = Some(dirs.session_dir.clone());
         config.app_mode = mode;
         config.model_pattern = self.model.clone();
+        // An explicit `--provider` lets the builder's custom-fallback fire for a bare unresolvable
+        // `--model` id (Pi `cliProvider`, model-resolver.ts:369,475).
+        config.cli_provider_explicit = self.provider.is_some();
         config.thinking_level = self.thinking.map(ThinkingArg::to_level);
         config.trust_override = self.trust_override();
         config.no_context_files = self.no_context_files;
@@ -388,6 +393,20 @@ impl Cli {
             config.tools = Some(self.tools.clone());
         }
         config.exclude_tools = self.exclude_tools.clone();
+        // Thread the captured extension flags (Pi `extensionFlagValues: parsed.unknownFlags`,
+        // main.ts:634) onto the config so they reach the session services; a loaded extension reads
+        // them via `applyExtensionFlagValues` (the WASM-guest consumption is the ext-host tier).
+        config.extension_flag_values = self
+            .extension_flags
+            .iter()
+            .map(|f| {
+                let value = match &f.value {
+                    ExtFlagValue::Bool(b) => SvcExtensionFlagValue::Bool(*b),
+                    ExtFlagValue::Str(s) => SvcExtensionFlagValue::Str(s.clone()),
+                };
+                (f.name.clone(), value)
+            })
+            .collect();
         config.target = self.session_target(&dirs.session_dir);
         let explicit_session =
             matches!(config.target, SessionTarget::Resume(_) | SessionTarget::Continue);
@@ -1130,6 +1149,34 @@ mod tests {
         let bare = parse(&[]).to_session_config(&d, AppMode::Print);
         assert!(!bare.no_extensions);
         assert!(bare.extra_extension_paths.is_empty());
+    }
+
+    #[test]
+    fn captured_extension_flag_values_thread_into_config() {
+        // Pi `extensionFlagValues: parsed.unknownFlags` (main.ts:634): the unknown `--flag[=val]`
+        // tokens partitioned out before clap must reach `SessionConfig` (and thence the services), so
+        // a loaded extension can read them. The bin sets `extension_flags` after clap; verify the
+        // mapping from the bin's `ExtFlagValue` to the svc `ExtensionFlagValue` is faithful.
+        let d = dirs();
+        let (clean, flags) = partition_extension_flags(&[
+            "--plan".to_string(),
+            "--reviewer=alice".to_string(),
+            "hi".to_string(),
+        ]);
+        let mut full = vec!["cyrup".to_string()];
+        full.extend(clean);
+        let mut cli = Cli::try_parse_from(full).expect("clap parse of the cleaned argv");
+        cli.extension_flags = flags;
+        let config = cli.to_session_config(&d, AppMode::Print);
+        assert_eq!(
+            config.extension_flag_values,
+            vec![
+                ("plan".to_string(), SvcExtensionFlagValue::Bool(true)),
+                ("reviewer".to_string(), SvcExtensionFlagValue::Str("alice".to_string())),
+            ]
+        );
+        // No unknown flags ⇒ an empty threaded set (the live path carries nothing extra).
+        assert!(parse(&["hi"]).to_session_config(&d, AppMode::Print).extension_flag_values.is_empty());
     }
 
     #[test]

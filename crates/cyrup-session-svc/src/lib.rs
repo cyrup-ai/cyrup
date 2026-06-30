@@ -36,7 +36,10 @@ mod tools;
 
 pub use attribution::merge_provider_attribution_headers;
 pub use bash::{BashOptions, BashResult};
-pub use builder::{extension_discovery_roots, NoTools, SessionBuilder, SessionConfig, SessionTarget};
+pub use builder::{
+    extension_discovery_roots, ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig,
+    SessionTarget,
+};
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
 pub use export::session_jsonl_to_html;
@@ -73,6 +76,11 @@ pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
 /// Re-exported so the TUI `/resume` selector can name the session-list rows
 /// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
 pub use cyrup_session::listing::SessionInfo;
+/// Re-exported so the CLI bin can resolve `--session`/`--fork` partial-UUID + global-cross-project
+/// references (Pi `resolveSessionPath`, main.ts:163-189) without a direct `cyrup-session` dependency:
+/// [`list_in_dir`] lists a cwd's sessions and [`list_all`] scans every project under the root.
+pub use cyrup_session::layout::{SessionLayout, SessionsRoot};
+pub use cyrup_session::listing::{list_all, list_in_dir};
 pub use cyrup_tools::{Availability, PermissionPolicy};
 /// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
 /// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.

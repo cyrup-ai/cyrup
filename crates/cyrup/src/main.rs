@@ -23,11 +23,16 @@ use cyrup::{
     DiagnosticLevel, Inputs,
 };
 use cyrup::cli::{qualified_matches, split_model_level};
-use cyrup_config::{CliConfigOverrides, ConfigDirs, EnvVars, SettingsScope};
+use cyrup::session_resolve::{resolve_session_target, Outcome, SessionFlags, SessionRef};
+use cyrup_config::{
+    CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, Settings, SettingsManager,
+    SettingsScope,
+};
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
-    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionBuilder, SessionFactory,
-    SessionServiceError, UserInput,
+    list_all, list_in_dir, AgentSession, AgentSessionRuntime, InputSource, ScopedModel,
+    SessionBuilder, SessionConfig, SessionFactory, SessionInfo, SessionLayout, SessionServiceError,
+    SessionTarget, SessionsRoot, UserInput,
 };
 use cyrup_tui::{crossterm_input_stream, App, UiTheme};
 
@@ -180,8 +185,41 @@ async fn run() -> anyhow::Result<i32> {
     }
     let provider = select_provider(cli.provider.as_deref(), cli.model.as_deref(), cli.api_key.as_deref())?;
 
+    // Unknown-model diagnostic (Pi `resolveCliModel`, main.ts:377-378 / model-resolver.ts:494-500):
+    // a `--model` on a *known* provider whose id is not in the catalog warns (the build still proceeds
+    // with a custom-id model). An *unknown provider* already errored in `select_provider` above.
+    if let Some(warning) = cyrup::unknown_model_warning(
+        cli.provider.as_deref(),
+        cli.model.as_deref(),
+        &cyrup::provider::all_available_models(),
+    ) {
+        report_diagnostics(&[Diagnostic::warning(warning)]);
+    }
+
     // Map CLI → SessionConfig.
-    let config = cli.to_session_config(&dirs, mode);
+    let mut config = cli.to_session_config(&dirs, mode);
+
+    // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
+    // `--session`/`--fork` partial-UUID prefix match, a global cross-project search, a
+    // `--session-id` create-if-missing-by-exact-id, the plain-stdin fork-into-cwd confirm, and the
+    // non-interactive missing-session-cwd guard. Engaged only when a session ref is supplied — the
+    // bare `New`/`Continue` target from `to_session_config` stands otherwise (no needless listing).
+    if (cli.fork.is_some() || cli.session.is_some() || cli.session_id.is_some())
+        && let Some(code) = resolve_session(&cli, &dirs, mode, &mut config)?
+    {
+        return Ok(code);
+    }
+
+    // Pre-launch startup-UI orchestration (Pi `cli/startup-ui.ts` + `cli/session-picker.ts` +
+    // `cli/project-trust.ts`): the `--resume` picker and the interactive project-trust prompt run over
+    // the cyrup-tui selectors BEFORE the runtime is built. Interactive-only (each needs a real TTY);
+    // the one-shot/RPC live path is untouched. Returns `Some(0)` when the user cancels the picker.
+    if mode == AppMode::Interactive
+        && let Some(code) = resolve_startup_ui(&cli, &dirs, mode, &mut config)?
+    {
+        return Ok(code);
+    }
+
     let deprecation_warnings = migration.deprecation_warnings.clone();
     let settings_store = file_settings_store(&dirs);
     let cancel = CancelToken::new();
@@ -193,6 +231,7 @@ async fn run() -> anyhow::Result<i32> {
         // `PI_STARTUP_BENCHMARK` only supports interactive mode (Pi main.ts:800-804) — here it is
         // satisfied (interactive). In the one-shot/RPC arms below it is an error.
         let target = config.target.clone();
+        let fresh = is_fresh_target(&target);
         let factory = Arc::new(
             SessionFactory::new(provider, config).settings_store(settings_store.clone()),
         );
@@ -202,7 +241,7 @@ async fn run() -> anyhow::Result<i32> {
                 .context("building agent session runtime")?,
         );
         let session = runtime.session().await;
-        apply_post_build(&session, session_name.as_deref(), &cli).await;
+        apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
         // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
         // when `runMigrations` moved any provider credential into `auth.json`, name them.
         if !migration.migrated_auth_providers.is_empty() {
@@ -216,8 +255,16 @@ async fn run() -> anyhow::Result<i32> {
         if !warnings.is_empty() {
             eprint!("{warnings}");
         }
-        timings.print();
         let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
+        // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:819-835): init the TUI, let stdin
+        // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
+        if timings::startup_benchmark_enabled() {
+            run_interactive_benchmark().await?;
+            timings.mark("interactiveMode.init");
+            timings.print();
+            return Ok(0);
+        }
+        timings.print();
         let inputs = build_inputs(&cli, &dirs.cwd).await?;
         run_interactive(runtime, session, inputs, cancel).await?;
         return Ok(0);
@@ -231,6 +278,7 @@ async fn run() -> anyhow::Result<i32> {
     match mode {
         AppMode::Rpc => {
             let target = config.target.clone();
+            let fresh = is_fresh_target(&target);
             let factory = Arc::new(
                 SessionFactory::new(provider, config).settings_store(settings_store.clone()),
             );
@@ -244,7 +292,7 @@ async fn run() -> anyhow::Result<i32> {
                 }
             };
             let session = runtime.session().await;
-            apply_post_build(&session, session_name.as_deref(), &cli).await;
+            apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
             let _signals = spawn_abort_on_signal(session, cancel.clone());
             let reader = tokio::io::BufReader::new(tokio::io::stdin());
@@ -254,6 +302,7 @@ async fn run() -> anyhow::Result<i32> {
         }
         AppMode::Print | AppMode::Json => {
             // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
+            let fresh = is_fresh_target(&config.target);
             let session = match SessionBuilder::new(provider, config)
                 .settings_store(settings_store.clone())
                 .build()
@@ -264,7 +313,7 @@ async fn run() -> anyhow::Result<i32> {
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),
                 Err(e) => return Err(anyhow::Error::new(e).context("building agent session")),
             };
-            apply_post_build(&session, session_name.as_deref(), &cli).await;
+            apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
             let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
             let inputs = build_inputs(&cli, &dirs.cwd).await?;
@@ -283,16 +332,70 @@ async fn run() -> anyhow::Result<i32> {
 /// Apply the per-run, post-build session knobs that have no `SessionConfig` slot: the trimmed
 /// `--name` display name (Pi `appendSessionInfo`, main.ts:586) and the `--models` Ctrl+P scope (Pi
 /// `resolveModelScope`/`scopedModels`, main.ts:685).
-async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli) {
+///
+/// `fresh` is whether this is a brand-new session (Pi `!hasExistingSession`, main.ts:394): a resumed
+/// session keeps its own restored model, so the saved-default-in-scope active-model pick only fires
+/// for a fresh session.
+async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli, fresh: bool) {
     if let Some(name) = name {
         let _ = session.set_session_name(name).await;
     }
     if !cli.models.is_empty() {
         let scoped = resolve_scoped_models(session.model_catalog(), &cli.models);
         if !scoped.is_empty() {
+            // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
+            // when `--models` scopes the set and `--model` is omitted, the active model is the saved
+            // default if it is in scope, else the first scoped model. Apply only on a fresh session.
+            if cli.model.is_none() && fresh {
+                let eff = session.services().settings.effective();
+                if let Some(chosen) = pick_scoped_active_model(
+                    &scoped,
+                    eff.default_provider().as_deref(),
+                    eff.default_model().as_deref(),
+                ) {
+                    let model = chosen.model.clone();
+                    let thinking = chosen.thinking_level;
+                    if session.set_model_resolved(model).await.is_ok() {
+                        // Use the scoped model's thinking level only when `--thinking` was omitted
+                        // (explicit `--thinking` takes precedence and is applied by the builder).
+                        if cli.thinking.is_none()
+                            && let Some(level) = thinking
+                        {
+                            let _ = session.set_thinking_level(level).await;
+                        }
+                    }
+                }
+            }
             session.set_scoped_models(scoped);
         }
     }
+}
+
+/// Whether a target starts a brand-new session (Pi `!hasExistingSession`): `New`/`CreateWithId` are
+/// fresh; `Resume`/`Continue`/`Fork` carry (or restore) an existing transcript + model.
+fn is_fresh_target(target: &SessionTarget) -> bool {
+    matches!(target, SessionTarget::New | SessionTarget::CreateWithId(_))
+}
+
+/// The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414): given the
+/// resolved `--models` scope and the settings default `(provider, model)`, prefer the saved default
+/// when it is a member of the scope (case-insensitive `provider`+`id` match, Pi `modelsAreEqual`),
+/// else the first scoped model. `None` only when the scope is empty.
+fn pick_scoped_active_model<'a>(
+    scoped: &'a [ScopedModel],
+    saved_provider: Option<&str>,
+    saved_model: Option<&str>,
+) -> Option<&'a ScopedModel> {
+    let saved = match (saved_provider, saved_model) {
+        (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+            scoped.iter().find(|sm| {
+                sm.model.provider.as_str().eq_ignore_ascii_case(provider)
+                    && sm.model.id.as_str().eq_ignore_ascii_case(model)
+            })
+        }
+        _ => None,
+    };
+    saved.or_else(|| scoped.first())
 }
 
 /// Resolve the `--models` patterns to a [`ScopedModel`] set against the live catalog (Pi
@@ -317,6 +420,192 @@ fn resolve_scoped_models(
         }
     }
     out
+}
+
+/// Resolve the session target with Pi's full non-interactive depth (Pi `createSessionManager`,
+/// main.ts:254-350) and write it onto `config`. Returns `Some(exit_code)` when the resolution itself
+/// terminates the run (a not-found ref / id-collision → 1, a declined fork → 0); `None` when it set a
+/// target to build. The session listings are scanned only here, behind the caller's ref-present guard.
+fn resolve_session(
+    cli: &Cli,
+    dirs: &ConfigDirs,
+    mode: AppMode,
+    config: &mut SessionConfig,
+) -> anyhow::Result<Option<i32>> {
+    let flags = SessionFlags {
+        fork: cli.fork.clone(),
+        session: cli.session.clone(),
+        session_id: cli.session_id.clone(),
+        r#continue: cli.r#continue,
+        resume: cli.resume,
+        no_session: cli.no_session,
+    };
+    let (locals, globals) = gather_session_refs(dirs);
+    let non_interactive = mode != AppMode::Interactive;
+    let mut confirm = prompt_fork_confirm;
+    let resolution = resolve_session_target(
+        &flags,
+        &dirs.cwd,
+        &locals,
+        &globals,
+        non_interactive,
+        &mut confirm,
+    );
+    // Pi prints these via `console.log` (stdout) / `console.error` (stderr) verbatim — no `Error:`
+    // prefix (the messages are pre-composed, e.g. `No session found matching '<arg>'`).
+    for line in &resolution.stdout {
+        println!("{line}");
+    }
+    for line in &resolution.stderr {
+        eprintln!("{line}");
+    }
+
+    // Interactive missing-session-cwd Continue/Cancel prompt (Pi `promptForMissingSessionCwd`,
+    // main.ts:575-580): a resumed session whose stored cwd is gone is offered a continuation against
+    // the current cwd, or cancels to exit 0. The non-interactive arm already errored above.
+    if let Some(issue) = resolution.missing_cwd {
+        let theme = UiTheme::default();
+        let body = cyrup::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
+        return match cyrup::run_missing_cwd_prompt(&theme, &body, &issue.fallback_cwd)? {
+            cyrup::MissingCwdChoice::Continue => {
+                // Reopen the session against the chosen (fallback) cwd (Pi `SessionManager.open(
+                // sessionFile, sessionDir, selectedCwd)`, main.ts:578).
+                config.target = SessionTarget::Resume(issue.session_file);
+                config.cwd_override = Some(issue.fallback_cwd);
+                config.persist = !cli.no_session;
+                Ok(None)
+            }
+            // Pi `if (!selectedCwd) process.exit(0)` (main.ts:576-577).
+            cyrup::MissingCwdChoice::Cancel => Ok(Some(0)),
+        };
+    }
+
+    Ok(match resolution.outcome {
+        Some(Outcome::Build(target)) => {
+            config.target = target;
+            // Recompute persistence now the target may be Resume/Fork/CreateWithId (Pi: any explicit
+            // session persists; `--no-session` forces ephemeral; interactive always persists).
+            let explicit = !matches!(config.target, SessionTarget::New);
+            config.persist = !cli.no_session && (explicit || mode == AppMode::Interactive);
+            None
+        }
+        Some(Outcome::ExitOk) => Some(0),
+        Some(Outcome::ExitErr) => Some(1),
+        None => None,
+    })
+}
+
+/// The pre-launch startup-UI orchestration (Pi `cli/startup-ui.ts` + `cli/session-picker.ts` +
+/// `cli/project-trust.ts`): run the interactive `--resume` picker and the project-trust prompt over
+/// the cyrup-tui selectors and feed their results back into `config` before the runtime is built.
+/// Returns `Some(0)` when the resume picker is cancelled (Pi `No session selected` + exit 0), else
+/// `None` (proceed). Interactive-only — the caller gates on the mode so the one-shot/RPC live path is
+/// never touched. TTY-bound (it drives real terminals), so it is not unit-tested; the row/label/
+/// decision builders it composes are unit-tested in [`cyrup::startup_ui`].
+fn resolve_startup_ui(
+    cli: &Cli,
+    dirs: &ConfigDirs,
+    mode: AppMode,
+    config: &mut SessionConfig,
+) -> anyhow::Result<Option<i32>> {
+    let theme = UiTheme::default();
+
+    // --resume (#1): mount the `SessionSelector` over the merged local+global session listing and
+    // resume the chosen session (Pi `selectSession`, session-picker.ts:15-55). A bare `--resume`
+    // mapped to `New` in `to_session_config`; the picker resolves the real target here.
+    if cli.resume && matches!(config.target, SessionTarget::New) {
+        let sessions = gather_session_infos(dirs);
+        match cyrup::run_resume_picker(&theme, &sessions, None)? {
+            cyrup::ResumeChoice::Selected(path) => {
+                config.target = SessionTarget::Resume(path);
+                config.persist = !cli.no_session;
+            }
+            // Pi `console.log(chalk.dim("No session selected")); process.exit(0)` (main.ts:329).
+            cyrup::ResumeChoice::Cancelled => {
+                println!("No session selected");
+                return Ok(Some(0));
+            }
+        }
+    }
+
+    // Project trust (#3): when the resolved trust decision needs a prompt (trust-requiring project
+    // resources, no `--approve`/`--no-approve`, no saved decision, default policy `prompt`), run the
+    // `TrustSelector` and feed the chosen decision in as this run's trust override (the builder honors
+    // an override directly, so no rebuild is needed). Cancelling proceeds untrusted (Pi `ui.select →
+    // undefined`). Pi `createProjectTrustContext` (project-trust.ts:7-62) / `resolveProjectTrusted`
+    // (main.ts:610-734).
+    if config.trust_override.is_none() {
+        let trust_store =
+            cyrup_config::trust::TrustStore::new(dirs.agent_dir.join("trust.json"));
+        let saved = trust_store.nearest(&dirs.cwd).ok().flatten();
+        let default_trust = default_project_trust(dirs);
+        let has_resources =
+            cyrup::has_trust_requiring_project_resources(&dirs.cwd, &dirs.agent_dir);
+        if cyrup::trust_needs_prompt(
+            has_resources,
+            None,
+            saved.as_ref().map(|e| e.decision),
+            default_trust,
+            mode,
+        ) {
+            let options = cyrup_config::trust::trust_options(&dirs.cwd, false);
+            if let Some(trusted) =
+                cyrup::run_trust_prompt(&theme, &dirs.cwd, &options, &saved, &trust_store)?
+            {
+                config.trust_override = Some(trusted);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// The global-only `defaultProjectTrust` policy (Pi `getDefaultProjectTrust`), read from the file
+/// settings store with the project scope untrusted (matching the startup settings manager).
+fn default_project_trust(dirs: &ConfigDirs) -> DefaultProjectTrust {
+    let mgr = SettingsManager::load(file_settings_store(dirs), Settings::new(), false);
+    mgr.effective().default_project_trust()
+}
+
+/// Scan the cwd's local session listing and the global cross-project listing into a merged
+/// [`SessionInfo`] vector (locals first, globals de-duplicated by path) for the `--resume` picker (Pi
+/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25).
+fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
+    let root = dirs.session_dir.clone();
+    let layout = SessionLayout::new(root.clone(), dirs.cwd.clone());
+    let mut sessions = list_in_dir(&layout.dir(), None, None);
+    for global in list_all(&SessionsRoot(root)) {
+        if !sessions.iter().any(|s| s.path == global.path) {
+            sessions.push(global);
+        }
+    }
+    sessions
+}
+
+/// Scan the cwd's session listing and the global cross-project listing into [`SessionRef`]s (Pi
+/// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:169,179).
+fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) {
+    let root = dirs.session_dir.clone();
+    let layout = SessionLayout::new(root.clone(), dirs.cwd.clone());
+    let locals: Vec<SessionRef> =
+        list_in_dir(&layout.dir(), None, None).iter().map(SessionRef::from).collect();
+    let globals: Vec<SessionRef> =
+        list_all(&SessionsRoot(root)).iter().map(SessionRef::from).collect();
+    (locals, globals)
+}
+
+/// The plain-stdin fork-into-cwd confirmation (Pi `promptConfirm`, main.ts:191-203): a cooked-mode
+/// `[y/N]` readline (NOT the TUI dialog host), run before any terminal takeover. Defaults to `no`.
+fn prompt_fork_confirm() -> bool {
+    use std::io::Write;
+    print!("Fork this session into current directory? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    answer == "y" || answer == "yes"
 }
 
 /// The `@file` references in the CLI positionals (Pi `parsed.fileArgs`). Used to reject `@file` in
@@ -472,6 +761,23 @@ fn ensure_prompt(inputs: &Inputs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The terminal-query drain window for the startup benchmark (Pi `setTimeout(resolve, 150)`,
+/// main.ts:826): the brief pause that lets the TUI's stdin handler consume the terminal's query
+/// replies (Kitty keyboard protocol, device attributes, cell size) before the terminal is restored.
+const BENCHMARK_DRAIN_MS: u64 = 150;
+
+/// The `PI_STARTUP_BENCHMARK` interactive teardown (Pi main.ts:819-835): initialise the TUI over the
+/// real terminal (Pi `interactiveMode.init()`), give the stdin handler [`BENCHMARK_DRAIN_MS`] to drain
+/// the terminal's query replies, then stop + restore — measuring cold startup without running the
+/// event loop. TTY-bound (it owns a real `CrosstermBackend`), so it is not unit-tested.
+async fn run_interactive_benchmark() -> anyhow::Result<()> {
+    let mut app = App::into_stdout(UiTheme::default()).context("initialising the terminal UI")?;
+    app.detect_image_support();
+    tokio::time::sleep(std::time::Duration::from_millis(BENCHMARK_DRAIN_MS)).await;
+    let _ = app.restore();
+    Ok(())
+}
+
 /// The interactive front-end: build the TUI over a real `CrosstermBackend<Stdout>`, seed any initial
 /// prompt, and run the event loop against the live session. Restores the terminal on exit.
 async fn run_interactive(
@@ -554,7 +860,69 @@ fn init_tracing(verbose: bool) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{format_token_count, fuzzy_match};
+    use super::{
+        format_token_count, fuzzy_match, is_fresh_target, pick_scoped_active_model, ScopedModel,
+        SessionTarget,
+    };
+
+    fn scoped(provider: &str, id: &str) -> ScopedModel {
+        // Build a `ScopedModel` from a real catalog entry so the pick exercises real `Model` fields.
+        let catalog = cyrup::provider::all_available_models();
+        let model = catalog
+            .iter()
+            .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)
+            .or_else(|| catalog.iter().find(|m| m.provider.as_str() == provider))
+            .expect("a catalog model for the provider")
+            .clone();
+        ScopedModel { model, thinking_level: None }
+    }
+
+    #[test]
+    fn scoped_active_model_prefers_saved_default_in_scope_else_first() {
+        // Pi `buildSessionOptions` (main.ts:394-414): saved default in scope wins; else scoped[0].
+        let a = scoped("anthropic", "");
+        let o = scoped("openai", "");
+        let scope = vec![a.clone(), o.clone()];
+
+        // Saved default IS in scope (case-insensitive) → it is chosen, even though it is not first.
+        let picked = pick_scoped_active_model(
+            &scope,
+            Some(&o.model.provider.as_str().to_uppercase()),
+            Some(&o.model.id.as_str().to_uppercase()),
+        )
+        .expect("a pick");
+        assert_eq!(picked.model.provider, o.model.provider);
+        assert_eq!(picked.model.id, o.model.id);
+
+        // Saved default NOT in scope → fall back to the first scoped model.
+        let picked = pick_scoped_active_model(&scope, Some("together"), Some("nope")).expect("a pick");
+        assert_eq!(picked.model.provider, a.model.provider);
+
+        // No saved default → the first scoped model.
+        let picked = pick_scoped_active_model(&scope, None, None).expect("a pick");
+        assert_eq!(picked.model.provider, a.model.provider);
+
+        // An empty scope yields nothing to pick.
+        assert!(pick_scoped_active_model(&[], Some("openai"), Some("gpt-4o")).is_none());
+    }
+
+    #[test]
+    fn benchmark_drain_window_matches_pi() {
+        // Pi `setTimeout(resolve, 150)` (main.ts:826).
+        assert_eq!(super::BENCHMARK_DRAIN_MS, 150);
+    }
+
+    #[test]
+    fn fresh_target_classifies_new_and_create_with_id() {
+        assert!(is_fresh_target(&SessionTarget::New));
+        assert!(is_fresh_target(&SessionTarget::CreateWithId("x".into())));
+        assert!(!is_fresh_target(&SessionTarget::Continue));
+        assert!(!is_fresh_target(&SessionTarget::Resume("/s/a.jsonl".into())));
+        assert!(!is_fresh_target(&SessionTarget::Fork {
+            source: "/s/a.jsonl".into(),
+            id: None
+        }));
+    }
 
     #[test]
     fn token_counts_humanise_like_pi() {

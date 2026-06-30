@@ -293,14 +293,39 @@ async fn model_resolution_wiring() {
     assert_eq!(m.model.as_str(), "faux-1");
     assert_eq!(m.provider.as_str(), "faux");
 
-    // An unknown pattern is a typed ModelNotFound error (no panic).
+    // An unknown *bare* pattern (no provider prefix, no explicit --provider) stays a typed
+    // ModelNotFound error (Pi `resolveCliModel` only builds a fallback when a provider is known).
     let mut cfg2 = base_config(&fx);
     cfg2.model_pattern = Some("does-not-exist".to_string());
-    match SessionBuilder::new(faux, cfg2).build().await {
+    match SessionBuilder::new(faux.clone(), cfg2).build().await {
         Err(SessionServiceError::ModelNotFound(_)) => {}
         Err(other) => panic!("expected ModelNotFound, got {other:?}"),
         Ok(_) => panic!("expected ModelNotFound, got Ok"),
     }
+}
+
+#[tokio::test]
+async fn unresolvable_model_on_known_provider_builds_a_custom_fallback() {
+    // Pi `buildFallbackModel` (model-resolver.ts:475-501): an unresolvable `--model` id on a KNOWN
+    // provider builds a custom-id model and proceeds (no error). The provider is "known" via a
+    // `provider/` prefix OR an explicit `--provider`.
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+
+    // `faux/custom-9000`: the `faux/` prefix names the resolved provider → custom fallback.
+    let mut cfg = base_config(&fx);
+    cfg.model_pattern = Some("faux/custom-9000".to_string());
+    let session = SessionBuilder::new(faux.clone(), cfg).build().await.unwrap();
+    let m = session.model();
+    assert_eq!(m.model.as_str(), "custom-9000");
+    assert_eq!(m.provider.as_str(), "faux");
+
+    // Bare id + explicit `--provider` (cli_provider_explicit) → custom fallback too.
+    let mut cfg2 = base_config(&fx);
+    cfg2.model_pattern = Some("totally-made-up".to_string());
+    cfg2.cli_provider_explicit = true;
+    let session2 = SessionBuilder::new(faux, cfg2).build().await.unwrap();
+    assert_eq!(session2.model().model.as_str(), "totally-made-up");
 }
 
 #[tokio::test]

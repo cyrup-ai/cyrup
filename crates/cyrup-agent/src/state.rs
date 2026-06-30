@@ -38,6 +38,15 @@ pub struct GenerationConfig {
     /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi `onResponse`,
     /// agent.ts:103).
     pub on_response: Option<OnResponseHook>,
+    /// Provider-scoped env overlay forwarded into `cyrup_provider::StreamOptions.env` (Pi
+    /// `StreamOptions.env`, types.ts:184). The session builder seeds it with the `httpProxy` setting
+    /// (`HTTP_PROXY`/`HTTPS_PROXY`) so the provider's proxy resolver honors the configured proxy (Pi
+    /// `applyHttpProxySettings`, main.ts:744). Empty/absent ⇒ the ambient process env is used.
+    pub env: Option<cyrup_provider::ProviderEnv>,
+    /// HTTP request idle timeout (ms) forwarded into `cyrup_provider::StreamOptions.timeout_ms` (Pi
+    /// `StreamOptions.timeoutMs` / `configureHttpDispatcher`, main.ts:745). Providers/SDKs that
+    /// support a request timeout honor it; others ignore it. `None`/`0` ⇒ no client-side cap.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Live agent state (arch-02 §4.1). Mutated only by the loop's reducer ([`reduce`]) and the

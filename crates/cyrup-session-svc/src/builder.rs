@@ -46,6 +46,19 @@ pub enum SessionTarget {
     Resume(PathBuf),
     /// Continue the most recent session for the cwd (or create one if none).
     Continue,
+    /// Fork a source session file into a fresh session anchored at the build cwd, optionally with an
+    /// explicit id (Pi `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })`, main.ts:251).
+    /// Used by `--fork <ref>` and by `--session <ref>` when the ref resolves to another project and
+    /// the user confirms forking it into the current directory.
+    Fork {
+        /// The resolved source session file to copy history from.
+        source: PathBuf,
+        /// The forked session's id (`--session-id`), or `None` to mint a fresh one.
+        id: Option<String>,
+    },
+    /// Create a fresh session with an explicit id (Pi `SessionManager.create(cwd, dir, { id })`,
+    /// main.ts:349). Used by `--session-id <id>` when no local session with that exact id exists.
+    CreateWithId(String),
 }
 
 /// The declarative inputs the builder resolves into a wired session (arch-11 §3.3).
@@ -67,6 +80,10 @@ pub struct SessionConfig {
     pub app_mode: AppMode,
     /// Model selection pattern (`provider/id[:level]`); `None` ⇒ settings default ⇒ first catalog.
     pub model_pattern: Option<String>,
+    /// Whether the CLI named a provider explicitly (`--provider`, Pi `cliProvider`). Lets the model
+    /// resolver build a Pi `buildFallbackModel` custom-id model for an unresolvable `--model` id on a
+    /// *known* provider even when the pattern carries no `provider/` prefix (Pi model-resolver.ts:475).
+    pub cli_provider_explicit: bool,
     /// Thinking level override (`None` ⇒ pattern `:level` ⇒ settings default).
     pub thinking_level: Option<ModelThinkingLevel>,
     /// `--approve` (Some(true)) / `--no-approve` (Some(false)).
@@ -122,6 +139,20 @@ pub struct SessionConfig {
     pub protect_paths: bool,
     /// Wrap the fs backend in [`TraversalFs`] confined to `cwd` (R-03-006).
     pub confine_to_cwd: bool,
+    /// Captured extension CLI flag values threaded from the bin (Pi `extensionFlagValues:
+    /// parsed.unknownFlags`, main.ts:634 / args.ts:188-201). Forwarded onto [`AgentSessionServices`]
+    /// so a loaded extension can read them via `applyExtensionFlagValues`. The WASM-guest *consumption*
+    /// rides the ext-host tier (ledgered); the bin-side capture + threading is closed here. Each entry
+    /// is `(name, value)` with the leading `--` already stripped.
+    pub extension_flag_values: Vec<(String, ExtensionFlagValue)>,
+}
+
+/// A captured extension CLI flag value (Pi `unknownFlags` map entry, args.ts:52-53). `Bool(true)` is a
+/// bare `--flag`; `Str` is `--flag=value` or `--flag value`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionFlagValue {
+    Bool(bool),
+    Str(String),
 }
 
 impl SessionConfig {
@@ -136,6 +167,7 @@ impl SessionConfig {
             session_dir: None,
             app_mode: AppMode::Print,
             model_pattern: None,
+            cli_provider_explicit: false,
             thinking_level: None,
             trust_override: None,
             no_context_files: false,
@@ -160,6 +192,7 @@ impl SessionConfig {
             permission_policy: PermissionPolicy::new(),
             protect_paths: true,
             confine_to_cwd: false,
+            extension_flag_values: Vec::new(),
         }
     }
 }
@@ -172,6 +205,22 @@ pub enum NoTools {
     All,
     /// Disable the default built-in tools but keep extension/custom tools (Pi default built-ins).
     Builtin,
+}
+
+/// Build the provider-scoped env overlay for the configured HTTP proxy (Pi `applyHttpProxySettings`,
+/// http-dispatcher.ts:42-47): a non-empty `httpProxy` setting sets both `HTTP_PROXY` and `HTTPS_PROXY`
+/// in the overlay (matching Pi's `process.env.HTTP_PROXY ??= proxy; process.env.HTTPS_PROXY ??= proxy`),
+/// so the provider's `resolveHttpProxyUrlForTarget` routes requests through it. An absent/blank setting
+/// yields `None` (the ambient process env is used unchanged).
+fn http_proxy_overlay(proxy: Option<&str>) -> Option<cyrup_provider::ProviderEnv> {
+    let proxy = proxy?.trim();
+    if proxy.is_empty() {
+        return None;
+    }
+    let mut overlay = cyrup_provider::ProviderEnv::new();
+    overlay.insert("HTTP_PROXY".to_string(), proxy.to_string());
+    overlay.insert("HTTPS_PROXY".to_string(), proxy.to_string());
+    Some(overlay)
 }
 
 /// Pi's default active built-in tool names (sdk.ts:244).
@@ -328,6 +377,29 @@ impl SessionBuilder {
                     SessionManager::open_with_cwd(path, cfg.cwd_override.as_deref())?
                 }
                 SessionTarget::Continue => SessionManager::continue_recent(&cwd, &layout)?,
+                // Fork the resolved source file into a fresh session at the build cwd (Pi
+                // `forkSessionOrExit`/`SessionManager.forkFrom`, main.ts:251-258). The `--session-id`
+                // (when given) becomes the forked session's id; otherwise one is minted.
+                SessionTarget::Fork { source, id } => {
+                    let opts = NewSessionOpts {
+                        id: id.clone().map(cyrup_core::SessionId::from),
+                        ..NewSessionOpts::default()
+                    };
+                    SessionManager::fork_from(source, &cwd, &layout, opts)?
+                }
+                // Create a fresh session with an explicit id (Pi `SessionManager.create(cwd, dir,
+                // { id })`, main.ts:349). Persists like `New`; an ephemeral run goes in-memory.
+                SessionTarget::CreateWithId(id) => {
+                    let opts = NewSessionOpts {
+                        id: Some(cyrup_core::SessionId::from(id.clone())),
+                        parent_session: cfg.parent_session.clone(),
+                    };
+                    if cfg.persist {
+                        SessionManager::create(&cwd, &layout, opts)?
+                    } else {
+                        SessionManager::in_memory(&cwd, opts)?
+                    }
+                }
             },
         };
         let session_id = manager.session_id().clone();
@@ -572,6 +644,21 @@ impl SessionBuilder {
                 high: to_u64(budgets.high),
             });
         }
+        // HTTP proxy + idle-timeout from settings (Pi `applyHttpProxySettings(settings.httpProxy)` +
+        // `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:744-745). The `httpProxy` setting
+        // becomes a provider-scoped `HTTP_PROXY`/`HTTPS_PROXY` overlay (Pi `StreamOptions.env`) that the
+        // provider's proxy resolver honors; the idle timeout becomes the request `timeout_ms`. The
+        // setting-only read (empty `EnvVars` for the fallback) mirrors Pi reading the setting value.
+        if let Some(overlay) =
+            http_proxy_overlay(eff.http_proxy(&cyrup_config::EnvVars::default()).as_deref())
+        {
+            agent_builder = agent_builder.provider_env(overlay);
+        }
+        if let Ok(timeout_ms) = eff.http_idle_timeout_ms()
+            && timeout_ms > 0
+        {
+            agent_builder = agent_builder.timeout_ms(timeout_ms);
+        }
         let agent = agent_builder.build();
 
         // Seed the model + thinking-level change entries so a future resume can restore them, and
@@ -648,6 +735,7 @@ impl SessionBuilder {
             model: resolved_model,
             system_prompt,
             host_services,
+            extension_flag_values: cfg.extension_flag_values.clone(),
         };
 
         Ok(AgentSession::from_parts(
@@ -714,7 +802,16 @@ fn resolve_model(
                 let parsed = resolver.parse_pattern(pat, true);
                 match parsed.model {
                     Some(m) => (Some(m), parsed.thinking_level),
-                    None => return Err(SessionServiceError::ModelNotFound(pat.clone())),
+                    // Pi `resolveCliModel` fallback (model-resolver.ts:475-501): an unresolvable
+                    // `--model` id on a *known* provider does NOT error — it builds a custom-id model
+                    // from the provider's default and proceeds (the bin already emitted the
+                    // "Using custom model id." warning). The provider is "known" when `--provider` was
+                    // explicit OR the pattern carries a `provider/` prefix naming the resolved
+                    // provider; a bare unresolvable id with neither stays a hard `ModelNotFound`.
+                    None => match fallback_model(&resolver, provider, cfg, pat) {
+                        Some((m, level)) => (Some(m), level),
+                        None => return Err(SessionServiceError::ModelNotFound(pat.clone())),
+                    },
                 }
             }
             None => (None, None),
@@ -788,6 +885,56 @@ fn resolve_model(
     Ok((model, model_ref, thinking, fallback))
 }
 
+/// Pi `resolveCliModel` custom-fallback (model-resolver.ts:475-501 + `buildFallbackModel`
+/// 163-177): when a strict `--model` pattern does not resolve but the provider is *known*, clone the
+/// provider's default (alias-preferred, else first) model and override `id`/`name` with the
+/// requested model id, so an unknown-but-intended model id proceeds as a custom model. The provider
+/// is "known" when `--provider` was explicit (`cli_provider_explicit`) or the pattern carries a
+/// `provider/` prefix naming the resolved provider. Returns `(model, thinking_level)` or `None` (⇒
+/// the caller keeps Pi's hard `ModelNotFound`). A trailing `:level` is honored only when `--thinking`
+/// was not given (Pi `fallbackThinking`, model-resolver.ts:481-490).
+fn fallback_model(
+    resolver: &ModelResolver,
+    provider: &dyn Provider,
+    cfg: &SessionConfig,
+    pattern: &str,
+) -> Option<(Model, Option<ModelThinkingLevel>)> {
+    let provider_id = provider.id();
+    let prefix = format!("{}/", provider_id.as_str());
+    let has_matching_prefix =
+        pattern.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase());
+    if !cfg.cli_provider_explicit && !has_matching_prefix {
+        return None;
+    }
+    // Strip the provider prefix (Pi `pattern = cliModel.substring(slashIndex + 1)`), then peel a
+    // trailing `:level` thinking suffix when `--thinking` was not explicitly set.
+    let stripped: &str =
+        if has_matching_prefix { pattern.get(prefix.len()..).unwrap_or(pattern) } else { pattern };
+    let (base_id, level): (&str, Option<ModelThinkingLevel>) = if cfg.thinking_level.is_some() {
+        (stripped, None)
+    } else if let Some(idx) = stripped.rfind(':') {
+        let suffix = stripped.get(idx + 1..).unwrap_or("");
+        match thinking_level_from_str(suffix) {
+            Some(lvl) => (stripped.get(..idx).unwrap_or(stripped), Some(lvl)),
+            None => (stripped, None),
+        }
+    } else {
+        (stripped, None)
+    };
+    if base_id.is_empty() {
+        return None;
+    }
+    // Clone the provider default (alias-preferred) or the first model, overriding id + name.
+    let base = resolver
+        .provider_default(provider_id)
+        .cloned()
+        .or_else(|| provider.models().first().cloned())?;
+    let mut model = base;
+    model.id = cyrup_core::ModelId::from(base_id);
+    model.name = base_id.to_string();
+    Some((model, level))
+}
+
 /// Synthesize a one-line prompt snippet for a built-in tool so the "Available tools" section is
 /// populated (arch-06 R-06-012). Mirrors the built-ins' own `prompt_snippet` intent.
 fn tool_contribution(name: &str) -> ToolPromptContribution {
@@ -838,4 +985,23 @@ fn ext_mode(mode: AppMode) -> (ExtMode, bool) {
 /// Today's date (UTC) for the prompt footer; falls back to the epoch on a clock fault.
 fn today() -> time::Date {
     time::OffsetDateTime::now_utc().date()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod tests {
+    use super::http_proxy_overlay;
+
+    #[test]
+    fn http_proxy_overlay_sets_both_proxy_keys_or_none() {
+        // Pi `applyHttpProxySettings` (http-dispatcher.ts:42-47): a non-empty setting sets both
+        // HTTP_PROXY and HTTPS_PROXY (so the provider proxy resolver routes through it).
+        let overlay = http_proxy_overlay(Some("http://proxy.local:8080")).expect("an overlay");
+        assert_eq!(overlay.get("HTTP_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+        assert_eq!(overlay.get("HTTPS_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+        // A blank / whitespace / absent setting yields no overlay (ambient env unchanged).
+        assert!(http_proxy_overlay(Some("   ")).is_none());
+        assert!(http_proxy_overlay(Some("")).is_none());
+        assert!(http_proxy_overlay(None).is_none());
+    }
 }

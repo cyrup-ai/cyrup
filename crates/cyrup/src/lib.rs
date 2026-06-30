@@ -18,8 +18,10 @@ pub mod input;
 pub mod migrations;
 pub mod provider;
 pub mod run;
+pub mod session_resolve;
 pub mod signals;
 pub mod startup;
+pub mod startup_ui;
 pub mod subcommands;
 pub mod timings;
 
@@ -32,12 +34,21 @@ pub use diagnostics::{
     DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT,
 };
 pub use input::{build_inputs, compose_inputs, split_positionals, Inputs};
-pub use provider::select_provider;
+pub use provider::{select_provider, unknown_model_warning};
 pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
+pub use session_resolve::{
+    format_missing_session_cwd_prompt, match_session_arg, missing_session_cwd_error,
+    resolve_session_target, MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup,
+    SessionRef,
+};
 pub use signals::spawn_abort_on_signal;
 pub use startup::{
     are_experimental_features_enabled, file_settings_store, is_official_distribution,
     should_run_first_time_setup,
+};
+pub use startup_ui::{
+    has_trust_requiring_project_resources, run_missing_cwd_prompt, run_resume_picker,
+    run_trust_prompt, session_rows, trust_needs_prompt, MissingCwdChoice, ResumeChoice, TrustChoice,
 };
 
 // Re-export the runtime-mode enum the whole bin pivots on (arch-11 §6.1).

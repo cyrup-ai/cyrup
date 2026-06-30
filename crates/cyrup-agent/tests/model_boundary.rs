@@ -49,6 +49,8 @@ struct Captured {
     max_retries: Option<u32>,
     api_key: Option<String>,
     system_prompt: Option<String>,
+    env: Option<cyrup_provider::ProviderEnv>,
+    timeout_ms: Option<u64>,
 }
 
 /// A `StreamFn` that records the forwarded `Context`/`StreamOptions`, then delegates to a faux
@@ -76,6 +78,8 @@ impl StreamFn for RecordingStreamFn {
             max_retries: opts.max_retries,
             api_key: opts.api_key.clone(),
             system_prompt: ctx.system_prompt.clone(),
+            env: opts.env.clone(),
+            timeout_ms: opts.timeout_ms,
         });
         self.inner.stream(model, ctx, opts)
     }
@@ -248,6 +252,30 @@ async fn gap3_5_6_8_generation_params_forwarded() {
     assert_eq!(c.max_retry_delay_ms, Some(7000));
     assert_eq!(c.max_retries, Some(4));
     assert_eq!(c.system_prompt.as_deref(), Some("sys"));
+}
+
+#[tokio::test]
+async fn provider_env_overlay_and_timeout_forward_to_stream_options() {
+    // The HTTP-proxy overlay + idle timeout (Pi `applyHttpProxySettings`/`configureHttpDispatcher`,
+    // main.ts:744-745) must reach `StreamOptions.env`/`timeout_ms` so the provider's proxy resolver
+    // honors the configured proxy.
+    let (sf, captured) =
+        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let mut overlay = cyrup_provider::ProviderEnv::new();
+    overlay.insert("HTTP_PROXY".to_string(), "http://proxy.local:8080".to_string());
+    overlay.insert("HTTPS_PROXY".to_string(), "http://proxy.local:8080".to_string());
+    let agent = Agent::builder(model_ref(), sf)
+        .provider_env(overlay)
+        .timeout_ms(120_000)
+        .build();
+    agent.prompt("go").await.unwrap().finished().await;
+
+    let cap = captured.lock().unwrap();
+    let c = &cap[0];
+    let env = c.env.as_ref().expect("the provider env overlay must forward");
+    assert_eq!(env.get("HTTP_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+    assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+    assert_eq!(c.timeout_ms, Some(120_000));
 }
 
 #[tokio::test]

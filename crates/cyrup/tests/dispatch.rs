@@ -11,7 +11,7 @@ use cyrup::run::{run_json_dispatch, run_print_dispatch};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
 use cyrup_sdk::core::{AssistantMessage, StopReason};
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
+use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, SessionTarget};
 use tempfile::TempDir;
 
 /// Build an ephemeral in-memory session over a faux provider scripted with `responses`.
@@ -97,4 +97,51 @@ async fn json_dispatch_emits_ordered_event_stream() {
     assert_eq!(kinds.first().map(String::as_str), Some("agent_start"), "stream opens with agent_start");
     assert_eq!(kinds.last().map(String::as_str), Some("agent_end"), "stream closes with agent_end");
     assert_eq!(code, 0);
+}
+
+/// `--session-id <fresh>` builds via the new `SessionTarget::CreateWithId` arm (Pi
+/// `SessionManager.create(cwd, dir, { id })`, main.ts:349) — the session adopts the exact id and
+/// persists. Previously a fresh id hit a literal `open` and failed; this exercises the create arm.
+#[tokio::test]
+async fn create_with_id_target_adopts_the_exact_id() {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = true;
+    config.target = SessionTarget::CreateWithId("my-custom-id".to_string());
+
+    let session = SessionBuilder::new(provider, config).build().await.unwrap();
+    assert_eq!(session.session_id().as_str(), "my-custom-id");
+}
+
+/// `--fork <ref>` builds via the new `SessionTarget::Fork` arm (Pi `SessionManager.forkFrom`,
+/// main.ts:251): the source session's history is copied into a fresh session that adopts the supplied
+/// `--session-id`. Exercises the create-source → flush → fork-with-id path end-to-end.
+#[tokio::test]
+async fn fork_target_copies_history_into_a_new_id() {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+
+    // 1. Build + run a persisted SOURCE session so a file with entries exists on disk.
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("source answer")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux;
+    let mut src_cfg = SessionConfig::new(cwd.path(), agent_dir.path());
+    src_cfg.persist = true;
+    let source = SessionBuilder::new(provider, src_cfg).build().await.unwrap();
+    let mut sink: Vec<u8> = Vec::new();
+    run_print_dispatch(&source, &text("seed", &[]), &mut sink).await.unwrap();
+    let source_file = source.session_file().await.expect("source session flushed to disk");
+
+    // 2. Fork that file into a fresh session that adopts the explicit id.
+    let provider2: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let mut fork_cfg = SessionConfig::new(cwd.path(), agent_dir.path());
+    fork_cfg.persist = true;
+    fork_cfg.target = SessionTarget::Fork { source: source_file, id: Some("forked-id".to_string()) };
+    let forked = SessionBuilder::new(provider2, fork_cfg).build().await.unwrap();
+
+    assert_eq!(forked.session_id().as_str(), "forked-id", "fork adopts --session-id");
+    assert!(!forked.entries_json().await.is_empty(), "fork copies the source history");
 }

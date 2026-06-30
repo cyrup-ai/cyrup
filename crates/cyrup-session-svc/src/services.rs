@@ -41,4 +41,7 @@ pub struct AgentSessionServices {
     /// active model (arch-08 §5.6). A loaded WASM extension's `models`/`session`/`control` imports
     /// resolve through this instead of the deny-all default.
     pub host_services: Arc<crate::host_services::LiveHostServices>,
+    /// Captured extension CLI flag values threaded from the CLI (Pi `extensionFlagValues`,
+    /// main.ts:634). Read-only seam a loaded extension consumes via `applyExtensionFlagValues`.
+    pub extension_flag_values: Vec<(String, crate::builder::ExtensionFlagValue)>,
 }

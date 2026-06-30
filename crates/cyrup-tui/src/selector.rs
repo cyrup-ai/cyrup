@@ -177,6 +177,17 @@ impl ListSelector {
         ListSelector { list, values, preview: false, title: Some(kind.title().to_string()) }
     }
 
+    /// A generic titled prompt (Pi `showStartupSelector`, startup-ui.ts:134-163): the pre-launch
+    /// Continue/Cancel-style selector the bin mounts before the agent runtime is built (e.g. the
+    /// missing-session-cwd prompt). Rows are `(value, label, description)`; confirming yields the
+    /// highlighted row's value. `selected` preselects a row; `maxVisible` is the row count.
+    pub fn prompt(title: String, rows: Vec<(String, String, Option<String>)>, selected: usize) -> Self {
+        let count = rows.len().clamp(1, u16::MAX as usize) as u16;
+        let mut selector = ListSelector::new(rows, count, selected, false);
+        selector.title = Some(title);
+        selector
+    }
+
     /// The value of the currently-highlighted row (empty string if the list is empty — never panics).
     fn current_value(&self) -> String {
         self.values.get(self.list.selected()).cloned().unwrap_or_default()

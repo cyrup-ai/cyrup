@@ -558,6 +558,10 @@ impl RunCtx {
             thinking_budgets: self.gen_config.thinking_budgets,
             on_payload: self.gen_config.on_payload.clone(),
             on_response: self.gen_config.on_response.clone(),
+            // Provider-scoped env overlay (e.g. the `httpProxy` setting) + request idle timeout (Pi
+            // `applyHttpProxySettings`/`configureHttpDispatcher`, main.ts:744-745).
+            env: self.gen_config.env.clone(),
+            timeout_ms: self.gen_config.timeout_ms,
             ..Default::default()
         };
         let ctx = Context {
@@ -1544,6 +1548,20 @@ impl AgentBuilder {
     /// fallback, agent-loop.ts:301-302).
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.gen_config.api_key = Some(key.into());
+        self
+    }
+    /// Provider-scoped env overlay forwarded into `StreamOptions.env` (Pi `StreamOptions.env`,
+    /// types.ts:184): the session builder seeds it with the `httpProxy` setting so the provider's
+    /// proxy resolver honors the configured proxy (Pi `applyHttpProxySettings`, main.ts:744).
+    pub fn provider_env(mut self, env: cyrup_provider::ProviderEnv) -> Self {
+        self.gen_config.env = Some(env);
+        self
+    }
+    /// HTTP request idle timeout (ms) forwarded into `StreamOptions.timeout_ms` (Pi
+    /// `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:745). Providers/SDKs that support a
+    /// request timeout honor it; others ignore it.
+    pub fn timeout_ms(mut self, ms: u64) -> Self {
+        self.gen_config.timeout_ms = Some(ms);
         self
     }
     /// Telemetry: inspect/replace the provider payload before sending (Pi `AgentOptions.onPayload`,
