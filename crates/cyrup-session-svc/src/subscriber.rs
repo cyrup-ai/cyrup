@@ -8,13 +8,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use cyrup_agent::{AgentEvent, EventSubscriber};
+use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber};
 use cyrup_core::EventStream;
 use cyrup_session::manager::SessionManager;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::event::{agent_message_to_core, AgentSessionEvent};
+use crate::session::SessionHandle;
 
 const CHANNEL_CAPACITY: usize = 1024;
 
@@ -71,7 +72,9 @@ impl Fanout {
     }
 
     /// Drop all run-scoped senders, terminating the streams returned by the just-finished `prompt`.
-    fn end_run(&self) {
+    /// Called by the persist+fan-out subscriber (unbound legacy path) on `agent_end`, and by the
+    /// post-run driver (bound path) once the WHOLE post-run loop settles.
+    pub(crate) fn end_run(&self) {
         lock(&self.run_scoped).clear();
     }
 
@@ -86,35 +89,67 @@ impl Fanout {
 }
 
 /// The single agent subscriber the facade registers: persists + fans out, in order (arch-11 §3.2).
+/// On a BOUND session it is also the cyrup analogue of Pi's `_handleAgentEvent` (agent-session.ts:512)
+/// — queue-mirror draining, overflow/retry-counter resets, last-assistant tracking, and the
+/// `agent_end.willRetry` payload — reached via the shared [`SessionHandle`].
 pub(crate) struct SvcSubscriber {
     fanout: Arc<Fanout>,
     manager: Arc<AsyncMutex<SessionManager>>,
+    handle: Arc<SessionHandle>,
 }
 
 impl SvcSubscriber {
-    pub(crate) fn new(fanout: Arc<Fanout>, manager: Arc<AsyncMutex<SessionManager>>) -> Self {
-        Self { fanout, manager }
+    pub(crate) fn new(
+        fanout: Arc<Fanout>,
+        manager: Arc<AsyncMutex<SessionManager>>,
+        handle: Arc<SessionHandle>,
+    ) -> Self {
+        Self { fanout, manager, handle }
     }
 }
 
 #[async_trait::async_trait]
 impl EventSubscriber for SvcSubscriber {
     async fn on_event(&self, event: &AgentEvent) {
+        let session = self.handle.get();
+
+        // 0. `_handleAgentEvent` head (Pi agent-session.ts:514-535): on a USER `message_start`, reset
+        //    the overflow latch and drain the matching queue mirror entry + emit `queue_update`.
+        if let (Some(s), AgentEvent::MessageStart { message }) = (&session, event)
+            && matches!(message, AgentMessage::User { .. })
+        {
+            s.on_user_message_start(message).await;
+        }
+
         // 1. Durable persistence: a finalized message lands in the session tree on `message_end`
         //    (arch-04 §6). User → assistant(toolCall) → toolResult → assistant, in event order.
-        if let AgentEvent::MessageEnd { message } = event
-            && let Some(core) = agent_message_to_core(message) {
+        if let AgentEvent::MessageEnd { message } = event {
+            if let Some(core) = agent_message_to_core(message) {
                 // Append the finalized message to the session tree (durable across the turn).
                 let _ = self.manager.lock().await.append_message(core);
             }
+            // `_handleAgentEvent` tail (Pi :562-577): track the last assistant + reset retry/overflow.
+            if let (Some(s), AgentMessage::Assistant(a)) = (&session, message) {
+                s.on_assistant_message_end(a).await;
+            }
+        }
 
-        // 2. Fan the event out to live subscriptions (awaited, in order).
-        let svc_ev = AgentSessionEvent::from_agent(event);
+        // 2. Fan the event out to live subscriptions (awaited, in order). `agent_end` carries the
+        //    live `willRetry` decision when bound (Pi :541); unbound emits `false`.
         let is_end = matches!(event, AgentEvent::AgentEnd { .. });
+        let svc_ev = match (event, &session) {
+            (AgentEvent::AgentEnd { messages }, Some(s)) => AgentSessionEvent::AgentEnd {
+                messages: messages.clone(),
+                will_retry: s.will_retry_after_agent_end(messages),
+            },
+            _ => AgentSessionEvent::from_agent(event),
+        };
         self.fanout.emit(svc_ev).await;
 
-        // 3. Terminate run-scoped subscriptions once the run settles.
-        if is_end {
+        // 3. Terminate run-scoped subscriptions once the run settles — but ONLY on an unbound session.
+        //    A bound session's post-run driver owns run termination (it may continue past this
+        //    `agent_end` for a retry / compaction / queued continuation).
+        if is_end && session.is_none() {
             self.fanout.end_run();
         }
     }

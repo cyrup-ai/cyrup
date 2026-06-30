@@ -100,7 +100,7 @@ pub enum DeliverAs {
 
 /// The event super-set the seam exposes (arch-11 §3.2).
 #[derive(Clone, Debug, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AgentSessionEvent {
     // --- forwarded AgentEvent (cyrup-agent / func-02) ---
     AgentStart,
@@ -138,6 +138,10 @@ pub enum AgentSessionEvent {
     },
     AgentEnd {
         messages: Vec<AgentMessage>,
+        /// Whether the run that just ended will be auto-retried (Pi `agent_end.willRetry`,
+        /// agent-session.ts:132/541). Computed in the persist+fan-out subscriber from the session's
+        /// live retry state; `false` for an unbound session (no post-run driver, never retries).
+        will_retry: bool,
     },
     // --- session-level (cyrup-session-svc) ---
     QueueUpdate {
@@ -172,6 +176,13 @@ pub enum AgentSessionEvent {
     /// The active thinking level changed (Pi `thinking_level_changed`, agent-session.ts:1566).
     ThinkingLevelChanged {
         level: String,
+    },
+    /// The session's display name / info entry changed (Pi `session_info_changed`,
+    /// agent-session.ts:2686). Emitted by [`crate::AgentSession::set_session_name`] after the
+    /// `session_info` entry is persisted.
+    SessionInfoChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// A session was started/replaced by the runtime (Pi `session_start`,
     /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
@@ -237,7 +248,7 @@ impl AgentSessionEvent {
                 tool_results: tool_results.clone(),
             },
             AgentEvent::AgentEnd { messages } => {
-                AgentSessionEvent::AgentEnd { messages: messages.clone() }
+                AgentSessionEvent::AgentEnd { messages: messages.clone(), will_retry: false }
             }
         }
     }
@@ -262,6 +273,7 @@ impl AgentSessionEvent {
             AgentSessionEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentSessionEvent::ModelChanged { .. } => "model_changed",
             AgentSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
+            AgentSessionEvent::SessionInfoChanged { .. } => "session_info_changed",
             AgentSessionEvent::SessionStart { .. } => "session_start",
             AgentSessionEvent::SessionShutdown { .. } => "session_shutdown",
             AgentSessionEvent::SessionReplaced { .. } => "session_replaced",

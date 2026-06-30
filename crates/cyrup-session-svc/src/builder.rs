@@ -479,6 +479,10 @@ impl SessionBuilder {
 
         // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
+        // R6: plumb the user-tier cross-tool `~/.agents` base (Pi `getHomeDir()/.agents`,
+        // package-manager.ts:2286,217) so cyrup-resources loads `~/.agents/skills` (user scope) and
+        // dedups the project `.agents/skills` ancestor walk against it.
+        disc.user_agents_dir = Some(cfg.home.join(".agents"));
         disc.trusted_project = trusted;
         disc.enable_skills = !cfg.no_skills;
         disc.enable_prompts = !cfg.no_prompt_templates;
@@ -679,10 +683,13 @@ impl SessionBuilder {
 
         let manager = Arc::new(AsyncMutex::new(manager));
         let fanout = Arc::new(Fanout::new());
+        // The shared self-handle: bound to the owning `Arc<AgentSession>` by `into_shared`, and read by
+        // the persist+fan-out subscriber (`_handleAgentEvent`) + the post-run driver.
+        let handle = Arc::new(crate::session::SessionHandle::default());
 
         // Attach the extension notify seam, then the facade's persist+fan-out subscriber.
         agent.subscribe(ext_subscriber);
-        agent.subscribe(Arc::new(SvcSubscriber::new(fanout.clone(), manager.clone())));
+        agent.subscribe(Arc::new(SvcSubscriber::new(fanout.clone(), manager.clone(), handle.clone())));
         let agent = Arc::new(agent);
 
         // ---- 10. assemble the session --------------------------------------------------------
@@ -725,6 +732,7 @@ impl SessionBuilder {
             proc: bash_proc,
             shell,
             dynamic_tools,
+            handle,
         };
 
         let services = AgentSessionServices {

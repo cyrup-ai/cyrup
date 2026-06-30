@@ -104,7 +104,7 @@ impl AgentSessionRuntime {
         factory: Arc<SessionFactory>,
         target: SessionTarget,
     ) -> Result<Self, SessionServiceError> {
-        let session = Arc::new(factory.build(target, None).await?);
+        let session = factory.build(target, None).await?.into_shared();
         let diagnostics = collect_diagnostics(&session);
         let (gen_tx, _rx) = watch::channel(0);
         Ok(Self {
@@ -217,11 +217,11 @@ impl AgentSessionRuntime {
         }
         let previous = current.session_file().await.map(|p| p.display().to_string());
         drop(current);
-        let next = Arc::new(
-            self.factory
-                .build_with_parent(SessionTarget::New, None, options.parent_session)
-                .await?,
-        );
+        let next = self
+            .factory
+            .build_with_parent(SessionTarget::New, None, options.parent_session)
+            .await?
+            .into_shared();
         self.install(next, "new", previous).await;
         Ok(SwitchResult { cancelled: false })
     }
@@ -262,7 +262,7 @@ impl AgentSessionRuntime {
         let previous = current.session_file().await.map(|p| p.display().to_string());
         drop(current);
         let next =
-            Arc::new(self.factory.build(SessionTarget::Resume(path), Some(cwd)).await?);
+            self.factory.build(SessionTarget::Resume(path), Some(cwd)).await?.into_shared();
         self.install(next, "resume", previous).await;
         Ok(SwitchResult { cancelled: false })
     }
@@ -300,13 +300,15 @@ impl AgentSessionRuntime {
                             file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
                         let layout = cyrup_session::SessionLayout::new(root, cwd);
                         mgr.create_branched_session(&leaf, &layout)?;
-                        (Arc::new(self.factory.build_from_manager(mgr).await?), selected_text)
+                        (self.factory.build_from_manager(mgr).await?.into_shared(), selected_text)
                     }
                     // Fork before the first message: a brand-new session.
-                    None => (Arc::new(self.factory.build(SessionTarget::New, None).await?), selected_text),
+                    None => {
+                        (self.factory.build(SessionTarget::New, None).await?.into_shared(), selected_text)
+                    }
                 }
             }
-            None => (Arc::new(self.factory.build(SessionTarget::New, None).await?), None),
+            None => (self.factory.build(SessionTarget::New, None).await?.into_shared(), None),
         };
         self.install(next, "fork", previous).await;
         Ok(RuntimeForkResult { cancelled: false, selected_text })
@@ -356,8 +358,11 @@ impl AgentSessionRuntime {
         if !cwd.exists() {
             return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
         }
-        let next =
-            Arc::new(self.factory.build(SessionTarget::Resume(destination), Some(cwd)).await?);
+        let next = self
+            .factory
+            .build(SessionTarget::Resume(destination), Some(cwd))
+            .await?
+            .into_shared();
         self.install(next, "resume", previous).await;
         Ok(SwitchResult { cancelled: false })
     }
@@ -384,7 +389,7 @@ impl AgentSessionRuntime {
         };
         let cwd = current.services().cwd.clone();
         drop(current);
-        let next = Arc::new(self.factory.build(target, Some(cwd)).await?);
+        let next = self.factory.build(target, Some(cwd)).await?.into_shared();
         self.install_inner(next, "reload", previous, before_start).await;
         Ok(())
     }

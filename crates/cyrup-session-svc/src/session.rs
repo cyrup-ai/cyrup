@@ -6,7 +6,7 @@
 //! across every turn. No mode reaches behaviour that does not flow through this object.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cyrup_agent::{Agent, AgentMessage};
 use cyrup_core::{
@@ -182,6 +182,25 @@ pub(crate) struct SessionExtras {
     pub proc: Arc<dyn ProcOps>,
     pub shell: ShellConfig,
     pub dynamic_tools: DynamicToolState,
+    /// The shared self-handle the builder also handed to the persist+fan-out subscriber.
+    pub handle: Arc<SessionHandle>,
+}
+
+/// A settable, weak self-reference so the persist+fan-out subscriber (which the agent owns) and the
+/// post-run driver task can reach the `Arc<AgentSession>` that owns them. The owning `Arc` is created
+/// by the caller (runtime / `into_shared`) AFTER `from_parts` returns, so the weak is filled in then
+/// via [`AgentSession::into_shared`]. While unset (a plain by-value `AgentSession`), the post-run loop
+/// is inert and the subscriber falls back to its legacy persist+fan-out-only behavior.
+#[derive(Default)]
+pub(crate) struct SessionHandle {
+    weak: OnceLock<Weak<AgentSession>>,
+}
+
+impl SessionHandle {
+    /// Upgrade to the owning session, if it was bound and is still alive.
+    pub(crate) fn get(&self) -> Option<Arc<AgentSession>> {
+        self.weak.get().and_then(Weak::upgrade)
+    }
 }
 
 /// The integration seam (arch-11 §3.1). Cheaply shareable via `Arc`; every method is `&self`.
@@ -255,6 +274,24 @@ pub struct AgentSession {
     pending_bash: Mutex<Vec<AgentMessage>>,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
     dynamic_tools: Mutex<DynamicToolState>,
+    // ---- post-run execution loop (Pi `_runAgentPrompt`/`_handlePostAgentRun`,
+    //      agent-session.ts:973-1022; the assembled-run driver) ----
+    /// Weak self-reference, bound by [`Self::into_shared`]; shared with the persist+fan-out
+    /// subscriber so both the subscriber's `_handleAgentEvent` work and the spawned post-run driver
+    /// can reach `Arc<AgentSession>`.
+    handle: Arc<SessionHandle>,
+    /// The last assistant message of the in-flight run (Pi `_lastAssistantMessage`,
+    /// agent-session.ts:510): set by the subscriber on every assistant `message_end`, taken by the
+    /// driver in [`Self::handle_post_agent_run`].
+    last_assistant: Mutex<Option<AssistantMessage>>,
+    /// `true` while a post-run driver task owns the run (Pi has no analogue — cyrup spawns the loop in
+    /// the background because `prompt` returns an event stream rather than awaiting the whole run).
+    /// [`Self::wait_for_idle`] waits on this so a one-shot caller sees the WHOLE loop settle, not just
+    /// the first `agent_end`.
+    driver_tx: tokio::sync::watch::Sender<bool>,
+    /// A keep-alive receiver so `driver_tx.send` never fails for want of a live receiver (a watch
+    /// `Sender` with zero receivers drops the sent value); `wait_for_idle` subscribes fresh ones.
+    _driver_keepalive: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AgentSession {
@@ -278,6 +315,9 @@ impl AgentSession {
         let eff = services.settings.effective();
         let steering_mode = crate::builder::parse_queue_mode(&eff.steering_mode());
         let follow_up_mode = crate::builder::parse_queue_mode(&eff.follow_up_mode());
+        // The post-run-driver liveness channel; the keep-alive receiver keeps `send` from failing for
+        // want of a live receiver (see field docs).
+        let (driver_tx_init, driver_keepalive) = tokio::sync::watch::channel(false);
         Self {
             agent,
             manager,
@@ -315,7 +355,23 @@ impl AgentSession {
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
             dynamic_tools: Mutex::new(extras.dynamic_tools),
+            handle: extras.handle,
+            last_assistant: Mutex::new(None),
+            driver_tx: driver_tx_init,
+            _driver_keepalive: driver_keepalive,
         }
+    }
+
+    /// Wrap a freshly-built session in its owning `Arc` and bind the self-handle so the persist+fan-out
+    /// subscriber and the post-run driver can reach it (arch-11; the assembled-run wiring). MUST be used
+    /// instead of a bare `Arc::new` wherever the post-run execution loop has to run (the runtime, print
+    /// mode, the SDK) so auto-retry / post-run auto-compaction / the queued-continuation actually fire
+    /// from a completed turn.
+    pub fn into_shared(self) -> Arc<Self> {
+        let handle = self.handle.clone();
+        let arc = Arc::new(self);
+        let _ = handle.weak.set(Arc::downgrade(&arc));
+        arc
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
@@ -347,7 +403,7 @@ impl AgentSession {
         let stream = self.fanout.subscribe_run();
         match self.prepare(input.into(), PromptOptions::default()).await? {
             Prepared::Run(messages) => {
-                self.agent.prompt(messages).await?;
+                self.spawn_run(messages).await?;
                 Ok(stream)
             }
             // An `input` handler serviced the submission (no run started); the stream stays idle.
@@ -383,9 +439,136 @@ impl AgentSession {
                 StreamingBehavior::Steer => self.steer(ui).await,
             },
             Prepared::Run(messages) => {
-                self.agent.prompt(messages).await?;
+                self.spawn_run(messages).await?;
                 Ok(PromptAccepted::Started)
             }
+        }
+    }
+
+    /// Dispatch an assembled run. A BOUND session (via [`Self::into_shared`]) spawns the post-run
+    /// driver task so auto-retry / post-run auto-compaction / queued continuations actually fire from
+    /// the completed turn (Pi `_runAgentPrompt`, agent-session.ts:973-985). An unbound by-value session
+    /// keeps the legacy behavior: start the run and let the subscriber terminate the run-scoped streams
+    /// on `agent_end` (the post-run loop does not run).
+    async fn spawn_run(&self, messages: Vec<AgentMessage>) -> Result<(), SessionServiceError> {
+        match self.handle.get() {
+            Some(this) => {
+                // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
+                // WHOLE loop, not just the first `agent_end`.
+                let _ = self.driver_tx.send(true);
+                tokio::spawn(async move { this.drive_run(messages).await });
+                Ok(())
+            }
+            None => {
+                self.agent.prompt(messages).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The post-run execution loop (Pi `_runAgentPrompt` + `_handlePostAgentRun`,
+    /// agent-session.ts:973-1022). Runs the prompt, then — for as long as the post-run handler asks —
+    /// drives `agent.continue()` for an auto-retry, a threshold/overflow auto-compaction, or an
+    /// `agent_end`-queued continuation. Spawned by [`Self::spawn_run`] on a bound session.
+    async fn drive_run(self: Arc<Self>, messages: Vec<AgentMessage>) {
+        if let Ok(handle) = self.agent.prompt(messages).await {
+            let _ = handle.finished().await;
+            while self.handle_post_agent_run().await {
+                match self.agent.continue_run().await {
+                    Ok(h) => {
+                        let _ = h.finished().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
+        self.flush_pending_bash_messages().await;
+        // Terminate the run-scoped subscriptions returned by `prompt` now the whole loop has settled.
+        self.fanout.end_run();
+        let _ = self.driver_tx.send(false);
+    }
+
+    /// Decide whether the just-finished run needs a continuation (Pi `_handlePostAgentRun`,
+    /// agent-session.ts:986-1013): retry a transient error after backoff, close a spent retry
+    /// sequence, run a post-run threshold/overflow compaction, or continue for `agent_end`-queued
+    /// messages. Returns `true` when the driver should `agent.continue()`.
+    async fn handle_post_agent_run(&self) -> bool {
+        let Some(msg) = Self::lock(&self.last_assistant).take() else { return false };
+        // Retryable transient error → backoff + continue (Pi :991-993).
+        if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
+            return true;
+        }
+        // A terminal error with a spent / non-retryable budget closes the retry sequence (Pi :995-1003).
+        if msg.stop_reason == cyrup_core::StopReason::Error && self.retry_attempt() > 0 {
+            let attempt = std::mem::replace(&mut *Self::lock(&self.retry_attempt), 0);
+            self.fanout_emit(AgentSessionEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: msg.error_message.clone(),
+            })
+            .await;
+        }
+        // Threshold / overflow post-run compaction → continue (Pi :1005-1007).
+        if self.check_compaction(&msg, true).await.unwrap_or(false) {
+            return true;
+        }
+        // Messages queued by `agent_end` extension handlers need a continuation (Pi :1009-1012).
+        self.agent.has_queued_messages()
+    }
+
+    /// The persist+fan-out subscriber's `message_start` handler for a USER message (Pi
+    /// `_handleAgentEvent` head, agent-session.ts:514-535): reset the overflow-recovery latch and, when
+    /// the message text matches a queued steer/follow-up mirror entry, drop it and emit `queue_update`
+    /// as the agent drains the queue.
+    pub(crate) async fn on_user_message_start(&self, message: &AgentMessage) {
+        *Self::lock(&self.overflow_recovery_attempted) = false;
+        let Some(text) = agent_user_text(message) else { return };
+        let mut drained = false;
+        {
+            let mut steer = Self::lock(&self.steering_messages);
+            if let Some(pos) = steer.iter().position(|m| *m == text) {
+                steer.remove(pos);
+                drained = true;
+            }
+        }
+        if !drained {
+            let mut fu = Self::lock(&self.follow_up_messages);
+            if let Some(pos) = fu.iter().position(|m| *m == text) {
+                fu.remove(pos);
+                drained = true;
+            }
+        }
+        if drained {
+            self.emit_queue_update().await;
+        }
+    }
+
+    /// The subscriber's `message_end` handler for an ASSISTANT message (Pi `_handleAgentEvent` tail,
+    /// agent-session.ts:562-577): track the last assistant message (drives the post-run loop) and — on
+    /// a non-error response — clear the overflow latch and reset the retry counter, emitting
+    /// `auto_retry_end{success:true}` if a retry sequence was in flight.
+    pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
+        *Self::lock(&self.last_assistant) = Some(assistant.clone());
+        if assistant.stop_reason == cyrup_core::StopReason::Error {
+            return;
+        }
+        *Self::lock(&self.overflow_recovery_attempted) = false;
+        let attempt = {
+            let mut at = Self::lock(&self.retry_attempt);
+            let v = *at;
+            if v > 0 {
+                *at = 0;
+            }
+            v
+        };
+        if attempt > 0 {
+            self.fanout_emit(AgentSessionEvent::AutoRetryEnd {
+                success: true,
+                attempt,
+                final_error: None,
+            })
+            .await;
         }
     }
 
@@ -639,8 +822,17 @@ impl AgentSession {
         messages
     }
 
-    /// Await full settlement of the in-flight run (`agent_end`). For print/one-shot modes (R-11-005).
+    /// Await full settlement of the in-flight run AND its post-run loop (R-11-005). On a bound session
+    /// the agent goes briefly idle BETWEEN a completed turn and a retry/compaction continuation, so
+    /// this first awaits the post-run driver (`driver_tx` is `true` for the whole loop) and only then
+    /// the agent — otherwise a one-shot caller would resume mid-loop.
     pub async fn wait_for_idle(&self) {
+        let mut rx = self.driver_tx.subscribe();
+        while *rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
         self.agent.wait_for_idle().await;
     }
 
@@ -1210,7 +1402,15 @@ impl AgentSession {
     /// Set the session's display name, persisting a `session_info` entry (Pi `setSessionName`,
     /// agent-session.ts:2690).
     pub async fn set_session_name(&self, name: &str) -> Result<(), SessionServiceError> {
-        self.manager.lock().await.append_session_info(name)?;
+        let resolved = {
+            let mut guard = self.manager.lock().await;
+            guard.append_session_info(name)?;
+            guard.session_name()
+        };
+        // Emit `session_info_changed { name }` to every live subscription (Pi `_emit(event)`,
+        // agent-session.ts:2714-2715); the `name` is re-read from the manager so it byte-matches Pi's
+        // `getSessionName()` (an empty/whitespace name resolves to `None`).
+        self.fanout_emit(AgentSessionEvent::SessionInfoChanged { name: resolved }).await;
         Ok(())
     }
 
@@ -2503,6 +2703,25 @@ fn strip_frontmatter(content: &str) -> &str {
         after.strip_prefix('\n').or_else(|| after.strip_prefix("\r\n")).unwrap_or(after)
     } else {
         content
+    }
+}
+
+/// The concatenated text of a `user` agent message, or `None` for any other role (Pi
+/// `_getUserMessageText`, agent-session.ts:589-595). Used to match a streaming user message against
+/// the facade steer/follow-up queue mirrors so they drain in lockstep with the agent.
+fn agent_user_text(m: &AgentMessage) -> Option<String> {
+    match m {
+        AgentMessage::User { content, .. } => Some(
+            content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
     }
 }
 

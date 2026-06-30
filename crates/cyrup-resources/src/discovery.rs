@@ -140,6 +140,13 @@ pub struct DiscoveryConfig {
     pub cwd: PathBuf,
     pub global_dir: PathBuf,
     pub global_agents_dir: PathBuf,
+    /// The user-tier cross-tool `.agents` base dir (Pi `getHomeDir()/.agents`,
+    /// package-manager.ts:2286,217). When `Some`, `<user_agents_dir>/skills` is loaded as a
+    /// USER/global-scope skill source AND excluded from the project `.agents/skills` ancestor walk so
+    /// it is not double-counted (Pi `userAgentsSkillsDir` + the `.filter(... !== userAgentsSkillsDir)`
+    /// dedup, package-manager.ts:2286-2289,2377-2389). `None` keeps the legacy
+    /// `global_agents_dir/skills` behavior (no user-tier `~/.agents/skills`).
+    pub user_agents_dir: Option<PathBuf>,
     pub project_root: Option<PathBuf>,
     /// DI-11 trust decision from cyrup-config (R-09-003/008/012).
     pub trusted_project: bool,
@@ -169,6 +176,7 @@ impl DiscoveryConfig {
             cwd: cwd.into(),
             global_dir,
             global_agents_dir,
+            user_agents_dir: None,
             project_root: None,
             trusted_project: false,
             enable_skills: true,
@@ -347,10 +355,14 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     // Settings override patterns (Pi `globalSettings.{skills,prompts,themes}`) selectively
     // enable/disable these auto-discovered loose resources (package-manager.ts:2271-2304).
     if cfg.enable_skills {
-        for root in [
-            cfg.global_dir.join("skills"),
-            cfg.global_agents_dir.join("skills"),
-        ] {
+        // The user-tier cross-tool `~/.agents/skills` (Pi `userAgentsSkillsDir`,
+        // package-manager.ts:2286,2377-2389) is loaded as a USER/global-scope source when the
+        // session-svc builder plumbs `user_agents_dir = $HOME/.agents`.
+        let mut roots = vec![cfg.global_dir.join("skills"), cfg.global_agents_dir.join("skills")];
+        if let Some(user_agents) = &cfg.user_agents_dir {
+            roots.push(user_agents.join("skills"));
+        }
+        for root in roots {
             let mut buf = Vec::new();
             scan_skill_root(
                 &root,
@@ -594,7 +606,14 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 // out-of-scope here: it needs `$HOME/.agents/skills` plumbed from cyrup-config into
                 // `DiscoveryConfig` (a new field) and set by cyrup-session-svc — both outside the
                 // editable crate set for this pass. Tracked in spec/gap-analysis/00-residual-ledger.md #6.
-                let user_agents_skills = cfg.global_agents_dir.join("skills");
+                // Dedup the ancestor walk against the user-tier `~/.agents/skills` (Pi
+                // `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))`,
+                // package-manager.ts:2289) when plumbed; otherwise fall back to the legacy
+                // `global_agents_dir/skills` exclusion.
+                let user_agents_skills = cfg
+                    .user_agents_dir
+                    .as_ref()
+                    .map_or_else(|| cfg.global_agents_dir.join("skills"), |d| d.join("skills"));
                 for root in collect_ancestor_agents_skill_dirs(&cfg.cwd) {
                     if root == user_agents_skills {
                         continue;
