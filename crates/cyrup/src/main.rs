@@ -20,7 +20,9 @@ use cyrup::{
 };
 use cyrup_config::{CliConfigOverrides, ConfigDirs, EnvVars};
 use cyrup_sdk::core::CancelToken;
-use cyrup_session_svc::{AgentSession, InputSource, SessionBuilder, UserInput};
+use cyrup_session_svc::{
+    AgentSession, AgentSessionRuntime, InputSource, SessionBuilder, SessionFactory, UserInput,
+};
 use cyrup_tui::{crossterm_input_stream, App, UiTheme};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -48,15 +50,39 @@ async fn run() -> anyhow::Result<i32> {
     let overrides = CliConfigOverrides { cwd: cli.cwd.clone(), ..Default::default() };
     let dirs = ConfigDirs::resolve(&overrides, &env).context("resolving config directories")?;
 
-    // Map CLI → SessionConfig, pick a provider, build the one seam.
+    // Map CLI → SessionConfig, pick a provider.
     let config = cli.to_session_config(&dirs, mode);
     let provider = select_provider(cli.model.as_deref())?;
+    let cancel = CancelToken::new();
+
+    // Interactive mode drives the **multi-session** `AgentSessionRuntime` (arch-11 §3.4) so the
+    // session-swap commands (`/new`, `/resume`, `/fork`, `/reload`, `/import`) rebuild the active
+    // session in place and the TUI re-binds to it (Pi `agent-session-runtime.ts` + interactive-mode
+    // session-swap). The one-shot/RPC modes keep the single fixed `AgentSession` seam unchanged: they
+    // never swap sessions, so the runtime tier is not built for them and their flow is unaffected.
+    if let AppMode::Interactive = mode {
+        let target = config.target.clone();
+        let factory = Arc::new(SessionFactory::new(provider, config));
+        let runtime = Arc::new(
+            AgentSessionRuntime::create(factory, target)
+                .await
+                .context("building agent session runtime")?,
+        );
+        let session = runtime.session().await;
+        // Signals: SIGINT/SIGTERM → abort the run + cancel the interactive loop (R-11-010/018). The
+        // abort targets the session active at launch; the cancel token breaks the loop on any swap.
+        let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
+        let inputs = build_inputs(&cli).await?;
+        run_interactive(runtime, session, inputs, cancel).await?;
+        return Ok(0);
+    }
+
+    // One-shot / RPC: build the one `AgentSession` seam (unchanged path, R-11-008).
     let session = Arc::new(
         SessionBuilder::new(provider, config).build().await.context("building agent session")?,
     );
 
     // Signals: SIGINT/SIGTERM → abort the run + cancel the interactive loop (R-11-010/018).
-    let cancel = CancelToken::new();
     let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
 
     match mode {
@@ -79,11 +105,8 @@ async fn run() -> anyhow::Result<i32> {
             let mut out = io::stdout();
             run_json_dispatch(&session, &inputs, &mut out).await
         }
-        AppMode::Interactive => {
-            let inputs = build_inputs(&cli).await?;
-            run_interactive(session, inputs, cancel).await?;
-            Ok(0)
-        }
+        // Interactive is dispatched above (it builds the runtime tier) and returns early.
+        AppMode::Interactive => unreachable!("interactive mode is handled before this match"),
     }
 }
 
@@ -101,6 +124,7 @@ fn ensure_prompt(inputs: &Inputs) -> anyhow::Result<()> {
 /// prompt, and run the event loop against the live session. Restores the terminal on exit. Thin and
 /// not unit-tested (it requires a real TTY); the testable logic lives in the library.
 async fn run_interactive(
+    runtime: Arc<AgentSessionRuntime>,
     session: Arc<AgentSession>,
     inputs: Inputs,
     cancel: CancelToken,
@@ -120,7 +144,10 @@ async fn run_interactive(
             .await;
     }
 
-    let result = app.run(input_stream, events, session.clone(), None, cancel).await;
+    // Hand the runtime to the loop so the session-swap commands rebuild the active session and the UI
+    // re-binds (re-subscribes the event stream + resets the transcript) on the generation bump.
+    let result =
+        app.run(input_stream, events, session.clone(), Some(runtime), None, cancel).await;
     // Total + idempotent restore so an error path still leaves a usable terminal.
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;

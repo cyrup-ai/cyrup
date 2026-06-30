@@ -79,6 +79,23 @@ fn custom_message_event_handles_array_content() {
 }
 
 #[test]
+fn user_message_renders_as_multiline_markdown_box() {
+    // The rich user-message variant (`user-message.ts`): the submitted text renders as multi-line
+    // markdown (not a single label line), keeping a `you:` accent label for legibility.
+    let mut app = new_app();
+    app.transcript_mut().push_user("# Heading\n\nFirst paragraph.\n\nSecond paragraph.");
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(out.contains("you: "), "user accent label committed:\n{out}");
+    assert!(out.contains("Heading"), "markdown heading rendered:\n{out}");
+    // Multi-paragraph markdown means more than one rendered line (vs. the old single label line).
+    assert!(out.contains("First paragraph"), "first paragraph rendered:\n{out}");
+    assert!(out.contains("Second paragraph"), "second paragraph rendered:\n{out}");
+    let user_lines = out.lines().filter(|l| l.contains("paragraph")).count();
+    assert!(user_lines >= 2, "user body spans multiple markdown lines:\n{out}");
+}
+
+#[test]
 fn core_messages_do_not_render_as_custom_blocks() {
     // A core user/assistant message must NOT be mistaken for a custom block.
     let mut app = new_app();

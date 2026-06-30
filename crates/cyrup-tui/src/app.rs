@@ -19,7 +19,7 @@ use cyrup_core::{CancelToken, EventStream};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
-use cyrup_session_svc::{ForkPosition, NavigateTreeOptions};
+use cyrup_session_svc::{AgentSessionRuntime, ForkPosition, NavigateTreeOptions};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -182,6 +182,11 @@ pub struct AppState {
     pub loader_tick: usize,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
+    /// A status line to show **after** the next runtime session-swap re-binds the UI (the swap
+    /// resets the transcript, so a pre-swap status would be wiped). Set by the session-lifecycle
+    /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
+    /// [`App::rebind_session`] once the generation bump fires and the new session is installed.
+    pub pending_swap_status: Option<String>,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Kept as a test-visible accumulator mirroring exactly what was handed to
     /// `insert_before`; never re-rendered inside the inline viewport.
@@ -212,6 +217,7 @@ impl AppState {
             loader: None,
             loader_tick: 0,
             should_quit: false,
+            pending_swap_status: None,
             scrollback: Vec::new(),
         }
     }
@@ -324,6 +330,24 @@ impl<B: Backend> App<B> {
     pub fn set_theme(&mut self, mut theme: UiTheme) {
         theme.generation = self.state.theme.generation.saturating_add(1);
         self.state.theme = theme;
+    }
+
+    /// Re-bind the UI to a freshly-installed runtime session (arch-11 §3.4 replacement; Pi's
+    /// interactive session-swap). Called by the run loop on a generation bump (a `/new`/`/resume`/
+    /// `/fork`/`/reload`/`/import` op or a runtime-side `SessionReplaced`): the run loop has already
+    /// dropped the stale subscription and re-subscribed the new session's `AgentSessionEvent` stream;
+    /// here we reset the per-session UI state (the transcript, the streaming/indicator status, any
+    /// open selector/overlay) for the new session and surface the swap status line. Committed
+    /// scrollback already lives in the terminal's native history (`insert_before`) and is preserved.
+    pub fn rebind_session(&mut self) {
+        self.state.transcript = TranscriptView::new();
+        self.state.selector = None;
+        self.state.overlays.clear();
+        self.state.status.set_streaming(false);
+        self.state.status.set_queued(0);
+        self.state.indicator.idle();
+        let msg = self.state.pending_swap_status.take().unwrap_or_else(|| "session replaced".into());
+        self.state.transcript.push_status(msg);
     }
 
     /// Render one frame: first flush newly-committed entries to native scrollback (R-ARCH-TUI-003),
@@ -857,7 +881,12 @@ impl<B: Backend> App<B> {
     /// selectors source their rows here (spec/tui/05 §8 late-data population) and open via
     /// [`open_data_selector`](Self::open_data_selector); lifecycle/IO commands call the matching
     /// session method and surface a status line / info block. Errors degrade to a status line.
-    pub async fn execute_command(&mut self, cmd: AppCommand, session: &Arc<AgentSession>) {
+    pub async fn execute_command(
+        &mut self,
+        cmd: AppCommand,
+        session: &Arc<AgentSession>,
+        runtime: Option<&Arc<AgentSessionRuntime>>,
+    ) {
         use AppCommand as C;
         match cmd {
             C::OpenSelector(SelectorKind::Model) => {
@@ -1119,10 +1148,30 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("scoped models → {n} enabled"));
             }
             C::ConfirmSelection { kind: SelectorKind::UserMessage, value } => {
+                // `/fork` (user-message-selector.ts): fork at the chosen entry. With the runtime
+                // threaded in, drive `AgentSessionRuntime::fork` so the runtime swaps to the new
+                // branched session and the UI re-binds on the generation bump (Pi `fork`,
+                // agent-session-runtime.ts:259); `position:"before"` re-seeds the editor with the
+                // anchor text. Without a runtime (SDK/embedder), fall back to the in-place
+                // `fork_at_entry` (no swap).
                 let entry = cyrup_core::EntryId::from(value.as_str());
-                match session.fork_at_entry(&entry, ForkPosition::Before).await {
-                    Ok(_) => self.state.transcript.push_status("forked from message"),
-                    Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                match runtime {
+                    Some(rt) => match rt.fork(entry, ForkPosition::Before).await {
+                        Ok(r) if r.cancelled => {
+                            self.state.transcript.push_status("fork cancelled")
+                        }
+                        Ok(r) => {
+                            if let Some(text) = r.selected_text {
+                                self.state.editor.set_text(&text);
+                            }
+                            self.state.pending_swap_status = Some("forked from message".into());
+                        }
+                        Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                    },
+                    None => match session.fork_at_entry(&entry, ForkPosition::Before).await {
+                        Ok(_) => self.state.transcript.push_status("forked from message"),
+                        Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                    },
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::Logout, value } => {
@@ -1165,8 +1214,25 @@ impl<B: Backend> App<B> {
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::Session, value } => {
-                // The chosen session file path (the runtime swap is the L7 residual, gap #3).
-                self.state.transcript.push_status(format!("resume {value} (/reload to switch)"));
+                // `/resume` swap (handleResumeSession, interactive-mode.ts): switch the runtime to the
+                // chosen session file (Pi `switchSession`, agent-session-runtime.ts:193). The runtime
+                // asserts the resumed cwd still exists, rebuilds cwd-bound services, and bumps the
+                // generation; the UI re-binds on the bump. Without a runtime, surface the path.
+                match runtime {
+                    Some(rt) => match rt.switch_session(value.clone()).await {
+                        Ok(r) if r.cancelled => {
+                            self.state.transcript.push_status("resume cancelled")
+                        }
+                        Ok(_) => {
+                            self.state.pending_swap_status = Some(format!("resumed {value}"));
+                        }
+                        Err(e) => self.state.transcript.push_status(format!("resume error: {e}")),
+                    },
+                    None => self
+                        .state
+                        .transcript
+                        .push_status(format!("resume {value} (/reload to switch)")),
+                }
             }
             C::DeleteSession(path) => {
                 // `/resume` in-list delete (`onDeleteSession`): remove the persisted JSONL via the
@@ -1197,7 +1263,16 @@ impl<B: Backend> App<B> {
                 }
             }
             C::Compact(arg) => match session.compact(arg).await {
-                Ok(_) => self.state.transcript.push_status("compacted context"),
+                // Render the compaction-summary message (`compaction-summary-message.ts`): the
+                // `[compaction]` label + `**Compacted from N tokens**` markdown body produced by the
+                // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
+                Ok(Some(result)) => {
+                    self.state
+                        .transcript
+                        .push_compaction_summary(result.tokens_before, result.summary);
+                }
+                // No-op (nothing to compact / aborted): a plain status line.
+                Ok(None) => self.state.transcript.push_status("nothing to compact"),
                 Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
             },
             C::Clone => match session.clone_at(None).await {
@@ -1274,16 +1349,47 @@ impl<B: Backend> App<B> {
                 );
                 self.state.transcript.push_block("Session", body);
             }
-            // Session-lifecycle ops (`/new`, `/import`, `/reload`) drive the L7 `SessionRuntime`
-            // (`new_session`/`import_from_jsonl`/`reload`); threading the runtime into the run loop +
-            // re-subscribing on the generation bump is residual gap #3 (the run loop holds a fixed
-            // `Arc<AgentSession>`). Surface the request so the path is real (no silent drop).
-            C::NewSession => self.state.transcript.push_status("starting new session…"),
-            C::Reload => self.state.transcript.push_status("reloading resources…"),
-            C::Import(p) => self
-                .state
-                .transcript
-                .push_status(format!("importing session {}", p.unwrap_or_default())),
+            // Session-lifecycle ops drive the `AgentSessionRuntime` (arch-11 §3.4): the op rebuilds
+            // the active session + bumps the generation, and the run loop's generation-watch arm
+            // re-binds the UI (re-subscribe + reset transcript) → `pending_swap_status`. Without a
+            // runtime (SDK/embedder), surface the request so the path is real (no silent drop).
+            C::NewSession => match runtime {
+                // `/new` (handleClearCommand): start a fresh session in the same cwd (Pi `newSession`).
+                Some(rt) => match rt.new_session().await {
+                    Ok(r) if r.cancelled => {
+                        self.state.transcript.push_status("new session cancelled")
+                    }
+                    Ok(_) => self.state.pending_swap_status = Some("started a new session".into()),
+                    Err(e) => self.state.transcript.push_status(format!("new session error: {e}")),
+                },
+                None => self.state.transcript.push_status("starting new session…"),
+            },
+            C::Reload => match runtime {
+                // `/reload` (handleReloadCommand): rebuild the active session in place (Pi `reload`,
+                // agent-session.ts:2451) — re-reads settings/resources/keybindings, resets the
+                // provider, preserves the persisted transcript.
+                Some(rt) => match rt.reload(None).await {
+                    Ok(()) => self.state.pending_swap_status = Some("reloaded resources".into()),
+                    Err(e) => self.state.transcript.push_status(format!("reload error: {e}")),
+                },
+                None => self.state.transcript.push_status("reloading resources…"),
+            },
+            C::Import(p) => match (runtime, p) {
+                // `/import <path>` (handleImportCommand): copy + resume a JSONL session (Pi
+                // `importFromJsonl`, agent-session-runtime.ts:353).
+                (Some(rt), Some(path)) => match rt.import_from_jsonl(path.clone(), None).await {
+                    Ok(r) if r.cancelled => self.state.transcript.push_status("import cancelled"),
+                    Ok(_) => {
+                        self.state.pending_swap_status = Some(format!("imported session {path}"))
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("import error: {e}")),
+                },
+                (Some(_), None) => self.state.transcript.push_status("usage: /import <path>"),
+                (None, p) => self
+                    .state
+                    .transcript
+                    .push_status(format!("importing session {}", p.unwrap_or_default())),
+            },
             C::Share => self.share_session(session).await,
         }
     }
@@ -2090,9 +2196,16 @@ impl App<CrosstermBackend<Stdout>> {
         mut input: EventStream<InputEvent>,
         mut events: EventStream<AgentSessionEvent>,
         session: Arc<AgentSession>,
+        runtime: Option<Arc<AgentSessionRuntime>>,
         mut theme_rx: Option<tokio::sync::watch::Receiver<Arc<ThemeData>>>,
         cancel: CancelToken,
     ) -> Result<(), TuiError> {
+        // The active session + its event subscription are re-bound on every runtime replacement
+        // (arch-11 §3.4): a session-swap command (or a runtime-side `SessionReplaced`) bumps the
+        // runtime's generation `watch`, the loop drops the stale subscription, subscribes the new
+        // session, and re-binds the UI ([`App::rebind_session`]). Without a runtime they are fixed.
+        let mut session = session;
+        let mut gen_rx = runtime.as_ref().map(|r| r.watch_generation());
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -2114,6 +2227,14 @@ impl App<CrosstermBackend<Stdout>> {
             let bash_next = async {
                 match bash_rx.as_mut() {
                     Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            // Resolve to `true` when the runtime swaps the active session (generation bump). When no
+            // runtime is threaded in, never resolves (single fixed session).
+            let session_swapped = async {
+                match gen_rx.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
                     None => std::future::pending().await,
                 }
             };
@@ -2153,7 +2274,9 @@ impl App<CrosstermBackend<Stdout>> {
                                 let _ = session.prompt_accepted(ui).await;
                             }
                         }
-                        AppAction::Command(cmd) => self.execute_command(cmd, &session).await,
+                        AppAction::Command(cmd) => {
+                            self.execute_command(cmd, &session, runtime.as_ref()).await
+                        }
                         AppAction::Redraw | AppAction::None => {}
                     }
                     self.draw_synchronized()?;
@@ -2196,6 +2319,19 @@ impl App<CrosstermBackend<Stdout>> {
                     if ok && let Some(rx) = theme_rx.as_ref() {
                         let data = rx.borrow().clone();
                         self.set_theme(UiTheme::from_theme_data(&data, 0));
+                        self.draw_synchronized()?;
+                    }
+                }
+                swapped = session_swapped => {
+                    // A runtime replacement (a `/new`/`/resume`/`/fork`/`/reload`/`/import` op, or a
+                    // runtime-side `SessionReplaced`, R-11-021) installed a new active session: drop
+                    // the stale subscription, subscribe the NEW session's event stream, and re-bind
+                    // the UI. Honors a runtime-driven swap identically to a UI-driven one.
+                    if swapped && let Some(rt) = runtime.as_ref() {
+                        let new_session = rt.session().await;
+                        events = new_session.subscribe();
+                        session = new_session;
+                        self.rebind_session();
                         self.draw_synchronized()?;
                     }
                 }

@@ -491,7 +491,21 @@ fn looks_like_diff(text: &str) -> bool {
 pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<Line<'static>> {
     match entry {
         Entry::User(text) => {
-            vec![label_line("you", text, theme.user_style(), theme.base_style())]
+            // The rich user-message render (`user-message.ts`): the submitted text is rendered as
+            // multi-line **markdown** (Pi `UserMessageComponent` wraps a `Markdown` in a
+            // `userMessageBg` box), with a `you:` accent label prefixed onto the first line so the
+            // conversation stays grep-legible — mirroring the assistant arm. (Pi's `userMessageBg`
+            // box background and the OSC-133 shell-zone markers wrapping the block are terminal
+            // shell-integration escapes that the ratatui cell grid / `insert_before` scrollback model
+            // cannot carry; the markdown body + user accent is the in-crate fidelity.)
+            let mut md = crate::markdown::render(text, width.saturating_sub(5).max(1), theme);
+            if md.is_empty() {
+                md.push(Line::default());
+            }
+            if let Some(first) = md.first_mut() {
+                first.spans.insert(0, Span::styled("you: ", theme.user_style()));
+            }
+            md
         }
         Entry::Assistant(text) => {
             let mut md = crate::markdown::render(text, width.saturating_sub(11).max(1), theme);
@@ -588,19 +602,6 @@ fn group_thousands(n: u64) -> String {
         out.push(*b as char);
     }
     out
-}
-
-/// Build a `label: text` line with a styled label and styled body.
-fn label_line(
-    label: &str,
-    text: &str,
-    label_style: ratatui::style::Style,
-    body_style: ratatui::style::Style,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), label_style),
-        Span::styled(text.to_string(), body_style),
-    ])
 }
 
 impl Component for TranscriptView {
