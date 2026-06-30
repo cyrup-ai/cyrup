@@ -35,12 +35,22 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # Multi-session runtime + run modes
+//! Beyond the single-session [`Session`] handle, the SDK re-exports the **multi-session runtime**
+//! surface — [`AgentSessionRuntime`] + its construction primitive [`SessionFactory`] (and the
+//! `new_session`/`switch_session`/`fork`/`reload`/`import`/`dispose` option/result types) — so an
+//! embedder can build and drive a runtime that swaps the active session in place (R-11-020/021,
+//! mirrors Pi's `createAgentSessionRuntime`). It also re-exports the **run-mode helpers**
+//! [`run_print`]/[`run_json`]/[`run_rpc`] (mirrors Pi's `runPrintMode`/`runRpcMode`) so an embedder
+//! can drive print/json/rpc over the seam (rpc over the runtime host) themselves.
+//!
 //! # What it re-exports
 //! The load-bearing types an embedder needs are re-exported here (and in [`prelude`]):
 //! [`AgentSessionEvent`], [`UserInput`], [`SessionConfig`], [`SessionTarget`], [`EventStream`],
 //! [`SessionServiceError`], plus [`InputSource`], [`PromptAccepted`], [`StreamingBehavior`], and
-//! [`AgentSessionServices`]. The foundational crates are also re-exported as modules
-//! ([`agent`], [`core`], [`provider`], [`session`], [`session_svc`]).
+//! [`AgentSessionServices`]; the runtime types above; and the run-mode helpers. The foundational
+//! crates are also re-exported as modules ([`agent`], [`core`], [`modes`], [`provider`],
+//! [`session`], [`session_svc`]).
 #![forbid(unsafe_code)]
 
 mod client;
@@ -60,12 +70,31 @@ pub use cyrup_session_svc::{
     SessionBuilder, SessionConfig, SessionServiceError, SessionTarget, StreamingBehavior, UserInput,
 };
 
+// ---- multi-session runtime surface (R-11-020/021; Pi `agent-session-runtime.ts`,
+// `createAgentSessionRuntime`) + the construction primitive an embedder builds it from
+// ([`SessionFactory`], Pi `CreateAgentSessionRuntimeFactory`). An embedder constructs a factory over
+// a resolved provider + base config, creates an [`AgentSessionRuntime`], and drives `new_session` /
+// `switch_session` / `fork` / `reload` / `import_from_jsonl` / `dispose` — re-subscribing on each
+// generation bump (R-11-021). This is the same layer the built-in interactive / RPC modes use.
+pub use cyrup_session_svc::{
+    AgentSessionRuntime, NewSessionOptions, RuntimeDiagnostic, RuntimeForkResult, SessionFactory,
+    SwitchResult, SwitchSessionOptions,
+};
+
+// ---- run-mode helpers (arch-11 §2.3; Pi `runPrintMode`/`runRpcMode` SDK exports) so an embedder
+// can drive print / json / rpc over the seam (or the runtime host, for rpc) themselves. ----
+pub use cyrup_modes::{
+    run_json, run_print, run_rpc, ModesError, PrintOptions, QueueModeArg, RpcOut, RpcResponse,
+    SessionCommand,
+};
+
 /// The single streaming primitive (arch-00 §3.1): every event feed is an `EventStream<T>`.
 pub use cyrup_core::EventStream;
 
 // ---- foundational crates, re-exported as modules for full access when needed ----
 pub use cyrup_agent as agent;
 pub use cyrup_core as core;
+pub use cyrup_modes as modes;
 pub use cyrup_provider as provider;
 pub use cyrup_session as session;
 pub use cyrup_session_svc as session_svc;

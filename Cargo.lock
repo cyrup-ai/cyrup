@@ -1086,6 +1086,7 @@ dependencies = [
  "async-trait",
  "cyrup-agent",
  "cyrup-core",
+ "cyrup-modes",
  "cyrup-provider",
  "cyrup-session",
  "cyrup-session-svc",

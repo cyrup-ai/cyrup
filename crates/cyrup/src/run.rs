@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use cyrup_modes::{run_json, run_print, run_rpc, PrintOptions};
-use cyrup_session_svc::{AgentSession, InputSource, UserInput};
+use cyrup_session_svc::{AgentSession, AgentSessionRuntime, InputSource, UserInput};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::input::Inputs;
@@ -41,8 +41,11 @@ pub async fn run_json_dispatch<W: Write>(
 }
 
 /// RPC dispatch: serve the persistent stdio line protocol over `reader`/`writer` (R-11-011…016).
+/// Drives the [`AgentSessionRuntime`] host so the session-replacing commands
+/// (`new_session`/`switch_session`/`fork`/`clone`) rebuild the active session and rebind (Pi
+/// `rpc-mode.ts` `runtimeHost`).
 pub async fn run_rpc_dispatch<R, W>(
-    session: &AgentSession,
+    runtime: &AgentSessionRuntime,
     reader: R,
     writer: &mut W,
 ) -> anyhow::Result<()>
@@ -50,7 +53,7 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-    run_rpc(session, reader, writer).await?;
+    run_rpc(runtime, reader, writer).await?;
     Ok(())
 }
 

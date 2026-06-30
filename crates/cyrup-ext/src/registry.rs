@@ -298,6 +298,17 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.commands.keys().cloned().collect())
     }
 
+    /// Every registered command's `(name, descriptor)` (Pi `getRegisteredCommands`, runner.ts) — the
+    /// invocable extension commands the RPC `get_commands` / TUI command list enumerate (R-11-014).
+    pub fn command_descriptions(&self) -> Result<Vec<(String, CommandDescriptor)>, ExtError> {
+        Ok(self
+            .lock_read()?
+            .commands
+            .iter()
+            .map(|(name, (_, desc))| (name.clone(), desc.clone()))
+            .collect())
+    }
+
     /// Drop every registration (hot-reload cache-bust, R-08-005). The dispatcher is reset separately.
     pub fn clear(&self) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;

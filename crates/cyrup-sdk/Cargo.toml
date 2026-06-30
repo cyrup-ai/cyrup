@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-session-svc = { workspace = true }
+cyrup-modes = { workspace = true }
 cyrup-agent = { workspace = true }
 cyrup-provider = { workspace = true }
 cyrup-session = { workspace = true }

@@ -23,6 +23,7 @@ mod command;
 mod compact;
 mod error;
 mod event;
+pub mod export;
 mod factory;
 mod host_services;
 mod hooks;
@@ -38,6 +39,7 @@ pub use bash::{BashOptions, BashResult};
 pub use builder::{NoTools, SessionBuilder, SessionConfig, SessionTarget};
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
+pub use export::session_jsonl_to_html;
 pub use event::{
     AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
     UserInput,
@@ -72,3 +74,9 @@ pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
 /// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
 pub use cyrup_session::listing::SessionInfo;
 pub use cyrup_tools::{Availability, PermissionPolicy};
+/// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
+/// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.
+pub use cyrup_agent::QueueMode;
+/// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
+/// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
+pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};

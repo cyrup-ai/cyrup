@@ -1234,6 +1234,108 @@ impl AgentSession {
         }
     }
 
+    /// Export the current session branch to a standalone HTML document (Pi `exportToHtml`,
+    /// agent-session.ts:3022). With `path` the document is written there; otherwise the Pi default
+    /// `cyrup-session-<basename>.html` (in the session cwd, basename = the session-file stem, else the
+    /// session id) is used. Returns the resolved output path. The rich per-tool HTML cards
+    /// (`export-html/tool-renderer.ts`) remain the one L5 residual; the document is a real transcript.
+    pub async fn export_to_html(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<std::path::PathBuf, SessionServiceError> {
+        let jsonl = {
+            let guard = self.manager.lock().await;
+            let mut buf: Vec<u8> = Vec::new();
+            guard.export_jsonl(&mut buf)?;
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let html = crate::export::session_jsonl_to_html(&jsonl);
+        let out = match path {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let basename = self
+                    .session_file()
+                    .await
+                    .and_then(|f| f.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| self.session_id().as_str().to_string());
+                self.services.cwd.join(format!("cyrup-session-{basename}.html"))
+            }
+        };
+        std::fs::write(&out, html).map_err(|e| SessionServiceError::Io(e.to_string()))?;
+        Ok(out)
+    }
+
+    /// The invocable slash commands a front-end can offer (Pi `get_commands`, rpc-mode.ts:653-683):
+    /// registered extension commands (`source:"extension"`), prompt templates (`source:"prompt"`),
+    /// and skills (`skill:<name>`, `source:"skill"`), each with a `name`/`description`/`sourceInfo`.
+    /// `sourceInfo` carries cyrup's `scope`/`origin`/`path` provenance (cyrup has no Pi `SourceInfo`
+    /// type — a documented [CYRUP-DELTA] shape; the `source` tag + provenance are 1:1 in spirit).
+    pub fn slash_command_catalog(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        // Registered extension commands.
+        if let Ok(cmds) = self.services.ext_host.registry().command_descriptions() {
+            for (name, desc) in cmds {
+                out.push(serde_json::json!({
+                    "name": name,
+                    "description": desc.description,
+                    "source": "extension",
+                    "sourceInfo": { "type": "extension" },
+                }));
+            }
+        }
+        // Prompt templates.
+        for t in self.services.resources.prompts.winners() {
+            out.push(serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "source": "prompt",
+                "sourceInfo": { "type": "prompt", "path": t.path.display().to_string() },
+            }));
+        }
+        // Skills (`/skill:<name>`).
+        for s in self.services.resources.skills.winners() {
+            out.push(serde_json::json!({
+                "name": format!("skill:{}", s.name),
+                "description": s.front.description.clone().unwrap_or_default(),
+                "source": "skill",
+                "sourceInfo": { "type": "skill", "path": s.skill_md.display().to_string() },
+            }));
+        }
+        out
+    }
+
+    /// The persisted entries on the current branch, serialized (Pi `get_entries`, rpc-mode.ts:609).
+    pub async fn entries_json(&self) -> Vec<serde_json::Value> {
+        let guard = self.manager.lock().await;
+        guard
+            .entries()
+            .iter()
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect()
+    }
+
+    /// The session tree as `{entry, children, label?}` nodes (Pi `get_tree`, rpc-mode.ts:622). The
+    /// optional Pi `labelTimestamp` is omitted (the defensive [`cyrup_session::manager::TreeNode`]
+    /// carries only the resolved label; Pi marks `labelTimestamp?` optional).
+    pub async fn tree_json(&self) -> Vec<serde_json::Value> {
+        fn node_to_json(node: &cyrup_session::manager::TreeNode) -> serde_json::Value {
+            let mut obj = serde_json::Map::new();
+            if let Ok(entry) = serde_json::to_value(&node.entry) {
+                obj.insert("entry".to_string(), entry);
+            }
+            obj.insert(
+                "children".to_string(),
+                serde_json::Value::Array(node.children.iter().map(node_to_json).collect()),
+            );
+            if let Some(label) = &node.label {
+                obj.insert("label".to_string(), serde_json::Value::String(label.clone()));
+            }
+            serde_json::Value::Object(obj)
+        }
+        let guard = self.manager.lock().await;
+        guard.tree().iter().map(node_to_json).collect()
+    }
+
     // ------------------------------------------------------------------- lifecycle ----
 
     /// Dispose the session (Pi `AgentSession.dispose` via runtime `dispose`,

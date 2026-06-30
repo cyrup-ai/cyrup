@@ -12,7 +12,9 @@ use std::sync::Arc;
 use cyrup_modes::{run_json, run_print, run_rpc, PrintOptions, SessionCommand};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
-use cyrup_session_svc::{InputSource, SessionBuilder, SessionConfig, UserInput};
+use cyrup_session_svc::{
+    AgentSessionRuntime, InputSource, SessionBuilder, SessionConfig, SessionFactory, UserInput,
+};
 use cyrup_core::StopReason;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -48,6 +50,15 @@ async fn build_session(
 ) -> cyrup_session_svc::AgentSession {
     let provider: Arc<dyn Provider> = faux;
     SessionBuilder::new(provider, base_config(fx)).build().await.expect("build session")
+}
+
+/// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
+async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> AgentSessionRuntime {
+    let provider: Arc<dyn Provider> = faux;
+    let cfg = base_config(fx);
+    let target = cfg.target.clone();
+    let factory = Arc::new(SessionFactory::new(provider, cfg));
+    AgentSessionRuntime::create(factory, target).await.expect("build runtime")
 }
 
 /// Parse the produced sink bytes into one `serde_json::Value` per non-empty LF-delimited line.
@@ -160,7 +171,7 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
         vec![faux_text("rpc answer")],
         StopReason::Stop,
     )]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     // A scripted request stream: prompt, then an abort, then two state queries.
     let input = concat!(
@@ -176,7 +187,7 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
 
-    run_rpc(&session, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     assert!(!lines.is_empty(), "no output produced");
@@ -197,26 +208,33 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
     assert_eq!(abort_resp["id"], "2");
     assert_eq!(abort_resp["success"], true);
 
-    // (3) get_state returns a session snapshot.
+    // (3) get_state returns the full session snapshot (Pi RpcSessionState).
     let state = responses.iter().find(|r| r["command"] == "get_state").expect("a get_state response");
     assert_eq!(state["id"], "3");
     assert!(state["data"]["sessionId"].is_string(), "state missing sessionId: {state}");
     assert!(state["data"]["model"]["provider"].is_string(), "state missing model: {state}");
+    // The widened shape (gap #25): every Pi RpcSessionState field is present.
+    for field in [
+        "thinkingLevel",
+        "isStreaming",
+        "isCompacting",
+        "steeringMode",
+        "followUpMode",
+        "autoCompactionEnabled",
+        "messageCount",
+        "pendingMessageCount",
+    ] {
+        assert!(!state["data"][field].is_null(), "state missing {field}: {state}");
+    }
 
-    // (4) get_commands lists the supported verbs.
+    // (4) get_commands returns the invocable-commands envelope (Pi `{commands:[...]}`), NOT the RPC
+    // verb names (gap #2). The faux fixture registers no extensions/prompts/skills → an empty list.
     let cmds = responses
         .iter()
         .find(|r| r["command"] == "get_commands")
         .expect("a get_commands response");
     assert_eq!(cmds["id"], "4");
-    let names: Vec<&str> = cmds["data"]
-        .as_array()
-        .expect("commands array")
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
-    assert!(names.contains(&"prompt"), "command catalog missing prompt: {names:?}");
-    assert!(names.contains(&"get_state"), "command catalog missing get_state: {names:?}");
+    assert!(cmds["data"]["commands"].is_array(), "get_commands must carry a commands array: {cmds}");
 
     // (5) the agent event stream surfaced on the protocol (at least the run start).
     let kinds: Vec<&str> = events.iter().copied().map(type_of).collect();
@@ -224,47 +242,54 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
 }
 
 #[tokio::test]
-async fn rpc_fork_returns_a_new_session_id() {
+async fn rpc_fork_at_entry_branches_and_rebinds() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(
         vec![faux_text("forked answer")],
         StopReason::Stop,
     )]);
-    let session = build_session(&fx, faux).await;
-    let original = session.session_id().as_str().to_string();
+    let runtime = build_runtime(&fx, faux).await;
+    let session = runtime.session().await;
 
-    // A fork needs a non-empty source: run one prompt to completion so the session has entries.
+    // A fork targets an entry: run one prompt so the branch has a user-message anchor to fork at.
     session
         .prompt_accepted(UserInput::text("seed the session", InputSource::Cli))
         .await
         .expect("prompt accepted");
     session.wait_for_idle().await;
+    let anchor = session
+        .user_messages_for_forking()
+        .await
+        .into_iter()
+        .next()
+        .expect("a forkable user-message anchor");
 
-    let input = "{\"type\":\"fork\",\"id\":\"42\"}\n";
-    let reader = Cursor::new(input.as_bytes().to_vec());
+    // Pi `fork({entryId})`: position "before" the user message; selected text is returned so a UI
+    // can re-edit it; the runtime swaps the active session and the protocol rebinds.
+    let input = format!("{{\"type\":\"fork\",\"id\":\"42\",\"entryId\":\"{}\"}}\n", anchor.entry_id.as_str());
+    let reader = Cursor::new(input.into_bytes());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&session, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     let resp = lines.iter().find(|l| l["command"] == "fork").expect("a fork response");
     assert_eq!(resp["id"], "42");
     assert_eq!(resp["success"], true, "fork must succeed: {resp}");
-    let new_id = resp["data"]["sessionId"].as_str().expect("fork returns a sessionId");
-    assert!(!new_id.is_empty(), "fork sessionId must be non-empty: {resp}");
-    assert_ne!(new_id, original, "fork must mint a new session id: {resp}");
+    assert_eq!(resp["data"]["cancelled"], false, "fork was not vetoed: {resp}");
+    assert_eq!(resp["data"]["text"], "seed the session", "fork returns the anchor text: {resp}");
 }
 
 #[tokio::test]
 async fn rpc_unknown_command_echoes_id_on_failure() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let input = "{\"type\":\"does_not_exist\",\"id\":\"9\"}\n";
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&session, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     let resp = lines.iter().find(|l| type_of(l) == "response").expect("a response");
@@ -276,13 +301,13 @@ async fn rpc_unknown_command_echoes_id_on_failure() {
 async fn rpc_malformed_command_echoes_id_on_failure() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     // A valid JSON object with a known `type` but a missing required field (`message`).
     let input = "{\"type\":\"prompt\",\"id\":\"13\"}\n";
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&session, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     let resp = lines.iter().find(|l| type_of(l) == "response").expect("a response");
@@ -295,12 +320,12 @@ async fn rpc_malformed_command_echoes_id_on_failure() {
 async fn rpc_unknown_command_is_a_failure_not_a_panic() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let input = "{\"type\":\"does_not_exist\",\"id\":\"9\"}\n";
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&session, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     let resp = lines.iter().find(|l| type_of(l) == "response").expect("a response");
@@ -308,19 +333,122 @@ async fn rpc_unknown_command_is_a_failure_not_a_panic() {
     assert!(resp["error"].is_string(), "unknown command must carry an error: {resp}");
 }
 
-/// `SessionCommand` deserializes the documented snake_case `type` tags + camelCase fields.
+/// `SessionCommand` deserializes the documented snake_case `type` tags + Pi's camelCase fields
+/// (`streamingBehavior`, `images`), 1:1 with `rpc-types.ts:22`.
 #[test]
 fn session_command_parses_streaming_behavior() {
     let cmd: SessionCommand = serde_json::from_str(
-        r#"{"type":"prompt","id":"7","message":"hi","streaming_behavior":"followUp"}"#,
+        r#"{"type":"prompt","id":"7","message":"hi","streamingBehavior":"followUp"}"#,
     )
     .expect("parse prompt");
     match cmd {
-        SessionCommand::Prompt { id, message, streaming_behavior } => {
+        SessionCommand::Prompt { id, message, images, streaming_behavior } => {
             assert_eq!(id.as_deref(), Some("7"));
             assert_eq!(message, "hi");
+            assert!(images.is_empty());
             assert!(streaming_behavior.is_some());
         }
         other => panic!("expected Prompt, got {other:?}"),
     }
+}
+
+/// The camelCase request fields + new command tags deserialize 1:1 with `rpc-types.ts` (the `type`
+/// discriminants are snake_case; multi-word fields are camelCase on the wire).
+#[test]
+fn session_command_parses_new_command_shapes() {
+    // `set_model` takes `provider` + `modelId`.
+    match serde_json::from_str::<SessionCommand>(
+        r#"{"type":"set_model","provider":"anthropic","modelId":"claude"}"#,
+    )
+    .expect("parse set_model")
+    {
+        SessionCommand::SetModel { provider, model_id, .. } => {
+            assert_eq!(provider, "anthropic");
+            assert_eq!(model_id, "claude");
+        }
+        other => panic!("expected SetModel, got {other:?}"),
+    }
+    // `fork` takes `entryId`.
+    match serde_json::from_str::<SessionCommand>(r#"{"type":"fork","entryId":"e1"}"#)
+        .expect("parse fork")
+    {
+        SessionCommand::Fork { entry_id, .. } => assert_eq!(entry_id, "e1"),
+        other => panic!("expected Fork, got {other:?}"),
+    }
+    // `bash` takes `command` + `excludeFromContext`; `set_steering_mode` the `one-at-a-time` arg.
+    serde_json::from_str::<SessionCommand>(
+        r#"{"type":"bash","command":"ls","excludeFromContext":true}"#,
+    )
+    .expect("parse bash");
+    serde_json::from_str::<SessionCommand>(r#"{"type":"set_steering_mode","mode":"one-at-a-time"}"#)
+        .expect("parse set_steering_mode");
+    serde_json::from_str::<SessionCommand>(r#"{"type":"new_session","parentSession":"p.jsonl"}"#)
+        .expect("parse new_session");
+}
+
+/// The extended command surface drives the runtime/session: model listing, thinking, queue modes,
+/// stats, a session-name round-trip, a new_session swap, and the corrected `get_commands` envelope.
+#[tokio::test]
+async fn rpc_extended_command_surface() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let input = concat!(
+        r#"{"type":"get_available_models","id":"a"}"#,
+        "\n",
+        r#"{"type":"cycle_model","id":"b"}"#,
+        "\n",
+        r#"{"type":"set_thinking_level","id":"c","level":"medium"}"#,
+        "\n",
+        r#"{"type":"set_steering_mode","id":"d","mode":"one-at-a-time"}"#,
+        "\n",
+        r#"{"type":"get_session_stats","id":"e"}"#,
+        "\n",
+        r#"{"type":"set_session_name","id":"f","name":"  my session  "}"#,
+        "\n",
+        r#"{"type":"set_session_name","id":"g","name":"   "}"#,
+        "\n",
+        r#"{"type":"get_messages","id":"h"}"#,
+        "\n",
+        r#"{"type":"new_session","id":"i"}"#,
+        "\n",
+    );
+    let reader = Cursor::new(input.as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+
+    let lines = parse_lines(&out);
+    let resp = |cmd: &str| lines.iter().find(|l| l["command"] == cmd).unwrap_or_else(|| panic!("no {cmd} response"));
+
+    // get_available_models → {models:[...]}.
+    assert_eq!(resp("get_available_models")["success"], true);
+    assert!(resp("get_available_models")["data"]["models"].is_array());
+
+    // cycle_model with a single faux model → success with null (≤1 candidate).
+    assert_eq!(resp("cycle_model")["success"], true);
+
+    // set_thinking_level clamps + succeeds; set_steering_mode succeeds.
+    assert_eq!(resp("set_thinking_level")["success"], true);
+    assert_eq!(resp("set_steering_mode")["success"], true);
+
+    // get_session_stats carries the aggregate counters.
+    let stats = resp("get_session_stats");
+    assert_eq!(stats["success"], true);
+    assert!(stats["data"]["messageCount"].is_number(), "stats missing messageCount: {stats}");
+
+    // set_session_name trims + persists ("f"), and rejects an empty/whitespace name ("g").
+    let named: Vec<&Value> = lines.iter().filter(|l| l["command"] == "set_session_name").collect();
+    let ok = named.iter().find(|r| r["id"] == "f").expect("named ok response");
+    assert_eq!(ok["success"], true, "trim+persist must succeed: {ok}");
+    let empty = named.iter().find(|r| r["id"] == "g").expect("named empty response");
+    assert_eq!(empty["success"], false, "empty name must be rejected: {empty}");
+
+    // get_messages now returns the {messages:[...]} envelope (gap #45).
+    assert!(resp("get_messages")["data"]["messages"].is_array(), "get_messages envelope");
+
+    // new_session swaps the active session and is not vetoed.
+    let new = resp("new_session");
+    assert_eq!(new["success"], true);
+    assert_eq!(new["data"]["cancelled"], false, "new_session not vetoed: {new}");
 }

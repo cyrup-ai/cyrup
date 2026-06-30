@@ -77,33 +77,43 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    // One-shot / RPC: build the one `AgentSession` seam (unchanged path, R-11-008).
-    let session = Arc::new(
-        SessionBuilder::new(provider, config).build().await.context("building agent session")?,
-    );
-
-    // Signals: SIGINT/SIGTERM → abort the run + cancel the interactive loop (R-11-010/018).
-    let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
-
     match mode {
         AppMode::Rpc => {
-            // RPC owns stdin as the protocol; do not pre-read prompt inputs.
+            // RPC drives the **multi-session** `AgentSessionRuntime` host (Pi `rpc-mode.ts`
+            // `runtimeHost`) so the session-replacing commands (`new_session`/`switch_session`/
+            // `fork`/`clone`) rebuild the active session in place and the protocol rebinds. RPC owns
+            // stdin as the protocol; do not pre-read prompt inputs.
+            let target = config.target.clone();
+            let factory = Arc::new(SessionFactory::new(provider, config));
+            let runtime = Arc::new(
+                AgentSessionRuntime::create(factory, target)
+                    .await
+                    .context("building agent session runtime")?,
+            );
+            let session = runtime.session().await;
+            let _signals = spawn_abort_on_signal(session, cancel.clone());
             let reader = tokio::io::BufReader::new(tokio::io::stdin());
             let mut writer = tokio::io::stdout();
-            run_rpc_dispatch(&session, reader, &mut writer).await?;
+            run_rpc_dispatch(&runtime, reader, &mut writer).await?;
             Ok(0)
         }
-        AppMode::Print => {
+        AppMode::Print | AppMode::Json => {
+            // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
+            let session = Arc::new(
+                SessionBuilder::new(provider, config)
+                    .build()
+                    .await
+                    .context("building agent session")?,
+            );
+            let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
             let inputs = build_inputs(&cli).await?;
             ensure_prompt(&inputs)?;
             let mut out = io::stdout();
-            run_print_dispatch(&session, &inputs, &mut out).await
-        }
-        AppMode::Json => {
-            let inputs = build_inputs(&cli).await?;
-            ensure_prompt(&inputs)?;
-            let mut out = io::stdout();
-            run_json_dispatch(&session, &inputs, &mut out).await
+            if let AppMode::Json = mode {
+                run_json_dispatch(&session, &inputs, &mut out).await
+            } else {
+                run_print_dispatch(&session, &inputs, &mut out).await
+            }
         }
         // Interactive is dispatched above (it builds the runtime tier) and returns early.
         AppMode::Interactive => unreachable!("interactive mode is handled before this match"),
