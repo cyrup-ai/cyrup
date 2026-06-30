@@ -687,9 +687,24 @@ fn apply_usage_estimate(
     context: &Context,
     options: &StreamOptions,
 ) {
+    message.usage = usage_estimate(prompt_cache, &message.content, context, options);
+}
+
+/// Compute the prompt-cache usage estimate (Pi `withUsageEstimate`, faux.ts:213-251) for an
+/// assistant message's `content` against `context`/`options`, mutating `prompt_cache` exactly as Pi
+/// mutates its per-provider `promptCache`. Exposed so an out-of-band caller — e.g. the scripted
+/// harness's queue-exhaustion error terminal (Pi `createErrorMessage` → `withUsageEstimate`,
+/// faux.ts:451-461) — can stamp the same usage object Pi does (`output:0` for the empty-content error
+/// message, `input` = the serialized-context estimate) rather than the fixed `buildUsage` defaults.
+pub fn usage_estimate(
+    prompt_cache: &Mutex<HashMap<String, String>>,
+    content: &[Content],
+    context: &Context,
+    options: &StreamOptions,
+) -> Usage {
     let prompt_text = serialize_context(context);
     let prompt_tokens = estimate_tokens(&prompt_text);
-    let output_tokens = estimate_output(&message.content);
+    let output_tokens = estimate_output(content);
     let mut input = prompt_tokens;
     let mut cache_read = 0u64;
     let mut cache_write = 0u64;
@@ -709,7 +724,7 @@ fn apply_usage_estimate(
         cache.insert(key, prompt_text);
     }
 
-    message.usage = Usage {
+    Usage {
         input,
         output: output_tokens,
         cache_read,
@@ -718,7 +733,7 @@ fn apply_usage_estimate(
         reasoning: None,
         total_tokens: input + output_tokens + cache_read + cache_write,
         cost: Cost::default(),
-    };
+    }
 }
 
 // ---- context serialization for the prompt-cache estimate (Pi serializeContext, faux.ts:190-202) ----

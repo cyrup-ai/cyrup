@@ -579,9 +579,21 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 // (or the filesystem root if there is none) — Pi `collectAncestorAgentsSkillDirs`
                 // (package-manager.ts:440-459) feeding `projectAgentsSkillDirs`
                 // (package-manager.ts:2286-2290), each loaded with its own `.agents` baseDir
-                // (2326-2342). The user-tier `~/.agents/skills` (cyrup `global_agents_dir/skills`,
-                // already loaded at Global scope) is filtered out so it is not double-counted, 1:1
-                // with Pi's `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))` (2289).
+                // (2326-2342). The user-tier skills dir is filtered out so it is not double-counted,
+                // 1:1 with Pi's `.filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))` (2289).
+                //
+                // USER-TIER DIR — DOCUMENTED DEFERRAL (residual #6). Pi's `userAgentsSkillsDir =
+                // join(getHomeDir(), ".agents", "skills")` is literally `$HOME/.agents/skills`
+                // (package-manager.ts:2286; `getHomeDir` = `process.env.HOME || homedir()`, :217) — the
+                // user tier of the SAME cross-tool `.agents/skills` convention walked above. cyrup
+                // instead uses `global_agents_dir/skills` = `agent_dir/agents/skills`
+                // (= `~/.cyrup/agent/agents/skills` by default; DiscoveryConfig::new + session-svc
+                // builder.rs:481). Pi-faithful is `~/.agents/skills`, and cyrup-config/trust.rs:173
+                // ALREADY uses `home.join(".agents")` for the matching trust-walk exclusion — so this
+                // is a genuine divergence (not a deliberate relocation), but the complete fix is
+                // out-of-scope here: it needs `$HOME/.agents/skills` plumbed from cyrup-config into
+                // `DiscoveryConfig` (a new field) and set by cyrup-session-svc — both outside the
+                // editable crate set for this pass. Tracked in spec/gap-analysis/00-residual-ledger.md #6.
                 let user_agents_skills = cfg.global_agents_dir.join("skills");
                 for root in collect_ancestor_agents_skill_dirs(&cfg.cwd) {
                     if root == user_agents_skills {

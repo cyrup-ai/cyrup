@@ -76,10 +76,22 @@ async fn run(
     }
 
     let url = format!("{}/chat/completions", model.base_url);
-    // Honor HTTP(S)_PROXY / ALL_PROXY / NO_PROXY for the live image client, uniformly with the six
-    // text wire protocols (Pi applies its shared HTTP transport proxy to every request including
-    // `openrouter-images`; `resolveHttpProxyUrlForTarget`, node-http-proxy.ts:92-112). The bare
-    // `build_client()` skipped the resolver / SOCKS-rejection semantics for image generation.
+    // PROXY MODEL — DOCUMENTED DEFERRAL (residual #4). cyrup routes the image client through the
+    // shared per-target resolver (`build_client_for_target` → Pi `resolveHttpProxyUrlForTarget`,
+    // node-http-proxy.ts:92-112), which honors `http(s)_proxy` + `all_proxy` + `no_proxy` and
+    // REJECTS SOCKS/PAC. Pi's image path does NOT use that resolver: `createClient`
+    // (openrouter-images.ts:107-119) builds a bare OpenAI SDK client whose global fetch is proxied by
+    // undici's GLOBAL `EnvHttpProxyAgent` (http-dispatcher.ts `configureHttpDispatcher` →
+    // `setGlobalDispatcher`), which reads HTTP_PROXY/HTTPS_PROXY/NO_PROXY ONLY — it never reads
+    // `all_proxy` and silently ignores SOCKS instead of rejecting it.
+    //
+    // Choice: KEEP cyrup's unified resolver (deliberate broader/safer delta), do NOT regress.
+    // Matching Pi exactly is not clean: it would require either (a) a bare client that honors NO
+    // proxy at all (strictly worse than Pi, which DOES honor HTTP(S)_PROXY), or (b) a third,
+    // image-only proxy mode replicating undici's `EnvHttpProxyAgent` (HTTP(S)_PROXY/NO_PROXY only,
+    // no `all_proxy`, silent SOCKS) — extra surface that is strictly LESS safe than rejecting SOCKS.
+    // The delta only surfaces in the rare `all_proxy`-set / SOCKS-on-image edge; the SOCKS-rejection
+    // test below pins the current (broader) behavior. See spec/gap-analysis/00-residual-ledger.md #4.
     let client =
         build_client_for_target(&url, &crate::auth::types::EnvAuthContext, options.env.as_ref())
             .await

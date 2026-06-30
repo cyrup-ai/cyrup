@@ -7,11 +7,12 @@
 //! match the faux provider exactly). Honors per-response model identity overrides — unlike the faux
 //! provider core, the scripted stream fn does NOT re-stamp the response identity (Pi parity).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{EventStream, ProviderId};
-use cyrup_provider::faux::{faux_event_stream, ChunkConfig};
+use cyrup_provider::faux::{faux_event_stream, usage_estimate, ChunkConfig};
 use cyrup_provider::{Context, Model, Provider, StreamEvent, StreamOptions};
 use futures::StreamExt;
 
@@ -41,6 +42,10 @@ pub struct ScriptedProvider {
     /// `true` ⇒ queue-consuming semantics; `false` ⇒ cycling (Pi's two flavours).
     queue_mode: bool,
     state: Arc<Mutex<FauxStreamFnState>>,
+    /// Per-provider prompt cache backing the queue-exhaustion `withUsageEstimate` (Pi's per-provider
+    /// `promptCache`, faux.ts:213-251,451-461). Shared across exhaustion calls so repeated drained
+    /// turns with the same `sessionId` accumulate cacheRead/cacheWrite exactly as Pi's Map does.
+    prompt_cache: Mutex<HashMap<String, String>>,
 }
 
 impl ScriptedProvider {
@@ -96,6 +101,7 @@ impl ScriptedProvider {
             responses: Mutex::new(responses),
             queue_mode,
             state: Arc::new(Mutex::new(FauxStreamFnState::default())),
+            prompt_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -172,9 +178,19 @@ impl Provider for ScriptedProvider {
         };
 
         let mut message = build_assistant_message(&resp);
-        // Pi `buildUsage`: the scripted stream fn uses fixed defaults (input:100/output:50), NOT the
-        // prompt-cache estimator (test-harness.ts:159).
-        message.usage = build_usage(resp.usage.as_ref());
+        if exhausted {
+            // Queue-exhaustion terminal (Pi faux.ts:451-461): Pi runs the `createErrorMessage`
+            // result (content `[]`) through `withUsageEstimate(message, context, streamOptions,
+            // promptCache)`, NOT the fixed `buildUsage` defaults. So the stamped usage is
+            // output:0 (empty content ⇒ `assistantContentToText([]) === ""`), input = the serialized
+            // -context estimate, and cacheRead/cacheWrite per the session prompt-cache (faux.ts:213-251).
+            message.usage =
+                usage_estimate(&self.prompt_cache, &message.content, context, options);
+        } else {
+            // Normal scripted step: Pi `buildUsage` fixed defaults (input:100/output:50), NOT the
+            // prompt-cache estimator (test-harness.ts:159).
+            message.usage = build_usage(resp.usage.as_ref());
+        }
 
         if exhausted {
             // Queue-exhaustion (no-step) path. Pi handles this OUT-OF-BAND of `streamWithDeltas`:

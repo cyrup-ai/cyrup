@@ -177,13 +177,13 @@ pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-/// Candidate read paths in priority order (R-03-006, path-utils.ts:53-83): the resolved path first,
-/// then the macOS AM/PM narrow-NBSP screenshot variant, then the NFD (decomposed) variant, then the
-/// curly-quote (`'` → U+2019) variant, then the combined NFD+curly variant. Each non-primary variant
-/// is emitted only when it differs from the resolved path, matching Pi's `!== resolved` guard. The
-/// `read` tool tries each via the `FsOps` seam and uses the first that exists. A reverse curly→`'`
-/// variant is appended as an additive cyrup-only fallback (never resolves a path Pi's set already
-/// covers).
+/// Candidate read paths in priority order (R-03-006, `resolveReadPathAsync`, path-utils.ts:86-116):
+/// EXACTLY Pi's five candidates, in Pi's order — the resolved path first, then the macOS AM/PM
+/// narrow-NBSP screenshot variant, then the NFD (decomposed) variant, then the curly-quote
+/// (`'` → U+2019) variant, then the combined NFD+curly variant. Each non-primary variant is emitted
+/// only when it differs from the resolved path, matching Pi's `!== resolved` guard. The `read` tool
+/// tries each via the `FsOps` seam and uses the first that exists. Pi appends NO further variants
+/// (there is no reverse U+2019→`'` candidate), so cyrup must not either.
 pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
     let primary = resolve_to_cwd(path, cwd);
     let s = primary.to_string_lossy().into_owned();
@@ -206,10 +206,6 @@ pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
     let nfd_curly = nfd.replace('\'', "\u{2019}");
     if nfd_curly != s {
         out.push(PathBuf::from(nfd_curly));
-    }
-    // [CYRUP extra] reverse curly U+2019 → straight `'` (additive fallback beyond Pi's set).
-    if s.contains('\u{2019}') {
-        out.push(PathBuf::from(s.replace('\u{2019}', "'")));
     }
     out
 }
@@ -324,6 +320,22 @@ mod tests {
                 s.contains('\u{2019}') && s.contains("e\u{0301}")
             }),
             "variants: {v:?}"
+        );
+    }
+
+    /// Pi `resolveReadPathAsync` (path-utils.ts:86-116) emits NO reverse U+2019→`'` candidate. For a
+    /// path that already contains a curly apostrophe and no straight one, Pi's five guards all reduce
+    /// to the resolved path (amPm: none; NFD: identical; curly `s.contains('\'')`: false; NFD+curly:
+    /// equals resolved), so the candidate set is exactly `[resolved]`. The removed cyrup-only 6th
+    /// variant would have injected `/work/it's.txt`; assert it does not.
+    #[test]
+    fn read_path_has_no_reverse_curly_variant() {
+        let cwd = Path::new("/work");
+        let v = resolve_read_path("it\u{2019}s.txt", cwd);
+        assert_eq!(v, vec![PathBuf::from("/work/it\u{2019}s.txt")], "variants: {v:?}");
+        assert!(
+            !v.iter().any(|p| p.to_string_lossy().contains("it's.txt")),
+            "Pi emits no reverse U+2019→' candidate: {v:?}"
         );
     }
 

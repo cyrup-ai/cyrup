@@ -515,6 +515,43 @@ mod smoke {
         );
     }
 
+    /// Byte-diff vs Pi `withUsageEstimate` for the queue-exhaustion terminal (faux.ts:451-461 →
+    /// 213-251). Pi stamps the error message (content `[]`) with `withUsageEstimate`, NOT the fixed
+    /// `buildUsage` defaults. For a single-user-message context the expected usage is derived from
+    /// `serializeContext` = `"user:hello"` (10 chars) ⇒ `input = ceil(10/4) = 3`, `output = 0`
+    /// (`assistantContentToText([]) === ""`), `cacheRead = cacheWrite = 0`, `totalTokens = 3`. The old
+    /// path stamped the fixed `input:100/output:50/total:150`.
+    #[tokio::test]
+    async fn scripted_queue_exhaustion_usage_matches_withusageestimate() {
+        use crate::user_msg;
+        use cyrup_core::{Cost, Usage};
+        use cyrup_provider::{Context, Provider, StreamOptions};
+
+        // Empty queue ⇒ the first call is the no-step exhaustion path.
+        let (provider, _state) = create_faux_stream_fn_queued(vec![], vec![faux_model()]);
+        let ctx = Context { messages: vec![user_msg("hello")], ..Default::default() };
+        let m = cyrup_provider::collect_message(provider.stream(
+            &faux_model(),
+            &ctx,
+            &StreamOptions::default(),
+        ))
+        .await;
+        assert_eq!(m.stop_reason, cyrup_core::StopReason::Error);
+        assert_eq!(m.error_message.as_deref(), Some("No more faux responses queued"));
+        // Re-derived expected bytes from Pi's withUsageEstimate (faux.ts:235-247).
+        let expected = Usage {
+            input: 3,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_1h: None,
+            reasoning: None,
+            total_tokens: 3,
+            cost: Cost::default(),
+        };
+        assert_eq!(m.usage, expected, "exhaustion usage must match Pi withUsageEstimate");
+    }
+
     /// Arbitrary `Model` override (Pi `createHarness({ model })`, test-harness.ts:324,369-370): an
     /// injected model with non-default modalities/reasoning/window flows onto the resolved session
     /// model.

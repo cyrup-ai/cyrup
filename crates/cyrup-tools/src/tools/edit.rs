@@ -69,24 +69,41 @@ impl EditTool {
     }
 }
 
-/// Normalize legacy shapes into `{ path, edits: [...] }` (R-03-020):
-/// - `edits` sent as a JSON string -> parse to array;
-/// - top-level `oldText`/`newText` -> single-element `edits`.
+/// Normalize legacy shapes into `{ path, edits: [...] }` (R-03-020), a 1:1 port of Pi
+/// `prepareEditArguments` (edit.ts:94-118):
+/// - `edits` sent as a JSON string -> parse, replacing only when it yields an array (edit.ts:102-107);
+/// - whenever BOTH top-level `oldText`/`newText` are strings, APPEND `{oldText,newText}` to the
+///   existing `edits` array (or a fresh one), regardless of whether `edits` is already present
+///   (edit.ts:109-117: `const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : []; edits.push(...)`).
+///
+/// The previous gate (`!obj.contains_key("edits")`) diverged from Pi: input
+/// `{path, edits:[], oldText, newText}` made Pi succeed with one edit but made cyrup keep `edits:[]`
+/// and fire the empty-array error, and `{edits:[{...}], oldText, newText}` had Pi append an extra
+/// edit while cyrup ignored the pair.
 fn normalize_args(mut raw: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = raw.as_object_mut() {
-        // edits-as-string
+        // edits-as-string -> parse, but only adopt the parsed value when it is an array
+        // (Pi `if (Array.isArray(parsed)) args.edits = parsed`, edit.ts:104-106).
         if let Some(serde_json::Value::String(s)) = obj.get("edits")
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                obj.insert("edits".to_string(), parsed);
-            }
-        // legacy single-edit
-        if !obj.contains_key("edits")
-            && let (Some(old), Some(new)) = (obj.remove("oldText"), obj.remove("newText")) {
-                obj.insert(
-                    "edits".to_string(),
-                    serde_json::json!([{ "oldText": old, "newText": new }]),
-                );
-            }
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+            && parsed.is_array()
+        {
+            obj.insert("edits".to_string(), parsed);
+        }
+        // legacy single-edit: append the pair whenever BOTH oldText and newText are strings
+        // (Pi edit.ts:109-117). A non-string (or absent) oldText/newText leaves the args untouched.
+        let both_strings = obj.get("oldText").is_some_and(serde_json::Value::is_string)
+            && obj.get("newText").is_some_and(serde_json::Value::is_string);
+        if both_strings {
+            let old = obj.remove("oldText").unwrap_or(serde_json::Value::Null);
+            let new = obj.remove("newText").unwrap_or(serde_json::Value::Null);
+            let mut edits = match obj.get("edits") {
+                Some(serde_json::Value::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            edits.push(serde_json::json!({ "oldText": old, "newText": new }));
+            obj.insert("edits".to_string(), serde_json::Value::Array(edits));
+        }
     }
     raw
 }
@@ -202,5 +219,96 @@ impl ToolMeta for EditTool {
             "Keep edits[].oldText as small as possible while still being unique in the file. Do not \
              pad with large unchanged regions.",
         ]
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::normalize_args;
+    use serde_json::json;
+
+    /// Byte-diff vs Pi `prepareEditArguments` (edit.ts:109-117): a legacy `{oldText,newText}` pair
+    /// is APPENDED to an existing `edits` array, regardless of whether `edits` is present. Pi:
+    /// `const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : []; edits.push({oldText,newText})`.
+    #[test]
+    fn legacy_pair_appends_into_existing_empty_array() {
+        // `{path, edits:[], oldText, newText}` — the regression input. Pi yields exactly one edit
+        // (the appended pair); the old `!contains_key("edits")` gate left `edits:[]` and would have
+        // fired the empty-array error.
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": [],
+            "oldText": "a",
+            "newText": "b"
+        }));
+        assert_eq!(
+            out,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "a", "newText": "b" }] })
+        );
+        // `oldText`/`newText` are stripped from the result (Pi's `{ ...rest, edits }` excludes them).
+        assert!(out.get("oldText").is_none());
+        assert!(out.get("newText").is_none());
+    }
+
+    /// Byte-diff vs Pi: a populated `edits` array PLUS a legacy pair yields the original edits with
+    /// the pair appended (edit.ts:114-115 `[...legacy.edits]` then `push`).
+    #[test]
+    fn legacy_pair_appends_after_existing_edits() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": [{ "oldText": "x", "newText": "y" }],
+            "oldText": "a",
+            "newText": "b"
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "path": "f.txt",
+                "edits": [
+                    { "oldText": "x", "newText": "y" },
+                    { "oldText": "a", "newText": "b" }
+                ]
+            })
+        );
+    }
+
+    /// No `edits` key + a legacy pair builds a fresh single-element array (the common shorthand).
+    #[test]
+    fn legacy_pair_without_edits_builds_single_element_array() {
+        let out = normalize_args(json!({ "path": "f.txt", "oldText": "a", "newText": "b" }));
+        assert_eq!(
+            out,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "a", "newText": "b" }] })
+        );
+    }
+
+    /// A non-string `oldText`/`newText` leaves the args untouched (Pi edit.ts:110-112 early return).
+    #[test]
+    fn non_string_pair_is_left_untouched() {
+        let out = normalize_args(json!({ "path": "f.txt", "oldText": 1, "newText": "b" }));
+        assert_eq!(out, json!({ "path": "f.txt", "oldText": 1, "newText": "b" }));
+    }
+
+    /// `edits` as a JSON string is parsed to an array (Pi edit.ts:102-107), and a legacy pair then
+    /// appends onto the parsed array.
+    #[test]
+    fn edits_string_parses_then_pair_appends() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": "[{\"oldText\":\"x\",\"newText\":\"y\"}]",
+            "oldText": "a",
+            "newText": "b"
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "path": "f.txt",
+                "edits": [
+                    { "oldText": "x", "newText": "y" },
+                    { "oldText": "a", "newText": "b" }
+                ]
+            })
+        );
     }
 }
