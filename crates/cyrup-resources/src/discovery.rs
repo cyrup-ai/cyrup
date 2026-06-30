@@ -206,6 +206,62 @@ pub struct ResourceRegistry {
     pub ext_crate_paths: Vec<PathBuf>,
 }
 
+impl ResourceRegistry {
+    /// Merge extension-contributed skill/prompt/theme paths into this snapshot, returning a NEW
+    /// snapshot (the registry is immutable; callers atomically swap the result in). 1:1 with Pi's
+    /// `ResourceLoader.extendResources` (resource-loader.ts:293) as driven by
+    /// `extendResourcesFromExtensions` (agent-session.ts:2112-2135): each contributed file is loaded
+    /// at the [`ResourceScope::Discovered`] tier (Pi's `scope:"temporary"` extension resources, rank
+    /// `6`) and folded back through [`ResourceSet::build`], so a same-name user/package/CLI resource
+    /// still wins (first-wins precedence). Existing candidates are preserved; `ext_crate_paths` are
+    /// carried over unchanged. Parse failures / missing paths are dropped (Pi logs a warning and
+    /// skips), never panicking.
+    pub fn extend(&self, extra: &DiscoveredPaths) -> ResourceRegistry {
+        let mut skills: Vec<Skill> = self.skills.all().to_vec();
+        let mut prompts: Vec<PromptTemplate> = self.prompts.all().to_vec();
+        let mut themes: Vec<Theme> = self.themes.all().to_vec();
+        // Warnings/diagnostics are surfaced by the primary discovery pass; the extend-merge mirrors
+        // Pi's loader, which records them internally rather than returning them to the caller.
+        let mut warnings: Vec<ResourceWarning> = Vec::new();
+        let mut diagnostics: Vec<ResourceDiagnostic> = Vec::new();
+        for p in &extra.skill_paths {
+            add_skill_path(
+                p,
+                ResourceScope::Discovered,
+                ResourceOrigin::Builtin,
+                &mut skills,
+                &mut warnings,
+                &mut diagnostics,
+            );
+        }
+        for p in &extra.prompt_paths {
+            add_prompt_path(
+                p,
+                ResourceScope::Discovered,
+                ResourceOrigin::Builtin,
+                &mut prompts,
+                &mut warnings,
+            );
+        }
+        for p in &extra.theme_paths {
+            add_theme_path(
+                p,
+                ResourceScope::Discovered,
+                ResourceOrigin::Builtin,
+                &mut themes,
+                &mut warnings,
+            );
+        }
+        let _ = (warnings, diagnostics);
+        ResourceRegistry {
+            skills: ResourceSet::build(skills),
+            prompts: ResourceSet::build(prompts),
+            themes: ResourceSet::build(themes),
+            ext_crate_paths: self.ext_crate_paths.clone(),
+        }
+    }
+}
+
 /// The result of a discovery pass.
 #[derive(Debug)]
 pub struct DiscoveryReport {

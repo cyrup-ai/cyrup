@@ -38,6 +38,11 @@ pub enum EventPatch {
     Message(Box<Message>),
     /// `before_agent_start`: system-prompt replacement + optional injection.
     SystemPromptAndInject { system: Option<String>, inject: Option<Box<Message>> },
+    /// `input` (Pi `action:"transform"`, runner.ts:1116-1119): rewrite the submission text and
+    /// (optionally) its images. `images: None` keeps the current images (Pi `result.images ??
+    /// currentImages`); `Some(_)` replaces them. Folds across handlers — a later handler observes
+    /// the rewritten text/images (R-08-011).
+    Input { text: String, images: Option<Vec<Content>> },
 }
 
 impl HostEvent {
@@ -79,6 +84,14 @@ impl HostEvent {
                 }
                 if let Some(m) = inject {
                     injected.push(*m);
+                }
+            }
+            // `input` (Pi runner.ts:1116-1119): always rewrite the text; replace images only when
+            // the handler supplied them (`Some`), else keep the folded-so-far images.
+            (HostEvent::Input { text, images }, EventPatch::Input { text: t, images: i }) => {
+                *text = t;
+                if let Some(i) = i {
+                    *images = i;
                 }
             }
             // Shape mismatch: ignore (degrade gracefully).

@@ -75,17 +75,32 @@ impl SessionManager {
     /// Open an existing session by path, migrating to the current version on load (R-04-004).
     /// An empty/zero-length file initializes a fresh session at that path (Pi parity).
     pub fn open(path: &Path) -> Result<Self, SessionError> {
+        Self::open_with_cwd(path, None)
+    }
+
+    /// Open an existing session by path, optionally overriding the manager's working directory
+    /// (Pi `SessionManager.open(path, sessionDir?, cwdOverride?)`, session-manager.ts:1410): the
+    /// effective cwd is `cwd_override ?? header.cwd` (Pi `cwdOverride ?? header?.cwd ?? process.cwd()`).
+    /// The override rebinds only the manager's own cwd (what [`Self::cwd`] reports, used for cwd
+    /// assertions and rebound services); the on-disk header retains its original cwd, exactly as Pi
+    /// leaves `fileEntries`' header untouched (the override lives on the `this.cwd` field only).
+    pub fn open_with_cwd(path: &Path, cwd_override: Option<&Path>) -> Result<Self, SessionError> {
         let meta = std::fs::metadata(path);
         if matches!(&meta, Ok(m) if m.len() == 0) {
-            // Empty file → fresh session anchored here.
+            // Empty file → fresh session anchored here. The override (when given) seeds both the
+            // header and the manager cwd, since there is no persisted header to preserve.
             let id = gen_session_id();
-            let header = SessionHeader::new(id, String::new(), now_ts());
+            let cwd = cwd_override.map(Path::to_path_buf).unwrap_or_default();
+            let header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());
             let store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
-            return Ok(Self::assemble(header, PathBuf::new(), store, Vec::new(), false));
+            return Ok(Self::assemble(header, cwd, store, Vec::new(), false));
         }
         let (mut header, mut entries, recovered) = load(path)?;
         let migrated = crate::migrate::to_current(&mut header, &mut entries);
-        let cwd = PathBuf::from(&header.cwd);
+        // Pi `cwdOverride ?? header?.cwd` — the override wins; the persisted header is left intact.
+        let cwd = cwd_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(&header.cwd));
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path));
         if migrated && !recovered {
             // Rewrite once at the current version (never silently discard a recovered prefix).
@@ -661,9 +676,15 @@ impl SessionManager {
 
     // ------------------------------------------------------------- export / accessors ---------
 
-    /// Write the session as JSONL (header + entries) for export (R-04-029).
+    /// Write the session as JSONL (header + entries) for export (R-04-029). The exported header's
+    /// `cwd` is taken from the manager's own (possibly cwd-overridden) cwd, not the persisted header —
+    /// 1:1 with Pi `exportToJsonl`, which builds `cwd: this.sessionManager.getCwd()`
+    /// (agent-session.ts:3061). Normally `self.cwd == self.header.cwd`; they differ only for a session
+    /// opened via [`Self::open_with_cwd`] with an override, which then exports under the override.
     pub fn export_jsonl(&self, w: &mut dyn Write) -> Result<(), SessionError> {
-        w.write_all(serde_json::to_string(&self.header)?.as_bytes())?;
+        let mut header = self.header.clone();
+        header.cwd = self.cwd.to_string_lossy().into_owned();
+        w.write_all(serde_json::to_string(&header)?.as_bytes())?;
         w.write_all(b"\n")?;
         for e in &self.entries {
             w.write_all(e.to_line()?.as_bytes())?;

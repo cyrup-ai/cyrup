@@ -232,7 +232,9 @@ pub enum HostEvent {
     ResourcesDiscover,
     ProjectTrust,
     // 5.5 input / 5.6 provider / model (Pi types.ts:1158-1163)
-    Input { text: String },
+    // Carries the submission text AND the attached images (Pi `InputEvent.text`/`.images`,
+    // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119).
+    Input { text: String, images: Vec<Content> },
     UserBash { command: String, operations: Value },
     BeforeProviderRequest { payload: Value },
     AfterProviderResponse { status: u32, headers: Value },

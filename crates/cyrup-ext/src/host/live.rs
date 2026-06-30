@@ -1001,7 +1001,7 @@ async fn invoke(
             )
             .await
         }
-        HostEvent::Input { text } => api.call_on_input(store, text).await,
+        HostEvent::Input { text, .. } => api.call_on_input(store, text).await,
         HostEvent::UserBash { command, operations } => {
             api.call_on_user_bash(store, command, &operations.to_string()).await
         }
