@@ -290,9 +290,16 @@ async fn dispatch(session: &AgentSession, line: &str, in_flight: &mut bool) -> R
         SessionCommand::Compact { id, custom_instructions } => {
             let id = id.map(Value::String);
             match session.compact(custom_instructions).await {
-                Ok(compacted) => {
-                    RpcResponse::ok("compact", id, Some(json!({ "compacted": compacted })))
-                }
+                // The facade now returns the full `CompactionResult`; the RPC payload reports both
+                // the boolean and (when produced) the result detail (Pi `compaction_end.result`).
+                Ok(result) => RpcResponse::ok(
+                    "compact",
+                    id,
+                    Some(json!({
+                        "compacted": result.is_some(),
+                        "result": result,
+                    })),
+                ),
                 Err(e) => RpcResponse::err("compact", id, e.to_string()),
             }
         }

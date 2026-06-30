@@ -222,7 +222,9 @@ impl Session {
     /// # Ok(()) }
     /// ```
     pub async fn compact(&self, custom_instructions: Option<String>) -> SdkResult<bool> {
-        Ok(self.inner.compact(custom_instructions).await?)
+        // The facade returns the full `CompactionResult` (Pi 1:1); the SDK surface keeps its
+        // "was a compaction produced?" boolean — `Some` ⇒ produced.
+        Ok(self.inner.compact(custom_instructions).await?.is_some())
     }
 
     // --------------------------------------------------------------- fork / branch ----
