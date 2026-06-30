@@ -1136,6 +1136,7 @@ dependencies = [
 name = "cyrup-tui"
 version = "0.0.0"
 dependencies = [
+ "cyrup-agent",
  "cyrup-core",
  "cyrup-provider",
  "cyrup-resources",
