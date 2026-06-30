@@ -14,6 +14,13 @@ use cyrup_session::prompt::ContextStore;
 /// Everything bound to a single cwd / session (arch-11 §3.3).
 pub struct AgentSessionServices {
     pub cwd: PathBuf,
+    /// The agent config dir (`~/.cyrup`), the root of the trust store, sessions, and auth (Pi
+    /// `CONFIG_DIR`). Retained so front-ends can derive the trust-store path (`agent_dir/trust.json`,
+    /// Pi `EnvVars::trustPath`) and the sessions root for `/trust` and `/resume` without re-resolving
+    /// config (an additive L6↔L5 data seam — read-only).
+    pub agent_dir: PathBuf,
+    /// The home dir used for trust-requiring-resource detection (defaults to `agent_dir`).
+    pub home: PathBuf,
     /// Layered settings (global ◁ project ◁ cli), reflecting the resolved trust decision.
     pub settings: SettingsManager,
     /// Whether the project scope is trusted (gates project settings + post-trust resources).

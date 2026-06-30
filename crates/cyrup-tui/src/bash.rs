@@ -144,13 +144,17 @@ impl BashExecution {
         out.push(Line::styled(rule.clone(), border_style));
         out.push(Line::styled(format!("$ {}", self.command), header_style));
 
-        let available: Vec<&String> = self.output_lines.iter().collect();
-        let total = available.len();
-        let (visible, hidden): (Vec<&String>, usize) = if self.expanded || total <= PREVIEW_LINES {
-            (available.clone(), 0)
+        // Collapse to the trailing [`PREVIEW_LINES`] **visual** (wrap-aware) lines, exactly like Pi's
+        // `truncateToVisualLines` (`visual-truncate.ts`): wrapping each logical line to the indented
+        // body width so a single long line that wraps counts as multiple preview lines (`hidden` is
+        // the number of hidden VISUAL lines). Expanded shows everything.
+        let body_width = width.saturating_sub(2).max(1);
+        let (visible, hidden): (Vec<String>, usize) = if self.expanded {
+            (self.output_lines.clone(), 0)
         } else {
-            let start = total - PREVIEW_LINES;
-            (available.get(start..).map(<[&String]>::to_vec).unwrap_or_default(), start)
+            let joined = self.output_lines.join("\n");
+            let vt = crate::chrome::truncate_to_visual_lines(&joined, PREVIEW_LINES, body_width);
+            (vt.lines, vt.skipped)
         };
         for line in &visible {
             out.push(Line::styled(format!("  {line}"), theme.muted_style()));

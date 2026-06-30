@@ -590,3 +590,57 @@ async fn runtime_fork_at_entry_and_fork_anchors() {
     assert!(!fork.cancelled);
     assert_eq!(runtime.generation().await, 1, "fork replaces the session");
 }
+
+// ----------------------------------------------------------------------------------------------
+// L6↔L5 additive data seams the TUI `/trust`, `/settings`, and `/resume` selectors source from
+// (round 7): trust options + write, settings persist, session list.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trust_settings_and_session_list_seams() {
+    use cyrup_session_svc::{SettingsScope, TrustDecision};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+
+    // ---- /trust: options + write + saved-decision readback ----
+    let options = session.project_trust_options();
+    assert!(options.iter().any(|o| o.label == "Trust" && o.trusted));
+    assert!(options.iter().any(|o| o.label == "Do not trust" && !o.trusted));
+    assert_eq!(session.saved_trust_decision(), None, "no decision persisted yet");
+
+    // Persist the "Trust" option's store updates → writes agent_dir/trust.json.
+    let trust_opt = options.iter().find(|o| o.label == "Trust").expect("trust option");
+    session.write_project_trust(&trust_opt.updates).expect("write trust");
+    assert!(session.trust_store_path().exists(), "trust.json written");
+    let saved = session.saved_trust_decision().expect("decision now persisted");
+    assert!(saved.decision.is_trusted(), "persisted decision is trusted");
+
+    // Round-trip an explicit untrusted decision.
+    session
+        .write_project_trust(&[(fx.cwd.clone(), Some(TrustDecision::Untrusted))])
+        .expect("write untrusted");
+    assert!(!session.saved_trust_decision().expect("decision").decision.is_trusted());
+
+    // ---- /settings: persist via the `&self` write seam (the default builder store is in-memory,
+    // so this verifies the seam round-trips without error, including the project trust gate). ----
+    session
+        .persist_setting(SettingsScope::Global, "terminal.showImages", serde_json::json!(false))
+        .expect("persist global setting");
+    session
+        .persist_setting(SettingsScope::Project, "quietStartup", serde_json::json!(true))
+        .expect("persist project setting (trusted)");
+
+    // ---- /resume: the session list includes this session (after a turn flushes it to disk) ----
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let _stream = session.prompt("hello world").await.expect("prompt");
+    session.wait_for_idle().await;
+    let sessions = session.list_sessions();
+    assert!(
+        sessions.iter().any(|s| s.id.to_string() == session.session_id().to_string()),
+        "current session appears in the resume list ({} found)",
+        sessions.len()
+    );
+}

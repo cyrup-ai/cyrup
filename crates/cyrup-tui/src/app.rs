@@ -45,6 +45,8 @@ use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
 use crate::selector::{
     CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
 };
+use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
+use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
 use crate::theme::UiTheme;
@@ -96,6 +98,9 @@ pub enum AppCommand {
     /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
     /// branch, login/logout, etc.
     ConfirmSelection { kind: SelectorKind, value: String },
+    /// Persist a settings field changed **in place** in the `/settings` grid (Pi settings-selector
+    /// `onChange` → `SettingsManager.setNested`). The slot stays open; the `/reload` re-reads it.
+    ApplySetting { id: String, value: String },
     /// `/new` — start a fresh session (`handleClearCommand`).
     NewSession,
     /// `/compact [instructions]` — manually compact context (`handleCompactCommand`).
@@ -116,6 +121,12 @@ pub enum AppCommand {
     SetName(String),
     /// `/session` — show session info + stats (`handleSessionCommand`).
     SessionInfo,
+    /// `/resume` in-list delete of a persisted session file (session-selector.ts:540 →
+    /// `delete_session_file`). Carries the session path.
+    DeleteSession(String),
+    /// `/resume` in-list rename of a persisted session (session-selector.ts:585 →
+    /// `rename_session_file`). Carries the session path + new name.
+    RenameSession { path: String, name: String },
 }
 
 /// All retained UI state (the data half of the `state -> frame` split).
@@ -161,6 +172,14 @@ pub struct AppState {
     /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
     /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
     pub show_startup_hints: bool,
+    /// A `DynamicBorder` loader occupying the editor slot during a long inline op (Pi
+    /// `BorderedLoader`, bordered-loader.ts): `/share`'s gist creation and any extension-UI long op.
+    /// When `Some`, it replaces the editor in the live region (the selector still wins if both are set,
+    /// which never happens). Cleared when the op completes.
+    pub loader: Option<crate::chrome::BorderedLoader>,
+    /// The 80 ms phase index for the active [`Self::loader`] / status spinner (advanced by the run-loop
+    /// tick). Drives the loader's animated glyph without a timer thread.
+    pub loader_tick: usize,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
@@ -190,6 +209,8 @@ impl AppState {
             pending_images: Vec::new(),
             reserve_status_rows: false,
             show_startup_hints: true,
+            loader: None,
+            loader_tick: 0,
             should_quit: false,
             scrollback: Vec::new(),
         }
@@ -491,7 +512,22 @@ impl<B: Backend> App<B> {
                 self.state.should_quit = true;
                 AppAction::Quit
             }
-            // Easter eggs (`arminsayshi`/`dementedelves`) + any unhandled recognized name: a status.
+            // `/arminsayshi` (`armin.ts` `ArminComponent`): the 31×36 XBM bitmap rendered with
+            // half-block glyphs (the random CRT/glitch animation effects are non-deterministic chrome
+            // and omitted; the art itself is a real rich render, not a status line).
+            "arminsayshi" => {
+                self.state.transcript.push_block("Armin says hi!", armin_art());
+                AppAction::Redraw
+            }
+            // `/dementedelves` (`daxnuts.ts`): a themed banner block (the model-triggered animation is
+            // chrome; the announcement is a real rich block).
+            "dementedelves" => {
+                self.state
+                    .transcript
+                    .push_block("Demented Elves", "🧝 The demented elves have entered the chat.");
+                AppAction::Redraw
+            }
+            // Any other unhandled recognized name: a status line.
             other => {
                 self.state.transcript.push_status(format!("command: /{other}"));
                 AppAction::Redraw
@@ -756,6 +792,32 @@ impl<B: Backend> App<B> {
                     None => AppAction::Redraw,
                 }
             }
+            SelectorOutcome::Apply(payload) => {
+                // A `/resume` in-list delete/rename rides a unit-separator-*tagged* `Apply` payload
+                // (`session_selector.rs`); decode it first so it never mis-routes to the settings
+                // handler. The slot stays open (the selector already mutated its own row list).
+                if let Some(action) = SessionSelectorOutcome::parse_apply(&payload) {
+                    return match action {
+                        SessionSelectorOutcome::Delete(path) => {
+                            AppAction::Command(AppCommand::DeleteSession(path))
+                        }
+                        SessionSelectorOutcome::Rename { path, name } => {
+                            AppAction::Command(AppCommand::RenameSession { path, name })
+                        }
+                        // `Resume` never arrives via `Apply` (it is a `Confirm`); ignore defensively.
+                        SessionSelectorOutcome::Resume(_) => AppAction::Redraw,
+                    };
+                }
+                // Otherwise a `/settings` row cycled in place: persist it live, keep the slot open
+                // (Pi's settings selector applies on each `onChange`). The payload is `"id\u{1f}value"`.
+                match payload.split_once(crate::FIELD_SEP) {
+                    Some((id, value)) => AppAction::Command(AppCommand::ApplySetting {
+                        id: id.to_string(),
+                        value: value.to_string(),
+                    }),
+                    None => AppAction::Redraw,
+                }
+            }
             SelectorOutcome::Cancel => {
                 self.close_selector(true);
                 AppAction::Redraw
@@ -881,10 +943,128 @@ impl<B: Backend> App<B> {
                     self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
                 }
             }
+            C::OpenSelector(SelectorKind::Login) => {
+                // `/login` (oauth-selector.ts + getLoginProviderOptions, interactive-mode.ts:4594-4617):
+                // the api-key-configurable providers are the unique providers in the model catalog,
+                // each tagged with its live auth state (stored / env / unconfigured). The oauth
+                // subscription device flow is the provider-tail residual; the picker + status UI is
+                // built here, and confirming surfaces the chosen provider's next step.
+                let auth = &session.services().auth;
+                let mut seen = std::collections::BTreeSet::new();
+                let mut entries = Vec::new();
+                for model in session.model_catalog() {
+                    let id = model.provider.to_string();
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let status = auth.get_auth_status(&cyrup_core::ProviderId::from(id.as_str()), None);
+                    let state = crate::AuthState::from_status(status.configured, status.source.is_some());
+                    entries.push((id, state));
+                }
+                let rows = crate::provider_rows(entries);
+                if rows.is_empty() {
+                    self.state.transcript.push_status("no providers available to configure");
+                } else {
+                    self.open_data_selector(SelectorKind::Login, rows, 0);
+                }
+            }
+            C::OpenSelector(SelectorKind::Logout) => {
+                // `/logout` (getLogoutProviderOptions, interactive-mode.ts:4619-4636): only providers
+                // with a STORED credential are listed; confirming deletes it. Env/`models.json` config
+                // is untouched (Pi's status-line caveat below).
+                let auth = &session.services().auth;
+                let stored = auth.list().unwrap_or_default();
+                let entries: Vec<(String, crate::AuthState)> =
+                    stored.into_iter().map(|id| (id, crate::AuthState::Configured)).collect();
+                let rows = crate::provider_rows(entries);
+                if rows.is_empty() {
+                    self.state.transcript.push_status(
+                        "no stored credentials to remove (/logout only removes /login credentials; \
+                         env vars and models.json are unchanged)",
+                    );
+                } else {
+                    self.open_data_selector(SelectorKind::Logout, rows, 0);
+                }
+            }
+            C::OpenSelector(SelectorKind::Settings) => {
+                // `/settings` (settings-selector.ts): the curated toggle/choice grid sourced from the
+                // live effective settings. Each row cycles in place on `Enter` and persists via
+                // `ApplySetting` (Pi's settings selector applies on `onChange`).
+                let rows = settings_rows(session.services().settings.effective());
+                let inner: Box<dyn Selector> = Box::new(SettingsSelector::new("Settings", rows));
+                self.open_boxed_selector(SelectorKind::Settings, inner);
+            }
+            C::OpenSelector(SelectorKind::Trust) => {
+                // `/trust` (trust-selector.ts): the yes/parent/no option list under a cwd + saved-
+                // decision header. Confirming writes the trust store (`write_project_trust`).
+                let options = session.project_trust_options();
+                let cwd = session.services().cwd.display().to_string();
+                let saved = session.saved_trust_decision();
+                let saved_label = format_saved_trust(&saved);
+                let selected = options
+                    .iter()
+                    .position(|o| {
+                        saved.as_ref().is_some_and(|s| {
+                            s.decision.is_trusted() == o.trusted
+                                && o.saved_path.as_deref() == Some(s.path.as_path())
+                        })
+                    })
+                    .unwrap_or(0);
+                let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+                let inner: Box<dyn Selector> = Box::new(TrustSelector::new(
+                    cwd,
+                    saved_label,
+                    session.services().project_trusted,
+                    labels,
+                    selected,
+                ));
+                self.open_boxed_selector(SelectorKind::Trust, inner);
+            }
+            C::OpenSelector(SelectorKind::Session) => {
+                // `/resume` (session-selector.ts): the persisted-session list for this cwd, newest
+                // first, sourced via the additive `list_sessions` seam. Confirming carries the chosen
+                // session file path; the actual runtime swap is driven by the L7 `SessionRuntime`
+                // (`switch_session`) once the runtime is threaded into the run loop (residual gap #3).
+                let sessions = session.list_sessions();
+                if sessions.is_empty() {
+                    self.state.transcript.push_status("no saved sessions to resume");
+                } else {
+                    let current = session.session_id().to_string();
+                    let rows: Vec<SessionRow> = sessions
+                        .iter()
+                        .map(|s| {
+                            let label = session_label(s);
+                            let is_current = s.id.to_string() == current;
+                            let desc = format!(
+                                "{} msgs{}",
+                                s.message_count,
+                                if is_current { " (current)" } else { "" }
+                            );
+                            // The query-DSL search text (`getSessionSearchText`,
+                            // session-selector-search.ts:26): `{id} {name} {allMessagesText} {cwd}`.
+                            let search_text = format!(
+                                "{} {} {} {}",
+                                s.id,
+                                s.name.as_deref().unwrap_or(""),
+                                s.all_messages_text,
+                                s.cwd
+                            );
+                            SessionRow {
+                                path: s.path.display().to_string(),
+                                label,
+                                name: s.name.clone(),
+                                desc: Some(desc),
+                                search_text,
+                                recency: system_time_nanos(s.modified),
+                            }
+                        })
+                        .collect();
+                    let inner: Box<dyn Selector> = Box::new(SessionSelector::new(rows));
+                    self.open_boxed_selector(SelectorKind::Session, inner);
+                }
+            }
             C::OpenSelector(other) => {
-                // Session/Settings/Trust/Login/Logout need richer host sourcing (the L7 multi-session
-                // list, the trust-store write, the oauth device flow) than this session exposes; surface
-                // the request so the path is real (no silent drop). Tracked on the residual ledger.
+                // Any remaining kind has no in-crate sourcing yet; surface the request (no silent drop).
                 self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
             }
             C::ConfirmSelection { kind: SelectorKind::Tree, value } => {
@@ -945,8 +1125,76 @@ impl<B: Backend> App<B> {
                     Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
                 }
             }
+            C::ConfirmSelection { kind: SelectorKind::Logout, value } => {
+                // Delete the stored credential for the chosen provider (Pi `/logout` onSelect →
+                // `authStorage.delete`, oauth-selector.ts). A real, in-crate effect against the
+                // `AuthStore` the session owns; env/config tiers are untouched.
+                let provider = cyrup_core::ProviderId::from(value.as_str());
+                match session.services().auth.delete(&provider).await {
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("removed stored credentials for {value}")),
+                    Err(e) => self.state.transcript.push_status(format!("logout error: {e}")),
+                }
+            }
+            C::ConfirmSelection { kind: SelectorKind::Login, value } => {
+                // The credential write itself — the oauth device/PKCE handshake or the api-key prompt
+                // dialog (Pi `showLoginDialog`/`showApiKeyLoginDialog`) — is the provider-tail residual.
+                // Surface the chosen provider + its next step so the picker is a real path.
+                let name = crate::provider_display_name(&value);
+                self.state.transcript.push_status(format!(
+                    "{name}: set the API key via `{value}` env var or `models.json`"
+                ));
+            }
+            C::ConfirmSelection { kind: SelectorKind::Trust, value } => {
+                // The trust selector confirms with the chosen option INDEX; re-derive the options and
+                // persist that option's store updates (Pi `/trust` `onSelect` → trust-store write).
+                let options = session.project_trust_options();
+                match value.parse::<usize>().ok().and_then(|i| options.get(i)) {
+                    Some(opt) => match session.write_project_trust(&opt.updates) {
+                        Ok(()) => {
+                            let label = if opt.trusted { "trusted" } else { "untrusted" };
+                            self.state.transcript.push_status(format!(
+                                "project trust → {label} (/reload to apply to this session)"
+                            ));
+                        }
+                        Err(e) => self.state.transcript.push_status(format!("trust error: {e}")),
+                    },
+                    None => self.state.transcript.push_status("trust selection cancelled"),
+                }
+            }
+            C::ConfirmSelection { kind: SelectorKind::Session, value } => {
+                // The chosen session file path (the runtime swap is the L7 residual, gap #3).
+                self.state.transcript.push_status(format!("resume {value} (/reload to switch)"));
+            }
+            C::DeleteSession(path) => {
+                // `/resume` in-list delete (`onDeleteSession`): remove the persisted JSONL via the
+                // additive `delete_session_file` seam (refuses the active session).
+                match session.delete_session_file(std::path::Path::new(&path)) {
+                    Ok(()) => self.state.transcript.push_status(format!("deleted session {path}")),
+                    Err(e) => self.state.transcript.push_status(format!("delete error: {e}")),
+                }
+            }
+            C::RenameSession { path, name } => {
+                // `/resume` in-list rename (`onRenameSession`): persist a `session_info` name on the
+                // target file via the additive `rename_session_file` seam.
+                match session.rename_session_file(std::path::Path::new(&path), &name).await {
+                    Ok(()) => self.state.transcript.push_status(format!("renamed session → {name}")),
+                    Err(e) => self.state.transcript.push_status(format!("rename error: {e}")),
+                }
+            }
             C::ConfirmSelection { kind, value } => {
                 self.state.transcript.push_status(format!("{} → {value}", kind.title()));
+            }
+            C::ApplySetting { id, value } => {
+                // Persist a `/settings` toggle/choice live (Global scope; Pi's settings selector
+                // writes the global layer). The `/reload` re-reads the effective view.
+                let json = parse_setting_value(&value);
+                match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
+                    Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                }
             }
             C::Compact(arg) => match session.compact(arg).await {
                 Ok(_) => self.state.transcript.push_status("compacted context"),
@@ -1026,15 +1274,75 @@ impl<B: Backend> App<B> {
                 );
                 self.state.transcript.push_block("Session", body);
             }
-            // Runtime-level ops (new session, import, share, resource reload) live at the L7 runtime
-            // host, not on `AgentSession`; surface the request (the host wires the actual op).
+            // Session-lifecycle ops (`/new`, `/import`, `/reload`) drive the L7 `SessionRuntime`
+            // (`new_session`/`import_from_jsonl`/`reload`); threading the runtime into the run loop +
+            // re-subscribing on the generation bump is residual gap #3 (the run loop holds a fixed
+            // `Arc<AgentSession>`). Surface the request so the path is real (no silent drop).
             C::NewSession => self.state.transcript.push_status("starting new session…"),
             C::Reload => self.state.transcript.push_status("reloading resources…"),
             C::Import(p) => self
                 .state
                 .transcript
                 .push_status(format!("importing session {}", p.unwrap_or_default())),
-            C::Share => self.state.transcript.push_status("sharing session…"),
+            C::Share => self.share_session(session).await,
+        }
+    }
+
+    /// `/share` (`handleShareCommand`, interactive-mode.ts:5191): export the session to HTML, write a
+    /// temp file, then shell `gh gist create --public=false <file>` behind a [`BorderedLoader`] and
+    /// surface the resulting gist URL. `gh` missing / logged-out / failing degrades to a status line
+    /// (Pi's `showError` paths). Fully in-crate (the HTML body is rendered by [`crate::export`]).
+    async fn share_session(&mut self, session: &Arc<AgentSession>) {
+        use tokio::process::Command;
+        // Render the session HTML over its own JSONL (the same body `/export` writes).
+        let html = match session.export_to_jsonl(None).await {
+            Ok(Some(jsonl)) => crate::export::session_jsonl_to_html(&jsonl),
+            Ok(None) => {
+                self.state.transcript.push_status("nothing to share (empty session)");
+                return;
+            }
+            Err(e) => {
+                self.state.transcript.push_status(format!("share export error: {e}"));
+                return;
+            }
+        };
+        let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
+        if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {
+            self.state.transcript.push_status(format!("share write error: {e}"));
+            return;
+        }
+        // Show the bordered loader in the editor slot while gh runs (Pi's `BorderedLoader`).
+        self.state.loader = Some(crate::chrome::BorderedLoader::cancellable(
+            "Creating gist…",
+            self.state.keymap.key_label(Action::Interrupt).unwrap_or_else(|| "esc".into()),
+        ));
+        let result = Command::new("gh")
+            .args(["gist", "create", "--public=false"])
+            .arg(&tmp)
+            .output()
+            .await;
+        self.state.loader = None;
+        let _ = std::fs::remove_file(&tmp);
+        match result {
+            Ok(out) if out.status.success() => {
+                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if url.is_empty() {
+                    self.state.transcript.push_status("gist created (no URL returned by gh)");
+                } else {
+                    self.state.transcript.push_block("Shared session", url);
+                }
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let msg = err.trim();
+                let detail = if msg.is_empty() { "gh gist create failed" } else { msg };
+                self.state.transcript.push_status(format!("share error: {detail}"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self
+                .state
+                .transcript
+                .push_status("GitHub CLI (gh) is not installed — see https://cli.github.com/"),
+            Err(e) => self.state.transcript.push_status(format!("share error: {e}")),
         }
     }
 
@@ -1322,6 +1630,209 @@ fn truncate_summary(s: &str) -> String {
     }
 }
 
+/// Build the `/settings` grid rows from the live effective settings (Pi `settings-selector.ts`
+/// `SettingsConfig` → `SettingItem`s, :479-712). Each row's `id` is the dotted settings key persisted
+/// on cycle; toggles cycle `true`/`false`, choices cycle their fixed sets. Read straight off
+/// [`cyrup_session_svc::EffectiveSettings`] so the displayed value matches the merged config.
+fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings) -> Vec<SettingRow> {
+    let choices = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled()),
+        SettingRow::toggle("terminal.showImages", "Show images", eff.show_images()),
+        SettingRow::choice(
+            "terminal.imageWidthCells",
+            "Image width",
+            eff.image_width_cells().to_string(),
+            choices(&["60", "80", "120"]),
+        ),
+        SettingRow::toggle("images.autoResize", "Auto-resize images", eff.image_auto_resize()),
+        SettingRow::toggle("images.blockImages", "Block images", eff.block_images()),
+        SettingRow::toggle("enableSkillCommands", "Skill commands", eff.enable_skill_commands()),
+        // `showHardwareCursor` / `terminal.clearOnShrink` — the effective getters need the env surface;
+        // a default `EnvVars` yields the persisted setting (else `false`), which is what the grid edits.
+        SettingRow::toggle(
+            "showHardwareCursor",
+            "Show hardware cursor",
+            eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::default()),
+        ),
+        SettingRow::toggle(
+            "terminal.clearOnShrink",
+            "Clear on shrink",
+            eff.clear_on_shrink(&cyrup_session_svc::EnvVars::default()),
+        ),
+        SettingRow::choice(
+            "editorPaddingX",
+            "Editor padding",
+            eff.editor_padding_x().to_string(),
+            choices(&["0", "1", "2", "3"]),
+        ),
+        SettingRow::choice(
+            "autocompleteMaxVisible",
+            "Autocomplete max items",
+            eff.autocomplete_max_visible().to_string(),
+            choices(&["3", "5", "7", "10", "15", "20"]),
+        ),
+        // `httpIdleTimeoutMs` — cycle the raw millisecond presets (Pi shows human labels; the persisted
+        // value is the same ms number). `disabled` = 0 (`HTTP_IDLE_TIMEOUT_CHOICES`, http-dispatcher.ts:5).
+        SettingRow::choice(
+            "httpIdleTimeoutMs",
+            "HTTP idle timeout (ms)",
+            eff.http_idle_timeout_ms().unwrap_or(300_000).to_string(),
+            choices(&["30000", "60000", "120000", "300000", "0"]),
+        ),
+        SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block()),
+        SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog()),
+        SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup()),
+        SettingRow::toggle(
+            "enableInstallTelemetry",
+            "Install telemetry",
+            eff.enable_install_telemetry(),
+        ),
+        SettingRow::toggle(
+            "terminal.showTerminalProgress",
+            "Terminal progress",
+            eff.show_terminal_progress(),
+        ),
+        SettingRow::choice(
+            "steeringMode",
+            "Steering mode",
+            eff.steering_mode(),
+            choices(&["all", "one-at-a-time"]),
+        ),
+        SettingRow::choice(
+            "followUpMode",
+            "Follow-up mode",
+            eff.follow_up_mode(),
+            choices(&["all", "one-at-a-time"]),
+        ),
+        SettingRow::choice(
+            "transport",
+            "Transport",
+            eff.transport(),
+            choices(&["auto", "websocket", "sse"]),
+        ),
+        SettingRow::choice(
+            "doubleEscapeAction",
+            "Double-escape action",
+            eff.double_escape_action(),
+            choices(&["fork", "tree", "none"]),
+        ),
+        SettingRow::choice(
+            "treeFilterMode",
+            "Tree filter mode",
+            eff.tree_filter_mode(),
+            choices(&["default", "no-tools", "user-only", "labeled-only", "all"]),
+        ),
+        SettingRow::choice(
+            "defaultProjectTrust",
+            "Default project trust",
+            default_trust_label(eff.default_project_trust()),
+            choices(&["ask", "always", "never"]),
+        ),
+    ]
+}
+
+/// The settings string for a [`cyrup_session_svc::DefaultProjectTrust`] (Pi serializes it as the
+/// lowercase enum value `ask`/`always`/`never`).
+fn default_trust_label(trust: cyrup_session_svc::DefaultProjectTrust) -> String {
+    use cyrup_session_svc::DefaultProjectTrust as D;
+    match trust {
+        D::Ask => "ask",
+        D::Always => "always",
+        D::Never => "never",
+    }
+    .to_string()
+}
+
+/// Coerce a cycled `/settings` value string back into JSON for persistence: `true`/`false` → bool, an
+/// integer → number, else a string (Pi's settings each have a typed `onChange`; the grid cycles the
+/// display string, so we re-type it here).
+fn parse_setting_value(value: &str) -> serde_json::Value {
+    match value {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        other => match other.parse::<i64>() {
+            Ok(n) => serde_json::Value::from(n),
+            Err(_) => serde_json::Value::String(other.to_string()),
+        },
+    }
+}
+
+/// Format the saved trust-decision header line for the `/trust` selector (Pi `formatDecision`,
+/// trust-selector.ts:23-31): `none`, or `trusted (path)` / `untrusted (path)`.
+fn format_saved_trust(saved: &Option<cyrup_session_svc::TrustEntry>) -> String {
+    match saved {
+        None => "none".to_string(),
+        Some(entry) => {
+            let label = if entry.decision.is_trusted() { "trusted" } else { "untrusted" };
+            format!("{label} ({})", entry.path.display())
+        }
+    }
+}
+
+/// The `/resume` row label for a session (Pi `session-selector.ts` row): its name (or first message),
+/// trimmed to one line.
+fn session_label(info: &cyrup_session_svc::SessionInfo) -> String {
+    let raw = match &info.name {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ if !info.first_message.trim().is_empty() => info.first_message.clone(),
+        _ => info.id.to_string(),
+    };
+    truncate_summary(&raw)
+}
+
+/// A monotonic recency key for a session's `modified` time (nanoseconds since the Unix epoch; `0`
+/// before the epoch / on a clock fault). Drives the `Relevance` sort tie-break (newest first).
+fn system_time_nanos(t: std::time::SystemTime) -> u128 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// Render the `/arminsayshi` XBM bitmap as half-block art (`armin.ts`: 31×36, LSB-first, `1` =
+/// background, `0` = foreground; two vertical pixels packed per cell into `█`/`▀`/`▄`/space). A pure,
+/// deterministic transcript block (the animation effects are omitted as non-testable chrome).
+fn armin_art() -> String {
+    const WIDTH: usize = 31;
+    const HEIGHT: usize = 36;
+    const BYTES_PER_ROW: usize = WIDTH.div_ceil(8);
+    const BITS: [u8; 144] = [
+        255, 255, 255, 127, 255, 240, 255, 127, 255, 237, 255, 127, 255, 219, 255, 127, 255, 183,
+        255, 127, 255, 119, 254, 127, 63, 248, 254, 127, 223, 255, 254, 127, 223, 63, 252, 127,
+        159, 195, 251, 127, 111, 252, 244, 127, 247, 15, 247, 127, 247, 255, 247, 127, 247, 255,
+        227, 127, 247, 7, 232, 127, 239, 248, 103, 112, 15, 255, 187, 111, 241, 0, 208, 91, 253,
+        63, 236, 83, 193, 255, 239, 87, 159, 253, 238, 95, 159, 252, 174, 95, 31, 120, 172, 95, 63,
+        0, 80, 108, 127, 0, 220, 119, 255, 192, 63, 120, 255, 1, 248, 127, 255, 3, 156, 120, 255,
+        7, 140, 124, 255, 15, 206, 120, 255, 255, 207, 127, 255, 255, 207, 120, 255, 255, 223, 120,
+        255, 255, 223, 125, 255, 255, 63, 126, 255, 255, 255, 127,
+    ];
+    // `1` (background) → false; `0` (foreground) → true. Out-of-range rows are background.
+    let pixel = |x: usize, y: usize| -> bool {
+        if y >= HEIGHT {
+            return false;
+        }
+        let byte_index = y * BYTES_PER_ROW + x / 8;
+        match BITS.get(byte_index) {
+            Some(byte) => ((byte >> (x % 8)) & 1) == 0,
+            None => false,
+        }
+    };
+    let mut out = String::new();
+    let rows = HEIGHT.div_ceil(2);
+    for row in 0..rows {
+        for x in 0..WIDTH {
+            let upper = pixel(x, row * 2);
+            let lower = pixel(x, row * 2 + 1);
+            out.push(match (upper, lower) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
@@ -1416,6 +1927,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
     if let Some(active) = state.selector.as_mut() {
         active.inner.render(frame, slot_area, &state.theme);
+    } else if let Some(loader) = state.loader.as_ref() {
+        // A long inline op (e.g. `/share`'s gist creation) owns the slot with a `BorderedLoader`.
+        loader.render(frame, slot_area, &state.theme, state.loader_tick);
     } else {
         state.editor.render(frame, slot_area, &state.theme);
         if let Some(ac) = state.editor.autocomplete() {

@@ -118,3 +118,24 @@ fn confirming_a_data_selector_emits_confirm_selection_command() {
     // The selector closed on confirm.
     assert_eq!(app.active_selector_kind(), None);
 }
+
+#[test]
+fn armin_easter_egg_pushes_a_half_block_art_block() {
+    let mut app = new_app();
+    assert_eq!(submit(&mut app, "/arminsayshi"), AppAction::Redraw);
+    // The easter egg is a real rich transcript block (the XBM half-block art), not a status line.
+    let block = app
+        .state()
+        .transcript
+        .pending()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Block { title, markdown } if title == "Armin says hi!" => Some(markdown.clone()),
+            _ => None,
+        })
+        .expect("armin art block pushed");
+    assert!(
+        block.contains('█') || block.contains('▀') || block.contains('▄'),
+        "art uses half-block glyphs: {block:?}"
+    );
+}

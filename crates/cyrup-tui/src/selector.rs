@@ -94,6 +94,10 @@ pub enum SelectorOutcome {
     Preview(String),
     /// The highlighted row was confirmed (`tui.select.confirm`); carries its value.
     Confirm(String),
+    /// A setting was changed **in place** without closing the slot (Pi's settings/config selectors
+    /// apply each cycle live via `onChange` and stay open — settings-list.ts `cycleValue`). Carries an
+    /// `"id\u{1f}value"` payload the chrome persists; the selector remains open and redraws.
+    Apply(String),
     /// The selector was dismissed (`tui.select.cancel` — `Esc`/`Ctrl+C`).
     Cancel,
 }

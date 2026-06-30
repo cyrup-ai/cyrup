@@ -1533,6 +1533,117 @@ impl AgentSession {
         &self.services
     }
 
+    /// The `trust.json` store path for this session (`agent_dir/trust.json`, Pi
+    /// `EnvVars::trustPath`). The additive data seam the `/trust` selector writes through.
+    pub fn trust_store_path(&self) -> std::path::PathBuf {
+        self.services.agent_dir.join("trust.json")
+    }
+
+    /// The standard project-trust options for this session's cwd (Pi `getProjectTrustOptions`,
+    /// trust-manager.ts:65; `cyrup_config::trust::trust_options`). Drives the `/trust` selector rows.
+    pub fn project_trust_options(&self) -> Vec<cyrup_config::trust::TrustOption> {
+        cyrup_config::trust::trust_options(&self.services.cwd, false)
+    }
+
+    /// The nearest saved trust decision for this session's cwd (Pi `findNearestTrustEntry`); `None`
+    /// when no ancestor has a persisted decision. Read-only; surfaced in the `/trust` selector header.
+    pub fn saved_trust_decision(&self) -> Option<cyrup_config::trust::TrustEntry> {
+        cyrup_config::trust::TrustStore::new(self.trust_store_path())
+            .nearest(&self.services.cwd)
+            .ok()
+            .flatten()
+    }
+
+    /// Persist a project-trust decision (the `updates` of a [`cyrup_config::trust::TrustOption`]) to
+    /// the `trust.json` store (Pi `/trust` `onSelect` → `setProjectTrust`, trust-manager.ts). An empty
+    /// `updates` (session-only option) writes nothing. The in-memory `services().project_trusted`
+    /// reflects the new session only after a `/reload`, matching Pi.
+    pub fn write_project_trust(
+        &self,
+        updates: &[(std::path::PathBuf, Option<cyrup_config::trust::TrustDecision>)],
+    ) -> Result<(), SessionServiceError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        cyrup_config::trust::TrustStore::new(self.trust_store_path()).set_many(updates)?;
+        Ok(())
+    }
+
+    /// Persist a settings field to the on-disk store (Pi `/settings`/`/config` selector apply →
+    /// `SettingsManager.setNested`). Writes via the manager's `&self` store seam; the in-memory
+    /// `effective()` view reflects it after a `/reload`, matching Pi's apply-then-reload flow. A
+    /// dotted `key` (`terminal.showImages`) addresses a nested field. Project writes require trust.
+    pub fn persist_setting(
+        &self,
+        scope: cyrup_config::SettingsScope,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), SessionServiceError> {
+        let path: Vec<&str> = key.split('.').filter(|s| !s.is_empty()).collect();
+        self.services.settings.persist_nested(scope, &path, value)?;
+        Ok(())
+    }
+
+    /// The sessions root directory for this session (`agent_dir/sessions`, the layout default). The
+    /// additive seam the `/resume` selector lists from.
+    pub fn sessions_root(&self) -> std::path::PathBuf {
+        self.services.agent_dir.join("sessions")
+    }
+
+    /// List the persisted sessions for this session's cwd, newest-first (Pi `SessionManager.list`,
+    /// session-manager.ts:1507 → the `/resume` selector). Reads the cwd-scoped layout dir under the
+    /// sessions root; an absent/empty dir yields an empty list (never an error).
+    pub fn list_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
+        let layout =
+            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone());
+        cyrup_session::listing::list(&layout)
+    }
+
+    /// Delete a persisted session **file** by path (Pi `/resume` in-list delete → `app.session.delete`
+    /// → `SessionManager.delete`, session-selector.ts:540). Additive seam for the TUI session selector:
+    /// removes the JSONL from disk. Refuses to delete *this* session's own file (Pi guards the active
+    /// session). An already-absent file is a no-op (idempotent), never an error.
+    pub fn delete_session_file(&self, path: &Path) -> Result<(), SessionServiceError> {
+        if let Some(active) = self.manager_path()
+            && same_file(&active, path)
+        {
+            return Err(SessionServiceError::Io(
+                "refusing to delete the active session".to_string(),
+            ));
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SessionServiceError::Io(e.to_string())),
+        }
+    }
+
+    /// Set a persisted session's display **name** by path (Pi `/resume` in-list rename →
+    /// `onRenameSession` → `SessionManager.setSessionName`, session-selector.ts:585). Additive seam:
+    /// opens the target file, appends a `session_info` entry (the same persisted record
+    /// [`Self::set_session_name`] writes for the active session), and lets the store flush. For the
+    /// *active* session this routes through the live manager so the in-memory tree stays consistent.
+    pub async fn rename_session_file(
+        &self,
+        path: &Path,
+        name: &str,
+    ) -> Result<(), SessionServiceError> {
+        if let Some(active) = self.manager_path()
+            && same_file(&active, path)
+        {
+            return self.set_session_name(name).await;
+        }
+        let mut mgr = cyrup_session::SessionManager::open(path)?;
+        mgr.append_session_info(name)?;
+        Ok(())
+    }
+
+    /// The on-disk path of this session's own JSONL, if the live manager exposes one (used to guard the
+    /// active session from a `/resume` delete/rename).
+    fn manager_path(&self) -> Option<std::path::PathBuf> {
+        self.manager.try_lock().ok().and_then(|g| g.session_file().map(Path::to_path_buf))
+    }
+
     /// The assembled *base* system prompt for this session (arch-06). Stable across the session.
     pub fn system_prompt(&self) -> &str {
         &self.services.system_prompt
@@ -2289,6 +2400,15 @@ fn strip_frontmatter(content: &str) -> &str {
 /// Current wall-clock time in milliseconds (Pi `Date.now()`); 0 on a clock fault.
 fn now_ms() -> i64 {
     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+/// `true` when two paths point at the same session file. Compares canonicalized paths when both
+/// resolve (handling `..`/symlinks), else falls back to a lexical compare.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 /// The concatenated text of a core `user` message entry, or `None` for any other entry/role.

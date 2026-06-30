@@ -197,9 +197,22 @@ impl TranscriptView {
         std::mem::take(&mut self.pending)
     }
 
-    /// Append a user message.
+    /// Append a user message. When `text` is a `<skill …>` block (a `/skill:name` expansion), it is
+    /// split into a collapsible `[skill]` invocation message plus the trailing user message, exactly
+    /// as Pi renders the `user` role (`parseSkillBlock` → `SkillInvocationMessageComponent` +
+    /// `UserMessageComponent`, interactive-mode.ts:3112-3132). Plain text falls through to a single
+    /// user entry.
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.pending.push(Entry::User(text.into()));
+        let text = text.into();
+        if let Some(block) = parse_skill_block(&text) {
+            self.pending
+                .push(Entry::SkillInvocation { name: block.name, content: block.content });
+            if let Some(user_message) = block.user_message {
+                self.pending.push(Entry::User(user_message));
+            }
+        } else {
+            self.pending.push(Entry::User(text));
+        }
         // A fresh prompt jumps the active region back to the tail (spec/tui/07 auto-scroll).
         self.scroll_offset = 0;
     }
@@ -622,4 +635,102 @@ pub fn content_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// A skill block parsed out of a submitted/replayed user message (Pi `ParsedSkillBlock`,
+/// agent-session.ts:103).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSkillBlock {
+    /// The skill name (`<skill name="…">`).
+    pub name: String,
+    /// The skill location (`location="…">`) — the on-disk path the skill expanded from.
+    pub location: String,
+    /// The skill block body (markdown between the open/close tags).
+    pub content: String,
+    /// The trailing user message after the block, if any (`\n\n{message}`).
+    pub user_message: Option<String>,
+}
+
+/// Parse a `<skill name="…" location="…">\n…\n</skill>(\n\n{userMessage})?` block out of message text
+/// (Pi `parseSkillBlock`, agent-session.ts:114, a hand-port of its anchored regex — no regex dep).
+/// Returns `None` for any text that is not exactly such a block.
+pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let (name, rest) = rest.split_once('"')?;
+    if name.is_empty() {
+        return None;
+    }
+    let rest = rest.strip_prefix(" location=\"")?;
+    let (location, rest) = rest.split_once('"')?;
+    if location.is_empty() {
+        return None;
+    }
+    let rest = rest.strip_prefix(">\n")?;
+    // Non-greedy: the body runs to the FIRST `\n</skill>` (`[\s\S]*?`).
+    let close = rest.find("\n</skill>")?;
+    let content = rest[..close].to_string();
+    let after = &rest[close + "\n</skill>".len()..];
+    let user_message = if after.is_empty() {
+        None
+    } else {
+        // Must be `\n\n{message}` to end (the regex's optional `(?:\n\n([\s\S]+))?$`).
+        let um = after.strip_prefix("\n\n")?.trim();
+        (!um.is_empty()).then(|| um.to_string())
+    };
+    Some(ParsedSkillBlock { name: name.to_string(), location: location.to_string(), content, user_message })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod skill_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_skill_block_with_trailing_user_message() {
+        let text = "<skill name=\"deploy\" location=\"/skills/deploy.md\">\nRun the deploy steps.\n</skill>\n\nplease deploy prod";
+        let block = parse_skill_block(text).expect("should parse");
+        assert_eq!(block.name, "deploy");
+        assert_eq!(block.location, "/skills/deploy.md");
+        assert_eq!(block.content, "Run the deploy steps.");
+        assert_eq!(block.user_message.as_deref(), Some("please deploy prod"));
+    }
+
+    #[test]
+    fn parses_a_skill_block_without_user_message() {
+        let text = "<skill name=\"lint\" location=\"/s/lint.md\">\nlint body\nmore\n</skill>";
+        let block = parse_skill_block(text).expect("should parse");
+        assert_eq!(block.name, "lint");
+        assert_eq!(block.content, "lint body\nmore");
+        assert_eq!(block.user_message, None);
+    }
+
+    #[test]
+    fn plain_text_is_not_a_skill_block() {
+        assert_eq!(parse_skill_block("just a normal message"), None);
+        // A single newline after `</skill>` (not `\n\n`) is not a valid trailer.
+        assert_eq!(
+            parse_skill_block("<skill name=\"x\" location=\"y\">\nz\n</skill>\noops"),
+            None
+        );
+    }
+
+    #[test]
+    fn push_user_splits_a_skill_block_into_two_entries() {
+        let mut view = TranscriptView::new();
+        view.push_user(
+            "<skill name=\"deploy\" location=\"/s/d.md\">\nbody\n</skill>\n\nrun it",
+        );
+        let entries = view.pending();
+        assert!(matches!(entries.first(), Some(Entry::SkillInvocation { name, .. }) if name == "deploy"));
+        assert!(matches!(entries.get(1), Some(Entry::User(t)) if t == "run it"));
+    }
+
+    #[test]
+    fn push_user_keeps_plain_text_as_one_entry() {
+        let mut view = TranscriptView::new();
+        view.push_user("hello world");
+        let entries = view.pending();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries.first(), Some(Entry::User(t)) if t == "hello world"));
+    }
 }

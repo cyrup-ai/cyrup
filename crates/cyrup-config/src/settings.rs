@@ -1199,6 +1199,35 @@ impl SettingsManager {
         Ok(())
     }
 
+    /// Persist a nested field to the on-disk store via scoped read-modify-write **without** updating
+    /// the in-memory merged view (an additive `&self` write seam: `set_nested` requires `&mut self`
+    /// because it reloads, but a front-end holding the manager behind an `Arc` — the TUI `/config`
+    /// selector — drives a `/reload` afterward, exactly as Pi's settings selector applies-then-reloads,
+    /// settings-manager.ts:573). The change becomes visible in `effective()` after the next
+    /// [`Self::reload`]. Project writes still require trust (R-07-004).
+    pub fn persist_nested(
+        &self,
+        scope: SettingsScope,
+        path: &[&str],
+        value: Value,
+    ) -> Result<(), ConfigError> {
+        if path.is_empty() {
+            return Ok(());
+        }
+        if scope == SettingsScope::Project && !self.project_trusted {
+            return Err(ConfigError::Untrusted);
+        }
+        let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        self.store.with_lock(scope, &mut |current| {
+            let mut doc = match current.map(Settings::parse) {
+                Some(Ok(s)) => s,
+                _ => Settings::default(),
+            };
+            set_value_at_path(&mut doc.obj, &path_owned, value.clone());
+            Some(doc.to_pretty())
+        })
+    }
+
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).
     pub fn set_editor_padding_x(&mut self, padding: f64) -> Result<(), ConfigError> {
         let clamped = (padding.floor() as i64).clamp(0, 3);

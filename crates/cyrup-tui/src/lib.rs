@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod auth_select;
 mod autocomplete;
 mod bash;
 mod chrome;
@@ -51,6 +52,9 @@ mod markdown;
 mod overlay;
 mod select_list;
 mod selector;
+mod session_search;
+mod session_selector;
+mod settings_selector;
 mod status;
 mod status_indicator;
 mod theme;
@@ -58,6 +62,7 @@ mod transcript;
 mod tree_selector;
 
 pub use app::{crossterm_input_stream, render, App, AppAction, AppCommand, AppState};
+pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
     Completion, CompletionContext,
@@ -87,11 +92,20 @@ pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE}
 pub use selector::{
     CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome, SCOPED_MODELS_ALL,
 };
+pub use session_search::{
+    filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,
+    parse_search_query, NameFilter, ParsedSearchQuery, QueryMode, SearchRow, SearchToken, SortMode,
+    TokenKind,
+};
+pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
+pub use settings_selector::{SettingRow, SettingsSelector, TrustSelector, FIELD_SEP};
 pub use status::{format_tokens, StatusLine};
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
 pub use theme::{color_of, UiTheme};
-pub use transcript::{content_text, Entry, TranscriptView};
+pub use transcript::{
+    content_text, parse_skill_block, Entry, ParsedSkillBlock, TranscriptView,
+};
 
 /// Re-export the exact crossterm ratatui uses (version-matched; ADR-0001 — never add a direct
 /// crossterm dep). Front-ends and tests build key events through this path.

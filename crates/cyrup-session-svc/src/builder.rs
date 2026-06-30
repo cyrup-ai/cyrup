@@ -582,6 +582,8 @@ impl SessionBuilder {
 
         let services = AgentSessionServices {
             cwd,
+            agent_dir: cfg.agent_dir.clone(),
+            home: cfg.home.clone(),
             settings,
             project_trusted: trusted,
             auth,
