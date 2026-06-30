@@ -39,14 +39,19 @@ pub use builder::{NoTools, SessionBuilder, SessionConfig, SessionTarget};
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
 pub use event::{
-    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, StreamingBehavior, UserInput,
+    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
+    UserInput,
 };
 pub use factory::SessionFactory;
 pub use host_services::{ControlSink, LiveHostServices};
-pub use runtime::{AgentSessionRuntime, RuntimeForkResult, SwitchResult};
+pub use runtime::{
+    AgentSessionRuntime, NewSessionOptions, RuntimeDiagnostic, RuntimeForkResult,
+    SwitchResult, SwitchSessionOptions,
+};
 pub use services::AgentSessionServices;
 pub use session::{
-    AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, ScopedModel,
+    AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, NavigateTreeOptions,
+    NavigateTreeOutcome, ScopedModel,
 };
 pub use state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
 pub use tools::ToolInfo;

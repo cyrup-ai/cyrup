@@ -33,9 +33,61 @@ pub struct RuntimeForkResult {
     pub selected_text: Option<String>,
 }
 
+/// A diagnostic collected while building the active session (Pi `AgentSessionRuntimeDiagnostic`,
+/// agent-session-services.ts:78). Surfaced to the host so it can warn the user about a degraded
+/// build (e.g. a resumed model that could not be restored). Most diagnostics originate from
+/// extension provider-registration (`#23`, outer-layer-L6) and so the list is empty until that
+/// lands; the model-restore fallback is the one source available at this tier today.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDiagnostic {
+    /// `"warning"` | `"error"` (Pi `severity`).
+    pub severity: String,
+    /// Human-readable message.
+    pub message: String,
+    /// What produced the diagnostic (`"model"`, `"provider"`, …), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Option bag for [`AgentSessionRuntime::new_session_with`] (Pi `newSession` options,
+/// runtime.ts:223). The `withSession`/`setup` host callbacks are L6-fed (see gap `#26`/`#27`); the
+/// data-carrying `parent_session` is honored here.
+#[derive(Clone, Debug, Default)]
+pub struct NewSessionOptions {
+    /// Record this file as the new session's parent (Pi `parentSession`, runtime.ts:224).
+    pub parent_session: Option<String>,
+}
+
+/// Option bag for [`AgentSessionRuntime::switch_session_with`] (Pi `switchSession` options,
+/// runtime.ts:195). The `withSession`/`projectTrustContextFactory` host callbacks are L6-fed (see
+/// gap `#27`); the data-carrying `cwd_override` is honored here.
+#[derive(Clone, Debug, Default)]
+pub struct SwitchSessionOptions {
+    /// Override the cwd the resumed session binds to (Pi `cwdOverride`, runtime.ts:196). When
+    /// `None`, the cwd is derived from the session file (the prior behavior).
+    pub cwd_override: Option<PathBuf>,
+}
+
 struct RuntimeInner {
     session: Arc<AgentSession>,
     generation: u64,
+    diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+/// Collect the build-time diagnostics for `session` (Pi `result.diagnostics`,
+/// agent-session-services.ts:176). Today the only tier-available source is the model-restore
+/// fallback; extension provider-registration diagnostics (`#23`) join here once that lands.
+fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
+    let mut out = Vec::new();
+    if let Some(msg) = session.model_fallback_message() {
+        out.push(RuntimeDiagnostic {
+            severity: "warning".to_string(),
+            message: msg.to_string(),
+            source: Some("model".to_string()),
+        });
+    }
+    out
 }
 
 /// Owns the active session + rebuilds it on every cwd/session switch (arch-11 §3.4).
@@ -53,8 +105,13 @@ impl AgentSessionRuntime {
         target: SessionTarget,
     ) -> Result<Self, SessionServiceError> {
         let session = Arc::new(factory.build(target, None).await?);
+        let diagnostics = collect_diagnostics(&session);
         let (gen_tx, _rx) = watch::channel(0);
-        Ok(Self { factory, inner: RwLock::new(RuntimeInner { session, generation: 0 }), gen_tx })
+        Ok(Self {
+            factory,
+            inner: RwLock::new(RuntimeInner { session, generation: 0, diagnostics }),
+            gen_tx,
+        })
     }
 
     /// The active session (cheap `Arc` clone). Re-read after any replacement.
@@ -65,6 +122,12 @@ impl AgentSessionRuntime {
     /// The current replacement generation (bumped on every successful switch/fork/new).
     pub async fn generation(&self) -> u64 {
         self.inner.read().await.generation
+    }
+
+    /// The build-time diagnostics for the active session (Pi `diagnostics` getter, runtime.ts:109).
+    /// Recomputed on every replacement. Empty when the session built cleanly.
+    pub async fn diagnostics(&self) -> Vec<RuntimeDiagnostic> {
+        self.inner.read().await.diagnostics.clone()
     }
 
     /// The active session's model-restore fallback warning, re-surfaced at the runtime tier (Pi
@@ -96,6 +159,18 @@ impl AgentSessionRuntime {
         reason: &str,
         previous_session_file: Option<String>,
     ) {
+        self.install_inner(next, reason, previous_session_file, None).await;
+    }
+
+    /// The replacement tail with an optional host pre-start hook run after install but before
+    /// `session_start` is emitted (Pi `beforeSessionStart`, runtime.ts:2470).
+    async fn install_inner(
+        &self,
+        next: Arc<AgentSession>,
+        reason: &str,
+        previous_session_file: Option<String>,
+        before_start: Option<Box<dyn FnOnce() + Send>>,
+    ) {
         // Tear down the outgoing session: `session_shutdown` to its streams + extensions.
         let new_gen = {
             let g = self.inner.read().await;
@@ -107,26 +182,46 @@ impl AgentSessionRuntime {
             // Invalidate prior subscriptions with a terminal `SessionReplaced` (R-11-021).
             current.notify_replaced(new_gen).await;
         }
-        // Install + bump generation.
+        // Install + bump generation; recompute the build diagnostics for the new session.
+        let diagnostics = collect_diagnostics(&next);
         {
             let mut g = self.inner.write().await;
             g.session = next.clone();
             g.generation = new_gen;
+            g.diagnostics = diagnostics;
         }
         let _ = self.gen_tx.send(new_gen);
+        // Host pre-start hook (reload only): runs after the new session is installed but before
+        // its `session_start` fans out (Pi `beforeSessionStart`, runtime.ts:2470).
+        if let Some(hook) = before_start {
+            hook();
+        }
         // Announce the new session.
         next.emit_session_start(reason, previous_session_file).await;
     }
 
     /// Start a fresh session in the same cwd (Pi `newSession`, agent-session-runtime.ts:223).
     pub async fn new_session(&self) -> Result<SwitchResult, SessionServiceError> {
+        self.new_session_with(NewSessionOptions::default()).await
+    }
+
+    /// Start a fresh session in the same cwd, honoring the [`NewSessionOptions`] bag (Pi `newSession`
+    /// options, runtime.ts:223-257). `parent_session` is recorded on the new session file.
+    pub async fn new_session_with(
+        &self,
+        options: NewSessionOptions,
+    ) -> Result<SwitchResult, SessionServiceError> {
         let current = self.session().await;
         if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id: String::new() }).await {
             return Ok(SwitchResult { cancelled: true });
         }
         let previous = current.session_file().await.map(|p| p.display().to_string());
         drop(current);
-        let next = Arc::new(self.factory.build(SessionTarget::New, None).await?);
+        let next = Arc::new(
+            self.factory
+                .build_with_parent(SessionTarget::New, None, options.parent_session)
+                .await?,
+        );
         self.install(next, "new", previous).await;
         Ok(SwitchResult { cancelled: false })
     }
@@ -138,16 +233,28 @@ impl AgentSessionRuntime {
         &self,
         path: impl Into<PathBuf>,
     ) -> Result<SwitchResult, SessionServiceError> {
+        self.switch_session_with(path, SwitchSessionOptions::default()).await
+    }
+
+    /// Resume a session file, honoring the [`SwitchSessionOptions`] bag (Pi `switchSession` options,
+    /// runtime.ts:193-220). A `cwd_override` rebinds the resumed session to a caller-supplied cwd
+    /// instead of the one derived from the file.
+    pub async fn switch_session_with(
+        &self,
+        path: impl Into<PathBuf>,
+        options: SwitchSessionOptions,
+    ) -> Result<SwitchResult, SessionServiceError> {
         let path = path.into();
         let current = self.session().await;
         let target_id = path.display().to_string();
         if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id }).await {
             return Ok(SwitchResult { cancelled: true });
         }
-        // Pre-flight: peek the resumed session's cwd and assert it still exists BEFORE teardown.
-        let cwd = {
-            let mgr = SessionManager::open(&path)?;
-            mgr.cwd().to_path_buf()
+        // Pre-flight: resolve the effective cwd (override wins, else derived from the file) and
+        // assert it still exists BEFORE teardown (Pi `assertSessionCwdExists`, runtime.ts:208).
+        let cwd = match options.cwd_override {
+            Some(c) => c,
+            None => SessionManager::open(&path)?.cwd().to_path_buf(),
         };
         if !cwd.exists() {
             return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
@@ -253,6 +360,33 @@ impl AgentSessionRuntime {
             Arc::new(self.factory.build(SessionTarget::Resume(destination), Some(cwd)).await?);
         self.install(next, "resume", previous).await;
         Ok(SwitchResult { cancelled: false })
+    }
+
+    /// Reload the active session in place (Pi `reload`, agent-session.ts:2451): re-emit
+    /// `session_shutdown{reload}`, rebuild the session via the factory — which re-loads settings,
+    /// re-discovers resources, re-derives the system prompt, and resets the provider — then re-emit
+    /// `session_start{reload}`. A persisted session is rebuilt by re-opening its file (preserving the
+    /// transcript); an in-memory session has no file to re-open and is rebuilt fresh. `before_start`
+    /// runs after the rebuild is installed but before `session_start` fans out (Pi
+    /// `options.beforeSessionStart`, agent-session.ts:2470). The generation bumps (held subscriptions
+    /// re-subscribe, R-11-021).
+    pub async fn reload(
+        &self,
+        before_start: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(), SessionServiceError> {
+        let current = self.session().await;
+        let previous = current.session_file().await.map(|p| p.display().to_string());
+        // Derive the current target so the rebuild re-opens the SAME session (a persisted file is
+        // resumed; an ephemeral session has nothing to re-open).
+        let target = match current.session_file().await {
+            Some(file) => SessionTarget::Resume(file),
+            None => SessionTarget::New,
+        };
+        let cwd = current.services().cwd.clone();
+        drop(current);
+        let next = Arc::new(self.factory.build(target, Some(cwd)).await?);
+        self.install_inner(next, "reload", previous, before_start).await;
+        Ok(())
     }
 
     /// Dispose the runtime (Pi `dispose`, agent-session-runtime.ts:390): `session_shutdown{quit}` +

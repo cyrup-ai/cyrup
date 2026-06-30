@@ -52,6 +52,11 @@ pub enum SessionTarget {
 #[derive(Clone)]
 pub struct SessionConfig {
     pub cwd: PathBuf,
+    /// Manager-cwd override for a `Resume` target (Pi `SessionManager.open(path, _, cwdOverride)`,
+    /// runtime.ts:207): when `Some`, the resumed [`SessionManager`]'s own cwd is rebound to this path
+    /// instead of being derived from the session file's header. `None` ⇒ derive from the header (the
+    /// default). Set by the runtime's `switch_session`/`import` flows; left `None` by one-shot builds.
+    pub cwd_override: Option<PathBuf>,
     /// Global agent dir (`~/.cyrup/agent`): global settings, auth, context files, resource roots.
     pub agent_dir: PathBuf,
     /// Home dir for trust-requiring-resource detection (defaults to `agent_dir`).
@@ -76,6 +81,10 @@ pub struct SessionConfig {
     pub append_system_prompt: Option<String>,
     /// Persist to disk (`false` ⇒ ephemeral in-memory session; print/json default, R-11-008).
     pub persist: bool,
+    /// Parent session file recorded on a freshly-created session (Pi `newSession({parentSession})`,
+    /// session-manager.ts; runtime.ts:238). `None` for a top-level session. Threaded into
+    /// [`NewSessionOpts::parent_session`] only on the `New` target (resumed sessions keep their own).
+    pub parent_session: Option<String>,
     pub target: SessionTarget,
     /// Model-visible tool-set control.
     pub tool_availability: Availability,
@@ -102,6 +111,7 @@ impl SessionConfig {
         let agent_dir = agent_dir.into();
         Self {
             cwd: cwd.into(),
+            cwd_override: None,
             home: agent_dir.clone(),
             agent_dir,
             session_dir: None,
@@ -114,6 +124,7 @@ impl SessionConfig {
             system_prompt: None,
             append_system_prompt: None,
             persist: true,
+            parent_session: None,
             target: SessionTarget::New,
             tool_availability: Availability::All,
             no_tools: None,
@@ -271,13 +282,25 @@ impl SessionBuilder {
             Some(m) => m,
             None => match &cfg.target {
                 SessionTarget::New => {
+                    // Record `parentSession` on a freshly-created session (Pi `newSession`,
+                    // runtime.ts:238): the `New` target alone honors it — a resumed/continued
+                    // session keeps the parent it was created with.
+                    let opts = NewSessionOpts {
+                        parent_session: cfg.parent_session.clone(),
+                        ..NewSessionOpts::default()
+                    };
                     if cfg.persist {
-                        SessionManager::create(&cwd, &layout, NewSessionOpts::default())?
+                        SessionManager::create(&cwd, &layout, opts)?
                     } else {
-                        SessionManager::in_memory(&cwd, NewSessionOpts::default())?
+                        SessionManager::in_memory(&cwd, opts)?
                     }
                 }
-                SessionTarget::Resume(path) => SessionManager::open(path)?,
+                // Rebind the resumed manager's cwd to the override when the runtime supplied one
+                // (Pi `SessionManager.open(path, _, cwdOverride)`, runtime.ts:207); else derive from
+                // the file header.
+                SessionTarget::Resume(path) => {
+                    SessionManager::open_with_cwd(path, cfg.cwd_override.as_deref())?
+                }
                 SessionTarget::Continue => SessionManager::continue_recent(&cwd, &layout)?,
             },
         };
@@ -318,6 +341,17 @@ impl SessionBuilder {
         let base_tools = select_active_tools(&visible, &cfg);
         let read_available = base_tools.iter().any(|t| t.name() == "read");
 
+        // ---- 4b. extension host (cyrup-ext) — built BEFORE resource discovery so the
+        // `resources_discover` aggregate (extendResourcesFromExtensions, Pi agent-session.ts:2112)
+        // can merge extension-contributed skill/prompt/theme paths into the registry the skill
+        // pointers + system prompt are then derived from.
+        let (mode, has_ui) = ext_mode(cfg.app_mode);
+        let host = ExtensionHost::new(HostConfig { mode, has_ui, cwd: cwd.clone() });
+        for ext in self.native_extensions {
+            host.load_native(ext).await?;
+        }
+        let ext_host = Arc::new(host);
+
         // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
         disc.trusted_project = trusted;
@@ -337,7 +371,26 @@ impl SessionBuilder {
         disc.global_overrides = overrides.clone();
         disc.project_overrides = overrides;
         let report = discover(&disc, cancel.token()).await?;
-        let resources = Arc::new(report.registry);
+        // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
+        // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
+        // BEFORE the skill pointers + system prompt are derived. An empty aggregate (no handlers, or
+        // nothing contributed) leaves the discovered registry untouched (Pi's early returns at
+        // :2118/:2124).
+        let resources = {
+            let agg = ext_host.aggregate_resources(&cancel.token()).await;
+            if agg.skill_paths.is_empty() && agg.prompt_paths.is_empty() && agg.theme_paths.is_empty()
+            {
+                report.registry
+            } else {
+                let extra = cyrup_resources::DiscoveredPaths {
+                    skill_paths: agg.skill_paths.iter().map(PathBuf::from).collect(),
+                    prompt_paths: agg.prompt_paths.iter().map(PathBuf::from).collect(),
+                    theme_paths: agg.theme_paths.iter().map(PathBuf::from).collect(),
+                };
+                report.registry.extend(&extra)
+            }
+        };
+        let resources = Arc::new(resources);
         // Read-gated skill pointers (R-06-010): only when the `read` tool is available.
         let skills: Vec<SkillPointer> = if read_available && !cfg.no_skills {
             resources.skills.winners().map(|s| s.pointer()).collect()
@@ -401,13 +454,7 @@ impl SessionBuilder {
         let seed: Vec<cyrup_agent::AgentMessage> =
             existing.messages.iter().map(core_message_to_agent).collect();
 
-        // ---- 8. extension host + both seams (cyrup-ext) ---------------------------------------
-        let (mode, has_ui) = ext_mode(cfg.app_mode);
-        let host = ExtensionHost::new(HostConfig { mode, has_ui, cwd: cwd.clone() });
-        for ext in self.native_extensions {
-            host.load_native(ext).await?;
-        }
-        let ext_host = Arc::new(host);
+        // ---- 8. extension host seams (cyrup-ext) — the host itself was built at step 4b ---------
         let active_tools = ext_host.active_tools(&base_tools)?;
         let session_cancel = CancelToken::new();
         let ext_subscriber = ext_host.subscriber(session_cancel.clone());

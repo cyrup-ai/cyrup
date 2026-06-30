@@ -27,7 +27,8 @@ use crate::bash::{bash_message_payload, run_bash, BashOptions, BashResult};
 use crate::compact::DynSummarizer;
 use crate::error::SessionServiceError;
 use crate::event::{
-    core_message_to_agent, AgentSessionEvent, PromptAccepted, StreamingBehavior, UserInput,
+    core_message_to_agent, AgentSessionEvent, PromptAccepted, PromptOptions, StreamingBehavior,
+    UserInput,
 };
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
@@ -63,6 +64,31 @@ pub struct ForkAnchor {
     pub text: String,
 }
 
+/// Options for the unified `/tree` navigation op (Pi `navigateTree(targetId, options)`,
+/// agent-session.ts:2704). `summarize` runs the branch summarizer over the abandoned branch;
+/// `custom_instructions`/`replace_instructions` steer that summary prompt (Pi
+/// `branch-summarization.ts:318-336`); `label` is attached to the resulting summary entry (or, when
+/// not summarizing, to the navigation target).
+#[derive(Clone, Debug, Default)]
+pub struct NavigateTreeOptions {
+    pub summarize: bool,
+    pub custom_instructions: Option<String>,
+    pub replace_instructions: bool,
+    pub label: Option<String>,
+}
+
+/// The outcome of [`AgentSession::navigate_tree`] (Pi navigateTree return,
+/// agent-session.ts:2710): `editor_text` is the re-editable text when the target is a user/custom
+/// message; `cancelled` is set when the op was a no-op or an extension vetoed it; `aborted` is set
+/// when an in-flight summarization was cancelled; `summary_entry` is the appended branch summary.
+#[derive(Clone, Debug, Default)]
+pub struct NavigateTreeOutcome {
+    pub editor_text: Option<String>,
+    pub cancelled: bool,
+    pub aborted: bool,
+    pub summary_entry: Option<cyrup_session::compaction::BranchSummaryEntry>,
+}
+
 /// A scoped model in the `cycle_model` set (Pi `{model, thinkingLevel?}`, agent-session.ts:870). An
 /// explicit `thinking_level` overrides the session level when cycled to; `None` inherits it.
 #[derive(Clone, Debug)]
@@ -78,6 +104,27 @@ pub struct ModelCycleResult {
     pub model: Model,
     pub thinking_level: ModelThinkingLevel,
     pub is_scoped: bool,
+}
+
+/// The disposition of the `input` extension event (Pi `InputEventResult.action`, runner.ts:1100).
+/// A `transform` outcome rewrites the in-flight [`UserInput`] in place (via `EventPatch::Input`) and
+/// then reports `Continue`, exactly as Pi folds `currentText`/`currentImages` before continuing.
+enum InputDisposition {
+    /// A handler fully serviced the submission (`handled`); no run or queue follows.
+    Handled,
+    /// No handler claimed it; proceed with expansion + run/queue (text/images may have been
+    /// rewritten by a `transform` handler already applied to the [`UserInput`]).
+    Continue,
+}
+
+/// What [`AgentSession::prepare`] resolved a submission to (the shared `prompt` preflight outcome).
+enum Prepared {
+    /// Assembled run input to dispatch to the agent.
+    Run(Vec<AgentMessage>),
+    /// An `input` handler serviced it; nothing to run.
+    Handled,
+    /// The agent is streaming; the (expanded) submission is queued via the carried behavior.
+    Queued(StreamingBehavior, UserInput),
 }
 
 /// The build-time inputs the facade threads into [`AgentSession::from_parts`] for the subsystems
@@ -257,9 +304,14 @@ impl AgentSession {
         }
         // Register the run-scoped subscription BEFORE starting the run so no event is missed.
         let stream = self.fanout.subscribe_run();
-        let messages = self.prepare_and_assemble(input.into()).await?;
-        self.agent.prompt(messages).await?;
-        Ok(stream)
+        match self.prepare(input.into(), PromptOptions::default()).await? {
+            Prepared::Run(messages) => {
+                self.agent.prompt(messages).await?;
+                Ok(stream)
+            }
+            // An `input` handler serviced the submission (no run started); the stream stays idle.
+            Prepared::Handled | Prepared::Queued(..) => Ok(stream),
+        }
     }
 
     /// Submit a prompt, resolving only to the preflight acceptance (mirrors Pi). The run is observed
@@ -268,12 +320,95 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<PromptAccepted, SessionServiceError> {
-        if self.is_streaming().await {
-            return Err(SessionServiceError::StreamingNeedsBehavior);
+        self.prompt_with(input, PromptOptions::default()).await
+    }
+
+    /// Submit a prompt with per-call [`PromptOptions`] (Pi `prompt(text, options)`,
+    /// agent-session.ts:998). Closes the in-`prompt` `streamingBehavior` seam (gap `#13`): while the
+    /// agent is streaming, the (template-expanded) text is queued via steer/follow-up per
+    /// `streaming_behavior` instead of being rejected, exactly as Pi does at agent-session.ts:1043-
+    /// 1056. The `Result` itself is the `preflightResult` callback (`Ok` = accepted, `Err` = the
+    /// preflight throw). An `input` extension handler may fully service the submission, yielding
+    /// [`PromptAccepted::Handled`].
+    pub async fn prompt_with(
+        &self,
+        input: impl Into<UserInput>,
+        options: PromptOptions,
+    ) -> Result<PromptAccepted, SessionServiceError> {
+        match self.prepare(input.into(), options).await? {
+            Prepared::Handled => Ok(PromptAccepted::Handled),
+            Prepared::Queued(behavior, ui) => match behavior {
+                StreamingBehavior::FollowUp => self.follow_up(ui).await,
+                StreamingBehavior::Steer => self.steer(ui).await,
+            },
+            Prepared::Run(messages) => {
+                self.agent.prompt(messages).await?;
+                Ok(PromptAccepted::Started)
+            }
         }
-        let messages = self.prepare_and_assemble(input.into()).await?;
-        self.agent.prompt(messages).await?;
-        Ok(PromptAccepted::Started)
+    }
+
+    /// The shared preflight Pi's `prompt` performs before either running or queueing
+    /// (agent-session.ts:1003-1142): emit the `input` extension event (which may fully service the
+    /// submission), then — if the agent is streaming — expand templates and route to the steer/
+    /// follow-up queue per `streaming_behavior` (erroring when none is given), else assemble the run
+    /// input. Returns the disposition the caller acts on.
+    async fn prepare(
+        &self,
+        mut ui: UserInput,
+        options: PromptOptions,
+    ) -> Result<Prepared, SessionServiceError> {
+        // 1. `input` extension event, emitted BEFORE expansion (Pi agent-session.ts:1015-1033). A
+        //    handler that returns `handled` fully services the submission — no run, no queue; a
+        //    `transform` handler rewrites `ui` (text/images) in place before continuing.
+        if matches!(self.emit_input_event(&mut ui).await, InputDisposition::Handled) {
+            return Ok(Prepared::Handled);
+        }
+        // 2. While streaming, expand then queue per `streamingBehavior` (Pi agent-session.ts:1043-
+        //    1056). Without a behavior the submission is rejected (Pi throws at :1044).
+        if self.is_streaming().await {
+            let behavior = options
+                .streaming_behavior
+                .ok_or(SessionServiceError::StreamingNeedsBehavior)?;
+            let mut queued = ui;
+            if queued.expand_templates {
+                queued.text = self.expand_input_text(&queued.text);
+            }
+            return Ok(Prepared::Queued(behavior, queued));
+        }
+        // 3. Not streaming: run the full pre-send sequence + assemble the run input.
+        Ok(Prepared::Run(self.prepare_and_assemble(ui).await?))
+    }
+
+    /// Emit the `input` extension event (Pi `emitInput`, runner.ts:1095). A handler may fully
+    /// service the submission (`HookOutcome::Handled`/`Block` ⇒ [`InputDisposition::Handled`]) or
+    /// *transform* it (`HookOutcome::Mutate(EventPatch::Input{..})`, Pi `action:"transform"`,
+    /// runner.ts:1116-1119): the folded text/images flow back into `ui` and the submission continues
+    /// with the rewritten content (Pi agent-session.ts:1029-1032).
+    async fn emit_input_event(&self, ui: &mut UserInput) -> InputDisposition {
+        if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::Input) {
+            return InputDisposition::Continue;
+        }
+        let cancel = self.session_cancel.child_token();
+        let event = HostEvent::Input { text: ui.text.clone(), images: ui.images.clone() };
+        let reduced = self
+            .services
+            .ext_host
+            .dispatcher()
+            .dispatch_block_mutate(event, &cancel)
+            .await;
+        match reduced {
+            Reduced::Handled(_) | Reduced::Blocked { .. } => InputDisposition::Handled,
+            // Apply any `transform` the handler chain folded into the event (Pi
+            // agent-session.ts:1029-1032: `currentText`/`currentImages` adopt the result).
+            Reduced::Pass(ev) => {
+                if let HostEvent::Input { text, images } = *ev {
+                    ui.text = text;
+                    ui.images = images;
+                }
+                InputDisposition::Continue
+            }
+        }
     }
 
     /// Run the pre-send sequence Pi's `prompt` performs before dispatching the run
@@ -623,6 +758,260 @@ impl AgentSession {
         drop(guard);
         *Self::lock(&self.branch_summary_cancel) = None;
         Ok(entry_opt?.map(|e| e.summary))
+    }
+
+    /// The unified `/tree` navigation op (Pi `navigateTree(targetId, options)`,
+    /// agent-session.ts:2704-2895). Navigates the leaf to `target`, optionally summarizing the
+    /// abandoned branch, and returns `{editor_text, cancelled, aborted, summary_entry}`:
+    ///
+    /// - No-op (`{cancelled:false}`) when `target` is already the leaf (agent-session.ts:2712).
+    /// - The `session_before_tree` extension hook may veto the navigation (`{cancelled:true}`,
+    ///   agent-session.ts:2757).
+    /// - When summarizing, an aborted summarization returns `{cancelled:true, aborted:true}`
+    ///   (agent-session.ts:2796).
+    /// - A `user`/`custom_message` target re-roots the leaf at the target's PARENT and returns the
+    ///   target's text as `editor_text` (so a UI can re-edit it); any other target navigates to the
+    ///   target itself (agent-session.ts:2823-2841).
+    /// - The summary is attached at the navigation target position via `branch_with_summary`
+    ///   (agent-session.ts:2847); the `label` lands on the summary entry, or — with no summary — on
+    ///   the target (agent-session.ts:2858/2867). Finally the agent transcript is rebuilt from the
+    ///   navigated context and `session_tree` is emitted (agent-session.ts:2871-2884).
+    pub async fn navigate_tree(
+        &self,
+        target: EntryId,
+        options: NavigateTreeOptions,
+    ) -> Result<NavigateTreeOutcome, SessionServiceError> {
+        use cyrup_session::compaction::{
+            collect_entries_for_branch_summary, prepare_branch_entries,
+        };
+        use cyrup_session::entry::{Entry, KnownEntry};
+
+        // session_before_tree veto hook (agent-session.ts:2752-2783). cyrup's `SessionBeforeTree`
+        // carries no preparation payload and the dispatcher only models the cancel decision; the
+        // instruction/label override-return is the wasm-host return-value path (gap #13 tail), so the
+        // override knobs are taken from the caller's `options`.
+        if !self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::SessionBeforeTree)
+        {
+            let cancel = self.session_cancel.child_token();
+            let reduced = self
+                .services
+                .ext_host
+                .dispatcher()
+                .dispatch_block_mutate(HostEvent::SessionBeforeTree, &cancel)
+                .await;
+            if matches!(reduced, Reduced::Blocked { .. }) {
+                return Ok(NavigateTreeOutcome { cancelled: true, ..Default::default() });
+            }
+        }
+
+        let mut guard = self.manager.lock().await;
+        let old_leaf = guard.leaf_id().cloned();
+
+        // No-op if already at target (agent-session.ts:2712).
+        if old_leaf.as_ref() == Some(&target) {
+            return Ok(NavigateTreeOutcome::default());
+        }
+
+        // Target must exist (agent-session.ts:2721).
+        let target_entry = guard
+            .entry(&target)
+            .cloned()
+            .ok_or_else(|| SessionServiceError::InvalidForkEntry(target.to_string()))?;
+
+        // Determine the new leaf position + re-editable text by target type
+        // (agent-session.ts:2823-2841).
+        let (new_leaf, editor_text): (Option<EntryId>, Option<String>) = match &target_entry {
+            Entry::Known(KnownEntry::Message { .. }) if user_message_text(&target_entry).is_some() => {
+                (target_entry.parent_id(), user_message_text(&target_entry))
+            }
+            Entry::Known(KnownEntry::CustomMessage { content, .. }) => {
+                (target_entry.parent_id(), Some(custom_message_text(content)))
+            }
+            _ => (Some(target.clone()), None),
+        };
+
+        // Summarize the abandoned branch when requested + there is something to summarize
+        // (agent-session.ts:2787). Pi still appends the non-empty "No content to summarize"
+        // placeholder, so we gate only on the collected entry count, not the prepared messages.
+        let mut summary_payload: Option<(String, serde_json::Value)> = None;
+        if options.summarize {
+            let old_path: Vec<Entry> =
+                guard.branch_path(old_leaf.as_ref()).into_iter().cloned().collect();
+            let target_path: Vec<Entry> =
+                guard.branch_path(Some(&target)).into_iter().cloned().collect();
+            let collection = collect_entries_for_branch_summary(&old_path, &target_path);
+            if !collection.entries.is_empty() {
+                let model = Self::lock(&self.compaction_model).clone();
+                let budget = u32::try_from(model.context_window)
+                    .unwrap_or(u32::MAX)
+                    .saturating_sub(self.branch_summary_settings.reserve_tokens);
+                let prep = prepare_branch_entries(&collection.entries, budget);
+                let cancel = self.session_cancel.child_token();
+                *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+                let result = self
+                    .generate_branch_summary_with_instructions(
+                        &prep,
+                        &model,
+                        options.custom_instructions.as_deref(),
+                        options.replace_instructions,
+                        cancel,
+                    )
+                    .await;
+                *Self::lock(&self.branch_summary_cancel) = None;
+                match result {
+                    Ok(text) => {
+                        let details = serde_json::to_value(prep.file_ops.to_details())
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        summary_payload = Some((text, details));
+                    }
+                    Err(cyrup_session::compaction::CompactionError::Aborted) => {
+                        return Ok(NavigateTreeOutcome {
+                            cancelled: true,
+                            aborted: true,
+                            ..Default::default()
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        // Apply the navigation + summary/label (agent-session.ts:2845-2868).
+        let summary_entry = match &summary_payload {
+            Some((text, details)) => {
+                let id = guard.branch_with_summary(
+                    new_leaf.as_ref(),
+                    text.clone(),
+                    Some(details.clone()),
+                    false,
+                )?;
+                let entry = branch_summary_entry_of(&guard, &id);
+                if let Some(label) = options.label.as_deref() {
+                    guard.append_label(&id, Some(label))?;
+                }
+                entry
+            }
+            None => {
+                match new_leaf.as_ref() {
+                    None => guard.reset_leaf(),
+                    Some(id) => guard.branch(id)?,
+                }
+                // No summary entry to label → label the navigation target itself.
+                if let Some(label) = options.label.as_deref() {
+                    guard.append_label(&target, Some(label))?;
+                }
+                None
+            }
+        };
+
+        // Rebuild the agent transcript from the navigated context (agent-session.ts:2871).
+        let ctx = guard.build_context();
+        let new_leaf_id = guard.leaf_id().cloned();
+        drop(guard);
+        let msgs: Vec<AgentMessage> = ctx.messages.iter().map(core_message_to_agent).collect();
+        self.agent.set_messages(msgs).await;
+
+        // session_tree notify (agent-session.ts:2877). cyrup collapses the Pi payload into one
+        // `tree` JSON value (the SDK forwards it to the guest as `tree_json`).
+        if !self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::SessionTree)
+        {
+            let tree = serde_json::json!({
+                "newLeafId": new_leaf_id,
+                "oldLeafId": old_leaf,
+                "summaryEntry": summary_entry,
+                "fromExtension": summary_payload.as_ref().map(|_| false),
+            });
+            let notify_cancel = self.session_cancel.child_token();
+            self.services
+                .ext_host
+                .dispatcher()
+                .dispatch_notify(&HostEvent::SessionTree { tree }, &notify_cancel)
+                .await;
+        }
+
+        Ok(NavigateTreeOutcome { editor_text, cancelled: false, aborted: false, summary_entry })
+    }
+
+    /// Generate a branch summary with optional custom/replace instructions (Pi `generateBranchSummary`
+    /// with `customInstructions`/`replaceInstructions`, branch-summarization.ts:318-336). cyrup-session's
+    /// `generate_branch_summary` takes no instruction knobs, so the `/tree` op threads them here over
+    /// the same public branch-summary primitives.
+    async fn generate_branch_summary_with_instructions(
+        &self,
+        prep: &cyrup_session::compaction::BranchPreparation,
+        model: &Model,
+        custom_instructions: Option<&str>,
+        replace_instructions: bool,
+        cancel: CancelToken,
+    ) -> Result<String, cyrup_session::compaction::CompactionError> {
+        use cyrup_session::compaction::{
+            format_file_operations, serialize_conversation, SummarizationRequest, Summarizer,
+            BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
+            SUMMARIZATION_SYSTEM_PROMPT,
+        };
+        // Pi short-circuits BEFORE the model call when there is nothing to summarize
+        // (branch-summarization.ts:309-311).
+        if prep.messages.is_empty() {
+            return Ok(BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string());
+        }
+        let transcript = serialize_conversation(&prep.messages);
+        // Instruction selection (branch-summarization.ts:319-326): `replace` swaps the default
+        // prompt; a bare custom instruction is appended as "Additional focus".
+        let instructions = match custom_instructions {
+            Some(ci) if !ci.is_empty() && replace_instructions => ci.to_string(),
+            Some(ci) if !ci.is_empty() => {
+                format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {ci}")
+            }
+            _ => BRANCH_SUMMARY_PROMPT.to_string(),
+        };
+        let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
+        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
+        let req = SummarizationRequest {
+            system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
+            prompt_text: prompt,
+            max_tokens: 2048,
+            model: ModelRef {
+                provider: model.provider.clone(),
+                api: Some(model.api.clone()),
+                model: model.id.clone(),
+            },
+            thinking: ModelThinkingLevel::Off,
+        };
+        let resp = summarizer.complete(req, cancel).await?;
+        match resp.stop_reason {
+            cyrup_core::StopReason::Error => Err(
+                cyrup_session::compaction::CompactionError::Summarization(
+                    resp.error_message.unwrap_or_default(),
+                ),
+            ),
+            cyrup_core::StopReason::Aborted => {
+                Err(cyrup_session::compaction::CompactionError::Aborted)
+            }
+            _ => {
+                let body = resp
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let (read, modified) = prep.file_ops.compute_lists();
+                Ok(format!(
+                    "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+                    format_file_operations(&read, &modified)
+                ))
+            }
+        }
     }
 
     /// Fork the current persisted session into a new file under the same cwd (R-04-020/021).
@@ -1035,6 +1424,13 @@ impl AgentSession {
     /// The persisted transcript messages on the current branch (R-11-014 `get_messages`).
     pub async fn messages(&self) -> Vec<Message> {
         self.manager.lock().await.build_context().messages
+    }
+
+    /// The id of the current branch leaf (Pi `sessionManager.getLeafId()`, agent-session.ts:2705).
+    /// `None` before any entry exists / after a reset-to-root. Drives the `/tree` overlay's
+    /// current-position marker and its `navigate_tree` no-op guard.
+    pub async fn leaf_id(&self) -> Option<EntryId> {
+        self.manager.lock().await.leaf_id().cloned()
     }
 
     /// The agent's current in-memory transcript (includes the streaming partial).
@@ -1765,6 +2161,55 @@ fn user_message_text(e: &cyrup_session::Entry) -> Option<String> {
         .collect::<Vec<_>>()
         .join("");
     Some(text)
+}
+
+/// The text of a `custom_message` entry (Pi `agent-session.ts:2833-2840`): a raw string is used as
+/// is; an array is filtered to its `text` parts and joined.
+fn custom_message_text(content: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|c| {
+                if c.get("type").and_then(Value::as_str) == Some("text") {
+                    c.get("text").and_then(Value::as_str).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Build a [`cyrup_session::compaction::BranchSummaryEntry`] payload from a freshly appended summary
+/// entry (mirrors cyrup-session's private `branch_summary_entry_of`, compaction/mod.rs:309) so the
+/// `/tree` op can surface the entry without re-running the summarizer.
+fn branch_summary_entry_of(
+    mgr: &SessionManager,
+    id: &EntryId,
+) -> Option<cyrup_session::compaction::BranchSummaryEntry> {
+    use cyrup_session::compaction::BranchSummaryEntry;
+    use cyrup_session::entry::{Entry, KnownEntry};
+    match mgr.entry(id) {
+        Some(Entry::Known(KnownEntry::BranchSummary {
+            base,
+            from_id,
+            summary,
+            details,
+            from_hook,
+        })) => Some(BranchSummaryEntry {
+            id: base.id.clone(),
+            parent_id: base.parent_id.clone(),
+            summary: summary.clone(),
+            from_id: from_id.clone(),
+            from_hook: from_hook.unwrap_or(false),
+            details: details.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// For a `position:"before"` fork: require a user-message anchor and return `(parent_id, text)`.

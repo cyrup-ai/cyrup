@@ -90,10 +90,29 @@ impl SessionFactory {
         target: SessionTarget,
         cwd: Option<PathBuf>,
     ) -> Result<AgentSession, SessionServiceError> {
+        self.build_with_parent(target, cwd, None).await
+    }
+
+    /// Build a fresh [`AgentSession`], additionally recording a `parent_session` on a freshly-created
+    /// (`New`) session (Pi `newSession({parentSession})`, runtime.ts:238). Resumed/continued targets
+    /// ignore `parent_session` (they keep the parent they were created with).
+    pub(crate) async fn build_with_parent(
+        &self,
+        target: SessionTarget,
+        cwd: Option<PathBuf>,
+        parent_session: Option<String>,
+    ) -> Result<AgentSession, SessionServiceError> {
         let mut cfg = self.base_config.clone();
         cfg.target = target;
+        cfg.parent_session = parent_session;
         if let Some(c) = cwd {
-            cfg.cwd = c;
+            // The runtime pre-resolves the effective cwd (an explicit override, else the file's own
+            // cwd) before building. Bind it to BOTH the rebuilt services (`cwd`) AND, for a `Resume`
+            // target, the resumed manager's own cwd (`cwd_override`) — Pi threads it into
+            // `SessionManager.open(path, _, cwdOverride)` so `getCwd()` reports the override
+            // (runtime.ts:207). For non-resume targets `cwd_override` is unread.
+            cfg.cwd = c.clone();
+            cfg.cwd_override = Some(c);
         }
         let mut builder = SessionBuilder::new(self.provider.clone(), cfg)
             .settings_store(self.settings_store.clone())

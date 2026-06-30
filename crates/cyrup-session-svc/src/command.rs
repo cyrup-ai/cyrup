@@ -14,7 +14,9 @@ use cyrup_core::EntryId;
 
 use crate::error::SessionServiceError;
 use crate::event::{PromptAccepted, UserInput};
-use crate::session::{AgentSession, ForkAnchor, ForkOutcome, ForkPosition};
+use crate::session::{
+    AgentSession, ForkAnchor, ForkOutcome, ForkPosition, NavigateTreeOptions, NavigateTreeOutcome,
+};
 use crate::state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
 
 /// The request/response control verbs the seam exposes (arch-11 §2.1).
@@ -44,6 +46,9 @@ pub enum SessionCommand {
     SetSteeringMode { mode: cyrup_agent::QueueMode },
     SetFollowUpMode { mode: cyrup_agent::QueueMode },
     Branch { entry: EntryId },
+    /// Unified `/tree` navigation (`navigateTree`): navigate to `target`, optionally summarizing the
+    /// abandoned branch, returning the re-editable text + appended summary entry.
+    NavigateTree { target: EntryId, options: NavigateTreeOptions },
     Fork { entry: EntryId, position: ForkPosition },
     /// Clone the session at an entry (or current leaf) into a new file without switching (`clone_at`).
     CloneAt { entry: Option<EntryId> },
@@ -78,6 +83,8 @@ pub enum SessionCommandOutput {
     ToolNames(Vec<String>),
     /// All enable-able tool definitions (`get_all_tools`).
     Tools(Vec<crate::ToolInfo>),
+    /// The result of a `/tree` navigation (`navigate_tree`).
+    TreeNavigation(NavigateTreeOutcome),
 }
 
 impl AgentSession {
@@ -162,6 +169,9 @@ impl AgentSession {
             C::Branch { entry } => {
                 self.branch(entry).await?;
                 O::Unit
+            }
+            C::NavigateTree { target, options } => {
+                O::TreeNavigation(self.navigate_tree(target, options).await?)
             }
             C::Fork { entry, position } => O::Fork(self.fork_at_entry(&entry, position).await?),
             C::CloneAt { entry } => O::Text(Some(self.clone_at(entry).await?.to_string())),

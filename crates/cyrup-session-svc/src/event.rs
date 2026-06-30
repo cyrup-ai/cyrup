@@ -66,6 +66,18 @@ impl From<String> for UserInput {
 pub enum PromptAccepted {
     Started,
     Queued(StreamingBehavior),
+    /// An `input` extension handler fully serviced the submission (Pi `inputResult.action ===
+    /// "handled"`, agent-session.ts:1025); no run was started and nothing was queued.
+    Handled,
+}
+
+/// Per-call prompt options (Pi `PromptOptions`, agent-session.ts:200-212). `streaming_behavior`
+/// selects the queue (steer/follow-up) when the agent is already streaming; without it a prompt
+/// submitted while streaming is rejected (Pi throws at agent-session.ts:1044).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PromptOptions {
+    /// How to deliver the message if the agent is mid-run (Pi `streamingBehavior`).
+    pub streaming_behavior: Option<StreamingBehavior>,
 }
 
 /// Steering-behavior selector for a prompt submitted while the agent runs (func-02 §9; R-11-016).
