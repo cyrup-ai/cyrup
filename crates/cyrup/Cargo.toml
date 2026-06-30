@@ -26,6 +26,8 @@ cyrup-session-svc = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-modes = { workspace = true }
 cyrup-tui = { workspace = true }
+# Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
+cyrup-resources = { workspace = true }
 # The provider seam — `faux` is the only runnable provider until real HTTP providers land, so the
 # bin enables it to be runnable end-to-end (a real-but-unimplemented model yields a clear error).
 cyrup-provider = { workspace = true, features = ["faux"] }
@@ -39,6 +41,13 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Image `@file` input (file-processor.ts:48-72): MIME sniff + downscale-to-2000px + base64 attach.
+image = { workspace = true }
+base64 = { workspace = true }
+# macOS screenshot `@file` path NFD-variant fallback (file-processor.ts / path-utils.ts:12-14).
+unicode-normalization = { workspace = true }
+# Startup migrations read/rewrite legacy `oauth.json`/`settings.json`/session-header JSON (migrations.ts).
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Dispatch integration tests build a real AgentSession over a scripted faux provider in a tempdir.

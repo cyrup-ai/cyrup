@@ -66,8 +66,9 @@ pub use handle::Session;
 
 // ---- load-bearing seam types, re-exported so embedders depend only on this crate ----
 pub use cyrup_session_svc::{
-    AgentSession, AgentSessionEvent, AgentSessionServices, InputSource, PromptAccepted,
-    SessionBuilder, SessionConfig, SessionServiceError, SessionTarget, StreamingBehavior, UserInput,
+    AgentSession, AgentSessionEvent, AgentSessionServices, InputSource, NoTools, PromptAccepted,
+    ScopedModel, SessionBuilder, SessionConfig, SessionServiceError, SessionTarget,
+    StreamingBehavior, UserInput,
 };
 
 // ---- multi-session runtime surface (R-11-020/021; Pi `agent-session-runtime.ts`,

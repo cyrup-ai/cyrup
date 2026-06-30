@@ -75,6 +75,25 @@ pub struct SessionConfig {
     pub no_context_files: bool,
     /// `--no-skills`.
     pub no_skills: bool,
+    /// `--no-prompt-templates` / `-np`: disable prompt-template discovery (Pi `noPromptTemplates`).
+    pub no_prompt_templates: bool,
+    /// `--no-themes`: disable theme discovery (Pi `noThemes`).
+    pub no_themes: bool,
+    /// `--no-extensions` / `-ne`: disable extension *discovery* (the project + global roots). Explicit
+    /// `--extension` paths still load (Pi `resourceLoaderOptions.noExtensions`, main.ts:664).
+    pub no_extensions: bool,
+    /// Explicit `--extension <path>` resources to load as pre-trust *configured* extensions (Pi
+    /// `resourceLoaderOptions.additionalExtensionPaths`, main.ts:660). Each may be a single extension
+    /// dir or a directory of extensions. Threaded into [`extension_discovery_roots`] regardless of
+    /// `no_extensions`.
+    pub extra_extension_paths: Vec<PathBuf>,
+    /// Explicit `--skill <path>` resources to append to discovery (Pi `additionalSkillPaths`,
+    /// resource-loader.ts:421). Merged into the discovered registry before skill-pointer derivation.
+    pub extra_skill_paths: Vec<PathBuf>,
+    /// Explicit `--prompt-template <path>` resources to append to discovery.
+    pub extra_prompt_paths: Vec<PathBuf>,
+    /// Explicit `--theme <path>` resources to append to discovery.
+    pub extra_theme_paths: Vec<PathBuf>,
     /// Full system-prompt replacement.
     pub system_prompt: Option<String>,
     /// Append text after the assembled prompt.
@@ -121,6 +140,13 @@ impl SessionConfig {
             trust_override: None,
             no_context_files: false,
             no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+            no_extensions: false,
+            extra_extension_paths: Vec::new(),
+            extra_skill_paths: Vec::new(),
+            extra_prompt_paths: Vec::new(),
+            extra_theme_paths: Vec::new(),
             system_prompt: None,
             append_system_prompt: None,
             persist: true,
@@ -358,10 +384,33 @@ impl SessionBuilder {
         }
         let ext_host = Arc::new(host);
 
+        // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
+        // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664). The roots
+        // are computed here (so `-ne` disables project+global discovery and `-e` paths are configured,
+        // pre-trust); the live wasm *instantiation* of each discovered extension runs only under the
+        // `wasm-host` feature (the Wasmtime engine + the `wasm32-wasip2` guest toolchain — the gated
+        // arch-08b live-wasm tail, residual ledger §09 #13). Native built-ins are already loaded above.
+        let ext_roots = extension_discovery_roots(&cfg);
+        #[cfg(feature = "wasm-host")]
+        {
+            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(
+                crate::host_services::LiveHostServices::new(self.provider.clone()),
+            );
+            // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
+            // diagnostics, main.ts:679-682) surface to the caller once the diagnostics channel reaches
+            // the bin; today they are recorded on the result (the wasm-host E2E is tooling-gated).
+            let _load_result =
+                ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        let _ = &ext_roots;
+
         // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
         disc.trusted_project = trusted;
         disc.enable_skills = !cfg.no_skills;
+        disc.enable_prompts = !cfg.no_prompt_templates;
+        disc.enable_themes = !cfg.no_themes;
         // Settings-tier resource overrides (cross-layer wiring; Pi `package-manager.ts:2265-2278`):
         // the `skills`/`prompts`/`themes` settings lists are enable/disable patterns over the
         // auto-discovered loose resources. The layered `SettingsManager` exposes the per-layer split
@@ -387,15 +436,21 @@ impl SessionBuilder {
         // :2118/:2124).
         let resources = {
             let agg = ext_host.aggregate_resources(&cancel.token()).await;
-            if agg.skill_paths.is_empty() && agg.prompt_paths.is_empty() && agg.theme_paths.is_empty()
-            {
+            // Fold BOTH the extension-contributed paths AND the explicit CLI `--skill`/
+            // `--prompt-template`/`--theme` paths (Pi `additionalSkillPaths` et al.) into the
+            // discovered registry before skill-pointer + system-prompt derivation. An empty aggregate
+            // (no handlers, no CLI paths) leaves the discovered registry untouched.
+            let mut skill_paths: Vec<PathBuf> = agg.skill_paths.iter().map(PathBuf::from).collect();
+            let mut prompt_paths: Vec<PathBuf> = agg.prompt_paths.iter().map(PathBuf::from).collect();
+            let mut theme_paths: Vec<PathBuf> = agg.theme_paths.iter().map(PathBuf::from).collect();
+            skill_paths.extend(cfg.extra_skill_paths.iter().cloned());
+            prompt_paths.extend(cfg.extra_prompt_paths.iter().cloned());
+            theme_paths.extend(cfg.extra_theme_paths.iter().cloned());
+            if skill_paths.is_empty() && prompt_paths.is_empty() && theme_paths.is_empty() {
                 report.registry
             } else {
-                let extra = cyrup_resources::DiscoveredPaths {
-                    skill_paths: agg.skill_paths.iter().map(PathBuf::from).collect(),
-                    prompt_paths: agg.prompt_paths.iter().map(PathBuf::from).collect(),
-                    theme_paths: agg.theme_paths.iter().map(PathBuf::from).collect(),
-                };
+                let extra =
+                    cyrup_resources::DiscoveredPaths { skill_paths, prompt_paths, theme_paths };
                 report.registry.extend(&extra)
             }
         };
@@ -747,6 +802,27 @@ fn tool_contribution(name: &str) -> ToolPromptContribution {
         _ => "Tool",
     };
     ToolPromptContribution::snippet(Arc::<str>::from(name), Arc::<str>::from(snippet))
+}
+
+/// Build the extension discovery roots from the config (Pi `resourceLoaderOptions`
+/// `additionalExtensionPaths` + `noExtensions`, main.ts:660,664). `--no-extensions`/`-ne` disables the
+/// project (`<cwd>/.cyrup/extensions`) + global (`<agentDir>/extensions`) discovery roots; explicit
+/// `--extension`/`-e` paths are always loaded (Pi: "explicit -e paths still work" — they are pre-trust
+/// *configured* roots). Pure + side-effect-free so it is unit-testable without a wasm host.
+pub fn extension_discovery_roots(cfg: &SessionConfig) -> cyrup_ext::DiscoveryRoots {
+    if cfg.no_extensions {
+        cyrup_ext::DiscoveryRoots {
+            project_cwd: None,
+            agent_dir: None,
+            configured: cfg.extra_extension_paths.clone(),
+        }
+    } else {
+        cyrup_ext::DiscoveryRoots {
+            project_cwd: Some(cfg.cwd.clone()),
+            agent_dir: Some(cfg.agent_dir.clone()),
+            configured: cfg.extra_extension_paths.clone(),
+        }
+    }
 }
 
 /// Map the runtime mode to the extension `(ExtMode, has_ui)` (R-11-002).

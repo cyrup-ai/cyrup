@@ -13,16 +13,32 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod diagnostics;
 pub mod input;
+pub mod migrations;
 pub mod provider;
 pub mod run;
 pub mod signals;
+pub mod startup;
+pub mod subcommands;
+pub mod timings;
 
-pub use cli::{resolve_app_mode, Cli, OutputFormat};
+pub use cli::{
+    normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
+    should_take_over_stdout, Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg,
+};
+pub use diagnostics::{
+    apply_arg_leniency, format_no_models_available_message, get_provider_login_help, Diagnostic,
+    DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT,
+};
 pub use input::{build_inputs, compose_inputs, split_positionals, Inputs};
 pub use provider::select_provider;
-pub use run::{exit_code, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
+pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
 pub use signals::spawn_abort_on_signal;
+pub use startup::{
+    are_experimental_features_enabled, file_settings_store, is_official_distribution,
+    should_run_first_time_setup,
+};
 
 // Re-export the runtime-mode enum the whole bin pivots on (arch-11 §6.1).
 pub use cyrup_config::AppMode;

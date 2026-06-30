@@ -34,6 +34,7 @@ async fn session_with(responses: Vec<AssistantMessage>) -> (AgentSession, TempDi
 fn text(initial: &str, follow_ups: &[&str]) -> Inputs {
     Inputs {
         initial: initial.to_string(),
+        images: Vec::new(),
         follow_ups: follow_ups.iter().map(|s| s.to_string()).collect(),
     }
 }

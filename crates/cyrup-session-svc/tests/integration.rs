@@ -644,3 +644,38 @@ async fn trust_settings_and_session_list_seams() {
         sessions.len()
     );
 }
+
+// ---- extension flag threading (Pi resourceLoaderOptions additionalExtensionPaths/noExtensions,
+// main.ts:660,664). The `--extension`/`--no-extensions` flags must reach the discovery roots. ----
+
+#[test]
+fn extension_discovery_roots_honor_no_extensions_and_explicit_paths() {
+    use cyrup_session_svc::extension_discovery_roots;
+
+    // Default: project + global roots scanned, no configured paths.
+    let mut cfg = SessionConfig::new(PathBuf::from("/work"), PathBuf::from("/agent"));
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(roots.project_cwd, Some(PathBuf::from("/work")));
+    assert_eq!(roots.agent_dir, Some(PathBuf::from("/agent")));
+    assert!(roots.configured.is_empty());
+
+    // Explicit `--extension` paths become pre-trust configured roots (always loaded).
+    cfg.extra_extension_paths = vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")];
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(
+        roots.configured,
+        vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")]
+    );
+    // Still discovering project + global.
+    assert!(roots.project_cwd.is_some() && roots.agent_dir.is_some());
+
+    // `--no-extensions` disables project + global *discovery*, but explicit `-e` paths still load.
+    cfg.no_extensions = true;
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(roots.project_cwd, None);
+    assert_eq!(roots.agent_dir, None);
+    assert_eq!(
+        roots.configured,
+        vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")]
+    );
+}

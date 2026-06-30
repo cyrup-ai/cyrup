@@ -20,7 +20,7 @@ pub async fn run_print_dispatch<W: Write>(
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    run_print(session, cli_input(&inputs.initial), out, PrintOptions::default()).await?;
+    run_print(session, initial_input(inputs), out, PrintOptions::default()).await?;
     for follow_up in &inputs.follow_ups {
         run_print(session, cli_input(follow_up), out, PrintOptions::default()).await?;
     }
@@ -33,7 +33,7 @@ pub async fn run_json_dispatch<W: Write>(
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    run_json(session, cli_input(&inputs.initial), out).await?;
+    run_json(session, initial_input(inputs), out).await?;
     for follow_up in &inputs.follow_ups {
         run_json(session, cli_input(follow_up), out).await?;
     }
@@ -76,4 +76,12 @@ pub async fn exit_code(session: &AgentSession) -> i32 {
 /// Wrap one-shot text as a CLI-sourced [`UserInput`].
 fn cli_input(text: &str) -> UserInput {
     UserInput::text(text.to_string(), InputSource::Cli)
+}
+
+/// The initial submission: the assembled text plus any image `@file` attachments (Pi
+/// `initialImages`, initial-message.ts:41).
+pub fn initial_input(inputs: &Inputs) -> UserInput {
+    let mut input = UserInput::text(inputs.initial.clone(), InputSource::Cli);
+    input.images = inputs.images.clone();
+    input
 }

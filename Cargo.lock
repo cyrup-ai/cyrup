@@ -932,19 +932,23 @@ name = "cyrup"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "cyrup-config",
  "cyrup-modes",
  "cyrup-provider",
+ "cyrup-resources",
  "cyrup-sdk",
  "cyrup-session-svc",
  "cyrup-tui",
  "futures",
+ "image",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -36,7 +36,7 @@ mod tools;
 
 pub use attribution::merge_provider_attribution_headers;
 pub use bash::{BashOptions, BashResult};
-pub use builder::{NoTools, SessionBuilder, SessionConfig, SessionTarget};
+pub use builder::{extension_discovery_roots, NoTools, SessionBuilder, SessionConfig, SessionTarget};
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
 pub use export::session_jsonl_to_html;
