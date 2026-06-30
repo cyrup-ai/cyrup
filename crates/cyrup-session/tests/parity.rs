@@ -650,6 +650,69 @@ fn gap24_clone_with_assistant_writes_eagerly() {
     assert!(cloned_path.exists(), "assistant-bearing clone is written eagerly");
 }
 
+// ---------------------------------------------------------------- M3 / M4 branched labels -----
+
+/// M3 + M4: `createBranchedSession` re-emits retained-target labels using the ORIGINAL timestamp
+/// from `labelTimestampsById` and collects them from the GLOBAL `labelsById` map for any target in
+/// the retained path (`session-manager.ts:1324-1331,1338-1343`) — NOT `now()`, and NOT only the
+/// `Label` entries that happen to lie on the branched path.
+///
+/// Fixture (constructed from Pi source semantics): three label entries hang OFF the branched path
+/// (they are children of the leaf / each other), so under the OLD on-path scan they would all be
+/// dropped:
+///   - L1 targets the on-path user `e1`, label "important", original ts 2020-01-01 (must survive)
+///   - L2 targets the on-path assistant `e2`, label "temp", ts 2021-01-01
+///   - L3 clears `e2` (label:null), ts 2022-01-01  → e2 must NOT be re-emitted
+///
+/// Pi's `labelsById` (== cyrup's `self.labels`) ends as `{e1 -> ("important", 2020)}`.
+#[test]
+fn m3_m4_branched_labels_keep_original_ts_and_global_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("2026-01-01T00-00-00-000Z_aaaaaaaa.jsonl");
+    let contents = concat!(
+        r#"{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/m3"}"#, "\n",
+        r#"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":0}}"#, "\n",
+        r#"{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}"#, "\n",
+        // OFF-PATH labels (children of e2 / each other), not on the root->e2 path:
+        r#"{"type":"label","id":"L1","parentId":"e2","timestamp":"2020-01-01T00:00:00.000Z","targetId":"e1","label":"important"}"#, "\n",
+        r#"{"type":"label","id":"L2","parentId":"L1","timestamp":"2021-01-01T00:00:00.000Z","targetId":"e2","label":"temp"}"#, "\n",
+        r#"{"type":"label","id":"L3","parentId":"L2","timestamp":"2022-01-01T00:00:00.000Z","targetId":"e2"}"#, "\n",
+    );
+    std::fs::write(&file, contents).unwrap();
+
+    let mut m = SessionManager::open(&file).unwrap();
+    // Sanity: global label map resolves the off-path label, and e2 was cleared.
+    assert_eq!(m.label(&EntryId::from("e1")), Some("important"));
+    assert_eq!(m.label(&EntryId::from("e2")), None);
+
+    // Branch onto the root->e2 path. The three label entries are OFF this path.
+    let lay = SessionLayout::new(dir.path().to_path_buf(), PathBuf::from("/proj/m3"));
+    m.create_branched_session(&EntryId::from("e2"), &lay).unwrap();
+
+    // Collect the re-attached label entries in the new (in-place) session.
+    let labels: Vec<(&str, &str)> = m
+        .entries()
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Known(KnownEntry::Label { base, target_id, label: Some(_), .. }) => {
+                Some((target_id.as_str(), base.timestamp.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // M4 (global scope): the off-path label targeting on-path e1 SURVIVED (old on-path scan dropped it).
+    // M4 (cleared): e2's set-then-cleared label was NOT re-emitted.
+    // M3 (timestamp): it carries the ORIGINAL 2020 timestamp, not now().
+    assert_eq!(
+        labels,
+        vec![("e1", "2020-01-01T00:00:00.000Z")],
+        "exactly the live e1 label, re-emitted with its ORIGINAL timestamp"
+    );
+    // And the label value is preserved.
+    assert_eq!(m.label(&EntryId::from("e1")), Some("important"));
+}
+
 // ================================================================================================
 // Round 3 — residual 1:1 gaps (G-1..G-7)
 // ================================================================================================

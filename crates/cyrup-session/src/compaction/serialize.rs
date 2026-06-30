@@ -94,13 +94,32 @@ fn render_arg(v: &serde_json::Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
 }
 
-/// Truncate a tool-result body to [`TOOL_RESULT_LIMIT`] chars, appending a marker (R-05-025).
+/// Truncate a tool-result body to [`TOOL_RESULT_LIMIT`] **UTF-16 code units**, appending a marker
+/// (R-05-025). Pi `truncateForSummary` (`utils.ts:95-99`) measures with JS `text.length` and slices
+/// with `text.slice(0, maxChars)` — both in UTF-16 code units, NOT Unicode scalar values. Counting
+/// scalars instead diverges on non-BMP text (emoji etc.): both the cut boundary AND the
+/// `[... N more characters truncated]` count would differ, changing the transcript handed to the
+/// summarizer model. The reported remainder is `total_utf16 − maxChars` exactly as Pi computes it
+/// (independent of the slice); the kept slice is the longest prefix whose UTF-16 length is `≤`
+/// `TOOL_RESULT_LIMIT` snapped to a `char` boundary (a non-BMP char straddling the boundary is
+/// excluded rather than split into a lone surrogate, which is unrepresentable in UTF-8 — the only
+/// residual, pathological divergence, and the byte-count marker still matches Pi).
 fn truncate(s: &str) -> String {
-    let total = s.chars().count();
+    let total = s.encode_utf16().count();
     if total <= TOOL_RESULT_LIMIT {
         return s.to_string();
     }
-    let kept: String = s.chars().take(TOOL_RESULT_LIMIT).collect();
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = ch.len_utf16();
+        if units + w > TOOL_RESULT_LIMIT {
+            break;
+        }
+        units += w;
+        end = i + ch.len_utf8();
+    }
+    let kept = s.get(..end).unwrap_or("");
     let remaining = total - TOOL_RESULT_LIMIT;
     format!("{kept}\n\n[... {remaining} more characters truncated]")
 }

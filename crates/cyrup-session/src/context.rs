@@ -5,7 +5,7 @@
 
 use cyrup_core::{Content, Message, ModelRef};
 
-use crate::agent_message::custom_to_message;
+use crate::agent_message::{custom_to_message, AgentMessage};
 use crate::entry::{Entry, KnownEntry};
 
 /// Compaction-summary wrapper (Pi `COMPACTION_SUMMARY_PREFIX`/`SUFFIX`, `messages.ts:11-17`). The
@@ -123,6 +123,91 @@ pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
         _ => {
             for e in path {
                 push_as_message(&mut messages, e);
+            }
+        }
+    }
+    messages
+}
+
+/// A message of Pi's **raw `AgentMessage`** context (Pi `buildSessionContext().messages`,
+/// `session-manager.ts:386-403`), used ONLY for the `tokensBefore` / `should_compact` token
+/// estimate. Unlike [`build_context_messages`] (which `convertToLlm`-renders every non-core role to
+/// a wrapped core `user` message), this keeps the `bashExecution` / `custom` / `branchSummary` /
+/// `compactionSummary` roles intact so [`crate::compaction::tokens::estimate_context_tokens_raw`]
+/// can dispatch on them exactly as Pi `estimateTokens` does (`compaction.ts:256-296`): a
+/// `bashExecution` costs `(command+output)/4` **even when `excludeFromContext`** (Pi's raw context
+/// never drops it), and a summary costs `summary.length/4` **without** the LLM wrapper prefix/suffix.
+#[derive(Clone, Debug)]
+pub enum RawContextMessage {
+    /// A `type:"message"` entry's raw `AgentMessage` (core / bash / custom-role). Boxed because the
+    /// core `AssistantMessage` arm dwarfs the other variants.
+    Agent(Box<AgentMessage>),
+    /// A `custom_message` entry's content (Pi `createCustomMessage` → `custom` role).
+    CustomContent(serde_json::Value),
+    /// A non-empty `branch_summary` entry's summary text (Pi `createBranchSummaryMessage`).
+    BranchSummary(String),
+    /// A `compaction` entry's summary text (Pi `createCompactionSummaryMessage`).
+    CompactionSummary(String),
+}
+
+/// Append the **raw `AgentMessage`** form of an entry, mirroring Pi `buildSessionContext`'s
+/// `appendMessage` (`session-manager.ts:389-399`) but WITHOUT `convertToLlm` rendering — the
+/// `appendMessage` arms are: `message` → `entry.message`, `custom_message` →
+/// `createCustomMessage(...)`, non-empty `branch_summary` → `createBranchSummaryMessage(...)`.
+/// Everything else is skipped (the compaction summary is prepended by the caller, exactly as Pi).
+fn push_as_raw(out: &mut Vec<RawContextMessage>, e: &Entry) {
+    if let Entry::Known(k) = e {
+        match k {
+            KnownEntry::Message { message, .. } => {
+                out.push(RawContextMessage::Agent(Box::new(message.clone())));
+            }
+            KnownEntry::CustomMessage { content, .. } => {
+                out.push(RawContextMessage::CustomContent(content.clone()));
+            }
+            KnownEntry::BranchSummary { summary, .. } if !summary.is_empty() => {
+                out.push(RawContextMessage::BranchSummary(summary.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build the active-path **raw `AgentMessage`** context exactly as Pi `buildSessionContext` does
+/// (`session-manager.ts:382-430`), but returning [`RawContextMessage`]s for token estimation only.
+/// Handles the compaction boundary identically to [`build_context_messages`]: emit the compaction
+/// summary first, then kept entries from `firstKeptEntryId`, then everything after. This is the input
+/// to `tokensBefore` / `should_compact` so the estimate matches Pi
+/// `estimateContextTokens(buildSessionContext(pathEntries).messages)` (`compaction.ts:678`) rather
+/// than estimating over the LLM-rendered text.
+pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<RawContextMessage> {
+    let mut messages = Vec::new();
+    match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
+        Some((cpos, Entry::Known(KnownEntry::Compaction {
+            summary,
+            first_kept_entry_id,
+            ..
+        }))) => {
+            messages.push(RawContextMessage::CompactionSummary(summary.clone()));
+            if let Some(before) = path.get(..cpos) {
+                let mut keeping = false;
+                for e in before {
+                    if &e.id() == first_kept_entry_id {
+                        keeping = true;
+                    }
+                    if keeping {
+                        push_as_raw(&mut messages, e);
+                    }
+                }
+            }
+            if let Some(after) = path.get(cpos + 1..) {
+                for e in after {
+                    push_as_raw(&mut messages, e);
+                }
+            }
+        }
+        _ => {
+            for e in path {
+                push_as_raw(&mut messages, e);
             }
         }
     }

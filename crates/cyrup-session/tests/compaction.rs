@@ -19,12 +19,15 @@ use cyrup_session::compaction::hooks::{
 use cyrup_session::compaction::summarize::{
     ProviderSummarizer, SummarizationRequest, Summarizer,
 };
-use cyrup_session::compaction::tokens::{estimate_context_tokens, TokenCache};
-use cyrup_session::compaction::{
-    branch, prepare_compaction, CompactionError, BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
+use cyrup_session::compaction::tokens::{
+    estimate_context_tokens, estimate_context_tokens_raw, TokenCache,
 };
-use cyrup_session::context::build_context_messages;
-use cyrup_session::agent_message::AgentMessage;
+use cyrup_session::compaction::{
+    branch, prepare_compaction, serialize_conversation, CompactionError,
+    BRANCH_SUMMARY_EMPTY_PLACEHOLDER,
+};
+use cyrup_session::context::{build_context_agent_messages, build_context_messages};
+use cyrup_session::agent_message::{AgentMessage, BashExecutionMessage};
 use cyrup_session::{
     BranchSummarySettings, Compactor, CompactionSettings, Entry, EntryBase, KnownEntry,
     NewSessionOpts, NoHooks, SessionLayout, SessionManager,
@@ -711,16 +714,15 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
 // ----------------------------------------------------------------- G-1 tokensBefore -----------
 
 #[test]
-fn g1_tokens_before_is_estimated_over_rendered_context() {
+fn g1_tokens_before_pure_core_raw_equals_rendered() {
     // Pi sets CompactionEntry.tokensBefore to
     //   estimateContextTokens(buildSessionContext(pathEntries).messages).tokens   (compaction.ts:678)
-    // i.e. the RENDERED LLM context, NOT a raw per-entry sum. cyrup matches: prepare.rs builds the
-    // context with build_context_messages and runs estimate_context_tokens. This pins the exact
-    // value for a known transcript and proves the equivalence with Pi's basis.
+    // over the RAW AgentMessage context. For a path of pure core user/assistant messages the raw
+    // and convertToLlm-rendered estimates are IDENTICAL, so this pins the value both ways.
     let cwd = PathBuf::from("/proj/g1");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    // 4 turns, no assistant usage (Usage::default → all zero) so estimate_context_tokens has no
-    // provider-usage anchor and sums chars/4 ceil over every rendered message.
+    // 4 turns, no assistant usage (Usage::default → all zero) so the estimate has no provider-usage
+    // anchor and sums chars/4 ceil over every message.
     for _ in 0..4 {
         m.append_message(user("uuuuuuuu")).unwrap(); //  8 chars → ceil(8/4)  = 2
         m.append_message(assistant("aaaaaaaaaaaa")).unwrap(); // 12 chars → ceil(12/4) = 3
@@ -731,13 +733,124 @@ fn g1_tokens_before_is_estimated_over_rendered_context() {
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
     let prep = prepare_compaction(&path, &cache, &settings).expect("history to summarize");
 
-    // 4 × (2 + 3) = 20 tokens over the full rendered context.
-    assert_eq!(prep.tokens_before, 20, "tokensBefore pins the rendered-context estimate");
-
-    // Exact equivalence with Pi's basis: estimateContextTokens(buildSessionContext(...).messages).
+    // 4 × (2 + 3) = 20 tokens; raw and rendered agree on pure core.
+    assert_eq!(prep.tokens_before, 20, "tokensBefore pins the raw-context estimate");
     let refs: Vec<&Entry> = path.iter().collect();
+    let raw = build_context_agent_messages(&refs);
     let rendered = build_context_messages(&refs);
-    assert_eq!(prep.tokens_before, estimate_context_tokens(&rendered).tokens);
+    assert_eq!(prep.tokens_before, estimate_context_tokens_raw(&raw).tokens);
+    assert_eq!(estimate_context_tokens_raw(&raw).tokens, estimate_context_tokens(&rendered).tokens);
+}
+
+/// M1 (CRITICAL): `tokensBefore` / `should_compact` estimate over Pi's RAW `AgentMessage` context
+/// (`compaction.ts:192-228,678`; `session-manager.ts:389-403`), NOT the convertToLlm-rendered text.
+/// The two diverge exactly for the entries below; the raw value is the one Pi persists.
+///
+/// BYTE-DIFF vs Pi: the identical 5-entry transcript was fed to
+///   `estimateContextTokens(buildSessionContext(entries,"e5").messages).tokens`
+/// in live Pi (packages/coding-agent, via tsx) → **77**, with per-message
+/// estimateTokens = [compactionSummary 14, user 11, bashExecution 23, branchSummary 17, custom 12].
+/// Note bashExecution is `excludeFromContext:true` yet STILL counted (23) — Pi's raw context never
+/// drops it — and the summaries are counted WITHOUT the LLM wrapper prefix/suffix.
+#[test]
+fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
+    fn base(id: &str, parent: Option<&str>) -> EntryBase {
+        EntryBase { id: EntryId::from(id), parent_id: parent.map(EntryId::from), timestamp: "2026-01-01T00:00:00Z".into() }
+    }
+
+    // e1: user core message (content len 42 → 11)
+    let e1 = msg_entry("e1", None, user("hello world this is the first user message"));
+    // e2: compaction (summary len 53 → 14); firstKeptEntryId = e1
+    let e2 = Entry::known(KnownEntry::Compaction {
+        base: base("e2", Some("e1")),
+        summary: "PRIOR SUMMARY TEXT that was compacted earlier here ok".into(),
+        first_kept_entry_id: EntryId::from("e1"),
+        tokens_before: 1234,
+        details: None,
+        from_hook: None,
+    });
+    // e3: EXCLUDED bash (cmd 15 + out 75 = 90 → 23) — Pi raw context still counts it.
+    let e3 = Entry::known(KnownEntry::Message {
+        base: base("e3", Some("e2")),
+        message: AgentMessage::BashExecution(BashExecutionMessage {
+            command: "cat /etc/passwd".into(),
+            output: "root:x:0:0:root:/root:/bin/bash\nsecret data here that is fairly long output".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 0,
+            exclude_from_context: Some(true),
+        }),
+    });
+    // e4: branch_summary (summary len 68 → 17)
+    let e4 = Entry::known(KnownEntry::BranchSummary {
+        base: base("e4", Some("e3")),
+        from_id: EntryId::from("x"),
+        summary: "a branch summary body describing the abandoned branch in some detail".into(),
+        details: None,
+        from_hook: None,
+    });
+    // e5: custom_message (content len 48 → 12)
+    let e5 = Entry::known(KnownEntry::CustomMessage {
+        base: base("e5", Some("e4")),
+        custom_type: "ext.note".into(),
+        content: json!("a custom injected message from an extension here"),
+        display: false,
+        details: None,
+    });
+
+    let path = [e1, e2, e3, e4, e5];
+    let refs: Vec<&Entry> = path.iter().collect();
+
+    // The fixed RAW path byte-matches Pi's captured tokensBefore = 77.
+    let raw = build_context_agent_messages(&refs);
+    let raw_tokens = estimate_context_tokens_raw(&raw).tokens;
+    assert_eq!(raw_tokens, 77, "tokensBefore must byte-match Pi's captured value (77)");
+
+    // And it genuinely DIFFERS from the old rendered basis (excluded bash dropped + summary
+    // wrappers over-counted), proving the fix is load-bearing, not a no-op.
+    let rendered = build_context_messages(&refs);
+    let rendered_tokens = estimate_context_tokens(&rendered).tokens;
+    assert_ne!(
+        rendered_tokens, 77,
+        "the rendered-context estimate must diverge from Pi here (it dropped the excluded bash + padded the summaries)"
+    );
+
+    // prepare_compaction persists exactly this raw value into CompactionEntry.tokensBefore.
+    let cache = TokenCache::default();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 5 };
+    let prep = prepare_compaction(&path, &cache, &settings).expect("history to summarize");
+    assert_eq!(prep.tokens_before, 77, "persisted tokensBefore must equal Pi's 77");
+}
+
+// ----------------------------------------------------------------- M2 truncation encoding -----
+
+/// M2: the summarizer transcript truncation slices/counts by **UTF-16 code unit**, matching Pi
+/// `truncateForSummary` (`utils.ts:95-99`: `text.length` / `text.slice(0, 2000)`), NOT Unicode
+/// scalars. For non-BMP text the two diverge in BOTH the cut boundary and the truncated count.
+///
+/// BYTE-DIFF vs Pi: feeding live Pi `serializeConversation` a toolResult of 1500 `U+1F600` emoji
+/// (1500 scalars, 3000 UTF-16 units) yielded emojiKept=1000, remaining=1000, and the output ended
+/// with `😀\n\n[... 1000 more characters truncated]` (captured via tsx). The OLD scalar logic would
+/// NOT truncate at all (1500 ≤ 2000) — a gross divergence in the text handed to the summarizer.
+#[test]
+fn m2_truncation_counts_utf16_code_units_like_pi() {
+    let text: String = "\u{1F600}".repeat(1500); // 1500 scalars, 3000 UTF-16 units
+    let msg = tool_result("read", "f", &text);
+    let out = serialize_conversation(std::slice::from_ref(&msg));
+
+    let expected = format!(
+        "[Tool result]: {}\n\n[... 1000 more characters truncated]",
+        "\u{1F600}".repeat(1000)
+    );
+    assert_eq!(out, expected, "UTF-16-unit truncation must byte-match Pi");
+    // Pi's captured invariants.
+    assert_eq!(out.encode_utf16().count(), 2053);
+    assert!(out.ends_with("\u{1F600}\n\n[... 1000 more characters truncated]"));
+    // The OLD scalar logic would have left all 1500 emoji untruncated (no marker at all).
+    assert_eq!(text.chars().count(), 1500);
+    assert!(!out.contains(&text), "must not pass the full untruncated body through");
 }
 
 // ----------------------------------------------------------------- G-3/G-8 empty branch -------

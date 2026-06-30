@@ -6,8 +6,8 @@ use cyrup_core::{EntryId, Message};
 use crate::compaction::cutpoint::find_cut_point;
 use crate::compaction::files::FileOps;
 use crate::compaction::settings::CompactionSettings;
-use crate::compaction::tokens::{estimate_context_tokens, TokenCache};
-use crate::context::{build_context_messages, push_as_message};
+use crate::compaction::tokens::{estimate_context_tokens_raw, TokenCache};
+use crate::context::{build_context_agent_messages, push_as_message};
 use crate::entry::{Entry, KnownEntry};
 
 /// The prepared compaction (also the before-compact hook input).
@@ -109,9 +109,11 @@ pub fn prepare_compaction(
     // tokens_before = estimated size of the ENTIRE pre-compaction context being reduced (Pi
     // `estimateContextTokens(buildSessionContext(pathEntries).messages).tokens`, `compaction.ts:678`),
     // NOT just the summarized slice — this is the number persisted in `CompactionEntry.tokensBefore`.
+    // Estimate over the RAW `AgentMessage` context (roles intact) so summary wrappers are not
+    // over-counted and `excludeFromContext` bash messages are still counted, matching Pi byte-for-byte.
     let refs: Vec<&Entry> = path.iter().collect();
-    let full_context = build_context_messages(&refs);
-    let tokens_before = estimate_context_tokens(&full_context).tokens;
+    let full_context = build_context_agent_messages(&refs);
+    let tokens_before = estimate_context_tokens_raw(&full_context).tokens;
 
     Some(CompactionPreparation {
         first_kept_entry_id,

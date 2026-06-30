@@ -225,25 +225,52 @@ impl SessionManager {
             retained.push(cloned);
         }
 
-        // Re-attach labels for retained targets as trailing label entries.
+        // Re-attach labels for retained targets as trailing label entries. Pi collects from the
+        // GLOBAL `labelsById`/`labelTimestampsById` maps for any target present in the retained path
+        // (`session-manager.ts:1324-1331`) — NOT just the `Label` entries that happen to lie on the
+        // branched path. cyrup's `self.labels` (target id → (label, original timestamp)) is the exact
+        // equivalent, rebuilt over the WHOLE file in `rebuild_index`/`apply_label` with latest-wins +
+        // cleared-removed semantics. Iterating it (a) preserves the latest label even when the
+        // governing `Label` entry is off-path, and (b) never re-emits a set-then-cleared label.
         let retained_ids: std::collections::HashSet<EntryId> =
             retained.iter().map(Entry::id).collect();
-        for e in &path_entries {
-            if let Entry::Known(KnownEntry::Label { target_id, label, .. }) = e
-                && retained_ids.contains(target_id) {
-                    let base = EntryBase {
-                        id: gen_short_id(),
-                        parent_id: prev.clone(),
-                        timestamp: now_ts(),
-                    };
-                    let lbl = Entry::known(KnownEntry::Label {
-                        base,
-                        target_id: target_id.clone(),
-                        label: label.clone(),
-                    });
-                    prev = Some(lbl.id());
-                    retained.push(lbl);
+        // Pi iterates `labelsById` in JS `Map` insertion order: a target is positioned at its FIRST
+        // live `set` and removed on clear (a re-`set` of a still-live target keeps its slot). Replay
+        // the full-file label entries with those semantics so the trailing label order is
+        // deterministic and matches Pi (ids themselves are irreducibly random in both ports).
+        let mut order: Vec<EntryId> = Vec::new();
+        for e in &self.entries {
+            if let Entry::Known(KnownEntry::Label { target_id, label, .. }) = e {
+                match label {
+                    Some(_) => {
+                        if !order.contains(target_id) {
+                            order.push(target_id.clone());
+                        }
+                    }
+                    None => order.retain(|t| t != target_id),
                 }
+            }
+        }
+        for target_id in &order {
+            if !retained_ids.contains(target_id) {
+                continue;
+            }
+            // `self.labels` holds the latest (label, original-timestamp) for this target; absent ⇒
+            // cleared (skip). Pi re-emits with the ORIGINAL `labelTimestampsById` timestamp, NOT now.
+            if let Some((label, label_ts)) = self.labels.get(target_id) {
+                let base = EntryBase {
+                    id: gen_short_id(),
+                    parent_id: prev.clone(),
+                    timestamp: label_ts.clone(),
+                };
+                let lbl = Entry::known(KnownEntry::Label {
+                    base,
+                    target_id: target_id.clone(),
+                    label: Some(label.clone()),
+                });
+                prev = Some(lbl.id());
+                retained.push(lbl);
+            }
         }
 
         let previous_session_file = self.session_file().map(|p| p.to_string_lossy().into_owned());

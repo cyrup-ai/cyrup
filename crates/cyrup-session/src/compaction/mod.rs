@@ -46,8 +46,8 @@ pub use summarize::{
     TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use tokens::{
-    context_tokens_from_usage, estimate_context_tokens, estimate_tokens, ContextUsageEstimate,
-    TokenCache,
+    context_tokens_from_usage, estimate_context_tokens, estimate_context_tokens_raw,
+    estimate_tokens, ContextUsageEstimate, TokenCache,
 };
 
 /// Orchestrates compaction + branch summarization against a [`SessionManager`], wiring the pure
@@ -85,12 +85,15 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         if !s.enabled {
             return false;
         }
-        // Estimate over the actual built context (Pi passes `estimateContextTokens(builtContext)`,
-        // `compaction.ts:225-228`), which differs from a raw entry map when a compaction is on the
-        // path or there is no assistant usage to anchor the estimate.
+        // Estimate over the RAW `AgentMessage` context — Pi passes
+        // `estimateContextTokens(buildSessionContext(pathEntries).messages)`
+        // (`compaction.ts:192-228,678`; `session-manager.ts:389-403`), whose `messages` keep the
+        // `bashExecution`/`branchSummary`/`compactionSummary`/`custom` roles intact. Estimating over
+        // the `convertToLlm`-rendered context instead would over-count summary wrappers and DROP
+        // `excludeFromContext` bash messages that Pi's raw context still counts.
         let refs: Vec<&Entry> = path.iter().collect();
-        let msgs = crate::context::build_context_messages(&refs);
-        let est = estimate_context_tokens(&msgs);
+        let msgs = crate::context::build_context_agent_messages(&refs);
+        let est = estimate_context_tokens_raw(&msgs);
         est.tokens > window.saturating_sub(s.reserve_tokens)
     }
 

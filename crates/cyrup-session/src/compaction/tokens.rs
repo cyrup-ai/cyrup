@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use cyrup_core::{Content, EntryId, Message, StopReason, Usage};
 
 use crate::agent_message::AgentMessage;
-use crate::context::push_as_message;
+use crate::context::{push_as_message, RawContextMessage};
 use crate::entry::{Entry, KnownEntry};
 
 /// Images count as this many chars before the `/4` division (Pi parity).
@@ -140,6 +140,57 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextUsageEstimate {
         .unwrap_or(&[])
         .iter()
         .map(estimate_tokens)
+        .fold(0u32, |a, b| a.saturating_add(b));
+    ContextUsageEstimate {
+        tokens: usage_tokens.saturating_add(trailing_tokens),
+        usage_tokens,
+        trailing_tokens,
+        last_usage_index,
+    }
+}
+
+/// Pi `estimateTokens` over a single [`RawContextMessage`] (`compaction.ts:256-296`): a
+/// `bashExecution` costs `(command+output)/4` (counted even when `excludeFromContext`), a `custom`
+/// costs its content chars/4, a `branchSummary`/`compactionSummary` costs `summary.length/4`, and
+/// core roles match [`estimate_tokens`]. This is the raw per-role basis Pi uses for `tokensBefore`,
+/// NOT the LLM-rendered text.
+fn estimate_raw_message(msg: &RawContextMessage) -> u32 {
+    match msg {
+        RawContextMessage::Agent(a) => estimate_agent_message(a),
+        RawContextMessage::CustomContent(c) => estimate_custom_message_content(c),
+        RawContextMessage::BranchSummary(s) | RawContextMessage::CompactionSummary(s) => {
+            estimate_summary_text(s)
+        }
+    }
+}
+
+/// Estimate live context over the **raw `AgentMessage`** context (Pi
+/// `estimateContextTokens(buildSessionContext(pathEntries).messages)`, `compaction.ts:192-228,678`).
+/// Identical anchor logic to [`estimate_context_tokens`] — prefer the last *valid* core-assistant
+/// usage, then locally estimate the trailing messages — but the trailing estimate dispatches on the
+/// raw role via [`estimate_raw_message`], so bash/summary/excluded-bash entries after the anchor are
+/// counted exactly as Pi counts them (not as their `convertToLlm`-rendered, wrapper-padded text).
+pub fn estimate_context_tokens_raw(messages: &[RawContextMessage]) -> ContextUsageEstimate {
+    let mut last_usage_index = None;
+    let mut usage_tokens = 0;
+    for (i, m) in messages.iter().enumerate() {
+        if let RawContextMessage::Agent(boxed) = m
+            && let AgentMessage::Core(Message::Assistant(a)) = boxed.as_ref()
+        {
+            let valid = !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted);
+            let tok = context_tokens_from_usage(&a.usage);
+            if valid && tok > 0 {
+                last_usage_index = Some(i);
+                usage_tokens = tok;
+            }
+        }
+    }
+    let trailing_start = last_usage_index.map(|i| i + 1).unwrap_or(0);
+    let trailing_tokens: u32 = messages
+        .get(trailing_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(estimate_raw_message)
         .fold(0u32, |a, b| a.saturating_add(b));
     ContextUsageEstimate {
         tokens: usage_tokens.saturating_add(trailing_tokens),
