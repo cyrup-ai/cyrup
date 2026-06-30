@@ -1559,6 +1559,11 @@ impl<B: Backend> App<B> {
                 self.state.status.set_thinking_level(level.clone());
                 self.state.transcript.push_status(format!("thinking → {level}"));
             }
+            AgentSessionEvent::SessionInfoChanged { name } => {
+                // Pi `interactive-mode.ts:2784` mirrors the renamed session into the header/status.
+                let label = name.clone().unwrap_or_default();
+                self.state.transcript.push_status(format!("session renamed → {label}"));
+            }
             // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
             // re-subscribes to the runtime's new generation on `SessionReplaced` (R-11-021); the
             // re-subscription itself is driven by the app's runtime watch, not this transcript hook.

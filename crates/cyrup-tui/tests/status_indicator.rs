@@ -88,7 +88,7 @@ fn agent_start_renders_band_and_agent_end_clears_it() {
         "spinner glyph not rendered:\n{working}"
     );
 
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![] });
+    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     let idle = buf_text(&app);
     assert!(!idle.contains("Working…"), "working band lingered after AgentEnd:\n{idle}");

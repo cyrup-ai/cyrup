@@ -308,7 +308,9 @@ async fn run() -> anyhow::Result<i32> {
                 .build()
                 .await
             {
-                Ok(s) => Arc::new(s),
+                // Bind the self-handle (via `into_shared`) so the post-run loop — auto-retry,
+                // post-run auto-compaction, queued continuations — fires for one-shot print/json runs.
+                Ok(s) => s.into_shared(),
                 // Non-interactive no-models-available guard (Pi main.ts:795-798).
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),
                 Err(e) => return Err(anyhow::Error::new(e).context("building agent session")),

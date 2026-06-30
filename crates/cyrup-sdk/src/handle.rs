@@ -5,6 +5,8 @@
 //! in `cyrup-session-svc` and below — `Session` only forwards calls and offers a couple of
 //! collect-to-completion conveniences so a typical embedder needs no stream plumbing of its own.
 
+use std::sync::Arc;
+
 use cyrup_core::{EventStream, ModelRef, SessionId};
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionServices, PromptAccepted, UserInput,
@@ -31,13 +33,15 @@ use crate::error::SdkResult;
 /// # Ok(()) }
 /// ```
 pub struct Session {
-    inner: AgentSession,
+    inner: Arc<AgentSession>,
 }
 
 impl Session {
-    /// Wrap a built [`AgentSession`]. Called by [`crate::CyrupBuilder::build_session`].
+    /// Wrap a built [`AgentSession`]. Called by [`crate::CyrupBuilder::build_session`]. Binds the
+    /// session's self-handle (via `into_shared`) so the post-run execution loop — auto-retry,
+    /// post-run auto-compaction, queued continuations — actually fires from a completed turn.
     pub(crate) fn new(inner: AgentSession) -> Self {
-        Self { inner }
+        Self { inner: inner.into_shared() }
     }
 
     /// Borrow the underlying facade for any method not surfaced here (escape hatch).
@@ -53,7 +57,14 @@ impl Session {
         &self.inner
     }
 
-    /// Consume the handle and return the wrapped [`AgentSession`].
+    /// The shared session `Arc` (clone-cheap; share across tasks).
+    pub fn agent_session_arc(&self) -> Arc<AgentSession> {
+        self.inner.clone()
+    }
+
+    /// Consume the handle and return the shared [`AgentSession`] (the post-run driver + subscriber
+    /// hold weak references to this same `Arc`, so the seam is returned as the `Arc` rather than moved
+    /// out of it).
     ///
     /// # Examples
     /// ```no_run
@@ -62,7 +73,7 @@ impl Session {
     /// let _ = facade;
     /// # }
     /// ```
-    pub fn into_inner(self) -> AgentSession {
+    pub fn into_inner(self) -> Arc<AgentSession> {
         self.inner
     }
 

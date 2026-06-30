@@ -155,7 +155,7 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
         message: AgentMessage::user_text(""),
         assistant_message_event: Box::new(StreamEvent::terminal(final_msg)),
     });
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![] });
+    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     assert!(
         app.scrollback_text().contains("assistant: The live stream is done"),
@@ -187,7 +187,7 @@ fn ingest_events_drive_status_and_transcript() {
     assert!(!text.contains("model → openai/gpt"), "status entry leaked into viewport:\n{text}");
 
     // AgentEnd clears the streaming flag; the footer keeps showing the model (no idle word).
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![] });
+    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
     let after = buf_text(&app);
     assert!(after.contains("openai/gpt"), "footer model lost after agent_end:\n{after}");
@@ -230,7 +230,7 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     assert!(app.scrollback_text().contains("you: question?"), "user not flushed to scrollback");
 
     // AgentEnd finalizes the streaming assistant turn.
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![] });
+    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
