@@ -212,6 +212,34 @@ impl Settings {
             .and_then(Value::as_str)
             .map(str::to_string)
     }
+
+    /// Read a `Vec<String>` settings array from THIS layer alone (no merge), with Pi's empty-array
+    /// default for an absent/non-array value. Mirrors [`EffectiveSettings::string_list`] but reads a
+    /// single raw layer so a caller can split global- vs project-scope resource overrides (Pi
+    /// `SettingsManager` exposes the per-layer `globalSettings`/`projectSettings` split,
+    /// settings-manager.ts:455-470).
+    fn layer_string_list(&self, key: &str) -> Vec<String> {
+        self.obj
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// `getSkillPaths` for THIS layer only (Pi `globalSettings.skills`/`projectSettings.skills`).
+    pub fn skill_paths(&self) -> Vec<String> {
+        self.layer_string_list("skills")
+    }
+
+    /// `getPromptTemplatePaths` for THIS layer only.
+    pub fn prompt_template_paths(&self) -> Vec<String> {
+        self.layer_string_list("prompts")
+    }
+
+    /// `getThemePaths` for THIS layer only.
+    pub fn theme_paths(&self) -> Vec<String> {
+        self.layer_string_list("themes")
+    }
 }
 
 /// Remove keys that are only honoured globally (§4.8: `defaultProjectTrust`).
@@ -1375,6 +1403,38 @@ mod tests {
         // without CLI, project wins
         let mgr2 = SettingsManager::load(store, Settings::new(), true);
         assert_eq!(mgr2.effective().default_model(), Some("p".to_string()));
+    }
+
+    #[test]
+    fn per_layer_resource_path_accessors_read_a_single_scope() {
+        // gap-09 #26 cross-layer wiring: `global()`/`project()` expose the per-layer split so a
+        // consumer (session-svc DiscoveryConfig) can gate global- vs project-scope resource
+        // overrides independently — NOT from the merged `effective()` view (which would let a
+        // project list silently widen the global scope, or vice-versa).
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "skills": ["g-skill"], "prompts": ["g-prompt"], "themes": ["g-theme"] }"#,
+        );
+        store.seed(
+            SettingsScope::Project,
+            r#"{ "skills": ["p-skill-a", "p-skill-b"], "prompts": ["p-prompt"] }"#,
+        );
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        // Each layer reports ONLY its own list (no merge).
+        assert_eq!(mgr.global().skill_paths(), vec!["g-skill".to_string()]);
+        assert_eq!(
+            mgr.project().skill_paths(),
+            vec!["p-skill-a".to_string(), "p-skill-b".to_string()]
+        );
+        assert_eq!(mgr.global().prompt_template_paths(), vec!["g-prompt".to_string()]);
+        assert_eq!(mgr.project().prompt_template_paths(), vec!["p-prompt".to_string()]);
+        // `themes` set only globally: project layer is empty (NOT inheriting the global value).
+        assert_eq!(mgr.global().theme_paths(), vec!["g-theme".to_string()]);
+        assert!(mgr.project().theme_paths().is_empty());
+        // The merged effective view still unions them (sanity: per-layer != effective).
+        assert!(mgr.effective().skill_paths().len() >= mgr.global().skill_paths().len());
     }
 
     #[test]

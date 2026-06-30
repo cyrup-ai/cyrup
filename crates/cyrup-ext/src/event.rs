@@ -187,6 +187,36 @@ impl Subscriptions {
     }
 }
 
+/// Where a user submission originated, as delivered to an `input` handler (Pi `InputSource`,
+/// extensions/types.ts:789 — `"interactive" | "rpc" | "extension"`). The richer host-side
+/// provenance is collapsed onto Pi's three handler-visible values at the dispatch boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InputEventSource {
+    Interactive,
+    Rpc,
+    Extension,
+}
+
+impl Default for InputEventSource {
+    /// Pi's default when no `source` is supplied (`options?.source ?? "interactive"`,
+    /// agent-session.ts:1021).
+    fn default() -> Self {
+        Self::Interactive
+    }
+}
+
+/// How a submission delivered while the agent is streaming will be queued (Pi
+/// `streamingBehavior`, extensions/types.ts:801 — `"steer" | "followUp"`). `None` on the
+/// [`HostEvent::Input`] event means the agent is idle (Pi passes `undefined` when not streaming,
+/// agent-session.ts:1022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InputStreamingBehavior {
+    Steer,
+    FollowUp,
+}
+
 /// The host event (host -> guest). One arm per func-08 §5 event; payload = minimum-spec record.
 /// Open-shaped fields carry `serde_json::Value`; fixed-shape ids/roles are typed (arch-08 §3.4).
 #[derive(Clone, Debug)]
@@ -233,8 +263,16 @@ pub enum HostEvent {
     ProjectTrust,
     // 5.5 input / 5.6 provider / model (Pi types.ts:1158-1163)
     // Carries the submission text AND the attached images (Pi `InputEvent.text`/`.images`,
-    // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119).
-    Input { text: String, images: Vec<Content> },
+    // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119),
+    // PLUS the `source` (Pi `InputEvent.source`, types.ts:799) and the in-flight `streaming_behavior`
+    // (Pi `InputEvent.streamingBehavior`, types.ts:801, `undefined` when idle) so a handler can
+    // branch on interactive-vs-queued / steer-vs-follow-up before deciding (Pi runner.ts:1108-1114).
+    Input {
+        text: String,
+        images: Vec<Content>,
+        source: InputEventSource,
+        streaming_behavior: Option<InputStreamingBehavior>,
+    },
     UserBash { command: String, operations: Value },
     BeforeProviderRequest { payload: Value },
     AfterProviderResponse { status: u32, headers: Value },

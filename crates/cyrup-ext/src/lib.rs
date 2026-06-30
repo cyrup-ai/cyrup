@@ -47,7 +47,7 @@ pub use aggregate::{
 pub use contract::{EventPatch, HandledValue, HookOutcome, Reduced};
 pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 pub use error::ExtError;
-pub use event::{EventKind, HostEvent, Subscriptions};
+pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
 pub use facade::{ExtensionHost, HostConfig};
 pub use build::build_component;

@@ -346,7 +346,13 @@ impl SessionBuilder {
         // can merge extension-contributed skill/prompt/theme paths into the registry the skill
         // pointers + system prompt are then derived from.
         let (mode, has_ui) = ext_mode(cfg.app_mode);
-        let host = ExtensionHost::new(HostConfig { mode, has_ui, cwd: cwd.clone() });
+        let host_config = HostConfig { mode, has_ui, cwd: cwd.clone() };
+        // With `wasm-host`, spin up the Wasmtime engine so live wasm extensions can be loaded with
+        // `LiveHostServices` injected (the seam below); otherwise a native-only host (the default).
+        #[cfg(feature = "wasm-host")]
+        let host = ExtensionHost::with_wasm(host_config)?;
+        #[cfg(not(feature = "wasm-host"))]
+        let host = ExtensionHost::new(host_config);
         for ext in self.native_extensions {
             host.load_native(ext).await?;
         }
@@ -358,18 +364,21 @@ impl SessionBuilder {
         disc.enable_skills = !cfg.no_skills;
         // Settings-tier resource overrides (cross-layer wiring; Pi `package-manager.ts:2265-2278`):
         // the `skills`/`prompts`/`themes` settings lists are enable/disable patterns over the
-        // auto-discovered loose resources. Without this the resource settings-tier never activates
-        // (DiscoveryConfig left both override sets empty = unconditionally enabled). The layered
-        // `SettingsManager` exposes only the merged effective view, so both global- and project-scope
-        // overrides are sourced from it (empty lists — the default — preserve "discover everything").
-        let eff = settings.effective();
-        let overrides = ResourceOverrides {
-            skills: eff.skill_paths(),
-            prompts: eff.prompt_template_paths(),
-            themes: eff.theme_paths(),
+        // auto-discovered loose resources. The layered `SettingsManager` exposes the per-layer split
+        // (Pi `globalSettings`/`projectSettings`, settings-manager.ts:455-470), so global-scope
+        // discovery is gated by the GLOBAL layer's lists and project-scope by the PROJECT layer's —
+        // not the merged effective view (which would let a project list silently widen the global
+        // scope, or vice-versa). Empty lists — the default — preserve "discover everything".
+        disc.global_overrides = ResourceOverrides {
+            skills: settings.global().skill_paths(),
+            prompts: settings.global().prompt_template_paths(),
+            themes: settings.global().theme_paths(),
         };
-        disc.global_overrides = overrides.clone();
-        disc.project_overrides = overrides;
+        disc.project_overrides = ResourceOverrides {
+            skills: settings.project().skill_paths(),
+            prompts: settings.project().prompt_template_paths(),
+            themes: settings.project().theme_paths(),
+        };
         let report = discover(&disc, cancel.token()).await?;
         // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
         // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
@@ -539,6 +548,12 @@ impl SessionBuilder {
             resolved_model.context_window,
             Some(thinking_level_to_str(thinking)),
         );
+        // Wire the command-tier control channel so a loaded extension's `control` capability
+        // (new/switch/fork/compact/set-model/…) reaches a real session effect: the SYNC guest call
+        // queues a `ControlOp` that `AgentSession::apply_pending_control` drains + applies (Pi
+        // `createCommandContext`, agent-session.ts:1158). The same `host_services` is the
+        // `Arc<dyn HostServices>` a wasm host load injects, so guest capabilities reach live state.
+        host_services.wire_control_channel();
 
         // Resolve the settings-driven knobs for the retry / auto-compaction subsystems BEFORE the
         // `settings` value is moved into the services bundle.

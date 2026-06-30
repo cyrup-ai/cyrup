@@ -15,6 +15,7 @@ use cyrup_core::ModelRef;
 use cyrup_ext::host::{ControlOp, HostServices};
 use cyrup_provider::Provider;
 use serde_json::{json, Value};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// A command-tier control sink: a loaded extension's `control` import (new/switch/fork/…) is routed
 /// here so the runtime can act on it (Pi `createCommandContext`, agent-session.ts:1158). Set by the
@@ -36,13 +37,24 @@ pub struct LiveHostServices {
     provider: Arc<dyn Provider>,
     snapshot: Mutex<LiveSnapshot>,
     control: Mutex<Option<ControlSink>>,
+    /// Receiver half of the command-tier control channel (see [`Self::wire_control_channel`]). A
+    /// guest's `control` capability call reaches the SYNC [`HostServices::control`] method (the
+    /// guest is wasm-suspended and cannot await), which forwards the [`ControlOp`] here; the session
+    /// drains + applies it at a command-tier-safe point (Pi runs `createCommandContext` ops directly,
+    /// agent-session.ts:1158 — cyrup bridges the sync→async gap via this queue).
+    control_rx: Mutex<Option<UnboundedReceiver<ControlOp>>>,
 }
 
 impl LiveHostServices {
     /// Wire a backend to the session's `provider`. Model/state are seeded via [`Self::update_model`]
     /// and [`Self::update_state`]; the control sink is attached later by the runtime.
     pub fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider, snapshot: Mutex::new(LiveSnapshot::default()), control: Mutex::new(None) }
+        Self {
+            provider,
+            snapshot: Mutex::new(LiveSnapshot::default()),
+            control: Mutex::new(None),
+            control_rx: Mutex::new(None),
+        }
     }
 
     fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -67,6 +79,33 @@ impl LiveHostServices {
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
     pub fn set_control_sink(&self, sink: ControlSink) {
         *Self::lock(&self.control) = Some(sink);
+    }
+
+    /// Wire the command-tier control channel: a loaded extension's `control` capability (new/switch/
+    /// fork/compact/set-model/…) is forwarded onto an in-process queue the session drains via
+    /// [`Self::take_pending_control`]. This is the bridge that lets a wasm guest (suspended across
+    /// the SYNC `control()` call) drive a real, ASYNC session effect. Idempotent: re-wiring replaces
+    /// the channel (a fresh session generation gets a fresh queue).
+    pub fn wire_control_channel(&self) {
+        let (tx, rx): (UnboundedSender<ControlOp>, UnboundedReceiver<ControlOp>) =
+            tokio::sync::mpsc::unbounded_channel();
+        self.set_control_sink(Arc::new(move |op| {
+            tx.send(op).map_err(|e| format!("control channel closed: {e}"))
+        }));
+        *Self::lock(&self.control_rx) = Some(rx);
+    }
+
+    /// Drain every queued control op (non-blocking). The session applies the session-tier ops and
+    /// hands the rest to the runtime (Pi `createCommandContext`, agent-session.ts:1158).
+    pub fn take_pending_control(&self) -> Vec<ControlOp> {
+        let mut g = Self::lock(&self.control_rx);
+        let mut out = Vec::new();
+        if let Some(rx) = g.as_mut() {
+            while let Ok(op) = rx.try_recv() {
+                out.push(op);
+            }
+        }
+        out
     }
 }
 

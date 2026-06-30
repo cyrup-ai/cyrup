@@ -88,7 +88,7 @@ impl HostEvent {
             }
             // `input` (Pi runner.ts:1116-1119): always rewrite the text; replace images only when
             // the handler supplied them (`Some`), else keep the folded-so-far images.
-            (HostEvent::Input { text, images }, EventPatch::Input { text: t, images: i }) => {
+            (HostEvent::Input { text, images, .. }, EventPatch::Input { text: t, images: i }) => {
                 *text = t;
                 if let Some(i) = i {
                     *images = i;

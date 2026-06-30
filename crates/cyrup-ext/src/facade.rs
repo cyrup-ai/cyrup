@@ -40,6 +40,10 @@ pub struct ExtensionHost {
     registry: Arc<ExtensionRegistry>,
     config: HostConfig,
     loaded: RwLock<Vec<ExtensionId>>,
+    /// Loaded native built-ins keyed by id — the native slash-command routing table (R-08-016). A
+    /// native command runs in-process (no wasm), so the handle is kept here to reach its
+    /// [`NativeExtension::execute_command`] when a `/<cmd>` it owns is invoked.
+    native: RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExtension>>>,
     #[cfg(feature = "wasm-host")]
     wasm: Option<crate::host_runtime::WasmRuntime>,
     /// Loaded live wasm instances keyed by id — the slash-command/reload routing table (R-08-016/005).
@@ -62,6 +66,7 @@ impl ExtensionHost {
             registry: Arc::new(ExtensionRegistry::new()),
             config,
             loaded: RwLock::new(Vec::new()),
+            native: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm-host")]
             wasm: None,
             #[cfg(feature = "wasm-host")]
@@ -86,10 +91,51 @@ impl ExtensionHost {
             self.registry.register_command(id.clone(), name, desc)?;
         }
 
+        // Keep the native handle for command-tier slash execution (R-08-016) before it is wrapped
+        // for event dispatch.
+        if let Ok(mut g) = self.native.write() {
+            g.insert(id.clone(), ext.clone());
+        }
         let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
         let handle = Arc::new(NativeHandle::new(ext, subs, ctx));
         self.dispatcher.add(handle)?;
         Ok(())
+    }
+
+    /// Execute a NATIVE built-in's registered slash command (Pi `_tryExecuteExtensionCommand` →
+    /// `command.handler(args, ctx)`, agent-session.ts:1148-1172; R-08-016). Routes the command name
+    /// to its owning native extension and runs [`NativeExtension::execute_command`] with a
+    /// **command-tier** [`HostCtx`] (session mutation allowed). Returns `Ok(None)` when no native
+    /// extension owns the command (the caller falls through, e.g. to the wasm path or normal prompt
+    /// handling); `Ok(Some(_))`/`Ok(Some(None))` when a native owner serviced it. Panic-contained
+    /// like event dispatch (R-08-036): a panicking handler is surfaced as `ExtError::Panicked`.
+    pub async fn execute_native_command(
+        &self,
+        name: &str,
+        args: &str,
+        cancel: &CancelToken,
+    ) -> Result<Option<Result<Option<String>, ExtError>>, ExtError> {
+        let owner = match self.registry.command_owner(name)? {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let ext = match self.native.read().ok().and_then(|g| g.get(&owner).cloned()) {
+            Some(e) => e,
+            // The command is owned by a non-native (wasm) extension: not our route.
+            None => return Ok(None),
+        };
+        let ctx = HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+        let fut = std::panic::AssertUnwindSafe(ext.execute_command(name, args, &ctx));
+        use futures::FutureExt;
+        let raced = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(Some(Err(ExtError::Cancelled))),
+            r = fut.catch_unwind() => r,
+        };
+        match raced {
+            Ok(out) => Ok(Some(out)),
+            Err(panic) => Ok(Some(Err(ExtError::Panicked(native_panic_msg(panic))))),
+        }
     }
 
     /// The ordered-awaited, notify-only subscriber handed to the agent (R-02-012/048).
@@ -312,6 +358,9 @@ impl ExtensionHost {
         // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
         self.dispatcher.clear()?;
         self.registry.clear()?;
+        if let Ok(mut g) = self.native.write() {
+            g.clear();
+        }
         if let Ok(mut g) = self.live.write() {
             g.clear();
         }
@@ -333,6 +382,27 @@ impl ExtensionHost {
     #[cfg(feature = "wasm-host")]
     const WASM_EPOCH_BUDGET_TICKS: u64 = 1000;
 
+    /// Names of every registered native command (diagnostics / completion). A subset of
+    /// [`ExtensionRegistry::command_names`] limited to native-owned commands.
+    pub fn native_command_names(&self) -> Vec<String> {
+        let native = match self.native.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        self.registry
+            .command_names()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| {
+                self.registry
+                    .command_owner(n)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|o| native.contains_key(&o))
+            })
+            .collect()
+    }
+
     fn reserve_id(&self, id: &ExtensionId) -> Result<(), ExtError> {
         let mut g = self.loaded.write().map_err(|_| ExtError::Io("host lock poisoned".into()))?;
         if g.iter().any(|e| e == id) {
@@ -340,5 +410,17 @@ impl ExtensionHost {
         }
         g.push(id.clone());
         Ok(())
+    }
+}
+
+/// Extract a panic payload message (mirrors `native::panic_msg`, kept local so the facade does not
+/// reach into the native module's private helper).
+fn native_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic".to_string()
     }
 }

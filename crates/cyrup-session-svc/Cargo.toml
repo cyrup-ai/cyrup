@@ -11,6 +11,14 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Off by default (native-only build, no wasmtime). Enabling forwards to cyrup-ext's existing
+# `wasm-host` feature so the extension host spins up the Wasmtime engine and `LiveHostServices` is
+# injected into live wasm extension loads. Enabling is gated on the wasm32-wasip2 guest toolchain
+# for a full end-to-end (see the residual ledger, cyrup-session-svc L7 row); the injection SEAM and
+# the control→session-effect bridge are always compiled + tested.
+wasm-host = ["cyrup-ext/wasm-host"]
+
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-agent = { workspace = true }

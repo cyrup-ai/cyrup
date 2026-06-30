@@ -177,6 +177,21 @@ pub trait NativeExtension: Send + Sync {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError>;
     /// Handle one event. Returns this extension's block/mutate/notify contribution.
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome;
+
+    /// Execute a registered slash command this extension owns (Pi `command.handler(args, ctx)`,
+    /// agent-session.ts:1159; R-08-016). `ctx` is **command-tier** (session mutation allowed). The
+    /// optional `String` is the command's text output (Pi commands return `void`; cyrup mirrors the
+    /// WASM `execute-command` shape so the two paths are interchangeable). The default rejects: a
+    /// native built-in that registers a command via [`InitApi::register_command`] MUST override this
+    /// to service it. Built-ins that only subscribe to events leave it unimplemented.
+    async fn execute_command(
+        &self,
+        name: &str,
+        _args: &str,
+        _ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
+    }
 }
 
 /// Wraps a `NativeExtension` into the unified [`Extension`] handle, applying panic containment

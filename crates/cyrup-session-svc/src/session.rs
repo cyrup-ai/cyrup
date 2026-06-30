@@ -13,7 +13,8 @@ use cyrup_core::{
     AssistantMessage, CancelToken, Content, EntryId, EventStream, Message, ModelId,
     ModelRef, ModelThinkingLevel, ProviderId, SessionId,
 };
-use cyrup_ext::{HostEvent, Reduced};
+use cyrup_ext::host::ControlOp;
+use cyrup_ext::{HostEvent, InputEventSource, InputStreamingBehavior, Reduced};
 use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model, Provider};
 use cyrup_session::compaction::{
     BranchSummarySettings, CompactionReason, CompactionSettings, Compactor, NoHooks,
@@ -27,8 +28,8 @@ use crate::bash::{bash_message_payload, run_bash, BashOptions, BashResult};
 use crate::compact::DynSummarizer;
 use crate::error::SessionServiceError;
 use crate::event::{
-    core_message_to_agent, AgentSessionEvent, PromptAccepted, PromptOptions, StreamingBehavior,
-    UserInput,
+    core_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted, PromptOptions,
+    StreamingBehavior, UserInput,
 };
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
@@ -115,6 +116,46 @@ enum InputDisposition {
     /// No handler claimed it; proceed with expansion + run/queue (text/images may have been
     /// rewritten by a `transform` handler already applied to the [`UserInput`]).
     Continue,
+}
+
+/// Collapse the host-side [`InputSource`] onto Pi's three handler-visible `InputSource` values
+/// (`"interactive" | "rpc" | "extension"`, extensions/types.ts:789). cyrup's richer provenance
+/// (`Cli`/`Stdin`/`Sdk`/`Tui`) all present as `interactive` to a handler, exactly as Pi's host
+/// passes `"interactive"` for any non-rpc submission (agent-session.ts:1021).
+fn input_event_source(source: InputSource) -> InputEventSource {
+    match source {
+        InputSource::Rpc => InputEventSource::Rpc,
+        InputSource::Cli | InputSource::Stdin | InputSource::Sdk | InputSource::Tui => {
+            InputEventSource::Interactive
+        }
+    }
+}
+
+/// Map the queue selector onto the handler-visible `streamingBehavior` (Pi `"steer" | "followUp"`).
+fn input_streaming_behavior(behavior: StreamingBehavior) -> InputStreamingBehavior {
+    match behavior {
+        StreamingBehavior::Steer => InputStreamingBehavior::Steer,
+        StreamingBehavior::FollowUp => InputStreamingBehavior::FollowUp,
+    }
+}
+
+/// Parse a guest `setModel` payload (a `control` capability arg) into `(provider, model)`. Accepts
+/// either `"provider/model"` (Pi's `provider/model` id form) or `{ "provider": .., "model": .. }`.
+/// Returns `None` for an unparseable payload (degrade, never panic).
+fn parse_model_ref(v: &serde_json::Value) -> Option<(ProviderId, ModelId)> {
+    if let Some(s) = v.as_str() {
+        let (p, m) = s.split_once('/')?;
+        if p.is_empty() || m.is_empty() {
+            return None;
+        }
+        return Some((ProviderId::from(p), ModelId::from(m)));
+    }
+    let p = v.get("provider").and_then(serde_json::Value::as_str)?;
+    let m = v.get("model").and_then(serde_json::Value::as_str)?;
+    if p.is_empty() || m.is_empty() {
+        return None;
+    }
+    Some((ProviderId::from(p), ModelId::from(m)))
 }
 
 /// What [`AgentSession::prepare`] resolved a submission to (the shared `prompt` preflight outcome).
@@ -358,15 +399,32 @@ impl AgentSession {
         mut ui: UserInput,
         options: PromptOptions,
     ) -> Result<Prepared, SessionServiceError> {
+        let streaming = self.is_streaming().await;
+        // 0. Slash extension-command exec FIRST (Pi `_tryExecuteExtensionCommand`,
+        //    agent-session.ts:1004-1013): for `expandPromptTemplates && text.startsWith("/")`, if a
+        //    registered command name matches, run its handler and short-circuit (no prompt sent).
+        //    Matches Pi's order: tried BEFORE the `input` event + before skill/template expansion.
+        if ui.expand_templates
+            && ui.text.starts_with('/')
+            && self.try_execute_extension_command(&ui.text).await
+        {
+            return Ok(Prepared::Handled);
+        }
         // 1. `input` extension event, emitted BEFORE expansion (Pi agent-session.ts:1015-1033). A
         //    handler that returns `handled` fully services the submission — no run, no queue; a
-        //    `transform` handler rewrites `ui` (text/images) in place before continuing.
-        if matches!(self.emit_input_event(&mut ui).await, InputDisposition::Handled) {
+        //    `transform` handler rewrites `ui` (text/images) in place before continuing. The handler
+        //    sees `streamingBehavior` only while streaming (Pi `this.isStreaming ? ... : undefined`,
+        //    agent-session.ts:1022).
+        let handler_behavior = if streaming { options.streaming_behavior } else { None };
+        if matches!(
+            self.emit_input_event(&mut ui, handler_behavior).await,
+            InputDisposition::Handled
+        ) {
             return Ok(Prepared::Handled);
         }
         // 2. While streaming, expand then queue per `streamingBehavior` (Pi agent-session.ts:1043-
         //    1056). Without a behavior the submission is rejected (Pi throws at :1044).
-        if self.is_streaming().await {
+        if streaming {
             let behavior = options
                 .streaming_behavior
                 .ok_or(SessionServiceError::StreamingNeedsBehavior)?;
@@ -385,12 +443,24 @@ impl AgentSession {
     /// *transform* it (`HookOutcome::Mutate(EventPatch::Input{..})`, Pi `action:"transform"`,
     /// runner.ts:1116-1119): the folded text/images flow back into `ui` and the submission continues
     /// with the rewritten content (Pi agent-session.ts:1029-1032).
-    async fn emit_input_event(&self, ui: &mut UserInput) -> InputDisposition {
+    async fn emit_input_event(
+        &self,
+        ui: &mut UserInput,
+        streaming_behavior: Option<StreamingBehavior>,
+    ) -> InputDisposition {
         if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::Input) {
             return InputDisposition::Continue;
         }
         let cancel = self.session_cancel.child_token();
-        let event = HostEvent::Input { text: ui.text.clone(), images: ui.images.clone() };
+        // Deliver the `source` (Pi `InputEvent.source`, agent-session.ts:1021) + the in-flight
+        // `streamingBehavior` (`undefined` when idle, :1022) so a handler can branch on
+        // interactive-vs-queued / steer-vs-follow-up before deciding (#13c).
+        let event = HostEvent::Input {
+            text: ui.text.clone(),
+            images: ui.images.clone(),
+            source: input_event_source(ui.source),
+            streaming_behavior: streaming_behavior.map(input_streaming_behavior),
+        };
         let reduced = self
             .services
             .ext_host
@@ -402,12 +472,35 @@ impl AgentSession {
             // Apply any `transform` the handler chain folded into the event (Pi
             // agent-session.ts:1029-1032: `currentText`/`currentImages` adopt the result).
             Reduced::Pass(ev) => {
-                if let HostEvent::Input { text, images } = *ev {
+                if let HostEvent::Input { text, images, .. } = *ev {
                     ui.text = text;
                     ui.images = images;
                 }
                 InputDisposition::Continue
             }
+        }
+    }
+
+    /// Try to execute a registered extension slash command (Pi `_tryExecuteExtensionCommand`,
+    /// agent-session.ts:1148-1172). Parses `/<name> <args>`, routes to the owning NATIVE extension
+    /// (R-08-016), and runs its command-tier handler. Returns `true` when a command was serviced
+    /// (the submission is fully handled — Pi returns `true` even when the handler errors, after
+    /// surfacing the error), `false` when no command matched (fall through to normal handling).
+    async fn try_execute_extension_command(&self, text: &str) -> bool {
+        let body = text.strip_prefix('/').unwrap_or(text);
+        let (name, args) = body.split_once(' ').unwrap_or((body, ""));
+        if name.is_empty() {
+            return false;
+        }
+        let cancel = self.session_cancel.child_token();
+        match self.services.ext_host.execute_native_command(name, args, &cancel).await {
+            // A native extension owned + serviced the command (Pi short-circuits regardless of the
+            // handler's own Ok/Err — the command was "handled").
+            Ok(Some(_)) => true,
+            // No native owner for this command name: not an extension command, fall through.
+            Ok(None) => false,
+            // Routing failure (e.g. poisoned lock): degrade to "not handled" (never panic).
+            Err(_) => false,
         }
     }
 
@@ -1279,6 +1372,41 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Drain + apply control ops a loaded extension queued via its `control` capability (Pi
+    /// `createCommandContext`, agent-session.ts:1158; arch-08 §6.3). This is the command-tier-safe
+    /// point that bridges the SYNC guest `control()` call to the real ASYNC session effect: a guest
+    /// that calls `session.setThinkingLevel(...)` / `setModel(...)` / `sendUserMessage(...)` / a
+    /// compaction reaches [`crate::host_services::LiveHostServices`], which queues the op; here it is
+    /// applied. Session-tier ops are handled in place; runtime-tier ops (new/switch/fork/navigate/
+    /// reload/wait-idle/send-message) are returned so the runtime can act on them. Mutating from a
+    /// command tier respects the deadlock rule (R-08-008): never called from inside the agent loop.
+    pub async fn apply_pending_control(&self) -> Vec<ControlOp> {
+        let ops = self.services.host_services.take_pending_control();
+        let mut deferred = Vec::new();
+        for op in ops {
+            match op {
+                ControlOp::SetThinkingLevel(level) => {
+                    if let Some(lv) = crate::builder::thinking_level_from_str(&level) {
+                        let _ = self.set_thinking_level(lv).await;
+                    }
+                }
+                ControlOp::SetModel(v) => {
+                    if let Some((provider, model)) = parse_model_ref(&v) {
+                        let _ = self.set_model_id(provider, model).await;
+                    }
+                }
+                ControlOp::SendUserMessage { content, .. } => {
+                    let _ = self.send_user_message(content, None).await;
+                }
+                ControlOp::Compact => {
+                    let _ = self.compact(None).await;
+                }
+                other => deferred.push(other),
+            }
+        }
+        deferred
+    }
+
     // --------------------------------------------------------------- thinking control ----
 
     /// The agent's current thinking level (Pi `thinkingLevel` getter, agent-session.ts:763).
@@ -1727,6 +1855,23 @@ impl AgentSession {
     /// Whether any loaded extension handles `kind` (Pi `hasExtensionHandlers`, agent-session.ts:3135).
     pub fn has_extension_handlers(&self, kind: cyrup_ext::EventKind) -> bool {
         !self.services.ext_host.dispatcher().no_subscribers(kind)
+    }
+
+    /// Load a live wasm extension COMPONENT into this session's host, injecting the session's
+    /// [`crate::host_services::LiveHostServices`] as the capability backend (arch-08 §5.6; Pi
+    /// `agent-session-services.ts` extension load). This is THE injection seam that retires the
+    /// cyrup-ext §08 ledger row: the same `host_services` that drives live model/session/control
+    /// state is what the guest's `models`/`session`/`control` imports reach. Behind the `wasm-host`
+    /// feature (the host is built with the Wasmtime engine); the default native-only build keeps a
+    /// guest-free host (full guest E2E is gated on the wasm32-wasip2 toolchain — residual ledger).
+    #[cfg(feature = "wasm-host")]
+    pub async fn load_wasm_extension(
+        &self,
+        id: cyrup_core::ExtensionId,
+        bytes: &[u8],
+    ) -> Result<Arc<cyrup_ext::host::LiveExtension>, SessionServiceError> {
+        let services: Arc<dyn cyrup_ext::host::HostServices> = self.services.host_services.clone();
+        Ok(self.services.ext_host.load_wasm(id, bytes, services).await?)
     }
 }
 
