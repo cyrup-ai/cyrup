@@ -19,7 +19,7 @@ use cyrup_core::{CancelToken, EventStream};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
-use cyrup_session_svc::ForkPosition;
+use cyrup_session_svc::{ForkPosition, NavigateTreeOptions};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -39,13 +39,17 @@ use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
-use crate::keymap::{Action, EditorAction, Keymap, SelectKeymap};
+use crate::image::{ImageBlock, ImageRenderer};
+use crate::keymap::{Action, EditorAction, Keymap, SelectKeymap, TreeKeymap};
 use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
-use crate::selector::{ListSelector, Selector, SelectorKind, SelectorOutcome};
+use crate::selector::{
+    CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
+};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
 use crate::theme::UiTheme;
 use crate::transcript::{content_text, entry_lines, TranscriptView};
+use crate::tree_selector::{TreeNode, TreeSelector};
 
 /// The number of visual lines a `PageUp`/`PageDown` scrolls the active region by (a conservative
 /// screenful; spec/tui/07 page-scroll). Resolved on the pure input thread without the live viewport
@@ -127,6 +131,9 @@ pub struct AppState {
     /// The selector binding table (`tui.select.*`, spec/tui/05 §10) consulted while a selector owns
     /// the input slot.
     pub select_keymap: SelectKeymap,
+    /// The `/tree` bespoke binding table (`app.tree.*`, spec/tui/05 §6.1) handed to each opened
+    /// [`TreeSelector`] so JSON rebinds of fold/unfold/label flow through (R-10-018).
+    pub tree_keymap: TreeKeymap,
     /// The slash-command registry driving dispatch + autocomplete (rebuilt on `/reload`).
     pub commands: CommandRegistry,
     /// The active editor-swap selector, if any (spec/tui/05 §1.1): when `Some`, it replaces the
@@ -140,9 +147,20 @@ pub struct AppState {
     pub thinking_level: String,
     /// Whether inline images are shown (vs. a text placeholder), toggled by the show-images selector.
     pub show_images: bool,
+    /// The terminal image-protocol renderer (spec/tui/06 §6; `terminal-image.ts`). Defaults to the
+    /// portable half-block raster; the production binary upgrades it to the real protocol via
+    /// [`App::detect_image_support`]. Drives the inline render of [`AppState::pending_images`].
+    pub image_renderer: ImageRenderer,
+    /// Images attached to the next prompt (the `@`-mention of an image file / a paste), rendered
+    /// inline above the editor in the live region (`components/image.ts`), honoring `show_images`.
+    pub pending_images: Vec<ImageBlock>,
     /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
     /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
     pub reserve_status_rows: bool,
+    /// Whether the compact startup keybinding-hints bar is shown (Pi `compactInstructions`,
+    /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
+    /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
+    pub show_startup_hints: bool,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
@@ -162,12 +180,16 @@ impl AppState {
             theme,
             keymap: Keymap::default(),
             select_keymap: SelectKeymap::default(),
+            tree_keymap: TreeKeymap::default(),
             commands: CommandRegistry::new(),
             selector: None,
             overlays: Vec::new(),
             thinking_level: "medium".to_string(),
             show_images: true,
+            image_renderer: ImageRenderer::default(),
+            pending_images: Vec::new(),
             reserve_status_rows: false,
+            show_startup_hints: true,
             should_quit: false,
             scrollback: Vec::new(),
         }
@@ -240,6 +262,41 @@ impl<B: Backend> App<B> {
     /// reached native scrollback without driving a real terminal.
     pub fn scrollback_text(&self) -> String {
         self.state.scrollback.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Attach a decoded image to the next prompt (rendered inline above the editor, spec/tui/06 §6;
+    /// `components/image.ts`). The `@`-mention of an image file and clipboard-image paste both land here.
+    pub fn attach_image(&mut self, image: ImageBlock) {
+        self.state.pending_images.push(image);
+    }
+
+    /// Attach an image file by path (the `@`-mention image source); a no-op (returns `false`) when the
+    /// path is not a decodable image, so a stray mention never disrupts the prompt.
+    pub fn attach_image_path(&mut self, path: &std::path::Path) -> bool {
+        match ImageBlock::from_path(path) {
+            Some(block) => {
+                self.state.pending_images.push(block);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear all attached images (after the prompt is sent, or on `Esc`).
+    pub fn clear_images(&mut self) {
+        self.state.pending_images.clear();
+    }
+
+    /// The images attached to the next prompt (test/inspection access).
+    pub fn pending_images(&self) -> &[ImageBlock] {
+        &self.state.pending_images
+    }
+
+    /// Probe the controlling TTY for its real image protocol (Kitty/iTerm2/sixel), upgrading from the
+    /// portable half-block default (`terminal-image.ts` capability handshake). Called by the binary at
+    /// startup; tests keep the half-block default so the inline path renders to `TestBackend`.
+    pub fn detect_image_support(&mut self) {
+        self.state.image_renderer = ImageRenderer::detect();
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026).
@@ -319,7 +376,9 @@ impl<B: Backend> App<B> {
                 if self.state.selector.is_some() {
                     return AppAction::None;
                 }
-                self.state.editor.insert_str(s);
+                // Route bracketed paste through `handle_paste` so large pastes collapse to an atomic
+                // `[paste #N …]` marker (spec/tui/03 §5.5); small pastes insert verbatim.
+                self.state.editor.handle_paste(s);
                 AppAction::Redraw
             }
             InputEvent::Resize(_, _) => AppAction::Redraw,
@@ -342,7 +401,13 @@ impl<B: Backend> App<B> {
     /// selector + bash-execution subsystems land (tracked on the residual ledger). This keeps the
     /// editor → dispatch path real and faithful (commands never reach the agent as literal text).
     fn dispatch_submission(&mut self, text: &str) -> AppAction {
-        match self.state.commands.dispatch(text) {
+        let dispatch = self.state.commands.dispatch(text);
+        // The startup hint bar is a first-run affordance; any real submission dismisses it
+        // (Pi drops `compactInstructions` once the conversation begins).
+        if !matches!(dispatch, Dispatch::Empty) {
+            self.state.show_startup_hints = false;
+        }
+        match dispatch {
             Dispatch::Empty => AppAction::Redraw,
             Dispatch::Prompt(prompt) => {
                 self.state.transcript.push_user(prompt.clone());
@@ -631,6 +696,35 @@ impl<B: Backend> App<B> {
             Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
     }
 
+    /// Open the bespoke scoped-models checkbox+reorder selector (`scoped-models-selector.ts`,
+    /// spec/tui/05 §6) over the full `catalog` `(id, label, provider, desc)` with the current scope
+    /// (`None` = all enabled). Confirming (Ctrl+S) yields an [`AppCommand::ConfirmSelection`] the run
+    /// loop applies via `set_scoped_models`.
+    pub fn open_checkbox_selector(
+        &mut self,
+        catalog: Vec<(String, String, String, Option<String>)>,
+        enabled: Option<Vec<String>>,
+    ) {
+        let saved_editor = self.state.editor.text();
+        let inner: Box<dyn Selector> =
+            Box::new(CheckboxSelector::scoped_models(catalog, enabled));
+        self.state.selector = Some(ActiveSelector {
+            kind: SelectorKind::ScopedModels,
+            inner,
+            saved_editor,
+            restore_theme: None,
+        });
+    }
+
+    /// Open an arbitrary boxed [`Selector`] in the input slot under `kind` (the seam for the bespoke
+    /// non-list selectors — `/tree`'s [`TreeSelector`] — that are not a plain [`ListSelector`] yet need
+    /// the same editor-swap lifecycle as the data selectors). Snapshots the editor like the others.
+    pub fn open_boxed_selector(&mut self, kind: SelectorKind, inner: Box<dyn Selector>) {
+        let saved_editor = self.state.editor.text();
+        self.state.selector =
+            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
+    }
+
     /// The kind of the currently-open selector, if any (test/inspection access).
     pub fn active_selector_kind(&self) -> Option<SelectorKind> {
         self.state.selector.as_ref().map(|s| s.kind)
@@ -704,12 +798,7 @@ impl<B: Backend> App<B> {
     pub async fn execute_command(&mut self, cmd: AppCommand, session: &Arc<AgentSession>) {
         use AppCommand as C;
         match cmd {
-            C::OpenSelector(SelectorKind::Model | SelectorKind::ScopedModels) => {
-                let kind = if matches!(cmd, C::OpenSelector(SelectorKind::ScopedModels)) {
-                    SelectorKind::ScopedModels
-                } else {
-                    SelectorKind::Model
-                };
+            C::OpenSelector(SelectorKind::Model) => {
                 let current = session.model().model.to_string();
                 let rows: Vec<(String, String, Option<String>)> = session
                     .scoped_models()
@@ -723,7 +812,28 @@ impl<B: Backend> App<B> {
                 if rows.is_empty() {
                     self.state.transcript.push_status("no models available (configure providers)");
                 } else {
-                    self.open_data_selector(kind, rows, selected);
+                    self.open_data_selector(SelectorKind::Model, rows, selected);
+                }
+            }
+            C::OpenSelector(SelectorKind::ScopedModels) => {
+                // The scoped-models picker is the bespoke checkbox+reorder selector over the FULL
+                // catalog (`scoped-models-selector.ts`): the catalog is every available model; the
+                // current scope is `scoped_models()` (empty ⇒ "all enabled", Pi's `enabledIds = null`).
+                let catalog: Vec<(String, String, String, Option<String>)> = session
+                    .model_catalog()
+                    .iter()
+                    .map(|m| {
+                        (m.id.to_string(), m.name.clone(), m.provider.to_string(), Some(m.provider.to_string()))
+                    })
+                    .collect();
+                if catalog.is_empty() {
+                    self.state.transcript.push_status("no models available (configure providers)");
+                } else {
+                    let scoped: Vec<String> =
+                        session.scoped_models().into_iter().map(|sm| sm.model.id.to_string()).collect();
+                    // Empty scope ⇒ "all enabled" (None); otherwise the explicit ordered set.
+                    let enabled = if scoped.is_empty() { None } else { Some(scoped) };
+                    self.open_checkbox_selector(catalog, enabled);
                 }
             }
             C::OpenSelector(SelectorKind::UserMessage) => {
@@ -743,16 +853,90 @@ impl<B: Backend> App<B> {
                     self.open_data_selector(SelectorKind::UserMessage, rows, last);
                 }
             }
+            C::OpenSelector(SelectorKind::Tree) => {
+                // `/tree` (tree-selector.ts): the session DAG flattened into [`TreeNode`]s. The live DAG
+                // getter is the one L5 residual (residual ledger), so the navigable node set is sourced
+                // from the fork anchors — the user-message spine of the conversation — each a depth-0
+                // `Message` node whose confirm drives `navigate_tree`. The connector/fold/filter engine
+                // (the bulk of the 47KB component) is already built in `tree_selector.rs`.
+                let anchors = session.user_messages_for_forking().await;
+                if anchors.is_empty() {
+                    self.state.transcript.push_status("no session history to navigate");
+                } else {
+                    let nodes: Vec<TreeNode> = anchors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            let mut node = TreeNode::message(
+                                a.entry_id.to_string(),
+                                0,
+                                truncate_summary(&a.text),
+                            );
+                            node.time_label = Some(format!("#{}", i + 1));
+                            node
+                        })
+                        .collect();
+                    let mut tree = TreeSelector::new(nodes);
+                    tree.set_keymap(self.state.tree_keymap.clone());
+                    self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
+                }
+            }
             C::OpenSelector(other) => {
-                // Session/Tree/Settings/Trust/Login/Logout need richer L5/host sourcing than is wired
-                // here yet; surface the request so the path is real (no silent drop).
+                // Session/Settings/Trust/Login/Logout need richer host sourcing (the L7 multi-session
+                // list, the trust-store write, the oauth device flow) than this session exposes; surface
+                // the request so the path is real (no silent drop). Tracked on the residual ledger.
                 self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
+            }
+            C::ConfirmSelection { kind: SelectorKind::Tree, value } => {
+                // Confirming a tree row navigates the leaf to that entry (Pi `navigateTree`,
+                // agent-session.ts:2704). A user/custom target re-roots at its parent and yields the
+                // target text as re-editable `editor_text`; cancel/no-op is surfaced as a status line.
+                let entry = cyrup_core::EntryId::from(value.as_str());
+                match session.navigate_tree(entry, NavigateTreeOptions::default()).await {
+                    Ok(outcome) if outcome.cancelled => {
+                        self.state.transcript.push_status("tree navigation cancelled");
+                    }
+                    Ok(outcome) => {
+                        if let Some(text) = outcome.editor_text {
+                            self.state.editor.set_text(&text);
+                        }
+                        // A summarized branch navigation records a branch-summary message
+                        // (`branch-summary-message.ts`) into the transcript.
+                        if let Some(entry) = outcome.summary_entry {
+                            self.state.transcript.push_branch_summary(entry.summary);
+                        }
+                        self.state.transcript.push_status("navigated session tree");
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+                }
             }
             C::ConfirmSelection { kind: SelectorKind::Model, value } => {
                 match session.set_model(&value).await {
                     Ok(_) => self.state.transcript.push_status(format!("model → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
                 }
+            }
+            C::ConfirmSelection { kind: SelectorKind::ScopedModels, value } => {
+                // The checkbox selector confirms with the ordered enabled ids (`\n`-joined), or the
+                // `SCOPED_MODELS_ALL` sentinel for "all enabled". Rebuild the scoped set from the
+                // catalog and persist via `set_scoped_models` (`scoped-models-selector.ts onPersist`).
+                let catalog = session.model_catalog();
+                let ordered_ids: Vec<String> = if value == crate::SCOPED_MODELS_ALL {
+                    catalog.iter().map(|m| m.id.to_string()).collect()
+                } else {
+                    value.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                };
+                let scoped: Vec<cyrup_session_svc::ScopedModel> = ordered_ids
+                    .iter()
+                    .filter_map(|id| catalog.iter().find(|m| m.id.to_string() == *id))
+                    .map(|m| cyrup_session_svc::ScopedModel {
+                        model: m.clone(),
+                        thinking_level: None,
+                    })
+                    .collect();
+                let n = scoped.len();
+                session.set_scoped_models(scoped);
+                self.state.transcript.push_status(format!("scoped models → {n} enabled"));
             }
             C::ConfirmSelection { kind: SelectorKind::UserMessage, value } => {
                 let entry = cyrup_core::EntryId::from(value.as_str());
@@ -773,14 +957,44 @@ impl<B: Backend> App<B> {
                 Err(e) => self.state.transcript.push_status(format!("clone error: {e}")),
             },
             C::Export(arg) => {
-                let path = arg.as_deref().map(std::path::Path::new);
-                match session.export_to_jsonl(path).await {
-                    Ok(Some(_text)) => self.state.transcript.push_status("exported session (jsonl)"),
-                    Ok(None) => {
-                        let label = arg.unwrap_or_default();
-                        self.state.transcript.push_status(format!("exported session → {label}"));
+                // Format chosen **by extension**, matching Pi (`handleExportCommand`,
+                // interactive-mode.ts:5106-5112): a `.jsonl` target writes the raw transcript;
+                // every other target (including no path) writes a styled HTML document — HTML is the
+                // default. cyrup renders the HTML body in-crate (`export::session_jsonl_to_html`) over
+                // the session's own JSONL; the rich tool-card renderer is the L5 residual.
+                let is_jsonl =
+                    arg.as_deref().is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
+                if is_jsonl {
+                    let path = arg.as_deref().map(std::path::Path::new);
+                    match session.export_to_jsonl(path).await {
+                        Ok(_) => {
+                            let label = arg.unwrap_or_default();
+                            self.state.transcript.push_status(format!("exported session → {label}"));
+                        }
+                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
                     }
-                    Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                } else {
+                    // Pull the transcript as JSONL (no path ⇒ returned as text), render to HTML, write.
+                    match session.export_to_jsonl(None).await {
+                        Ok(Some(jsonl)) => {
+                            let html = crate::export::session_jsonl_to_html(&jsonl);
+                            match &arg {
+                                Some(path) => match std::fs::write(path, &html) {
+                                    Ok(()) => self
+                                        .state
+                                        .transcript
+                                        .push_status(format!("exported session → {path}")),
+                                    Err(e) => self
+                                        .state
+                                        .transcript
+                                        .push_status(format!("export error: {e}")),
+                                },
+                                None => self.state.transcript.push_block("Session (HTML)", html),
+                            }
+                        }
+                        Ok(None) => self.state.transcript.push_status("exported session"),
+                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                    }
                 }
             }
             C::SetName(name) => match session.set_session_name(&name).await {
@@ -858,7 +1072,19 @@ impl<B: Backend> App<B> {
                 self.state.transcript.commit_tools();
             }
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
-            AgentSessionEvent::MessageStart { .. } | AgentSessionEvent::MessageEnd { .. } => {}
+            // A finished message: an extension `Custom` message renders as a distinct labeled block
+            // (`custom-message.ts`, interactive-mode.ts:3083). Core user/assistant text is already
+            // surfaced via the user echo + streaming-delta path, so only `Custom` is folded here (on
+            // `MessageEnd` so it commits once, not twice with `MessageStart`).
+            AgentSessionEvent::MessageStart { .. } => {}
+            AgentSessionEvent::MessageEnd { .. } => {
+                // The `AgentMessage` type lives in `cyrup-agent` (a dev-dep here, not a direct dep), so
+                // the `Custom` arm is detected via its serde projection (`tag = "role"`,
+                // `rename_all_fields = camelCase`) rather than a direct match — no dependency ripple.
+                if let Some((kind, body)) = custom_message_from_event(ev) {
+                    self.state.transcript.push_custom_message(kind, body);
+                }
+            }
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
                 self.ingest_stream_event(assistant_message_event);
             }
@@ -1051,6 +1277,40 @@ fn copy_to_clipboard(text: &str) {
 fn copy_to_clipboard(_text: &str) {}
 
 /// Truncate a one-line summary to a sane length (avoid overrunning the marker line).
+/// Detect a `Custom`-role [`cyrup_agent::AgentMessage`] from its serde projection and return its
+/// `(kind, body)` for [`TranscriptView::push_custom_message`](crate::transcript::TranscriptView::push_custom_message).
+/// `AgentMessage` is only a dev-dependency here, so the message is inspected through `serde_json`
+/// (`{"role":"custom","kind":…,"payload":…}`) instead of a direct pattern match — no dep ripple.
+/// Returns `None` for any non-custom (core user/assistant/toolResult) message.
+fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(String, String)> {
+    let value = serde_json::to_value(ev).ok()?;
+    let message = value.get("message")?;
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("custom") {
+        return None;
+    }
+    let kind =
+        message.get("kind").and_then(serde_json::Value::as_str).unwrap_or("custom").to_string();
+    let body = message.get("payload").map(custom_message_text).unwrap_or_default();
+    Some((kind, body))
+}
+
+/// Extract display text from a `Custom` message payload (`string | (Text|Image)[]`, mirroring Pi's
+/// `getCustomMessageText`): a JSON string is used verbatim; an array joins its `{text}` parts; any
+/// other shape yields the empty string (rendered as a bare label).
+fn custom_message_text(payload: &serde_json::Value) -> String {
+    match payload {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Collapse a multi-line string to a single space-joined line, truncated to 80 graphemes with an
+/// ellipsis (`truncateSummary` — selector descriptions, tree previews).
 fn truncate_summary(s: &str) -> String {
     const MAX: usize = 80;
     let one_line = s.replace(['\n', '\r', '\t'], " ");
@@ -1104,15 +1364,52 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     let want_status = state.indicator.is_active() || state.reserve_status_rows;
     let room = area.height >= chrome_h.saturating_add(footer_h).saturating_add(3);
     let band_h: u16 = if want_status && room { 2 } else { 0 };
-    let [msg_area, band_area, slot_area, popup_area, status_area] = Layout::vertical([
+    // Attached images render inline above the editor (`components/image.ts`): each block reserves its
+    // natural cell height (clamped so they never crowd out the message/editor rows). The strip is
+    // suppressed while a selector owns the slot (the editor is hidden then).
+    let images_h: u16 = if state.selector.is_some() || state.pending_images.is_empty() {
+        0
+    } else {
+        let budget = area
+            .height
+            .saturating_sub(chrome_h.saturating_add(footer_h).saturating_add(band_h).saturating_add(1));
+        let natural: u16 = state
+            .pending_images
+            .iter()
+            .map(|b| state.image_renderer.cell_size(b, area.width).1)
+            .fold(0u16, |a, h| a.saturating_add(h));
+        natural.min(budget)
+    };
+    let [msg_area, band_area, images_area, slot_area, popup_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(band_h),
+        Constraint::Length(images_h),
         Constraint::Length(slot_h),
         Constraint::Length(popup_h),
         Constraint::Length(footer_h),
     ])
     .areas(area);
     state.transcript.render(frame, msg_area, &state.theme);
+    // The compact startup-help bar (`compactInstructions`, interactive-mode.ts:697-703) occupies the
+    // bottom row of the otherwise-empty message area at startup — just above the editor — sourced from
+    // the live keymap so rebinds reflect. It is suppressed once a submission lands (`show_startup_hints`
+    // cleared) and while a selector owns the slot, so it never shifts the editor/footer geometry.
+    if state.show_startup_hints
+        && state.selector.is_none()
+        && !state.transcript.has_active()
+        && msg_area.height >= 1
+    {
+        let hint_row = ratatui::layout::Rect {
+            x: msg_area.x,
+            y: msg_area.y.saturating_add(msg_area.height - 1),
+            width: msg_area.width,
+            height: 1,
+        };
+        crate::chrome::render_compact_hints(frame, hint_row, &state.theme, &state.keymap);
+    }
+    if images_h > 0 {
+        render_images(frame, images_area, state);
+    }
     if band_h > 0 {
         let cancel = state.keymap.key_label(Action::Interrupt);
         state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
@@ -1131,6 +1428,24 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     // §6.4): each clears its own `Rect` then renders its box.
     for overlay in state.overlays.iter_mut() {
         overlay.render(frame, area, &state.theme);
+    }
+}
+
+/// Render the attached-image strip inline above the editor (`components/image.ts`): stack each
+/// [`ImageBlock`] at its natural cell height, drawing the real protocol when `show_images` is on and a
+/// text placeholder when off (spec/tui/06 §6). Honors the live image protocol negotiated at startup.
+fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let mut y = area.y;
+    let bottom = area.y.saturating_add(area.height);
+    for block in &state.pending_images {
+        if y >= bottom {
+            break;
+        }
+        let want = state.image_renderer.cell_size(block, area.width).1.max(1);
+        let h = want.min(bottom.saturating_sub(y));
+        let cell = ratatui::layout::Rect { x: area.x, y, width: area.width, height: h };
+        state.image_renderer.render(frame, cell, block, &state.theme, state.show_images);
+        y = y.saturating_add(h);
     }
 }
 

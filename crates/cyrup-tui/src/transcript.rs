@@ -45,6 +45,18 @@ pub enum Entry {
     /// A finished `!`/`!!` bash execution (`bash-execution.ts`): the command header + output block,
     /// committed to scrollback when the process exits.
     Bash(BashExecution),
+    /// A skill-invocation message (`skill-invocation-message.ts`): a bold `[skill]` label + the skill
+    /// name, with the skill block content rendered as markdown below.
+    SkillInvocation { name: String, content: String },
+    /// A custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
+    /// `body`, styled distinctly from a plain user message.
+    Custom { label: String, body: String },
+    /// A branch-summary message (`branch-summary-message.ts`): a bold `[branch]` label + the
+    /// `**Branch Summary**` markdown body produced when navigating away from a branch.
+    BranchSummary(String),
+    /// A compaction-summary message (`compaction-summary-message.ts`): a bold `[compaction]` label
+    /// noting the pre-compaction token count + the `**Compacted from N tokens**` summary markdown.
+    CompactionSummary { tokens_before: u64, summary: String },
 }
 
 /// One tool execution, shown live in the viewport while it runs (`tool-execution.ts` pending box) and
@@ -307,6 +319,31 @@ impl TranscriptView {
         self.pending.push(Entry::Block { title: title.into(), markdown: markdown.into() });
     }
 
+    /// Push a skill-invocation message (`skill-invocation-message.ts`): a `[skill]` label + the skill
+    /// name header, with the skill block content rendered as markdown.
+    pub fn push_skill_invocation(&mut self, name: impl Into<String>, content: impl Into<String>) {
+        self.pending.push(Entry::SkillInvocation { name: name.into(), content: content.into() });
+    }
+
+    /// Push a custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
+    /// `body`.
+    pub fn push_custom_message(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        self.pending.push(Entry::Custom { label: label.into(), body: body.into() });
+    }
+
+    /// Push a branch-summary message (`branch-summary-message.ts`): the `**Branch Summary**` body
+    /// produced when navigating away from / abandoning a branch.
+    pub fn push_branch_summary(&mut self, summary: impl Into<String>) {
+        self.pending.push(Entry::BranchSummary(summary.into()));
+    }
+
+    /// Push a compaction-summary message (`compaction-summary-message.ts`): the pre-compaction token
+    /// count + the `**Compacted from N tokens**` summary body.
+    pub fn push_compaction_summary(&mut self, tokens_before: u64, summary: impl Into<String>) {
+        self.pending
+            .push(Entry::CompactionSummary { tokens_before, summary: summary.into() });
+    }
+
     /// Build the styled lines the inline viewport renders: **only** the active streaming partial,
     /// rendered as markdown (spec/tui/06 §8). Committed entries live in native scrollback (see
     /// [`drain_committed`](Self::drain_committed)).
@@ -465,6 +502,22 @@ pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<L
             full.set_expanded(true);
             full.render_lines(width, theme, None, None)
         }
+        Entry::SkillInvocation { name, content } => {
+            // `[skill]` label + bold name header, full content as markdown (the committed/expanded
+            // form — `skill-invocation-message.ts` expanded branch).
+            labeled_message_lines("skill", &format!("**{name}**"), content, theme, width)
+        }
+        Entry::Custom { label, body } => {
+            // A bracketed extension-type label + the markdown body (`custom-message.ts`).
+            labeled_message_lines(label, "", body, theme, width)
+        }
+        Entry::BranchSummary(summary) => {
+            labeled_message_lines("branch", "**Branch Summary**", summary, theme, width)
+        }
+        Entry::CompactionSummary { tokens_before, summary } => {
+            let header = format!("**Compacted from {} tokens**", group_thousands(*tokens_before));
+            labeled_message_lines("compaction", &header, summary, theme, width)
+        }
         Entry::Status(text) => vec![Line::styled(format!("• {text}"), theme.dim_style())],
         Entry::Block { title, markdown } => {
             let rule = "─".repeat(width.max(1));
@@ -480,6 +533,48 @@ pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<L
             out
         }
     }
+}
+
+/// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants,
+/// `{skill-invocation,custom,branch-summary,compaction-summary}-message.ts`): a bold-accent
+/// `[label]` line, then the optional bold `header` + the `body` rendered as markdown. The committed
+/// scrollback form is the *expanded* render (the complete record), like committed tools.
+fn labeled_message_lines(
+    label: &str,
+    header: &str,
+    body: &str,
+    theme: &UiTheme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
+    let mut out = vec![Line::styled(format!("[{label}]"), bold)];
+    let md_src = if header.is_empty() {
+        body.to_string()
+    } else if body.is_empty() {
+        header.to_string()
+    } else {
+        format!("{header}\n\n{body}")
+    };
+    if !md_src.is_empty() {
+        out.extend(crate::markdown::render(&md_src, width.max(1), theme));
+    }
+    out
+}
+
+/// Group an integer with `,` thousands separators (Pi `Number.toLocaleString()` for the compaction
+/// token count). Pure ASCII; never allocates beyond the result.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// Build a `label: text` line with a styled label and styled body.

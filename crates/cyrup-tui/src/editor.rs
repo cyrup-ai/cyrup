@@ -7,11 +7,20 @@
 //! typing coalescing, prompt history recall (Up/Down at the buffer edges, 100-entry, draft save),
 //! char-jump (Ctrl+]), bash-mode detection (leading `!`/`!!`), and the slash/path autocomplete popup
 //! (`autocomplete.rs`). Keys resolve through [`EditorKeymap`] — the editor never compares keys inline
-//! (R-10-018). Grapheme-cluster motion (emoji/combining) and wrap-aware vertical motion remain a
-//! tracked residual (char-granular here).
+//! (R-10-018). Horizontal motion + backspace/forward-delete step over whole **grapheme clusters**
+//! (emoji, ZWJ sequences, combining marks) via [`unicode_segmentation`], matching Pi's editor, which
+//! treats a user-perceived character as one cursor unit (`pi-tui/src/components/editor.ts`). Vertical
+//! Up/Down motion is **wrap-aware**: logical lines are wrapped into a visual-line map
+//! ([`build_visual_line_map`]) and the cursor moves by *visual* line, preserving a **sticky preferred
+//! column** ([`InputEditor::preferred_visual_col`]) across short/long/rewrapped lines, falling through
+//! to history at the first visual line and to line-end at the last (spec/tui/03 §4.1-§4.2). Large
+//! pastes collapse to atomic `[paste #N …]` markers ([`InputEditor::handle_paste`]) that expand back
+//! to content on submit ([`InputEditor::expanded_text`], spec/tui/03 §5.5).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::layout::Rect;
 use ratatui::symbols::border;
@@ -85,6 +94,38 @@ pub struct InputEditor {
     registry: CommandRegistry,
     autocomplete: Option<Autocomplete>,
     cwd: PathBuf,
+    /// Cached whole-tree file list for `@`-mention search (`autocomplete.ts` populates once, then
+    /// fuzzy-filters in-process per keystroke). Lazily built on the first `@`-mention, invalidated on
+    /// `set_cwd`. `None` until first needed.
+    mention_files: Option<Vec<String>>,
+    /// The layout width (in columns) used to wrap logical lines into **visual** lines for vertical
+    /// motion (`editor.ts:1690` `build_visual_line_map(width)`). Updated every render; `80` until the
+    /// first render. Vertical Up/Down resolve against the visual map computed at this width.
+    view_width: usize,
+    /// The **sticky preferred column** for vertical motion (`editor.ts:66`
+    /// `preferred_visual_col`): the intended visual column Up/Down try to land on across short/long/
+    /// rewrapped visual lines. `Some` while a vertical run is in progress; cleared by any horizontal
+    /// motion, edit, or paste so the next vertical move re-seeds from the live cursor (spec/tui/03 §4.2).
+    preferred_visual_col: Option<usize>,
+    /// Large-paste store (`editor.ts:81` `pastes: id -> expanded content`): each entry is the full
+    /// pasted text the buffer shows collapsed to a `[paste #N …]` marker. [`expanded_text`] substitutes
+    /// markers back to content on submit (`expandPasteMarkers`, spec/tui/03 §5.5).
+    pastes: BTreeMap<u32, String>,
+    /// Monotonic id for the next large paste (`editor.ts:82` `paste_counter`).
+    paste_counter: u32,
+}
+
+/// One **visual** line of the wrapped editor: a contiguous slice of a logical line that fits the
+/// layout width (`editor.ts:1690-1715` `VisualLine { logical_line, start_col, length }`). An empty
+/// logical line yields exactly one zero-length visual line so the cursor still has a row to sit on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisualLine {
+    /// The logical line (`lines` index) this visual line is a slice of.
+    pub logical: usize,
+    /// The char column in the logical line where this visual line begins.
+    pub start: usize,
+    /// The number of chars on this visual line (0 for an empty logical line / trailing wrap).
+    pub len: usize,
 }
 
 impl Default for InputEditor {
@@ -112,6 +153,11 @@ impl InputEditor {
             registry: CommandRegistry::new(),
             autocomplete: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            mention_files: None,
+            view_width: 80,
+            preferred_visual_col: None,
+            pastes: BTreeMap::new(),
+            paste_counter: 0,
         }
     }
 
@@ -125,9 +171,17 @@ impl InputEditor {
         &self.keymap
     }
 
-    /// Override the working directory used for path completion (defaults to the process cwd).
+    /// Override the working directory used for path completion (defaults to the process cwd). Clears
+    /// the cached `@`-mention file list so the new tree is re-enumerated on the next mention.
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = cwd;
+        self.mention_files = None;
+    }
+
+    /// Inject the `@`-mention candidate file list directly (test seam / an async populator). Bypasses
+    /// the lazy `fd`/walk source.
+    pub fn set_mention_files(&mut self, files: Vec<String>) {
+        self.mention_files = Some(files);
     }
 
     /// Focus state (R-10-009 — focused inputs drive the hardware cursor).
@@ -201,12 +255,212 @@ impl InputEditor {
         self.autocomplete = None;
         self.jump = None;
         self.last_action = LastAction::None;
+        self.preferred_visual_col = None;
+        self.pastes.clear();
         self.exit_history();
     }
 
     /// The char length of the current line (0 if somehow out of range).
     fn cur_len(&self) -> usize {
         self.lines.get(self.row).map_or(0, Vec::len)
+    }
+
+    // ---- visual-line map (wrap-aware vertical motion, spec/tui/03 §4) -----------------------
+
+    /// Record the layout width used to wrap lines for vertical motion (set every render; also a test
+    /// seam). `0` is clamped to `1` so wrapping never divides by zero.
+    pub fn set_view_width(&mut self, width: usize) {
+        self.view_width = width.max(1);
+    }
+
+    /// Build the wrap-aware visual-line map at the current [`view_width`](Self::view_width)
+    /// (`editor.ts:1690` `build_visual_line_map`). Each logical line expands into one or more
+    /// [`VisualLine`]s via word-aware wrapping; the result is in reading order and always non-empty
+    /// (at least one zero-length visual line for the single empty buffer line).
+    pub fn visual_line_map(&self) -> Vec<VisualLine> {
+        let width = self.view_width.max(1);
+        let mut map = Vec::with_capacity(self.lines.len());
+        for (logical, line) in self.lines.iter().enumerate() {
+            for (start, len) in word_wrap_line(line, width) {
+                map.push(VisualLine { logical, start, len });
+            }
+        }
+        if map.is_empty() {
+            map.push(VisualLine { logical: 0, start: 0, len: 0 });
+        }
+        map
+    }
+
+    /// Map the cursor `(row, col)` to its index in `map` (`editor.ts:1742` `find_current_visual_line`):
+    /// the visual line of the cursor's logical row that contains `col`; when `col` sits exactly on a
+    /// wrap boundary it belongs to the *start* of the following visual line, and an end-of-line cursor
+    /// rides the last visual line of the row.
+    fn current_visual_line(&self, map: &[VisualLine]) -> usize {
+        let mut fallback = 0;
+        for (i, vl) in map.iter().enumerate() {
+            if vl.logical != self.row {
+                continue;
+            }
+            fallback = i;
+            if self.col >= vl.start && self.col < vl.start + vl.len {
+                return i;
+            }
+        }
+        fallback
+    }
+
+    /// Vertical Up by one **visual** line, preserving the sticky preferred column (spec/tui/03 §4.2).
+    /// At the first visual line the cursor falls through to line-start (history is handled by the
+    /// caller before this runs).
+    fn move_up_visual(&mut self) {
+        let map = self.visual_line_map();
+        let cur = self.current_visual_line(&map);
+        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
+        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
+        self.preferred_visual_col = Some(goal);
+        if cur == 0 {
+            // First visual line: fall through to line-start (spec/tui/03 §5.1).
+            self.col = 0;
+            return;
+        }
+        if let Some(target) = map.get(cur - 1) {
+            self.row = target.logical;
+            self.col = target.start + goal.min(target.len);
+        }
+    }
+
+    /// Vertical Down by one **visual** line, preserving the sticky preferred column (spec/tui/03 §4.2).
+    /// At the last visual line the cursor falls through to line-end (history is handled by the caller).
+    fn move_down_visual(&mut self) {
+        let map = self.visual_line_map();
+        let cur = self.current_visual_line(&map);
+        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
+        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
+        self.preferred_visual_col = Some(goal);
+        if cur + 1 >= map.len() {
+            // Last visual line: fall through to line-end (spec/tui/03 §5.1).
+            self.col = self.cur_len();
+            return;
+        }
+        if let Some(target) = map.get(cur + 1) {
+            self.row = target.logical;
+            self.col = target.start + goal.min(target.len);
+        }
+    }
+
+    /// Drop the sticky vertical-motion column (called by every non-vertical motion/edit so the next
+    /// Up/Down re-seeds the goal column from the live cursor).
+    fn reset_preferred_col(&mut self) {
+        self.preferred_visual_col = None;
+    }
+
+    // ---- large-paste markers (spec/tui/03 §5.5) --------------------------------------------
+
+    /// Handle a (bracketed) paste (`editor.ts:615` `handlePaste`): sanitize, then either collapse a
+    /// **large** paste (`> 10` lines or `> 1000` chars) to an atomic `[paste #N …]` marker stored in
+    /// [`pastes`](Self::pastes), or insert a small paste verbatim. The marker keeps the buffer compact;
+    /// [`expanded_text`](Self::expanded_text) restores the full content on submit.
+    pub fn handle_paste(&mut self, raw: &str) {
+        let text = sanitize_paste(raw);
+        let line_count = text.split('\n').count();
+        let char_count = text.chars().count();
+        if line_count > 10 || char_count > 1000 {
+            self.paste_counter += 1;
+            let id = self.paste_counter;
+            let marker = if line_count > 1 {
+                format!("[paste #{id} +{line_count} lines]")
+            } else {
+                format!("[paste #{id} {char_count} chars]")
+            };
+            self.pastes.insert(id, text);
+            self.push_undo_for(LastAction::None);
+            for c in marker.chars() {
+                self.insert_char(c);
+            }
+            self.last_action = LastAction::None;
+            self.reset_preferred_col();
+            self.exit_history();
+            self.update_autocomplete();
+        } else {
+            self.insert_str(&text);
+        }
+    }
+
+    /// The buffer text with every `[paste #N …]` marker expanded back to its stored content
+    /// (`expandPasteMarkers`, `editor.ts`). Submission uses this so the model receives the full paste.
+    pub fn expanded_text(&self) -> String {
+        let text = self.text();
+        if self.pastes.is_empty() {
+            return text;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if let Some((_, content, end)) = self.marker_at(&chars, i) {
+                out.push_str(content);
+                i = end;
+            } else if let Some(c) = chars.get(i) {
+                out.push(*c);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// If a `[paste #N …]` marker for a known id starts at `chars[i]`, return its `(id, content, end)`
+    /// where `end` is the char index just past the closing `]`. Bounds-checked throughout (no-panic).
+    fn marker_at<'a>(&'a self, chars: &[char], i: usize) -> Option<(u32, &'a str, usize)> {
+        const PREFIX: [char; 8] = ['[', 'p', 'a', 's', 't', 'e', ' ', '#'];
+        for (k, pc) in PREFIX.iter().enumerate() {
+            if chars.get(i + k) != Some(pc) {
+                return None;
+            }
+        }
+        let mut j = i + PREFIX.len();
+        let mut id: u32 = 0;
+        let mut digits = 0;
+        while let Some(&c) = chars.get(j).filter(|c| c.is_ascii_digit()) {
+            id = id.saturating_mul(10).saturating_add(c.to_digit(10).unwrap_or(0));
+            j += 1;
+            digits += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        // Scan to the closing `]` on the same marker (a stray `[` aborts — no nested marker).
+        while let Some(&c) = chars.get(j) {
+            if c == ']' || c == '[' {
+                break;
+            }
+            j += 1;
+        }
+        if chars.get(j) != Some(&']') {
+            return None;
+        }
+        let content = self.pastes.get(&id)?;
+        Some((id, content.as_str(), j + 1))
+    }
+
+    /// If `col` falls inside (or on either edge of) a complete `[paste #N …]` marker on the current
+    /// line, return its `(start_col, end_col, paste_id)` so deletion removes it atomically
+    /// (`segmentWithMarkers`, spec/tui/03 §5.5).
+    fn marker_covering(&self, col: usize) -> Option<(usize, usize, u32)> {
+        let line = self.lines.get(self.row)?;
+        let mut i = 0;
+        while i < line.len() {
+            if let Some((id, _, end)) = self.marker_at(line, i) {
+                if col >= i && col <= end {
+                    return Some((i, end, id));
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        None
     }
 
     /// Snapshot the buffer + cursor for undo.
@@ -246,6 +500,7 @@ impl InputEditor {
             line.insert(col, c);
             self.col = col + 1;
         }
+        self.preferred_visual_col = None;
     }
 
     /// Insert a string (e.g. a paste) char by char.
@@ -278,15 +533,33 @@ impl InputEditor {
 
     // ---- deletion --------------------------------------------------------------------------
 
-    /// Backspace: delete the char before the cursor, joining lines at column 0.
+    /// Backspace: delete the whole grapheme cluster before the cursor (emoji/ZWJ/combining marks
+    /// removed as one unit, `editor.ts`), joining lines at column 0.
     pub fn backspace(&mut self) {
+        // A large-paste marker is an atomic segment: backspacing anywhere across it (or just after its
+        // closing `]`) removes the whole marker and drops its stored content (spec/tui/03 §5.5).
+        // Backspace deletes the marker only when the cursor is *inside* or just-after it
+        // (`col > start`); at `col == start` it falls through to delete the preceding char.
+        if self.col > 0
+            && let Some((s, e, id)) =
+                self.marker_covering(self.col).filter(|&(s, _, _)| self.col > s)
+        {
+            if let Some(line) = self.lines.get_mut(self.row) {
+                line.drain(s..e.min(line.len()));
+            }
+            self.pastes.remove(&id);
+            self.col = s;
+            return;
+        }
         if self.col > 0 {
-            let idx = self.col - 1;
-            if let Some(line) = self.lines.get_mut(self.row)
-                && idx < line.len() {
-                    line.remove(idx);
+            let start = self.prev_grapheme(self.col);
+            if let Some(line) = self.lines.get_mut(self.row) {
+                let end = self.col.min(line.len());
+                if start < end {
+                    line.drain(start..end);
                 }
-            self.col = idx;
+            }
+            self.col = start;
         } else if self.row > 0 && self.row < self.lines.len() {
             let cur = self.lines.remove(self.row);
             let prev_row = self.row - 1;
@@ -299,14 +572,31 @@ impl InputEditor {
         }
     }
 
-    /// Forward-delete: delete the char at the cursor, joining the next line at end-of-line.
+    /// Forward-delete: delete the whole grapheme cluster at the cursor (one user-perceived char),
+    /// joining the next line at end-of-line.
     pub fn delete(&mut self) {
         let len = self.cur_len();
+        // Forward-delete removes a whole marker when the cursor is inside or just-before it
+        // (`col < end`); at `col == end` it falls through to delete the following char.
+        if self.col < len
+            && let Some((s, e, id)) =
+                self.marker_covering(self.col).filter(|&(_, e, _)| self.col < e)
+        {
+            if let Some(line) = self.lines.get_mut(self.row) {
+                line.drain(s..e.min(line.len()));
+            }
+            self.pastes.remove(&id);
+            self.col = s;
+            return;
+        }
         if self.col < len {
-            if let Some(line) = self.lines.get_mut(self.row)
-                && self.col < line.len() {
-                    line.remove(self.col);
+            let end = self.next_grapheme(self.col);
+            if let Some(line) = self.lines.get_mut(self.row) {
+                let end = end.min(line.len());
+                if self.col < end {
+                    line.drain(self.col..end);
                 }
+            }
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             if let Some(line) = self.lines.get_mut(self.row) {
@@ -430,7 +720,7 @@ impl InputEditor {
 
     pub fn move_left(&mut self) {
         if self.col > 0 {
-            self.col -= 1;
+            self.col = self.prev_grapheme(self.col);
         } else if self.row > 0 {
             self.row -= 1;
             self.col = self.cur_len();
@@ -439,11 +729,26 @@ impl InputEditor {
 
     pub fn move_right(&mut self) {
         if self.col < self.cur_len() {
-            self.col += 1;
+            self.col = self.next_grapheme(self.col);
         } else if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = 0;
         }
+    }
+
+    /// The previous grapheme-cluster boundary strictly left of char-column `col` on the current line
+    /// (emoji/ZWJ/combining marks step as one unit; `editor.ts` grapheme motion). `0` if none.
+    fn prev_grapheme(&self, col: usize) -> usize {
+        let Some(line) = self.lines.get(self.row) else { return col.saturating_sub(1) };
+        grapheme_boundaries(line).into_iter().rfind(|&b| b < col).unwrap_or(0)
+    }
+
+    /// The next grapheme-cluster boundary strictly right of char-column `col` on the current line.
+    /// Clamps to the line length when `col` is already at/after the last cluster.
+    fn next_grapheme(&self, col: usize) -> usize {
+        let Some(line) = self.lines.get(self.row) else { return col + 1 };
+        let len = line.len();
+        grapheme_boundaries(line).into_iter().find(|&b| b > col).unwrap_or(len)
     }
 
     pub fn move_home(&mut self) {
@@ -620,10 +925,16 @@ impl InputEditor {
         self.lines.iter().map(|l| l.iter().collect()).collect()
     }
 
-    /// Recompute the popup after an edit: auto-open only for slash context, otherwise update an
-    /// already-open popup or close it (spec/tui/04 §5 — bare path does not auto-pop without Tab).
+    /// Recompute the popup after an edit: auto-open for slash **and** `@`-mention context, otherwise
+    /// update an already-open popup or close it (spec/tui/04 §5 — bare path does not auto-pop without
+    /// Tab; `@`-mention auto-pops on `@`, `autocomplete.ts:101`).
     fn update_autocomplete(&mut self) {
         let was_open = self.autocomplete.is_some();
+        // `@`-mention search auto-pops the moment an `@` token forms (whole-tree fuzzy file search).
+        if let Some(ac) = self.compute_mention() {
+            self.autocomplete = Some(ac);
+            return;
+        }
         let computed = Autocomplete::compute(
             &self.registry,
             &self.lines_as_strings(),
@@ -638,9 +949,32 @@ impl InputEditor {
         };
     }
 
+    /// The text left of the cursor on the current line (the autocomplete context window).
+    fn before_cursor(&self) -> String {
+        self.lines.get(self.row).map_or(String::new(), |line| line.iter().take(self.col).collect())
+    }
+
+    /// Compute the `@`-mention popup for the current cursor, lazily enumerating the tree on first use
+    /// (`autocomplete.ts:719-772`). `None` when the trailing token is not an `@`-mention or nothing
+    /// matches.
+    fn compute_mention(&mut self) -> Option<Autocomplete> {
+        let before = self.before_cursor();
+        crate::autocomplete::mention_query(&before)?;
+        if self.mention_files.is_none() {
+            self.mention_files = Some(crate::autocomplete::list_files(&self.cwd, 2000));
+        }
+        let files = self.mention_files.as_deref().unwrap_or(&[]);
+        crate::autocomplete::mention_autocomplete(&before, files)
+    }
+
     /// Trigger completion explicitly (Tab with no popup): force path completion, or slash completion
     /// while typing a `/name` (spec/tui/04 §5). A single forced match auto-applies (§3.7 item 10).
     fn trigger_completion(&mut self) -> EditorOutcome {
+        // `@`-mention takes precedence on an explicit Tab too (whole-tree fuzzy file search).
+        if let Some(ac) = self.compute_mention() {
+            self.autocomplete = Some(ac);
+            return EditorOutcome::Edited;
+        }
         let computed = Autocomplete::compute(
             &self.registry,
             &self.lines_as_strings(),
@@ -770,6 +1104,10 @@ impl InputEditor {
     /// Dispatch a resolved editor action.
     fn apply_editor_action(&mut self, action: EditorAction) -> EditorOutcome {
         use EditorAction as E;
+        // Any non-vertical action re-seeds the sticky goal column on the next Up/Down (spec/tui/03 §4.2).
+        if !matches!(action, E::CursorUp | E::CursorDown) {
+            self.reset_preferred_col();
+        }
         match action {
             E::CursorLeft => {
                 self.move_left();
@@ -782,20 +1120,20 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::CursorUp => {
+                // History recall only fires on the first visual line (`history_up_eligible` already
+                // requires `row == 0` + empty/browsing/col-0, which is always the first visual line).
                 if self.history_up_eligible() {
                     self.history_older();
-                } else if self.row > 0 {
-                    self.row -= 1;
-                    self.col = self.col.min(self.cur_len());
+                } else {
+                    self.move_up_visual();
                 }
                 EditorOutcome::Edited
             }
             E::CursorDown => {
                 if self.history_index >= 0 {
                     self.history_newer();
-                } else if self.row + 1 < self.lines.len() {
-                    self.row += 1;
-                    self.col = self.col.min(self.cur_len());
+                } else {
+                    self.move_down_visual();
                 }
                 EditorOutcome::Edited
             }
@@ -883,7 +1221,9 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::Submit => {
-                let text = self.text();
+                // Expand large-paste markers back to their full content before the agent sees the text
+                // (`expandPasteMarkers`, spec/tui/03 §5.5).
+                let text = self.expanded_text();
                 if text.trim().is_empty() {
                     return EditorOutcome::Edited;
                 }
@@ -922,11 +1262,89 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Word-aware wrap of one logical line into `(start_col, len)` visual segments fitting `width`
+/// (`wordWrapLine`, `editor.ts:114-206`): break at the last whitespace boundary that fits; force-break
+/// an overlong word at column granularity. An empty line yields one zero-length segment. `width` is
+/// assumed `>= 1` (callers clamp). Columns are char indices into `line`.
+fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let n = line.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    while start < n {
+        if n - start <= width {
+            segs.push((start, n - start));
+            break;
+        }
+        let hard_end = start + width;
+        // Last whitespace boundary strictly after `start` and within the window — break *after* it so
+        // the trailing space stays on the wrapped line (matching Pi's greedy word wrap).
+        let mut end = hard_end;
+        let mut i = hard_end;
+        while i > start {
+            if line.get(i - 1).is_some_and(|c| c.is_whitespace()) {
+                end = i;
+                break;
+            }
+            i -= 1;
+        }
+        // No whitespace in the window ⇒ force-break the overlong word at the hard edge.
+        if end <= start {
+            end = hard_end;
+        }
+        segs.push((start, end - start));
+        start = end;
+    }
+    if segs.is_empty() {
+        segs.push((0, 0));
+    }
+    segs
+}
+
+/// Sanitize a bracketed-paste payload (`editor.ts:1142-1179`): normalize `\r\n`/`\r` to `\n`, expand
+/// tabs to four spaces, and drop control bytes other than `\n`.
+fn sanitize_paste(raw: &str) -> String {
+    let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(unified.len());
+    for c in unified.chars() {
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+
+/// The grapheme-cluster boundaries of `line` expressed as **char-column** indices, including the
+/// leading `0` and trailing line length (`unicode_segmentation` extended grapheme clusters — the
+/// boundaries Pi's editor steps the cursor over). A pure-ASCII line yields every column.
+fn grapheme_boundaries(line: &[char]) -> Vec<usize> {
+    let s: String = line.iter().collect();
+    let mut bounds = Vec::with_capacity(line.len() + 1);
+    bounds.push(0usize);
+    let mut col = 0usize;
+    for g in s.graphemes(true) {
+        col += g.chars().count();
+        bounds.push(col);
+    }
+    bounds
+}
+
 impl Component for InputEditor {
     /// Render the editor with **top + bottom rules only** (no side bars, no title) — Pi
     /// `editor.ts:476,517,575` (spec/tui/03 §3.1). The rule color flips to bash-green while the buffer
     /// starts with `!` (spec/tui/03 §7.1); otherwise it uses the border role, accented when focused.
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        // Record the layout width so vertical (visual-line) motion wraps the same way it is drawn.
+        // The editor has no side borders; one column is reserved for the end-of-line cursor cell
+        // (`editor.ts:471` `layout_width = content_width - 1`).
+        self.view_width = (area.width.saturating_sub(1)).max(1) as usize;
         let rule_style = if self.is_bash_mode() {
             theme.bash_mode_style()
         } else if self.focused {

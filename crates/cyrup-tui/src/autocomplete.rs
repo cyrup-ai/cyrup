@@ -30,6 +30,9 @@ pub enum CompletionContext {
     Slash,
     /// Bare path completion (replaces the trailing path token).
     Path,
+    /// `@`-mention whole-tree fuzzy file search (`autocomplete.ts:101,164,408`): replaces the trailing
+    /// `@query` token with `@path` (quoting paths that contain spaces).
+    Mention,
 }
 
 /// One candidate: the inserted `value` (replacing `prefix`) plus popup display fields.
@@ -109,6 +112,17 @@ impl Autocomplete {
             // Path: directories keep drilling (no space), files get a trailing space (`:408-425`).
             CompletionContext::Path => {
                 (completion.value.clone(), if completion.is_dir { "" } else { " " })
+            }
+            // Mention: `@{path} ` — quote the path when it contains whitespace (`autocomplete.ts:408`
+            // `@"…"`); always a trailing space (a mention is a complete token).
+            CompletionContext::Mention => {
+                let path = &completion.value;
+                let rendered = if path.contains(char::is_whitespace) {
+                    format!("@\"{path}\"")
+                } else {
+                    format!("@{path}")
+                };
+                (rendered, " ")
             }
         };
         let new_before = format!("{head}{insert}{trailing}");
@@ -229,4 +243,106 @@ fn read_dir_sorted(dir: &Path, prefix: &str) -> Option<Vec<(String, bool)>> {
 /// `$HOME` as a `PathBuf`, if set.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+// ----------------------------------------------------------------- @-mention search ----
+
+/// The `@`-mention query under the cursor (`autocomplete.ts:101` `@`-prefix detect), if the trailing
+/// token is a mention. Returns the text *after* the `@`, with a leading `"` stripped (the `@"quoted
+/// path"` form, `:408`). `Some("")` immediately after typing `@` (open the popup with the whole tree).
+pub fn mention_query(before: &str) -> Option<String> {
+    let token = trailing_token(before);
+    let rest = token.strip_prefix('@')?;
+    Some(rest.strip_prefix('"').unwrap_or(rest).to_string())
+}
+
+/// Build the `@`-mention completion popup (`autocomplete.ts:164,408`): fuzzy-rank the whole-tree
+/// `candidates` (repo-relative paths from [`list_files`]) by the `@`-query, newest-best first. `prefix`
+/// is the literal `@query` token the apply step replaces. `None` when nothing matches (closes the popup).
+pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autocomplete> {
+    let query = mention_query(before)?;
+    let token = trailing_token(before);
+    let matches = fuzzy::filter(candidates, &query, |c| c.as_str());
+    if matches.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(matches.len());
+    let mut completions = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let Some(path) = candidates.get(m.index) else { continue };
+        items.push(SelectItem::label(path.clone()));
+        completions.push(Completion { value: path.clone(), is_dir: false });
+    }
+    let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matching files");
+    Some(Autocomplete { context: CompletionContext::Mention, prefix: token, completions, list })
+}
+
+/// List repo files for `@`-mention search (`autocomplete.ts:719-772`), capped at `limit`. Prefers
+/// `fd` (fast + `.gitignore`-aware), falling back to a bounded in-process walk when `fd` is absent so
+/// the feature works with no external tool. Returns paths **relative** to `cwd`, `/`-separated.
+pub fn list_files(cwd: &Path, limit: usize) -> Vec<String> {
+    if let Some(files) = fd_list(cwd, limit) {
+        return files;
+    }
+    walk_list(cwd, limit)
+}
+
+/// Spawn `fd` to enumerate tracked files (`.gitignore`-aware, hidden excluded except dotfiles fd shows
+/// by default-off). `--strip-cwd-prefix` yields repo-relative paths. `None` when `fd` is unavailable or
+/// errors, so the caller falls back to the in-process walk.
+fn fd_list(cwd: &Path, limit: usize) -> Option<Vec<String>> {
+    let output = std::process::Command::new("fd")
+        .args(["--type", "f", "--color", "never", "--strip-cwd-prefix", "--exclude", ".git"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut files: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .take(limit)
+        .map(|l| l.replace('\\', "/"))
+        .collect();
+    files.sort();
+    Some(files)
+}
+
+/// A bounded breadth-first walk used when `fd` is not installed: visits at most `limit * 8` entries,
+/// skips VCS/build noise (`.git`, `node_modules`, `target`, `.cyrup`) and returns up to `limit`
+/// `/`-separated repo-relative file paths.
+fn walk_list(cwd: &Path, limit: usize) -> Vec<String> {
+    const SKIP: [&str; 5] = [".git", "node_modules", "target", ".cyrup", ".jj"];
+    let visit_cap = limit.saturating_mul(8).max(limit);
+    let mut out: Vec<String> = Vec::new();
+    let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+    queue.push_back(cwd.to_path_buf());
+    let mut visited = 0usize;
+    while let Some(dir) = queue.pop_front() {
+        if out.len() >= limit || visited >= visit_cap {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            visited += 1;
+            if out.len() >= limit || visited >= visit_cap {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                queue.push_back(path);
+            } else if let Ok(rel) = path.strip_prefix(cwd) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out.sort();
+    out
 }

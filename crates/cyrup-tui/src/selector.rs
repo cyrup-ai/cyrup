@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::keymap::{SelectAction, SelectKeymap};
+use crate::keymap::{ModelsAction, ModelsKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
 use crate::theme::UiTheme;
 
@@ -289,6 +289,257 @@ impl ListSelector {
             SelectorOutcome::Preview(self.current_value())
         } else {
             SelectorOutcome::Redraw
+        }
+    }
+}
+
+/// The sentinel a [`CheckboxSelector`] confirm carries when **all** models are enabled (`enabledIds =
+/// null`, `scoped-models-selector.ts:18`), distinct from an explicit ordered list. The run loop maps
+/// this to "scope = full catalog".
+pub const SCOPED_MODELS_ALL: &str = "*";
+
+/// One catalog model in the scoped-models picker.
+#[derive(Clone, Debug)]
+struct ModelRow {
+    /// The model id (the `enabledIds` element + confirm value).
+    id: String,
+    /// Display label (model name).
+    label: String,
+    /// Provider id (drives `toggleProvider`).
+    provider: String,
+    /// Secondary text (provider/desc shown in the right column).
+    desc: Option<String>,
+}
+
+/// The scoped-models checkbox + reorder selector (`scoped-models-selector.ts`, spec/tui/05 §6). Unlike
+/// the plain [`ListSelector`], this renders the **full catalog** with per-row enable checkboxes
+/// (`✓`/`✗`), `Enter` **toggles** membership (it does *not* confirm), Alt+Up/Down **reorder** an
+/// enabled model in cycle order, Ctrl+A/Ctrl+X enable/clear all, Ctrl+P toggles a whole provider, and
+/// **Ctrl+S** confirms+persists. The `enabled` set mirrors Pi's `EnabledIds` (`None` = all enabled).
+pub struct CheckboxSelector {
+    rows: Vec<ModelRow>,
+    /// `None` = all enabled (no filter); `Some(ordered ids)` = the explicit cycle set, in order.
+    enabled: Option<Vec<String>>,
+    /// The rendered list (rebuilt from `rows` + `enabled` on every state change to refresh markers).
+    list: SelectList,
+    /// The scoped-models bespoke bindings (Alt+Up/Down, Ctrl+A/X/P/S).
+    models_keymap: ModelsKeymap,
+}
+
+impl CheckboxSelector {
+    /// Build from the full catalog `(id, label, provider, desc)` rows and the current scoped set
+    /// (`None` = all enabled). The highlight preselects the first row.
+    pub fn scoped_models(
+        catalog: Vec<(String, String, String, Option<String>)>,
+        enabled: Option<Vec<String>>,
+    ) -> Self {
+        let rows: Vec<ModelRow> = catalog
+            .into_iter()
+            .map(|(id, label, provider, desc)| ModelRow { id, label, provider, desc })
+            .collect();
+        let mut sel = CheckboxSelector {
+            rows,
+            enabled,
+            list: SelectList::new(Vec::new(), ColumnLayout::SLASH),
+            models_keymap: ModelsKeymap::default(),
+        };
+        sel.refresh();
+        sel.list.set_max_visible(10);
+        sel
+    }
+
+    /// Override the scoped-models bindings (JSON-configured `app.models.*`).
+    pub fn set_models_keymap(&mut self, keymap: ModelsKeymap) {
+        self.models_keymap = keymap;
+    }
+
+    /// `true` when model `id` is in the scoped set (`isEnabled`, `scoped-models-selector.ts:21`).
+    fn is_enabled(&self, id: &str) -> bool {
+        match &self.enabled {
+            None => true,
+            Some(list) => list.iter().any(|e| e == id),
+        }
+    }
+
+    /// The current scoped set: `None` = all enabled, else the explicit ordered ids
+    /// (test/inspection + confirm sourcing).
+    pub fn enabled_ids(&self) -> Option<&[String]> {
+        self.enabled.as_deref()
+    }
+
+    /// Rebuild the rendered list from `rows` + `enabled`, refreshing the `✓`/`✗` markers while
+    /// preserving the highlight. When **all** are enabled (`None`) no marker is drawn, matching Pi
+    /// (`allEnabled ? "" : ✓/✗`, `:221`).
+    fn refresh(&mut self) {
+        let selected = self.list.selected();
+        let all = self.enabled.is_none();
+        let mut items = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let label = if all {
+                row.label.clone()
+            } else if self.is_enabled(&row.id) {
+                format!("✓ {}", row.label)
+            } else {
+                format!("✗ {}", row.label)
+            };
+            items.push(SelectItem::new(label, row.desc.clone()));
+        }
+        let mut list = SelectList::new(items, ColumnLayout::SLASH).with_no_match("No models");
+        list.set_max_visible(10);
+        list.set_selected(selected.min(self.rows.len().saturating_sub(1)));
+        self.list = list;
+    }
+
+    /// The highlighted model id, if any.
+    fn current_id(&self) -> Option<String> {
+        self.rows.get(self.list.selected()).map(|r| r.id.clone())
+    }
+
+    /// Toggle membership of `id` (`toggle`, `:25-31`): from "all" the first toggle starts a set with
+    /// only `id`; a member is removed; a non-member is appended.
+    fn toggle(&mut self, id: &str) {
+        self.enabled = match self.enabled.take() {
+            None => Some(vec![id.to_string()]),
+            Some(mut list) => {
+                if let Some(pos) = list.iter().position(|e| e == id) {
+                    list.remove(pos);
+                } else {
+                    list.push(id.to_string());
+                }
+                Some(list)
+            }
+        };
+    }
+
+    /// Move `id` by `delta` within the enabled order (`move`, `:50-60`). No-op when all-enabled or
+    /// `id` is not a member / would move out of bounds.
+    fn reorder(&mut self, id: &str, delta: isize) {
+        let Some(list) = self.enabled.as_mut() else { return };
+        let Some(idx) = list.iter().position(|e| e == id) else { return };
+        let new = idx as isize + delta;
+        if new < 0 || new as usize >= list.len() {
+            return;
+        }
+        list.swap(idx, new as usize);
+    }
+
+    /// Enable/clear every model of `id`'s provider (`toggleProvider`, `:311-323`): clear them if all
+    /// are already enabled, else enable them all.
+    fn toggle_provider(&mut self, id: &str) {
+        let Some(provider) = self.rows.iter().find(|r| r.id == id).map(|r| r.provider.clone()) else {
+            return;
+        };
+        let provider_ids: Vec<String> =
+            self.rows.iter().filter(|r| r.provider == provider).map(|r| r.id.clone()).collect();
+        let all_on = provider_ids.iter().all(|pid| self.is_enabled(pid));
+        // Materialize the current set as an explicit list, then add/remove the provider's ids.
+        let mut list: Vec<String> = match &self.enabled {
+            None => self.rows.iter().map(|r| r.id.clone()).collect(),
+            Some(l) => l.clone(),
+        };
+        if all_on {
+            list.retain(|e| !provider_ids.contains(e));
+        } else {
+            for pid in provider_ids {
+                if !list.contains(&pid) {
+                    list.push(pid);
+                }
+            }
+        }
+        // Collapse back to "all" when every catalog model ended up enabled (Pi's null normalization).
+        self.enabled = if list.len() == self.rows.len() { None } else { Some(list) };
+    }
+
+    /// The confirm value: [`SCOPED_MODELS_ALL`] when all are enabled, else the ordered ids joined by
+    /// `\n` (the run loop splits this to rebuild the scoped set).
+    fn confirm_value(&self) -> String {
+        match &self.enabled {
+            None => SCOPED_MODELS_ALL.to_string(),
+            Some(list) => list.join("\n"),
+        }
+    }
+}
+
+impl Selector for CheckboxSelector {
+    fn desired_height(&self, _width: u16) -> u16 {
+        // Top rule + title + list body + footer-hint row + bottom rule.
+        self.list.rendered_height().saturating_add(4)
+    }
+
+    fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        let [top, title_area, body, hint, bottom] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        frame.render_widget(border_rule(top.width, theme), top);
+        let title = Span::styled(
+            " Scoped Models",
+            theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD),
+        );
+        frame.render_widget(Paragraph::new(Line::from(title)), title_area);
+        let lines = self.list.lines(body.width, theme);
+        frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);
+        // Footer hint (`getFooterText`, `:166-174`): the bespoke action keys.
+        let hint_text = " enter toggle · alt+↑/↓ reorder · ctrl+a all · ctrl+x clear · ctrl+s save";
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint_text, theme.dim_style()))),
+            hint,
+        );
+        frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
+        // Bespoke scoped-models bindings take precedence over the shared select map.
+        if let Some(action) = self.models_keymap.action_for(key) {
+            let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
+            match action {
+                ModelsAction::ReorderUp => {
+                    self.reorder(&id, -1);
+                    self.refresh();
+                }
+                ModelsAction::ReorderDown => {
+                    self.reorder(&id, 1);
+                    self.refresh();
+                }
+                ModelsAction::EnableAll => {
+                    self.enabled = None;
+                    self.refresh();
+                }
+                ModelsAction::ClearAll => {
+                    self.enabled = Some(Vec::new());
+                    self.refresh();
+                }
+                ModelsAction::ToggleProvider => {
+                    self.toggle_provider(&id);
+                    self.refresh();
+                }
+                ModelsAction::Save => return SelectorOutcome::Confirm(self.confirm_value()),
+            }
+            return SelectorOutcome::Redraw;
+        }
+        match keymap.action_for(key) {
+            Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
+                self.list.select_up();
+                SelectorOutcome::Redraw
+            }
+            Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
+                self.list.select_down();
+                SelectorOutcome::Redraw
+            }
+            // Enter TOGGLES membership (it does NOT confirm) — `:278-289`.
+            Some(SelectAction::Confirm) => {
+                if let Some(id) = self.current_id() {
+                    self.toggle(&id);
+                    self.refresh();
+                }
+                SelectorOutcome::Redraw
+            }
+            Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
+            None => SelectorOutcome::Ignored,
         }
     }
 }

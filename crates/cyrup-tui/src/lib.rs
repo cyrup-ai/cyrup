@@ -22,22 +22,30 @@
 //! overlay z-stack + hotkeys popup** ([`overlay`]), active-region **page-scroll**, and the
 //! **`$EDITOR`/`$VISUAL` external-editor escape** (`Ctrl+G`) are all built and TestBackend-covered.
 //!
+//! # Built this round (L6 round-4)
+//! Inline images (`image.rs` — `ratatui-image` TTY-protocol probe + half-block fallback + `show_images`
+//! placeholder), the **`@`-mention `fd` file search** (`autocomplete.rs`), **grapheme-cluster** editor
+//! motion (`editor.rs` via `unicode-segmentation`), and the bespoke **scoped-models checkbox+reorder**
+//! selector ([`CheckboxSelector`] + [`ModelsKeymap`]).
+//!
 //! # Remaining gaps (see `spec/gap-analysis/12-cyrup-tui.md`)
-//! The six unbuilt data-bound selectors + bespoke selector layouts, `@`-mention `fd` search, inline
-//! images (`ratatui-image`), wrap-aware/sticky-column vertical motion + large-paste markers, the
-//! message-component/chrome tail, and HTML export — plus the outer-layer ext-UI command protocol and
-//! grapheme-cluster motion (dep-gated).
+//! The five unsourced data-bound selectors + their bespoke layouts (tree/session/settings/trust/oauth),
+//! wrap-aware/sticky-column vertical motion + large-paste markers, the message-component/chrome tail,
+//! clipboard-image paste + base64 message-image decode — plus the outer-layer ext-UI command protocol.
 #![forbid(unsafe_code)]
 
 mod app;
 mod autocomplete;
 mod bash;
+mod chrome;
 mod commands;
 mod component;
 mod diff;
 mod editor;
 mod error;
+mod export;
 mod fuzzy;
+mod image;
 mod keymap;
 mod markdown;
 mod overlay;
@@ -47,9 +55,13 @@ mod status;
 mod status_indicator;
 mod theme;
 mod transcript;
+mod tree_selector;
 
 pub use app::{crossterm_input_stream, render, App, AppAction, AppCommand, AppState};
-pub use autocomplete::{Applied, Autocomplete, Completion, CompletionContext};
+pub use autocomplete::{
+    list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
+    Completion, CompletionContext,
+};
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
 pub use commands::{
@@ -57,14 +69,26 @@ pub use commands::{
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;
-pub use editor::{EditorOutcome, InputEditor};
+pub use chrome::{
+    compact_hints, format_key_text, key_hint_line, key_hint_spans, render_compact_hints,
+    truncate_to_visual_lines, BorderedLoader, VisualTruncate,
+};
+pub use editor::{EditorOutcome, InputEditor, VisualLine};
+pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
-pub use keymap::{Action, EditorAction, EditorKeymap, Key, Keymap, SelectAction, SelectKeymap};
+pub use image::{ImageBlock, ImageRenderer};
+pub use keymap::{
+    Action, EditorAction, EditorKeymap, Key, Keymap, ModelsAction, ModelsKeymap, SelectAction,
+    SelectKeymap, TreeAction, TreeKeymap,
+};
 pub use markdown::{render as render_markdown, trim_partial_closing_fence};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
-pub use selector::{ListSelector, Selector, SelectorKind, SelectorOutcome};
+pub use selector::{
+    CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome, SCOPED_MODELS_ALL,
+};
 pub use status::{format_tokens, StatusLine};
+pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
 pub use theme::{color_of, UiTheme};
 pub use transcript::{content_text, Entry, TranscriptView};

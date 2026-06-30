@@ -2,7 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyrup_tui::{Action, EditorAction, EditorKeymap, Key, Keymap, SelectAction, SelectKeymap};
+use cyrup_tui::{
+    Action, EditorAction, EditorKeymap, Key, Keymap, ModelsAction, ModelsKeymap, SelectAction,
+    SelectKeymap,
+};
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
@@ -53,6 +56,30 @@ fn select_and_editor_maps_merge_their_own_ids_only() {
     assert_eq!(
         ek.action_for(&key(KeyCode::Char('m'), KeyModifiers::CONTROL)),
         Some(EditorAction::Submit)
+    );
+}
+
+#[test]
+fn models_keymap_merges_app_models_ids_only() {
+    // The scoped-models bespoke map (`app.models.*`, core/keybindings.ts:150-175) picks only its ids.
+    let doc = r#"{
+        "app.models.save": "ctrl+enter",
+        "app.models.reorderUp": "shift+up",
+        "tui.select.confirm": "ctrl+y"
+    }"#;
+    let mut mk = ModelsKeymap::default();
+    mk.merge_json(doc).unwrap();
+    // The rebound save key resolves; the old default (ctrl+s) was dropped.
+    assert_eq!(
+        mk.action_for(&key(KeyCode::Enter, KeyModifiers::CONTROL)),
+        Some(ModelsAction::Save)
+    );
+    assert_eq!(mk.action_for(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)), None);
+    assert_eq!(mk.action_for(&key(KeyCode::Up, KeyModifiers::SHIFT)), Some(ModelsAction::ReorderUp));
+    // Defaults untouched by the doc survive (Ctrl+A → enableAll).
+    assert_eq!(
+        mk.action_for(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        Some(ModelsAction::EnableAll)
     );
 }
 

@@ -114,7 +114,10 @@ base64               = { version = "0.22" }
 # `forbid(unsafe_code)` in cyrup-tui is unaffected (the lint is per-crate, not transitive).
 pulldown-cmark       = { version = "0.13.4", default-features = false }
 syntect              = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
-ratatui-image        = { version = "11.0.6" }
+# `default-features = false` drops the `chafa-dyn` feature (a C `libchafa` pkg-config dep used only
+# for higher-quality sixel encoding); sixel still works via the pure-Rust `icy_sixel`, so the
+# workspace stays all-Rust with no system library. `crossterm` matches ratatui's backend.
+ratatui-image        = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:

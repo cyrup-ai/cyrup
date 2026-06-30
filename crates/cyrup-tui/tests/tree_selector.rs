@@ -1,0 +1,122 @@
+//! `/tree` session-navigator layout tests (spec/tui/05 §5.1; Pi `tree-selector.ts`). Exercises the
+//! bespoke layout: connectors, fold markers/behavior, filter modes, glyphs, and navigation — both
+//! through the public API and via TestBackend buffer assertions.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+
+use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use cyrup_tui::{
+    FilterMode, SelectKeymap, Selector, SelectorOutcome, TreeKind, TreeNode, TreeSelector, UiTheme,
+};
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::Terminal;
+
+fn node(id: &str, depth: usize, label: &str, kind: TreeKind) -> TreeNode {
+    let mut n = TreeNode::message(id, depth, label);
+    n.kind = kind;
+    n
+}
+
+/// A small DAG:
+///   root (●)
+///   ├─⊟ model→opus (◆, foldable open)
+///   │   └─ "streaming" (●)
+///   ├─ 14 tool calls (⚙)
+///   └─ "fix footer" (●, labeled)
+///        └─ compaction (✓)
+fn sample() -> Vec<TreeNode> {
+    let mut model = node("m", 1, "model -> opus", TreeKind::ModelChange);
+    model.foldable = true;
+    let mut footer = node("f", 1, "fix footer", TreeKind::Message);
+    footer.has_label = true;
+    vec![
+        node("root", 0, "initial prompt", TreeKind::Message),
+        model,
+        node("stream", 2, "wire up streaming", TreeKind::Message),
+        node("tools", 1, "14 tool calls", TreeKind::ToolGroup),
+        footer,
+        node("compact", 2, "compaction", TreeKind::Compaction),
+    ]
+}
+
+fn buf_string(terminal: &Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    let area = buf.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+#[test]
+fn renders_connectors_glyphs_and_fold_markers() {
+    let theme = UiTheme::dark();
+    let mut sel = TreeSelector::new(sample());
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme)).unwrap();
+    let text = buf_string(&terminal);
+    assert!(text.contains("Session Tree"), "header: {text}");
+    assert!(text.contains("Filter: default"));
+    assert!(text.contains('●'), "message glyph");
+    assert!(text.contains('◆'), "model-change glyph");
+    assert!(text.contains('⚙'), "tool-group glyph");
+    assert!(text.contains("├─") || text.contains("└─"), "connectors: {text}");
+    assert!(text.contains('⊟'), "open-fold marker for the foldable node");
+    assert!(text.contains("☆labeled"), "label star on the labeled node");
+}
+
+#[test]
+fn fold_hides_descendants_and_unfold_restores() {
+    let mut sel = TreeSelector::new(sample());
+    assert_eq!(sel.visible_indices().len(), 6);
+    // Select the foldable model node (row 1) and fold it (`z`).
+    sel.handle(&key(KeyCode::Down), &SelectKeymap::default()); // -> row 1 (model)
+    sel.handle(&key(KeyCode::Char('z')), &SelectKeymap::default()); // fold
+    // The "streaming" child (depth 2 under model) is now hidden.
+    let visible = sel.visible_indices();
+    assert_eq!(visible.len(), 5, "one descendant hidden by the fold");
+    // Unfold (`x`) restores it.
+    sel.handle(&key(KeyCode::Char('x')), &SelectKeymap::default());
+    assert_eq!(sel.visible_indices().len(), 6);
+}
+
+#[test]
+fn filter_modes_change_visible_set() {
+    let mut sel = TreeSelector::new(sample());
+    // no-tools (key `2`) hides the tool group.
+    sel.handle(&key(KeyCode::Char('2')), &SelectKeymap::default());
+    assert_eq!(sel.filter(), FilterMode::NoTools);
+    assert!(!sel.visible_ids().contains(&"tools".to_string()));
+    // labeled-only (key `4`) keeps only the labeled node.
+    sel.handle(&key(KeyCode::Char('4')), &SelectKeymap::default());
+    assert_eq!(sel.filter(), FilterMode::LabeledOnly);
+    assert_eq!(sel.visible_ids(), vec!["f".to_string()]);
+    // user (key `3`) keeps only messages.
+    sel.handle(&key(KeyCode::Char('3')), &SelectKeymap::default());
+    let ids = sel.visible_ids();
+    assert!(ids.contains(&"root".to_string()) && ids.contains(&"stream".to_string()));
+    assert!(!ids.contains(&"tools".to_string()) && !ids.contains(&"m".to_string()));
+}
+
+#[test]
+fn enter_confirms_selected_entry_id() {
+    let mut sel = TreeSelector::new(sample());
+    sel.handle(&key(KeyCode::Down), &SelectKeymap::default()); // row 1 = model "m"
+    let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Confirm("m".to_string()));
+}
+
+#[test]
+fn esc_cancels() {
+    let mut sel = TreeSelector::new(sample());
+    let out = sel.handle(&key(KeyCode::Esc), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Cancel);
+}

@@ -106,6 +106,10 @@ async fn run_interactive(
     cancel: CancelToken,
 ) -> anyhow::Result<()> {
     let mut app = App::into_stdout(UiTheme::default()).context("initialising the terminal UI")?;
+    // Probe the controlling TTY for its real image protocol (Kitty/iTerm2/sixel), upgrading from the
+    // portable half-block default so inline images render as native graphics where supported
+    // (spec/tui/06 §6; `terminal-image.ts`). Degrades silently to half-blocks on unsupported terminals.
+    app.detect_image_support();
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
 

@@ -38,6 +38,44 @@ fn backspace_deletes_char_before_cursor() {
 }
 
 #[test]
+fn left_right_step_over_whole_grapheme_cluster() {
+    // A family-emoji ZWJ sequence is many `char`s but ONE grapheme cluster: one Left must skip it all
+    // (spec/tui/03 §4 grapheme motion). "a👨‍👩‍👧b" — the middle cluster is 5 scalar values.
+    let mut ed = InputEditor::new();
+    ed.set_text("a👨‍👩‍👧b");
+    // Cursor at end. One Left lands before the trailing 'b'.
+    ed.handle_key(&key(KeyCode::Left));
+    let (_, after_b) = ed.cursor();
+    // One more Left skips the entire family cluster in a single step, landing just after 'a'.
+    ed.handle_key(&key(KeyCode::Left));
+    let (_, after_family) = ed.cursor();
+    assert_eq!(after_family, 1, "Left did not step the whole grapheme cluster as one unit");
+    assert!(after_b - after_family >= 5, "the cluster should span ≥5 scalar columns");
+    // Right steps back over the whole cluster in one move.
+    ed.handle_key(&key(KeyCode::Right));
+    assert_eq!(ed.cursor().1, after_b);
+}
+
+#[test]
+fn backspace_removes_whole_grapheme_cluster() {
+    let mut ed = InputEditor::new();
+    ed.set_text("a👨‍👩‍👧");
+    ed.handle_key(&key(KeyCode::Backspace));
+    assert_eq!(ed.text(), "a", "backspace must delete the entire emoji cluster, not one scalar");
+    assert_eq!(ed.cursor(), (0, 1));
+}
+
+#[test]
+fn forward_delete_removes_whole_grapheme_cluster() {
+    let mut ed = InputEditor::new();
+    ed.set_text("👨‍👩‍👧b");
+    ed.handle_key(&key(KeyCode::Home));
+    ed.handle_key(&key(KeyCode::Delete));
+    assert_eq!(ed.text(), "b", "forward-delete must remove the entire emoji cluster");
+    assert_eq!(ed.cursor(), (0, 0));
+}
+
+#[test]
 fn cursor_move_then_insert_lands_mid_string() {
     let mut ed = InputEditor::new();
     type_str(&mut ed, "abcd");
@@ -219,4 +257,141 @@ fn char_jump_forward_moves_to_target() {
     ed.handle_key(&ctrl(']'));
     ed.handle_key(&key(KeyCode::Char('.')));
     assert_eq!(ed.cursor(), (0, 5)); // first '.'
+}
+
+// ---- wrap-aware vertical (visual-line) motion (spec/tui/03 §4) ------------------------------
+
+#[test]
+fn visual_line_map_wraps_long_line_at_word_boundary() {
+    // A single logical line wider than the layout width expands into multiple visual lines,
+    // breaking at the last whitespace that fits (`wordWrapLine`, editor.ts:114).
+    let mut ed = InputEditor::new();
+    ed.set_view_width(10);
+    type_str(&mut ed, "alpha bravo charlie");
+    let map = ed.visual_line_map();
+    assert!(map.len() >= 2, "long line must wrap into >1 visual line: {map:?}");
+    // Every visual line is a slice of logical line 0.
+    assert!(map.iter().all(|vl| vl.logical == 0));
+    // First visual line starts at column 0; the second resumes after the wrap.
+    assert_eq!(map[0].start, 0);
+    assert!(map[1].start > 0);
+}
+
+#[test]
+fn cursor_down_moves_by_visual_line_not_logical_line() {
+    // One *logical* line that wraps to several *visual* lines: Down advances a visual line, so the
+    // cursor stays on logical row 0 but jumps forward across the wrap (it does NOT fall to history).
+    let mut ed = InputEditor::new();
+    ed.set_view_width(10);
+    type_str(&mut ed, "alpha bravo charlie");
+    // Cursor at end (col 19). Move Home, then Down should land on the second visual line, row 0.
+    ed.handle_key(&KeyCode::Home.into());
+    assert_eq!(ed.cursor(), (0, 0));
+    ed.handle_key(&key(KeyCode::Down));
+    let (row, col) = ed.cursor();
+    assert_eq!(row, 0, "still the same logical line");
+    assert!(col > 0, "cursor advanced to the next visual line, col={col}");
+}
+
+#[test]
+fn vertical_motion_keeps_sticky_goal_column() {
+    // Goal column survives a short intermediate line: Down from a long line through a short line and
+    // onto another long line restores the original column (sticky preferred_visual_col).
+    let mut ed = InputEditor::new();
+    ed.set_view_width(40);
+    type_str(&mut ed, "abcdefghij");
+    newline(&mut ed); // logical row 1
+    type_str(&mut ed, "xy");
+    newline(&mut ed); // logical row 2
+    type_str(&mut ed, "0123456789");
+    // Navigate to row 0, col 7.
+    ed.handle_key(&key(KeyCode::Up));
+    ed.handle_key(&key(KeyCode::Up));
+    ed.handle_key(&KeyCode::Home.into());
+    for _ in 0..7 {
+        ed.handle_key(&key(KeyCode::Right));
+    }
+    assert_eq!(ed.cursor(), (0, 7));
+    // Down to the short row clamps to its end (col 2)...
+    ed.handle_key(&key(KeyCode::Down));
+    assert_eq!(ed.cursor(), (1, 2));
+    // ...then Down to the long row RESTORES the sticky goal column 7.
+    ed.handle_key(&key(KeyCode::Down));
+    assert_eq!(ed.cursor(), (2, 7));
+}
+
+#[test]
+fn horizontal_motion_reseeds_goal_column() {
+    let mut ed = InputEditor::new();
+    ed.set_view_width(40);
+    type_str(&mut ed, "abcdefghij");
+    newline(&mut ed);
+    type_str(&mut ed, "xy");
+    newline(&mut ed);
+    type_str(&mut ed, "0123456789");
+    ed.handle_key(&key(KeyCode::Up));
+    ed.handle_key(&key(KeyCode::Up));
+    ed.handle_key(&KeyCode::Home.into());
+    for _ in 0..7 {
+        ed.handle_key(&key(KeyCode::Right));
+    }
+    ed.handle_key(&key(KeyCode::Down)); // row1 col2 (clamped)
+    // A horizontal move re-seeds the goal: Left to col1, then Down must land at col1, not col7.
+    ed.handle_key(&key(KeyCode::Left));
+    assert_eq!(ed.cursor(), (1, 1));
+    ed.handle_key(&key(KeyCode::Down));
+    assert_eq!(ed.cursor(), (2, 1));
+}
+
+// ---- large-paste markers (spec/tui/03 §5.5) ------------------------------------------------
+
+#[test]
+fn large_multiline_paste_collapses_to_marker_and_expands_on_submit() {
+    let mut ed = InputEditor::new();
+    let big: String = (0..15).map(|i| format!("line {i}\n")).collect();
+    ed.handle_paste(&big);
+    // The buffer shows a compact marker, not the 15 lines.
+    assert!(ed.text().contains("[paste #1 +16 lines]"), "buffer={:?}", ed.text());
+    assert_eq!(ed.line_count(), 1);
+    // expanded_text restores the full content.
+    assert_eq!(ed.expanded_text(), big);
+}
+
+#[test]
+fn small_paste_inserts_verbatim() {
+    let mut ed = InputEditor::new();
+    ed.handle_paste("just a line");
+    assert_eq!(ed.text(), "just a line");
+    assert_eq!(ed.expanded_text(), "just a line");
+}
+
+#[test]
+fn backspace_deletes_whole_paste_marker_atomically() {
+    let mut ed = InputEditor::new();
+    let big = "x".repeat(1200);
+    ed.handle_paste(&big);
+    assert!(ed.text().contains("[paste #1"));
+    // Cursor sits just after the marker's closing ']'. One Backspace removes the entire marker.
+    ed.handle_key(&key(KeyCode::Backspace));
+    assert_eq!(ed.text(), "");
+    assert_eq!(ed.expanded_text(), "");
+}
+
+#[test]
+fn submit_expands_paste_marker() {
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "prefix ");
+    let big: String = (0..20).map(|i| format!("L{i}\n")).collect();
+    ed.handle_paste(&big);
+    type_str(&mut ed, " suffix");
+    let out = ed.handle_key(&key(KeyCode::Enter));
+    match out {
+        EditorOutcome::Submit(text) => {
+            assert!(text.starts_with("prefix "));
+            assert!(text.ends_with(" suffix"));
+            assert!(text.contains("L0\n"));
+            assert!(!text.contains("[paste #"));
+        }
+        other => panic!("expected Submit, got {other:?}"),
+    }
 }

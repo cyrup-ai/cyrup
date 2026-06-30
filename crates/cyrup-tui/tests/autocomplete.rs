@@ -176,3 +176,59 @@ fn popup_renders_below_editor_in_viewport() {
     assert!(text.contains("settings"), "popup row 'settings' missing from viewport:\n{text}");
     assert!(text.contains("Open settings menu"), "description column missing:\n{text}");
 }
+
+// ---- @-mention search (autocomplete.ts:101,164,408) ---------------------------------------
+
+#[test]
+fn at_mention_auto_pops_and_fuzzy_filters_the_tree() {
+    let mut ed = InputEditor::new();
+    ed.set_mention_files(vec![
+        "src/app.rs".to_string(),
+        "src/editor.rs".to_string(),
+        "Cargo.toml".to_string(),
+        "README.md".to_string(),
+    ]);
+    // Typing `@` auto-opens the mention popup over the whole tree (no Tab needed).
+    type_str(&mut ed, "@");
+    assert!(ed.autocomplete_open(), "@ did not auto-open the mention popup");
+    // Narrowing by a fuzzy query keeps the popup and ranks matches.
+    type_str(&mut ed, "edit");
+    let ac = ed.autocomplete().unwrap();
+    let top = ac.list.selected_item().unwrap();
+    assert_eq!(top.label, "src/editor.rs", "fuzzy mention ranking wrong; got {}", top.label);
+}
+
+#[test]
+fn at_mention_accept_inserts_path_with_trailing_space() {
+    let mut ed = InputEditor::new();
+    ed.set_mention_files(vec!["src/editor.rs".to_string(), "src/app.rs".to_string()]);
+    type_str(&mut ed, "look at @edit");
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "look at @src/editor.rs ");
+    assert!(!ed.autocomplete_open(), "popup should close once the mention completes");
+}
+
+#[test]
+fn at_mention_quotes_paths_with_spaces() {
+    let mut ed = InputEditor::new();
+    ed.set_mention_files(vec!["my docs/notes.md".to_string()]);
+    type_str(&mut ed, "@notes");
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "@\"my docs/notes.md\" ");
+}
+
+#[test]
+fn mention_list_files_walks_the_tree_skipping_vcs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("src/main.rs"), "").unwrap();
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    std::fs::write(root.join(".git/HEAD"), "").unwrap();
+    // The walk fallback (used when `fd` is absent) is exercised directly via the public lister.
+    let files = cyrup_tui::mention_list_files(root, 100);
+    assert!(files.contains(&"src/main.rs".to_string()), "missing nested file: {files:?}");
+    assert!(files.contains(&"Cargo.toml".to_string()), "missing root file: {files:?}");
+    assert!(!files.iter().any(|f| f.contains(".git")), ".git must be skipped: {files:?}");
+}

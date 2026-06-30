@@ -27,6 +27,13 @@ tokio-stream.workspace = true
 # Rich rendering (spec/tui/06): markdown parse + syntax highlight. Both pure-Rust.
 pulldown-cmark = { workspace = true }
 syntect = { workspace = true }
+# Inline images (spec/tui/06 §6; tui/src/terminal-image.ts): Kitty/iTerm2/sixel via `ratatui-image`,
+# with a half-block fallback that renders to ANY backend (incl. `TestBackend`) and a text placeholder
+# under the `show_images` toggle. `image` decodes/resizes the source bytes (already in-workspace).
+ratatui-image = { workspace = true }
+image = { workspace = true }
+# Grapheme-cluster cursor motion (spec/tui/03 §4; editor-component.ts grapheme stepping) — user-approved.
+unicode-segmentation = { workspace = true }
 # JSON keybindings loader (spec/tui/07 §3.9; core/keybindings.ts:14-262) + theme-data hot-reload.
 serde_json = { workspace = true }
 

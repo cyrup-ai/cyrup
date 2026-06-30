@@ -417,6 +417,162 @@ impl SelectKeymap {
     }
 }
 
+/// The scoped-models checkbox-selector actions (`scoped-models-selector.ts:255-330`;
+/// `core/keybindings.ts:150-175` `app.models.*`). These bind only inside the scoped-models selector,
+/// on top of the shared `tui.select.*` navigation; resolved via [`ModelsKeymap`] (R-10-018).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModelsAction {
+    /// Move the highlighted (enabled) model up in cycle order — `app.models.reorderUp` (Alt+Up).
+    ReorderUp,
+    /// Move the highlighted (enabled) model down in cycle order — `app.models.reorderDown` (Alt+Down).
+    ReorderDown,
+    /// Enable every model (the scoped set becomes "all") — `app.models.enableAll` (Ctrl+A).
+    EnableAll,
+    /// Clear the scoped set (no model enabled) — `app.models.clearAll` (Ctrl+X).
+    ClearAll,
+    /// Toggle every model of the highlighted row's provider — `app.models.toggleProvider` (Ctrl+P).
+    ToggleProvider,
+    /// Confirm + persist the scoped set — `app.models.save` (Ctrl+S).
+    Save,
+}
+
+impl ModelsAction {
+    /// Resolve an `app.models.*` binding id (spec/tui/05; `core/keybindings.ts:150-175`).
+    pub fn from_id(id: &str) -> Option<ModelsAction> {
+        match id {
+            "app.models.reorderUp" => Some(ModelsAction::ReorderUp),
+            "app.models.reorderDown" => Some(ModelsAction::ReorderDown),
+            "app.models.enableAll" => Some(ModelsAction::EnableAll),
+            "app.models.clearAll" => Some(ModelsAction::ClearAll),
+            "app.models.toggleProvider" => Some(ModelsAction::ToggleProvider),
+            "app.models.save" => Some(ModelsAction::Save),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable scoped-models binding table (`core/keybindings.ts:150-175`). Defaults: Alt+Up/Down
+/// reorder, Ctrl+A enable-all, Ctrl+X clear-all, Ctrl+P toggle-provider, Ctrl+S save.
+#[derive(Clone, Debug)]
+pub struct ModelsKeymap {
+    bindings: Vec<(Key, ModelsAction)>,
+}
+
+impl Default for ModelsKeymap {
+    fn default() -> Self {
+        use ModelsAction as M;
+        ModelsKeymap {
+            bindings: vec![
+                (Key { code: KeyCode::Up, mods: KeyModifiers::ALT }, M::ReorderUp),
+                (Key { code: KeyCode::Down, mods: KeyModifiers::ALT }, M::ReorderDown),
+                (Key::ctrl('a'), M::EnableAll),
+                (Key::ctrl('x'), M::ClearAll),
+                (Key::ctrl('p'), M::ToggleProvider),
+                (Key::ctrl('s'), M::Save),
+            ],
+        }
+    }
+}
+
+impl ModelsKeymap {
+    /// Resolve the scoped-models action for an event, if any (R-10-018).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<ModelsAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: ModelsAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `app.models.*` ids.
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = ModelsAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `/tree` session-navigator actions (`tree-selector.ts:1180-1197`; `core/keybindings.ts`
+/// `app.tree.*`). These bind only inside the tree selector, on top of the shared `tui.select.*`
+/// navigation; resolved via [`TreeKeymap`] (R-10-018, spec/tui/05 §6.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TreeAction {
+    /// Fold the selected branch's descendants, or move up at a leaf — `app.tree.foldOrUp` (`z`).
+    FoldOrUp,
+    /// Unfold the selected branch, or move down at a leaf — `app.tree.unfoldOrDown` (`x`).
+    UnfoldOrDown,
+    /// Begin inline label edit on the selected entry — `app.tree.editLabel` (`e`).
+    EditLabel,
+    /// Toggle the per-row label-timestamp column — `app.tree.toggleLabelTimestamp` (`t`).
+    ToggleLabelTimestamp,
+}
+
+impl TreeAction {
+    /// Resolve an `app.tree.*` binding id (spec/tui/05 §6.1).
+    pub fn from_id(id: &str) -> Option<TreeAction> {
+        match id {
+            "app.tree.foldOrUp" => Some(TreeAction::FoldOrUp),
+            "app.tree.unfoldOrDown" => Some(TreeAction::UnfoldOrDown),
+            "app.tree.editLabel" => Some(TreeAction::EditLabel),
+            "app.tree.toggleLabelTimestamp" => Some(TreeAction::ToggleLabelTimestamp),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable `/tree` binding table (spec/tui/05 §6.1). Defaults: `z` fold/up, `x` unfold/down,
+/// `e` edit label, `t` toggle label-timestamp.
+#[derive(Clone, Debug)]
+pub struct TreeKeymap {
+    bindings: Vec<(Key, TreeAction)>,
+}
+
+impl Default for TreeKeymap {
+    fn default() -> Self {
+        use TreeAction as T;
+        TreeKeymap {
+            bindings: vec![
+                (Key::plain(KeyCode::Char('z')), T::FoldOrUp),
+                (Key::plain(KeyCode::Char('x')), T::UnfoldOrDown),
+                (Key::plain(KeyCode::Char('e')), T::EditLabel),
+                (Key::plain(KeyCode::Char('t')), T::ToggleLabelTimestamp),
+            ],
+        }
+    }
+}
+
+impl TreeKeymap {
+    /// Resolve the tree action for an event, if any (R-10-018).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<TreeAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: TreeAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `app.tree.*` ids.
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = TreeAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The configurable editor binding table (spec/tui/03 §6.1). Defaults port
 /// `pi-tui/src/keybindings.ts:54-134`. Multiple keys may bind one action; first match wins.
 #[derive(Clone, Debug)]
