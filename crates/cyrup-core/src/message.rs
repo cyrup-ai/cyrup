@@ -323,7 +323,7 @@ pub struct Cost {
 ///
 /// Pi-interop flat shape: `provider`/`model`/`api` are separate fields (not a nested `ModelRef`);
 /// use [`AssistantMessage::model_ref`] for handoff-equality.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
     #[serde(deserialize_with = "de_assistant_content")]
@@ -356,6 +356,53 @@ pub struct AssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error_message: Option<String>,
     pub timestamp: i64,
+}
+
+impl serde::Serialize for AssistantMessage {
+    /// Self-tagging serializer: emits `role: "assistant"` FIRST (Pi's `AssistantMessage` literal
+    /// always carries it, `ai/src/types.ts:384`), then Pi's exact field order — role, content, api,
+    /// provider, model, responseModel?, responseId?, diagnostics?, usage, stopReason, errorMessage?,
+    /// timestamp. So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
+    /// `done.message`/`error.error` that embeds one — is byte-1:1 with Pi. Verified against captured
+    /// Pi bytes (`text-turn.pi-captured` `start` partial begins `{"role":"assistant","content":[],
+    /// "api":...}`). The derived `Deserialize` ignores the extra `role` key on read.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let len = 8
+            + usize::from(self.response_model.is_some())
+            + usize::from(self.response_id.is_some())
+            + usize::from(self.diagnostics.is_some())
+            + usize::from(self.error_message.is_some());
+        let mut st = serializer.serialize_struct("AssistantMessage", len)?;
+        st.serialize_field("role", "assistant")?;
+        st.serialize_field("content", &self.content)?;
+        st.serialize_field("api", &self.api)?;
+        st.serialize_field("provider", &self.provider)?;
+        st.serialize_field("model", &self.model)?;
+        match &self.response_model {
+            Some(v) => st.serialize_field("responseModel", v)?,
+            None => st.skip_field("responseModel")?,
+        }
+        match &self.response_id {
+            Some(v) => st.serialize_field("responseId", v)?,
+            None => st.skip_field("responseId")?,
+        }
+        match &self.diagnostics {
+            Some(v) => st.serialize_field("diagnostics", v)?,
+            None => st.skip_field("diagnostics")?,
+        }
+        st.serialize_field("usage", &self.usage)?;
+        st.serialize_field("stopReason", &self.stop_reason)?;
+        match &self.error_message {
+            Some(v) => st.serialize_field("errorMessage", v)?,
+            None => st.skip_field("errorMessage")?,
+        }
+        st.serialize_field("timestamp", &self.timestamp)?;
+        st.end()
+    }
 }
 
 impl AssistantMessage {
@@ -404,7 +451,7 @@ impl AssistantMessage {
 
 /// A conversation message (func-01 §4.2). Custom (extension/app) message types live in
 /// `cyrup-agent`'s `AgentMessage` wrapper and are filtered before the model call (func-02).
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Message {
     User {
@@ -413,7 +460,7 @@ pub enum Message {
         /// form is validated to `Text|Image` only (gap 5/9 / R-00-013). On WRITE, a single
         /// signature-less text block is serialized back to the bare-string shorthand for byte
         /// parity with Pi (gap 16); anything else serializes as the content array.
-        #[serde(deserialize_with = "de_user_content", serialize_with = "se_user_content")]
+        #[serde(deserialize_with = "de_user_content")]
         content: Vec<Content>,
         timestamp: i64,
     },
@@ -433,33 +480,50 @@ pub enum Message {
     },
 }
 
-/// The variant name of a [`Content`] block, for per-role validation error messages.
-fn content_kind(c: &Content) -> &'static str {
-    match c {
-        Content::Text { .. } => "text",
-        Content::Thinking { .. } => "thinking",
-        Content::ToolCall(_) => "toolCall",
-        Content::Image { .. } => "image",
-    }
-}
-
-/// Reject any block whose variant is not permitted for `role` (Pi types content per role,
-/// types.ts:379/385/402); `allowed` is the human-readable union for the error message.
-fn validate_role_content<E: serde::de::Error>(
-    content: &[Content],
-    role: &str,
-    allowed: &str,
-    permitted: impl Fn(&Content) -> bool,
-) -> Result<(), E> {
-    for c in content {
-        if !permitted(c) {
-            return Err(E::custom(format!(
-                "{role} content may only contain {allowed}, found `{}`",
-                content_kind(c)
-            )));
+impl serde::Serialize for Message {
+    /// Manual serializer so the `role` discriminant appears EXACTLY ONCE and in Pi's field order.
+    /// `Assistant` delegates to [`AssistantMessage`]'s self-tagging serializer (which emits
+    /// `role:"assistant"` first, then Pi's order); `User`/`ToolResult` write their own `role` then
+    /// their fields. A derived internally-tagged `Serialize` would DOUBLE the `role` key for the
+    /// `Assistant` arm now that its struct self-tags. `Deserialize` stays derived (`tag = "role"`).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        match self {
+            Message::User { content, timestamp } => {
+                let mut st = serializer.serialize_struct("Message", 3)?;
+                st.serialize_field("role", "user")?;
+                // Pi bare-string shorthand for a single signature-less text block (gap 16);
+                // otherwise the content array. Round-trips through `de_user_content`.
+                match content.as_slice() {
+                    [Content::Text { text, text_signature: None }] => {
+                        st.serialize_field("content", text)?
+                    }
+                    _ => st.serialize_field("content", content)?,
+                }
+                st.serialize_field("timestamp", timestamp)?;
+                st.end()
+            }
+            Message::Assistant(m) => m.serialize(serializer),
+            Message::ToolResult { tool_call_id, tool_name, content, is_error, details, timestamp } => {
+                let len = 6 + usize::from(details.is_some());
+                let mut st = serializer.serialize_struct("Message", len)?;
+                st.serialize_field("role", "toolResult")?;
+                st.serialize_field("toolCallId", tool_call_id)?;
+                st.serialize_field("toolName", tool_name)?;
+                st.serialize_field("content", content)?;
+                st.serialize_field("isError", is_error)?;
+                match details {
+                    Some(d) => st.serialize_field("details", d)?,
+                    None => st.skip_field("details")?,
+                }
+                st.serialize_field("timestamp", timestamp)?;
+                st.end()
+            }
         }
     }
-    Ok(())
 }
 
 /// Deserialize `UserMessage.content` accepting Pi's bare-string shorthand OR the content array, and
@@ -477,28 +541,12 @@ where
         Str(String),
         Arr(Vec<Content>),
     }
-    let content = match StringOrArray::deserialize(deserializer)? {
+    // Pi runtime read-tolerance (see `de_assistant_content`): accept the bare-string shorthand or
+    // the content array, with no role-union rejection.
+    Ok(match StringOrArray::deserialize(deserializer)? {
         StringOrArray::Str(s) => vec![Content::text(s)],
         StringOrArray::Arr(v) => v,
-    };
-    validate_role_content(&content, "user", "text or image", |c| {
-        matches!(c, Content::Text { .. } | Content::Image { .. })
-    })?;
-    Ok(content)
-}
-
-/// Serialize `UserMessage.content` back to Pi's bare-string shorthand when it is exactly one
-/// signature-less [`Content::Text`] (Pi may emit `content: "hi"` directly, types.ts:379 — gap 16);
-/// otherwise emit the content array. Fully round-trips through [`de_user_content`].
-fn se_user_content<S>(content: &[Content], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    if let [Content::Text { text, text_signature: None }] = content {
-        serializer.serialize_str(text)
-    } else {
-        serializer.collect_seq(content)
-    }
+    })
 }
 
 /// Deserialize `ToolResultMessage.content`, validating to `Text|Image` only (Pi
@@ -508,11 +556,8 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
-    let content = Vec::<Content>::deserialize(deserializer)?;
-    validate_role_content(&content, "toolResult", "text or image", |c| {
-        matches!(c, Content::Text { .. } | Content::Image { .. })
-    })?;
-    Ok(content)
+    // Pi runtime read-tolerance (see `de_assistant_content`): no role-union rejection.
+    Vec::<Content>::deserialize(deserializer)
 }
 
 /// Deserialize `AssistantMessage.content`, validating to `Text|Thinking|ToolCall` only (Pi
@@ -523,15 +568,14 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
-    let content = Vec::<Content>::deserialize(deserializer)?;
-    validate_role_content(&content, "assistant", "text, thinking or toolCall", |c| {
-        matches!(c, Content::Text { .. } | Content::Thinking { .. } | Content::ToolCall(_))
-    })?;
-    Ok(content)
+    // Pi's per-role content unions are COMPILE-TIME TS only; its runtime `JSON.parse` accepts any
+    // block regardless of role (no schema validation, `ai/src/types.ts:385`). cyrup matches that
+    // read tolerance 1:1 — no role-union rejection — so any session JSONL Pi loads, cyrup loads.
+    Vec::<Content>::deserialize(deserializer)
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -651,33 +695,74 @@ mod tests {
     }
 
     #[test]
-    fn assistant_content_rejects_image_on_deserialize() {
-        // gap 9: Pi types assistant content as Text|Thinking|ToolCall — an image is rejected.
+    fn assistant_content_accepts_image_on_deserialize_like_pi() {
+        // Pi's runtime is type-erased: `JSON.parse` accepts an image in an assistant turn even
+        // though the compile-time TS union forbids it (types.ts:385). cyrup matches that read
+        // tolerance 1:1 — a session JSONL Pi loads, cyrup loads.
         let json = serde_json::json!({
             "role": "assistant",
             "content": [{ "type": "image", "data": "x", "mimeType": "image/png" }],
             "provider": "faux", "model": "m", "api": "faux",
             "usage": Usage::default(), "stopReason": "stop", "timestamp": 0,
         });
-        let err = serde_json::from_value::<Message>(json).expect_err("must reject image");
-        assert!(err.to_string().contains("assistant content"), "{err}");
+        let m = serde_json::from_value::<Message>(json).expect("Pi accepts an off-union block");
+        match m {
+            Message::Assistant(a) => assert!(matches!(a.content.as_slice(), [Content::Image { .. }])),
+            other => panic!("expected assistant, got {other:?}"),
+        }
     }
 
     #[test]
-    fn user_and_tool_result_content_reject_assistant_only_blocks() {
-        // gap 9: user/toolResult content is Text|Image — a toolCall/thinking is rejected.
+    fn user_and_tool_result_content_accept_off_union_blocks_like_pi() {
+        // Pi runtime read-tolerance (see above): user/toolResult content is typed Text|Image at
+        // compile time but `JSON.parse` accepts any block (types.ts:379,402). cyrup matches 1:1.
         let user = serde_json::json!({
             "role": "user",
             "content": [{ "type": "toolCall", "id": "t", "name": "n", "arguments": {} }],
             "timestamp": 0,
         });
-        assert!(serde_json::from_value::<Message>(user).is_err());
+        assert!(serde_json::from_value::<Message>(user).is_ok());
         let tr = serde_json::json!({
             "role": "toolResult", "toolCallId": "t", "toolName": "n",
             "content": [{ "type": "thinking", "thinking": "x" }],
             "isError": false, "timestamp": 0,
         });
-        assert!(serde_json::from_value::<Message>(tr).is_err());
+        assert!(serde_json::from_value::<Message>(tr).is_ok());
+    }
+
+    #[test]
+    fn bare_assistant_message_role_first_pi_order_single_role_key() {
+        let m = AssistantMessage {
+            content: vec![Content::text("hi")],
+            provider: "faux".into(),
+            model: "faux-1".into(),
+            api: "faux".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        // Standalone (as embedded in `StreamEvent.partial`): role:"assistant" FIRST, Pi field order.
+        let s = serde_json::to_string(&m).expect("serialize");
+        assert!(s.starts_with(r#"{"role":"assistant","content":"#), "role first: {s}");
+        let order: Vec<usize> = [
+            "\"role\"", "\"content\"", "\"api\"", "\"provider\"", "\"model\"", "\"usage\"",
+            "\"stopReason\"", "\"timestamp\"",
+        ]
+        .iter()
+        .map(|k| s.find(k).expect("key present"))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "Pi field order: {s}");
+        assert_eq!(s.matches("\"role\"").count(), 1, "exactly one role key: {s}");
+        let back: AssistantMessage = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, m);
+        // Wrapped in Message::Assistant (the JSONL form): STILL exactly one role key, role first.
+        let wrapped = serde_json::to_string(&Message::Assistant(m)).expect("serialize");
+        assert_eq!(wrapped.matches("\"role\"").count(), 1, "no duplicate role in Message: {wrapped}");
+        assert!(wrapped.starts_with(r#"{"role":"assistant","content":"#), "{wrapped}");
     }
 
     #[test]
