@@ -155,6 +155,10 @@ pub enum ApiStreamOptions {
     OpenAiResponses(crate::api::openai_responses::OpenAiResponsesOptions),
     /// Options for the `azure-openai-responses` wire protocol.
     AzureOpenAiResponses(crate::api::azure_openai_responses::AzureOpenAiResponsesOptions),
+    /// Options for the `google-generative-ai` wire protocol.
+    Google(crate::api::google_generative_ai::GoogleOptions),
+    /// Options for the `mistral-conversations` wire protocol.
+    Mistral(crate::api::mistral_conversations::MistralOptions),
 }
 
 impl ApiStreamOptions {
@@ -185,6 +189,22 @@ impl ApiStreamOptions {
             _ => None,
         }
     }
+
+    /// The `google-generative-ai` options, if this is that variant.
+    pub fn google(&self) -> Option<&crate::api::google_generative_ai::GoogleOptions> {
+        match self {
+            ApiStreamOptions::Google(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The `mistral-conversations` options, if this is that variant.
+    pub fn mistral(&self) -> Option<&crate::api::mistral_conversations::MistralOptions> {
+        match self {
+            ApiStreamOptions::Mistral(o) => Some(o),
+            _ => None,
+        }
+    }
 }
 
 impl StreamOptions {
@@ -211,6 +231,16 @@ impl StreamOptions {
         self.api_options
             .as_ref()
             .and_then(ApiStreamOptions::azure_openai_responses)
+    }
+
+    /// The carried `google-generative-ai` per-API options, if any.
+    pub fn google_options(&self) -> Option<&crate::api::google_generative_ai::GoogleOptions> {
+        self.api_options.as_ref().and_then(ApiStreamOptions::google)
+    }
+
+    /// The carried `mistral-conversations` per-API options, if any.
+    pub fn mistral_options(&self) -> Option<&crate::api::mistral_conversations::MistralOptions> {
+        self.api_options.as_ref().and_then(ApiStreamOptions::mistral)
     }
 }
 

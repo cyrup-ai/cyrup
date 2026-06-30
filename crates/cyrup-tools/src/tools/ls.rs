@@ -25,13 +25,15 @@ pub struct LsTool {
 
 impl LsTool {
     pub fn new(fs: Arc<dyn FsOps>, cwd: PathBuf, opts: LsOpts) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (ls.ts:14-17): verbatim descriptions, `type:"number"`,
+        // no `minimum`, no `additionalProperties`, and — because BOTH properties are optional —
+        // NO `required` key at all (TypeBox omits an empty `required`).
         let params = serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory to list (default '.')." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max entries (default 500)." }
-            },
-            "additionalProperties": false
+                "path": { "type": "string", "description": "Directory to list (default: current directory)" },
+                "limit": { "type": "number", "description": "Maximum number of entries to return (default: 500)" }
+            }
         });
         Self { fs, cwd, opts, params }
     }
@@ -128,7 +130,8 @@ impl Tool for LsTool {
             ));
         }
         if t.info.truncated {
-            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
+            // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (ls.ts:192).
+            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));

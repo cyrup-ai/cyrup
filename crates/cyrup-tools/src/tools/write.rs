@@ -31,14 +31,15 @@ impl WriteTool {
         cwd: PathBuf,
         opts: WriteOpts,
     ) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (write.ts:14-17): verbatim descriptions,
+        // no `additionalProperties`.
         let params = serde_json::json!({
             "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path (relative to cwd or absolute)." },
-                "content": { "type": "string", "description": "Full file contents to write." }
-            },
             "required": ["path", "content"],
-            "additionalProperties": false
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
+                "content": { "type": "string", "description": "Content to write to the file" }
+            }
         });
         Self { fs, locks, cwd, opts, params }
     }

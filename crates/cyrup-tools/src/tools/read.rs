@@ -3,7 +3,7 @@
 use crate::config::ReadOpts;
 use crate::details::ReadDetails;
 use crate::ops::FsOps;
-use crate::truncate::{format_size, truncate_head, TruncOpts};
+use crate::truncate::{format_size, truncate_head, TruncOpts, DEFAULT_MAX_BYTES};
 use crate::{error, path, ToolMeta};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
@@ -26,15 +26,18 @@ pub struct ReadTool {
 
 impl ReadTool {
     pub fn new(fs: Arc<dyn FsOps>, cwd: PathBuf, opts: ReadOpts) -> Self {
+        // Schema is byte-for-byte Pi's TypeBox emission (read.ts:20-24): verbatim property
+        // descriptions, `type:"number"` (not integer), NO `minimum`, and NO `additionalProperties`
+        // (TypeBox only sets it where the source passes `{ additionalProperties: false }` — that is
+        // `edit` alone). This object IS the model-facing `input_schema`.
         let params = serde_json::json!({
             "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path (relative to cwd or absolute)." },
-                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed start line." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max lines to read." }
-            },
             "required": ["path"],
-            "additionalProperties": false
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+                "offset": { "type": "number", "description": "Line number to start reading from (1-indexed)" },
+                "limit": { "type": "number", "description": "Maximum number of lines to read" }
+            }
         });
         Self { fs, cwd, opts, params }
     }
@@ -59,18 +62,28 @@ impl Tool for ReadTool {
         let input: ReadInput =
             serde_json::from_value(params).map_err(|e| error::invalid(format!("read: {e}")))?;
 
-        // Resolve to an existing candidate (macOS variant fallback, R-03-006).
+        // Resolve to an existing candidate (macOS variant fallback, R-03-006). Pi
+        // `resolveReadPathAsync` SELECTS the first variant that EXISTS (`F_OK`) and falls back to
+        // the primary if none exist (read.ts:238, path-utils.ts:86-118). Readability is then a
+        // SEPARATE `R_OK` check on the CHOSEN path — it does NOT continue probing other variants
+        // (read.ts:241). So a primary that exists-but-is-unreadable errors even when a readable
+        // variant follows (UM-6).
         let candidates = path::resolve_read_path(&input.path, &self.cwd);
         let mut abs = None;
         for cand in &candidates {
-            if self.fs.access(cand, crate::ops::Access::Read).await.is_ok() {
+            if self.fs.access(cand, crate::ops::Access::Exists).await.is_ok() {
                 abs = Some(cand.clone());
                 break;
             }
         }
-        let abs = abs.ok_or_else(|| {
-            error::not_found(format!("File not found or unreadable: {}", input.path))
-        })?;
+        // None exist ⇒ Pi keeps the primary (candidates[0]); the R_OK check below then fails.
+        let abs = abs.unwrap_or_else(|| candidates.first().cloned().unwrap_or_default());
+        if self.fs.access(&abs, crate::ops::Access::Read).await.is_err() {
+            return Err(error::not_found(format!(
+                "File not found or unreadable: {}",
+                input.path
+            )));
+        }
 
         if cancel.is_cancelled() {
             return Err(error::aborted());
@@ -121,12 +134,14 @@ impl Tool for ReadTool {
             // `isError` failure. `firstLineSize` is the byte length of the first selected line.
             let line_no = start + 1;
             let first_line_bytes = window.first().map_or(0, |l| l.len());
+            // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` and `head -c ${DEFAULT_MAX_BYTES}` here
+            // (read.ts:293), independent of any configured limit. Use the fixed constant.
             let out = format!(
                 "[Line {line_no} is {}, exceeds {} limit. Use bash: sed -n '{line_no}p' {} | head -c {}]",
                 format_size(first_line_bytes),
-                format_size(self.opts.max_bytes),
+                format_size(DEFAULT_MAX_BYTES),
                 input.path,
-                self.opts.max_bytes,
+                DEFAULT_MAX_BYTES,
             );
             return Ok(ToolResult {
                 content: vec![Content::text(out)],
@@ -149,12 +164,13 @@ impl Tool for ReadTool {
                     shown_to + 1
                 ));
             } else {
+                // Pi's byte-case qualifier hardcodes `formatSize(DEFAULT_MAX_BYTES)` (read.ts:303).
                 out.push_str(&format!(
                     "\n\n[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
                     start + 1,
                     shown_to,
                     total,
-                    format_size(self.opts.max_bytes),
+                    format_size(DEFAULT_MAX_BYTES),
                     shown_to + 1
                 ));
             }

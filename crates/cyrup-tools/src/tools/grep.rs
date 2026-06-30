@@ -35,19 +35,20 @@ pub struct GrepTool {
 
 impl GrepTool {
     pub fn new(fs: Arc<dyn FsOps>, cwd: PathBuf, opts: GrepOpts) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (grep.ts:24-36): verbatim descriptions,
+        // `type:"number"`, no `minimum`, no `additionalProperties`.
         let params = serde_json::json!({
             "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Regex (or literal) to search for." },
-                "path": { "type": "string", "description": "Search root (default '.')." },
-                "glob": { "type": "string", "description": "Restrict to files matching this glob." },
-                "ignoreCase": { "type": "boolean", "description": "Case-insensitive (default false)." },
-                "literal": { "type": "boolean", "description": "Treat pattern as a literal string." },
-                "context": { "type": "integer", "minimum": 0, "description": "Context lines before/after." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max matches (default 100)." }
-            },
             "required": ["pattern"],
-            "additionalProperties": false
+            "properties": {
+                "pattern": { "type": "string", "description": "Search pattern (regex or literal string)" },
+                "path": { "type": "string", "description": "Directory or file to search (default: current directory)" },
+                "glob": { "type": "string", "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
+                "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
+                "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
+                "context": { "type": "number", "description": "Number of lines to show before and after each match (default: 0)" },
+                "limit": { "type": "number", "description": "Maximum number of matches to return (default: 100)" }
+            }
         });
         Self { fs, cwd, opts, params }
     }
@@ -190,7 +191,12 @@ impl Tool for GrepTool {
             // `replace(/\r/g,"")` (grep.ts:206,259). Splitting the same bytes the searcher numbered
             // on `\n` keeps line numbers aligned; CR removal happens per output line below.
             let content = String::from_utf8_lossy(&bytes);
-            let src_lines: Vec<&str> = content.split('\n').collect();
+            // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
+            // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using lone-`\r`
+            // separators yields context blocks that key off these folded segments — matching Pi
+            // even where that diverges from the matcher's `\n`-based numbering.
+            let folded = content.replace("\r\n", "\n").replace('\r', "\n");
+            let src_lines: Vec<&str> = folded.split('\n').collect();
             for &ln in &match_lines {
                 let l = ln as usize;
                 // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
@@ -239,7 +245,8 @@ impl Tool for GrepTool {
             ));
         }
         if t.info.truncated {
-            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
+            // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (grep.ts:347).
+            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
         }
         if any_line_truncated {
             notices.push(format!(

@@ -8,7 +8,7 @@
 
 use super::{AssistantImages, ImagesApiImpl, ImagesContext, ImagesModel, ImagesOptions};
 use crate::stream::ProviderResponse;
-use crate::stream::sse::build_client;
+use crate::stream::sse::build_client_for_target;
 use cyrup_core::{ApiId, Content, Usage};
 use serde_json::json;
 use std::sync::Arc;
@@ -75,8 +75,15 @@ async fn run(
         params = next;
     }
 
-    let client = build_client().map_err(|e| GenError::Message(e.to_string()))?;
     let url = format!("{}/chat/completions", model.base_url);
+    // Honor HTTP(S)_PROXY / ALL_PROXY / NO_PROXY for the live image client, uniformly with the six
+    // text wire protocols (Pi applies its shared HTTP transport proxy to every request including
+    // `openrouter-images`; `resolveHttpProxyUrlForTarget`, node-http-proxy.ts:92-112). The bare
+    // `build_client()` skipped the resolver / SOCKS-rejection semantics for image generation.
+    let client =
+        build_client_for_target(&url, &crate::auth::types::EnvAuthContext, options.env.as_ref())
+            .await
+            .map_err(|e| GenError::Message(e.to_string()))?;
     let mut builder = client.post(&url).bearer_auth(&api_key).json(&params);
     // `defaultHeaders: providerHeadersToRecord({ ...model.headers, ...optionsHeaders })`
     // (openrouter-images.ts:116). A `None` value suppresses a default; on a fresh request there is no
@@ -405,6 +412,39 @@ mod tests {
                 .iter()
                 .all(|m| m.output.contains(&Modality::Image))
         );
+    }
+
+    /// Behaviour-check vs Pi: the image request path now runs through the shared proxy resolver
+    /// (`build_client_for_target` → `resolveHttpProxyUrlForTarget`, node-http-proxy.ts:92-112),
+    /// uniformly with the six text wire protocols. Proven by the SOCKS-rejection semantics: a
+    /// `socks5://` proxy in `options.env` is surfaced as an error BEFORE any request is sent (Pi
+    /// throws `UNSUPPORTED_PROXY_PROTOCOL_MESSAGE`, node-http-proxy.ts:106-108). The previous bare
+    /// `build_client()` skipped the resolver entirely, so this error could never arise.
+    #[tokio::test]
+    async fn image_request_applies_proxy_resolver_and_rejects_socks() {
+        let model = nano_banana();
+        let ctx = ImagesContext {
+            input: vec![Content::text("a small red circle")],
+        };
+        let env: crate::auth::types::ProviderEnv =
+            [("all_proxy".to_string(), "socks5://proxy.local:1080".to_string())]
+                .into_iter()
+                .collect();
+        let opts = ImagesOptions {
+            api_key: Some("test-key".to_string()),
+            env: Some(env),
+            ..Default::default()
+        };
+        let err = run(&model, &ctx, &opts)
+            .await
+            .expect_err("socks proxy must be rejected before sending");
+        match err {
+            GenError::Message(m) => assert!(
+                m.contains("SOCKS and PAC"),
+                "expected SOCKS rejection from the resolver, got: {m}"
+            ),
+            GenError::Aborted => panic!("expected a SOCKS-rejection message, got Aborted"),
+        }
     }
 
     /// Live smoke test against the real OpenRouter image API. Ignored by default; run with

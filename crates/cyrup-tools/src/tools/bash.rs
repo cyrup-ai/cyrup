@@ -32,14 +32,15 @@ pub struct BashTool {
 
 impl BashTool {
     pub fn new(proc: Arc<dyn ProcOps>, shell: ShellConfig, cwd: PathBuf, opts: BashOpts) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (bash.ts:24-27): verbatim descriptions,
+        // `type:"number"`, no `minimum`, no `additionalProperties`.
         let params = serde_json::json!({
             "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "Shell command to run in the cwd." },
-                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (no default)." }
-            },
             "required": ["command"],
-            "additionalProperties": false
+            "properties": {
+                "command": { "type": "string", "description": "Bash command to execute" },
+                "timeout": { "type": "number", "description": "Timeout in seconds (optional, no default timeout)" }
+            }
         });
         Self { proc, shell, cwd, opts, params }
     }
@@ -172,6 +173,9 @@ impl Tool for BashTool {
         let (exec_result, ()) = tokio::join!(exec_fut, flush_fut);
         let status = exec_result?;
 
+        // Flush the streaming decoder before reading final totals (Pi `output.finish()` precedes the
+        // snapshot, output-accumulator.ts:80-89), so a trailing incomplete UTF-8 sequence counts.
+        acc.finish();
         let tail = acc.tail_string();
         let t = truncate_tail(&tail, TruncOpts::new(max_lines, max_bytes));
         let total_lines = acc.total_lines();
@@ -211,9 +215,11 @@ impl Tool for BashTool {
             } else if truncated_by == Some(crate::truncate::TruncatedBy::Lines) {
                 format!("[Showing lines {start_line}-{end_line} of {total_lines}. Full output: {ps}]")
             } else {
+                // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` in this footer (bash.ts:372) even
+                // though bash's truncation point itself is configurable. Mirror the constant.
                 format!(
                     "[Showing lines {start_line}-{end_line} of {total_lines} ({} limit). Full output: {ps}]",
-                    format_size(max_bytes),
+                    format_size(crate::truncate::DEFAULT_MAX_BYTES),
                 )
             };
             if !text.is_empty() {

@@ -19,6 +19,10 @@ pub use shell::{shell_env, ShellConfig, Transport};
 /// Access mode for [`FsOps::access`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
+    /// Existence-only probe (`F_OK`). Pi `pathExists` (path-utils.ts:31-38) uses `F_OK` to SELECT
+    /// the read-path variant; the readability (`R_OK`) check is then a SEPARATE step on the chosen
+    /// path that does NOT fall through to other variants (read.ts:238-241).
+    Exists,
     Read,
     ReadWrite,
 }

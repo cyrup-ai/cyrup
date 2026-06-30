@@ -469,6 +469,52 @@ mod smoke {
         assert_eq!(m2.error_message.as_deref(), Some("No more faux responses queued"));
     }
 
+    /// Queue-exhaustion EVENT ORDERING — byte/behaviour-diff anchor against Pi faux.ts:451-461.
+    ///
+    /// Pi handles the no-step (empty-queue) case OUT-OF-BAND of `streamWithDeltas`:
+    /// `outer.push({ type: "error", reason: "error", error: message }); outer.end(message); return;`
+    /// — it pushes a SINGLE `error` event and never emits a leading `start`. So Pi's exhaustion
+    /// event sequence is exactly `[error]`. The prior cyrup routed exhaustion through
+    /// `faux_event_stream`, which unconditionally prepends `StreamEvent::Start` (faux.rs:408),
+    /// yielding `[start, error]` — a silent divergence the `*_errors` test above missed (it only
+    /// asserts the collected terminal message, which is identical either way). This pins the exact
+    /// event-kind sequence so the divergence cannot regress.
+    #[tokio::test]
+    async fn scripted_queue_exhaustion_emits_error_only_no_start() {
+        use cyrup_provider::{Context, Provider, StreamOptions};
+        // A queue that starts empty ⇒ the very first call is already the no-step path.
+        let (provider, _state) = create_faux_stream_fn_queued(vec![], vec![faux_model()]);
+        let events = drain(provider.stream(
+            &faux_model(),
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
+        // Pi emits exactly one event for exhaustion (faux.ts:451-461): the `error` terminal. No
+        // `start`. This is the load-bearing byte-diff: `events.len() == 1`, kind == error.
+        assert_eq!(
+            events.len(),
+            1,
+            "Pi exhaustion emits [error] only (faux.ts:451-461); got {events:?}"
+        );
+        match &events[0] {
+            StreamEvent::Error { reason, error } => {
+                assert_eq!(*reason, cyrup_provider::stream::ErrorReason::Error);
+                assert_eq!(error.stop_reason, cyrup_core::StopReason::Error);
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("No more faux responses queued")
+                );
+            }
+            other => panic!("expected a lone Error terminal (Pi faux.ts:451-461), got {other:?}"),
+        }
+        // Explicit guard against the [start, error] regression.
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Start { .. })),
+            "exhaustion must not emit a leading `start` (Pi pushes only the `error` event)"
+        );
+    }
+
     /// Arbitrary `Model` override (Pi `createHarness({ model })`, test-harness.ts:324,369-370): an
     /// injected model with non-default modalities/reasoning/window flows onto the resolved session
     /// model.

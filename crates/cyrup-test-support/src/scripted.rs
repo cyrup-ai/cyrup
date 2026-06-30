@@ -150,31 +150,44 @@ impl Provider for ScriptedProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> EventStream<StreamEvent> {
-        let resp = {
+        let (resp, exhausted) = {
             let mut responses = self.responses.lock().unwrap_or_else(|e| e.into_inner());
             let mut state = self.lock_state();
             state.contexts.push(context.clone());
-            let resp = if self.queue_mode {
+            let resolved = if self.queue_mode {
                 // Queue flavour: consume from the front; exhaustion ⇒ Pi's error terminal.
                 if responses.is_empty() {
-                    FauxResponse::error("No more faux responses queued")
+                    (FauxResponse::error("No more faux responses queued"), true)
                 } else {
-                    responses.remove(0)
+                    (responses.remove(0), false)
                 }
             } else {
                 // Cycling flavour: wrap around (Pi `index = callCount % responses.length`).
                 let index =
                     if responses.is_empty() { 0 } else { state.call_count % responses.len() };
-                responses.get(index).cloned().unwrap_or_else(|| FauxResponse::text("ok"))
+                (responses.get(index).cloned().unwrap_or_else(|| FauxResponse::text("ok")), false)
             };
             state.call_count += 1;
-            resp
+            resolved
         };
 
         let mut message = build_assistant_message(&resp);
         // Pi `buildUsage`: the scripted stream fn uses fixed defaults (input:100/output:50), NOT the
         // prompt-cache estimator (test-harness.ts:159).
         message.usage = build_usage(resp.usage.as_ref());
+
+        if exhausted {
+            // Queue-exhaustion (no-step) path. Pi handles this OUT-OF-BAND of `streamWithDeltas`:
+            // `outer.push({type:"error",reason:"error",error:message}); outer.end(message); return;`
+            // (faux.ts:451-461) — it pushes a SINGLE `error` event and never emits a leading `start`.
+            // Routing through `faux_event_stream` here would prepend `StreamEvent::Start`, yielding
+            // `[start, error]` where Pi yields `[error]`. Emit just the terminal error event to match
+            // Pi's exact event sequence. `StreamEvent::terminal` maps the `Error` stop reason onto
+            // `StreamEvent::Error { reason: Error, error: message }` — the error event IS the terminal.
+            return Box::pin(futures::stream::once(async move {
+                StreamEvent::terminal(message)
+            }));
+        }
 
         let inner = faux_event_stream(message, options, ChunkConfig::default());
 

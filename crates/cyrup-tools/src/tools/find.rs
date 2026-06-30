@@ -29,15 +29,16 @@ pub struct FindTool {
 
 impl FindTool {
     pub fn new(fs: Arc<dyn FsOps>, cwd: PathBuf, opts: FindOpts) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (find.ts:20-26): verbatim descriptions,
+        // `type:"number"`, no `minimum`, no `additionalProperties`.
         let params = serde_json::json!({
             "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Glob; basename match unless it contains '/'." },
-                "path": { "type": "string", "description": "Search root (default '.')." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 1000)." }
-            },
             "required": ["pattern"],
-            "additionalProperties": false
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'" },
+                "path": { "type": "string", "description": "Directory to search in (default: current directory)" },
+                "limit": { "type": "number", "description": "Maximum number of results (default: 1000)" }
+            }
         });
         Self { fs, cwd, opts, params }
     }
@@ -131,7 +132,8 @@ impl Tool for FindTool {
             ));
         }
         if t.info.truncated {
-            notices.push(format!("{} limit reached", format_size(self.opts.max_bytes)));
+            // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (find.ts:335).
+            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));

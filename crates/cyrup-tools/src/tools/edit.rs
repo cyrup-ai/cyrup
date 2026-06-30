@@ -41,25 +41,28 @@ impl EditTool {
         cwd: PathBuf,
         opts: EditOpts,
     ) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (edit.ts:33-53): verbatim descriptions on every
+        // property, and `additionalProperties:false` on BOTH the top object and the nested edit
+        // object — `edit` is the ONLY tool whose source passes `{ additionalProperties: false }`.
         let params = serde_json::json!({
             "type": "object",
+            "required": ["path", "edits"],
             "properties": {
-                "path": { "type": "string", "description": "File path (must exist)." },
+                "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
                 "edits": {
                     "type": "array",
-                    "description": "Edits, each replacing a unique oldText with newText.",
                     "items": {
                         "type": "object",
-                        "properties": {
-                            "oldText": { "type": "string" },
-                            "newText": { "type": "string" }
-                        },
                         "required": ["oldText", "newText"],
+                        "properties": {
+                            "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                            "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
+                        },
                         "additionalProperties": false
-                    }
+                    },
+                    "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
                 }
             },
-            "required": ["path", "edits"],
             "additionalProperties": false
         });
         Self { fs, locks, cwd, opts, params }
@@ -108,14 +111,21 @@ impl Tool for EditTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         let params = normalize_args(params);
-        let input: EditInput =
-            serde_json::from_value(params).map_err(|e| error::invalid(format!("edit: {e}")))?;
-        if input.edits.is_empty() {
-            // Pi `validateEditInput` (edit.ts:120-125).
+        // Pi `validateEditInput` (edit.ts:120-125) runs FIRST and rejects ANY shape where `edits`
+        // is not a non-empty array — missing, non-array, or empty — with this exact literal. This
+        // precedes serde deserialization so a malformed `edits` surfaces Pi's message rather than a
+        // serde type error.
+        let edits_ok = params
+            .get("edits")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        if !edits_ok {
             return Err(error::invalid(
                 "Edit tool input is invalid. edits must contain at least one replacement.",
             ));
         }
+        let input: EditInput =
+            serde_json::from_value(params).map_err(|e| error::invalid(format!("edit: {e}")))?;
 
         let abs = path::resolve_to_cwd(&input.path, &self.cwd);
         let _guard = self.locks.guard(&abs, &cancel).await?;

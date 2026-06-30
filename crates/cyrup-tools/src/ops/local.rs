@@ -78,6 +78,7 @@ impl FsOps for LocalFs {
             let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| error::invalid(format!("invalid path: {}", error::show(path))))?;
             let amode = match mode {
+                Access::Exists => libc::F_OK,
                 Access::Read => libc::R_OK,
                 Access::ReadWrite => libc::R_OK | libc::W_OK,
             };

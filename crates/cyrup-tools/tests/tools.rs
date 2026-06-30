@@ -1073,13 +1073,15 @@ async fn bash_timeout_empty_output_has_no_leading_newline() {
     assert_eq!(msg, "Command timed out after 1 seconds", "got: {msg}");
 }
 
-// gap #10 — a matched line carrying an embedded CR is sanitized: Pi's `lineText.replace(/\r/g, "")`
-// strips EVERY interior `\r` (grep.ts:259), not just a trailing one.
+// UM-5 (corrected) — Pi `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206), so an
+// interior CR is a LINE BREAK, not a character to strip. ripgrep numbers the whole `foo\rNEEDLE\rbar`
+// as line 1 (it only breaks on `\n`), but Pi's folded src_lines are ["foo","NEEDLE","bar",""], so the
+// rendered line-1 block is `foo`. (The old cyrup split on `\n` only + stripped interior CR per line,
+// emitting the divergent `fooNEEDLEbar` — the exact UM-5 miss.) cyrup now matches Pi byte-for-byte.
 #[tokio::test]
-async fn grep_strips_interior_carriage_returns() {
+async fn grep_folds_interior_carriage_returns_as_line_breaks() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    // A single logical line with an interior CR (e.g. progress-bar output captured to a file).
     std::fs::write(cwd.join("cr.txt"), "foo\rNEEDLE\rbar\n").unwrap();
     let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
     let r = grep
@@ -1087,8 +1089,8 @@ async fn grep_strips_interior_carriage_returns() {
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(!text.contains('\r'), "interior CR must be stripped: {text:?}");
-    assert!(text.contains("cr.txt:1: fooNEEDLEbar"), "got: {text:?}");
+    assert!(!text.contains('\r'), "no CR may survive folding: {text:?}");
+    assert_eq!(text, "cr.txt:1: foo", "Pi renders the folded line-1 segment, not the joined line");
 }
 
 // gap #9 — the edit access-error literal ends with a trailing period: Pi throws
@@ -1242,4 +1244,113 @@ async fn edit_effective_access_precheck_rejects_write_only_file() {
         .unwrap_err();
     assert!(err.to_string().starts_with("Could not edit file: wo.txt. "), "got: {err}");
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+}
+
+// ======================================================================================
+// Round-13 UNTRACKED-miss byte-diff regressions (gap 04: UM-4..UM-7). Each asserts cyrup's
+// model-facing output equals Pi's, with the exact Pi behavior reconstructed from source.
+// ======================================================================================
+
+// UM-5 — grep `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206). The matcher
+// numbers lines on raw `\n`, so for a file using a LONE `\r` separator the context block keys off
+// the FOLDED segment. File bytes `x\rTARGET\n`: ripgrep (and grep_searcher) report the match on
+// line 1 (`x\rTARGET`), but Pi's getFileLines splits the folded text into ["x","TARGET",""] and
+// renders src_lines[0] = "x". So Pi prints `cr.txt:1: x` — NOT `xTARGET` (old cyrup, split-on-\n
+// only + per-line \r strip).
+#[tokio::test]
+async fn grep_folds_lone_cr_before_splitting_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("cr.txt"), b"x\rTARGET\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
+    let r = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "TARGET", "path": "cr.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_text(&r), "cr.txt:1: x", "grep must fold lone CR like Pi getFileLines");
+}
+
+// UM-4 — byte-limit NOTICE text hardcodes `formatSize(DEFAULT_MAX_BYTES)` (= 50.0KB) regardless of
+// any configured limit (grep.ts:347). With a configured 10-byte limit the truncation fires, yet the
+// notice must still read `50.0KB limit reached` (Pi's hardcoded constant), NOT `10B`.
+#[tokio::test]
+async fn grep_byte_limit_notice_uses_default_constant_not_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("f.txt"), "hello world this is a long matching line\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts { limit: 100, max_bytes: 10 });
+    let r = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hello", "path": "f.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains("50.0KB limit reached"), "notice must use DEFAULT_MAX_BYTES: {text}");
+    assert!(!text.contains("10B limit reached"), "notice must NOT track configured limit: {text}");
+}
+
+// UM-6 — read SELECTS the read-path variant by existence (F_OK) then checks readability (R_OK) on
+// the CHOSEN path WITHOUT falling through to other variants (read.ts:238-241). A primary that
+// EXISTS but is unreadable, with a readable curly-quote variant, must ERROR (Pi) — not silently
+// succeed via the variant (old cyrup probed R_OK in the selection loop). `'` and U+2019 are
+// distinct code points, so these are two real files even on case-insensitive APFS.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_variant_probe_uses_existence_not_readability() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let primary = cwd.join("a'b.txt"); // straight apostrophe
+    let variant = cwd.join("a\u{2019}b.txt"); // curly variant (resolve_read_path fallback)
+    std::fs::write(&primary, "PRIMARY\n").unwrap();
+    std::fs::write(&variant, "VARIANT\n").unwrap();
+    std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&primary).is_ok() {
+        // Running as root (R_OK bypassed): the precondition can't hold; skip.
+        let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o644));
+        return;
+    }
+    let read = ReadTool::new(fs(), cwd.clone(), ReadOpts::default());
+    let res = read
+        .execute(cid(), serde_json::json!({ "path": "a'b.txt" }), CancelToken::new(), noop_sink())
+        .await;
+    let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o644));
+    let err = res.expect_err("Pi errors: primary exists but is unreadable; no variant fall-through");
+    assert!(
+        err.to_string().contains("not found") || err.to_string().contains("unreadable"),
+        "got: {err}"
+    );
+}
+
+// UM-7 — a malformed `edits` (missing / non-array) yields Pi's exact `validateEditInput` literal
+// (edit.ts:120-125), not a serde type error. Pi validates BEFORE deserialization.
+#[tokio::test]
+async fn edit_malformed_edits_yields_pi_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("f.txt"), "hello\n").unwrap();
+    let edit = edit_tool(cwd);
+    // edits is a number, not an array.
+    let err = edit
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "edits": 42 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Edit tool input is invalid. edits must contain at least one replacement."
+    );
 }

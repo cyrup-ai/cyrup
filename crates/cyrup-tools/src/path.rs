@@ -68,36 +68,112 @@ fn try_am_pm(path: &str) -> Option<String> {
     }
 }
 
-/// Expand a leading `~` to the user's home directory.
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+/// Expand a leading `~` to the user's home directory. Mirrors Pi `normalizePath`'s tilde branch
+/// (paths.ts:66-72): `~` → home, `~/rest` → home/rest, and on Windows `~\rest` → home/rest.
+fn expand_home(path: &str) -> String {
+    if path == "~" {
         if let Some(home) = home_dir() {
-            return home.join(rest);
+            return home.to_string_lossy().into_owned();
         }
-    } else if path == "~"
-        && let Some(home) = home_dir() {
-            return home;
-        }
-    PathBuf::from(path)
+        return path.to_string();
+    }
+    let win_tilde = cfg!(windows) && path.starts_with("~\\");
+    if let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| win_tilde.then(|| path.get(2..)).flatten())
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
+    }
+    path.to_string()
 }
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Resolve a user-supplied path against `cwd` (R-03-005). Relatives join `cwd`; absolutes pass
-/// through. Trims surrounding whitespace and a leading `@` (drag-and-drop / mention sugar).
+/// Minimal `file://` URL → path, mirroring Node `fileURLToPath` for the cases the tools see
+/// (paths.ts:74-76): `file:///abs` and `file://localhost/abs` both yield `/abs`, with percent-escapes
+/// decoded. Returns `None` if `s` is not a `file://` URL.
+fn file_url_to_path(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(percent_decode(rest))
+}
+
+/// Decode `%XX` escapes (UTF-8) as Node's `fileURLToPath` does. Invalid escapes pass through.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes.get(i) {
+            Some(b'%') => {
+                let hi = bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16));
+                let lo = bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16));
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            Some(&b) => {
+                out.push(b);
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Lexically collapse `.`/`..` segments and drop trailing separators, mirroring Node `path.resolve`
+/// (paths.ts:84). Purely lexical — symlinks are NOT resolved. `..` at the root is dropped.
+fn lexical_resolve(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => stack.push(comp),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(stack.last(), Some(Component::Normal(_))) {
+                    stack.pop();
+                }
+            }
+            Component::Normal(_) => stack.push(comp),
+        }
+    }
+    let mut out = PathBuf::new();
+    for c in stack {
+        out.push(c.as_os_str());
+    }
+    out
+}
+
+/// Resolve a user-supplied path against `cwd` (R-03-005), faithful to Pi's `resolveToCwd` →
+/// `resolvePath(input, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true })`
+/// (path-utils.ts:48-50, paths.ts:57-85). The order is exactly Pi's `normalizePath`: NO trim,
+/// fold Unicode spaces, strip a leading `@`, expand `~`, decode `file://`, then `path.resolve`
+/// (lexical `.`/`..` collapse + trailing-slash removal). Relatives resolve against `cwd`.
 pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
-    // Pi's `resolvePath(..., { normalizeUnicodeSpaces: true, stripAtPrefix: true })`
-    // (path-utils.ts:48-50) normalizes Unicode spaces before resolving.
-    let normalized = normalize_unicode_spaces(path);
-    let trimmed = normalized.trim();
-    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    let expanded = expand_home(trimmed);
-    if expanded.is_absolute() {
-        expanded
+    // Pi does NOT pass `trim`, so leading/trailing whitespace is preserved (a leading space even
+    // suppresses `@` stripping — `"  @x"` stays `"  @x"`).
+    let mut normalized = normalize_unicode_spaces(path);
+    if let Some(rest) = normalized.strip_prefix('@') {
+        normalized = rest.to_string();
+    }
+    let normalized = expand_home(&normalized);
+    if let Some(p) = file_url_to_path(&normalized) {
+        return lexical_resolve(Path::new(&p));
+    }
+    let candidate = Path::new(&normalized);
+    if candidate.is_absolute() {
+        lexical_resolve(candidate)
     } else {
-        cwd.join(expanded)
+        lexical_resolve(&cwd.join(candidate))
     }
 }
 
@@ -156,9 +232,54 @@ mod tests {
     }
 
     #[test]
-    fn strips_at_and_trims() {
+    fn strips_leading_at_when_first_char() {
+        // Pi `stripAtPrefix` only fires when the (space-normalized) string STARTS with `@`
+        // (paths.ts:62). Captured Pi: resolveToCwd("@rel.txt","/work") => "/work/rel.txt".
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("  @rel.txt ", cwd), PathBuf::from("/work/rel.txt"));
+        assert_eq!(resolve_to_cwd("@rel.txt", cwd), PathBuf::from("/work/rel.txt"));
+    }
+
+    #[test]
+    fn does_not_trim_whitespace() {
+        // Pi passes no `trim` option, so surrounding spaces are PRESERVED and a leading space
+        // suppresses `@` stripping. Captured Pi: resolveToCwd("  @rel.txt ","/work")
+        // => "/work/  @rel.txt " (UM-2, paths.ts:57-58). Old cyrup trimmed → "/work/rel.txt".
+        let cwd = Path::new("/work");
+        assert_eq!(
+            resolve_to_cwd("  @rel.txt ", cwd),
+            PathBuf::from("/work/  @rel.txt ")
+        );
+    }
+
+    #[test]
+    fn collapses_dot_and_dotdot_like_node_resolve() {
+        // UM-3: Pi uses Node `path.resolve`, which lexically collapses `.`/`..` and drops trailing
+        // separators. Captured Pi ground truth (node path.resolve):
+        let cwd = Path::new("/work");
+        assert_eq!(resolve_to_cwd("a/../b.txt", cwd), PathBuf::from("/work/b.txt"));
+        assert_eq!(resolve_to_cwd("./x/./y", cwd), PathBuf::from("/work/x/y"));
+        assert_eq!(resolve_to_cwd("a/b/../../c", cwd), PathBuf::from("/work/c"));
+        assert_eq!(resolve_to_cwd("sub/", cwd), PathBuf::from("/work/sub"));
+        assert_eq!(
+            resolve_to_cwd("../sibling", Path::new("/work/sub")),
+            PathBuf::from("/work/sibling")
+        );
+    }
+
+    #[test]
+    fn decodes_file_url() {
+        // UM-3: Pi resolves `file://` URLs via Node `fileURLToPath` (paths.ts:74-76).
+        // Captured Pi: resolveToCwd("file:///etc/hosts","/work") => "/etc/hosts".
+        let cwd = Path::new("/work");
+        assert_eq!(
+            resolve_to_cwd("file:///etc/hosts", cwd),
+            PathBuf::from("/etc/hosts")
+        );
+        // Percent-escapes are decoded.
+        assert_eq!(
+            resolve_to_cwd("file:///tmp/a%20b.txt", cwd),
+            PathBuf::from("/tmp/a b.txt")
+        );
     }
 
     #[test]

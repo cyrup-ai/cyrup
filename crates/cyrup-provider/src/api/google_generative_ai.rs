@@ -194,6 +194,66 @@ pub(crate) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) 
     headers
 }
 
+/// A Gemini `thinkingLevel` value (Pi `GoogleThinkingLevel`, google-shared.ts:16). Serialized to the
+/// exact wire string Pi passes through unchanged in `buildParams` (`options.thinking.level as any`,
+/// google-generative-ai.ts:377-378).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoogleThinkingLevel {
+    /// `"THINKING_LEVEL_UNSPECIFIED"`.
+    Unspecified,
+    /// `"MINIMAL"`.
+    Minimal,
+    /// `"LOW"`.
+    Low,
+    /// `"MEDIUM"`.
+    Medium,
+    /// `"HIGH"`.
+    High,
+}
+
+impl GoogleThinkingLevel {
+    /// The exact `thinkingLevel` wire string.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            GoogleThinkingLevel::Unspecified => "THINKING_LEVEL_UNSPECIFIED",
+            GoogleThinkingLevel::Minimal => "MINIMAL",
+            GoogleThinkingLevel::Low => "LOW",
+            GoogleThinkingLevel::Medium => "MEDIUM",
+            GoogleThinkingLevel::High => "HIGH",
+        }
+    }
+}
+
+/// A direct per-request `thinking` override (Pi `GoogleOptions.thinking`,
+/// google-generative-ai.ts:40-44). When present it is read verbatim by [`build_params`], bypassing
+/// the unified-`reasoning`-driven lowering — mirroring Pi's `buildParams` reading `options.thinking`
+/// directly (google-generative-ai.ts:373-384) rather than the value `streamSimple` would compute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoogleThinking {
+    /// `thinking.enabled` (google-generative-ai.ts:41). `false` lowers to the model's
+    /// disabled-thinking config.
+    pub enabled: bool,
+    /// `thinking.budgetTokens` (google-generative-ai.ts:42): `-1` for dynamic, `0` to disable. Only
+    /// honored when `level` is `None` (Pi prefers `level` over `budgetTokens`).
+    pub budget_tokens: Option<i64>,
+    /// `thinking.level` (google-generative-ai.ts:43). Takes precedence over `budget_tokens`.
+    pub level: Option<GoogleThinkingLevel>,
+}
+
+/// Per-API typed options for the `google-generative-ai` wire protocol (Pi `GoogleOptions`,
+/// google-generative-ai.ts:38-45). Only the fields cyrup does not already carry on the unified
+/// [`StreamOptions`](crate::StreamOptions) live here: `toolChoice` folds onto
+/// `StreamOptions.tool_choice` and the simple reasoning level onto `StreamOptions.reasoning`, but a
+/// direct `thinking.{budgetTokens,level}` per-request override has no other home. Carried via
+/// [`StreamOptions::api_options`](crate::StreamOptions::api_options); defaults to `None` (no
+/// override), reproducing the streamSimple-driven behavior exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GoogleOptions {
+    /// Direct `thinkingConfig` override (Pi `GoogleOptions.thinking`). `None` = no override: the
+    /// unified `reasoning` level drives `thinkingConfig` as before.
+    pub thinking: Option<GoogleThinking>,
+}
+
 /// Test-only convenience wrapper for [`build_params`].
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
@@ -216,10 +276,16 @@ pub(crate) fn build_params(model: &Model, ctx: &Context, opts: &StreamOptions) -
 
     // Thinking lowering (Pi `streamSimple`, google-generative-ai.ts:283-319). cyrup carries the
     // unified `reasoning` level directly, so the lowering happens inline (as in `anthropic_messages`).
-    if model.reasoning
-        && let Some(cfg) = thinking_config(model, opts.reasoning)
-    {
-        generation_config.insert("thinkingConfig".to_string(), cfg);
+    // A direct `GoogleOptions.thinking` per-request override (Pi `buildParams` reading
+    // `options.thinking`, google-generative-ai.ts:373-384) bypasses that lowering and is read verbatim.
+    if model.reasoning {
+        let cfg = match opts.google_options().and_then(|g| g.thinking) {
+            Some(thinking) => thinking_config_override(model, &thinking),
+            None => thinking_config(model, opts.reasoning),
+        };
+        if let Some(cfg) = cfg {
+            generation_config.insert("thinkingConfig".to_string(), cfg);
+        }
     }
 
     let mut obj = Map::new();
@@ -281,6 +347,25 @@ fn thinking_config(model: &Model, reasoning: ModelThinkingLevel) -> Option<Value
         cfg.insert("thinkingBudget".to_string(), json!(budget));
     }
     Some(Value::Object(cfg))
+}
+
+/// Lower a direct `GoogleOptions.thinking` override to `thinkingConfig` (1:1 with Pi `buildParams`,
+/// google-generative-ai.ts:373-384). When `enabled`, `level` wins over `budgetTokens`; otherwise the
+/// model's disabled-thinking config. The outer `model.reasoning` guard is applied by the caller,
+/// mirroring Pi's `options.thinking?.enabled && model.reasoning` / `model.reasoning && … !enabled`.
+fn thinking_config_override(model: &Model, thinking: &GoogleThinking) -> Option<Value> {
+    if thinking.enabled {
+        let mut cfg = Map::new();
+        cfg.insert("includeThoughts".to_string(), json!(true));
+        if let Some(level) = thinking.level {
+            cfg.insert("thinkingLevel".to_string(), json!(level.as_wire()));
+        } else if let Some(budget) = thinking.budget_tokens {
+            cfg.insert("thinkingBudget".to_string(), json!(budget));
+        }
+        Some(Value::Object(cfg))
+    } else {
+        Some(disabled_thinking_config(model))
+    }
 }
 
 /// The disabled-thinking config for a reasoning model (Pi `getDisabledThinkingConfig`,
@@ -1316,6 +1401,78 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "LOW"
         );
+    }
+
+    /// Byte-diff vs Pi `buildParams` (google-generative-ai.ts:373-384): a direct
+    /// `GoogleOptions.thinking` override is read verbatim, bypassing the unified-`reasoning` lowering.
+    /// `level` wins over `budgetTokens`; `enabled:false` lowers to the disabled config; the override
+    /// can DISABLE thinking on a request whose unified `reasoning` is High (proving the override path,
+    /// not the lowering, drove the bytes).
+    #[test]
+    fn google_thinking_override_threads_budget_and_level() {
+        // 1. budgetTokens override on a Gemini-2.x model: thinkingBudget = the supplied value
+        //    (-1 dynamic), NOT the `getGoogleBudget`-computed 32768.
+        let m = model_with("gemini-2.5-pro", true);
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            api_options: Some(crate::stream::ApiStreamOptions::Google(GoogleOptions {
+                thinking: Some(GoogleThinking {
+                    enabled: true,
+                    budget_tokens: Some(-1),
+                    level: None,
+                }),
+            })),
+            ..Default::default()
+        };
+        let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
+            .clone();
+        // Pi: { includeThoughts: true, thinkingBudget: -1 }.
+        assert_eq!(tc, json!({ "includeThoughts": true, "thinkingBudget": -1 }));
+
+        // 2. level wins over budgetTokens (Pi reads `level` first, google-generative-ai.ts:376-381).
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::Low,
+            api_options: Some(crate::stream::ApiStreamOptions::Google(GoogleOptions {
+                thinking: Some(GoogleThinking {
+                    enabled: true,
+                    budget_tokens: Some(9999),
+                    level: Some(GoogleThinkingLevel::Medium),
+                }),
+            })),
+            ..Default::default()
+        };
+        let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
+            .clone();
+        // Pi: { includeThoughts: true, thinkingLevel: "MEDIUM" } (no thinkingBudget).
+        assert_eq!(tc, json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" }));
+
+        // 3. enabled:false override DISABLES thinking even though unified reasoning is High → the
+        //    model's disabled config (Pi `model.reasoning && options.thinking && !enabled`,
+        //    google-generative-ai.ts:383-384). For gemini-2.5 that is `{ thinkingBudget: 0 }`.
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            api_options: Some(crate::stream::ApiStreamOptions::Google(GoogleOptions {
+                thinking: Some(GoogleThinking {
+                    enabled: false,
+                    budget_tokens: None,
+                    level: None,
+                }),
+            })),
+            ..Default::default()
+        };
+        let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
+            .clone();
+        assert_eq!(tc, json!({ "thinkingBudget": 0 }));
+
+        // 4. without the override, the unified `reasoning` lowering still drives the bytes (32768),
+        //    proving (1)/(2) came from the override path.
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
+        let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
+            .clone();
+        assert_eq!(tc["thinkingBudget"], 32768);
     }
 
     #[test]

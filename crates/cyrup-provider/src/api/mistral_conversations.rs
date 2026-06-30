@@ -220,6 +220,37 @@ pub(crate) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) 
     headers
 }
 
+/// Mistral `promptMode` (Pi `MistralOptions.promptMode`, mistral-conversations.ts:41). The only
+/// value Pi defines is `"reasoning"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MistralPromptMode {
+    /// `"reasoning"`.
+    Reasoning,
+}
+
+impl MistralPromptMode {
+    /// The exact `promptMode` wire string.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            MistralPromptMode::Reasoning => "reasoning",
+        }
+    }
+}
+
+/// Per-API typed options for the `mistral-conversations` wire protocol (Pi `MistralOptions`,
+/// mistral-conversations.ts:39-43). `toolChoice` folds onto `StreamOptions.tool_choice` and the
+/// simple reasoning level onto `StreamOptions.reasoning`; only a direct `promptMode` per-request
+/// override has no other home. Carried via
+/// [`StreamOptions::api_options`](crate::StreamOptions::api_options); defaults to `None` (no
+/// override), reproducing the streamSimple-driven behavior exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MistralOptions {
+    /// Direct `promptMode` override (Pi `buildChatPayload` reads `options.promptMode`,
+    /// mistral-conversations.ts:256). `None` = no override: the unified `reasoning` level drives
+    /// `promptMode` as before.
+    pub prompt_mode: Option<MistralPromptMode>,
+}
+
 /// Test-only convenience wrapper for [`build_chat_payload`].
 #[cfg(test)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
@@ -266,8 +297,13 @@ pub(crate) fn build_chat_payload(model: &Model, ctx: &Context, opts: &StreamOpti
         obj.insert("toolChoice".to_string(), map_tool_choice(tc));
     }
 
-    // Reasoning lowering (Pi `streamSimple`, mistral-conversations.ts:120-130).
-    let (prompt_mode, reasoning_effort) = lower_reasoning(model, opts.reasoning);
+    // Reasoning lowering (Pi `streamSimple`, mistral-conversations.ts:120-130). A direct
+    // `MistralOptions.promptMode` per-request override (Pi `buildChatPayload` reads
+    // `options.promptMode`, mistral-conversations.ts:256) wins over the computed value.
+    let (mut prompt_mode, reasoning_effort) = lower_reasoning(model, opts.reasoning);
+    if let Some(pm) = opts.mistral_options().and_then(|m| m.prompt_mode) {
+        prompt_mode = Some(pm.as_wire());
+    }
     if let Some(pm) = prompt_mode {
         obj.insert("promptMode".to_string(), json!(pm));
     }
@@ -1278,6 +1314,53 @@ mod tests {
         let body = build_body(&m, &user_ctx("x"), &opts);
         assert_eq!(body["promptMode"], "reasoning");
         assert!(body.get("reasoningEffort").is_none());
+    }
+
+    /// Byte-diff vs Pi `buildChatPayload` (mistral-conversations.ts:256): a direct
+    /// `MistralOptions.promptMode` override is written verbatim, overriding the unified-`reasoning`
+    /// lowering. Proven two ways: (a) it ADDS `promptMode` on a non-reasoning request that the
+    /// lowering leaves bare, and (b) it overrides on a model whose lowering would otherwise emit
+    /// `reasoningEffort` only.
+    #[test]
+    fn mistral_prompt_mode_override_threads_to_payload() {
+        // (a) Non-reasoning model + no unified reasoning ⇒ lowering yields no promptMode; the direct
+        //     override supplies it. Pi: `if (options?.promptMode) payload.promptMode = options.promptMode`.
+        let m = model_with("codestral-latest", false);
+        let opts = StreamOptions {
+            api_options: Some(crate::stream::ApiStreamOptions::Mistral(MistralOptions {
+                prompt_mode: Some(MistralPromptMode::Reasoning),
+            })),
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert_eq!(body["promptMode"], "reasoning");
+        // The lowering contributed nothing here, so reasoningEffort stays absent.
+        assert!(body.get("reasoningEffort").is_none());
+
+        // (b) A reasoning-effort model at High would lower to `reasoningEffort:"high"` with no
+        //     promptMode; the override adds `promptMode:"reasoning"` on top (Pi reads both fields
+        //     independently from `options`).
+        let m = model_with("mistral-small-latest", true);
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            api_options: Some(crate::stream::ApiStreamOptions::Mistral(MistralOptions {
+                prompt_mode: Some(MistralPromptMode::Reasoning),
+            })),
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert_eq!(body["promptMode"], "reasoning");
+        assert_eq!(body["reasoningEffort"], "high");
+
+        // Control: without the override the same request omits promptMode (proving the override drove
+        // the bytes above, not the lowering).
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert!(body.get("promptMode").is_none());
+        assert_eq!(body["reasoningEffort"], "high");
     }
 
     #[test]
