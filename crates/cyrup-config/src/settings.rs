@@ -476,17 +476,21 @@ impl EffectiveSettings {
         self.merged.get_bool("enableAnalytics").unwrap_or(false)
     }
 
-    pub fn enabled_models(&self) -> Vec<String> {
-        self.merged
-            .get("enabledModels")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// `getEnabledModels(): string[] | undefined` (Pi settings-manager.ts:1133-1135). Returns
+    /// `None` when the key is unset — distinct from `Some(vec![])` (an explicit empty list) — so a
+    /// consumer can tell "cycle ALL models" (unset) from "cycle NONE" (empty). Collapsing both to
+    /// an empty `Vec` (the prior `unwrap_or_default`) lost that distinction.
+    pub fn enabled_models(&self) -> Option<Vec<String>> {
+        self.merged.get("enabledModels").map(|v| {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
     }
 
     /// `sessionDir`, tilde-expanded (Pi `getSessionDir` → `normalizePath`, settings-manager.ts:665).
@@ -735,20 +739,31 @@ impl EffectiveSettings {
     }
 
     /// `thinkingBudgets` — custom per-level token budgets, or `None` when unset (Pi
-    /// `getThinkingBudgets`, settings-manager.ts:1043-1045).
+    /// `getThinkingBudgets`, settings-manager.ts:1043-1045). Pi returns the raw object as-is
+    /// (loose typing): a single malformed field does NOT discard the others. Parse field-wise so a
+    /// bad value for one level leaves that field `None` while the other valid levels survive,
+    /// instead of collapsing the entire object to `None` (whole-object `from_value`).
     pub fn thinking_budgets(&self) -> Option<ThinkingBudgets> {
-        self.merged
-            .get("thinkingBudgets")
-            .and_then(|v| serde_json::from_value::<ThinkingBudgets>(v.clone()).ok())
+        let obj = self.merged.get("thinkingBudgets")?.as_object()?;
+        Some(ThinkingBudgets {
+            minimal: obj.get("minimal").and_then(Value::as_i64),
+            low: obj.get("low").and_then(Value::as_i64),
+            medium: obj.get("medium").and_then(Value::as_i64),
+            high: obj.get("high").and_then(Value::as_i64),
+        })
     }
 
     /// `getWarnings` — the warnings object (a shallow copy; empty when unset) (Pi
-    /// settings-manager.ts:1199-1201).
+    /// settings-manager.ts:1199-1201, `{ ...(this.settings.warnings ?? {}) }`). Like Pi's loose
+    /// typing, parse field-wise: a malformed field falls back to its default without discarding the
+    /// rest of the object (whole-object `from_value` would collapse it all to `Default`).
     pub fn warnings(&self) -> Warnings {
-        self.merged
-            .get("warnings")
-            .and_then(|v| serde_json::from_value::<Warnings>(v.clone()).ok())
-            .unwrap_or_default()
+        match self.merged.get("warnings").and_then(Value::as_object) {
+            Some(obj) => Warnings {
+                anthropic_extra_usage: obj.get("anthropicExtraUsage").and_then(Value::as_bool),
+            },
+            None => Warnings::default(),
+        }
     }
 
     /// `retry.provider.timeoutMs` — SDK/provider request timeout, or `None` when unset (Pi
@@ -1738,6 +1753,69 @@ mod tests {
                 max_retries: Some(7),
                 max_retry_delay_ms: 999,
             }
+        );
+    }
+
+    #[test]
+    fn thinking_budgets_and_warnings_parse_field_wise() {
+        // Pi returns these objects raw/loosely-typed (settings-manager.ts:1043-1045, 1199-1201):
+        // one malformed field does NOT discard the rest. The prior whole-object `from_value`
+        // collapsed the ENTIRE object to None/Default on a single bad field. Assert the surviving
+        // valid fields are preserved (Pi behaviour), not lost.
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(
+                r#"{
+                    "thinkingBudgets": { "minimal": 50, "low": "oops", "medium": 700 },
+                    "warnings": { "anthropicExtraUsage": "nope" }
+                }"#,
+            )
+            .unwrap(),
+        );
+        // `low` is a string (malformed) → that field is None, but `minimal` and `medium` survive.
+        // The whole-object parse would have yielded `None` for the entire budgets object.
+        assert_eq!(
+            s.thinking_budgets(),
+            Some(ThinkingBudgets {
+                minimal: Some(50),
+                low: None,
+                medium: Some(700),
+                high: None
+            })
+        );
+        // `anthropicExtraUsage` is a string (malformed) → that field falls back to None; the object
+        // itself is still returned (present key) rather than collapsing.
+        assert_eq!(
+            s.warnings(),
+            Warnings {
+                anthropic_extra_usage: None
+            }
+        );
+
+        // An empty `thinkingBudgets` object is present → `Some(default)`, distinct from unset/None.
+        let s2 = EffectiveSettings::from_settings(
+            Settings::parse(r#"{ "thinkingBudgets": {} }"#).unwrap(),
+        );
+        assert_eq!(s2.thinking_budgets(), Some(ThinkingBudgets::default()));
+    }
+
+    #[test]
+    fn enabled_models_distinguishes_unset_from_empty() {
+        // Pi `getEnabledModels(): string[] | undefined` (settings-manager.ts:1133-1135): unset is
+        // `undefined` (cycle ALL), an explicit `[]` is empty (cycle NONE). The prior
+        // `unwrap_or_default` collapsed both to an empty Vec.
+        let unset = EffectiveSettings::from_settings(Settings::default());
+        assert_eq!(unset.enabled_models(), None);
+
+        let empty =
+            EffectiveSettings::from_settings(Settings::parse(r#"{ "enabledModels": [] }"#).unwrap());
+        assert_eq!(empty.enabled_models(), Some(vec![]));
+
+        let some = EffectiveSettings::from_settings(
+            Settings::parse(r#"{ "enabledModels": ["anthropic/claude-opus-4-8"] }"#).unwrap(),
+        );
+        assert_eq!(
+            some.enabled_models(),
+            Some(vec!["anthropic/claude-opus-4-8".to_string()])
         );
     }
 

@@ -113,6 +113,10 @@ fn build_run_ctx(
     stream_fn: Arc<dyn StreamFn>,
 ) -> RunCtx {
     let AgentContext { system_prompt, messages, tools } = context;
+    // The loop's working copy (Pi `currentContext.messages`, a `.slice()` of the supplied snapshot)
+    // is kept distinct from the throwaway reducer `state.messages` so a `prepare_next_turn` context
+    // override updates only the working copy — matching the high-level agent (agent-loop.ts:104-107).
+    let working_messages = messages.clone();
     let state = Arc::new(Mutex::new(StateInner {
         system_prompt: system_prompt.clone(),
         model: config.model.clone(),
@@ -141,6 +145,7 @@ fn build_run_ctx(
         config.thinking_level,
         config.gen_config,
         tools,
+        working_messages,
         cancel,
         false,
     )

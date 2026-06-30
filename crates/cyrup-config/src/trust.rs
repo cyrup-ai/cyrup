@@ -51,8 +51,46 @@ pub struct TrustStore {
     path: PathBuf,
 }
 
+/// Lexically resolve a path to an absolute, `.`/`..`-normalized form WITHOUT touching the
+/// filesystem (Pi `resolvePath` → Node `path.resolve`, utils/paths.ts:81-84). Relative inputs are
+/// absolutized against the process cwd; `..` is popped lexically (never above the root).
+fn resolve_path(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(base) => base.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    let mut out: Vec<Component> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // A `..` cannot escape the root/prefix; keep leading `..` only on a relative path
+                // (unreachable here since `abs` is absolute, but kept for total correctness).
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(comp),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+/// Pi `canonicalizePath(resolvePath(cwd))` (trust-manager.ts:39-41 `normalizeCwd`): first
+/// absolutize + lexically normalize (so a relative or not-yet-existing cwd still yields a stable
+/// absolute key), then resolve symlinks via the real filesystem, FALLING BACK to the
+/// resolved-but-unreal path on failure (utils/paths.ts:28-34). Critically the fallback is the
+/// normalized absolute path, NOT the raw input.
 fn canonicalize(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    let resolved = resolve_path(p);
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
 }
 
 impl TrustStore {
@@ -457,6 +495,27 @@ mod tests {
         let other = tmp().join("unrelated");
         std::fs::create_dir_all(&other).unwrap();
         assert!(store.nearest(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn canonicalize_absolutizes_and_normalizes_like_pi_resolve_path() {
+        // Pi `normalizeCwd = canonicalizePath(resolvePath(cwd))` (trust-manager.ts:39-41). For a
+        // non-existent absolute path with `..`, `resolvePath` lexically normalizes and
+        // `realpathSync` fails → returns the resolved-but-unreal path. Ground truth captured from
+        // Pi: `canonicalizePath(resolve("/nonexistent-xyz-123/../abc")) === "/abc"`.
+        // The OLD crate code returned the RAW input ("/nonexistent-xyz-123/../abc") verbatim.
+        assert_eq!(
+            canonicalize(Path::new("/nonexistent-xyz-123/../abc")),
+            PathBuf::from("/abc")
+        );
+
+        // For a relative input, Pi absolutizes against the process cwd: `resolve("foo/../bar")`
+        // === `${process.cwd()}/bar`. The OLD code returned "foo/../bar" verbatim (not absolute).
+        let got = canonicalize(Path::new("foo/../bar"));
+        assert!(got.is_absolute(), "relative cwd must be absolutized");
+        let expected = std::env::current_dir().unwrap().join("bar");
+        assert_eq!(got, expected);
+        assert_ne!(got, PathBuf::from("foo/../bar"));
     }
 
     #[test]

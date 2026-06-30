@@ -34,9 +34,9 @@ use crate::state::{reduce, AgentStateSnapshot, GenerationConfig, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{
-    ApiId, AssistantMessage, CancelToken, Content, ExecMode, ModelRef, RunCancel, SessionId,
-    StopReason, ModelThinkingLevel, Tool, ToolCall, ToolCallId, ToolError, ToolResult, ToolUpdate,
-    ToolUpdateSink, Usage, UNRESOLVED_API,
+    ApiId, AssistantMessage, CancelToken, Content, ExecMode, ModelRef, ProviderId, RunCancel,
+    SessionId, StopReason, ModelThinkingLevel, Tool, ToolCall, ToolCallId, ToolError, ToolResult,
+    ToolUpdate, ToolUpdateSink, Usage, UNRESOLVED_API,
 };
 use cyrup_provider::{validate_tool_call, Context, StreamEvent, StreamOptions};
 use futures::future::FutureExt;
@@ -51,6 +51,36 @@ use tokio::task::JoinSet;
 /// Lock a `std::sync::Mutex` ignoring poisoning (no panic on a poisoned lock; arch-00 no-panic).
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wall-clock milliseconds since the Unix epoch — the Rust analogue of Pi `Date.now()`
+/// (agent.ts:383,504; agent-loop.ts:741). Used to stamp prompt user messages, tool-result messages,
+/// and the synthetic failure message so the value reaches the `convert_to_llm` wire payload exactly
+/// as Pi's does. Never panics: a clock before the epoch degrades to `0`.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// An errored assistant transcript message matching Pi `handleRunFailure` (agent.ts:494-505): one
+/// EMPTY text block (`[{type:"text", text:""}]`, NOT empty content) plus a `Date.now()` timestamp.
+/// Both reach the wire payload via `convert_to_llm`, so they must mirror Pi byte-for-byte.
+/// `cyrup_core::AssistantMessage::errored` yields `content: []`/`timestamp: 0`; this overlays Pi's
+/// single empty text block and wall-clock stamp on top (the `errored` type lives in cyrup-core and is
+/// shared, so the Pi-specific transcript shape is applied here at the agent boundary).
+fn errored_assistant(
+    provider: ProviderId,
+    model: &str,
+    api: Option<ApiId>,
+    stop_reason: StopReason,
+    msg: impl Into<String>,
+) -> AssistantMessage {
+    let mut m = AssistantMessage::errored(provider, model, api, stop_reason, msg);
+    m.content = vec![Content::text("")];
+    m.timestamp = now_millis();
+    m
 }
 
 fn empty_assistant(model: &ModelRef) -> AssistantMessage {
@@ -135,7 +165,9 @@ impl PromptInput {
     pub fn text_with_images(text: impl Into<String>, images: Vec<Content>) -> Self {
         let mut content = vec![Content::text(text)];
         content.extend(images);
-        Self { messages: vec![AgentMessage::User { content, timestamp: None }] }
+        // Pi `normalizePromptInput` stamps the string-input user message with `Date.now()`
+        // (agent.ts:393); this value reaches the wire payload via `convert_to_llm`.
+        Self { messages: vec![AgentMessage::User { content, timestamp: Some(now_millis()) }] }
     }
 
     /// The single message this input wraps (panics-free: returns an empty user message if empty).
@@ -150,12 +182,14 @@ impl PromptInput {
 
 impl From<&str> for PromptInput {
     fn from(s: &str) -> Self {
-        Self { messages: vec![AgentMessage::user_text(s)] }
+        // Pi `normalizePromptInput` stamps a string prompt with `Date.now()` (agent.ts:389-393).
+        Self { messages: vec![AgentMessage::User { content: vec![Content::text(s)], timestamp: Some(now_millis()) }] }
     }
 }
 impl From<String> for PromptInput {
     fn from(s: String) -> Self {
-        Self { messages: vec![AgentMessage::user_text(s)] }
+        // Pi `normalizePromptInput` stamps a string prompt with `Date.now()` (agent.ts:389-393).
+        Self { messages: vec![AgentMessage::User { content: vec![Content::text(s)], timestamp: Some(now_millis()) }] }
     }
 }
 impl From<AgentMessage> for PromptInput {
@@ -241,6 +275,13 @@ pub(crate) struct RunCtx {
     tools: Vec<Arc<dyn Tool>>,
     cancel: RunCancel,
     new_messages: Vec<AgentMessage>,
+    /// The loop's OWN working transcript — Pi `currentContext.messages`, a `.slice()` SNAPSHOT of the
+    /// agent's `messages` taken at run start, NOT the live `Arc` (agent.ts:424-429; agent-loop.ts:104-107).
+    /// This is the array the loop reads to build each LLM payload and that a `prepare_next_turn`
+    /// context override replaces. The agent's observable `state.messages` grows INDEPENDENTLY via the
+    /// reducer on `message_end` (agent.ts:519-522), so neither a context override nor a mid-run
+    /// external `set_messages` leaks between the two — exactly as in Pi.
+    messages: Vec<AgentMessage>,
     turn_index: usize,
     /// On continue-from-assistant, the first `getSteeringMessages` poll returns `[]` so a second
     /// queued steering message is not drained a turn too early (Pi `skipInitialSteeringPoll`,
@@ -267,6 +308,7 @@ impl RunCtx {
         thinking_level: ModelThinkingLevel,
         gen_config: GenerationConfig,
         tools: Vec<Arc<dyn Tool>>,
+        messages: Vec<AgentMessage>,
         cancel: RunCancel,
         skip_initial_steering_poll: bool,
     ) -> Self {
@@ -287,6 +329,7 @@ impl RunCtx {
             tools,
             cancel,
             new_messages: Vec::new(),
+            messages,
             turn_index: 0,
             skip_initial_steering_poll,
         }
@@ -331,6 +374,10 @@ impl RunCtx {
                 for p in prompts {
                     self.emit(AgentEvent::MessageStart { message: p.clone() }).await;
                     self.emit(AgentEvent::MessageEnd { message: p.clone() }).await;
+                    // Pi appends each prompt to the loop's working copy (`currentContext.messages`,
+                    // agent-loop.ts:106/187) — the observable `state.messages` grows separately via
+                    // the reducer on the `message_end` above.
+                    self.messages.push(p.clone());
                     self.new_messages.push(p);
                 }
                 self.run_loop(true).await;
@@ -365,10 +412,17 @@ impl RunCtx {
                 for m in std::mem::take(&mut pending) {
                     self.emit(AgentEvent::MessageStart { message: m.clone() }).await;
                     self.emit(AgentEvent::MessageEnd { message: m.clone() }).await;
+                    // Pi pushes each injected steering/follow-up message onto the loop's working copy
+                    // (`currentContext.messages.push`, agent-loop.ts:186).
+                    self.messages.push(m.clone());
                     self.new_messages.push(m);
                 }
 
                 let asst = self.stream_assistant().await;
+                // Pi's `streamAssistantResponse` leaves the final assistant message in the loop's
+                // working copy (`currentContext.messages`, agent-loop.ts:346/348/361/363); mirror that
+                // before tool execution / the post-turn hooks read the context.
+                self.messages.push(AgentMessage::Assistant(asst.clone()));
                 self.new_messages.push(AgentMessage::Assistant(asst.clone()));
 
                 if matches!(asst.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -392,6 +446,9 @@ impl RunCtx {
                     // follow-up still flow through the post-turn path below.
                     has_more_tools = !batch.terminate;
                     for r in &tool_results {
+                        // Pi pushes each tool result onto the loop's working copy
+                        // (`currentContext.messages.push(result)`, agent-loop.ts:213).
+                        self.messages.push(AgentMessage::ToolResult(r.clone()));
                         self.new_messages.push(AgentMessage::ToolResult(r.clone()));
                     }
                 }
@@ -414,7 +471,7 @@ impl RunCtx {
                 // the live context (system prompt + tools + full transcript), and the new-message
                 // accumulator (Pi `ShouldStopAfterTurnContext`/`PrepareNextTurnContext`,
                 // types.ts:116-138).
-                let ctx_messages = lock(&self.state).messages.clone();
+                let ctx_messages = self.messages.clone();
                 let prep = {
                     let ctx = PostTurn {
                         messages: &self.new_messages,
@@ -442,10 +499,13 @@ impl RunCtx {
                             self.thinking_level = t;
                         }
                         if let Some(ctx) = u.context {
-                            // `currentContext = snapshot.context ?? currentContext`: the override
-                            // replaces the working transcript; this turn's `message_end`s have
-                            // already been appended, and subsequent turns append onto the override.
-                            lock(&self.state).messages = ctx;
+                            // `currentContext = snapshot.context ?? currentContext`
+                            // (agent-loop.ts:228): the override replaces ONLY the loop's working copy.
+                            // The agent's observable `state.messages` keeps growing via the reducer, so
+                            // the override never leaks into `agent.state.messages` (Pi keeps the two
+                            // arrays distinct, agent.ts:519-522). Subsequent turns append onto the
+                            // override here.
+                            self.messages = ctx;
                         }
                     }
                     Ok(None) => {}
@@ -458,7 +518,7 @@ impl RunCtx {
                 // Pi passes the UPDATED `currentContext` to `shouldStopAfterTurn` (it runs AFTER the
                 // `prepareNextTurn` reassignment, agent-loop.ts:241-251), so re-snapshot the (possibly
                 // overridden) transcript for this hook's context view.
-                let ctx_messages_after = lock(&self.state).messages.clone();
+                let ctx_messages_after = self.messages.clone();
                 let stop = {
                     let ctx = PostTurn {
                         messages: &self.new_messages,
@@ -509,7 +569,10 @@ impl RunCtx {
         // non-reasoning model silently ignores the level (func-01 R-01-041).
         let model = self.model.clone();
         let effective_thinking = self.thinking_level;
-        let base_messages = lock(&self.state).messages.clone();
+        // Read the loop's OWN working copy (Pi `context.messages`, agent-loop.ts:283), NOT the live
+        // `state.messages` Arc — a `prepare_next_turn` context override or a mid-run external
+        // `set_messages` must not cross between the two.
+        let base_messages = self.messages.clone();
 
         let transformed =
             match self.hooks.transform_context(base_messages, self.cancel.child()).await {
@@ -580,7 +643,7 @@ impl RunCtx {
         let mut partial = empty_assistant(&model);
         let mut final_msg: Option<AssistantMessage> = None;
 
-        loop {
+        'consume: loop {
             tokio::select! {
                 biased;
                 _ = cancel_tok.cancelled() => {
@@ -590,13 +653,14 @@ impl RunCtx {
                         })
                         .await;
                     }
-                    let aborted = AssistantMessage::errored(
-                        model.provider.clone(),
-                        model.model.as_str(),
-                        model.api.clone(),
-                        StopReason::Aborted,
-                        "aborted",
-                    );
+                    // Pi returns the stream's own `result()` terminal on abort (agent-loop.ts:344),
+                    // which carries the ACCUMULATED partial content with `stopReason:"aborted"` — NOT
+                    // a fresh empty message. Reuse the structured partial we have been tracking and
+                    // only stamp the terminal reason, so a subscriber/transcript sees the streamed
+                    // text/thinking/tool-call blocks rather than `[]`.
+                    let mut aborted = partial.clone();
+                    aborted.stop_reason = StopReason::Aborted;
+                    aborted.error_message = Some("aborted".to_string());
                     self.emit(AgentEvent::MessageEnd {
                         message: AgentMessage::Assistant(aborted.clone()),
                     })
@@ -621,11 +685,17 @@ impl RunCtx {
                             })
                             .await;
                         }
+                        // Pi RETURNS from `streamAssistantResponse` immediately on the `done`/`error`
+                        // terminal (agent-loop.ts:342-355): it stops consuming the stream right here.
+                        // Break out of the consume loop so a (non-conforming) post-terminal event can
+                        // neither emit a stray `message_update` nor overwrite the final `partial`.
                         StreamEvent::Done { message, .. } => {
                             final_msg = Some(message.clone());
+                            break 'consume;
                         }
                         StreamEvent::Error { error, .. } => {
                             final_msg = Some(error.clone());
+                            break 'consume;
                         }
                         // Every other event is a content-block start/delta/end (text, thinking, OR
                         // tool-call): re-emit the refreshed partial on `message_update` (Pi emits
@@ -646,7 +716,7 @@ impl RunCtx {
         }
 
         let final_msg = final_msg.unwrap_or_else(|| {
-            AssistantMessage::errored(
+            errored_assistant(
                 model.provider.clone(),
                 model.model.as_str(),
                 model.api.clone(),
@@ -666,7 +736,9 @@ impl RunCtx {
     }
 
     async fn emit_error_assistant(&self, msg: &str, model: &ModelRef) -> AssistantMessage {
-        let asst = AssistantMessage::errored(
+        // Pi routes a `transformContext`/`convertToLlm` throw through `handleRunFailure`, whose
+        // failure message carries one empty text block + `Date.now()` (agent.ts:494-505).
+        let asst = errored_assistant(
             model.provider.clone(),
             model.model.as_str(),
             model.api.clone(),
@@ -684,9 +756,9 @@ impl RunCtx {
             self.find_tool(&c.name).map(|t| t.execution_mode() == ExecMode::Sequential).unwrap_or(false)
         });
         let sequential = any_seq || matches!(self.tool_execution, ToolExecution::Sequential);
-        // Snapshot the live transcript once for the per-call hook context view (Pi
-        // `currentContext.messages`).
-        let ctx_messages = lock(&self.state).messages.clone();
+        // Snapshot the loop's working transcript once for the per-call hook context view (Pi
+        // `currentContext.messages`, agent-loop.ts:691).
+        let ctx_messages = self.messages.clone();
         if sequential {
             self.execute_sequential(assistant, &ctx_messages, calls).await
         } else {
@@ -764,7 +836,9 @@ impl RunCtx {
             content: vec![Content::text(msg)],
             details: None,
             is_error: true,
-            timestamp: 0,
+            // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
+            // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
+            timestamp: now_millis(),
         };
         Finalized {
             source_index: 0,
@@ -845,7 +919,9 @@ impl RunCtx {
             content,
             details,
             is_error,
-            timestamp: 0,
+            // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
+            // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
+            timestamp: now_millis(),
         };
         Finalized {
             source_index,
@@ -1311,11 +1387,20 @@ impl Agent {
         // `handleRunFailure(error, signal.aborted)`, agent.ts:470,476-492).
         let fail_cancel = cancel.clone();
 
-        let (system_prompt, model, thinking_level, tools) = {
+        let (system_prompt, model, thinking_level, tools, messages) = {
             let mut st = lock(&self.state);
             st.error_message = None;
             st.is_streaming = true;
-            (st.system_prompt.clone(), st.model.clone(), st.thinking_level, st.tools.clone())
+            // Pi `createContextSnapshot` hands the loop a `.slice()` COPY of `messages`
+            // (agent.ts:424-429); the loop mutates only that copy while the agent's observable
+            // `state.messages` grows independently via the reducer on `message_end`.
+            (
+                st.system_prompt.clone(),
+                st.model.clone(),
+                st.thinking_level,
+                st.tools.clone(),
+                st.messages.clone(),
+            )
         };
         let _ = self.running_tx.send(true);
 
@@ -1334,6 +1419,7 @@ impl Agent {
             thinking_level,
             self.gen_config.clone(),
             tools,
+            messages,
             cancel,
             skip_initial_steering_poll,
         );
@@ -1377,7 +1463,9 @@ impl Agent {
                     // but a `panic!`/`unwrap` payload is a `&str`/`String` we can downcast to recover
                     // the real message; otherwise fall back to a generic string.
                     let error_message = panic_message(payload.as_ref());
-                    let failure = AssistantMessage::errored(
+                    // Pi `handleRunFailure` failure message: one empty text block + `Date.now()`
+                    // (agent.ts:494-505), NOT empty content / a zero timestamp.
+                    let failure = errored_assistant(
                         model.provider.clone(),
                         model.model.as_str(),
                         model.api.clone(),

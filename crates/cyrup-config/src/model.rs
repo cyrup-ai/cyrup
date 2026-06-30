@@ -30,18 +30,22 @@ pub struct ScopedModel {
 }
 
 /// Outcome of parsing a model pattern (arch-07 §3.6). `warning` is surfaced, never panics.
+/// Mirrors Pi's `ParsedModelResult` (`{ model, thinkingLevel, warning }`, model-resolver.ts:156-161):
+/// Pi has no "ambiguous" concept — an ambiguous bare id resolves via partial matching, never errors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModel {
     pub model: Option<Model>,
     pub thinking_level: Option<ModelThinkingLevel>,
     pub warning: Option<String>,
-    pub ambiguous: bool,
 }
 
+/// Result of resolving a reference (Pi `tryMatchModel` return: `Model | undefined`).
+/// Pi never errors on ambiguity: `findExactModelReferenceMatch` returns `undefined` for a bare id
+/// present on >1 provider, so resolution falls through to partial matching
+/// (model-resolver.ts:90-118, 124-154).
 enum Match<'a> {
     None,
     One(&'a Model),
-    Ambiguous(Vec<&'a Model>),
 }
 
 /// `true` if a model id looks like a dated version (`…-YYYYMMDD`), i.e. NOT an alias.
@@ -85,20 +89,19 @@ impl<'a> ModelResolver<'a> {
             }
         }
 
-        // 2. bare exact id (ambiguous across providers ⇒ error).
+        // 2. bare exact id. Pi's `findExactModelReferenceMatch` returns the model ONLY when exactly
+        // one id matches; a bare id present on >1 provider returns `undefined` (it does NOT error),
+        // so it falls through to partial matching below (model-resolver.ts:116-118). Likewise a
+        // zero-hit exact match falls through.
         let exact: Vec<&Model> = self
             .available
             .iter()
             .filter(|m| m.id.as_str().to_ascii_lowercase() == lower)
             .collect();
-        match exact.len() {
-            1 => {
-                if let Some(m) = exact.first() {
-                    return Match::One(m);
-                }
-            }
-            n if n > 1 => return Match::Ambiguous(exact),
-            _ => {}
+        if exact.len() == 1
+            && let Some(m) = exact.first()
+        {
+            return Match::One(m);
         }
 
         // 3. partial match against id or name; alias-preferred, highest-sorting on ties.
@@ -125,93 +128,77 @@ impl<'a> ModelResolver<'a> {
         }
     }
 
-    /// Exact/partial lookup; `Ok(None)` = no match, `Err` = ambiguous bare id (R-07-019).
-    pub fn find_exact(&self, reference: &str) -> Result<Option<&'a Model>, String> {
+    /// Exact-then-partial lookup (Pi `tryMatchModel`, model-resolver.ts:124-154). `None` = no match.
+    /// Pi never errors on an ambiguous bare id; it falls through to partial matching, which always
+    /// resolves to a single (alias-preferred, highest-sorting) model.
+    pub fn find_exact(&self, reference: &str) -> Option<&'a Model> {
         match self.match_reference(reference) {
-            Match::One(m) => Ok(Some(m)),
-            Match::None => Ok(None),
-            Match::Ambiguous(v) => {
-                let providers: Vec<String> = v
-                    .iter()
-                    .map(|m| format!("{}/{}", m.provider, m.id))
-                    .collect();
-                Err(format!(
-                    "ambiguous model id '{reference}': matches {}",
-                    providers.join(", ")
-                ))
-            }
+            Match::One(m) => Some(m),
+            Match::None => None,
         }
     }
 
     /// Parse a `pattern[:level]` (R-07-020). `strict` (CLI `--model`) refuses to guess on an
     /// invalid trailing token; non-strict (scope mode) warns and recurses on the prefix.
     pub fn parse_pattern(&self, pattern: &str, strict: bool) -> ParsedModel {
-        match self.match_reference(pattern) {
-            Match::One(m) => {
-                return ParsedModel {
-                    model: Some(m.clone()),
-                    thinking_level: None,
-                    warning: None,
-                    ambiguous: false,
-                };
-            }
-            Match::Ambiguous(v) => {
-                let providers: Vec<String> = v
-                    .iter()
-                    .map(|m| format!("{}/{}", m.provider, m.id))
-                    .collect();
-                return ParsedModel {
-                    model: None,
-                    thinking_level: None,
-                    warning: Some(format!(
-                        "ambiguous model id '{pattern}': matches {}",
-                        providers.join(", ")
-                    )),
-                    ambiguous: true,
-                };
-            }
-            Match::None => {}
+        // Try a full exact/partial match first (Pi `tryMatchModel`, model-resolver.ts:198-201).
+        if let Match::One(m) = self.match_reference(pattern) {
+            return ParsedModel {
+                model: Some(m.clone()),
+                thinking_level: None,
+                warning: None,
+            };
         }
 
-        // Strip a trailing `:<token>` (colon-safe: split at the LAST colon, recurse on prefix).
+        // No match — split on the LAST colon if present (Pi model-resolver.ts:203-211).
         let Some(idx) = pattern.rfind(':') else {
             return ParsedModel {
                 model: None,
                 thinking_level: None,
                 warning: None,
-                ambiguous: false,
             };
         };
         let (prefix, rest) = pattern.split_at(idx);
         let suffix = rest.get(1..).unwrap_or("");
 
         if let Some(level) = parse_thinking_level(suffix) {
+            // Valid level — recurse on the prefix. Keep the level only when the inner parse is
+            // clean (Pi `thinkingLevel: result.warning ? undefined : suffix`; :213-224). When the
+            // prefix itself does not resolve, return the inner result verbatim (:224).
             let inner = self.parse_pattern(prefix, strict);
-            let thinking = if inner.warning.is_some() || inner.ambiguous {
-                None
+            if inner.model.is_some() {
+                let thinking = if inner.warning.is_some() {
+                    None
+                } else {
+                    Some(level)
+                };
+                ParsedModel {
+                    model: inner.model,
+                    thinking_level: thinking,
+                    warning: inner.warning,
+                }
             } else {
-                Some(level)
-            };
-            ParsedModel {
-                model: inner.model,
-                thinking_level: thinking,
-                warning: inner.warning,
-                ambiguous: inner.ambiguous,
+                inner
             }
         } else if strict {
+            // Strict (CLI `--model`): don't guess — treat the suffix as part of the id and fail
+            // (Pi :228-232).
             ParsedModel {
                 model: None,
                 thinking_level: None,
                 warning: None,
-                ambiguous: false,
             }
         } else {
+            // Scope mode: recurse on the prefix and warn (Pi :234-244).
             let inner = self.parse_pattern(prefix, strict);
-            ParsedModel {
-                model: inner.model,
-                thinking_level: None,
-                warning: Some(format!("invalid thinking level '{suffix}'")),
-                ambiguous: inner.ambiguous,
+            if inner.model.is_some() {
+                ParsedModel {
+                    model: inner.model,
+                    thinking_level: None,
+                    warning: Some(format!("invalid thinking level '{suffix}'")),
+                }
+            } else {
+                inner
             }
         }
     }
@@ -285,12 +272,111 @@ impl<'a> ModelResolver<'a> {
 }
 
 /// `minimatch`-style glob matcher (Pi uses `minimatch(.., { nocase: true })`,
-/// model-resolver.ts:282). Supports `*` (any run), `?` (one char), and `[...]` character classes
-/// (with a leading `!`/`^` negation), case-insensitively. No external dep.
+/// model-resolver.ts:282). Faithful to minimatch's path-segment semantics: `*`/`?`/`[...]` do NOT
+/// cross `/` (they match within a single segment), `**` is a globstar matching zero or more whole
+/// segments, and `{a,b}` brace lists are expanded before matching. Case-insensitive. No external
+/// dep. (Extglobs `?(..)`/`*(..)`/`+(..)`/`@(..)`/`!(..)` are a documented residual; they are rare
+/// in model scope patterns.)
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let pat_lower = pattern.to_ascii_lowercase();
+    let text_lower = text.to_ascii_lowercase();
+    let text_parts: Vec<&str> = text_lower.split('/').collect();
+    brace_expand(&pat_lower).into_iter().any(|expanded| {
+        let pat_parts: Vec<&str> = expanded.split('/').collect();
+        match_segments(&pat_parts, &text_parts)
+    })
+}
+
+/// Match a path-segment-split glob against a path-segment-split text. A `**` segment is a globstar
+/// (matches zero or more whole segments); every other segment matches exactly one text segment via
+/// [`glob_match_chars`] (which never crosses `/`).
+fn match_segments(pat: &[&str], text: &[&str]) -> bool {
+    match pat.split_first() {
+        None => text.is_empty(),
+        Some((&first, rest)) => {
+            if first == "**" {
+                // Globstar: try consuming 0..=text.len() segments.
+                (0..=text.len()).any(|k| match_segments(rest, text.get(k..).unwrap_or(&[])))
+            } else {
+                match text.split_first() {
+                    Some((&t0, trest)) if segment_matches(first, t0) => match_segments(rest, trest),
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
+/// Match a single glob segment (no `/`) against a single text segment, case already folded.
+fn segment_matches(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
     glob_match_chars(&p, &t)
+}
+
+/// Expand `{a,b,c}` brace lists (minimatch default; brace-expansion package) into concrete
+/// patterns. Handles top-level commas and nesting; an unbalanced or comma-less brace is left
+/// literal (matching brace-expansion's "single element" behavior). `{a..b}` numeric/alpha ranges
+/// are not expanded (a documented residual; unused in model scopes).
+fn brace_expand(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let Some(open) = chars.iter().position(|&c| c == '{') else {
+        return vec![s.to_string()];
+    };
+    // Find the matching `}` and the top-level (depth-1) comma positions.
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut commas: Vec<usize> = Vec::new();
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            ',' if depth == 1 => commas.push(i),
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        // Unbalanced brace — treat literally.
+        return vec![s.to_string()];
+    };
+    let collect = |range: &[char]| -> String { range.iter().collect() };
+    let pre: String = collect(chars.get(..open).unwrap_or(&[]));
+    let post: String = collect(chars.get(close + 1..).unwrap_or(&[]));
+    let post_expanded = brace_expand(&post);
+
+    if commas.is_empty() {
+        // No top-level comma — keep this brace literal, but expand the remainder.
+        let body: String = collect(chars.get(open..=close).unwrap_or(&[]));
+        return post_expanded
+            .into_iter()
+            .map(|tail| format!("{pre}{body}{tail}"))
+            .collect();
+    }
+
+    // Split the brace body into options at the top-level commas.
+    let mut options: Vec<String> = Vec::new();
+    let mut start = open + 1;
+    for &c in &commas {
+        options.push(collect(chars.get(start..c).unwrap_or(&[])));
+        start = c + 1;
+    }
+    options.push(collect(chars.get(start..close).unwrap_or(&[])));
+
+    let mut out = Vec::new();
+    for opt in options {
+        for opt_expanded in brace_expand(&opt) {
+            for tail in &post_expanded {
+                out.push(format!("{pre}{opt_expanded}{tail}"));
+            }
+        }
+    }
+    out
 }
 
 fn glob_match_chars(p: &[char], t: &[char]) -> bool {
@@ -1069,18 +1155,41 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_bare_id_errors() {
-        // A-07-6
+    fn ambiguous_bare_id_resolves_via_partial_like_pi() {
+        // Pi never errors on an ambiguous bare id: `findExactModelReferenceMatch` returns
+        // `undefined` for an id on >1 provider (model-resolver.ts:116-118), so `tryMatchModel`
+        // falls through to partial matching, which always yields a single model
+        // (alias-preferred, then `b.id.localeCompare(a.id)` descending → first in original order
+        // on ties). Ground truth derived from Pi: both "shared" ids are aliases and equal, so the
+        // first-listed (provider "a") wins.
         let models = vec![
             model("a", "shared", "A Shared"),
             model("b", "shared", "B Shared"),
         ];
         let r = ModelResolver::new(&models);
-        let err = r.find_exact("shared");
-        assert!(err.is_err());
+        // find_exact (Pi `tryMatchModel`) resolves to provider a, never erroring.
+        let found = r.find_exact("shared").expect("ambiguous bare id resolves, never errors");
+        assert_eq!(found.provider.as_str(), "a");
+        // parse_pattern likewise resolves (no warning, a concrete model).
         let parsed = r.parse_pattern("shared", true);
-        assert!(parsed.ambiguous);
-        assert!(parsed.model.is_none());
+        assert_eq!(parsed.model.as_ref().unwrap().provider.as_str(), "a");
+        assert!(parsed.warning.is_none());
+        // A realistic Pi case: `kimi-k2.6` is shared by moonshotai/moonshotai-cn/opencode/
+        // opencode-go. Pi yields exactly 1 cycle entry (moonshotai, first-listed); the old crate
+        // yielded 0 by erroring. Assert resolve_scope now returns 1.
+        let shared_kimi = vec![
+            model("moonshotai", "kimi-k2.6", "Kimi"),
+            model("moonshotai-cn", "kimi-k2.6", "Kimi CN"),
+            model("opencode", "kimi-k2.6", "Kimi OC"),
+            model("opencode-go", "kimi-k2.6", "Kimi OCG"),
+        ];
+        let r = ModelResolver::new(&shared_kimi);
+        let scoped = r.resolve_scope(&["kimi-k2.6".to_string()]);
+        assert_eq!(scoped.len(), 1, "Pi resolves an ambiguous bare id to 1 model");
+        assert_eq!(
+            scoped.first().unwrap().model.provider.as_str(),
+            "moonshotai"
+        );
     }
 
     #[test]
@@ -1102,7 +1211,7 @@ mod tests {
     fn exact_provider_id_case_insensitive() {
         let models = vec![model("OpenAI", "GPT-4o", "GPT-4o")];
         let r = ModelResolver::new(&models);
-        let m = r.find_exact("openai/gpt-4o").unwrap().unwrap();
+        let m = r.find_exact("openai/gpt-4o").unwrap();
         assert_eq!(m.id.as_str(), "GPT-4o");
     }
 
@@ -1308,6 +1417,69 @@ mod tests {
             &yes_auth,
         );
         assert!(r.fallback_message.is_none());
+    }
+
+    #[test]
+    fn glob_matches_pi_minimatch_byte_for_byte() {
+        // Byte-diff proof: every (pattern, text, expected) triple was captured from Pi's actual
+        // `minimatch(text, pattern, { nocase: true })` (the exact call at model-resolver.ts:282),
+        // committed to `src/testdata/glob_minimatch.json`. Assert the Rust matcher agrees on all
+        // cases — covering the proven miss (`anthropic*` does NOT cross `/`, so it matches 0),
+        // brace expansion, globstar `**`, `?`, `[...]`, negation, and nocase.
+        let fixture = include_str!("testdata/glob_minimatch.json");
+        let cases: Vec<(String, String, bool)> =
+            serde_json::from_str(fixture).expect("valid fixture");
+        assert!(cases.len() >= 200, "fixture should be comprehensive");
+        let mut mismatches = Vec::new();
+        for (pattern, text, expected) in &cases {
+            let got = glob_match(pattern, text);
+            if got != *expected {
+                mismatches.push(format!(
+                    "minimatch({text:?}, {pattern:?}) = {expected}, glob_match = {got}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "glob_match diverges from Pi minimatch:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn scope_glob_is_path_segment_aware_like_pi() {
+        // Assembled behaviour: the proven miss is that `anthropic*` matched ALL anthropic models in
+        // the old flat matcher but matches NONE in Pi (the `*` cannot cross `/` into the id, and no
+        // bare id starts with "anthropic"). Conversely `anthropic/*` matches the two anthropic
+        // models. Models with multi-segment ids (cloudflare) require `**` to traverse.
+        let models = vec![
+            model("anthropic", "claude-opus-4-8", "Opus"),
+            model("anthropic", "claude-haiku-4", "Haiku"),
+            model("openai", "gpt-5.5", "GPT"),
+            model("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6", "Kimi"),
+        ];
+        let r = ModelResolver::new(&models);
+        assert_eq!(
+            r.resolve_scope(&["anthropic*".to_string()]).len(),
+            0,
+            "Pi: `anthropic*` crosses no `/`, matches 0"
+        );
+        assert_eq!(r.resolve_scope(&["anthropic/*".to_string()]).len(), 2);
+        // `{anthropic,openai}/*` brace-expands to two segment patterns → 3 models.
+        assert_eq!(
+            r.resolve_scope(&["{anthropic,openai}/*".to_string()]).len(),
+            3
+        );
+        // A single `*` segment does NOT match the multi-segment cloudflare id; `**` does.
+        assert_eq!(
+            r.resolve_scope(&["cloudflare-workers-ai/*".to_string()]).len(),
+            0
+        );
+        assert_eq!(
+            r.resolve_scope(&["cloudflare-workers-ai/**".to_string()])
+                .len(),
+            1
+        );
     }
 
     #[test]
