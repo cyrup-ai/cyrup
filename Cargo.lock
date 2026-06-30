@@ -973,6 +973,7 @@ dependencies = [
  "cyrup-core",
  "cyrup-provider",
  "directories",
+ "feruca",
  "fs4",
  "oauth2",
  "serde",

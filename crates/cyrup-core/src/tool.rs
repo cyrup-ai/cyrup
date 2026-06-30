@@ -25,11 +25,18 @@ pub struct ToolResult {
     pub terminate: bool,
 }
 
-/// A streamed progress update (func-02 R-02-023).
+/// A streamed progress update (func-02 R-02-023). Mirrors Pi's `AgentToolResult` (the
+/// `partialResult` payload, types.ts:350-360): besides `content`/`details` a partial may carry the
+/// optional early-termination hint `terminate`, which surfaces on the `tool_execution_update` event
+/// (agent-loop.ts:641-653). `None` = the field is absent on the wire (Pi `terminate?: boolean`).
 #[derive(Clone, Debug, Default)]
 pub struct ToolUpdate {
     pub content: Vec<Content>,
     pub details: Option<serde_json::Value>,
+    /// Optional early-termination hint carried by the partial result (Pi `AgentToolResult.terminate`,
+    /// types.ts:359). `None` omits the field from the emitted update, exactly as Pi omits an
+    /// `undefined` `terminate`.
+    pub terminate: Option<bool>,
 }
 
 /// Sink the runtime hands to a tool to stream progress. The runtime ignores updates after the

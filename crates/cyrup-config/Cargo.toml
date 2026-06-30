@@ -16,6 +16,7 @@ base64 = "0.22.1"
 cyrup-core = { workspace = true }
 cyrup-provider = { workspace = true }
 directories = "6.0.0"
+feruca = { workspace = true }
 fs4 = "1.1.0"
 oauth2 = "5.0.0"
 serde.workspace = true

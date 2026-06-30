@@ -96,7 +96,7 @@ impl Tool for BashTool {
         let mut sink = on_update;
 
         // Pi emits an initial empty update before streaming (bash.ts:338-340).
-        sink(ToolUpdate { content: vec![], details: None });
+        sink(ToolUpdate { content: vec![], details: None, terminate: None });
 
         // Pi debounces mid-stream output updates with a 100ms throttle that has BOTH a leading edge
         // AND a scheduled TRAILING-edge `setTimeout` flush (`scheduleOutputUpdate`, bash.ts:158,
@@ -251,6 +251,7 @@ impl Tool for BashTool {
         sink(ToolUpdate {
             content: vec![Content::text(preview_content)],
             details: details.clone(),
+            terminate: None,
         });
 
         match status {
@@ -336,7 +337,7 @@ fn build_stream_update(
     let full_path = acc.snapshot_path();
     let details =
         stream_details(preview.info, truncated, total_lines, total_bytes, max_bytes, full_path);
-    ToolUpdate { content: vec![Content::text(preview.content)], details }
+    ToolUpdate { content: vec![Content::text(preview.content)], details, terminate: None }
 }
 
 /// Pi's `emitOutputUpdate` (bash.ts:302-314): a no-op unless something is dirty; otherwise clear the

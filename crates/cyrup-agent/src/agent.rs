@@ -114,8 +114,18 @@ fn result_value_of(content: &[Content], details: &Option<Value>, terminate: bool
     serde_json::json!({ "content": content, "details": details, "terminate": terminate })
 }
 
+/// The `tool_execution_update.partialResult` payload — Pi emits the tool's `AgentToolResult`
+/// (`{content, details, terminate?}`), where `terminate` is OMITTED when the tool left it
+/// `undefined` (agent-loop.ts:641-653; types.ts:350-360). Mirror that: include `terminate` only
+/// when `Some`, so an absent hint produces no key (rather than a `null`).
 fn update_value(u: &ToolUpdate) -> Value {
-    serde_json::json!({ "content": u.content, "details": u.details })
+    let mut obj = serde_json::Map::new();
+    obj.insert("content".to_string(), serde_json::to_value(&u.content).unwrap_or(Value::Null));
+    obj.insert("details".to_string(), u.details.clone().unwrap_or(Value::Null));
+    if let Some(t) = u.terminate {
+        obj.insert("terminate".to_string(), Value::Bool(t));
+    }
+    Value::Object(obj)
 }
 
 /// Emit one event without a [`RunCtx`] — the same reduce-then-await-subscribers path as
@@ -657,10 +667,15 @@ impl RunCtx {
                     // which carries the ACCUMULATED partial content with `stopReason:"aborted"` — NOT
                     // a fresh empty message. Reuse the structured partial we have been tracking and
                     // only stamp the terminal reason, so a subscriber/transcript sees the streamed
-                    // text/thinking/tool-call blocks rather than `[]`.
+                    // text/thinking/tool-call blocks rather than `[]`. The terminal's `errorMessage`
+                    // is Pi's uniform abort string `"Request was aborted"` — every provider throws
+                    // `new Error("Request was aborted")` on `signal.aborted` and the catch sets
+                    // `output.errorMessage = error.message` (anthropic-messages.ts:718,733-734; the
+                    // faux provider's `createAbortedMessage` uses the same string, faux.ts:291-297) —
+                    // NOT the bare `"aborted"`.
                     let mut aborted = partial.clone();
                     aborted.stop_reason = StopReason::Aborted;
-                    aborted.error_message = Some("aborted".to_string());
+                    aborted.error_message = Some("Request was aborted".to_string());
                     self.emit(AgentEvent::MessageEnd {
                         message: AgentMessage::Assistant(aborted.clone()),
                     })

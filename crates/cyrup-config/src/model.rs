@@ -116,11 +116,21 @@ impl<'a> ModelResolver<'a> {
         if partial.is_empty() {
             return Match::None;
         }
+        // alias first, then highest-sorting id (descending). Pi tie-breaks with
+        // `b.id.localeCompare(a.id)` (model-resolver.ts:147,151) — locale-aware UCA collation, NOT a
+        // Unicode-scalar `String::cmp`. The two diverge when matched alias ids differ only by case or
+        // by `-`/`_`/`.` (e.g. byte-order puts `B` < `a` and `-`(0x2d) < `.`(0x2e) < `_`(0x5f), while
+        // localeCompare/UCA orders case as a tertiary weight and weights punctuation differently).
+        // Reuse the same `feruca` (pure-Rust UCA) collator config proven to match Node's default
+        // `localeCompare` for `cyrup-tools` `ls` (ls.rs:85-87): CLDR-root tailoring, non-ignorable
+        // ("not shifted") variable handling, byte-value final tiebreak. `collate(b, a)` reproduces
+        // the descending `b.localeCompare(a)`.
+        let mut collator = feruca::Collator::new(feruca::Tailoring::default(), false, true);
         partial.sort_by(|a, b| {
-            // alias first, then highest-sorting id (descending).
             let aa = is_alias(a.id.as_str());
             let ba = is_alias(b.id.as_str());
-            ba.cmp(&aa).then_with(|| b.id.as_str().cmp(a.id.as_str()))
+            ba.cmp(&aa)
+                .then_with(|| collator.collate(b.id.as_str(), a.id.as_str()))
         });
         match partial.first() {
             Some(m) => Match::One(m),
@@ -274,9 +284,11 @@ impl<'a> ModelResolver<'a> {
 /// `minimatch`-style glob matcher (Pi uses `minimatch(.., { nocase: true })`,
 /// model-resolver.ts:282). Faithful to minimatch's path-segment semantics: `*`/`?`/`[...]` do NOT
 /// cross `/` (they match within a single segment), `**` is a globstar matching zero or more whole
-/// segments, and `{a,b}` brace lists are expanded before matching. Case-insensitive. No external
-/// dep. (Extglobs `?(..)`/`*(..)`/`+(..)`/`@(..)`/`!(..)` are a documented residual; they are rare
-/// in model scope patterns.)
+/// segments, and `{a,b}`/`{1..3}` brace lists and ranges are expanded before matching. Per-segment
+/// it supports backslash escaping, the dot-rule (`dot:false`), and the extglobs
+/// `@(..)`/`?(..)`/`*(..)`/`+(..)` (see [`segment_matches`]). Case-insensitive. No external dep.
+/// (The `!(..)` negation extglob is a documented agreed-deferral — unreachable for provider/model
+/// ids; see the residual ledger.)
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pat_lower = pattern.to_ascii_lowercase();
     let text_lower = text.to_ascii_lowercase();
@@ -295,8 +307,14 @@ fn match_segments(pat: &[&str], text: &[&str]) -> bool {
         None => text.is_empty(),
         Some((&first, rest)) => {
             if first == "**" {
-                // Globstar: try consuming 0..=text.len() segments.
-                (0..=text.len()).any(|k| match_segments(rest, text.get(k..).unwrap_or(&[])))
+                // Globstar: consume 0..=N whole segments, but under the dot-rule (`dot:false`) it
+                // must NOT traverse a segment that begins with `.` (minimatch: `**/*` does not match
+                // `.git/a`, and `**` does not match `.git`). Cap the run at the first dot-segment.
+                let mut max_k = 0usize;
+                while text.get(max_k).is_some_and(|s| !s.starts_with('.')) {
+                    max_k += 1;
+                }
+                (0..=max_k).any(|k| match_segments(rest, text.get(k..).unwrap_or(&[])))
             } else {
                 match text.split_first() {
                     Some((&t0, trest)) if segment_matches(first, t0) => match_segments(rest, trest),
@@ -308,38 +326,229 @@ fn match_segments(pat: &[&str], text: &[&str]) -> bool {
 }
 
 /// Match a single glob segment (no `/`) against a single text segment, case already folded.
+///
+/// Implements minimatch's per-segment semantics (default options, the `{ nocase: true }` call at
+/// model-resolver.ts:282): `*`/`?`/`[...]` wildcards, backslash escaping (`\x` = literal `x`), the
+/// extglobs `@(..)`/`?(..)`/`*(..)`/`+(..)`, and the dot-rule (`dot:false`): a text segment that
+/// begins with `.` is matched only when the pattern's first unit is a LITERAL `.` (so a leading
+/// `*`/`?`/`[`/extglob does not match a dotfile). (The `!(..)` negation extglob, and minimatch's
+/// obscure bracket-vs-leading-dot sub-corner — `[.]` matching `.x` but `[xy.]` not — are documented
+/// agreed-deferrals: both are unreachable for provider/model ids, which never start a path segment
+/// with `.` and never negate; see the residual ledger.)
 fn segment_matches(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    glob_match_chars(&p, &t)
+    // Dot-rule (minimatch default `dot:false`).
+    if t.first() == Some(&'.') && !pattern_first_is_literal_dot(&p) {
+        return false;
+    }
+    seg_match(&p, &t)
 }
 
-/// Expand `{a,b,c}` brace lists (minimatch default; brace-expansion package) into concrete
-/// patterns. Handles top-level commas and nesting; an unbalanced or comma-less brace is left
-/// literal (matching brace-expansion's "single element" behavior). `{a..b}` numeric/alpha ranges
-/// are not expanded (a documented residual; unused in model scopes).
-fn brace_expand(s: &str) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
-    let Some(open) = chars.iter().position(|&c| c == '{') else {
-        return vec![s.to_string()];
+/// Whether the pattern segment's first unit is a literal `.` (bare or escaped) — the only thing that
+/// matches a leading-dot text segment under `dot:false`.
+fn pattern_first_is_literal_dot(p: &[char]) -> bool {
+    match p.first().copied() {
+        Some('.') => true,
+        Some('\\') => p.get(1).copied() == Some('.'),
+        _ => false,
+    }
+}
+
+/// Recursively match the entire pattern-segment `p` against the entire text-segment `t` (no `/` in
+/// either). Backtracks on `*` and on extglob repetition.
+fn seg_match(p: &[char], t: &[char]) -> bool {
+    let Some(c0) = p.first().copied() else {
+        return t.is_empty();
     };
-    // Find the matching `}` and the top-level (depth-1) comma positions.
+    // Extglob lead: `@(` / `?(` / `*(` / `+(`. (`!(` is a documented deferral — `!` is a literal.)
+    if matches!(c0, '@' | '?' | '*' | '+') && p.get(1).copied() == Some('(') {
+        return match_extglob(c0, p, t);
+    }
+    let p_tail = p.get(1..).unwrap_or(&[]);
+    let t_tail = t.get(1..).unwrap_or(&[]);
+    match c0 {
+        // `\x` → literal `x`. A trailing `\` (no following char) cannot match.
+        '\\' => match p.get(1).copied() {
+            Some(lit) => t.first() == Some(&lit) && seg_match(p.get(2..).unwrap_or(&[]), t_tail),
+            None => false,
+        },
+        // `*` consumes zero or more chars within the segment.
+        '*' => (0..=t.len()).any(|k| seg_match(p_tail, t.get(k..).unwrap_or(&[]))),
+        // `?` consumes exactly one char.
+        '?' => !t.is_empty() && seg_match(p_tail, t_tail),
+        '[' => match_class_then(p, t),
+        lit => t.first() == Some(&lit) && seg_match(p_tail, t_tail),
+    }
+}
+
+/// Match a `[...]` class at the head of `p` against `t[0]`, then continue. Mirrors the prior
+/// `match_unit` class handling (negation `[!..]`/`[^..]`, a leading `]` as a literal member, ranges;
+/// an unterminated `[` is a literal `[`).
+fn match_class_then(p: &[char], t: &[char]) -> bool {
+    let mut j = 1;
+    let negate = matches!(p.get(j).copied(), Some('!') | Some('^'));
+    if negate {
+        j += 1;
+    }
+    let class_start = j;
+    while let Some(cur) = p.get(j).copied() {
+        if cur == ']' && j != class_start {
+            break;
+        }
+        j += 1;
+    }
+    let t_tail = t.get(1..).unwrap_or(&[]);
+    if p.get(j).copied() == Some(']') {
+        let Some(c) = t.first().copied() else {
+            return false;
+        };
+        let inset = class_matches(p, class_start, j, c);
+        inset != negate && seg_match(p.get(j + 1..).unwrap_or(&[]), t_tail)
+    } else {
+        // Unterminated class → treat `[` as a literal.
+        t.first() == Some(&'[') && seg_match(p.get(1..).unwrap_or(&[]), t_tail)
+    }
+}
+
+/// Match an extglob `K(alt|alt|..)rest` at the head of `p` against `t`, where `K ∈ {@,?,*,+}`.
+fn match_extglob(kind: char, p: &[char], t: &[char]) -> bool {
+    // Find the matching `)` (the `(` is at p[1]); track nesting.
     let mut depth = 0usize;
     let mut close = None;
-    let mut commas: Vec<usize> = Vec::new();
-    for (i, &c) in chars.iter().enumerate().skip(open) {
+    let mut i = 1usize;
+    while let Some(&c) = p.get(i) {
         match c {
-            '{' => depth += 1,
-            '}' => {
+            '(' => depth += 1,
+            ')' => {
                 depth -= 1;
                 if depth == 0 {
                     close = Some(i);
                     break;
                 }
             }
-            ',' if depth == 1 => commas.push(i),
             _ => {}
         }
+        i += 1;
+    }
+    let Some(close) = close else {
+        // Unterminated `K(` → match the lead char literally.
+        return t.first() == Some(&kind) && seg_match(p.get(1..).unwrap_or(&[]), t.get(1..).unwrap_or(&[]));
+    };
+    let body = p.get(2..close).unwrap_or(&[]);
+    let rest = p.get(close + 1..).unwrap_or(&[]);
+    let alts = split_top_alternatives(body);
+    match kind {
+        // Exactly one of the alternatives, then `rest`.
+        '@' => one_alt_then(&alts, rest, t),
+        // Zero or one.
+        '?' => seg_match(rest, t) || one_alt_then(&alts, rest, t),
+        // Zero or more.
+        '*' => star_alts(&alts, rest, t),
+        // One or more = one alternative, then zero-or-more.
+        '+' => plus_alts(&alts, rest, t),
+        _ => false,
+    }
+}
+
+/// `@(alts)rest`: some alternative matches a prefix `t[..k]`, then `rest` matches `t[k..]`.
+fn one_alt_then(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
+    alts.iter().any(|alt| {
+        (0..=t.len()).any(|k| {
+            seg_match(alt, t.get(..k).unwrap_or(&[])) && seg_match(rest, t.get(k..).unwrap_or(&[]))
+        })
+    })
+}
+
+/// `*(alts)rest`: zero or more alternatives (each consuming ≥1 char), then `rest`.
+fn star_alts(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
+    if seg_match(rest, t) {
+        return true;
+    }
+    alts.iter().any(|alt| {
+        (1..=t.len()).any(|k| {
+            seg_match(alt, t.get(..k).unwrap_or(&[]))
+                && star_alts(alts, rest, t.get(k..).unwrap_or(&[]))
+        })
+    })
+}
+
+/// `+(alts)rest`: one alternative (≥1 char), then `*(alts)rest`.
+fn plus_alts(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
+    alts.iter().any(|alt| {
+        (1..=t.len()).any(|k| {
+            seg_match(alt, t.get(..k).unwrap_or(&[]))
+                && star_alts(alts, rest, t.get(k..).unwrap_or(&[]))
+        })
+    })
+}
+
+/// Split an extglob body into alternatives at the top-level `|` (respecting nested `(...)`).
+fn split_top_alternatives(body: &[char]) -> Vec<Vec<char>> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, &c) in body.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                out.push(body.get(start..i).unwrap_or(&[]).to_vec());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(body.get(start..).unwrap_or(&[]).to_vec());
+    out
+}
+
+/// Expand brace expressions (minimatch default; the `brace-expansion` package) into concrete
+/// patterns. Handles top-level comma lists `{a,b,c}`, numeric/alpha RANGES `{1..3}`/`{a..c}` (with
+/// optional `..step` and zero-padding), nesting, and escape-awareness (a `\{`/`\}` is literal). An
+/// unbalanced or comma-less/range-less brace is left literal (matching brace-expansion's
+/// "single element" behavior).
+fn brace_expand(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    // First UNESCAPED `{`.
+    let mut open = None;
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        match c {
+            '\\' => i += 2,
+            '{' => {
+                open = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(open) = open else {
+        return vec![s.to_string()];
+    };
+    // Find the matching `}` and the top-level (depth-1) comma positions, skipping escaped braces.
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut commas: Vec<usize> = Vec::new();
+    let mut j = open;
+    while let Some(&c) = chars.get(j) {
+        match c {
+            '\\' => {
+                j += 2;
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(j);
+                    break;
+                }
+            }
+            ',' if depth == 1 => commas.push(j),
+            _ => {}
+        }
+        j += 1;
     }
     let Some(close) = close else {
         // Unbalanced brace — treat literally.
@@ -350,23 +559,29 @@ fn brace_expand(s: &str) -> Vec<String> {
     let post: String = collect(chars.get(close + 1..).unwrap_or(&[]));
     let post_expanded = brace_expand(&post);
 
-    if commas.is_empty() {
-        // No top-level comma — keep this brace literal, but expand the remainder.
-        let body: String = collect(chars.get(open..=close).unwrap_or(&[]));
+    // The brace body (between `{` and `}`).
+    let body = chars.get(open + 1..close).unwrap_or(&[]);
+
+    // Determine this brace's expansion options: comma list, else a numeric/alpha range, else literal.
+    let options: Vec<String> = if !commas.is_empty() {
+        let mut opts: Vec<String> = Vec::new();
+        let mut start = open + 1;
+        for &c in &commas {
+            opts.push(collect(chars.get(start..c).unwrap_or(&[])));
+            start = c + 1;
+        }
+        opts.push(collect(chars.get(start..close).unwrap_or(&[])));
+        opts
+    } else if let Some(seq) = expand_brace_range(body) {
+        seq
+    } else {
+        // No comma and not a range — keep this brace literal, expand only the remainder.
+        let literal: String = collect(chars.get(open..=close).unwrap_or(&[]));
         return post_expanded
             .into_iter()
-            .map(|tail| format!("{pre}{body}{tail}"))
+            .map(|tail| format!("{pre}{literal}{tail}"))
             .collect();
-    }
-
-    // Split the brace body into options at the top-level commas.
-    let mut options: Vec<String> = Vec::new();
-    let mut start = open + 1;
-    for &c in &commas {
-        options.push(collect(chars.get(start..c).unwrap_or(&[])));
-        start = c + 1;
-    }
-    options.push(collect(chars.get(start..close).unwrap_or(&[])));
+    };
 
     let mut out = Vec::new();
     for opt in options {
@@ -379,70 +594,92 @@ fn brace_expand(s: &str) -> Vec<String> {
     out
 }
 
-fn glob_match_chars(p: &[char], t: &[char]) -> bool {
-    let (mut pi, mut ti) = (0usize, 0usize);
-    // Backtracking position for the most recent `*` and the text index it started consuming at.
-    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
-    while ti < t.len() {
-        let pc = p.get(pi).copied();
-        if pc == Some('*') {
-            star_pi = Some(pi);
-            star_ti = ti;
-            pi += 1;
-        } else if let (Some(tc), true) = (t.get(ti).copied(), pc.is_some())
-            && {
-                let (m, next) = match_unit(p, pi, tc);
-                if m {
-                    pi = next;
-                }
-                m
+/// Expand a brace-range body `A..B` / `A..B..S` (numeric or single-char alpha) into its sequence,
+/// matching the `brace-expansion` package: inclusive bounds, reverse ranges (`{3..1}`), an optional
+/// positive step, and numeric zero-padding (`{01..03}` → `01,02,03`). `None` = not a valid range.
+fn expand_brace_range(body: &[char]) -> Option<Vec<String>> {
+    let s: String = body.iter().collect();
+    let parts: Vec<&str> = s.split("..").collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    let (Some(&start), Some(&end)) = (parts.first(), parts.get(1)) else {
+        return None;
+    };
+    // Numeric range.
+    if let (Ok(a), Ok(b)) = (start.parse::<i64>(), end.parse::<i64>()) {
+        let step = match parts.get(2) {
+            Some(s) => s.parse::<i64>().ok()?.abs(),
+            None => 1,
+        };
+        let step = if step == 0 { 1 } else { step };
+        let padded = is_zero_padded(start) || is_zero_padded(end);
+        let width = start
+            .trim_start_matches('-')
+            .len()
+            .max(end.trim_start_matches('-').len());
+        let mut out = Vec::new();
+        let mut x = a;
+        if a <= b {
+            while x <= b {
+                out.push(format_range_num(x, padded, width));
+                x += step;
             }
-        {
-            ti += 1;
-        } else if let Some(sp) = star_pi {
-            // Backtrack: let the `*` consume one more text char.
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
         } else {
-            return false;
+            while x >= b {
+                out.push(format_range_num(x, padded, width));
+                x -= step;
+            }
         }
+        return Some(out);
     }
-    while p.get(pi).copied() == Some('*') {
-        pi += 1;
+    // Single-char alpha range.
+    let sc: Vec<char> = start.chars().collect();
+    let ec: Vec<char> = end.chars().collect();
+    let (Some(&sc0), Some(&ec0)) = (sc.first(), ec.first()) else {
+        return None;
+    };
+    if sc.len() == 1 && ec.len() == 1 && sc0.is_ascii_alphabetic() && ec0.is_ascii_alphabetic() {
+        let step = match parts.get(2) {
+            Some(s) => s.parse::<i64>().ok()?.abs(),
+            None => 1,
+        };
+        let step = if step == 0 { 1 } else { step };
+        let (a, b) = (sc0 as i64, ec0 as i64);
+        let mut out = Vec::new();
+        let mut x = a;
+        if a <= b {
+            while x <= b {
+                out.push(char::from_u32(x as u32).map(String::from).unwrap_or_default());
+                x += step;
+            }
+        } else {
+            while x >= b {
+                out.push(char::from_u32(x as u32).map(String::from).unwrap_or_default());
+                x -= step;
+            }
+        }
+        return Some(out);
     }
-    pi == p.len()
+    None
 }
 
-/// Match the pattern unit at `p[pi]` (a `?`, a `[...]` class, or a literal char) against `c`.
-/// Returns `(matched, next_pi)` where `next_pi` is the pattern index just past this unit.
-fn match_unit(p: &[char], pi: usize, c: char) -> (bool, usize) {
-    match p.get(pi).copied() {
-        Some('?') => (true, pi + 1),
-        Some('[') => {
-            let mut j = pi + 1;
-            let negate = matches!(p.get(j).copied(), Some('!') | Some('^'));
-            if negate {
-                j += 1;
-            }
-            let class_start = j;
-            while let Some(cur) = p.get(j).copied() {
-                if cur == ']' && j != class_start {
-                    break;
-                }
-                j += 1;
-            }
-            // `j` now points at the closing `]` (or past the end if unterminated).
-            if p.get(j).copied() == Some(']') {
-                let matched = class_matches(p, class_start, j, c);
-                (matched != negate, j + 1)
-            } else {
-                // Unterminated class → treat `[` as a literal.
-                (c == '[', pi + 1)
-            }
-        }
-        Some(lit) => (lit == c, pi + 1),
-        None => (false, pi),
+/// Whether a numeric range bound is zero-padded (e.g. `01`, `-05`) — `brace-expansion` then pads the
+/// whole sequence to the max bound width.
+fn is_zero_padded(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    digits.len() > 1 && digits.starts_with('0')
+}
+
+/// Format a numeric range element, zero-padding to `width` when the range was padded.
+fn format_range_num(x: i64, padded: bool, width: usize) -> String {
+    if !padded {
+        return x.to_string();
+    }
+    if x < 0 {
+        format!("-{:0>w$}", -x, w = width.saturating_sub(1))
+    } else {
+        format!("{:0>width$}", x)
     }
 }
 
@@ -1425,11 +1662,15 @@ mod tests {
         // `minimatch(text, pattern, { nocase: true })` (the exact call at model-resolver.ts:282),
         // committed to `src/testdata/glob_minimatch.json`. Assert the Rust matcher agrees on all
         // cases — covering the proven miss (`anthropic*` does NOT cross `/`, so it matches 0),
-        // brace expansion, globstar `**`, `?`, `[...]`, negation, and nocase.
+        // brace lists, globstar `**`, `?`, `[...]`, class negation, nocase, AND the residual-#4
+        // feature classes: brace RANGES (`{1..3}`/`{a..c}`/`{01..03}`/`{3..1}`/`{1..5..2}`), the
+        // extglobs `@(..)`/`?(..)`/`*(..)`/`+(..)`, backslash escaping, and the dot-rule (`dot:false`
+        // — `*`/`?`/`**`/`[` do not match a leading-dot segment). (The `!(..)` negation extglob is a
+        // documented agreed-deferral, excluded from the fixture; see the residual ledger.)
         let fixture = include_str!("testdata/glob_minimatch.json");
         let cases: Vec<(String, String, bool)> =
             serde_json::from_str(fixture).expect("valid fixture");
-        assert!(cases.len() >= 200, "fixture should be comprehensive");
+        assert!(cases.len() >= 700, "fixture should be comprehensive");
         let mut mismatches = Vec::new();
         for (pattern, text, expected) in &cases {
             let got = glob_match(pattern, text);
@@ -1442,6 +1683,46 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "glob_match diverges from Pi minimatch:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn partial_tiebreak_collator_matches_pi_localecompare() {
+        // Pi tie-breaks ambiguous partial matches with `b.id.localeCompare(a.id)`
+        // (model-resolver.ts:147,151). Every (a, b, sign) triple is the EXACT sign Node returned for
+        // `b.localeCompare(a)`, captured to `src/testdata/locale_compare.json`. Assert the `feruca`
+        // collator we tie-break with (CLDR-root, non-ignorable, byte tiebreak — the same config the
+        // sort uses) reproduces that sign for every pair, so the tie-break is byte-1:1 with Pi rather
+        // than the old Unicode-scalar `String::cmp` (which diverges on case + `-`/`_`/`.`).
+        let fixture = include_str!("testdata/locale_compare.json");
+        let cases: Vec<(String, String, i32)> =
+            serde_json::from_str(fixture).expect("valid locale_compare fixture");
+        assert!(cases.len() >= 800, "fixture should be comprehensive");
+        let mut collator = feruca::Collator::new(feruca::Tailoring::default(), false, true);
+        let mut mismatches = Vec::new();
+        for (a, b, sign) in &cases {
+            let got = match collator.collate(b.as_str(), a.as_str()) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            // Also prove the OLD scalar cmp would have diverged on the divergent pairs (informational
+            // — the assertion is only on the collator matching Pi).
+            if got != *sign {
+                let scalar = match b.as_str().cmp(a.as_str()) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                mismatches.push(format!(
+                    "b={b:?} a={a:?}: Pi localeCompare={sign}, feruca={got} (scalar cmp={scalar})"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "tie-break collator diverges from Pi localeCompare:\n{}",
             mismatches.join("\n")
         );
     }

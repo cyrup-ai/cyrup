@@ -634,7 +634,13 @@ impl LiveExtension {
                 .cloned()
                 .and_then(|c| serde_json::from_value::<Vec<Content>>(c).ok())
                 .unwrap_or_default();
-            on_update(ToolUpdate { content, details: chunk.get("details").cloned() });
+            on_update(ToolUpdate {
+                content,
+                details: chunk.get("details").cloned(),
+                // Pi's `partialResult` is an `AgentToolResult`, which may carry `terminate`
+                // (types.ts:359); thread it through from the guest's update chunk.
+                terminate: chunk.get("terminate").and_then(Value::as_bool),
+            });
         }
         match res {
             Ok(Ok(out)) => {

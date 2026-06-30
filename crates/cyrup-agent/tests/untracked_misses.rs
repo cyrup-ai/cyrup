@@ -27,7 +27,7 @@ use cyrup_agent::{
 };
 use cyrup_core::{
     CancelToken, Content, EventStream, Message, ModelRef, StopReason, Tool, ToolCallId, ToolError,
-    ToolResult, ToolUpdateSink,
+    ToolResult, ToolUpdate, ToolUpdateSink,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
@@ -400,6 +400,14 @@ async fn miss4_abort_carries_streamed_partial_content() {
         "the aborted assistant must carry the ACCUMULATED partial content (was empty): {:?}",
         aborted.content
     );
+    // Byte-1:1 abort terminal: stopReason `aborted` + Pi's uniform `errorMessage` string. Every
+    // provider throws `new Error("Request was aborted")` on `signal.aborted` and the catch assigns
+    // `output.errorMessage = error.message` (anthropic-messages.ts:718,733-734; faux.ts:291-297).
+    assert_eq!(
+        aborted.error_message.as_deref(),
+        Some("Request was aborted"),
+        "the aborted terminal must carry Pi's uniform abort errorMessage"
+    );
 }
 
 // ===========================================================================
@@ -461,4 +469,99 @@ async fn miss6_no_message_update_after_terminal() {
         .unwrap_or_default();
     assert!(text.iter().any(|t| t == "ok"), "final message is the done terminal");
     assert!(!text.iter().any(|t| t == "LEAK"), "final message must not be overwritten by post-terminal partial");
+}
+
+// ===========================================================================
+// Residual #1 — tool_execution_update.partialResult carries `terminate`
+// (agent-loop.ts:641-653; AgentToolResult.terminate, types.ts:350-360).
+// cyrup_core::ToolUpdate now mirrors Pi's AgentToolResult by carrying an optional `terminate`,
+// threaded onto the emitted `partialResult` (omitted when None, matching Pi's `terminate?`).
+// ===========================================================================
+
+/// A tool that streams two partials: the first sets `terminate = Some(true)` (with a detail), the
+/// second leaves it `None`, then settles.
+struct UpdatingTool {
+    name: String,
+    params: Value,
+}
+
+#[async_trait::async_trait]
+impl Tool for UpdatingTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        mut on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        on_update(ToolUpdate {
+            content: vec![Content::text("step")],
+            details: Some(json!({ "k": 1 })),
+            terminate: Some(true),
+        });
+        on_update(ToolUpdate {
+            content: vec![Content::text("more")],
+            details: None,
+            terminate: None,
+        });
+        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: false })
+    }
+}
+
+#[tokio::test]
+async fn residual1_tool_update_partial_result_carries_terminate_byte_for_byte() {
+    let (sf, _payloads) = payload_recording(vec![
+        faux_assistant_message(vec![faux_tool_call("upd", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
+    ]);
+    let tool = Arc::new(UpdatingTool { name: "upd".into(), params: obj_schema() });
+    let rec = Arc::new(Recorder::default());
+    let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
+    agent.subscribe(rec.clone());
+
+    agent.prompt("go").await.unwrap().finished().await;
+    agent.wait_for_idle().await;
+
+    // The `partialResult` JSON of every tool_execution_update, in order.
+    let partials: Vec<Value> = rec
+        .snapshot()
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionUpdate { partial_result, .. } => Some(partial_result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(partials.len(), 2, "two streamed updates were emitted");
+
+    // Byte-shape #1: a partial with `terminate = true` serializes the key with `true` (Pi passes the
+    // tool's `AgentToolResult` straight onto `partialResult`).
+    assert_eq!(
+        partials[0],
+        json!({
+            "content": [{ "type": "text", "text": "step" }],
+            "details": { "k": 1 },
+            "terminate": true
+        }),
+        "first partialResult must carry terminate:true"
+    );
+    // Byte-shape #2: a partial with `terminate = None` OMITS the key entirely — exactly as Pi omits
+    // an `undefined` `terminate?` (NOT a `null`).
+    assert_eq!(
+        partials[1],
+        json!({
+            "content": [{ "type": "text", "text": "more" }],
+            "details": null
+        }),
+        "second partialResult must omit the terminate key"
+    );
+    assert!(
+        partials[1].get("terminate").is_none(),
+        "absent terminate must produce no key, matching Pi's optional field"
+    );
 }
