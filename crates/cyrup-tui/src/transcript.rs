@@ -5,21 +5,21 @@
 //! single mutable streaming buffer for the assistant turn currently being produced.
 //!
 //! ## Dependency note (driving from `AgentSessionEvent`)
-//! `AgentSessionEvent`'s message-bearing variants carry `cyrup_agent::AgentMessage` /
-//! `cyrup_provider::StreamEvent`, and the tool variants carry `serde_json::Value`. `cyrup-tui` does
-//! **not** depend on `cyrup-agent`, `cyrup-provider`, or `serde_json` directly (arch-10 §2 crate
-//! edge + the pre-staged dependency set), so those payloads cannot be pattern-matched here. The
-//! neutral [`TranscriptView`] API ([`push_user`](TranscriptView::push_user),
-//! [`push_assistant_delta`](TranscriptView::push_assistant_delta), …) is the integration seam an
-//! adapter feeds. The terminal assistant message *is* recoverable event-side via
-//! `StreamEvent::terminal_message()` (an inherent method returning `&cyrup_core::AssistantMessage`,
-//! a type we DO depend on) — see [`crate::app::App::ingest_event`]. Incremental delta text
-//! extraction is deferred until `cyrup-agent`/`cyrup-provider` join the dependency set.
+//! `cyrup-tui` depends directly on `cyrup-provider` (Cargo.toml), so the streaming-delta variants of
+//! `StreamEvent` *are* pattern-matched: [`crate::app::App::ingest_event`] folds
+//! `MessageUpdate`'s `assistant_message_event` and appends `TextDelta { delta, .. }` here via
+//! [`push_assistant_delta`](TranscriptView::push_assistant_delta), so the viewport grows
+//! token-by-token like Pi's interactive stream. The terminal assistant message is recovered via
+//! `StreamEvent::terminal_message()` (yielding a `&cyrup_core::AssistantMessage`) and replaces the
+//! partial on `Done`/`Error`. The neutral [`TranscriptView`] API
+//! ([`push_user`](TranscriptView::push_user),
+//! [`push_assistant_delta`](TranscriptView::push_assistant_delta), …) remains the integration seam
+//! an adapter feeds.
 
 use cyrup_core::Content;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::component::Component;
@@ -130,15 +130,18 @@ impl TranscriptView {
 
     /// Build the styled lines the inline viewport renders: **only** the active streaming partial.
     /// Committed entries live in native scrollback (see [`drain_committed`](Self::drain_committed)).
+    ///
+    /// Pi renders the in-flight assistant message **inline** with no surrounding box/title
+    /// (`assistant-message.ts:84-93`); a dim soft cursor `▌` trails the last grapheme while the turn
+    /// streams (spec/tui/01 §3) — the hardware cursor stays on the editor.
     fn lines(&self, theme: &UiTheme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(partial) = &self.streaming {
-            lines.push(label_line(
-                "assistant",
-                partial,
-                theme.accent_style(),
-                theme.assistant_style(),
-            ));
+            lines.push(Line::from(vec![
+                Span::styled("assistant: ", theme.accent_style()),
+                Span::styled(partial.clone(), theme.assistant_style()),
+                Span::styled("▌", theme.dim_style()),
+            ]));
         }
         lines
     }
@@ -176,18 +179,16 @@ fn label_line(
 }
 
 impl Component for TranscriptView {
+    /// Render the active turn **inline** (no box/title — `assistant-message.ts:84-93`, spec/tui/01 §3):
+    /// the streaming partial is a wrapped `Paragraph` filling the region, tail-anchored so the newest
+    /// text stays visible as it grows (spec/tui/01 §3 overflow).
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme.dim_style())
-            .title(Span::styled(" conversation ", theme.dim_style()));
         let lines = self.lines(theme);
-        // Auto-scroll: keep the tail visible when content exceeds the inner height.
-        let inner_h = area.height.saturating_sub(2) as usize;
+        // Auto-scroll: keep the tail (newest text) visible when content exceeds the region height.
+        let inner_h = area.height as usize;
         let total = lines.len();
         let scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
         let para = Paragraph::new(lines)
-            .block(block)
             .style(theme.base_style())
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));

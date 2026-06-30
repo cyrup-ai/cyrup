@@ -15,6 +15,10 @@ workspace = true
 cyrup-core = { workspace = true }
 cyrup-session-svc = { workspace = true }
 cyrup-resources = { workspace = true }
+# Already a transitive dep (via cyrup-session-svc) and a dev-dep below; promoted to a direct
+# dependency so the streaming-delta variants of `StreamEvent` (`TextDelta { delta, partial }`,
+# stream.rs:306) can be matched in `App::ingest_event` (gap 1 — live token-by-token render).
+cyrup-provider = { workspace = true }
 thiserror = { workspace = true }
 ratatui = "0.30.2"
 tokio.workspace = true
@@ -23,4 +27,7 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
+# Dev-only: lets the streaming-delta render test build the `AgentMessage` carried by
+# `AgentSessionEvent::MessageUpdate` (the runtime payload the TUI ignores but the variant requires).
+cyrup-agent = { workspace = true }
 tempfile.workspace = true

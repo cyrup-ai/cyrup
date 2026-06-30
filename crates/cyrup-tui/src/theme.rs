@@ -26,6 +26,16 @@ pub struct UiTheme {
     pub accent: Option<Color>,
     /// Pi `error` token — errors and failed tool calls (theme.ts:41).
     pub error: Option<Color>,
+    /// Pi `muted` token — secondary text (descriptions, scroll indicators, hints) (theme.ts:543).
+    pub muted: Option<Color>,
+    /// Pi `border` token — rule/border lines for the editor + selectors (theme.ts:537).
+    pub border: Option<Color>,
+    /// Pi `success` token — current/active markers (`✓`), succeeded states (theme.ts:540).
+    pub success: Option<Color>,
+    /// Pi `warning` token — context-% warning band, `(cancelled)`, experimental marker (theme.ts:542).
+    pub warning: Option<Color>,
+    /// Pi `bashMode` token — green editor border + `$ cmd` header while in bash mode (theme.ts).
+    pub bash_mode: Option<Color>,
 }
 
 impl Default for UiTheme {
@@ -46,6 +56,11 @@ impl UiTheme {
             background: None,
             accent: role("accent"),
             error: role("error"),
+            muted: role("muted"),
+            border: role("border"),
+            success: role("success"),
+            warning: role("warning"),
+            bash_mode: role("bashMode"),
         }
     }
 
@@ -98,6 +113,11 @@ impl UiTheme {
             background: None,
             accent: Some(accent),
             error: Some(error),
+            muted: None,
+            border: None,
+            success: None,
+            warning: None,
+            bash_mode: None,
         }
     }
 
@@ -115,6 +135,11 @@ impl UiTheme {
             background: None,
             accent: role("accent"),
             error: role("error"),
+            muted: role("muted"),
+            border: role("border"),
+            success: role("success"),
+            warning: role("warning"),
+            bash_mode: role("bashMode"),
         }
     }
 
@@ -165,6 +190,35 @@ impl UiTheme {
     /// Style for assistant message text.
     pub fn assistant_style(&self) -> Style {
         self.base_style()
+    }
+
+    /// Muted style (descriptions, scroll indicators, hints, footer body) — Pi `muted` (theme.ts:543).
+    /// Falls back to a dimmed foreground when the theme omits the role.
+    pub fn muted_style(&self) -> Style {
+        match self.muted {
+            Some(c) => Style::default().fg(c),
+            None => self.dim_style(),
+        }
+    }
+
+    /// Border/rule style for the editor + selector `DynamicBorder` rules — Pi `border` (theme.ts:537).
+    pub fn border_style(&self) -> Style {
+        Style::default().fg(self.border.or(self.muted).unwrap_or(Color::DarkGray))
+    }
+
+    /// Success style (current/active `✓` markers, succeeded states) — Pi `success` (theme.ts:540).
+    pub fn success_style(&self) -> Style {
+        Style::default().fg(self.success.unwrap_or(Color::Green))
+    }
+
+    /// Warning style (context-% band, `(cancelled)`, experimental marker) — Pi `warning` (theme.ts:542).
+    pub fn warning_style(&self) -> Style {
+        Style::default().fg(self.warning.unwrap_or(Color::Yellow))
+    }
+
+    /// Bash-mode style (green editor border + `$ cmd` header) — Pi `bashMode` (theme.ts).
+    pub fn bash_mode_style(&self) -> Style {
+        Style::default().fg(self.bash_mode.or(self.success).unwrap_or(Color::Green))
     }
 }
 

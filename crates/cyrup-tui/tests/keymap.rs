@@ -35,14 +35,15 @@ fn key_matches_event() {
 }
 
 #[test]
-fn default_keymap_binds_quit_and_interrupt() {
+fn default_keymap_binds_pi_app_actions() {
+    // Pi defaults (core/keybindings.ts:63-202): Ctrl+D exit, Ctrl+C clear, Esc interrupt.
     let km = Keymap::default();
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let plain_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-    assert_eq!(km.action_for(&ctrl_c), Some(Action::Quit));
     assert_eq!(km.action_for(&ctrl_d), Some(Action::Quit));
+    assert_eq!(km.action_for(&ctrl_c), Some(Action::Clear));
     assert_eq!(km.action_for(&esc), Some(Action::Interrupt));
     assert_eq!(km.action_for(&plain_a), None);
 }

@@ -15,31 +15,42 @@
 //!   onto `ratatui` colors, with a hot-reload hook ([`UiTheme::from_theme_data`]).
 //! - [`Keymap`]/[`Action`] resolve global keys (no hardcoded checks, R-10-018).
 //!
-//! # Deferred (would require deps beyond the pre-staged set or larger surface; see arch-10 §12)
-//! - **Incremental assistant delta text from events.** `AgentSessionEvent`'s message/delta payloads
-//!   are `cyrup_agent::AgentMessage` / `cyrup_provider::StreamEvent`, which `cyrup-tui` does not
-//!   depend on; only the *terminal* assistant message is recovered (see [`App::ingest_event`]). The
-//!   neutral [`TranscriptView::push_assistant_delta`] API is the streaming seam meanwhile.
-//! - Markdown rendering, syntax highlighting, inline images (need `pulldown-cmark`/`syntect`/
-//!   `ratatui-image`), overlays/z-order, stackable autocomplete, the external-editor escape, and the
-//!   extension-UI command protocol — all out of scope for this pass.
+//! # Deferred (would require deps beyond the pre-staged set; see arch-10 §12 + the residual ledger)
+//! Streaming assistant delta text is **live**, not deferred: `cyrup-provider` is a direct dependency
+//! and [`App::ingest_event`] folds `StreamEvent::TextDelta` into the transcript token-by-token. The
+//! remaining gaps are gated on deps not yet ratified into the workspace or on the outer (L7) binary
+//! layer: markdown rendering (`pulldown-cmark`), syntax highlighting (`syntect`), inline images
+//! (`ratatui-image`), the overlay/z-order + selector-overlay system, the external-editor escape, and
+//! the extension-UI command protocol. See `spec/gap-analysis/12-cyrup-tui.md`.
 #![forbid(unsafe_code)]
 
 mod app;
+mod autocomplete;
+mod commands;
 mod component;
 mod editor;
 mod error;
+mod fuzzy;
 mod keymap;
+mod select_list;
+mod selector;
 mod status;
 mod theme;
 mod transcript;
 
 pub use app::{crossterm_input_stream, render, App, AppAction, AppState};
+pub use autocomplete::{Applied, Autocomplete, Completion, CompletionContext};
+pub use commands::{
+    CommandRegistry, CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+};
 pub use component::{Component, InputEvent};
 pub use editor::{EditorOutcome, InputEditor};
 pub use error::TuiError;
-pub use keymap::{Action, Key, Keymap};
-pub use status::StatusLine;
+pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
+pub use keymap::{Action, EditorAction, EditorKeymap, Key, Keymap, SelectAction, SelectKeymap};
+pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
+pub use selector::{ListSelector, Selector, SelectorKind, SelectorOutcome};
+pub use status::{format_tokens, StatusLine};
 pub use theme::{color_of, UiTheme};
 pub use transcript::{content_text, Entry, TranscriptView};
 

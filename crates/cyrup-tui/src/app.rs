@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::{CancelToken, EventStream};
+use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
 use futures::StreamExt;
@@ -33,10 +34,12 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
+use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
-use crate::keymap::{Action, Keymap};
+use crate::keymap::{Action, Keymap, SelectKeymap};
+use crate::selector::{ListSelector, Selector, SelectorKind, SelectorOutcome};
 use crate::status::StatusLine;
 use crate::theme::UiTheme;
 use crate::transcript::{content_text, entry_line, TranscriptView};
@@ -63,6 +66,19 @@ pub struct AppState {
     pub status: StatusLine,
     pub theme: UiTheme,
     pub keymap: Keymap,
+    /// The selector binding table (`tui.select.*`, spec/tui/05 §10) consulted while a selector owns
+    /// the input slot.
+    pub select_keymap: SelectKeymap,
+    /// The slash-command registry driving dispatch + autocomplete (rebuilt on `/reload`).
+    pub commands: CommandRegistry,
+    /// The active editor-swap selector, if any (spec/tui/05 §1.1): when `Some`, it replaces the
+    /// editor in the bottom inline region and captures input until it confirms/cancels.
+    pub selector: Option<ActiveSelector>,
+    /// The current reasoning level (`off`…`xhigh`), preselected by the thinking selector and updated
+    /// on confirm. The authoritative level lives on the agent/session at the L7 layer.
+    pub thinking_level: String,
+    /// Whether inline images are shown (vs. a text placeholder), toggled by the show-images selector.
+    pub show_images: bool,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
@@ -80,10 +96,27 @@ impl AppState {
             status: StatusLine::default(),
             theme,
             keymap: Keymap::default(),
+            select_keymap: SelectKeymap::default(),
+            commands: CommandRegistry::new(),
+            selector: None,
+            thinking_level: "medium".to_string(),
+            show_images: true,
             should_quit: false,
             scrollback: Vec::new(),
         }
     }
+}
+
+/// The active editor-swap selector plus the state needed to restore the editor on close (spec/tui/05
+/// §7 `ActiveSelector`). Pi snapshots the editor text on open (`interactive-mode.ts:2371`) and, for
+/// the theme picker, restores the prior theme on cancel (`theme-selector.ts` caller responsibility).
+pub struct ActiveSelector {
+    kind: SelectorKind,
+    inner: Box<dyn Selector>,
+    /// Editor text snapshotted on open, re-applied when the slot closes.
+    saved_editor: String,
+    /// Theme to restore if a previewing selector is cancelled (theme picker only).
+    restore_theme: Option<UiTheme>,
 }
 
 /// The interactive front-end over an injectable backend.
@@ -189,22 +222,26 @@ impl<B: Backend> App<B> {
                 if matches!(key.kind, KeyEventKind::Release) {
                     return AppAction::None;
                 }
+                // A focused selector captures input first (spec/tui/05 §2 routing step 2): its
+                // navigation/confirm/cancel keys are handled before the global keymap, so `Esc`/`Ctrl+C`
+                // dismiss the selector rather than interrupting the agent. Unbound keys fall through.
+                if self.state.selector.is_some() {
+                    return self.handle_selector_key(key);
+                }
                 if let Some(action) = self.state.keymap.action_for(key) {
                     return self.apply_action(action);
                 }
                 match self.state.editor.handle_key(key) {
-                    EditorOutcome::Submit(text) => {
-                        if text.trim().is_empty() {
-                            return AppAction::Redraw;
-                        }
-                        self.state.transcript.push_user(text.clone());
-                        AppAction::Submit(text)
-                    }
+                    EditorOutcome::Submit(text) => self.dispatch_submission(&text),
                     EditorOutcome::Edited => AppAction::Redraw,
                     EditorOutcome::Ignored => AppAction::None,
                 }
             }
             InputEvent::Paste(s) => {
+                // A selector owns the slot: pure-list selectors ignore pastes (no embedded Input yet).
+                if self.state.selector.is_some() {
+                    return AppAction::None;
+                }
                 self.state.editor.insert_str(s);
                 AppAction::Redraw
             }
@@ -215,6 +252,36 @@ impl<B: Backend> App<B> {
             }
             InputEvent::FocusLost => {
                 self.state.editor.set_focused(false);
+                AppAction::Redraw
+            }
+        }
+    }
+
+    /// Classify a submitted line via the [`CommandRegistry`] and route it (spec/tui/04 §2.3).
+    ///
+    /// A plain prompt is echoed into the transcript and returned as [`AppAction::Submit`] for the run
+    /// loop to deliver to the runtime. A recognized slash command or a `!`/`!!` bash invocation is
+    /// surfaced as a status line for now — opening the bound overlay / executing bash is wired as the
+    /// selector + bash-execution subsystems land (tracked on the residual ledger). This keeps the
+    /// editor → dispatch path real and faithful (commands never reach the agent as literal text).
+    fn dispatch_submission(&mut self, text: &str) -> AppAction {
+        match self.state.commands.dispatch(text) {
+            Dispatch::Empty => AppAction::Redraw,
+            Dispatch::Prompt(prompt) => {
+                self.state.transcript.push_user(prompt.clone());
+                AppAction::Submit(prompt)
+            }
+            Dispatch::Command { name, arg } => {
+                let label = match arg {
+                    Some(a) => format!("/{name} {a}"),
+                    None => format!("/{name}"),
+                };
+                self.state.transcript.push_status(format!("command: {label}"));
+                AppAction::Redraw
+            }
+            Dispatch::Bash { command, excluded } => {
+                let marker = if excluded { "!!" } else { "!" };
+                self.state.transcript.push_status(format!("bash ({marker}): {command}"));
                 AppAction::Redraw
             }
         }
@@ -232,17 +299,118 @@ impl<B: Backend> App<B> {
                 self.state.status.set_streaming(false);
                 AppAction::Interrupt
             }
+            // `app.clear` (Ctrl+C): clear the editor buffer; if it was already empty Pi treats a
+            // second press as exit (double-Ctrl+C). Here a clear is always a redraw.
+            Action::Clear => {
+                self.state.editor.clear();
+                AppAction::Redraw
+            }
+            // `app.suspend` / `app.tools.expand` / page scroll are surfaced as actions for the run
+            // loop to handle (SIGTSTP, expand toggle, transcript paging); the chrome itself only
+            // redraws. Full wiring of suspend + transcript scroll is tracked on the residual ledger.
+            Action::Suspend
+            | Action::ToolsExpand
+            | Action::PageUp
+            | Action::PageDown => AppAction::Redraw,
+        }
+    }
+
+    /// Open an editor-swap selector (spec/tui/05 §1.1 `showSelector`): snapshot the editor text, build
+    /// the selector for `kind`, and put it in the input slot. The theme picker also stashes the live
+    /// theme so a cancel can restore it. Idempotent-ish: opening replaces any already-open selector.
+    pub fn open_selector(&mut self, kind: SelectorKind) {
+        let saved_editor = self.state.editor.text();
+        let (inner, restore_theme): (Box<dyn Selector>, Option<UiTheme>) = match kind {
+            SelectorKind::Thinking => {
+                (Box::new(ListSelector::thinking(&self.state.thinking_level)), None)
+            }
+            SelectorKind::ShowImages => {
+                (Box::new(ListSelector::show_images(self.state.show_images)), None)
+            }
+            SelectorKind::Theme => (
+                Box::new(ListSelector::theme(&self.state.theme.name)),
+                Some(self.state.theme.clone()),
+            ),
+        };
+        self.state.selector = Some(ActiveSelector { kind, inner, saved_editor, restore_theme });
+    }
+
+    /// The kind of the currently-open selector, if any (test/inspection access).
+    pub fn active_selector_kind(&self) -> Option<SelectorKind> {
+        self.state.selector.as_ref().map(|s| s.kind)
+    }
+
+    /// Route one key to the active selector and act on the outcome (spec/tui/05 §3.1). `Confirm`
+    /// applies the selection by kind and closes the slot; `Cancel` restores the prior theme (if any)
+    /// and closes; `Preview` re-themes live without closing. A no-op if no selector is open.
+    fn handle_selector_key(&mut self, key: &event::KeyEvent) -> AppAction {
+        let Some(active) = self.state.selector.as_mut() else { return AppAction::None };
+        let outcome = active.inner.handle(key, &self.state.select_keymap);
+        let kind = active.kind;
+        match outcome {
+            SelectorOutcome::Ignored => AppAction::None,
+            SelectorOutcome::Redraw => AppAction::Redraw,
+            SelectorOutcome::Preview(value) => {
+                // Theme live preview: re-theme the whole UI as the highlight moves
+                // (`theme-selector.ts:54-56`). Other kinds never emit `Preview`.
+                if kind == SelectorKind::Theme {
+                    self.set_theme(UiTheme::builtin(&value));
+                }
+                AppAction::Redraw
+            }
+            SelectorOutcome::Confirm(value) => {
+                self.confirm_selector(kind, &value);
+                self.close_selector(false);
+                AppAction::Redraw
+            }
+            SelectorOutcome::Cancel => {
+                self.close_selector(true);
+                AppAction::Redraw
+            }
+        }
+    }
+
+    /// Apply a confirmed selection. Theme is fully applied in-crate; thinking-level + show-images
+    /// persistence reaches the agent/settings at the L7 binary layer, so here we record the choice in
+    /// app state and surface a status line (the same seam `/think` cycling uses).
+    fn confirm_selector(&mut self, kind: SelectorKind, value: &str) {
+        match kind {
+            SelectorKind::Theme => {
+                self.set_theme(UiTheme::builtin(value));
+                self.state.transcript.push_status(format!("theme → {value}"));
+            }
+            SelectorKind::Thinking => {
+                self.state.thinking_level = value.to_string();
+                self.state.status.set_thinking_level(value);
+                self.state.transcript.push_status(format!("thinking → {value}"));
+            }
+            SelectorKind::ShowImages => {
+                self.state.show_images = value == "yes";
+                let label = if self.state.show_images { "inline" } else { "placeholder" };
+                self.state.transcript.push_status(format!("images → {label}"));
+            }
+        }
+    }
+
+    /// Close the selector slot and restore the editor (spec/tui/05 §7 `done()`). When `cancelled` and
+    /// a theme was being previewed, the prior theme is restored first.
+    fn close_selector(&mut self, cancelled: bool) {
+        if let Some(active) = self.state.selector.take() {
+            if cancelled && let Some(theme) = active.restore_theme {
+                self.set_theme(theme);
+            }
+            self.state.editor.set_text(&active.saved_editor);
         }
     }
 
     /// Fold an `AgentSessionEvent` into the UI state.
     ///
-    /// Only the dependency-reachable parts are decoded (see [`crate::transcript`] dependency note):
-    /// tool names + error flag, model changes, queue depth, compaction, and the **terminal**
-    /// assistant message (recovered via `StreamEvent::terminal_message()`, which yields a
-    /// `&cyrup_core::AssistantMessage`). Incremental delta text needs `cyrup-agent`/`cyrup-provider`
-    /// in the dependency set and is fed meanwhile through
-    /// [`TranscriptView::push_assistant_delta`](crate::transcript::TranscriptView::push_assistant_delta).
+    /// Decodes tool names + error flag, model changes, queue depth, compaction, the live streaming
+    /// **delta** text (`MessageUpdate` → [`Self::ingest_stream_event`] →
+    /// [`TranscriptView::push_assistant_delta`](crate::transcript::TranscriptView::push_assistant_delta)),
+    /// and the **terminal** assistant message (recovered via `StreamEvent::terminal_message()`, which
+    /// yields a `&cyrup_core::AssistantMessage`). `cyrup-provider` is a direct dependency, so the
+    /// token-by-token render (gap 1) is live, not deferred.
     pub fn ingest_event(&mut self, ev: &AgentSessionEvent) {
         match ev {
             AgentSessionEvent::AgentStart => self.state.status.set_streaming(true),
@@ -253,17 +421,7 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
             AgentSessionEvent::MessageStart { .. } | AgentSessionEvent::MessageEnd { .. } => {}
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
-                // Terminal events carry the authoritative `AssistantMessage` (core type, reachable).
-                if let Some(asst) = assistant_message_event.terminal_message() {
-                    let text = content_text(&asst.content);
-                    if !text.is_empty() {
-                        self.state.transcript.commit_assistant(Some(text));
-                    }
-                    let tokens = asst.usage.total_tokens;
-                    if tokens > 0 {
-                        self.state.status.set_tokens(tokens);
-                    }
-                }
+                self.ingest_stream_event(assistant_message_event);
             }
             AgentSessionEvent::ToolExecutionStart { tool_name, .. } => {
                 self.state.transcript.push_tool_start(tool_name.clone());
@@ -292,9 +450,13 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::ModelChanged { provider, model } => {
                 let label = format!("{provider}/{model}");
                 self.state.status.set_model(label.clone());
+                // Feed the provider into the footer right cluster (`(provider)` prefix, footer.ts:191).
+                self.state.status.set_provider(Some(provider.clone()));
                 self.state.transcript.push_status(format!("model → {label}"));
             }
             AgentSessionEvent::ThinkingLevelChanged { level } => {
+                // Mirror the level into the footer right cluster (`• {level}`, footer.ts:186-188).
+                self.state.status.set_thinking_level(level.clone());
                 self.state.transcript.push_status(format!("thinking → {level}"));
             }
             // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
@@ -312,6 +474,41 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Fold one streaming `StreamEvent` (the `assistantMessageEvent` payload of a `MessageUpdate`,
+    /// session-svc `event.rs:111`) into the transcript — the live token-by-token render (gap 1).
+    ///
+    /// `TextDelta { delta, .. }` (provider `stream.rs:306`) is appended to the in-flight streaming
+    /// buffer via [`TranscriptView::push_assistant_delta`], so the viewport grows a character at a
+    /// time exactly like Pi's interactive stream. A terminal event (`Done`/`Error`, recoverable via
+    /// [`StreamEvent::terminal_message`]) replaces the partial with the authoritative
+    /// `AssistantMessage` text and records its token usage in the footer. Non-text streaming frames
+    /// (start/text-start/text-end/thinking*/toolcall*) carry only the running `partial`; the
+    /// authoritative text reaches us via `TextDelta` + the terminal, so nothing is rendered for them.
+    fn ingest_stream_event(&mut self, ev: &StreamEvent) {
+        match ev {
+            StreamEvent::TextDelta { delta, .. } => {
+                if !delta.is_empty() {
+                    self.state.transcript.push_assistant_delta(delta);
+                }
+            }
+            StreamEvent::Done { message, .. } | StreamEvent::Error { error: message, .. } => {
+                let text = content_text(&message.content);
+                if text.is_empty() {
+                    // Pure tool-use / empty terminal: keep any streamed partial; `AgentEnd` commits it.
+                    self.state.transcript.commit_assistant(None);
+                } else {
+                    self.state.transcript.commit_assistant(Some(text));
+                }
+                let tokens = message.usage.total_tokens;
+                if tokens > 0 {
+                    self.state.status.set_tokens(tokens);
+                }
+                // Accumulate the turn into the cumulative session footer totals (footer.ts:86-107).
+                self.state.status.add_usage(&message.usage);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Flatten a styled [`Line`] into its plain text (concatenated span content).
@@ -322,17 +519,45 @@ fn line_text(line: &Line<'_>) -> String {
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    let editor_rows = (state.editor.line_count().min(u16::MAX as usize) as u16).saturating_add(2);
     let max_editor = area.height.saturating_sub(2).max(3);
-    let editor_h = editor_rows.clamp(3, max_editor);
-    let [msg_area, editor_area, status_area] = Layout::vertical([
+    // A selector occupies the editor slot at its desired (dynamic) height; otherwise the editor sizes
+    // to its line count + the two rule rows (spec/tui/05 §1.1: the selector "grows the live region").
+    let slot_h = match state.selector.as_ref() {
+        Some(active) => active.inner.desired_height(area.width).clamp(3, max_editor),
+        None => {
+            let editor_rows =
+                (state.editor.line_count().min(u16::MAX as usize) as u16).saturating_add(2);
+            editor_rows.clamp(3, max_editor)
+        }
+    };
+    // The autocomplete popup is appended directly below the editor's bottom rule, inside the live
+    // region (spec/tui/04 §7) — not a floating overlay. Suppressed while a selector owns the slot.
+    let popup_h = if state.selector.is_some() {
+        0
+    } else {
+        state.editor.autocomplete().map(|ac| ac.list.rendered_height()).unwrap_or(0)
+    };
+    // The footer is two rows (location + usage/model) per spec/tui/01 §4; it collapses to one when
+    // the viewport is too short to spare the second row.
+    let chrome_h = slot_h.saturating_add(popup_h);
+    let footer_h = if area.height >= chrome_h.saturating_add(3) { 2 } else { 1 };
+    let [msg_area, slot_area, popup_area, status_area] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(editor_h),
-        Constraint::Length(1),
+        Constraint::Length(slot_h),
+        Constraint::Length(popup_h),
+        Constraint::Length(footer_h),
     ])
     .areas(area);
     state.transcript.render(frame, msg_area, &state.theme);
-    state.editor.render(frame, editor_area, &state.theme);
+    if let Some(active) = state.selector.as_mut() {
+        active.inner.render(frame, slot_area, &state.theme);
+    } else {
+        state.editor.render(frame, slot_area, &state.theme);
+        if let Some(ac) = state.editor.autocomplete() {
+            let lines = ac.list.lines(popup_area.width, &state.theme);
+            frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), popup_area);
+        }
+    }
     state.status.render(frame, status_area, &state.theme);
 }
 
