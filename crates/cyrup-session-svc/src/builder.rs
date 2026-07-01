@@ -459,8 +459,14 @@ impl SessionBuilder {
         // was injected at load time, and `AgentSession::apply_pending_control` drains the one on
         // `services.host_services`; if these differ the guest's `control` op is silently lost. Seed the
         // active model + wire the command-tier control channel up front so guest reads/ops are live.
-        let host_services =
-            Arc::new(crate::host_services::LiveHostServices::new(self.provider.clone()));
+        // `bash_proc` (the local process ops) + `cwd` back the `exec` capability grant (Pi
+        // `execCommand`, exec.ts:34-46): a granted extension execs argv (shell:false) through the
+        // SAME process backend the `bash` seam uses, defaulting to the session cwd.
+        let host_services = Arc::new(crate::host_services::LiveHostServices::new(
+            self.provider.clone(),
+            bash_proc.clone(),
+            cwd.clone(),
+        ));
         host_services.update_model(
             model_ref.clone(),
             resolved_model.context_window,

@@ -339,8 +339,19 @@ impl bindings::cyrup::ext::exec::Host for HostState {
     ) -> Result<wit_types::ExecResult, String> {
         let guest = guest_of(self)?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        let ExecOutput { code, stdout, stderr } = guest.services.exec(&cmd, &args, &opts)?;
-        Ok(wit_types::ExecResult { code, stdout, stderr })
+        // Resolve the Pi `signal` (exec.ts:66-72): a `signalId` that was already aborted (`ui.abort-signal`)
+        // yields a pre-cancelled token so the grant kills the process immediately (the guest is
+        // wasm-suspended across this call, so the signal cannot be aborted mid-run). No tier guard
+        // (exec is ambient at any tier once the load-time trust gate passed, arch-08 §6.3).
+        let cancel = CancelToken::new();
+        if let Some(id) = opts.get("signalId").and_then(|v| v.as_str())
+            && guest.is_signal_aborted(id)
+        {
+            cancel.cancel();
+        }
+        let ExecOutput { code, stdout, stderr, killed } =
+            guest.services.exec(&cmd, &args, &opts, cancel)?;
+        Ok(wit_types::ExecResult { code, stdout, stderr, killed })
     }
 }
 

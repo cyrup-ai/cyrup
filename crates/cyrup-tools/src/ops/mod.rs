@@ -216,6 +216,27 @@ pub struct ExecSpec {
     pub shell: ShellConfig,
 }
 
+/// A DIRECT argv (shell:false) exec request (Pi `execCommand`, exec.ts:34-46): `program` is run with
+/// `args` as a real argv vector — NO shell, NO word-splitting — in `cwd` with `env` overrides. This is
+/// the capability-scoped `exec` grant path (arch-08 exec), distinct from the shell-based [`ExecSpec`]
+/// the `bash` tool uses.
+#[derive(Clone, Debug)]
+pub struct ArgvSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// Captured output of an argv exec (Pi `ExecResult`, exec.ts:23-28): stdout and stderr collected
+/// SEPARATELY (unlike the `bash` streaming seam which merges them), plus the exit status.
+#[derive(Clone, Debug)]
+pub struct ArgvOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 /// Process outcome. `Killed` (cancel) and `TimedOut` are returned as `Ok` so `bash` can craft the
 /// right error while preserving the accumulated output (R-03-023/024). `Signaled` is a process that
 /// died to an external signal (no exit code) without our cancel — Pi returns `exitCode: null` and
@@ -257,6 +278,19 @@ pub trait ProcOps: Send + Sync {
         timeout: Option<Duration>,
         on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
     ) -> Result<ExitStatus, ToolError>;
+
+    /// Run a command as a DIRECT argv vector (shell:false; Pi `execCommand`, exec.ts:34-46), buffering
+    /// stdout and stderr SEPARATELY. Honors cancel + timeout, killing the whole process tree on
+    /// cancel/timeout (R-03-024/027). Backs the capability-scoped `exec` grant an extension calls
+    /// (arch-08 exec); the default is unsupported so only the local backend runs argv execs.
+    async fn exec_argv(
+        &self,
+        _spec: ArgvSpec,
+        _cancel: CancelToken,
+        _timeout: Option<Duration>,
+    ) -> Result<ArgvOutput, ToolError> {
+        Err(ToolError::new("argv exec is not supported by this process backend"))
+    }
 }
 
 /// A bundle of both operation surfaces (arch-03 §3.3).

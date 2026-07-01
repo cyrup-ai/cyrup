@@ -129,7 +129,12 @@ impl Ctx {
         {
             let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             match crate::guest::bindings::cyrup::ext::exec::run(cmd, &argv, &opts_json) {
-                Ok(r) => Ok(ExecResult { code: r.code, stdout: r.stdout, stderr: r.stderr }),
+                Ok(r) => Ok(ExecResult {
+                    code: r.code,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    killed: r.killed,
+                }),
                 Err(e) => Err(e),
             }
         }
@@ -141,12 +146,14 @@ impl Ctx {
     }
 }
 
-/// Result of [`Ctx::exec`].
+/// Result of [`Ctx::exec`] (Pi `ExecResult`, exec.ts:23-28). `killed` is true when the host
+/// SIGTERM/SIGKILLed the process on a timeout/abort.
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+    pub killed: bool,
 }
 
 /// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).

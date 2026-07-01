@@ -39,11 +39,14 @@ interface types {
     has-renderer: bool,
   }
 
-  // Result of a capability-scoped exec (arch-08 caps/exec.rs).
+  // Result of a capability-scoped exec (arch-08 caps/exec.rs). 1:1 with Pi's `ExecResult`
+  // (exec.ts:23-28): `killed` is true when the host SIGTERM/SIGKILLed the process on a
+  // timeout/abort (Pi `execCommand` `killed`), false for a natural exit or an external signal.
   record exec-result {
     code: s32,
     stdout: string,
     stderr: string,
+    killed: bool,
   }
 
   // Result of executing a guest-registered tool (R-08-015, Pi types.ts:1043 AgentToolResult).

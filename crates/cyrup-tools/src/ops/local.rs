@@ -6,8 +6,8 @@
 //! process-group calls (`setsid`/`killpg`) with safety comments.
 
 use super::{
-    Access, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig, Transport, WalkItem,
-    WalkOpts,
+    Access, ArgvOutput, ArgvSpec, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig,
+    Transport, WalkItem, WalkOpts,
 };
 use crate::error;
 use cyrup_core::{CancelToken, EventStream, ToolError};
@@ -218,6 +218,39 @@ fn build_command(spec: &ExecSpec) -> std::process::Command {
     std_cmd
 }
 
+/// Build the OS command for an [`ArgvSpec`] — a DIRECT argv (shell:false) exec (Pi `execCommand`
+/// spawn with `shell:false`, exec.ts:41-45): the program IS `spec.program`, its args are the literal
+/// `spec.args` (no shell, no word-splitting), with the same unix process-group setup as the shell path
+/// so the whole tree can be reaped on timeout/cancel.
+#[allow(unsafe_code)]
+fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
+    let mut std_cmd = std::process::Command::new(&spec.program);
+    std_cmd.args(&spec.args);
+    std_cmd.current_dir(&spec.cwd);
+    for (k, v) in &spec.env {
+        std_cmd.env(k, v);
+    }
+    // Pi uses stdio `["ignore","pipe","pipe"]` (exec.ts:44): stdin closed, stdout+stderr piped.
+    std_cmd.stdin(std::process::Stdio::null());
+    std_cmd.stdout(std::process::Stdio::piped());
+    std_cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` only detaches the child into its own session/process group before exec;
+        // it touches no parent memory and is async-signal-safe. This makes the child the group leader
+        // (pgid == pid) so the whole tree can be killed via `killpg` on timeout/cancel (R-03-027).
+        unsafe {
+            std_cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    std_cmd
+}
+
 /// Kill the child's whole process tree (R-03-024/027).
 #[allow(unsafe_code)]
 fn kill_tree(child: &mut tokio::process::Child) {
@@ -346,5 +379,70 @@ impl ProcOps for LocalProc {
             }
         };
         Ok(status)
+    }
+
+    async fn exec_argv(
+        &self,
+        spec: ArgvSpec,
+        cancel: CancelToken,
+        timeout: Option<Duration>,
+    ) -> Result<ArgvOutput, ToolError> {
+        let std_cmd = build_argv_command(&spec);
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
+        // Pi `execCommand` never rejects on a bad command — its caller maps a spawn failure to
+        // `{code:1}` (exec.ts:99-105). Here we surface the spawn error and let the grant layer
+        // (`LiveHostServices::exec`) apply that Pi mapping.
+        let mut child =
+            cmd.spawn().map_err(|e| error::io(&format!("spawn {}", spec.program), &e))?;
+
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        // Buffer each stream separately (Pi accumulates `stdout`/`stderr` strings, exec.ts:47-48,81-87).
+        let mut out_buf: Vec<u8> = Vec::new();
+        let mut err_buf: Vec<u8> = Vec::new();
+
+        let timeout_fut = async {
+            match timeout {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(timeout_fut);
+
+        let status = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    kill_tree(&mut child);
+                    let _ = child.wait().await;
+                    break ExitStatus::Killed;
+                }
+                _ = &mut timeout_fut => {
+                    kill_tree(&mut child);
+                    let _ = child.wait().await;
+                    break ExitStatus::TimedOut;
+                }
+                chunk = read_chunk(&mut stdout) => {
+                    match chunk {
+                        Some(data) => out_buf.extend_from_slice(&data),
+                        None => stdout = None,
+                    }
+                }
+                chunk = read_chunk(&mut stderr) => {
+                    match chunk {
+                        Some(data) => err_buf.extend_from_slice(&data),
+                        None => stderr = None,
+                    }
+                }
+                s = child.wait(), if stdout.is_none() && stderr.is_none() => {
+                    break match s {
+                        Ok(st) => exit_from(st),
+                        Err(_) => ExitStatus::Exited(-1),
+                    };
+                }
+            }
+        };
+        Ok(ArgvOutput { status, stdout: out_buf, stderr: err_buf })
     }
 }

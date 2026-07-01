@@ -9,12 +9,15 @@
 //! while the session's manager is async-locked. `LiveHostServices` therefore reads from a small
 //! sync snapshot the session pushes on model/state changes, plus the provider's (sync) model list.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use cyrup_core::{EntryId, ModelRef};
-use cyrup_ext::host::{ControlOp, HostServices};
+use cyrup_core::{CancelToken, EntryId, ModelRef};
+use cyrup_ext::host::{ControlOp, ExecOutput, HostServices};
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
+use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
@@ -39,6 +42,13 @@ struct LiveSnapshot {
 /// The live host-services backend (arch-08 §5.6).
 pub struct LiveHostServices {
     provider: Arc<dyn Provider>,
+    /// The process backend the `exec` capability grant runs argv (shell:false) commands through
+    /// (Pi `execCommand`, exec.ts:34-46). Shared with the session's `bash` seam (the same
+    /// [`cyrup_tools::ProcOps`]), so a granted extension execs through the real local process ops.
+    proc: Arc<dyn ProcOps>,
+    /// The session cwd — the default working directory for an `exec` with no `cwd` option (Pi's
+    /// `execCommand(..., opts?.cwd ?? cwd)` where `cwd` is the extension's cwd, loader.ts:317-320).
+    cwd: PathBuf,
     snapshot: Mutex<LiveSnapshot>,
     control: Mutex<Option<ControlSink>>,
     /// Receiver half of the command-tier control channel (see [`Self::wire_control_channel`]). A
@@ -59,11 +69,14 @@ pub struct LiveHostServices {
 }
 
 impl LiveHostServices {
-    /// Wire a backend to the session's `provider`. Model/state are seeded via [`Self::update_model`]
-    /// and [`Self::update_state`]; the control sink is attached later by the runtime.
-    pub fn new(provider: Arc<dyn Provider>) -> Self {
+    /// Wire a backend to the session's `provider`, process ops (`proc`), and session `cwd`. Model/state
+    /// are seeded via [`Self::update_model`] and [`Self::update_state`]; the control sink is attached
+    /// later by the runtime. `proc` + `cwd` back the `exec` capability grant (Pi `execCommand`).
+    pub fn new(provider: Arc<dyn Provider>, proc: Arc<dyn ProcOps>, cwd: PathBuf) -> Self {
         Self {
             provider,
+            proc,
+            cwd,
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
             control_rx: Mutex::new(None),
@@ -193,6 +206,68 @@ impl HostServices for LiveHostServices {
         }
     }
 
+    fn exec(
+        &self,
+        cmd: &str,
+        args: &[String],
+        opts: &Value,
+        cancel: CancelToken,
+    ) -> Result<ExecOutput, String> {
+        // The `exec` GRANT (arch-08 §5.6): reaching here means the load-time trust gate already said
+        // yes (`is_trusted = origin.is_pre_trust() || project_trusted`, loader.rs:57-60, enforced
+        // facade.rs:563) — an untrusted extension gets `DenyServices` and never lands here. So this
+        // adds NO extra trust/tier check; it just runs the command, 1:1 with Pi `execCommand`
+        // (exec.ts:34-46): shell:false argv, `cwd ?? sessionCwd`, `env` overrides, and a `timeoutMs`
+        // that SIGTERM/SIGKILLs (killed=true) on expiry.
+        let cwd = opts
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cwd.clone());
+        let timeout = opts
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
+        let env: Vec<(String, String)> = opts
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let spec = ArgvSpec { program: cmd.to_string(), args: args.to_vec(), cwd, env };
+        let proc = self.proc.clone();
+        // The `HostServices` trait is sync (the guest is wasm-suspended across the call); drive the
+        // async process ops to completion on the current multi-threaded runtime worker.
+        let outcome = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(proc.exec_argv(spec, cancel, timeout))
+        });
+        let out = match outcome {
+            Ok(o) => o,
+            // Pi `execCommand` never rejects: a spawn/wait failure resolves `{code:1}` (exec.ts:99-105).
+            Err(_) => {
+                return Ok(ExecOutput { code: 1, stdout: String::new(), stderr: String::new(), killed: false });
+            }
+        };
+        // Map the process status onto Pi's `{code, killed}` (exec.ts:52-63,97): a natural exit keeps
+        // its code; a host-driven kill (cancel/timeout) is `killed=true` with `code 0` (Pi's SIGTERM
+        // ⇒ exit null ⇒ `code ?? 0`); an external signal we did NOT send is `killed=false, code 0`.
+        let (code, killed) = match out.status {
+            ExitStatus::Exited(n) => (n, false),
+            ExitStatus::Signaled => (0, false),
+            ExitStatus::Killed | ExitStatus::TimedOut => (0, true),
+        };
+        Ok(ExecOutput {
+            code,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            killed,
+        })
+    }
+
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
         // Persist the custom (non-LLM) entry into the LIVE session tree (Pi
         // `sessionManager.appendCustomEntry`, agent-session.ts:2265-2271) and snapshot the persisted
@@ -238,10 +313,15 @@ mod tests {
     use cyrup_provider::faux::FauxProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A backend seeded with the real local process ops + a temp cwd (the `exec` grant path).
+    fn svc_with(provider: Arc<dyn Provider>) -> LiveHostServices {
+        LiveHostServices::new(provider, cyrup_tools::Backend::default().proc, std::env::temp_dir())
+    }
+
     #[test]
     fn reflects_live_model_and_models_catalog() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-        let svc = LiveHostServices::new(provider.clone());
+        let svc = svc_with(provider.clone());
 
         // Before wiring: no current model, control denied, but the catalog is live from the provider.
         assert!(svc.current_model().is_none());
@@ -265,7 +345,7 @@ mod tests {
     #[test]
     fn control_routes_to_the_wired_sink() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-        let svc = LiveHostServices::new(provider);
+        let svc = svc_with(provider);
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
         svc.set_control_sink(Arc::new(move |_op| {
@@ -275,5 +355,75 @@ mod tests {
         svc.control(ControlOp::Reload).expect("control routes to the sink");
         svc.control(ControlOp::Compact).expect("control routes to the sink");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// The `exec` grant runs a DIRECT argv (shell:false) command and returns the REAL captured
+    /// output/code/killed — 1:1 with Pi `execCommand` (exec.ts:34-46). Multi-thread runtime so the
+    /// sync grant can `block_in_place` on the async process ops.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_runs_argv_with_cwd_env_and_reports_killed_on_timeout() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // 1) Real stdout + exit code, NO shell (argv `echo hi`).
+        let out = svc
+            .exec("echo", &["hi".to_string()], &json!({}), CancelToken::new())
+            .expect("echo runs via the exec grant");
+        assert_eq!(out.stdout, "hi\n");
+        assert_eq!(out.code, 0);
+        assert!(!out.killed, "a natural exit is not `killed`");
+
+        // 2) shell:false — an argv that a shell would splice is passed literally, so `echo` prints the
+        //    metacharacters verbatim (proves no `bash -c` word-splitting).
+        let out = svc
+            .exec("echo", &["a; echo b".to_string()], &json!({}), CancelToken::new())
+            .expect("echo runs");
+        assert_eq!(out.stdout, "a; echo b\n", "argv is literal — no shell interpretation");
+
+        // 3) `cwd` option honored (Pi `opts?.cwd ?? cwd`).
+        let tmp = std::env::temp_dir();
+        let out = svc
+            .exec("pwd", &[], &json!({ "cwd": tmp.to_string_lossy() }), CancelToken::new())
+            .expect("pwd runs");
+        let printed = std::fs::canonicalize(out.stdout.trim_end()).unwrap_or_default();
+        assert_eq!(printed, std::fs::canonicalize(&tmp).unwrap_or(tmp), "exec ran in the given cwd");
+
+        // 4) `env` overrides threaded to the child (Pi `ExecOptions.env`).
+        let out = svc
+            .exec(
+                "printenv",
+                &["CYRUP_EXEC_TEST".to_string()],
+                &json!({ "env": { "CYRUP_EXEC_TEST": "grant" } }),
+                CancelToken::new(),
+            )
+            .expect("printenv runs");
+        assert_eq!(out.stdout, "grant\n");
+
+        // 5) `timeoutMs` ⇒ the host kills the process (SIGTERM/SIGKILL the group) and reports
+        //    `killed=true` (Pi `killProcess` sets `killed`, exec.ts:52-63).
+        let out = svc
+            .exec("sleep", &["30".to_string()], &json!({ "timeoutMs": 100 }), CancelToken::new())
+            .expect("sleep runs then is killed on timeout");
+        assert!(out.killed, "a timed-out exec is `killed`");
+
+        // 6) an already-aborted signal (pre-cancelled token) kills immediately ⇒ `killed=true`.
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let out = svc
+            .exec("sleep", &["30".to_string()], &json!({}), cancelled)
+            .expect("a pre-cancelled exec resolves");
+        assert!(out.killed, "a pre-aborted signal kills the exec");
+    }
+
+    /// The DEFAULT (deny-all) backend denies exec with Pi's "not granted" message — the untrusted
+    /// analog (an untrusted extension gets `DenyServices`, arch-08 §5.6).
+    #[test]
+    fn deny_services_refuses_exec() {
+        use cyrup_ext::host::{DenyServices, HostServices as _};
+        let err = DenyServices
+            .exec("echo", &["hi".to_string()], &json!({}), CancelToken::new())
+            .expect_err("deny-all backend refuses exec");
+        assert!(err.contains("not granted"), "denied with the Pi message: {err}");
     }
 }

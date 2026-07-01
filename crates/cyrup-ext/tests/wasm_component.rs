@@ -178,6 +178,25 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
     assert_eq!(widget["widget"], json!("text"));
     assert!(widget["text"].as_str().unwrap_or("").contains("demo call"));
 
+    // 7) the exec capability is DENIED for this DenyServices-backed guest (the untrusted analog): the
+    //    guest's `/execdemo` calls `pi.exec("echo",["hi"])` across the WIT boundary, the host router
+    //    routes it to `DenyServices::exec` which returns "exec capability not granted", and the guest
+    //    surfaces that denial (Pi's ambient exec is unavailable to an ungranted extension).
+    let out = ext.execute_command("execdemo", "", &cancel).await.expect("execdemo runs");
+    assert_eq!(
+        out.as_deref(),
+        Some("exec denied: exec capability not granted"),
+        "the deny-all backend refuses the guest's exec"
+    );
+    assert!(
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("exec denied: exec capability not granted")),
+        "the guest observed the exec denial across the boundary: {:?}",
+        ext.guest().notifications()
+    );
+
     // an unknown command surfaces an error (never a host crash).
     let err = ext.execute_command("nope", "", &cancel).await.unwrap_err();
     assert!(err.to_string().contains("no such command"), "unknown command surfaced: {err}");

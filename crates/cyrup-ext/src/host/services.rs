@@ -13,12 +13,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`).
+/// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
+/// exec.ts:23-28). `killed` is true when the host SIGTERM/SIGKILLed the process on a timeout/abort.
 #[derive(Clone, Debug, Default)]
 pub struct ExecOutput {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+    pub killed: bool,
 }
 
 /// UI dialog options bag (Pi `ExtensionUIDialogOptions`, types.ts:89): a live-countdown `timeout_ms`
@@ -142,7 +144,17 @@ pub trait HostServices: Send + Sync {
     }
 
     // --- exec capability (R-08-030); denied by default ---
-    fn exec(&self, _cmd: &str, _args: &[String], _opts: &Value) -> Result<ExecOutput, String> {
+    /// Run a DIRECT argv (shell:false) command (Pi `execCommand`, exec.ts:34-46). `opts` is the Pi
+    /// `ExecOptions` bag (`{cwd, timeoutMs, env}`); `cancel` carries an already-aborted `signalId`
+    /// (the guest is wasm-suspended across this call, so the signal can only have been aborted
+    /// beforehand — Pi `signal.aborted`). Denied by default (no ambient authority, R-ARCH-EXT-011).
+    fn exec(
+        &self,
+        _cmd: &str,
+        _args: &[String],
+        _opts: &Value,
+        _cancel: CancelToken,
+    ) -> Result<ExecOutput, String> {
         Err("exec capability not granted".into())
     }
 
@@ -321,7 +333,13 @@ impl HostServices for RecordingServices {
     fn current_model(&self) -> Option<String> {
         self.responses.current_model.clone()
     }
-    fn exec(&self, cmd: &str, args: &[String], _opts: &Value) -> Result<ExecOutput, String> {
+    fn exec(
+        &self,
+        cmd: &str,
+        args: &[String],
+        _opts: &Value,
+        _cancel: CancelToken,
+    ) -> Result<ExecOutput, String> {
         if let Ok(mut g) = self.state.lock() {
             g.exec_calls.push((cmd.to_string(), args.to_vec()));
         }

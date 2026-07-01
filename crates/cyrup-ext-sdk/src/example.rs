@@ -7,9 +7,9 @@
 //! dynamically-registered streaming tool (`demo_echo`).
 
 use crate::{
-    AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, DialogOptions, ExtensionApi,
-    MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider, Outcome, ProviderConfig,
-    ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor, ToolOutput,
+    AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, DialogOptions, ExecOptions,
+    ExtensionApi, MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider, Outcome,
+    ProviderConfig, ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor, ToolOutput,
 };
 use serde_json::{json, Value};
 
@@ -182,6 +182,30 @@ pub fn build() -> ExtensionApi {
             ctx.ctx().session().set_session_name("renamed-by-guest");
             ctx.ctx().session().set_label(&id, "guest-label");
             Ok(Some(format!("appended {id}")))
+        },
+    );
+
+    // A command exercising the capability-scoped exec grant (arch-08 exec; Pi `pi.exec` →
+    // `execCommand`, exec.ts:34-46): run `echo hi` as a DIRECT argv (shell:false) and surface the
+    // REAL captured stdout + `killed` flag. When the host has NOT granted exec (untrusted ⇒
+    // `DenyServices`) the call errors and we notify the denial reason instead — proving the same
+    // seam gates both ways.
+    api.register_command(
+        "execdemo",
+        CommandDescriptor::new("Run `echo hi` via the exec capability and report stdout (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| match ctx.ctx().exec(
+            "echo",
+            &["hi"],
+            &ExecOptions::default(),
+        ) {
+            Ok(r) => {
+                ctx.ui().notify(&format!("exec stdout: {}", r.stdout.trim_end()));
+                Ok(Some(format!("exec code {} killed {}", r.code, r.killed)))
+            }
+            Err(e) => {
+                ctx.ui().notify(&format!("exec denied: {e}"));
+                Ok(Some(format!("exec denied: {e}")))
+            }
         },
     );
 
