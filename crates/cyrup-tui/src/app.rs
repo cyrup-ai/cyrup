@@ -19,7 +19,9 @@ use cyrup_core::{CancelToken, EventStream};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
-use cyrup_session_svc::{AgentSessionRuntime, ForkPosition, NavigateTreeOptions};
+use cyrup_session_svc::{
+    AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
+};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -41,6 +43,7 @@ use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
 use crate::image::{ImageBlock, ImageRenderer};
 use crate::keymap::{Action, EditorAction, Keymap, SelectKeymap, TreeKeymap};
+use crate::model_selector::{ModelEntry, ModelSelector};
 use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
 use crate::selector::{
     CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
@@ -49,9 +52,9 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
-use crate::theme::UiTheme;
+use crate::theme::{ColorMode, ThemeController, UiTheme};
 use crate::transcript::{content_text, entry_lines, TranscriptView};
-use crate::tree_selector::{TreeNode, TreeSelector};
+use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
 
 /// The number of visual lines a `PageUp`/`PageDown` scrolls the active region by (a conservative
 /// screenful; spec/tui/07 page-scroll). Resolved on the pure input thread without the live viewport
@@ -138,6 +141,10 @@ pub struct AppState {
     /// compaction runs, blank when idle. Driven by `AgentSessionEvent`s in [`App::ingest_event`].
     pub indicator: StatusIndicator,
     pub theme: UiTheme,
+    /// The terminal color depth every theme is projected into (feature #3/#4): boot resolves it from
+    /// the terminal (`ColorMode::detect` / the `ThemeController`); a live `/theme` switch re-projects
+    /// the new theme through it so 256-color terminals keep indexed colors after a switch.
+    pub color_mode: ColorMode,
     pub keymap: Keymap,
     /// The selector binding table (`tui.select.*`, spec/tui/05 §10) consulted while a selector owns
     /// the input slot.
@@ -201,6 +208,7 @@ impl AppState {
             editor: InputEditor::new(),
             status: StatusLine::default(),
             indicator: StatusIndicator::new(),
+            color_mode: theme.color_mode,
             theme,
             keymap: Keymap::default(),
             select_keymap: SelectKeymap::default(),
@@ -374,10 +382,29 @@ impl<B: Backend> App<B> {
         self.state.image_renderer = ImageRenderer::detect();
     }
 
-    /// Apply a new theme, bumping its generation so caches invalidate (R-10-026).
-    pub fn set_theme(&mut self, mut theme: UiTheme) {
+    /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is
+    /// re-projected through the app's live [`ColorMode`] (feature #3/#4) so a `/theme` switch or hot
+    /// reload on a 256-color terminal keeps indexed colors (`with_color_mode` is idempotent for an
+    /// already-projected theme).
+    pub fn set_theme(&mut self, theme: UiTheme) {
+        let mut theme = theme.with_color_mode(self.state.color_mode);
         theme.generation = self.state.theme.generation.saturating_add(1);
         self.state.theme = theme;
+    }
+
+    /// Boot the render theme from a [`ThemeController`] (feature #4): adopt the controller's resolved
+    /// color mode and set the projected theme. This is the seam the binary uses to honor
+    /// `settings.theme` + the terminal background at startup instead of the hardwired dark boot.
+    pub fn apply_theme_controller(&mut self, controller: &ThemeController) {
+        self.state.color_mode = controller.color_mode();
+        let mut theme = controller.theme();
+        theme.generation = self.state.theme.generation.saturating_add(1);
+        self.state.theme = theme;
+    }
+
+    /// The app's active color mode (test/inspection).
+    pub fn color_mode(&self) -> ColorMode {
+        self.state.color_mode
     }
 
     /// Re-bind the UI to a freshly-installed runtime session (arch-11 §3.4 replacement; Pi's
@@ -877,6 +904,21 @@ impl<B: Backend> App<B> {
         });
     }
 
+    /// Open the `/model` selector (feature #1): the full [`ModelSelector`] with fuzzy search, the
+    /// `all | scoped` scope toggle, `[provider]` badges, and a `✓` on the active model — over the live
+    /// model catalog `(id, name, provider, current, scoped)`. Replaces the bare titled list the audit
+    /// flagged. Snapshots the editor like every editor-swap selector.
+    pub fn open_model_selector(&mut self, models: Vec<ModelEntry>) {
+        let saved_editor = self.state.editor.text();
+        let inner: Box<dyn Selector> = Box::new(ModelSelector::new(models));
+        self.state.selector = Some(ActiveSelector {
+            kind: SelectorKind::Model,
+            inner,
+            saved_editor,
+            restore_theme: None,
+        });
+    }
+
     /// Open an arbitrary boxed [`Selector`] in the input slot under `kind` (the seam for the bespoke
     /// non-list selectors — `/tree`'s [`TreeSelector`] — that are not a plain [`ListSelector`] yet need
     /// the same editor-swap lifecycle as the data selectors). Snapshots the editor like the others.
@@ -994,20 +1036,30 @@ impl<B: Backend> App<B> {
         use AppCommand as C;
         match cmd {
             C::OpenSelector(SelectorKind::Model) => {
-                let current = session.model().model.to_string();
-                let rows: Vec<(String, String, Option<String>)> = session
+                // `/model` (feature #1): the full catalog, each row tagged with its provider, whether it
+                // is the active model, and whether it is in the scoped set (drives the `⇥` scope filter).
+                let current = session.model();
+                let scoped: std::collections::HashSet<String> = session
                     .scoped_models()
                     .into_iter()
-                    .map(|sm| {
-                        let id = sm.model.id.to_string();
-                        (id.clone(), sm.model.name.clone(), Some(sm.model.provider.to_string()))
+                    .map(|sm| sm.model.id.to_string())
+                    .collect();
+                let models: Vec<ModelEntry> = session
+                    .model_catalog()
+                    .iter()
+                    .map(|m| ModelEntry {
+                        id: m.id.to_string(),
+                        name: m.name.clone(),
+                        provider: m.provider.to_string(),
+                        current: m.id.as_str() == current.model.as_str()
+                            && m.provider.as_str() == current.provider.as_str(),
+                        scoped: scoped.contains(m.id.as_str()),
                     })
                     .collect();
-                let selected = rows.iter().position(|(v, _, _)| *v == current).unwrap_or(0);
-                if rows.is_empty() {
+                if models.is_empty() {
                     self.state.transcript.push_status("no models available (configure providers)");
                 } else {
-                    self.open_data_selector(SelectorKind::Model, rows, selected);
+                    self.open_model_selector(models);
                 }
             }
             C::OpenSelector(SelectorKind::ScopedModels) => {
@@ -1049,28 +1101,17 @@ impl<B: Backend> App<B> {
                 }
             }
             C::OpenSelector(SelectorKind::Tree) => {
-                // `/tree` (tree-selector.ts): the session DAG flattened into [`TreeNode`]s. The live DAG
-                // getter is the one L5 residual (residual ledger), so the navigable node set is sourced
-                // from the fork anchors — the user-message spine of the conversation — each a depth-0
-                // `Message` node whose confirm drives `navigate_tree`. The connector/fold/filter engine
-                // (the bulk of the 47KB component) is already built in `tree_selector.rs`.
-                let anchors = session.user_messages_for_forking().await;
-                if anchors.is_empty() {
+                // `/tree` (tree-selector.ts): the real session DAG flattened via the new
+                // `AgentSession::session_dag` getter (feature #2) — nodes with parent/depth/label/kind/
+                // fold/leaf/label/timestamp — feeding the connector/fold/filter engine in
+                // `tree_selector.rs`. This replaces the flat user-message spine the audit flagged as
+                // "data-starved" so the selector renders the actual branch tree.
+                let dag = session.session_dag().await;
+                if dag.is_empty() {
                     self.state.transcript.push_status("no session history to navigate");
                 } else {
-                    let nodes: Vec<TreeNode> = anchors
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
-                            let mut node = TreeNode::message(
-                                a.entry_id.to_string(),
-                                0,
-                                truncate_summary(&a.text),
-                            );
-                            node.time_label = Some(format!("#{}", i + 1));
-                            node
-                        })
-                        .collect();
+                    let nodes: Vec<TreeNode> =
+                        dag.iter().map(tree_node_from_dag).collect();
                     let mut tree = TreeSelector::new(nodes);
                     tree.set_keymap(self.state.tree_keymap.clone());
                     self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
@@ -1844,6 +1885,29 @@ fn truncate_summary(s: &str) -> String {
     } else {
         let head: String = one_line.chars().take(MAX.saturating_sub(1)).collect();
         format!("{head}…")
+    }
+}
+
+/// Project a flattened [`SessionDagNode`] (feature #2) into the tree selector's [`TreeNode`]: map the
+/// UI-agnostic [`SessionDagKind`] to the render [`TreeKind`] glyph, carry depth/label/fold/leaf/label,
+/// and use the leaf marker (`◀`) as the time label so the active branch tip is visible in the row.
+fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
+    let kind = match n.kind {
+        SessionDagKind::Message | SessionDagKind::Other => TreeKind::Message,
+        SessionDagKind::Tool => TreeKind::ToolGroup,
+        SessionDagKind::ModelChange => TreeKind::ModelChange,
+        SessionDagKind::ThinkingChange => TreeKind::ThinkingChange,
+        SessionDagKind::Compaction => TreeKind::Compaction,
+    };
+    TreeNode {
+        id: n.entry_id.to_string(),
+        depth: n.depth,
+        label: truncate_summary(&n.label),
+        kind,
+        foldable: n.foldable,
+        folded: false,
+        has_label: n.has_label,
+        time_label: n.is_leaf.then(|| "current".to_string()),
     }
 }
 

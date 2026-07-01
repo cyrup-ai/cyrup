@@ -66,6 +66,54 @@ pub struct ForkAnchor {
     pub text: String,
 }
 
+/// The entry-type classification of a [`SessionDagNode`], mirroring the glyph switch Pi's tree
+/// selector keys off (`tree-selector.ts:567-611`, `:762`). Kept UI-agnostic (a plain tag) so the
+/// TUI maps it to its own `TreeKind` glyph without this layer depending on cyrup-tui.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDagKind {
+    /// A user/assistant/bash message entry (`●`).
+    Message,
+    /// A `tool_result` message entry (`⚙`).
+    Tool,
+    /// A `model_change` entry (`◆`).
+    ModelChange,
+    /// A `thinking_level_change` entry (`◇`).
+    ThinkingChange,
+    /// A `compaction` or `branch_summary` entry (`✓`).
+    Compaction,
+    /// Anything else (`session_info`/`label`/`custom`/unknown) — rendered as a message.
+    Other,
+}
+
+/// One node of the **flattened session DAG** (feature #2): the flat-tree getter the `/tree` selector
+/// was starved for. Produced by [`AgentSession::session_dag`] by walking the manager's real branch
+/// tree (`SessionManager::tree`) in pre-order, carrying each node's parent link, depth, display label,
+/// kind, fold-ability (has children), leaf-ness (the active branch tip), user-label, and timestamp —
+/// exactly the `FlatNode` fields Pi's `flattenTree` computes (`tree-selector.ts:27-35`, `:199-320`).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDagNode {
+    /// The entry id (the branch/summarize target on confirm).
+    pub entry_id: EntryId,
+    /// The parent entry id (`None` for a root).
+    pub parent_id: Option<EntryId>,
+    /// Pre-order tree depth (0 = a root; roots get no connector, spec/tui/05 §5.1).
+    pub depth: usize,
+    /// The one-line display label (role-prefixed message text / `model → id` / `thinking → level` / …).
+    pub label: String,
+    /// The entry-type classification driving the row glyph.
+    pub kind: SessionDagKind,
+    /// Whether this node has descendants (renders the foldable `⊟`/`⊞` marker).
+    pub foldable: bool,
+    /// Whether this node is the current branch leaf (the active tip).
+    pub is_leaf: bool,
+    /// Whether the entry carries a user label (renders the `☆` star).
+    pub has_label: bool,
+    /// The entry's RFC3339 timestamp (drives the right-aligned time column).
+    pub timestamp: String,
+}
+
 /// Options for the unified `/tree` navigation op (Pi `navigateTree(targetId, options)`,
 /// agent-session.ts:2704). `summarize` runs the branch summarizer over the abandoned branch;
 /// `custom_instructions`/`replace_instructions` steer that summary prompt (Pi
@@ -1594,6 +1642,21 @@ impl AgentSession {
         guard.tree().iter().map(node_to_json).collect()
     }
 
+    /// The **flattened session DAG** for the `/tree` selector (feature #2): the manager's real branch
+    /// tree (`SessionManager::tree`) walked in pre-order into [`SessionDagNode`]s carrying parent/depth/
+    /// label/kind/fold/leaf/label/timestamp — the flat-DAG getter the connector/fold/filter engine in
+    /// `cyrup-tui::tree_selector` was data-starved for (audit: `/tree` showed a flat user-message
+    /// list). Mirrors Pi `flattenTree` over `SessionManager.getTree()` (`tree-selector.ts:199-320`).
+    pub async fn session_dag(&self) -> Vec<SessionDagNode> {
+        let guard = self.manager.lock().await;
+        let leaf = guard.leaf_id().cloned();
+        let mut out = Vec::new();
+        for root in guard.tree() {
+            flatten_dag_node(&root, None, 0, leaf.as_ref(), &mut out);
+        }
+        out
+    }
+
     // ------------------------------------------------------------------- lifecycle ----
 
     /// Dispose the session (Pi `AgentSession.dispose` via runtime `dispose`,
@@ -2940,6 +3003,107 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => a == b,
     }
+}
+
+/// Recursively flatten a [`cyrup_session::manager::TreeNode`] into pre-order [`SessionDagNode`]s
+/// (feature #2 helper; Pi `flattenTree` DFS, `tree-selector.ts:199-320`). Children are already
+/// timestamp-sorted by the manager (`build_node`). `depth` is the pre-order tree depth (0 = root).
+fn flatten_dag_node(
+    node: &cyrup_session::manager::TreeNode,
+    parent_id: Option<EntryId>,
+    depth: usize,
+    leaf: Option<&EntryId>,
+    out: &mut Vec<SessionDagNode>,
+) {
+    let id = node.entry.id();
+    let (kind, label) = dag_display(&node.entry);
+    let label = match &node.label {
+        Some(l) => format!("[{l}] {label}"),
+        None => label,
+    };
+    out.push(SessionDagNode {
+        entry_id: id.clone(),
+        parent_id,
+        depth,
+        label,
+        kind,
+        foldable: !node.children.is_empty(),
+        is_leaf: leaf == Some(&id),
+        has_label: node.label.is_some(),
+        timestamp: node.entry.base().map(|b| b.timestamp.clone()).unwrap_or_default(),
+    });
+    for child in &node.children {
+        flatten_dag_node(child, Some(id.clone()), depth + 1, leaf, out);
+    }
+}
+
+/// Classify an entry and derive its one-line tree label (Pi `getEntryDisplayText`,
+/// `tree-selector.ts:762-830`, condensed to a single normalized line). Returns `(kind, label)`.
+fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
+    use cyrup_session::agent_message::AgentMessage as SessMsg;
+    use cyrup_session::entry::{Entry, KnownEntry};
+
+    let normalize = |s: &str| s.replace(['\n', '\t'], " ").trim().to_string();
+    let clip = |s: String| -> String {
+        let out: String = s.chars().take(80).collect();
+        out
+    };
+    match e {
+        Entry::Known(KnownEntry::Message { message, .. }) => match message {
+            SessMsg::Core(Message::User { content, .. }) => {
+                (SessionDagKind::Message, clip(format!("user: {}", normalize(&join_text(content)))))
+            }
+            SessMsg::Core(Message::Assistant(m)) => {
+                let text = normalize(&join_text(&m.content));
+                let body = if text.is_empty() { "(no content)".to_string() } else { text };
+                (SessionDagKind::Message, clip(format!("assistant: {body}")))
+            }
+            SessMsg::Core(Message::ToolResult { tool_name, .. }) => {
+                (SessionDagKind::Tool, format!("[{tool_name}]"))
+            }
+            SessMsg::BashExecution(b) => {
+                (SessionDagKind::Message, clip(format!("[bash]: {}", normalize(&b.command))))
+            }
+            SessMsg::Custom(c) => (SessionDagKind::Message, format!("[{}]", c.custom_type)),
+        },
+        Entry::Known(KnownEntry::ModelChange { model_id, .. }) => {
+            (SessionDagKind::ModelChange, format!("model → {model_id}"))
+        }
+        Entry::Known(KnownEntry::ThinkingLevelChange { thinking_level, .. }) => {
+            (SessionDagKind::ThinkingChange, format!("thinking → {thinking_level}"))
+        }
+        Entry::Known(KnownEntry::Compaction { .. }) => {
+            (SessionDagKind::Compaction, "compaction".to_string())
+        }
+        Entry::Known(KnownEntry::BranchSummary { summary, .. }) => {
+            (SessionDagKind::Compaction, clip(format!("branch summary: {}", normalize(summary))))
+        }
+        Entry::Known(KnownEntry::SessionInfo { name, .. }) => {
+            (SessionDagKind::Other, format!("title: {}", name.clone().unwrap_or_default()))
+        }
+        Entry::Known(KnownEntry::CustomMessage { custom_type, .. }) => {
+            (SessionDagKind::Other, format!("[{custom_type}]"))
+        }
+        Entry::Known(KnownEntry::Custom { custom_type, .. }) => {
+            (SessionDagKind::Other, format!("custom {custom_type}"))
+        }
+        Entry::Known(KnownEntry::Label { label, .. }) => {
+            (SessionDagKind::Other, format!("label {}", label.clone().unwrap_or_default()))
+        }
+        Entry::Unknown(_) => (SessionDagKind::Other, "(entry)".to_string()),
+    }
+}
+
+/// Join the `text` parts of a content vector (helper for [`dag_display`]).
+fn join_text(content: &[Content]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// The concatenated text of a core `user` message entry, or `None` for any other entry/role.

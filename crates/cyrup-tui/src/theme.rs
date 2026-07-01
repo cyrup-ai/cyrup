@@ -9,6 +9,71 @@
 use cyrup_resources::theme::{builtin_themes, ColorSpec, ResolvedTheme, ThemeData};
 use ratatui::style::{Color, Modifier, Style};
 
+/// The terminal color-depth the [`UiTheme`] projects its RGB roles into (Pi `ColorMode`,
+/// `theme.ts:162` + the capability probe `theme.ts:588`). Pi carries only `truecolor`/`256color`;
+/// cyrup extends the enum with `Ansi16` and `None` for depth-limited/monochrome terminals so the
+/// projection is total. The mode is chosen once at boot from the terminal capabilities (`COLORTERM`)
+/// and re-applied whenever the theme changes (`ThemeController`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorMode {
+    /// 24-bit direct color — RGB roles pass through as `Color::Rgb` (Pi `"truecolor"`).
+    #[default]
+    TrueColor,
+    /// 256-color indexed — RGB roles are quantized to the xterm 6×6×6 cube + grayscale ramp via
+    /// [`rgb_to_256`] and emitted as `Color::Indexed` (Pi `"256color"`, `hexTo256`/`fgAnsi`).
+    Ansi256,
+    /// 16-color — RGB roles collapse to the nearest of the 16 ANSI names (depth-limited terminals).
+    Ansi16,
+    /// Monochrome — every color role is dropped (`Color::Reset`, terminal default).
+    None,
+}
+
+impl ColorMode {
+    /// Pick the color mode from the environment the way Pi's capability probe does (`getCapabilities`,
+    /// `theme.ts:588`): a `COLORTERM` of `truecolor`/`24bit` ⇒ [`ColorMode::TrueColor`]; a `TERM`
+    /// mentioning `256color` ⇒ [`ColorMode::Ansi256`]; a dumb/no-color terminal ⇒ [`ColorMode::None`];
+    /// otherwise the safe [`ColorMode::Ansi256`] default (matching Pi's `256color` fallback).
+    pub fn detect() -> ColorMode {
+        let colorterm = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+            return ColorMode::TrueColor;
+        }
+        let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+        if term == "dumb" || term.is_empty() {
+            return ColorMode::None;
+        }
+        if term.contains("256color") {
+            return ColorMode::Ansi256;
+        }
+        // Pi's `createTheme` falls back to `256color` when truecolor is unavailable (`theme.ts:588`).
+        ColorMode::Ansi256
+    }
+
+    /// Project one `ratatui::Color` into this mode. Only `Color::Rgb` is transformed (named/indexed
+    /// colors are already depth-safe); the transform is the single **style-projection boundary** the
+    /// whole TUI passes its role colors through (mirrors Pi `fgAnsi`/`bgAnsi`, `theme.ts:260-288`).
+    pub fn project(self, color: Color) -> Color {
+        let Color::Rgb(r, g, b) = color else { return color };
+        match self {
+            ColorMode::TrueColor => color,
+            ColorMode::Ansi256 => Color::Indexed(rgb_to_256(r, g, b)),
+            ColorMode::Ansi16 => Color::Indexed(rgb_to_16(r, g, b)),
+            ColorMode::None => Color::Reset,
+        }
+    }
+
+    /// Project an optional role color (helper for the [`UiTheme`] fields).
+    fn project_opt(self, color: Option<Color>) -> Option<Color> {
+        match color {
+            Some(c) => match self.project(c) {
+                Color::Reset if self == ColorMode::None => None,
+                projected => Some(projected),
+            },
+            None => None,
+        }
+    }
+}
+
 /// The render-facing theme. Cheap to clone (a handful of optional colors + a name).
 #[derive(Clone, Debug)]
 pub struct UiTheme {
@@ -16,6 +81,9 @@ pub struct UiTheme {
     pub name: String,
     /// Bumped on hot-reload so caches can invalidate (R-10-026 / arch-10 §3.4).
     pub generation: u64,
+    /// The terminal color depth this theme's roles were projected into (Pi `Theme.mode`). Set at boot
+    /// from [`ColorMode::detect`] / the `ThemeController`, applied via [`UiTheme::with_color_mode`].
+    pub color_mode: ColorMode,
     /// Pi `text` token — default foreground text (theme.ts:45). `None` ⇒ inherit terminal default.
     pub foreground: Option<Color>,
     /// Background. Pi has **no** global background token — backgrounds are per-component
@@ -61,6 +129,7 @@ impl UiTheme {
         UiTheme {
             name: name.into(),
             generation,
+            color_mode: ColorMode::default(),
             foreground: role("text"),
             // Pi has no global background token; per-component backgrounds are wired separately.
             background: None,
@@ -120,6 +189,7 @@ impl UiTheme {
         UiTheme {
             name: name.to_string(),
             generation: 0,
+            color_mode: ColorMode::default(),
             foreground: Some(text),
             background: None,
             accent: Some(accent),
@@ -147,6 +217,7 @@ impl UiTheme {
         UiTheme {
             name: data.name.clone(),
             generation,
+            color_mode: ColorMode::default(),
             foreground: role("text"),
             // Pi has no global background token; per-component backgrounds are wired separately.
             background: None,
@@ -164,6 +235,33 @@ impl UiTheme {
     /// Bump the generation (caches keyed by generation re-render). Used by the hot-reload hook.
     pub fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Project every RGB role color into `mode` (the **style-projection boundary**, feature #3): on a
+    /// 256-color terminal each `Color::Rgb` role is quantized to a `Color::Indexed` cube/grayscale
+    /// index so the backend never emits a truecolor escape a 256-color terminal would mangle (Pi
+    /// `createTheme` binds every color through `fgAnsi(value, mode)` at build time, `theme.ts:342-348`).
+    /// The transform is idempotent for non-RGB colors, so re-applying a mode is safe. Every downstream
+    /// `*_style` accessor reads the already-projected fields, so no per-widget change is needed.
+    pub fn with_color_mode(mut self, mode: ColorMode) -> Self {
+        self.color_mode = mode;
+        self.foreground = mode.project_opt(self.foreground);
+        self.background = mode.project_opt(self.background);
+        self.accent = mode.project_opt(self.accent);
+        self.error = mode.project_opt(self.error);
+        self.muted = mode.project_opt(self.muted);
+        self.border = mode.project_opt(self.border);
+        self.success = mode.project_opt(self.success);
+        self.warning = mode.project_opt(self.warning);
+        self.bash_mode = mode.project_opt(self.bash_mode);
+        // The full role map (syntax/markdown/thinking/bg tints) is projected too, so every role
+        // resolved via `role_color`/`roles.get` is depth-safe.
+        self.roles = self
+            .roles
+            .iter()
+            .filter_map(|(k, &c)| mode.project_opt(Some(c)).map(|p| (k.clone(), p)))
+            .collect();
         self
     }
 
@@ -315,7 +413,15 @@ impl UiTheme {
     /// given hex default (the `dark.json` value from spec/tui/06 §3.2) when the live theme omits it —
     /// so the markdown/syntax layer is total even under the synthetic static fallback theme.
     pub fn role_color(&self, key: &str, default_hex: &str) -> Color {
-        self.roles.get(key).copied().or_else(|| parse_hex(default_hex)).unwrap_or(Color::Reset)
+        // Stored roles are already projected by `with_color_mode`; a hex fallback for a role the
+        // theme omits is projected here so a 256-color terminal never gets a stray truecolor escape.
+        match self.roles.get(key).copied() {
+            Some(c) => c,
+            None => self
+                .color_mode
+                .project_opt(parse_hex(default_hex))
+                .unwrap_or(Color::Reset),
+        }
     }
 
     /// `fg`-only style for a role with a hex default (spec/tui/06 §3.2 dark hexes).
@@ -451,6 +557,102 @@ fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -
     parse_hex(hex)
 }
 
+/// The xterm 6×6×6 color-cube channel values (indices 0–5) — Pi `CUBE_VALUES` (`theme.ts:183`).
+const CUBE_VALUES: [i32; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Quantize `(r,g,b)` to the nearest xterm-256 palette index (a **faithful port** of Pi's `rgbTo256`,
+/// `theme.ts:222-253`): the closer of the nearest 6×6×6 cube cell (indices 16–231) and the nearest
+/// 24-step grayscale ramp entry (indices 232–255) under a luma-weighted Euclidean distance, but the
+/// grayscale ramp is only preferred for near-neutral colors (channel spread `< 10`) so tinted colors
+/// keep their hue. This is the quantizer [`ColorMode::Ansi256`] applies at the projection boundary.
+pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    // Nearest cube channel, returning both its palette index (0..5) and its value (no re-indexing, so
+    // the whole function stays panic-free under `clippy::indexing_slicing`).
+    let closest_cube = |v: i32| -> (usize, i32) {
+        // Seed replaced on the first iteration (best_d starts at MAX); value is irrelevant.
+        let mut best = (0usize, 0i32);
+        let mut best_d = i32::MAX;
+        for (i, &c) in CUBE_VALUES.iter().enumerate() {
+            let d = (v - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = (i, c);
+            }
+        }
+        best
+    };
+    // Human-eye-weighted squared distance (Pi `colorDistance`, coefficients ×1000 to stay integral).
+    let dist = |r1: i32, g1: i32, b1: i32, r2: i32, g2: i32, b2: i32| -> i64 {
+        let (dr, dg, db) = ((r1 - r2) as i64, (g1 - g2) as i64, (b1 - b2) as i64);
+        dr * dr * 299 + dg * dg * 587 + db * db * 114
+    };
+
+    let ((ri, rv), (gi, gv), (bi, bv)) = (closest_cube(r), closest_cube(g), closest_cube(b));
+    let cube_index = 16 + 36 * ri + 6 * gi + bi;
+    let cube_dist = dist(r, g, b, rv, gv, bv);
+
+    // Grayscale ramp: 24 grays from 8 to 238 (Pi `GRAY_VALUES`).
+    let gray = ((299 * r + 587 * g + 114 * b) as f64 / 1000.0).round() as i32;
+    let mut gray_idx = 0usize;
+    let mut gray_best = i32::MAX;
+    for i in 0..24i32 {
+        let value = 8 + i * 10;
+        let d = (gray - value).abs();
+        if d < gray_best {
+            gray_best = d;
+            gray_idx = i as usize;
+        }
+    }
+    let gray_value = 8 + gray_idx as i32 * 10;
+    let gray_index = 232 + gray_idx;
+    let gray_dist = dist(r, g, b, gray_value, gray_value, gray_value);
+
+    let spread = r.max(g).max(b) - r.min(g).min(b);
+    if spread < 10 && gray_dist < cube_dist {
+        gray_index as u8
+    } else {
+        cube_index as u8
+    }
+}
+
+/// The 16 ANSI base colors as RGB (the xterm defaults), for [`ColorMode::Ansi16`] quantization.
+const ANSI16_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// Quantize `(r,g,b)` to the nearest of the 16 ANSI base colors (depth-limited terminals). Returns the
+/// palette index `0..=15` as a `Color::Indexed` value.
+fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    let mut best = 0u8;
+    let mut best_d = i64::MAX;
+    for (i, &(cr, cg, cb)) in ANSI16_RGB.iter().enumerate() {
+        let (dr, dg, db) = ((r - cr as i32) as i64, (g - cg as i32) as i64, (b - cb as i32) as i64);
+        let d = dr * dr * 299 + dg * dg * 587 + db * db * 114;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
 /// Parse `#rrggbb` / `rrggbb` / `#rgb` into a `Color`; anything malformed ⇒ `None`.
 fn parse_hex(s: &str) -> Option<Color> {
     let h = s.trim().strip_prefix('#').unwrap_or(s.trim());
@@ -485,4 +687,247 @@ fn hex_pair(hi: Option<&u8>, lo: Option<&u8>) -> Option<u8> {
     let h = hex_digit(hi)?;
     let l = hex_digit(lo)?;
     h.checked_mul(16)?.checked_add(l)
+}
+
+// ============================================================================
+// ThemeController (Pi theme-controller.ts + theme.ts theme-resolution) — feature #4
+// ============================================================================
+
+/// The detected/assumed terminal background polarity (Pi `TerminalTheme`, `theme.ts`), used to resolve
+/// an `auto` theme setting and as the fallback theme when `settings.theme` is unset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TerminalTheme {
+    /// A light terminal background — the boot fallback resolves to the `light` theme.
+    Light,
+    /// A dark terminal background — the boot fallback resolves to the `dark` theme (Pi's default).
+    #[default]
+    Dark,
+}
+
+impl TerminalTheme {
+    /// The built-in theme name for this polarity (Pi resolves an unset setting to the terminal theme
+    /// name, `theme-controller.ts:53-55`).
+    pub fn theme_name(self) -> &'static str {
+        match self {
+            TerminalTheme::Light => "light",
+            TerminalTheme::Dark => "dark",
+        }
+    }
+
+    /// Detect the terminal background polarity from the environment the way Pi does
+    /// (`detectTerminalBackgroundFromEnv`, `theme.ts:724-743`): parse the last numeric field of
+    /// `COLORFGBG` as the background palette index and classify by its luminance; on no hint, fall back
+    /// to [`TerminalTheme::Dark`] (Pi's `"fallback"` / low-confidence default).
+    pub fn detect() -> TerminalTheme {
+        let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
+        if let Some(bg) = colorfgbg_background_index(&colorfgbg) {
+            let (r, g, b) = ansi256_to_rgb(bg);
+            return if relative_luminance(r, g, b) >= 0.5 {
+                TerminalTheme::Light
+            } else {
+                TerminalTheme::Dark
+            };
+        }
+        TerminalTheme::Dark
+    }
+}
+
+/// Pi `parseAutoThemeSetting` (`theme.ts:638-653`): a `"<light>/<dark>"` setting with exactly one
+/// slash parses into a `(light, dark)` pair; anything else is not an auto setting.
+pub fn parse_auto_theme_setting(setting: Option<&str>) -> Option<(String, String)> {
+    let s = setting?;
+    let first = s.find('/')?;
+    // Reject a second slash (Pi: `indexOf("/", slashIndex+1) !== -1`).
+    if s[first + 1..].contains('/') {
+        return None;
+    }
+    let light = s[..first].trim();
+    let dark = s[first + 1..].trim();
+    if light.is_empty() || dark.is_empty() {
+        return None;
+    }
+    Some((light.to_string(), dark.to_string()))
+}
+
+/// Pi `resolveThemeSetting` (`theme.ts:655-666`): resolve the raw `settings.theme` value against the
+/// detected `terminal` polarity into a concrete theme name. An `auto` (`light/dark`) setting picks the
+/// arm matching `terminal`; a bare name passes through; any other slash-namespaced value ⇒ `None`
+/// (unresolvable → caller falls back to the terminal theme).
+pub fn resolve_theme_setting(setting: Option<&str>, terminal: TerminalTheme) -> Option<String> {
+    if let Some((light, dark)) = parse_auto_theme_setting(setting) {
+        return Some(match terminal {
+            TerminalTheme::Light => light,
+            TerminalTheme::Dark => dark,
+        });
+    }
+    match setting {
+        Some(s) if s.contains('/') => None,
+        Some(s) => Some(s.to_string()),
+        None => None,
+    }
+}
+
+/// The boot + live-switch owner of the render theme (Pi `InteractiveThemeController`,
+/// `theme-controller.ts`). It resolves the boot theme from `settings.theme` with a terminal-bg
+/// fallback, carries the [`ColorMode`] so every projected [`UiTheme`] is depth-correct, and drives
+/// `/theme` + hot-switch by name. This is the seam the audit calls for (#4): production booted
+/// dark-only, ignoring `settings.theme` + terminal background; the controller fixes that.
+#[derive(Clone, Debug)]
+pub struct ThemeController {
+    color_mode: ColorMode,
+    terminal_theme: TerminalTheme,
+    active_name: String,
+    generation: u64,
+}
+
+impl ThemeController {
+    /// Boot the controller from the raw `settings.theme` value (Pi `getThemeSetting()`), the terminal
+    /// [`ColorMode`], and the detected terminal background polarity (Pi
+    /// `theme-controller.ts` constructor + `applyFromSettings`, lines 32-59). The active theme is
+    /// `resolveThemeSetting(setting, terminal)` when it resolves, else the terminal theme name — never
+    /// hardwired dark. An unknown name degrades to `dark` at projection time (`UiTheme::builtin`).
+    pub fn boot(
+        theme_setting: Option<&str>,
+        color_mode: ColorMode,
+        terminal_theme: TerminalTheme,
+    ) -> Self {
+        let active_name = resolve_theme_setting(theme_setting, terminal_theme)
+            .unwrap_or_else(|| terminal_theme.theme_name().to_string());
+        ThemeController { color_mode, terminal_theme, active_name, generation: 0 }
+    }
+
+    /// Boot with the color mode + terminal polarity detected from the environment (the binary path).
+    pub fn boot_from_env(theme_setting: Option<&str>) -> Self {
+        ThemeController::boot(theme_setting, ColorMode::detect(), TerminalTheme::detect())
+    }
+
+    /// The projected render theme for the active name (built-in lookup, then depth projection). This is
+    /// what the app boots its `UiTheme` from and re-reads on a live `/theme` switch.
+    pub fn theme(&self) -> UiTheme {
+        UiTheme::builtin(&self.active_name)
+            .with_color_mode(self.color_mode)
+            .with_generation(self.generation)
+    }
+
+    /// The active theme name (test/inspection).
+    pub fn active_name(&self) -> &str {
+        &self.active_name
+    }
+
+    /// The color mode the controller projects into (test/inspection).
+    pub fn color_mode(&self) -> ColorMode {
+        self.color_mode
+    }
+
+    /// The terminal background polarity the boot theme was resolved against (Pi
+    /// `getTerminalTheme`, `theme-controller.ts:88-90`; drives auto-sync + the unset-setting fallback).
+    pub fn terminal_theme(&self) -> TerminalTheme {
+        self.terminal_theme
+    }
+
+    /// Switch the active theme by name (Pi `setThemeName`, `theme-controller.ts:62-65`), bumping the
+    /// generation so render caches invalidate. Returns the freshly projected [`UiTheme`].
+    pub fn set_theme_name(&mut self, name: impl Into<String>) -> UiTheme {
+        self.active_name = name.into();
+        self.generation = self.generation.saturating_add(1);
+        self.theme()
+    }
+}
+
+/// Pi `getColorFgBgBackgroundIndex` (`theme.ts:697-706`): the last valid `0..=255` field of a
+/// semicolon-separated `COLORFGBG`.
+fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
+    colorfgbg
+        .split(';')
+        .rev()
+        .filter_map(|p| p.trim().parse::<i32>().ok())
+        .find(|&n| (0..=255).contains(&n))
+        .map(|n| n as u8)
+}
+
+/// WCAG relative luminance of an sRGB color (Pi `getRgbColorLuminance`, `theme.ts:708-714`).
+fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
+    let lin = |c: u8| {
+        let v = c as f64 / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// Map an xterm-256 palette index to its RGB (Pi `ansi256ToHex`, `theme.ts:968`): the 16 base colors,
+/// the 6×6×6 cube (16–231), and the 24-step grayscale ramp (232–255).
+fn ansi256_to_rgb(index: u8) -> (u8, u8, u8) {
+    // All indices are `.get`-guarded so the function stays panic-free (`clippy::indexing_slicing`).
+    let cube = |i: i32| CUBE_VALUES.get(i as usize).copied().unwrap_or(0) as u8;
+    match index {
+        0..=15 => ANSI16_RGB.get(index as usize).copied().unwrap_or((0, 0, 0)),
+        16..=231 => {
+            let i = (index - 16) as i32;
+            (cube(i / 36), cube((i / 6) % 6), cube(i % 6))
+        }
+        _ => {
+            let v = (8 + (index as i32 - 232) * 10) as u8;
+            (v, v, v)
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_mode_projects_rgb_to_indexed_and_leaves_named_alone() {
+        let rgb = Color::Rgb(0x8a, 0xbe, 0xb7);
+        assert!(matches!(ColorMode::Ansi256.project(rgb), Color::Indexed(_)));
+        assert_eq!(ColorMode::TrueColor.project(rgb), rgb);
+        assert_eq!(ColorMode::None.project(rgb), Color::Reset);
+        // Named/indexed colors are already depth-safe and pass through unchanged.
+        assert_eq!(ColorMode::Ansi256.project(Color::Cyan), Color::Cyan);
+        assert_eq!(ColorMode::Ansi256.project(Color::Indexed(42)), Color::Indexed(42));
+    }
+
+    #[test]
+    fn with_color_mode_is_idempotent_and_projects_every_role() {
+        let dark = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
+        // Foreground is now an indexed color, never RGB.
+        assert!(matches!(dark.foreground, Some(Color::Indexed(_))));
+        assert!(dark.roles.values().all(|c| !matches!(c, Color::Rgb(_, _, _))));
+        // Re-applying the same mode changes nothing (idempotent for a projected theme).
+        let again = dark.clone().with_color_mode(ColorMode::Ansi256);
+        assert_eq!(again.foreground, dark.foreground);
+    }
+
+    #[test]
+    fn parse_auto_theme_setting_matches_pi() {
+        assert_eq!(
+            parse_auto_theme_setting(Some("light/dark")),
+            Some(("light".to_string(), "dark".to_string()))
+        );
+        // Exactly one slash required; a bare name or a two-slash value is not an auto setting.
+        assert_eq!(parse_auto_theme_setting(Some("dark")), None);
+        assert_eq!(parse_auto_theme_setting(Some("a/b/c")), None);
+        assert_eq!(parse_auto_theme_setting(None), None);
+    }
+
+    #[test]
+    fn resolve_theme_setting_matches_pi() {
+        // Auto setting resolves against the terminal polarity.
+        assert_eq!(
+            resolve_theme_setting(Some("solarized-light/solarized-dark"), TerminalTheme::Dark),
+            Some("solarized-dark".to_string())
+        );
+        // A bare name passes through; an unresolvable slash value ⇒ None (caller falls back).
+        assert_eq!(resolve_theme_setting(Some("nord"), TerminalTheme::Light), Some("nord".to_string()));
+        assert_eq!(resolve_theme_setting(Some("a/b/c"), TerminalTheme::Dark), None);
+        assert_eq!(resolve_theme_setting(None, TerminalTheme::Light), None);
+    }
+
+    #[test]
+    fn ansi256_to_rgb_known_points() {
+        assert_eq!(ansi256_to_rgb(16), (0, 0, 0));
+        assert_eq!(ansi256_to_rgb(231), (255, 255, 255));
+        assert_eq!(ansi256_to_rgb(244), (128, 128, 128));
+    }
 }

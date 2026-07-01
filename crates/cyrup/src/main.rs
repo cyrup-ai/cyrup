@@ -34,7 +34,7 @@ use cyrup_session_svc::{
     SessionBuilder, SessionConfig, SessionFactory, SessionInfo, SessionLayout, SessionServiceError,
     SessionTarget, SessionsRoot, UserInput,
 };
-use cyrup_tui::{crossterm_input_stream, App, UiTheme};
+use cyrup_tui::{crossterm_input_stream, App, ThemeController, UiTheme};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -788,7 +788,14 @@ async fn run_interactive(
     inputs: Inputs,
     cancel: CancelToken,
 ) -> anyhow::Result<()> {
-    let mut app = App::into_stdout(UiTheme::default()).context("initialising the terminal UI")?;
+    // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
+    // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
+    // unset/`auto` setting resolves against the detected terminal polarity; every role is projected
+    // into the detected `ColorMode` (feature #3) so 256-color terminals get indexed colors.
+    let theme_setting = session.services().settings.effective().theme_setting();
+    let controller = ThemeController::boot_from_env(theme_setting.as_deref());
+    let mut app =
+        App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
     let input_stream = crossterm_input_stream(cancel.clone());

@@ -56,7 +56,7 @@ pub use runtime::{
 pub use services::AgentSessionServices;
 pub use session::{
     AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, NavigateTreeOptions,
-    NavigateTreeOutcome, ScopedModel,
+    NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
 };
 pub use state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
 pub use tools::ToolInfo;
