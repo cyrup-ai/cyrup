@@ -86,6 +86,20 @@ pub enum BeforeCompactDecision {
     },
 }
 
+/// An extension-supplied compaction override (Pi `SessionBeforeCompactResult.compaction`, a
+/// `CompactionResult`). Supplied by the session-service producer AFTER firing the external
+/// `session_before_compact` extension hook against a real [`super::CompactionPreparation`], and fed
+/// to [`super::Compactor::run_compaction_prepared`] so the override's `summary`/`details` replace the
+/// default model summarization; the appended entry is marked `fromExtension`. Fields left `None`
+/// inherit the prepared cut (`first_kept_entry_id`, `tokens_before`) or an empty details bag.
+#[derive(Clone, Debug, Default)]
+pub struct CompactionOverride {
+    pub summary: String,
+    pub first_kept_entry_id: Option<EntryId>,
+    pub tokens_before: Option<u64>,
+    pub details: Option<Value>,
+}
+
 /// Post-compact notification (R-05-021).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

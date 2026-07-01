@@ -11,8 +11,8 @@
 
 use cyrup_core::{CancelToken, Content, Message};
 use cyrup_ext::{
-    DenyServices, EventKind, Extension, ExtMode, ExtensionHost, HostConfig, InputEventSource,
-    InputReduction, UserBashReduction,
+    CompactionReduction, DenyServices, EventKind, Extension, ExtMode, ExtensionHost, HostConfig,
+    InputEventSource, InputReduction, TreeReduction, UserBashReduction,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -138,4 +138,52 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
         matches!(host.emit_user_bash("ls", &cancel).await, UserBashReduction::Continue),
         "a safe user_bash command proceeds"
     );
+
+    // 6) session_before_compact (L4 gap #5): the guest READS the typed `CompactionPreparation` off
+    // the event and returns a custom-summary override that flows back across the live wasm boundary
+    // with the new WIT arity (preparation-json + branch-entries-json + reason + willRetry).
+    assert!(
+        ext.subscriptions().contains(EventKind::SessionBeforeCompact),
+        "guest subscribed to SessionBeforeCompact"
+    );
+    match host
+        .emit_session_before_compact(
+            json!({ "firstKeptEntryId": "e7", "tokensBefore": 10 }),
+            json!([]),
+            None,
+            "manual",
+            false,
+            &cancel,
+        )
+        .await
+    {
+        CompactionReduction::Override(v) => {
+            // The guest derived the summary from the preparation it read — proof the typed payload
+            // crossed the seam, not a fabricated constant.
+            assert_eq!(
+                v["summary"], "demo-summary[manual|firstKept=e7]",
+                "the guest read the preparation and returned a derived summary override: {v}"
+            );
+        }
+        other => panic!("expected a compaction override, got {other:?}"),
+    }
+
+    // 7) session_before_tree (L4 gap #5): the guest reads the typed `TreePreparation` and overrides
+    // the branch-summary label.
+    assert!(
+        ext.subscriptions().contains(EventKind::SessionBeforeTree),
+        "guest subscribed to SessionBeforeTree"
+    );
+    match host
+        .emit_session_before_tree(json!({ "targetId": "t9", "userWantsSummary": true }), &cancel)
+        .await
+    {
+        TreeReduction::Override(v) => {
+            assert_eq!(
+                v["label"], "demo-tree-label[t9]",
+                "the guest read the tree preparation and returned a derived label override: {v}"
+            );
+        }
+        other => panic!("expected a tree override, got {other:?}"),
+    }
 }

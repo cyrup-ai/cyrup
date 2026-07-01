@@ -47,6 +47,14 @@ pub enum EventPatch {
     /// outbound payload wholesale (`currentPayload = handlerResult`); later handlers observe the
     /// replacement. Open-shaped: the provider request body crosses as `serde_json::Value`.
     ProviderRequest(Value),
+    /// `session_before_compact` (Pi `SessionBeforeCompactResult.compaction`, types.ts:1079): an
+    /// extension-supplied compaction override (a `CompactionResult`: `{summary, firstKeptEntryId?,
+    /// tokensBefore?, details?}`). The LAST override wins across the chain; the producer threads its
+    /// `summary`/`details` into the appended compaction entry (marked `fromExtension`).
+    CompactionOverride(Value),
+    /// `session_before_tree` (Pi `SessionBeforeTreeResult`, types.ts:1082-1094): an extension-supplied
+    /// summary/customInstructions/label override for the branch summarization. Open-shaped.
+    TreeOverride(Value),
 }
 
 impl HostEvent {
@@ -102,6 +110,16 @@ impl HostEvent {
             // payload wholesale; the next handler sees the replacement.
             (HostEvent::BeforeProviderRequest { payload }, EventPatch::ProviderRequest(v)) => {
                 *payload = v;
+            }
+            // `session_before_compact` (Pi `SessionBeforeCompactResult.compaction`): capture the
+            // extension-supplied compaction override on the event so the producer folds it back.
+            (
+                HostEvent::SessionBeforeCompact { override_result, .. },
+                EventPatch::CompactionOverride(v),
+            ) => *override_result = Some(v),
+            // `session_before_tree` (Pi `SessionBeforeTreeResult`): capture the summary/label override.
+            (HostEvent::SessionBeforeTree { override_result, .. }, EventPatch::TreeOverride(v)) => {
+                *override_result = Some(v)
             }
             // Shape mismatch: ignore (degrade gracefully).
             _ => {}

@@ -57,6 +57,32 @@ pub enum UserBashReduction {
     Blocked { reason: Option<String>, by: ExtensionId },
 }
 
+/// The reduced result of [`ExtensionHost::emit_session_before_compact`] (Pi
+/// `SessionBeforeCompactResult`, types.ts:1077-1080): proceed with the default compaction, a veto
+/// (first block wins), or an extension-supplied compaction override (Pi `compaction: CompactionResult`).
+#[derive(Clone, Debug)]
+pub enum CompactionReduction {
+    /// No handler intervened — run the default (model) compaction.
+    Proceed,
+    /// A handler vetoed the compaction (Pi `{cancel:true}`); first block wins.
+    Blocked { reason: Option<String>, by: ExtensionId },
+    /// A handler supplied a compaction override (Pi `SessionBeforeCompactResult.compaction`) — the
+    /// producer threads its summary/details into the appended compaction entry (`fromExtension`).
+    Override(Value),
+}
+
+/// The reduced result of [`ExtensionHost::emit_session_before_tree`] (Pi `SessionBeforeTreeResult`,
+/// types.ts:1082-1094): proceed, a veto, or a summary/customInstructions/label override.
+#[derive(Clone, Debug)]
+pub enum TreeReduction {
+    /// No handler intervened — run the default branch summarization / navigation.
+    Proceed,
+    /// A handler vetoed the navigation (Pi `{cancel:true}`); first block wins.
+    Blocked { reason: Option<String>, by: ExtensionId },
+    /// A handler supplied a summary/customInstructions/label override (Pi `SessionBeforeTreeResult`).
+    Override(Value),
+}
+
 /// Configuration for the host (mode + cwd + UI availability drive the dispatch `HostCtx`).
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -359,6 +385,63 @@ impl ExtensionHost {
             Reduced::Blocked { reason, by } => UserBashReduction::Blocked { reason, by },
             Reduced::Handled(HandledValue(v)) => UserBashReduction::Handled(v),
             Reduced::Pass(_) => UserBashReduction::Continue,
+        }
+    }
+
+    /// Dispatch `session_before_compact` (Pi `emit("session_before_compact")`,
+    /// agent-session.ts:1672-1693; L4 gap #5). The guest sees the computed `preparation` + branch
+    /// entries + reason/willRetry and may veto (`block`) or return a compaction override (`mutate`,
+    /// Pi `SessionBeforeCompactResult.compaction`). Returns the reduced [`CompactionReduction`] for the
+    /// compaction producer to apply (proceed / cancel / thread the override into the entry).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn emit_session_before_compact(
+        &self,
+        preparation: Value,
+        branch_entries: Value,
+        custom_instructions: Option<String>,
+        reason: &str,
+        will_retry: bool,
+        cancel: &CancelToken,
+    ) -> CompactionReduction {
+        let ev = HostEvent::SessionBeforeCompact {
+            preparation,
+            branch_entries,
+            custom_instructions,
+            reason: reason.to_string(),
+            will_retry,
+            override_result: None,
+        };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Blocked { reason, by } => CompactionReduction::Blocked { reason, by },
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::SessionBeforeCompact { override_result: Some(v), .. } => {
+                    CompactionReduction::Override(v)
+                }
+                _ => CompactionReduction::Proceed,
+            },
+            // `session_before_compact` has no `handled` channel (Pi returns only cancel/compaction).
+            Reduced::Handled(_) => CompactionReduction::Proceed,
+        }
+    }
+
+    /// Dispatch `session_before_tree` (Pi `emit("session_before_tree")`, agent-session.ts:2752-2783;
+    /// L4 gap #5). The guest sees the computed `preparation` (`TreePreparation`) and may veto or return
+    /// a summary/customInstructions/label override. Returns the reduced [`TreeReduction`].
+    pub async fn emit_session_before_tree(
+        &self,
+        preparation: Value,
+        cancel: &CancelToken,
+    ) -> TreeReduction {
+        let ev = HostEvent::SessionBeforeTree { preparation, override_result: None };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Blocked { reason, by } => TreeReduction::Blocked { reason, by },
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::SessionBeforeTree { override_result: Some(v), .. } => {
+                    TreeReduction::Override(v)
+                }
+                _ => TreeReduction::Proceed,
+            },
+            Reduced::Handled(_) => TreeReduction::Proceed,
         }
     }
 

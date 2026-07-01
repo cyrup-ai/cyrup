@@ -50,7 +50,8 @@ pub use error::ExtError;
 pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
 pub use facade::{
-    BeforeAgentStartReduction, ExtensionHost, HostConfig, InputReduction, UserBashReduction,
+    BeforeAgentStartReduction, CompactionReduction, ExtensionHost, HostConfig, InputReduction,
+    TreeReduction, UserBashReduction,
 };
 pub use build::build_component;
 pub use hooks::ExtHooks;

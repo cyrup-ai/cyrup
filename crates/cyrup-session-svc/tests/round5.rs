@@ -249,7 +249,9 @@ impl NativeExtension for TreeVeto {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::SessionBeforeTree => HookOutcome::Block { reason: Some("vetoed".into()) },
+            HostEvent::SessionBeforeTree { .. } => {
+                HookOutcome::Block { reason: Some("vetoed".into()) }
+            }
             _ => HookOutcome::Noop,
         }
     }

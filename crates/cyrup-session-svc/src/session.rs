@@ -14,11 +14,13 @@ use cyrup_core::{
     ModelRef, ModelThinkingLevel, ProviderId, SessionId,
 };
 use cyrup_ext::host::ControlOp;
-use cyrup_ext::{HostEvent, InputEventSource, InputStreamingBehavior, Reduced};
+use cyrup_ext::{
+    CompactionReduction, HostEvent, InputEventSource, InputStreamingBehavior, Reduced, TreeReduction,
+};
 use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model};
 use cyrup_session::compaction::{
-    context_tokens_from_usage, estimate_context_tokens, BranchSummarySettings, CompactionReason,
-    CompactionSettings, Compactor, NoHooks,
+    context_tokens_from_usage, estimate_context_tokens, BranchSummarySettings, CompactionOverride,
+    CompactionPreparation, CompactionReason, CompactionSettings, Compactor, NoHooks,
 };
 use cyrup_session::context::SessionContext;
 use cyrup_session::manager::SessionManager;
@@ -1036,17 +1038,49 @@ impl AgentSession {
         *Self::lock(&self.compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
-        // session_before_compact ext hook: a handler may veto (cancel) the compaction
-        // (agent-session.ts:1672-1693).
-        if !self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::SessionBeforeCompact)
+        let model = { Self::lock(&self.compaction_model).clone() };
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
+        let compactor = Compactor::new(summarizer, NoHooks);
+        let settings = self.compaction_settings.clone();
+
+        // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
+        // then fires `session_before_compact` against it, agent-session.ts:1663-1693; L4 gap #5).
+        // `None` ⇒ nothing to compact — this is the ONLY preparation (no double-prep: the same
+        // `prep` feeds `run_compaction_prepared` below).
+        let (prep, branch_entries) = {
+            let guard = self.manager.lock().await;
+            match compactor.prepare(&guard, &settings) {
+                Some(x) => x,
+                None => {
+                    drop(guard);
+                    *Self::lock(&self.compaction_cancel) = None;
+                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: None,
+                    })
+                    .await;
+                    return Ok(None);
+                }
+            }
+        };
+
+        // session_before_compact ext hook: veto (cancel) OR return a compaction override, both seen
+        // against the real preparation (agent-session.ts:1672-1693).
+        let external_override = match self
+            .emit_before_compact(
+                &prep,
+                &branch_entries,
+                custom_instructions.as_deref(),
+                reason,
+                false,
+                &cancel,
+            )
+            .await
         {
-            let reduced = self
-                .services
-                .ext_host
-                .dispatcher()
-                .dispatch_block_mutate(HostEvent::SessionBeforeCompact, &cancel)
-                .await;
-            if matches!(reduced, Reduced::Blocked { .. }) {
+            BeforeCompactOutcome::Cancel => {
                 *Self::lock(&self.compaction_cancel) = None;
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
@@ -1058,21 +1092,21 @@ impl AgentSession {
                 .await;
                 return Ok(None);
             }
-        }
-
-        let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
-        let compactor = Compactor::new(summarizer, NoHooks);
+            BeforeCompactOutcome::Proceed(ov) => ov,
+        };
 
         let mut guard = self.manager.lock().await;
         let result = compactor
-            .run_compaction(
+            .run_compaction_prepared(
                 &mut guard,
                 &model,
-                &self.compaction_settings,
+                &settings,
                 reason,
                 custom_instructions,
                 false,
+                &prep,
+                branch_entries,
+                external_override,
                 cancel,
             )
             .await;
@@ -1095,13 +1129,20 @@ impl AgentSession {
                     estimated_tokens_after,
                     details: entry.details.clone(),
                 };
-                // session_compact ext notify (agent-session.ts:1740-1747).
+                // session_compact ext notify (agent-session.ts:1740-1747): the full Pi payload —
+                // the produced compaction entry, whether an extension drove it, reason, retry flag.
                 let notify_cancel = self.session_cancel.child_token();
                 self.services
                     .ext_host
                     .dispatcher()
                     .dispatch_notify(
-                        &HostEvent::SessionCompact { summary: cr.summary.clone() },
+                        &HostEvent::SessionCompact {
+                            compaction_entry: serde_json::to_value(&entry)
+                                .unwrap_or(serde_json::Value::Null),
+                            from_extension: entry.from_hook,
+                            reason: compaction_reason_str(reason).to_string(),
+                            will_retry: false,
+                        },
                         &notify_cancel,
                     )
                     .await;
@@ -1143,6 +1184,49 @@ impl AgentSession {
                 .await;
                 Err(e.into())
             }
+        }
+    }
+
+    /// Fire the `session_before_compact` extension hook against a REAL preparation and reduce the
+    /// guest's decision (L4 gap #5). Shared by manual [`Self::compact`] and [`Self::run_auto_compaction`].
+    /// Returns [`BeforeCompactOutcome::Cancel`] on a veto, else the (optional) compaction override.
+    async fn emit_before_compact(
+        &self,
+        prep: &CompactionPreparation,
+        branch_entries: &[cyrup_session::entry::Entry],
+        custom_instructions: Option<&str>,
+        reason: CompactionReason,
+        will_retry: bool,
+        cancel: &CancelToken,
+    ) -> BeforeCompactOutcome {
+        if self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::SessionBeforeCompact)
+        {
+            return BeforeCompactOutcome::Proceed(None);
+        }
+        let preparation = compaction_preparation_value(prep);
+        let branch = serde_json::to_value(branch_entries).unwrap_or_else(|_| serde_json::json!([]));
+        match self
+            .services
+            .ext_host
+            .emit_session_before_compact(
+                preparation,
+                branch,
+                custom_instructions.map(str::to_string),
+                compaction_reason_str(reason),
+                will_retry,
+                cancel,
+            )
+            .await
+        {
+            CompactionReduction::Blocked { .. } => BeforeCompactOutcome::Cancel,
+            CompactionReduction::Override(v) => {
+                BeforeCompactOutcome::Proceed(Some(parse_compaction_override(&v)))
+            }
+            CompactionReduction::Proceed => BeforeCompactOutcome::Proceed(None),
         }
     }
 
@@ -1225,97 +1309,150 @@ impl AgentSession {
         };
         use cyrup_session::entry::{Entry, KnownEntry};
 
-        // session_before_tree veto hook (agent-session.ts:2752-2783). cyrup's `SessionBeforeTree`
-        // carries no preparation payload and the dispatcher only models the cancel decision; the
-        // instruction/label override-return is the wasm-host return-value path (gap #13 tail), so the
-        // override knobs are taken from the caller's `options`.
+        // Phase 1 (guard held): read the session to compute the navigation target + the branch
+        // collection, then build the real `TreePreparation` for the extension hook. The guard is
+        // RELEASED before the hook so a guest may read the session during `session_before_tree`
+        // without a re-entrant manager-lock deadlock (agent-session.ts:2704-2751; L4 gap #5).
+        let (old_leaf, new_leaf, editor_text, collection, common_ancestor_id) = {
+            let guard = self.manager.lock().await;
+            let old_leaf = guard.leaf_id().cloned();
+
+            // No-op if already at target, BEFORE the hook (agent-session.ts:2712).
+            if old_leaf.as_ref() == Some(&target) {
+                return Ok(NavigateTreeOutcome::default());
+            }
+
+            // Target must exist (agent-session.ts:2721).
+            let target_entry = guard
+                .entry(&target)
+                .cloned()
+                .ok_or_else(|| SessionServiceError::InvalidForkEntry(target.to_string()))?;
+
+            // Determine the new leaf position + re-editable text by target type
+            // (agent-session.ts:2823-2841).
+            let (new_leaf, editor_text): (Option<EntryId>, Option<String>) = match &target_entry {
+                Entry::Known(KnownEntry::Message { .. })
+                    if user_message_text(&target_entry).is_some() =>
+                {
+                    (target_entry.parent_id(), user_message_text(&target_entry))
+                }
+                Entry::Known(KnownEntry::CustomMessage { content, .. }) => {
+                    (target_entry.parent_id(), Some(custom_message_text(content)))
+                }
+                _ => (Some(target.clone()), None),
+            };
+
+            let old_path: Vec<Entry> =
+                guard.branch_path(old_leaf.as_ref()).into_iter().cloned().collect();
+            let target_path: Vec<Entry> =
+                guard.branch_path(Some(&target)).into_iter().cloned().collect();
+            let collection = collect_entries_for_branch_summary(&old_path, &target_path);
+            let common_ancestor_id = collection.common_ancestor_id.clone();
+            (old_leaf, new_leaf, editor_text, collection, common_ancestor_id)
+        };
+
+        // Phase 2 (no guard): session_before_tree ext hook — veto OR a summary/customInstructions/
+        // label override, against the real `TreePreparation` (agent-session.ts:2752-2783).
+        let mut eff_custom_instructions = options.custom_instructions.clone();
+        let mut eff_replace_instructions = options.replace_instructions;
+        let mut eff_label = options.label.clone();
+        let mut override_summary: Option<(String, serde_json::Value)> = None;
         if !self
             .services
             .ext_host
             .dispatcher()
             .no_subscribers(cyrup_ext::EventKind::SessionBeforeTree)
         {
+            let preparation = serde_json::json!({
+                "targetId": target,
+                "oldLeafId": old_leaf,
+                "commonAncestorId": common_ancestor_id,
+                "entriesToSummarize": collection.entries,
+                "userWantsSummary": options.summarize,
+                "customInstructions": options.custom_instructions,
+                "replaceInstructions": options.replace_instructions,
+                "label": options.label,
+            });
             let cancel = self.session_cancel.child_token();
-            let reduced = self
-                .services
-                .ext_host
-                .dispatcher()
-                .dispatch_block_mutate(HostEvent::SessionBeforeTree, &cancel)
-                .await;
-            if matches!(reduced, Reduced::Blocked { .. }) {
-                return Ok(NavigateTreeOutcome { cancelled: true, ..Default::default() });
-            }
-        }
-
-        let mut guard = self.manager.lock().await;
-        let old_leaf = guard.leaf_id().cloned();
-
-        // No-op if already at target (agent-session.ts:2712).
-        if old_leaf.as_ref() == Some(&target) {
-            return Ok(NavigateTreeOutcome::default());
-        }
-
-        // Target must exist (agent-session.ts:2721).
-        let target_entry = guard
-            .entry(&target)
-            .cloned()
-            .ok_or_else(|| SessionServiceError::InvalidForkEntry(target.to_string()))?;
-
-        // Determine the new leaf position + re-editable text by target type
-        // (agent-session.ts:2823-2841).
-        let (new_leaf, editor_text): (Option<EntryId>, Option<String>) = match &target_entry {
-            Entry::Known(KnownEntry::Message { .. }) if user_message_text(&target_entry).is_some() => {
-                (target_entry.parent_id(), user_message_text(&target_entry))
-            }
-            Entry::Known(KnownEntry::CustomMessage { content, .. }) => {
-                (target_entry.parent_id(), Some(custom_message_text(content)))
-            }
-            _ => (Some(target.clone()), None),
-        };
-
-        // Summarize the abandoned branch when requested + there is something to summarize
-        // (agent-session.ts:2787). Pi still appends the non-empty "No content to summarize"
-        // placeholder, so we gate only on the collected entry count, not the prepared messages.
-        let mut summary_payload: Option<(String, serde_json::Value)> = None;
-        if options.summarize {
-            let old_path: Vec<Entry> =
-                guard.branch_path(old_leaf.as_ref()).into_iter().cloned().collect();
-            let target_path: Vec<Entry> =
-                guard.branch_path(Some(&target)).into_iter().cloned().collect();
-            let collection = collect_entries_for_branch_summary(&old_path, &target_path);
-            if !collection.entries.is_empty() {
-                let model = Self::lock(&self.compaction_model).clone();
-                let budget = u32::try_from(model.context_window)
-                    .unwrap_or(u32::MAX)
-                    .saturating_sub(self.branch_summary_settings.reserve_tokens);
-                let prep = prepare_branch_entries(&collection.entries, budget);
-                let cancel = self.session_cancel.child_token();
-                *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
-                let result = self
-                    .generate_branch_summary_with_instructions(
-                        &prep,
-                        &model,
-                        options.custom_instructions.as_deref(),
-                        options.replace_instructions,
-                        cancel,
-                    )
-                    .await;
-                *Self::lock(&self.branch_summary_cancel) = None;
-                match result {
-                    Ok(text) => {
-                        let details = serde_json::to_value(prep.file_ops.to_details())
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        summary_payload = Some((text, details));
-                    }
-                    Err(cyrup_session::compaction::CompactionError::Aborted) => {
-                        return Ok(NavigateTreeOutcome {
-                            cancelled: true,
-                            aborted: true,
-                            ..Default::default()
-                        });
-                    }
-                    Err(e) => return Err(e.into()),
+            match self.services.ext_host.emit_session_before_tree(preparation, &cancel).await {
+                TreeReduction::Blocked { .. } => {
+                    return Ok(NavigateTreeOutcome { cancelled: true, ..Default::default() });
                 }
+                TreeReduction::Override(v) => {
+                    if let Some(ci) = v.get("customInstructions").and_then(|s| s.as_str()) {
+                        eff_custom_instructions = Some(ci.to_string());
+                    }
+                    if let Some(ri) = v.get("replaceInstructions").and_then(serde_json::Value::as_bool)
+                    {
+                        eff_replace_instructions = ri;
+                    }
+                    if let Some(lbl) = v.get("label").and_then(|s| s.as_str()) {
+                        eff_label = Some(lbl.to_string());
+                    }
+                    // A summary override (Pi `SessionBeforeTreeResult.summary = {summary, details?}`)
+                    // is used directly as the branch summary (fromExtension), skipping the model.
+                    if let Some(s) = v.get("summary") {
+                        let text = s
+                            .get("summary")
+                            .and_then(|t| t.as_str())
+                            .or_else(|| s.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let details =
+                            s.get("details").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        override_summary = Some((text, details));
+                    }
+                }
+                TreeReduction::Proceed => {}
+            }
+        }
+
+        // Phase 3 (guard re-held): summarize the abandoned branch (unless the extension supplied the
+        // summary) + apply the navigation, threading the (possibly overridden) instructions/label.
+        let mut guard = self.manager.lock().await;
+
+        let mut from_extension_summary = false;
+        let mut summary_payload: Option<(String, serde_json::Value)> = None;
+        if let Some((text, details)) = override_summary {
+            // The extension supplied the branch summary directly (agent-session.ts:2762-2775).
+            if options.summarize {
+                summary_payload = Some((text, details));
+                from_extension_summary = true;
+            }
+        } else if options.summarize && !collection.entries.is_empty() {
+            // Summarize the abandoned branch (agent-session.ts:2787). Pi still appends the non-empty
+            // "No content to summarize" placeholder, so we gate only on the collected entry count.
+            let model = Self::lock(&self.compaction_model).clone();
+            let budget = u32::try_from(model.context_window)
+                .unwrap_or(u32::MAX)
+                .saturating_sub(self.branch_summary_settings.reserve_tokens);
+            let prep = prepare_branch_entries(&collection.entries, budget);
+            let cancel = self.session_cancel.child_token();
+            *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+            let result = self
+                .generate_branch_summary_with_instructions(
+                    &prep,
+                    &model,
+                    eff_custom_instructions.as_deref(),
+                    eff_replace_instructions,
+                    cancel,
+                )
+                .await;
+            *Self::lock(&self.branch_summary_cancel) = None;
+            match result {
+                Ok(text) => {
+                    let details = serde_json::to_value(prep.file_ops.to_details())
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    summary_payload = Some((text, details));
+                }
+                Err(cyrup_session::compaction::CompactionError::Aborted) => {
+                    return Ok(NavigateTreeOutcome {
+                        cancelled: true,
+                        aborted: true,
+                        ..Default::default()
+                    });
+                }
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -1326,10 +1463,10 @@ impl AgentSession {
                     new_leaf.as_ref(),
                     text.clone(),
                     Some(details.clone()),
-                    false,
+                    from_extension_summary,
                 )?;
                 let entry = branch_summary_entry_of(&guard, &id);
-                if let Some(label) = options.label.as_deref() {
+                if let Some(label) = eff_label.as_deref() {
                     guard.append_label(&id, Some(label))?;
                 }
                 entry
@@ -1340,7 +1477,7 @@ impl AgentSession {
                     Some(id) => guard.branch(id)?,
                 }
                 // No summary entry to label → label the navigation target itself.
-                if let Some(label) = options.label.as_deref() {
+                if let Some(label) = eff_label.as_deref() {
                     guard.append_label(&target, Some(label))?;
                 }
                 None
@@ -1366,7 +1503,7 @@ impl AgentSession {
                 "newLeafId": new_leaf_id,
                 "oldLeafId": old_leaf,
                 "summaryEntry": summary_entry,
-                "fromExtension": summary_payload.as_ref().map(|_| false),
+                "fromExtension": summary_payload.as_ref().map(|_| from_extension_summary),
             });
             let notify_cancel = self.session_cancel.child_token();
             self.services
@@ -2822,19 +2959,39 @@ impl AgentSession {
         *Self::lock(&self.auto_compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
-        if !self
-            .services
-            .ext_host
-            .dispatcher()
-            .no_subscribers(cyrup_ext::EventKind::SessionBeforeCompact)
+        let model = { Self::lock(&self.compaction_model).clone() };
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
+        let compactor = Compactor::new(summarizer, NoHooks);
+        let settings = self.effective_compaction_settings();
+
+        // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
+        let (prep, branch_entries) = {
+            let guard = self.manager.lock().await;
+            match compactor.prepare(&guard, &settings) {
+                Some(x) => x,
+                None => {
+                    drop(guard);
+                    *Self::lock(&self.auto_compaction_cancel) = None;
+                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: None,
+                    })
+                    .await;
+                    return Ok(false);
+                }
+            }
+        };
+
+        // session_before_compact ext hook: veto OR compaction override, against the real preparation
+        // (agent-session.ts:1980-1990).
+        let external_override = match self
+            .emit_before_compact(&prep, &branch_entries, None, reason, will_retry, &cancel)
+            .await
         {
-            let reduced = self
-                .services
-                .ext_host
-                .dispatcher()
-                .dispatch_block_mutate(HostEvent::SessionBeforeCompact, &cancel)
-                .await;
-            if matches!(reduced, Reduced::Blocked { .. }) {
+            BeforeCompactOutcome::Cancel => {
                 *Self::lock(&self.auto_compaction_cancel) = None;
                 // Pi agent-session.ts:1984-1990: a cancelling handler emits aborted:true, willRetry:false.
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
@@ -2847,15 +3004,23 @@ impl AgentSession {
                 .await;
                 return Ok(false);
             }
-        }
+            BeforeCompactOutcome::Proceed(ov) => ov,
+        };
 
-        let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
-        let compactor = Compactor::new(summarizer, NoHooks);
-        let settings = self.effective_compaction_settings();
         let mut guard = self.manager.lock().await;
         let result = compactor
-            .run_compaction(&mut guard, &model, &settings, reason, None, false, cancel)
+            .run_compaction_prepared(
+                &mut guard,
+                &model,
+                &settings,
+                reason,
+                None,
+                will_retry,
+                &prep,
+                branch_entries,
+                external_override,
+                cancel,
+            )
             .await;
         match result {
             Ok(Some(entry)) => {
@@ -2880,7 +3045,13 @@ impl AgentSession {
                     .ext_host
                     .dispatcher()
                     .dispatch_notify(
-                        &HostEvent::SessionCompact { summary: entry.summary.clone() },
+                        &HostEvent::SessionCompact {
+                            compaction_entry: serde_json::to_value(&entry)
+                                .unwrap_or(serde_json::Value::Null),
+                            from_extension: entry.from_hook,
+                            reason: compaction_reason_str(reason).to_string(),
+                            will_retry,
+                        },
                         &notify_cancel,
                     )
                     .await;
@@ -3132,6 +3303,52 @@ fn agent_user_text(m: &AgentMessage) -> Option<String> {
                 .join(""),
         ),
         _ => None,
+    }
+}
+
+/// The reduced `session_before_compact` decision (L4 gap #5): cancel the compaction, or proceed with
+/// an optional extension-supplied compaction override.
+enum BeforeCompactOutcome {
+    /// A handler vetoed the compaction (Pi `{cancel:true}`).
+    Cancel,
+    /// Proceed — `Some` carries the guest's compaction override (Pi
+    /// `SessionBeforeCompactResult.compaction`), `None` runs the default model summarization.
+    Proceed(Option<CompactionOverride>),
+}
+
+/// Serialize a [`CompactionPreparation`] into the Pi `CompactionPreparation` byte-shape (camelCase)
+/// for the `session_before_compact` seam (compaction.ts:634-650): the guest reads the real cut point,
+/// the messages to summarize, the file operations, and the compaction settings.
+fn compaction_preparation_value(prep: &CompactionPreparation) -> serde_json::Value {
+    serde_json::json!({
+        "firstKeptEntryId": prep.first_kept_entry_id,
+        "messagesToSummarize": prep.messages_to_summarize,
+        "turnPrefixMessages": prep.turn_prefix_messages,
+        "isSplitTurn": prep.is_split_turn,
+        "tokensBefore": prep.tokens_before,
+        "previousSummary": prep.previous_summary,
+        "fileOps": prep.file_ops.to_details(),
+        "settings": prep.settings,
+    })
+}
+
+/// Parse a guest compaction override (Pi `SessionBeforeCompactResult.compaction`, a `CompactionResult`)
+/// into a [`CompactionOverride`]. A missing `summary` degrades to empty (never a panic).
+fn parse_compaction_override(v: &serde_json::Value) -> CompactionOverride {
+    CompactionOverride {
+        summary: v.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        first_kept_entry_id: v.get("firstKeptEntryId").and_then(|s| s.as_str()).map(EntryId::from),
+        tokens_before: v.get("tokensBefore").and_then(serde_json::Value::as_u64),
+        details: v.get("details").cloned(),
+    }
+}
+
+/// The Pi wire string for a compaction `reason` (`"manual"|"threshold"|"overflow"`).
+fn compaction_reason_str(r: CompactionReason) -> &'static str {
+    match r {
+        CompactionReason::Manual => "manual",
+        CompactionReason::Threshold => "threshold",
+        CompactionReason::Overflow => "overflow",
     }
 }
 

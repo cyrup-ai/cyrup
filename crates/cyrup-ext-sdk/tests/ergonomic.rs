@@ -381,9 +381,9 @@ fn all_thirty_events_are_registerable() {
     api.on_thinking_level_select(|_, _| {});
     api.on_session_before_switch(|_, _| Outcome::noop());
     api.on_session_before_fork(|_, _| Outcome::noop());
-    api.on_session_before_compact(|_| Outcome::noop());
+    api.on_session_before_compact(|_, _| Outcome::noop());
     api.on_session_compact(|_, _| {});
-    api.on_session_before_tree(|_| Outcome::noop());
+    api.on_session_before_tree(|_, _| Outcome::noop());
     api.on_session_tree(|_, _| {});
 
     let kinds = api.subscription_kinds();

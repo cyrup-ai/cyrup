@@ -290,9 +290,36 @@ pub enum HostEvent {
     // session control lifecycle (Pi types.ts:1148-1156)
     SessionBeforeSwitch { target_id: String },
     SessionBeforeFork { entry_id: String },
-    SessionBeforeCompact,
-    SessionCompact { summary: String },
-    SessionBeforeTree,
+    /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587): the computed
+    /// `preparation` (`CompactionPreparation`), the `branch_entries` in scope, optional
+    /// `custom_instructions`, the trigger `reason` (`"manual"|"threshold"|"overflow"`), and
+    /// `will_retry`. A handler may veto (`block`) or return a compaction override via `mutate` — the
+    /// folded override lands in `override_result` (Pi `SessionBeforeCompactResult.compaction`).
+    SessionBeforeCompact {
+        preparation: Value,
+        branch_entries: Value,
+        custom_instructions: Option<String>,
+        reason: String,
+        will_retry: bool,
+        /// The guest's compaction override, folded from a `mutate` outcome (`None` = no override).
+        override_result: Option<Value>,
+    },
+    /// `session_compact` (Pi `SessionCompactEvent`, types.ts:589-598): the produced compaction entry
+    /// (its `summary` carries the text), whether an extension drove it, the trigger reason, retry flag.
+    SessionCompact {
+        compaction_entry: Value,
+        from_extension: bool,
+        reason: String,
+        will_retry: bool,
+    },
+    /// `session_before_tree` (Pi `SessionBeforeTreeEvent`, types.ts:623-628): the computed
+    /// `preparation` (`TreePreparation`). A handler may veto (`block`) or return a
+    /// summary/customInstructions/label override via `mutate` (folded into `override_result`).
+    SessionBeforeTree {
+        preparation: Value,
+        /// The guest's tree override, folded from a `mutate` outcome (`None` = no override).
+        override_result: Option<Value>,
+    },
     SessionTree { tree: Value },
 }
 
@@ -326,9 +353,9 @@ impl HostEvent {
             HostEvent::ThinkingLevelSelect { .. } => K::ThinkingLevelSelect,
             HostEvent::SessionBeforeSwitch { .. } => K::SessionBeforeSwitch,
             HostEvent::SessionBeforeFork { .. } => K::SessionBeforeFork,
-            HostEvent::SessionBeforeCompact => K::SessionBeforeCompact,
+            HostEvent::SessionBeforeCompact { .. } => K::SessionBeforeCompact,
             HostEvent::SessionCompact { .. } => K::SessionCompact,
-            HostEvent::SessionBeforeTree => K::SessionBeforeTree,
+            HostEvent::SessionBeforeTree { .. } => K::SessionBeforeTree,
             HostEvent::SessionTree { .. } => K::SessionTree,
         }
     }

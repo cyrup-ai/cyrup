@@ -167,12 +167,13 @@ fn session_compact_is_pi_shaped() {
     );
 }
 
-/// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:575-586): a NEW ready struct
-/// (the prior event had no payload). Serializable shape: `{branchEntries, customInstructions?,
-/// reason, willRetry}` (Pi `preparation` + the non-serializable `signal` are omitted from the seam).
+/// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587). Serializable shape:
+/// `{preparation, branchEntries, customInstructions?, reason, willRetry}` — the computed
+/// `CompactionPreparation` now crosses the seam (L4 gap #5); the non-serializable `signal` is omitted.
 #[test]
 fn session_before_compact_is_pi_shaped() {
     let ev = SessionBeforeCompactEvent {
+        preparation: json!({ "firstKeptEntryId": "e3", "tokensBefore": 42 }),
         branch_entries: json!([{ "id": "e1" }]),
         custom_instructions: Some("be terse".into()),
         reason: "threshold".into(),
@@ -181,14 +182,16 @@ fn session_before_compact_is_pi_shaped() {
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
         json!({
+            "preparation": { "firstKeptEntryId": "e3", "tokensBefore": 42 },
             "branchEntries": [{ "id": "e1" }],
             "customInstructions": "be terse",
             "reason": "threshold",
             "willRetry": true
         })
     );
-    // `customInstructions?` is Pi-optional (types.ts:580): None must be omitted.
+    // `customInstructions?` is Pi-optional (types.ts:581): None must be omitted.
     let ev2 = SessionBeforeCompactEvent {
+        preparation: json!({}),
         branch_entries: json!([]),
         custom_instructions: None,
         reason: "overflow".into(),

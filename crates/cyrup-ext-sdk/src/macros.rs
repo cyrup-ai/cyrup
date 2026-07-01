@@ -207,11 +207,28 @@ macro_rules! export_extension {
                 fn on_session_before_fork(entry_id: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(25, &[&entry_id])
                 }
-                fn on_session_before_compact() -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(26, &[])
+                fn on_session_before_compact(
+                    preparation_json: ::std::string::String,
+                    branch_entries_json: ::std::string::String,
+                    custom_instructions: ::core::option::Option<::std::string::String>,
+                    reason: ::std::string::String,
+                    will_retry: bool,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(
+                        26,
+                        &[
+                            &preparation_json,
+                            &branch_entries_json,
+                            custom_instructions.as_deref().unwrap_or(""),
+                            &reason,
+                            $crate::guest::b(will_retry),
+                        ],
+                    )
                 }
-                fn on_session_before_tree() -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(28, &[])
+                fn on_session_before_tree(
+                    preparation_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(28, &[&preparation_json])
                 }
 
                 // --- notify-only hooks ---
@@ -275,8 +292,21 @@ macro_rules! export_extension {
                 fn on_thinking_level_select(level: ::std::string::String) {
                     $crate::guest::notify(23, &[&level]);
                 }
-                fn on_session_compact(summary: ::std::string::String) {
-                    $crate::guest::notify(27, &[&summary]);
+                fn on_session_compact(
+                    compaction_entry_json: ::std::string::String,
+                    from_extension: bool,
+                    reason: ::std::string::String,
+                    will_retry: bool,
+                ) {
+                    $crate::guest::notify(
+                        27,
+                        &[
+                            &compaction_entry_json,
+                            $crate::guest::b(from_extension),
+                            &reason,
+                            $crate::guest::b(will_retry),
+                        ],
+                    );
                 }
                 fn on_session_tree(tree_json: ::std::string::String) {
                     $crate::guest::notify(29, &[&tree_json]);

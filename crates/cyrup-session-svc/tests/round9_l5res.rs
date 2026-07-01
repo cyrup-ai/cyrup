@@ -17,7 +17,8 @@ use cyrup_core::{
     Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::{
-    CommandDescriptor, EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
+    CommandDescriptor, EventKind, EventPatch, ExtError, HostCtx, HostEvent, HookOutcome, InitApi,
+    NativeExtension,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
@@ -420,4 +421,93 @@ async fn execute_bash_emits_user_bash_with_live_values() {
     assert_eq!(seen[0].0, "echo hello", "the live command is delivered");
     assert!(seen[0].1, "the !!-prefix excludeFromContext flag is delivered");
     assert_eq!(seen[0].2, fx.cwd.display().to_string(), "the agent cwd is delivered");
+}
+
+// ============================================ L4 gap #5: session_before_compact typed override ====
+
+/// A native extension subscribed to `session_before_compact` that READS the typed
+/// `CompactionPreparation` off the event and returns a custom-summary override (Pi
+/// `SessionBeforeCompactResult.compaction`, agent-session.ts:1672-1693). Records the preparation it
+/// observed so the test can assert the typed payload actually crossed the seam.
+struct CompactionOverrider {
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+#[async_trait::async_trait]
+impl NativeExtension for CompactionOverrider {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("compaction-overrider")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::SessionBeforeCompact]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::SessionBeforeCompact { preparation, reason, .. } => {
+                self.seen.lock().unwrap().push(preparation.clone());
+                // Derive the override summary from the REAL preparation so the assertion proves the
+                // typed payload was read, not fabricated.
+                let first_kept = preparation
+                    .get("firstKeptEntryId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                HookOutcome::Mutate(EventPatch::CompactionOverride(serde_json::json!({
+                    "summary": format!("ext-summary[{reason}|firstKept={first_kept}]"),
+                })))
+            }
+            _ => HookOutcome::Noop,
+        }
+    }
+}
+
+/// L4 gap #5: an ASSEMBLED manual compaction where a native guest reads the typed
+/// `CompactionPreparation` and returns a custom-summary override — the override lands in the appended
+/// compaction entry (`fromExtension`) and flows out as the `CompactionResult.summary`, replacing the
+/// default model summarization (no summarizer call needed).
+#[tokio::test]
+async fn compaction_before_compact_override_lands_in_entry() {
+    let fx = fixture();
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let faux = Arc::new(FauxProvider::new());
+    // Only the two turn responses — the override skips the model summarizer entirely.
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .with_native_extension(Arc::new(CompactionOverrider { seen: seen.clone() }))
+        .build()
+        .await
+        .expect("build");
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+
+    let result = session.compact(None).await.expect("compact must not error");
+    let cr = result.expect("an aggressive-keep compaction over two turns produces a result");
+
+    // The extension read a REAL preparation: it carries the Pi `CompactionPreparation` fields.
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed.len(), 1, "the before_compact hook fired exactly once");
+    let prep = &observed[0];
+    assert!(prep.get("firstKeptEntryId").is_some(), "typed preparation carries firstKeptEntryId: {prep}");
+    assert!(prep.get("messagesToSummarize").is_some(), "typed preparation carries messagesToSummarize: {prep}");
+    assert!(prep.get("tokensBefore").is_some(), "typed preparation carries tokensBefore: {prep}");
+
+    // The override summary landed in the resulting compaction entry (fromExtension), replacing the
+    // default model summary.
+    assert!(
+        cr.summary.starts_with("ext-summary[manual|firstKept="),
+        "the extension override summary lands in the compaction result: {}",
+        cr.summary
+    );
+
+    // And it is durable in the exported JSONL as a compaction entry.
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
+    assert!(jsonl.contains("ext-summary[manual"), "the override summary is persisted: {jsonl}");
+    assert!(jsonl.contains("\"type\":\"compaction\""), "a compaction entry was appended");
 }

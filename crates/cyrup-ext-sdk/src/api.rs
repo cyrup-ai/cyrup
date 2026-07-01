@@ -105,6 +105,16 @@ impl Outcome {
     pub fn before_agent_start(result: BeforeAgentStartResult) -> Self {
         Outcome::mutate(result)
     }
+    /// `session_before_compact`: supply a compaction override (Pi `SessionBeforeCompactResult.compaction`).
+    /// The override's summary/details land in the appended compaction entry (`fromExtension`).
+    pub fn compaction_override(result: SessionBeforeCompactResult) -> Self {
+        Outcome::mutate(result)
+    }
+    /// `session_before_tree`: supply a summary/customInstructions/label override (Pi
+    /// `SessionBeforeTreeResult`).
+    pub fn tree_override(result: SessionBeforeTreeResult) -> Self {
+        Outcome::mutate(result)
+    }
 
     pub(crate) fn into_raw(self) -> RawOutcome {
         match self {
@@ -543,11 +553,22 @@ impl ExtensionApi {
             f(SessionBeforeForkEvent { entry_id: arg(a, 0).into() }, c).into_raw()
         }));
     }
-    pub fn on_session_before_compact(&mut self, f: impl Fn(&Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_COMPACT, Box::new(move |_a, c| f(c).into_raw()));
+    pub fn on_session_before_compact(&mut self, f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static) {
+        self.handlers.insert(kind::SESSION_BEFORE_COMPACT, Box::new(move |a, c| {
+            let ev = SessionBeforeCompactEvent {
+                preparation: json(arg(a, 0)),
+                branch_entries: json(arg(a, 1)),
+                custom_instructions: opt_str(arg(a, 2)),
+                reason: arg(a, 3).into(),
+                will_retry: arg(a, 4) == "true",
+            };
+            f(ev, c).into_raw()
+        }));
     }
-    pub fn on_session_before_tree(&mut self, f: impl Fn(&Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_TREE, Box::new(move |_a, c| f(c).into_raw()));
+    pub fn on_session_before_tree(&mut self, f: impl Fn(SessionBeforeTreeEvent, &Ctx) -> Outcome + 'static) {
+        self.handlers.insert(kind::SESSION_BEFORE_TREE, Box::new(move |a, c| {
+            f(SessionBeforeTreeEvent { preparation: json(arg(a, 0)) }, c).into_raw()
+        }));
     }
 
     // --- notify-only subscriptions (return ignored) ---
@@ -616,16 +637,15 @@ impl ExtensionApi {
         self.handlers.insert(kind::THINKING_LEVEL_SELECT, notify(move |a, c| f(ThinkingLevelSelectEvent { level: arg(a, 0).into() }, c)));
     }
     pub fn on_session_compact(&mut self, f: impl Fn(SessionCompactEvent, &Ctx) + 'static) {
-        // The live host seam currently supplies only the summary string (the cyrup-session-svc
-        // producer is cross-crate, see couldNotClose): reconstruct the minimal Pi-shaped event with
-        // `compactionEntry = {summary}`. The struct SHAPE is Pi-correct & ready; `fromExtension`/
-        // `reason`/`willRetry` populate once the producer threads them through the seam.
+        // The host seam supplies the full Pi shape: the produced compaction entry, whether an
+        // extension drove it, the trigger reason, and the retry flag (L4 gap #5, wired through the
+        // cyrup-session-svc producer).
         self.handlers.insert(kind::SESSION_COMPACT, notify(move |a, c| {
             let ev = SessionCompactEvent {
-                compaction_entry: serde_json::json!({ "summary": arg(a, 0) }),
-                from_extension: false,
-                reason: String::new(),
-                will_retry: false,
+                compaction_entry: json(arg(a, 0)),
+                from_extension: arg(a, 1) == "true",
+                reason: arg(a, 2).into(),
+                will_retry: arg(a, 3) == "true",
             };
             f(ev, c)
         }));

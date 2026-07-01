@@ -101,6 +101,33 @@ pub fn build() -> ExtensionApi {
         }
     });
 
+    // session_before_compact (L4 gap #5): READ the computed typed preparation and return a custom
+    // summary override (Pi `SessionBeforeCompactResult.compaction`, agent-session.ts:1672-1693). The
+    // override's summary lands in the appended compaction entry (marked `fromExtension`). The demo
+    // derives the summary from the preparation so the test proves the typed payload crossed the seam.
+    api.on_session_before_compact(|ev, _ctx| {
+        // `preparation.firstKeptEntryId` is a real field of Pi's `CompactionPreparation`.
+        let first_kept = ev
+            .preparation
+            .get("firstKeptEntryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        Outcome::compaction_override(crate::SessionBeforeCompactResult {
+            summary: format!("demo-summary[{}|firstKept={first_kept}]", ev.reason),
+            ..Default::default()
+        })
+    });
+
+    // session_before_tree (L4 gap #5): READ the TreePreparation and override the branch-summary label
+    // (Pi `SessionBeforeTreeResult.label`). Proves the typed tree preparation crossed the seam.
+    api.on_session_before_tree(|ev, _ctx| {
+        let target = ev.preparation.get("targetId").and_then(|v| v.as_str()).unwrap_or("?");
+        Outcome::tree_override(crate::SessionBeforeTreeResult {
+            label: Some(format!("demo-tree-label[{target}]")),
+            ..Default::default()
+        })
+    });
+
     // A dynamically-registered tool (R-08-013/015): echoes its `text` argument, streaming a chunk.
     api.register_tool(
         ToolDescriptor::new(

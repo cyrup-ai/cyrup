@@ -195,9 +195,22 @@ interface events {
   // session control hooks (types.ts:1148-1156): before_* are block/mutate, the rest notify.
   on-session-before-switch:  func(target-id: string) -> hook-outcome;
   on-session-before-fork:    func(entry-id: string) -> hook-outcome;
-  on-session-before-compact: func() -> hook-outcome;
-  on-session-compact:        func(summary: string);
-  on-session-before-tree:    func() -> hook-outcome;
+  // session_before_compact (Pi SessionBeforeCompactEvent, types.ts:577-587): the computed
+  // `preparation` (CompactionPreparation, compaction.ts:634) + the `branch-entries` in scope + optional
+  // `custom-instructions` + the trigger `reason` ("manual"|"threshold"|"overflow") + `will-retry`. A
+  // handler may VETO via `block` or return a compaction override via `mutate` (Pi
+  // SessionBeforeCompactResult.compaction = a CompactionResult) — the override's summary/details land
+  // in the appended compaction entry (fromExtension). All payloads cross as serde_json strings.
+  on-session-before-compact: func(preparation-json: string, branch-entries-json: string, custom-instructions: option<string>, reason: string, will-retry: bool) -> hook-outcome;
+  // session_compact (Pi SessionCompactEvent, types.ts:589-598): the produced `compaction-entry` (its
+  // `summary` field carries the summary text), whether an extension drove it (`from-extension`), the
+  // trigger `reason`, and `will-retry`.
+  on-session-compact:        func(compaction-entry-json: string, from-extension: bool, reason: string, will-retry: bool);
+  // session_before_tree (Pi SessionBeforeTreeEvent, types.ts:623-628): the computed `preparation`
+  // (TreePreparation, compaction.ts) — targetId/oldLeafId/commonAncestorId/entriesToSummarize/
+  // userWantsSummary/customInstructions?/label?. A handler may VETO via `block` or return a
+  // summary/customInstructions/label override via `mutate` (Pi SessionBeforeTreeResult).
+  on-session-before-tree:    func(preparation-json: string) -> hook-outcome;
   on-session-tree:           func(tree-json: string);
 }
 

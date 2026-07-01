@@ -200,23 +200,40 @@ pub struct SessionBeforeForkEvent {
     pub entry_id: String,
 }
 
-/// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:575-586). Byte-shape:
-/// `{branchEntries, customInstructions?, reason, willRetry}` — the serializable payload (Pi's
-/// `preparation` and the non-serializable `signal: AbortSignal` are omitted from the seam). `reason`
-/// is `"manual"|"threshold"|"overflow"`. READY but not yet host-wired (see crate docs / couldNotClose:
-/// the `on-session-before-compact` host producer lives in cyrup-session-svc).
+/// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587). Byte-shape:
+/// `{preparation, branchEntries, customInstructions?, reason, willRetry}` — the computed
+/// `preparation` (Pi `CompactionPreparation`: firstKeptEntryId/messagesToSummarize/
+/// turnPrefixMessages/isSplitTurn/tokensBefore/previousSummary?/fileOps/settings), the branch
+/// entries in scope, optional custom instructions, the trigger `reason`
+/// (`"manual"|"threshold"|"overflow"`), and `willRetry`. The non-serializable `signal: AbortSignal`
+/// is omitted from the seam. A handler returns [`SessionBeforeCompactResult`] via
+/// [`crate::Outcome::compaction_override`] or vetoes via [`crate::Outcome::block`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionBeforeCompactEvent {
-    /// The session entries in scope for this compaction (Pi `branchEntries`, types.ts:579).
+    /// The computed compaction preparation (Pi `preparation: CompactionPreparation`, types.ts:579).
+    pub preparation: Value,
+    /// The session entries in scope for this compaction (Pi `branchEntries`, types.ts:580).
     pub branch_entries: Value,
-    /// Custom summarization instructions, if any (Pi `customInstructions?`, types.ts:580).
+    /// Custom summarization instructions, if any (Pi `customInstructions?`, types.ts:581).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
-    /// What triggered the compaction (Pi `reason`, types.ts:582).
+    /// What triggered the compaction (Pi `reason`, types.ts:583).
     pub reason: String,
-    /// True when the aborted turn is retried after compaction (Pi `willRetry`, types.ts:584).
+    /// True when the aborted turn is retried after compaction (Pi `willRetry`, types.ts:585).
     pub will_retry: bool,
+}
+
+/// `session_before_tree` (Pi `SessionBeforeTreeEvent`, types.ts:623-628). Byte-shape:
+/// `{preparation}` — the computed `TreePreparation` (targetId/oldLeafId/commonAncestorId/
+/// entriesToSummarize/userWantsSummary/customInstructions?/replaceInstructions?/label?). The
+/// non-serializable `signal: AbortSignal` is omitted. A handler returns [`SessionBeforeTreeResult`]
+/// via [`crate::Outcome::tree_override`] or vetoes via [`crate::Outcome::block`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeTreeEvent {
+    /// The computed tree-navigation preparation (Pi `preparation: TreePreparation`, types.ts:626).
+    pub preparation: Value,
 }
 
 /// `session_compact` (Pi `SessionCompactEvent`, types.ts:588-597). Byte-shape:
@@ -316,4 +333,44 @@ impl ProjectTrustResult {
     pub fn undecided() -> Self {
         Self { trusted: ProjectTrustDecision::Undecided, remember: false }
     }
+}
+
+/// `session_before_compact` compaction override (Pi `SessionBeforeCompactResult.compaction`, a
+/// `CompactionResult`, types.ts:1079 + compaction.ts:103-110). Returned via
+/// [`crate::Outcome::compaction_override`]: the `summary` (and optional `details`) replace the
+/// default model summarization and the appended compaction entry is marked `fromExtension`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeCompactResult {
+    /// The override summary text (Pi `CompactionResult.summary`).
+    pub summary: String,
+    /// The first kept entry id (Pi `CompactionResult.firstKeptEntryId`); `None` = keep the prepared cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_kept_entry_id: Option<String>,
+    /// The pre-compaction token count (Pi `CompactionResult.tokensBefore`); `None` = keep the prepared value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_before: Option<u64>,
+    /// Extension-specific structured details (Pi `CompactionResult.details?`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+/// `session_before_tree` override (Pi `SessionBeforeTreeResult`, types.ts:1082-1094). Returned via
+/// [`crate::Outcome::tree_override`]: an override summary (with optional details), and/or overridden
+/// `customInstructions`/`replaceInstructions`/`label` for the branch summarization.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeTreeResult {
+    /// An override branch summary (Pi `SessionBeforeTreeResult.summary?`, `{summary, details?}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<Value>,
+    /// Override custom summarization instructions (Pi `customInstructions?`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    /// Override whether `customInstructions` replaces the default prompt (Pi `replaceInstructions?`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_instructions: Option<bool>,
+    /// Override label to attach to the branch summary entry (Pi `label?`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }

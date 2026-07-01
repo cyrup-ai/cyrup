@@ -34,8 +34,8 @@ pub use error::CompactionError;
 pub use files::{format_file_operations, CompactionDetails, FileOps};
 pub use hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
-    BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionReason, NoHooks,
-    PostCompactEvent, PostTreeEvent,
+    BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionOverride, CompactionReason,
+    NoHooks, PostCompactEvent, PostTreeEvent,
 };
 pub use prepare::{prepare_compaction, CompactionPreparation};
 pub use serialize::serialize_conversation;
@@ -97,6 +97,21 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         est.tokens > window.saturating_sub(s.reserve_tokens)
     }
 
+    /// Prepare a compaction over the current branch WITHOUT running it (R-05-007; Pi
+    /// `prepareCompaction`, compaction.ts:652). Exposes the computed [`CompactionPreparation`] + the
+    /// branch path so a caller (the session service) can fire the external `session_before_compact`
+    /// extension hook against the REAL preparation, then feed the SAME prep back to
+    /// [`Self::run_compaction_prepared`] — no double-preparation. `None` ⇒ nothing to compact.
+    pub fn prepare(
+        &self,
+        session: &SessionManager,
+        settings: &CompactionSettings,
+    ) -> Option<(CompactionPreparation, Vec<Entry>)> {
+        let path: Vec<Entry> = session.branch_path(None).into_iter().cloned().collect();
+        let prep = prepare_compaction(&path, &self.cache, settings)?;
+        Some((prep, path))
+    }
+
     /// Run a full compaction: prepare → `before_compact` hook → (default | custom) summarize →
     /// append `CompactionEntry` → `post_compact`. Returns the appended entry, or `None` when there
     /// is nothing to compact or the hook cancelled (R-05-002/008/009/019/020/021).
@@ -111,62 +126,129 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         will_retry: bool,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
-        let path: Vec<Entry> = session.branch_path(None).into_iter().cloned().collect();
-        let prep = match prepare_compaction(&path, &self.cache, settings) {
-            Some(p) => p,
+        let (prep, path) = match self.prepare(session, settings) {
+            Some(x) => x,
             None => return Ok(None),
         };
+        self.finish_compaction(
+            session, model, settings, reason, custom_instructions, will_retry, &prep, path, None,
+            cancel,
+        )
+        .await
+    }
 
-        let event = BeforeCompactEvent {
-            messages_to_summarize: prep.messages_to_summarize.clone(),
-            turn_prefix_messages: prep.turn_prefix_messages.clone(),
-            previous_summary: prep.previous_summary.clone(),
-            file_ops: prep.file_ops.to_details(),
-            tokens_before: u64::from(prep.tokens_before),
-            first_kept_entry_id: prep.first_kept_entry_id.clone(),
-            settings: settings.clone(),
-            branch_entries: path.clone(),
-            custom_instructions: custom_instructions.clone(),
+    /// Run a compaction from an ALREADY-computed preparation (L4 gap #5). The session-service producer
+    /// calls [`Self::prepare`], fires the external `session_before_compact` extension hook against the
+    /// real prep, and then calls this — passing the guest's compaction override, if any (Pi
+    /// `SessionBeforeCompactResult.compaction`). The preparation is NOT recomputed (no double-prep);
+    /// `external_override` (when `Some`) replaces the default model summarization and the appended
+    /// entry is marked `fromExtension`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_compaction_prepared(
+        &self,
+        session: &mut SessionManager,
+        model: &Model,
+        settings: &CompactionSettings,
+        reason: CompactionReason,
+        custom_instructions: Option<String>,
+        will_retry: bool,
+        prep: &CompactionPreparation,
+        branch_entries: Vec<Entry>,
+        external_override: Option<CompactionOverride>,
+        cancel: CancelToken,
+    ) -> Result<Option<CompactionEntry>, CompactionError> {
+        self.finish_compaction(
+            session,
+            model,
+            settings,
             reason,
+            custom_instructions,
             will_retry,
-        };
+            prep,
+            branch_entries,
+            external_override,
+            cancel,
+        )
+        .await
+    }
 
-        // before-compact hook: cancel / supply custom summary / proceed (R-05-019/020).
-        let (summary, first_kept, tokens_before, details, from_hook) =
-            match self.hooks.before_compact(&event, cancel.child_token()).await? {
-                BeforeCompactDecision::Cancel => return Ok(None),
-                BeforeCompactDecision::Custom {
-                    summary,
-                    first_kept_entry_id,
-                    tokens_before,
-                    details,
-                } => (
-                    summary,
-                    first_kept_entry_id,
-                    tokens_before,
-                    details.unwrap_or_else(|| serde_json::json!({})),
-                    true,
-                ),
-                BeforeCompactDecision::Proceed => {
-                    let summary = compact_default(
-                        &self.summarizer,
-                        &prep,
-                        model,
-                        custom_instructions.as_deref(),
-                        cancel.clone(),
-                    )
-                    .await?;
-                    let details = serde_json::to_value(prep.file_ops.to_details())
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    (
+    /// Shared compaction tail: resolve the summary (external override > internal `before_compact` hook
+    /// > default model summarization), append the `CompactionEntry`, fire `post_compact`.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_compaction(
+        &self,
+        session: &mut SessionManager,
+        model: &Model,
+        settings: &CompactionSettings,
+        reason: CompactionReason,
+        custom_instructions: Option<String>,
+        will_retry: bool,
+        prep: &CompactionPreparation,
+        branch_entries: Vec<Entry>,
+        external_override: Option<CompactionOverride>,
+        cancel: CancelToken,
+    ) -> Result<Option<CompactionEntry>, CompactionError> {
+        let (summary, first_kept, tokens_before, details, from_hook) = match external_override {
+            // An external extension override (Pi `SessionBeforeCompactResult.compaction`) wins over
+            // the internal `CompactionHooks` seam: its summary/details land in the entry (fromExtension).
+            Some(ov) => (
+                ov.summary,
+                ov.first_kept_entry_id.unwrap_or_else(|| prep.first_kept_entry_id.clone()),
+                ov.tokens_before.unwrap_or(u64::from(prep.tokens_before)),
+                ov.details.unwrap_or_else(|| serde_json::json!({})),
+                true,
+            ),
+            None => {
+                let event = BeforeCompactEvent {
+                    messages_to_summarize: prep.messages_to_summarize.clone(),
+                    turn_prefix_messages: prep.turn_prefix_messages.clone(),
+                    previous_summary: prep.previous_summary.clone(),
+                    file_ops: prep.file_ops.to_details(),
+                    tokens_before: u64::from(prep.tokens_before),
+                    first_kept_entry_id: prep.first_kept_entry_id.clone(),
+                    settings: settings.clone(),
+                    branch_entries,
+                    custom_instructions: custom_instructions.clone(),
+                    reason,
+                    will_retry,
+                };
+                // before-compact hook: cancel / supply custom summary / proceed (R-05-019/020).
+                match self.hooks.before_compact(&event, cancel.child_token()).await? {
+                    BeforeCompactDecision::Cancel => return Ok(None),
+                    BeforeCompactDecision::Custom {
                         summary,
-                        prep.first_kept_entry_id.clone(),
-                        u64::from(prep.tokens_before),
+                        first_kept_entry_id,
+                        tokens_before,
                         details,
-                        false,
-                    )
+                    } => (
+                        summary,
+                        first_kept_entry_id,
+                        tokens_before,
+                        details.unwrap_or_else(|| serde_json::json!({})),
+                        true,
+                    ),
+                    BeforeCompactDecision::Proceed => {
+                        let summary = compact_default(
+                            &self.summarizer,
+                            prep,
+                            model,
+                            custom_instructions.as_deref(),
+                            cancel.clone(),
+                        )
+                        .await?;
+                        let details = serde_json::to_value(prep.file_ops.to_details())
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        (
+                            summary,
+                            prep.first_kept_entry_id.clone(),
+                            u64::from(prep.tokens_before),
+                            details,
+                            false,
+                        )
+                    }
                 }
-            };
+            }
+        };
 
         let id = session.append_compaction(
             summary,

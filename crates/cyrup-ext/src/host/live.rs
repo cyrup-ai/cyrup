@@ -1062,8 +1062,27 @@ async fn invoke(
         HostEvent::SessionBeforeFork { entry_id } => {
             api.call_on_session_before_fork(store, entry_id).await
         }
-        HostEvent::SessionBeforeCompact => api.call_on_session_before_compact(store).await,
-        HostEvent::SessionBeforeTree => api.call_on_session_before_tree(store).await,
+        HostEvent::SessionBeforeCompact {
+            preparation,
+            branch_entries,
+            custom_instructions,
+            reason,
+            will_retry,
+            ..
+        } => {
+            api.call_on_session_before_compact(
+                store,
+                &preparation.to_string(),
+                &branch_entries.to_string(),
+                custom_instructions.as_deref(),
+                reason,
+                *will_retry,
+            )
+            .await
+        }
+        HostEvent::SessionBeforeTree { preparation, .. } => {
+            api.call_on_session_before_tree(store, &preparation.to_string()).await
+        }
         // ---- notify-only: fire-and-forget, return Noop ----
         HostEvent::AgentStart => api.call_on_agent_start(store).await.and_then(|()| noop()),
         HostEvent::AgentEnd { messages } => {
@@ -1113,9 +1132,16 @@ async fn invoke(
         HostEvent::ThinkingLevelSelect { level } => {
             api.call_on_thinking_level_select(store, level).await.and_then(|()| noop())
         }
-        HostEvent::SessionCompact { summary } => {
-            api.call_on_session_compact(store, summary).await.and_then(|()| noop())
-        }
+        HostEvent::SessionCompact { compaction_entry, from_extension, reason, will_retry } => api
+            .call_on_session_compact(
+                store,
+                &compaction_entry.to_string(),
+                *from_extension,
+                reason,
+                *will_retry,
+            )
+            .await
+            .and_then(|()| noop()),
         HostEvent::SessionTree { tree } => {
             api.call_on_session_tree(store, &tree.to_string()).await.and_then(|()| noop())
         }
@@ -1208,6 +1234,11 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
         // `before_provider_request` (Pi runner.ts:962): the handler's return value REPLACES the
         // payload wholesale. The guest sends the replacement payload as the mutate value.
         EventKind::BeforeProviderRequest => Some(EventPatch::ProviderRequest(v)),
+        // `session_before_compact` / `session_before_tree` (Pi `SessionBeforeCompactResult.compaction`
+        // / `SessionBeforeTreeResult`): the guest's `mutate` value is the override bag; the producer
+        // interprets its shape (summary/details/label).
+        EventKind::SessionBeforeCompact => Some(EventPatch::CompactionOverride(v)),
+        EventKind::SessionBeforeTree => Some(EventPatch::TreeOverride(v)),
         // Other kinds have no typed patch shape (notify, or `user_bash`/discovery which use the
         // `handled` channel, not `mutate`); ignore.
         _ => None,
