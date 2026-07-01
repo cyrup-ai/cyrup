@@ -95,7 +95,7 @@ macro_rules! anthropic_fleet {
 }
 
 anthropic_fleet! {
-    "kimi-coding"       => (KIMI_CODING, "Kimi Coding", "KIMI_API_KEY", "kimi-coding"),
+    "kimi-coding"       => (KIMI_CODING, "Kimi For Coding", "KIMI_API_KEY", "kimi-coding"),
     "minimax"           => (MINIMAX, "MiniMax", "MINIMAX_API_KEY", "minimax"),
     "minimax-cn"        => (MINIMAX_CN, "MiniMax CN", "MINIMAX_CN_API_KEY", "minimax-cn"),
     "vercel-ai-gateway" => (VERCEL_AI_GATEWAY, "Vercel AI Gateway", "AI_GATEWAY_API_KEY", "vercel-ai-gateway"),
@@ -186,8 +186,8 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = anthropic_models();
-        // Every entry in Pi's `anthropic.models.ts` (25 models).
-        assert_eq!(models.len(), 25);
+        // Every entry in Pi's `anthropic.models.ts` (24 models).
+        assert_eq!(models.len(), 24);
         assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "anthropic"));
         assert!(models.iter().all(|m| m.base_url == ANTHROPIC_BASE_URL));
@@ -242,8 +242,8 @@ mod tests {
         assert_eq!(opus45.context_window, 200_000);
         assert_eq!(opus45.max_tokens, 64_000);
 
-        // Haiku 3.5 is a non-reasoning model.
-        assert!(!find("claude-3-5-haiku-latest").reasoning);
+        // Haiku 3 is a non-reasoning model.
+        assert!(!find("claude-3-haiku-20240307").reasoning);
     }
 
     #[test]
@@ -260,7 +260,7 @@ mod tests {
             ("kimi-coding", 3usize),
             ("minimax", 3),
             ("minimax-cn", 3),
-            ("vercel-ai-gateway", 185),
+            ("vercel-ai-gateway", 186),
         ];
         for (id, count) in expected {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));

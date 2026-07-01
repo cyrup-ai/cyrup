@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = opencode_models();
-        assert_eq!(models.len(), 45);
+        assert_eq!(models.len(), 48);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode"));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
         // The catalog spans all four wire protocols this provider declares (Pi opencode.ts:8-23).

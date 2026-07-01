@@ -53,6 +53,7 @@
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore};
 use crate::collection::{CreateModelsOptions, Models, create_models};
+use crate::images::{ImagesModels, ImagesProvider, create_images_models};
 use crate::provider::Provider;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
@@ -60,7 +61,8 @@ use crate::providers::{
     anthropic_provider_with, azure_openai_responses_provider_with,
     cloudflare_ai_gateway_provider_with, cloudflare_workers_ai_provider_with,
     fireworks_provider_with, google_provider_with, mistral_provider_with, openai_provider_with,
-    opencode_go_provider_with, opencode_provider_with, together_provider_with,
+    opencode_go_provider_with, opencode_provider_with, openrouter_images_provider,
+    together_provider_with,
 };
 use std::sync::Arc;
 
@@ -171,6 +173,22 @@ pub fn default_models(options: CreateModelsOptions) -> Models {
     models
 }
 
+/// Every built-in image-generation provider, freshly constructed (Pi `builtinImagesProviders`,
+/// `all.ts:120-122`). Currently just `openrouter-images` (Pi's only built-in image provider).
+pub fn all_images_providers() -> Vec<Arc<dyn ImagesProvider>> {
+    vec![Arc::new(openrouter_images_provider())]
+}
+
+/// An [`ImagesModels`] collection with every built-in image-generation provider registered (Pi
+/// `builtinImagesModels`, `all.ts:125-131`).
+pub fn default_images_models(options: CreateModelsOptions) -> ImagesModels {
+    let mut models = create_images_models(options);
+    for provider in all_images_providers() {
+        models.set_provider(provider);
+    }
+    models
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -236,6 +254,28 @@ mod tests {
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());
+    }
+
+    /// The built-in images collection registers `openrouter-images` (Pi `builtinImagesModels`,
+    /// `all.ts:125-131`) so an image model resolves out of the box.
+    #[test]
+    fn default_images_models_registers_openrouter() {
+        let models = default_images_models(CreateModelsOptions::default());
+        let ids: Vec<String> = models
+            .get_providers()
+            .iter()
+            .map(|p| p.id().to_string())
+            .collect();
+        assert!(
+            ids.iter().any(|id| id == "openrouter"),
+            "missing built-in image provider 'openrouter'"
+        );
+        assert!(
+            models
+                .get_model("openrouter", "google/gemini-2.5-flash-image")
+                .is_some(),
+            "expected openrouter image model resolvable"
+        );
     }
 
     /// Together's `moonshotai/Kimi-K2.6` resolves through the registry to the together provider.

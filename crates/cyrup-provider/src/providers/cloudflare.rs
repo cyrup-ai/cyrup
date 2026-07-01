@@ -510,17 +510,17 @@ mod tests {
 
     #[test]
     fn ai_gateway_catalog_parses_with_expected_api_mix() {
-        // Pi `cloudflare-ai-gateway.models.ts`: 37 models = 17 anthropic-messages + 4
+        // Pi `cloudflare-ai-gateway.models.ts`: 38 models = 18 anthropic-messages + 4
         // openai-completions + 16 openai-responses, all carrying the dual account/gateway placeholders.
         let models = cloudflare_ai_gateway_models();
-        assert_eq!(models.len(), 37);
+        assert_eq!(models.len(), 38);
         assert!(
             models
                 .iter()
                 .all(|m| m.provider.as_str() == "cloudflare-ai-gateway")
         );
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
-        assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 17);
+        assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 18);
         assert_eq!(count(OPENAI_COMPLETIONS), 4);
         assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 16);
         assert!(models.iter().all(|m| {
@@ -713,6 +713,6 @@ mod tests {
         let p = cloudflare_ai_gateway_provider();
         assert_eq!(p.id(), &ProviderId::from("cloudflare-ai-gateway"));
         assert_eq!(p.name(), "Cloudflare AI Gateway");
-        assert_eq!(p.models().len(), 37);
+        assert_eq!(p.models().len(), 38);
     }
 }

@@ -318,6 +318,17 @@ pub fn together_models() -> Vec<Model> {
             Some(m()),
             together_compat(false, Some(ThinkingFormat::Together)),
         ),
+        model(
+            "zai-org/GLM-5.2",
+            "GLM-5.2",
+            true,
+            false,
+            cost(1.4, 4.4, 0.26),
+            262_144,
+            164_000,
+            Some(m()),
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
     ]
 }
 
@@ -396,8 +407,8 @@ mod tests {
     #[test]
     fn full_catalog_ported_verbatim_from_pi() {
         let models = together_models();
-        // Every model id present in Pi's `together.models.ts` (19 entries).
-        assert_eq!(models.len(), 19);
+        // Every model id present in Pi's `together.models.ts` (20 entries).
+        assert_eq!(models.len(), 20);
         let find = |id: &str| {
             models
                 .iter()

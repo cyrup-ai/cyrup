@@ -76,8 +76,8 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = fireworks_models();
-        // Every entry in Pi's `fireworks.models.ts` (15 models).
-        assert_eq!(models.len(), 15);
+        // Every entry in Pi's `fireworks.models.ts` (16 models).
+        assert_eq!(models.len(), 16);
         assert!(models.iter().all(|m| m.provider.as_str() == "fireworks"));
         // Mixed-API: most models are anthropic-messages, glm-5p2 is openai-completions.
         assert!(models.iter().any(|m| m.api.as_str() == ANTHROPIC_MESSAGES));

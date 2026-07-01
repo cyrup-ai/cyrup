@@ -15,7 +15,9 @@ pub mod opencode_go;
 pub mod openrouter_images;
 pub mod together;
 
-pub use all::{all_providers, all_providers_with, default_models};
+pub use all::{
+    all_images_providers, all_providers, all_providers_with, default_images_models, default_models,
+};
 pub use anthropic::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
     anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,
