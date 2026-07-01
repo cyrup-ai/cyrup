@@ -28,6 +28,49 @@ pub fn all_available_models() -> Vec<cyrup_provider::Model> {
     models.get_models(None)
 }
 
+/// Resolve the launch `(provider_id, "provider/model_id")` for the **no-`--provider`/no-`--model`**
+/// default path, by Pi's `findInitialModel` precedence (model-resolver.ts:527-607, steps 3-4):
+///
+/// 1. the saved settings default `(defaultProvider, defaultModelId)` when it resolves in the full
+///    registry (Pi step 3, `modelRegistry.find`), else
+/// 2. the first *configured* provider's curated default model (Pi step 4, `getAvailable()` filtered
+///    to `hasConfiguredAuth`, scanning `defaultModelPerProvider`), else the first configured model.
+///
+/// Returns `Some((provider_id, pattern))` for a REAL configured provider so the caller launches on it
+/// (footer shows e.g. `together/moonshotai/Kimi-K2.6`), or `None` when NOTHING is configured — in
+/// which case the caller keeps the offline scripted [`FauxProvider`] as the fallback. `faux` is never
+/// returned here: it is not a registry entry (excluded from [`all_available_models`]), so it stays the
+/// fallback ONLY when this yields `None`. `has_configured_auth` mirrors Pi `modelRegistry`'s check (a
+/// provider with a stored credential / known env var such as `TOGETHER_API_KEY` / runtime `--api-key`).
+pub fn default_launch_model(
+    default_provider: Option<&str>,
+    default_model_id: Option<&str>,
+    has_configured_auth: &dyn Fn(&cyrup_provider::Model) -> bool,
+) -> Option<(String, String)> {
+    let all = all_available_models();
+    let available: Vec<cyrup_provider::Model> =
+        all.iter().filter(|m| has_configured_auth(m)).cloned().collect();
+    // No `--provider`/`--model`, no `--models` scope, fresh (non-continuing) session: Pi's step-1/2
+    // (CLI args / scoped) are inert, so this exercises steps 3-5 exactly.
+    let result = cyrup_config::find_initial_model(
+        None,
+        None,
+        &[],
+        false,
+        default_provider,
+        default_model_id,
+        None,
+        &all,
+        &available,
+        has_configured_auth,
+    );
+    result.model.map(|m| {
+        let provider = m.provider.as_str().to_string();
+        let pattern = format!("{}/{}", provider, m.id.as_str());
+        (provider, pattern)
+    })
+}
+
 /// A [`cyrup_session_svc::ProviderResolver`] backed by [`select_provider`]: rebuilds the owning
 /// built-in provider — installing its env-backed credentials — for a target provider id. Wired into
 /// the session so a `/model` selection that targets a DIFFERENT provider than the current one swaps
@@ -254,6 +297,41 @@ mod tests {
         assert_eq!(unknown_model_warning(None, Some("gpt-4o"), &catalog), None);
         // No `--model` at all → nothing to diagnose.
         assert_eq!(unknown_model_warning(Some("openai"), None, &catalog), None);
+    }
+
+    #[test]
+    fn no_model_with_configured_provider_launches_that_provider_default_not_faux() {
+        // Given a configured provider (Pi `hasConfiguredAuth` true — e.g. `TOGETHER_API_KEY` set) and
+        // no `--model`/`--provider`, the launch model is that provider's curated default, NOT faux
+        // (Pi `findInitialModel` step 4, model-resolver.ts:611-626).
+        let together_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "together";
+        let (provider, pattern) = default_launch_model(None, None, &together_configured)
+            .expect("a configured provider yields a real launch model");
+        assert_eq!(provider, "together");
+        assert_ne!(provider, "faux");
+        // Pi `defaultModelPerProvider["together"]` (model-resolver.ts:40).
+        assert_eq!(pattern, "together/moonshotai/Kimi-K2.6");
+    }
+
+    #[test]
+    fn no_model_and_nothing_configured_stays_faux_fallback() {
+        // Nothing configured ⇒ `None` ⇒ the caller keeps the offline scripted faux provider (Pi
+        // `findInitialModel` step 5, model-resolver.ts:628-629 — no available model).
+        let nothing_configured = |_: &cyrup_provider::Model| false;
+        assert_eq!(default_launch_model(None, None, &nothing_configured), None);
+    }
+
+    #[test]
+    fn saved_settings_default_wins_over_curated_provider_default() {
+        // A saved settings default `(provider, model)` that resolves in the registry wins over the
+        // configured-provider curated default (Pi `findInitialModel` step 3, model-resolver.ts:600-609).
+        let together_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "together";
+        // The saved default names together's curated model explicitly; still resolves to together.
+        let (provider, pattern) =
+            default_launch_model(Some("together"), Some("moonshotai/Kimi-K2.6"), &together_configured)
+                .expect("saved settings default resolves");
+        assert_eq!(provider, "together");
+        assert_eq!(pattern, "together/moonshotai/Kimi-K2.6");
     }
 
     #[test]

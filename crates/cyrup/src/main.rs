@@ -25,8 +25,8 @@ use cyrup::{
 use cyrup::cli::{qualified_matches, split_model_level};
 use cyrup::session_resolve::{resolve_session_target, Outcome, SessionFlags, SessionRef};
 use cyrup_config::{
-    CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, Settings, SettingsManager,
-    SettingsScope,
+    AuthStore, CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, Settings,
+    SettingsManager, SettingsScope,
 };
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
@@ -184,7 +184,7 @@ async fn run() -> anyhow::Result<i32> {
     if let Some(search) = &cli.list_models {
         return list_models(&cyrup::provider::all_available_models(), search);
     }
-    let provider = select_provider(cli.provider.as_deref(), cli.model.as_deref(), cli.api_key.as_deref())?;
+    let mut provider = select_provider(cli.provider.as_deref(), cli.model.as_deref(), cli.api_key.as_deref())?;
 
     // Unknown-model diagnostic (Pi `resolveCliModel`, main.ts:377-378 / model-resolver.ts:494-500):
     // a `--model` on a *known* provider whose id is not in the catalog warns (the build still proceeds
@@ -224,6 +224,40 @@ async fn run() -> anyhow::Result<i32> {
     let deprecation_warnings = migration.deprecation_warnings.clone();
     let settings_store = file_settings_store(&dirs);
     let cancel = CancelToken::new();
+
+    // Default-launch model (Pi `findInitialModel`, model-resolver.ts:527-607): when NEITHER
+    // `--provider` nor `--model` (nor a `--models` scope) is given, cyrup must launch on a REAL
+    // configured provider — the saved settings default, else a configured provider's curated default
+    // — instead of always falling back to the offline scripted faux provider. The `select_provider`
+    // call above yields faux for this no-flag case (there is no provider prefix to key off); here we
+    // upgrade it to the resolved default provider/model when one is configured, and set the
+    // corresponding `model_pattern` so the builder launches on that exact model (footer shows e.g.
+    // `together/moonshotai/Kimi-K2.6`). Only for a FRESH session — a resumed/continued session keeps
+    // its own restored model. When NOTHING is configured this is a no-op and faux stays the fallback.
+    if cli.provider.is_none()
+        && cli.model.is_none()
+        && cli.models.is_empty()
+        && is_fresh_target(&config.target)
+    {
+        // Pi `hasConfiguredAuth`: the model's provider has a stored credential / known env var
+        // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds.
+        let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
+        let has_configured_auth =
+            move |m: &cyrup_provider::Model| auth.has_auth(&m.provider, None);
+        // Saved settings default `(provider, model)` (Pi step 3), read from the same file store.
+        let settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
+        let eff = settings.effective();
+        let default_provider = eff.default_provider();
+        let default_model = eff.default_model();
+        if let Some((launch_provider, launch_pattern)) = cyrup::provider::default_launch_model(
+            default_provider.as_deref(),
+            default_model.as_deref(),
+            &has_configured_auth,
+        ) {
+            provider = select_provider(Some(&launch_provider), None, None)?;
+            config.model_pattern = Some(launch_pattern);
+        }
+    }
 
     // Interactive mode drives the **multi-session** `AgentSessionRuntime` (arch-11 §3.4) so the
     // session-swap commands rebuild the active session in place and the TUI re-binds to it. The
