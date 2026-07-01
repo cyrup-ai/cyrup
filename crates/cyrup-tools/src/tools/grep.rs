@@ -128,12 +128,13 @@ impl Tool for GrepTool {
                 .unwrap_or_else(|| to_posix(&search_root));
             files.push((search_root.clone(), rel));
         } else {
-            // Pi runs `rg --hidden` (grep.ts:215): search dotfiles/dot-dirs while still honoring
-            // `.gitignore` (arch-03:404). So include hidden files in the walk. `require_git:false`
-            // preserves grep's historical unconditional `--no-require-git` walk (the find-only
-            // git-boundary fix, find.ts:226-240, is not in scope here).
+            // Pi runs plain `rg --hidden` with NO `--no-require-git` flag (grep.ts:215-219): search
+            // dotfiles/dot-dirs, but honor `.gitignore` only *inside* a git repo — ripgrep's default,
+            // which is `ignore`'s `require_git:true` (the crate does the in-repo detection internally).
+            // Unlike Pi's `find` (fd `--no-require-git` outside a repo, find.ts:226-240), Pi's grep
+            // never disables require-git, so outside any repo a stray `.gitignore` is NOT applied.
             let mut walk =
-                self.fs.walk(&search_root, WalkOpts { include_hidden: true, require_git: false });
+                self.fs.walk(&search_root, WalkOpts { include_hidden: true, require_git: true });
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(error::aborted()),

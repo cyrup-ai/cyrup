@@ -459,7 +459,32 @@ fn fixture_repo() -> tempfile::TempDir {
     std::fs::create_dir(p.join("sub")).unwrap();
     std::fs::write(p.join("sub/c.txt"), "hello nested\n").unwrap();
     std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+    // A real git repo: Pi's grep is plain ripgrep (require_git=true default), so `.gitignore` is
+    // honored only *inside* a repo. The `ignore` crate detects the repo by this `.git` dir.
+    std::fs::create_dir(p.join(".git")).unwrap();
     dir
+}
+
+// grep parity: Pi's grep passes NO `--no-require-git` (grep.ts:215-219), so OUTSIDE any git repo a
+// stray `.gitignore` is NOT applied (ripgrep default require_git=true) — the opposite of Pi's `find`
+// (fd `--no-require-git`, which honors it outside a repo). A gitignored file must still be searched.
+#[tokio::test]
+async fn grep_gitignore_not_applied_outside_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(root.join("keep.txt"), "needle here\n").unwrap();
+    std::fs::write(root.join("skip.log"), "needle here\n").unwrap();
+
+    let grep = GrepTool::new(fs(), root.to_path_buf(), GrepOpts::default());
+    let r = grep
+        .execute(cid(), serde_json::json!({ "pattern": "needle" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    // No `.git` here → gitignore inert → the gitignored `skip.log` IS searched (matches Pi grep).
+    assert!(text.contains("keep.txt:1: needle here"), "got: {text}");
+    assert!(text.contains("skip.log:1: needle here"), "gitignore wrongly applied outside repo: {text}");
 }
 
 #[tokio::test]
@@ -497,6 +522,9 @@ async fn grep_and_find_search_hidden_files() {
     std::fs::write(cwd.join(".config/app.toml"), "key = hidden\n").unwrap();
     std::fs::write(cwd.join(".gitignore"), "ignored.txt\n").unwrap();
     std::fs::write(cwd.join("ignored.txt"), "hello-hidden\n").unwrap();
+    // Inside a real repo, so grep (ripgrep default require_git=true) honors `.gitignore` while
+    // `--hidden` still searches dotfiles — the exact combination this test asserts.
+    std::fs::create_dir(cwd.join(".git")).unwrap();
 
     let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
     let r = grep
