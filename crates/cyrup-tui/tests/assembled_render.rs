@@ -324,3 +324,20 @@ fn assembled_ctrl_d_does_not_quit_a_non_empty_buffer_but_exits_when_empty() {
     assert_eq!(action, AppAction::Quit, "Ctrl+D on an empty buffer must exit");
 }
 
+#[test]
+fn assembled_backslash_enter_soft_newline_routes_as_edit_not_submit() {
+    // (#5) A routed keypress: typing `foo\` then Enter must NOT submit — the trailing backslash is
+    // deleted and a newline inserted (Pi editor.ts:796-802, spec/tui/03 §5.7). A plain Enter submits.
+    let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
+    for c in "foo\\".chars() {
+        app.handle_input(&key(KeyCode::Char(c)));
+    }
+    let action = app.handle_input(&key(KeyCode::Enter));
+    assert_eq!(action, AppAction::Redraw, "backslash-Enter must edit (redraw), never submit");
+    assert_eq!(app.editor_mut().text(), "foo\n", "backslash not converted to a soft newline");
+
+    // A following plain Enter (no trailing backslash) now submits the buffer as a prompt (trimmed).
+    let action = app.handle_input(&key(KeyCode::Enter));
+    assert_eq!(action, AppAction::Submit("foo".to_string()), "plain Enter should submit");
+}
+

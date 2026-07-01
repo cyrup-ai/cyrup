@@ -422,6 +422,41 @@ fn backspace_deletes_whole_paste_marker_atomically() {
 }
 
 #[test]
+fn backslash_enter_inserts_soft_newline_instead_of_submitting() {
+    // Pi editor.ts:796-802 / spec/tui/03 §5.7: a terminals-without-Shift+Enter workaround. If the char
+    // immediately before the cursor is a literal backslash, Enter deletes it and inserts a newline.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "foo\\");
+    let out = ed.handle_key(&key(KeyCode::Enter));
+    assert_eq!(out, EditorOutcome::Edited, "backslash-Enter must NOT submit");
+    // The backslash is gone and the line is broken: "foo" then an empty line, cursor at line start.
+    assert_eq!(ed.text(), "foo\n");
+    assert_eq!(ed.cursor(), (1, 0));
+}
+
+#[test]
+fn plain_enter_still_submits_without_a_trailing_backslash() {
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "hello");
+    match ed.handle_key(&key(KeyCode::Enter)) {
+        EditorOutcome::Submit(text) => assert_eq!(text, "hello"),
+        other => panic!("expected Submit, got {other:?}"),
+    }
+}
+
+#[test]
+fn backslash_not_immediately_before_cursor_still_submits() {
+    // The guard only fires on the char *immediately* before the cursor. A backslash elsewhere on the
+    // line (cursor moved left past it) submits normally.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "a\\b");
+    match ed.handle_key(&key(KeyCode::Enter)) {
+        EditorOutcome::Submit(text) => assert_eq!(text, "a\\b"),
+        other => panic!("expected Submit, got {other:?}"),
+    }
+}
+
+#[test]
 fn submit_expands_paste_marker() {
     let mut ed = InputEditor::new();
     type_str(&mut ed, "prefix ");

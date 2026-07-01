@@ -64,7 +64,8 @@ mod transcript;
 mod tree_selector;
 
 pub use app::{
-    crossterm_input_stream, render, App, AppAction, AppCommand, AppState, RebuildBackend,
+    crossterm_input_stream, reanchor_inline_region, render, App, AppAction, AppCommand, AppState,
+    RebuildBackend,
 };
 pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{

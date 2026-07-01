@@ -1342,6 +1342,21 @@ impl InputEditor {
                 EditorOutcome::Edited
             }
             E::Submit => {
+                // Backslash-Enter → soft newline (Pi `editor.ts:796-802`, spec/tui/03 §5.7): a
+                // workaround for terminals without Shift+Enter. If the char immediately before the
+                // cursor is a literal backslash, delete it and insert a newline INSTEAD of submitting
+                // (Pi `handleBackspace()` + `addNewLine()`), so `foo\<Enter>` breaks the line.
+                if self.col > 0
+                    && self.lines.get(self.row).and_then(|l| l.get(self.col - 1)) == Some(&'\\')
+                {
+                    self.push_undo_for(LastAction::None);
+                    self.backspace();
+                    self.insert_newline();
+                    self.last_action = LastAction::None;
+                    self.exit_history();
+                    self.update_autocomplete();
+                    return EditorOutcome::Edited;
+                }
                 // Expand large-paste markers back to their full content before the agent sees the text
                 // (`expandPasteMarkers`, spec/tui/03 §5.5).
                 let text = self.expanded_text();
