@@ -1758,19 +1758,29 @@ impl AgentSession {
 
     /// The invocable slash commands a front-end can offer (Pi `get_commands`, rpc-mode.ts:653-683):
     /// registered extension commands (`source:"extension"`), prompt templates (`source:"prompt"`),
-    /// and skills (`skill:<name>`, `source:"skill"`), each with a `name`/`description`/`sourceInfo`.
-    /// `sourceInfo` carries cyrup's `scope`/`origin`/`path` provenance (cyrup has no Pi `SourceInfo`
-    /// type — a documented [CYRUP-DELTA] shape; the `source` tag + provenance are 1:1 in spirit).
+    /// and skills (`skill:<name>`, `source:"skill"`), each with a `name`/`description`/`source`/
+    /// `sourceInfo` (rpc-types.ts `RpcSlashCommand`). `sourceInfo` is the full Pi `SourceInfo`
+    /// (`{path, source, scope, origin, baseDir?}`, source-info.ts:6-12), wired from the
+    /// `scope`/`origin` provenance the prompt/skill structs already carry
+    /// ([`cyrup_resources::ResourceOrigin::source_info_json`]).
     pub fn slash_command_catalog(&self) -> Vec<serde_json::Value> {
         let mut out: Vec<serde_json::Value> = Vec::new();
-        // Registered extension commands.
+        // Registered extension commands. Extension-contributed commands have no on-disk resource
+        // provenance; Pi passes through the extension-supplied `command.sourceInfo`. cyrup synthesizes
+        // a `temporary`/`top-level` SourceInfo anchored at the extension id (createSyntheticSourceInfo,
+        // source-info.ts:24-40).
         if let Ok(cmds) = self.services.ext_host.registry().command_descriptions() {
             for (name, desc) in cmds {
                 out.push(serde_json::json!({
                     "name": name,
                     "description": desc.description,
                     "source": "extension",
-                    "sourceInfo": { "type": "extension" },
+                    "sourceInfo": {
+                        "path": "",
+                        "source": "extension",
+                        "scope": "temporary",
+                        "origin": "top-level",
+                    },
                 }));
             }
         }
@@ -1780,7 +1790,7 @@ impl AgentSession {
                 "name": t.name,
                 "description": t.description,
                 "source": "prompt",
-                "sourceInfo": { "type": "prompt", "path": t.path.display().to_string() },
+                "sourceInfo": t.origin.source_info_json(&t.path),
             }));
         }
         // Skills (`/skill:<name>`).
@@ -1789,7 +1799,7 @@ impl AgentSession {
                 "name": format!("skill:{}", s.name),
                 "description": s.front.description.clone().unwrap_or_default(),
                 "source": "skill",
-                "sourceInfo": { "type": "skill", "path": s.skill_md.display().to_string() },
+                "sourceInfo": s.origin.source_info_json(&s.skill_md),
             }));
         }
         out

@@ -67,17 +67,20 @@ fn queue_mode_str(mode: QueueMode) -> &'static str {
 /// An incoming RPC request (`type`-tagged snake_case to match Pi clients; camelCase fields per the
 /// wire; R-11-014, rpc-types.ts:20-72).
 ///
-/// Every variant carries an optional `id` echoed back on its [`RpcResponse`] for correlation
-/// (R-11-015). Unknown command types deserialize to [`SessionCommand::Unknown`] and yield a
-/// `success:false` response — never a panic (R-00-009).
+/// The request `id` is **not** a variant field: exactly as Pi reads `const id = command.id` once at
+/// the top of `handleCommand` (rpc-mode.ts:383), cyrup recovers it from the raw parsed line in
+/// [`dispatch`] (`raw_id`), preserved as-sent (string **or** number — Pi types `id?: string` but an
+/// opaque number passes through untouched, R-11-015; #10). Keeping `id` off the variant means a
+/// numeric-`id` command still deserializes and **executes** rather than tripping payload
+/// validation. Unknown command types deserialize to [`SessionCommand::Unknown`] via `#[serde(other)]`
+/// (detected in [`dispatch`], never reaching [`handle`]); a required field that is missing/wrong-typed
+/// yields a serde error — both produce a `success:false` response, never a panic (R-00-009).
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
     // ---- Prompting ----
     /// Submit a prompt. While streaming, `streamingBehavior` is required (R-11-016).
     Prompt {
-        #[serde(default)]
-        id: Option<String>,
         message: String,
         #[serde(default)]
         images: Vec<Content>,
@@ -86,222 +89,144 @@ pub enum SessionCommand {
     },
     /// Enqueue a steering message (delivered after the current tool batch).
     Steer {
-        #[serde(default)]
-        id: Option<String>,
         message: String,
         #[serde(default)]
         images: Vec<Content>,
     },
     /// Enqueue a follow-up message (delivered after the agent goes idle).
     FollowUp {
-        #[serde(default)]
-        id: Option<String>,
         message: String,
         #[serde(default)]
         images: Vec<Content>,
     },
     /// Interrupt the active run (idempotent).
-    Abort {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    Abort,
     /// Start a fresh session in the same cwd, optionally recording a `parentSession`.
     NewSession {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(default, rename = "parentSession")]
         parent_session: Option<String>,
     },
 
     // ---- State ----
     /// Query the full snapshot of session state (rpc-types.ts:94-107).
-    GetState {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetState,
 
     // ---- Model ----
     /// Switch the active model by `provider` + `modelId`.
     SetModel {
-        #[serde(default)]
-        id: Option<String>,
         provider: String,
         #[serde(rename = "modelId")]
         model_id: String,
     },
     /// Cycle to the next model in the scoped/available set.
-    CycleModel {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    CycleModel,
     /// List the available models.
-    GetAvailableModels {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetAvailableModels,
 
     // ---- Thinking ----
     /// Set the thinking level (`off`|`minimal`|`low`|`medium`|`high`|`xhigh`).
-    SetThinkingLevel {
-        #[serde(default)]
-        id: Option<String>,
-        level: ModelThinkingLevel,
-    },
+    SetThinkingLevel { level: ModelThinkingLevel },
     /// Cycle to the next thinking level.
-    CycleThinkingLevel {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    CycleThinkingLevel,
 
     // ---- Queue modes ----
     /// Set the steering drain mode.
-    SetSteeringMode {
-        #[serde(default)]
-        id: Option<String>,
-        mode: QueueModeArg,
-    },
+    SetSteeringMode { mode: QueueModeArg },
     /// Set the follow-up drain mode.
-    SetFollowUpMode {
-        #[serde(default)]
-        id: Option<String>,
-        mode: QueueModeArg,
-    },
+    SetFollowUpMode { mode: QueueModeArg },
 
     // ---- Compaction ----
     /// Compact the current branch.
     Compact {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(default, rename = "customInstructions")]
         custom_instructions: Option<String>,
     },
     /// Toggle auto-compaction.
-    SetAutoCompaction {
-        #[serde(default)]
-        id: Option<String>,
-        enabled: bool,
-    },
+    SetAutoCompaction { enabled: bool },
 
     // ---- Retry ----
     /// Toggle auto-retry.
-    SetAutoRetry {
-        #[serde(default)]
-        id: Option<String>,
-        enabled: bool,
-    },
+    SetAutoRetry { enabled: bool },
     /// Abort the pending auto-retry.
-    AbortRetry {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    AbortRetry,
 
     // ---- Bash ----
     /// Run an immediate bash command out of the agent loop.
     Bash {
-        #[serde(default)]
-        id: Option<String>,
         command: String,
         #[serde(default, rename = "excludeFromContext")]
         exclude_from_context: bool,
     },
     /// Cancel a running bash command.
-    AbortBash {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    AbortBash,
 
     // ---- Session ----
     /// Aggregate transcript statistics for the current branch.
-    GetSessionStats {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetSessionStats,
     /// Export the current branch to a standalone HTML document.
     ExportHtml {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(default, rename = "outputPath")]
         output_path: Option<String>,
     },
     /// Resume a session file, rebuilding cwd-bound services.
     SwitchSession {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(rename = "sessionPath")]
         session_path: String,
     },
     /// Fork at an entry into a new branched session (`position:"before"` returns the anchor text).
     Fork {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(rename = "entryId")]
         entry_id: String,
     },
     /// Clone the current leaf at-position into a new session.
-    Clone {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    Clone,
     /// The user-message fork anchors on the current branch.
-    GetForkMessages {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetForkMessages,
     /// The persisted entries on the current branch (optionally `since` an entry id).
     GetEntries {
-        #[serde(default)]
-        id: Option<String>,
         #[serde(default)]
         since: Option<String>,
     },
     /// The full session tree.
-    GetTree {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetTree,
     /// The text of the last assistant message.
-    GetLastAssistantText {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetLastAssistantText,
     /// Set the session display name (trimmed; empty rejected).
-    SetSessionName {
-        #[serde(default)]
-        id: Option<String>,
-        name: String,
-    },
+    SetSessionName { name: String },
 
     // ---- Messages ----
     /// Query the persisted transcript on the current branch.
-    GetMessages {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetMessages,
 
     // ---- Commands ----
     /// List the slash commands available for invocation via a prompt.
-    GetCommands {
-        #[serde(default)]
-        id: Option<String>,
-    },
+    GetCommands,
 
-    /// Any unrecognized `type` (R-00-009).
+    /// Any unrecognized `type` (R-00-009). Detected in [`dispatch`]; never reaches [`handle`].
     #[serde(other)]
     Unknown,
 }
 
 /// A correlated reply to a [`SessionCommand`] (arch-11 §3.5).
+///
+/// Field order is the exact byte layout Pi's `success`/`error` helpers emit
+/// (`{ id, type, command, success, data|error }`, rpc-mode.ts:63-76): `id` **first** (omitted when
+/// absent, so an id-less response byte-matches Pi's `{ type, command, ... }`), then the `type` tag,
+/// the echoed `command`, the `success` flag, and finally the mutually-exclusive `data`/`error`. The
+/// `command` is an owned `String` because the unknown-command / malformed-payload error paths echo
+/// the caller's **real** `type` string, not one of the fixed verb literals (#7/#8).
 #[derive(Debug, serde::Serialize)]
 pub struct RpcResponse {
+    /// Echoed request `id` for correlation, preserved as-is (string or number; R-11-015). Emitted
+    /// first to match Pi's object literal (`{ id, type: "response", … }`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Value>,
     /// Always `"response"`.
     #[serde(rename = "type")]
     pub kind: &'static str,
-    /// Echoed command name.
-    pub command: &'static str,
+    /// Echoed command name (a fixed verb, or the caller's real `type` on the error paths).
+    pub command: String,
     pub success: bool,
-    /// Echoed request `id` for correlation, preserved as-is (string or number; R-11-015).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,12 +234,19 @@ pub struct RpcResponse {
 }
 
 impl RpcResponse {
-    fn ok(command: &'static str, id: Option<Value>, data: Option<Value>) -> Self {
-        Self { kind: "response", command, success: true, id, data, error: None }
+    fn ok(command: impl Into<String>, id: Option<Value>, data: Option<Value>) -> Self {
+        Self { id, kind: "response", command: command.into(), success: true, data, error: None }
     }
 
-    fn err(command: &'static str, id: Option<Value>, error: impl Into<String>) -> Self {
-        Self { kind: "response", command, success: false, id, data: None, error: Some(error.into()) }
+    fn err(command: impl Into<String>, id: Option<Value>, error: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind: "response",
+            command: command.into(),
+            success: false,
+            data: None,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -418,39 +350,89 @@ where
     Ok(())
 }
 
-/// Decode one request line and apply it. Side effect: a freshly-started run sets `in_flight`.
+/// Decode one request line and apply it, in the same **staged** order Pi's `handleInputLine` +
+/// `handleCommand` use (rpc-mode.ts:723-773, 382-689). Side effect: a freshly-started run sets
+/// `in_flight`.
+///
+/// 1. **Parse** the line as JSON (`JSON.parse`, rpc-mode.ts:726). A syntax error is *not* a command:
+///    Pi emits `error(undefined, "parse", "Failed to parse command: …")` with **no** id — `JSON.parse`
+///    itself failed, so there is no object to recover an id from (rpc-mode.ts:728-734). #6.
+/// 2. Recover the `id` from the parsed object (`const id = command.id`, rpc-mode.ts:383), preserved
+///    exactly as sent — string **or** number (#10); `null`/absent → no id.
+/// 3. **Deserialize** the command. An unknown `type` tag hits Pi's `switch` default:
+///    `error(id, command.type, "Unknown command: <type>")` echoing the **real** type (rpc-mode.ts:686-689).
+///    #7. A recognized type whose payload is missing/wrong-typed a required field surfaces as a runtime
+///    error under `handleCommand`, caught as `error(id, command.type, <message>)` — again the **real**
+///    command name, not `"unknown"` (rpc-mode.ts:755-772). #8.
 async fn dispatch(
     runtime: &AgentSessionRuntime,
     session: &AgentSession,
     line: &str,
     in_flight: &mut bool,
 ) -> Dispatched {
-    // Recover the request `id` from the raw JSON FIRST so even an unknown/unmappable command can be
-    // correlated (R-11-015). Preserved exactly as sent (string or number); `null`/absent → no id.
-    let raw_id = extract_id(line);
-
-    let cmd: SessionCommand = match serde_json::from_str(line) {
-        Ok(c) => c,
-        // A JSON object carrying an id MUST echo it even when it fails to map to a known command.
+    // (1) Parse the raw line. A malformed line is Pi's `"parse"` error with NO id.
+    let value: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
         Err(e) => {
             return Dispatched {
-                response: RpcResponse::err("unknown", raw_id, format!("invalid command json: {e}")),
+                response: RpcResponse::err(
+                    "parse",
+                    None,
+                    format!("Failed to parse command: {e}"),
+                ),
                 rebind: false,
             }
         }
     };
 
-    let response = handle(runtime, session, cmd, raw_id, in_flight).await;
-    // The session-replacing commands rebind on success (non-cancelled).
-    let rebind = response.success
-        && matches!(response.command, "new_session" | "switch_session" | "fork" | "clone")
-        && response
-            .data
-            .as_ref()
-            .and_then(|d| d.get("cancelled"))
-            .and_then(Value::as_bool)
-            != Some(true);
-    Dispatched { response, rebind }
+    // (2) Recover the id and the `type` discriminant before consuming `value`. The id is preserved
+    // as-sent (string or number); the type string is what Pi echoes on the error paths.
+    let raw_id = value.get("id").filter(|id| !id.is_null()).cloned();
+    let type_str = value.get("type").and_then(Value::as_str).map(str::to_owned);
+
+    // (3) Deserialize the recognized command's payload.
+    match serde_json::from_value::<SessionCommand>(value) {
+        // Recognized-shape line with an unknown `type` tag (`#[serde(other)]`): echo the real type.
+        Ok(SessionCommand::Unknown) => {
+            let name = type_str.unwrap_or_default();
+            let message = format!("Unknown command: {name}");
+            Dispatched { response: RpcResponse::err(name, raw_id, message), rebind: false }
+        }
+        Ok(cmd) => {
+            let response = handle(runtime, session, cmd, raw_id, in_flight).await;
+            // The session-replacing commands rebind on success (non-cancelled).
+            let rebind = response.success
+                && matches!(
+                    response.command.as_str(),
+                    "new_session" | "switch_session" | "fork" | "clone"
+                )
+                && response
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("cancelled"))
+                    .and_then(Value::as_bool)
+                    != Some(true);
+            Dispatched { response, rebind }
+        }
+        // A known `type` whose payload failed validation (missing/wrong-typed required field): echo
+        // the real command name + the runtime error, NOT `"unknown"`. A missing/`null` `type` tag
+        // (serde: "missing field `type`") has no command name to echo — fall back to Pi's default
+        // `Unknown command` shaping so it still correlates.
+        Err(e) => match type_str {
+            Some(name) => Dispatched {
+                response: RpcResponse::err(name, raw_id, e.to_string()),
+                rebind: false,
+            },
+            None => Dispatched {
+                response: RpcResponse::err(
+                    String::new(),
+                    raw_id,
+                    "Unknown command: undefined",
+                ),
+                rebind: false,
+            },
+        },
+    }
 }
 
 #[allow(clippy::too_many_lines)] // a faithful 1:1 of Pi's `handleCommand` switch (rpc-mode.ts:385).
@@ -461,10 +443,13 @@ async fn handle(
     raw_id: Option<Value>,
     in_flight: &mut bool,
 ) -> RpcResponse {
+    // Pi reads the id once at the top of `handleCommand` (`const id = command.id`, rpc-mode.ts:383);
+    // cyrup recovered it in `dispatch` and threads it in as `raw_id`. Each arm clones it into the
+    // reply (string or number, preserved as-sent).
     match cmd {
         // -------------------------------------------------------------- Prompting ----
-        SessionCommand::Prompt { id, message, images, streaming_behavior } => {
-            let id = id.map(Value::String);
+        SessionCommand::Prompt { message, images, streaming_behavior } => {
+            let id = raw_id.clone();
             let input = user_input(message, images);
             match session.prompt_with(input, PromptOptions { streaming_behavior }).await {
                 Ok(accepted) => {
@@ -476,28 +461,28 @@ async fn handle(
                 Err(e) => RpcResponse::err("prompt", id, e.to_string()),
             }
         }
-        SessionCommand::Steer { id, message, images } => {
-            let id = id.map(Value::String);
+        SessionCommand::Steer { message, images } => {
+            let id = raw_id.clone();
             *in_flight = true;
             match session.steer(user_input(message, images)).await {
                 Ok(_) => RpcResponse::ok("steer", id, None),
                 Err(e) => RpcResponse::err("steer", id, e.to_string()),
             }
         }
-        SessionCommand::FollowUp { id, message, images } => {
-            let id = id.map(Value::String);
+        SessionCommand::FollowUp { message, images } => {
+            let id = raw_id.clone();
             *in_flight = true;
             match session.follow_up(user_input(message, images)).await {
                 Ok(_) => RpcResponse::ok("follow_up", id, None),
                 Err(e) => RpcResponse::err("follow_up", id, e.to_string()),
             }
         }
-        SessionCommand::Abort { id } => {
+        SessionCommand::Abort => {
             session.abort();
-            RpcResponse::ok("abort", id.map(Value::String), None)
+            RpcResponse::ok("abort", raw_id.clone(), None)
         }
-        SessionCommand::NewSession { id, parent_session } => {
-            let id = id.map(Value::String);
+        SessionCommand::NewSession { parent_session } => {
+            let id = raw_id.clone();
             let options = cyrup_session_svc::NewSessionOptions { parent_session };
             match runtime.new_session_with(options).await {
                 Ok(result) => {
@@ -508,13 +493,13 @@ async fn handle(
         }
 
         // ------------------------------------------------------------------ State ----
-        SessionCommand::GetState { id } => {
-            RpcResponse::ok("get_state", id.map(Value::String), Some(state_view(session).await))
+        SessionCommand::GetState => {
+            RpcResponse::ok("get_state", raw_id.clone(), Some(state_view(session).await))
         }
 
         // ------------------------------------------------------------------ Model ----
-        SessionCommand::SetModel { id, provider, model_id } => {
-            let id = id.map(Value::String);
+        SessionCommand::SetModel { provider, model_id } => {
+            let id = raw_id.clone();
             let found = session
                 .model_catalog()
                 .iter()
@@ -535,8 +520,8 @@ async fn handle(
                 ),
             }
         }
-        SessionCommand::CycleModel { id } => {
-            let id = id.map(Value::String);
+        SessionCommand::CycleModel => {
+            let id = raw_id.clone();
             match session.cycle_model(true).await {
                 Ok(Some(result)) => RpcResponse::ok(
                     "cycle_model",
@@ -551,25 +536,25 @@ async fn handle(
                 Err(e) => RpcResponse::err("cycle_model", id, e.to_string()),
             }
         }
-        SessionCommand::GetAvailableModels { id } => {
+        SessionCommand::GetAvailableModels => {
             let models = serde_json::to_value(session.model_catalog()).unwrap_or(json!([]));
             RpcResponse::ok(
                 "get_available_models",
-                id.map(Value::String),
+                raw_id.clone(),
                 Some(json!({ "models": models })),
             )
         }
 
         // --------------------------------------------------------------- Thinking ----
-        SessionCommand::SetThinkingLevel { id, level } => {
-            let id = id.map(Value::String);
+        SessionCommand::SetThinkingLevel { level } => {
+            let id = raw_id.clone();
             match session.set_thinking_level(level).await {
                 Ok(_) => RpcResponse::ok("set_thinking_level", id, None),
                 Err(e) => RpcResponse::err("set_thinking_level", id, e.to_string()),
             }
         }
-        SessionCommand::CycleThinkingLevel { id } => {
-            let id = id.map(Value::String);
+        SessionCommand::CycleThinkingLevel => {
+            let id = raw_id.clone();
             match session.cycle_thinking_level().await {
                 Ok(Some(level)) => {
                     RpcResponse::ok("cycle_thinking_level", id, Some(json!({ "level": level })))
@@ -580,18 +565,18 @@ async fn handle(
         }
 
         // ------------------------------------------------------------ Queue modes ----
-        SessionCommand::SetSteeringMode { id, mode } => {
+        SessionCommand::SetSteeringMode { mode } => {
             session.set_steering_mode(mode.into());
-            RpcResponse::ok("set_steering_mode", id.map(Value::String), None)
+            RpcResponse::ok("set_steering_mode", raw_id.clone(), None)
         }
-        SessionCommand::SetFollowUpMode { id, mode } => {
+        SessionCommand::SetFollowUpMode { mode } => {
             session.set_follow_up_mode(mode.into());
-            RpcResponse::ok("set_follow_up_mode", id.map(Value::String), None)
+            RpcResponse::ok("set_follow_up_mode", raw_id.clone(), None)
         }
 
         // ------------------------------------------------------------- Compaction ----
-        SessionCommand::Compact { id, custom_instructions } => {
-            let id = id.map(Value::String);
+        SessionCommand::Compact { custom_instructions } => {
+            let id = raw_id.clone();
             match session.compact(custom_instructions).await {
                 Ok(result) => RpcResponse::ok(
                     "compact",
@@ -601,41 +586,41 @@ async fn handle(
                 Err(e) => RpcResponse::err("compact", id, e.to_string()),
             }
         }
-        SessionCommand::SetAutoCompaction { id, enabled } => {
+        SessionCommand::SetAutoCompaction { enabled } => {
             session.set_auto_compaction_enabled(enabled);
-            RpcResponse::ok("set_auto_compaction", id.map(Value::String), None)
+            RpcResponse::ok("set_auto_compaction", raw_id.clone(), None)
         }
 
         // ------------------------------------------------------------------ Retry ----
-        SessionCommand::SetAutoRetry { id, enabled } => {
+        SessionCommand::SetAutoRetry { enabled } => {
             session.set_auto_retry_enabled(enabled);
-            RpcResponse::ok("set_auto_retry", id.map(Value::String), None)
+            RpcResponse::ok("set_auto_retry", raw_id.clone(), None)
         }
-        SessionCommand::AbortRetry { id } => {
+        SessionCommand::AbortRetry => {
             session.abort_retry();
-            RpcResponse::ok("abort_retry", id.map(Value::String), None)
+            RpcResponse::ok("abort_retry", raw_id.clone(), None)
         }
 
         // ------------------------------------------------------------------- Bash ----
-        SessionCommand::Bash { id, command, exclude_from_context } => {
-            let id = id.map(Value::String);
+        SessionCommand::Bash { command, exclude_from_context } => {
+            let id = raw_id.clone();
             let result = session
                 .execute_bash(&command, BashOptions { exclude_from_context }, None)
                 .await;
             RpcResponse::ok("bash", id, Some(serde_json::to_value(result).unwrap_or(Value::Null)))
         }
-        SessionCommand::AbortBash { id } => {
+        SessionCommand::AbortBash => {
             session.abort_bash();
-            RpcResponse::ok("abort_bash", id.map(Value::String), None)
+            RpcResponse::ok("abort_bash", raw_id.clone(), None)
         }
 
         // ---------------------------------------------------------------- Session ----
-        SessionCommand::GetSessionStats { id } => {
+        SessionCommand::GetSessionStats => {
             let stats = serde_json::to_value(session.session_stats().await).unwrap_or(Value::Null);
-            RpcResponse::ok("get_session_stats", id.map(Value::String), Some(stats))
+            RpcResponse::ok("get_session_stats", raw_id.clone(), Some(stats))
         }
-        SessionCommand::ExportHtml { id, output_path } => {
-            let id = id.map(Value::String);
+        SessionCommand::ExportHtml { output_path } => {
+            let id = raw_id.clone();
             let path = output_path.map(std::path::PathBuf::from);
             match session.export_to_html(path.as_deref()).await {
                 Ok(out) => {
@@ -644,8 +629,8 @@ async fn handle(
                 Err(e) => RpcResponse::err("export_html", id, e.to_string()),
             }
         }
-        SessionCommand::SwitchSession { id, session_path } => {
-            let id = id.map(Value::String);
+        SessionCommand::SwitchSession { session_path } => {
+            let id = raw_id.clone();
             match runtime.switch_session(session_path).await {
                 Ok(result) => RpcResponse::ok(
                     "switch_session",
@@ -655,8 +640,8 @@ async fn handle(
                 Err(e) => RpcResponse::err("switch_session", id, e.to_string()),
             }
         }
-        SessionCommand::Fork { id, entry_id } => {
-            let id = id.map(Value::String);
+        SessionCommand::Fork { entry_id } => {
+            let id = raw_id.clone();
             match runtime.fork(EntryId::from(entry_id.as_str()), ForkPosition::Before).await {
                 Ok(result) => RpcResponse::ok(
                     "fork",
@@ -666,8 +651,8 @@ async fn handle(
                 Err(e) => RpcResponse::err("fork", id, e.to_string()),
             }
         }
-        SessionCommand::Clone { id } => {
-            let id = id.map(Value::String);
+        SessionCommand::Clone => {
+            let id = raw_id.clone();
             let leaf = session.leaf_id().await;
             match leaf {
                 None => RpcResponse::err(
@@ -685,7 +670,7 @@ async fn handle(
                 },
             }
         }
-        SessionCommand::GetForkMessages { id } => {
+        SessionCommand::GetForkMessages => {
             let messages: Vec<Value> = session
                 .user_messages_for_forking()
                 .await
@@ -694,12 +679,12 @@ async fn handle(
                 .collect();
             RpcResponse::ok(
                 "get_fork_messages",
-                id.map(Value::String),
+                raw_id.clone(),
                 Some(json!({ "messages": messages })),
             )
         }
-        SessionCommand::GetEntries { id, since } => {
-            let id = id.map(Value::String);
+        SessionCommand::GetEntries { since } => {
+            let id = raw_id.clone();
             let mut entries = session.entries_json().await;
             if let Some(since) = since {
                 match entries.iter().position(|e| e.get("id").and_then(Value::as_str) == Some(since.as_str())) {
@@ -710,25 +695,25 @@ async fn handle(
             let leaf = session.leaf_id().await.map(|l| l.as_str().to_string());
             RpcResponse::ok("get_entries", id, Some(json!({ "entries": entries, "leafId": leaf })))
         }
-        SessionCommand::GetTree { id } => {
+        SessionCommand::GetTree => {
             let tree = session.tree_json().await;
             let leaf = session.leaf_id().await.map(|l| l.as_str().to_string());
             RpcResponse::ok(
                 "get_tree",
-                id.map(Value::String),
+                raw_id.clone(),
                 Some(json!({ "tree": tree, "leafId": leaf })),
             )
         }
-        SessionCommand::GetLastAssistantText { id } => {
+        SessionCommand::GetLastAssistantText => {
             let text = session.last_assistant_text().await;
             RpcResponse::ok(
                 "get_last_assistant_text",
-                id.map(Value::String),
+                raw_id.clone(),
                 Some(json!({ "text": text })),
             )
         }
-        SessionCommand::SetSessionName { id, name } => {
-            let id = id.map(Value::String);
+        SessionCommand::SetSessionName { name } => {
+            let id = raw_id.clone();
             let trimmed = name.trim();
             if trimmed.is_empty() {
                 return RpcResponse::err("set_session_name", id, "Session name cannot be empty");
@@ -740,8 +725,8 @@ async fn handle(
         }
 
         // --------------------------------------------------------------- Messages ----
-        SessionCommand::GetMessages { id } => {
-            let id = id.map(Value::String);
+        SessionCommand::GetMessages => {
+            let id = raw_id.clone();
             match serde_json::to_value(session.messages().await) {
                 Ok(v) => RpcResponse::ok("get_messages", id, Some(json!({ "messages": v }))),
                 Err(e) => RpcResponse::err("get_messages", id, e.to_string()),
@@ -749,14 +734,18 @@ async fn handle(
         }
 
         // --------------------------------------------------------------- Commands ----
-        SessionCommand::GetCommands { id } => RpcResponse::ok(
+        SessionCommand::GetCommands => RpcResponse::ok(
             "get_commands",
-            id.map(Value::String),
+            raw_id.clone(),
             Some(json!({ "commands": session.slash_command_catalog() })),
         ),
 
-        // A well-formed-but-unknown `type`: echo the recovered id so the client can correlate.
-        SessionCommand::Unknown => RpcResponse::err("unknown", raw_id, "unknown command type"),
+        // Unreachable: `dispatch` intercepts the `#[serde(other)]` unknown-type variant before it
+        // reaches `handle` (Pi's `switch` default, rpc-mode.ts:686-689). Kept for exhaustiveness —
+        // defensively echoes the id rather than panicking (R-00-009).
+        SessionCommand::Unknown => {
+            RpcResponse::err(String::new(), raw_id.clone(), "Unknown command: undefined")
+        }
     }
 }
 
@@ -792,14 +781,6 @@ async fn state_view(session: &AgentSession) -> Value {
         "messageCount": session.messages().await.len(),
         "pendingMessageCount": session.pending_message_count(),
     })
-}
-
-/// Recover the top-level `id` from a raw request line, preserved as-is (string or number) for
-/// correlation; returns `None` when the line is not a JSON object, has no `id`, or `id` is null.
-fn extract_id(line: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(line)
-        .ok()
-        .and_then(|v| v.get("id").filter(|id| !id.is_null()).cloned())
 }
 
 /// Serialize one protocol record and write it as a single LF-terminated line, flushed immediately so

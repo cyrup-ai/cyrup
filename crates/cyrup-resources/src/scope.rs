@@ -12,7 +12,7 @@
 //! (resource-loader.ts:421/436/455), so under first-wins a same-name package (already in the sorted
 //! `enabledSkills`, rank `4`) wins and the CLI path loses.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cyrup_core::{ExtensionId, PackageId};
 
@@ -78,6 +78,80 @@ impl ResourceScope {
             ResourceScope::Cli => 5,
             ResourceScope::Discovered => 6,
             ResourceScope::Builtin => 7,
+        }
+    }
+
+    /// Pi's `SourceScope` (`"user" | "project" | "temporary"`, source-info.ts:3) for the RPC
+    /// `get_commands` catalog. Pi's package-manager assigns `scope:"project"` to project settings
+    /// and project packages, `scope:"user"` to global settings and global packages
+    /// (package-manager.ts:911-924/1225-1229), and `scope:"temporary"` to explicit CLI/`--skill`
+    /// sources (package-manager.ts:940). The cyrup-only `Discovered`/`Builtin` deltas have no Pi
+    /// tier; they map to `"temporary"` (the transient, non-persisted scope).
+    pub fn pi_source_scope(self) -> &'static str {
+        match self {
+            ResourceScope::ProjectSettings
+            | ResourceScope::Project
+            | ResourceScope::ProjectPackage => "project",
+            ResourceScope::GlobalSettings
+            | ResourceScope::Global
+            | ResourceScope::GlobalPackage => "user",
+            ResourceScope::Cli | ResourceScope::Discovered | ResourceScope::Builtin => "temporary",
+        }
+    }
+
+    /// Pi's `PathMetadata.source` string (package-manager.ts): `"local"` for settings-listed
+    /// entries, `"auto"` for auto-discovered loose files. Package/CLI/delta tiers carry a more
+    /// specific source rendered by [`ResourceOrigin::source_info_json`].
+    fn pi_source_label(self) -> &'static str {
+        match self {
+            ResourceScope::ProjectSettings | ResourceScope::GlobalSettings => "local",
+            _ => "auto",
+        }
+    }
+}
+
+impl ResourceOrigin {
+    /// Render this provenance as Pi's `SourceInfo` (`{path, source, scope, origin, baseDir?}`,
+    /// source-info.ts:6-12) for the RPC `get_commands` catalog (rpc-mode.ts:653-683). `path` is the
+    /// resource file; `source`/`scope`/`origin`/`baseDir` are the `PathMetadata` fields Pi records at
+    /// discovery time (package-manager.ts:56-61) — mapped 1:1 from the `scope`/`origin` cyrup's
+    /// `Skill`/`PromptTemplate` already carry. `origin:"package"` for installed packages, else
+    /// `"top-level"`; `baseDir` is present only for the settings/auto loose-file tiers (the config
+    /// dir root), omitted for packages (Pi never sets it there).
+    pub fn source_info_json(&self, path: &Path) -> serde_json::Value {
+        let path_str = path.display().to_string();
+        match self {
+            ResourceOrigin::LooseFile { scope, root } => serde_json::json!({
+                "path": path_str,
+                "source": scope.pi_source_label(),
+                "scope": scope.pi_source_scope(),
+                "origin": "top-level",
+                "baseDir": root.display().to_string(),
+            }),
+            ResourceOrigin::Package { id, scope } => serde_json::json!({
+                "path": path_str,
+                "source": id.as_str(),
+                "scope": scope.pi_source_scope(),
+                "origin": "package",
+            }),
+            ResourceOrigin::Cli { path: _ } => serde_json::json!({
+                "path": path_str,
+                "source": "cli",
+                "scope": "temporary",
+                "origin": "top-level",
+            }),
+            ResourceOrigin::Extension { ext } => serde_json::json!({
+                "path": path_str,
+                "source": ext.as_str(),
+                "scope": "temporary",
+                "origin": "top-level",
+            }),
+            ResourceOrigin::Builtin => serde_json::json!({
+                "path": path_str,
+                "source": "builtin",
+                "scope": "temporary",
+                "origin": "top-level",
+            }),
         }
     }
 }
