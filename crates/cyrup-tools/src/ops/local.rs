@@ -146,7 +146,11 @@ impl FsOps for LocalFs {
                 // Pi runs `rg`/`fd` which honor the user's global gitignore (`~/.gitignore`,
                 // arch-03:404). Mirror that with `git_global(true)`.
                 .git_global(true)
-                .require_git(false)
+                // `require_git(false)` (fd's `--no-require-git`) honors `.gitignore` even outside a
+                // repo; `require_git(true)` is fd/ripgrep's default nested-repo-boundary behavior.
+                // The caller sets this per search path (find.ts:226-240): `false` outside a repo,
+                // `true` inside one. See `WalkOpts::require_git`.
+                .require_git(opts.require_git)
                 .parents(true)
                 .build();
             for result in walker {

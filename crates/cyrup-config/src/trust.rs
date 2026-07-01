@@ -720,4 +720,29 @@ mod tests {
         std::fs::write(cwd.join(".cyrup").join("settings.json"), "{}").unwrap();
         assert!(has_trust_requiring_resources(&cwd, &home));
     }
+
+    #[test]
+    fn home_agents_skills_excluded_but_project_ancestor_counted() {
+        // Pi trust-manager.ts:184-206 (`hasTrustRequiringProjectResources`): the user/global
+        // `~/.agents/skills` (anchored at `process.env.HOME || homedir()`, :185) is a trusted user
+        // resource and is NEVER trust-requiring, even when cwd IS $HOME; a NON-home ancestor's
+        // `.agents/skills` IS. This is why the REAL `$HOME` must be threaded (G1) rather than the
+        // agent dir: a misresolved home turns the user skills dir into a false project trust gate.
+        let home = tmp();
+        std::fs::create_dir_all(home.join(".agents").join("skills")).unwrap();
+
+        // cwd == home: its own `.agents/skills` is the excluded user dir → no trust required.
+        assert!(!has_trust_requiring_resources(&home, &home));
+
+        // A project below home with its own `.agents/skills` IS trust-requiring.
+        let proj = home.join("proj");
+        std::fs::create_dir_all(proj.join(".agents").join("skills")).unwrap();
+        assert!(has_trust_requiring_resources(&proj, &home));
+
+        // GAP GUARD: if `home` is misresolved to an unrelated dir (as it was when `SessionConfig.home`
+        // silently fell back to the agent dir), the user's own `~/.agents/skills` is no longer
+        // excluded and becomes a spurious trust gate.
+        let wrong_home = tmp();
+        assert!(has_trust_requiring_resources(&home, &wrong_home));
+    }
 }

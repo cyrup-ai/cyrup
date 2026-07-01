@@ -365,6 +365,11 @@ impl Cli {
     /// ephemeral in every mode (Pi `noSession`, args.ts:104).
     pub fn to_session_config(&self, dirs: &ConfigDirs, mode: AppMode) -> SessionConfig {
         let mut config = SessionConfig::new(dirs.cwd.clone(), dirs.agent_dir.clone());
+        // Thread the REAL user home (not the agent dir) so the resources ancestor-walk dedup
+        // (`~/.agents/skills`) and the trust-requiring-resource walk resolve against `$HOME`, exactly
+        // like Pi's `getHomeDir()` (`process.env.HOME || homedir()`, package-manager.ts:217) and
+        // trust-manager.ts:185. `SessionConfig::new` defaults `home` to the agent dir; override it here.
+        config.home = dirs.home.clone();
         config.session_dir = Some(dirs.session_dir.clone());
         config.app_mode = mode;
         config.model_pattern = self.model.clone();
@@ -875,6 +880,7 @@ mod tests {
             session_dir: "/agent/sessions".into(),
             package_dir: "/agent/packages".into(),
             cwd: "/work".into(),
+            home: "/home/user".into(),
         }
     }
 
@@ -1132,6 +1138,19 @@ mod tests {
         assert!(resume.persist);
         let ephemeral = parse(&["--no-session"]).to_session_config(&d, AppMode::Interactive);
         assert!(!ephemeral.persist);
+    }
+
+    #[test]
+    fn to_session_config_threads_real_home_not_agent_dir() {
+        // G1: the real `$HOME` (Pi `getHomeDir()`, package-manager.ts:217) must flow onto
+        // `SessionConfig.home`, distinct from the agent dir, so the resources ancestor-walk dedup
+        // (`~/.agents/skills`) and the trust-requiring-resource walk resolve against the real home.
+        let d = dirs();
+        let config = parse(&[]).to_session_config(&d, AppMode::Print);
+        assert_eq!(config.home, d.home);
+        assert_eq!(config.home, PathBuf::from("/home/user"));
+        // The gap was `home` silently equalling the agent dir (the `SessionConfig::new` default).
+        assert_ne!(config.home, config.agent_dir);
     }
 
     #[test]

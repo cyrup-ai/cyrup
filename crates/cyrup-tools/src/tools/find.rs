@@ -42,6 +42,25 @@ impl FindTool {
         });
         Self { fs, cwd, opts, params }
     }
+
+    /// Pi's git-repo probe (find.ts:230-239): walk from `search_path` up through its parents and
+    /// report whether any ancestor (inclusive) contains a `.git` entry. Mirrors Pi's
+    /// `pathExists(path.join(current, ".git"))` loop that stops at the filesystem root. The `.git`
+    /// probe goes through the [`FsOps`] seam so remote backends resolve against the correct
+    /// filesystem; a `.git` file (worktrees/submodules) or directory both count.
+    async fn inside_git_repo(&self, search_path: &std::path::Path) -> bool {
+        let mut current = search_path;
+        loop {
+            if self.fs.metadata(&current.join(".git")).await.is_ok() {
+                return true;
+            }
+            match current.parent() {
+                // Pi breaks when `dirname(current) === current` (the root fixpoint).
+                Some(parent) if parent != current => current = parent,
+                _ => return false,
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -73,10 +92,18 @@ impl Tool for FindTool {
         let matcher = PatternMatcher::build(&input.pattern)?;
         let limit = input.limit.unwrap_or(self.opts.limit);
 
+        // Pi (find.ts:226-240, issue #5960): fd normally ignores `.gitignore` OUTSIDE a git repo, so
+        // it passes `--no-require-git` there. INSIDE a repo it uses fd's default git-aware behavior
+        // so parent `.gitignore` rules stop at nested repo boundaries. Walk parents of the search
+        // path looking for a `.git` entry to decide which mode to use.
+        let inside_git_repo = self.inside_git_repo(&search_root).await;
+
         let mut results: Vec<String> = Vec::new();
         // Pi runs `fd --hidden` (find.ts:224): match dotfiles/dot-dirs while still honoring
         // `.gitignore` (arch-03:430). So include hidden files in the walk.
-        let mut walk = self.fs.walk(&search_root, WalkOpts { include_hidden: true });
+        let mut walk = self
+            .fs
+            .walk(&search_root, WalkOpts { include_hidden: true, require_git: inside_git_repo });
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(error::aborted()),

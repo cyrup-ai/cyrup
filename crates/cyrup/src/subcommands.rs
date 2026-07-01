@@ -555,6 +555,7 @@ mod tests {
             session_dir: root.join("agent/sessions"),
             package_dir: root.join("agent/packages"),
             cwd: root.join("work"),
+            home: root.to_path_buf(),
         }
     }
 

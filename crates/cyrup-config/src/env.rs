@@ -118,6 +118,13 @@ pub struct ConfigDirs {
     pub session_dir: PathBuf,
     pub package_dir: PathBuf,
     pub cwd: PathBuf,
+    /// The real user home directory (`process.env.HOME || homedir()`; Pi `getHomeDir()`,
+    /// package-manager.ts:217, and trust-manager.ts:185). This is the SAME home Pi uses to anchor
+    /// `~/.agents/skills` (the user-tier cross-tool skills dir excluded from the project
+    /// `.agents/skills` ancestor walk) and the trust-requiring-resource walk — NOT the agent dir.
+    /// Threaded onto `SessionConfig.home` so discovery + trust detection resolve against the real
+    /// home, matching Pi. (`resolve` errors early when the home cannot be determined at all.)
+    pub home: PathBuf,
 }
 
 impl ConfigDirs {
@@ -160,6 +167,7 @@ impl ConfigDirs {
             session_dir,
             package_dir,
             cwd,
+            home,
         })
     }
 
@@ -205,6 +213,30 @@ impl ConfigDirs {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::{CliConfigOverrides, ConfigDirs, EnvVars};
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_captures_real_home_distinct_from_agent_dir() {
+        // G1: `ConfigDirs::resolve` must retain the real user home (Pi `getHomeDir()`,
+        // package-manager.ts:217; `getAgentDir` = `join(homedir(), CONFIG_DIR_NAME, "agent")`,
+        // config.ts:520) rather than discarding it. With no env/CLI agent-dir override the agent dir
+        // defaults to `<home>/.cyrup/agent`, so `home` is a strict ancestor and must differ.
+        let env = EnvVars::default();
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            ..Default::default()
+        };
+        let dirs = ConfigDirs::resolve(&cli, &env).unwrap();
+        assert_eq!(dirs.agent_dir, dirs.home.join(".cyrup").join("agent"));
+        assert_ne!(dirs.home, dirs.agent_dir);
+        assert!(dirs.agent_dir.starts_with(&dirs.home));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod flag_tests {
     use super::truthy;
 
     #[test]

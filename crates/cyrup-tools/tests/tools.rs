@@ -569,6 +569,158 @@ async fn find_format_and_gitignore_and_sentinel() {
     assert!(first_text(&dirs).contains("sub/"), "got: {}", first_text(&dirs));
 }
 
+// G2 — the find git-boundary fix (find.ts:226-240, issue #5960). Inside a git repo, fd's default
+// git-aware behavior lets a parent `.gitignore` rule stop at a NESTED repo boundary. Cyrup detects
+// the enclosing repo and sets `require_git(true)` accordingly. Observable: the outer repo's
+// `*.log` rule ignores `outer.log` but does NOT cross into the nested repo, so `nested/inner.log`
+// IS discovered.
+#[tokio::test]
+async fn find_git_boundary_stops_at_nested_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(root.join("outer.log"), "x").unwrap();
+    std::fs::create_dir_all(root.join("nested/.git")).unwrap();
+    std::fs::write(root.join("nested/inner.log"), "x").unwrap();
+
+    let find = FindTool::new(fs(), root.to_path_buf(), FindOpts::default());
+    let r = find
+        .execute(cid(), serde_json::json!({ "pattern": "*.log" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    let lines: Vec<&str> = text.lines().collect();
+    // Parent `.gitignore` stops at the nested repo boundary — inner.log surfaces.
+    assert!(lines.contains(&"nested/inner.log"), "nested repo boundary not honored: {text}");
+    // The outer repo's own file remains gitignored.
+    assert!(!lines.contains(&"outer.log"), "outer .gitignore should apply in its own repo: {text}");
+}
+
+// G2 — OUTSIDE any git repo, fd passes `--no-require-git` so `.gitignore` is STILL honored. Cyrup
+// detects no enclosing `.git` and sets `require_git(false)`. A temp dir has no `.git`, so the
+// gitignored `*.log` file must not appear.
+#[tokio::test]
+async fn find_gitignore_honored_outside_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(root.join("keep.txt"), "x").unwrap();
+    std::fs::write(root.join("skip.log"), "x").unwrap();
+
+    let find = FindTool::new(fs(), root.to_path_buf(), FindOpts::default());
+    let logs = find
+        .execute(cid(), serde_json::json!({ "pattern": "*.log" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert_eq!(first_text(&logs), "No files found matching pattern");
+    let txt = find
+        .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert!(first_text(&txt).lines().any(|l| l == "keep.txt"), "got: {}", first_text(&txt));
+}
+
+// G1 — `timeout` is Pi's `Type.Number` (float SECONDS, bash.ts:42). `timeout:2.5` must deserialize
+// and resolve to 2500ms. Run a 30s sleep with a 2.5s timeout and assert it is killed at ~2.5s and
+// the message prints the original `2.5` value (bash.ts:414-415).
+#[tokio::test]
+async fn bash_timeout_fractional_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let start = std::time::Instant::now();
+    let err = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "sleep 30", "timeout": 2.5 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    let elapsed = start.elapsed();
+    let msg = err.to_string();
+    assert!(msg.contains("Command timed out after 2.5 seconds"), "got: {msg}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2300)
+            && elapsed < std::time::Duration::from_millis(4000),
+        "expected ~2.5s kill, got {elapsed:?}"
+    );
+}
+
+// G1 — `resolveTimeoutMs` rejects non-positive values with Pi's EXACT error string, before running
+// anything (bash.ts:29-31 → re-thrown verbatim via `throw err`, bash.ts:417).
+#[tokio::test]
+async fn bash_timeout_zero_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(
+            cid(),
+            // A command that would succeed instantly if it ever ran — proves the guard fires first.
+            serde_json::json!({ "command": "echo should-not-run", "timeout": 0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Invalid timeout: must be a finite number of seconds");
+}
+
+// G1 — a negative timeout is likewise rejected with the same error (bash.ts:29 `timeout <= 0`).
+#[tokio::test]
+async fn bash_timeout_negative_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo x", "timeout": -1.5 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Invalid timeout: must be a finite number of seconds");
+}
+
+// G1 — a timeout whose millisecond form exceeds the 32-bit ceiling is rejected with Pi's exact
+// maximum message (bash.ts:34-35, `${MAX_TIMEOUT_MS / 1000}` = 2147483.647).
+#[tokio::test]
+async fn bash_timeout_over_maximum_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(
+            cid(),
+            // 2_147_484 s * 1000 = 2_147_484_000 ms > 2_147_483_647.
+            serde_json::json!({ "command": "echo x", "timeout": 2_147_484 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Invalid timeout: maximum is 2147483.647 seconds");
+}
+
+// G1 — the largest valid timeout (exactly 2147483.647s → 2_147_483_647ms) is accepted. It must NOT
+// error at resolve time; the command runs to completion well within the window.
+#[tokio::test]
+async fn bash_timeout_at_maximum_is_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let r = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo ok", "timeout": 2_147_483.647 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(first_text(&r).contains("ok"));
+}
+
 #[tokio::test]
 async fn find_limit_truncation() {
     let dir = tempfile::tempdir().unwrap();

@@ -187,11 +187,17 @@ fn is_bmp(buf: &[u8]) -> bool {
     color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
 }
 
-/// Options for a tree walk (grep/find). Hidden files are skipped by default (ripgrep/fd parity);
-/// `.gitignore` is always honored.
+/// Options for a tree walk (grep/find). Hidden files are skipped by default (ripgrep/fd parity).
+///
+/// `require_git` mirrors fd/ripgrep's `--require-git` behavior: when `false` (fd's
+/// `--no-require-git`), `.gitignore` files are honored even outside a git repository; when `true`
+/// (fd/ripgrep default), git-ignore semantics only apply inside a repo, so parent `.gitignore`
+/// rules stop at nested repo boundaries. Pi's `find` sets this per search path (find.ts:226-240,
+/// issue #5960); `grep` keeps the historical unconditional `false`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WalkOpts {
     pub include_hidden: bool,
+    pub require_git: bool,
 }
 
 /// A single walked path.

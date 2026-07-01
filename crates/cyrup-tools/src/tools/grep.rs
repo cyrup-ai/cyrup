@@ -129,8 +129,11 @@ impl Tool for GrepTool {
             files.push((search_root.clone(), rel));
         } else {
             // Pi runs `rg --hidden` (grep.ts:215): search dotfiles/dot-dirs while still honoring
-            // `.gitignore` (arch-03:404). So include hidden files in the walk.
-            let mut walk = self.fs.walk(&search_root, WalkOpts { include_hidden: true });
+            // `.gitignore` (arch-03:404). So include hidden files in the walk. `require_git:false`
+            // preserves grep's historical unconditional `--no-require-git` walk (the find-only
+            // git-boundary fix, find.ts:226-240, is not in scope here).
+            let mut walk =
+                self.fs.walk(&search_root, WalkOpts { include_hidden: true, require_git: false });
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(error::aborted()),

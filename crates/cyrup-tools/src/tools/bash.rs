@@ -19,7 +19,31 @@ use std::time::Duration;
 #[serde(rename_all = "camelCase")]
 struct BashInput {
     command: String,
-    timeout: Option<u64>,
+    // Pi's TypeBox `Type.Number` (bash.ts:42) is a JS float measured in SECONDS, so `timeout:2.5`
+    // must deserialize. Modeling this as `u64` (the old cyrup type) rejected any fractional value.
+    timeout: Option<f64>,
+}
+
+/// Pi's `MAX_TIMEOUT_MS` (bash.ts:24): the 32-bit `setTimeout` ceiling.
+const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
+
+/// Port of Pi's `resolveTimeoutMs` (bash.ts:27-38), called at the top of `exec` (bash.ts:85). The
+/// input is a count of SECONDS. `None` stays `None` (no default timeout). A non-finite or
+/// non-positive value throws Pi's exact `"Invalid timeout: must be a finite number of seconds"`;
+/// a value whose millisecond form exceeds the 32-bit ceiling throws Pi's exact
+/// `"Invalid timeout: maximum is 2147483.647 seconds"` (`${MAX_TIMEOUT_MS / 1000}`). Otherwise the
+/// seconds are converted to a `Duration` of `round(secs * 1000)` ms.
+fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<Duration>, ToolError> {
+    let Some(secs) = timeout else { return Ok(None) };
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(error::invalid("Invalid timeout: must be a finite number of seconds"));
+    }
+    let timeout_ms = secs * 1000.0;
+    if timeout_ms > MAX_TIMEOUT_MS {
+        return Err(error::invalid("Invalid timeout: maximum is 2147483.647 seconds"));
+    }
+    // `timeout_ms` is finite and in `(0, 2_147_483_647]`, so `round() as u64` is exact and total.
+    Ok(Some(Duration::from_millis(timeout_ms.round() as u64)))
 }
 
 pub struct BashTool {
@@ -88,15 +112,22 @@ impl Tool for BashTool {
 
         let spec = ExecSpec { command: ctx.command, cwd: ctx.cwd, env: ctx.env, shell };
 
-        let timeout = input.timeout.map(Duration::from_secs);
         let max_lines = self.opts.max_lines;
         let max_bytes = self.opts.max_bytes;
 
         let mut acc = OutputAccumulator::new("cyrup-bash", max_lines, max_bytes);
         let mut sink = on_update;
 
-        // Pi emits an initial empty update before streaming (bash.ts:338-340).
+        // Pi emits an initial empty update before streaming (bash.ts:355-357). This happens BEFORE
+        // `ops.exec` runs `resolveTimeoutMs` (bash.ts:400,85), so an invalid timeout surfaces AFTER
+        // this empty update — emit it first, then validate.
         sink(ToolUpdate { content: vec![], details: None, terminate: None });
+
+        // Pi's `resolveTimeoutMs` (bash.ts:85): validate the seconds and convert to a `Duration`.
+        // An invalid value reaches Pi's catch as a plain `Error` that matches neither `"aborted"`
+        // nor `"timeout:"`, so it is re-thrown verbatim via `throw err` (bash.ts:417) with no status
+        // appended — mirror that by returning the raw error here.
+        let timeout = resolve_timeout_ms(input.timeout)?;
 
         // Pi debounces mid-stream output updates with a 100ms throttle that has BOTH a leading edge
         // AND a scheduled TRAILING-edge `setTimeout` flush (`scheduleOutputUpdate`, bash.ts:158,
@@ -275,7 +306,10 @@ impl Tool for BashTool {
             // Catch path (abort/timeout): `formatOutput(snapshot, "")` — `emptyText` is `""`, so an
             // empty output yields just the status with NO leading `\n\n` (bash.ts:375,388-396).
             ExitStatus::TimedOut => {
-                let secs = input.timeout.unwrap_or(0);
+                // Pi throws `timeout:${timeout}` (bash.ts:138) then prints the ORIGINAL seconds
+                // value in `Command timed out after ${timeoutSecs} seconds` (bash.ts:414-415). Rust
+                // `f64` Display matches JS number stringification (`1.0`→"1", `2.5`→"2.5").
+                let secs = input.timeout.unwrap_or(0.0);
                 Err(error::invalid(append_status(&text, &format!("Command timed out after {secs} seconds"))))
             }
             ExitStatus::Killed => Err(error::invalid(append_status(&text, "Command aborted"))),

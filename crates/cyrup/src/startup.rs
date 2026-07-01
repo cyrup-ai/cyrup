@@ -96,6 +96,7 @@ mod tests {
             session_dir: dir.path().join("agent/sessions"),
             package_dir: dir.path().join("agent/packages"),
             cwd: dir.path().join("work"),
+            home: dir.path().to_path_buf(),
         };
         std::fs::create_dir_all(&dirs.agent_dir).unwrap();
         let store = file_settings_store(&dirs);
