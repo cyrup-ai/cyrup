@@ -285,18 +285,31 @@ impl<'a> ModelResolver<'a> {
 /// model-resolver.ts:282). Faithful to minimatch's path-segment semantics: `*`/`?`/`[...]` do NOT
 /// cross `/` (they match within a single segment), `**` is a globstar matching zero or more whole
 /// segments, and `{a,b}`/`{1..3}` brace lists and ranges are expanded before matching. Per-segment
-/// it supports backslash escaping, the dot-rule (`dot:false`), and the extglobs
-/// `@(..)`/`?(..)`/`*(..)`/`+(..)` (see [`segment_matches`]). Case-insensitive. No external dep.
-/// (The `!(..)` negation extglob is a documented agreed-deferral — unreachable for provider/model
-/// ids; see the residual ledger.)
+/// it supports backslash escaping, the dot-rule (`dot:false`), and the FULL extglob set
+/// `@(..)`/`?(..)`/`*(..)`/`+(..)`/`!(..)` including the negative extglob (see [`segment_matches`]).
+/// A leading `!` on the whole pattern is minimatch's whole-match negation (`nonegate:false`), so
+/// `!(foo)` is `!`+literal `(foo)` — the "standalone `!()` quirk" — not a negative extglob.
+/// Case-insensitive. No external dep. Verified byte-for-byte against Pi's `minimatch` on a large
+/// captured table (see `glob_matches_pi_minimatch_byte_for_byte`).
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pat_lower = pattern.to_ascii_lowercase();
     let text_lower = text.to_ascii_lowercase();
+    // minimatch `parseNegate` (default `nonegate:false`): strip a run of leading `!` from the WHOLE
+    // pattern; an odd count negates the final result. This runs before brace-expansion/segmenting,
+    // so a leading `!(..)` is negation + a literal `(..)` group, never a negative extglob.
+    let raw: Vec<char> = pat_lower.chars().collect();
+    let mut neg_off = 0usize;
+    while raw.get(neg_off).copied() == Some('!') {
+        neg_off += 1;
+    }
+    let negate = neg_off % 2 == 1;
+    let stripped: String = raw.get(neg_off..).unwrap_or(&[]).iter().collect();
     let text_parts: Vec<&str> = text_lower.split('/').collect();
-    brace_expand(&pat_lower).into_iter().any(|expanded| {
+    let any_hit = brace_expand(&stripped).into_iter().any(|expanded| {
         let pat_parts: Vec<&str> = expanded.split('/').collect();
         match_segments(&pat_parts, &text_parts)
-    })
+    });
+    negate ^ any_hit
 }
 
 /// Match a path-segment-split glob against a path-segment-split text. A `**` segment is a globstar
@@ -329,90 +342,191 @@ fn match_segments(pat: &[&str], text: &[&str]) -> bool {
 ///
 /// Implements minimatch's per-segment semantics (default options, the `{ nocase: true }` call at
 /// model-resolver.ts:282): `*`/`?`/`[...]` wildcards, backslash escaping (`\x` = literal `x`), the
-/// extglobs `@(..)`/`?(..)`/`*(..)`/`+(..)`, and the dot-rule (`dot:false`): a text segment that
-/// begins with `.` is matched only when the pattern's first unit is a LITERAL `.` (so a leading
-/// `*`/`?`/`[`/extglob does not match a dotfile). (The `!(..)` negation extglob, and minimatch's
-/// obscure bracket-vs-leading-dot sub-corner — `[.]` matching `.x` but `[xy.]` not — are documented
-/// agreed-deferrals: both are unreachable for provider/model ids, which never start a path segment
-/// with `.` and never negate; see the residual ledger.)
+/// full extglob set `@(..)`/`?(..)`/`*(..)`/`+(..)`/`!(..)` (see [`m`]), the dot-rule (`dot:false`):
+/// a text segment that begins with `.` is matched only when the pattern's first unit is a LITERAL
+/// `.` — where, per minimatch's single-char bracket rule, a non-negated `[.]`/`[\.]` counts as a
+/// literal `.` (the `[.]`-at-segment-start dot-bracket corner); and the `justDots`/`needNoTrav`
+/// rule: the literal segments `.`/`..` are matched ONLY by a purely-literal pattern equal to them.
 fn segment_matches(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = text.chars().collect();
+    // `justDots`/`needNoTrav`: `.`/`..` text segments only match a purely-literal pattern == text.
+    if text == "." || text == ".." {
+        return as_pure_literal(&p).as_deref() == Some(text);
+    }
     // Dot-rule (minimatch default `dot:false`).
-    if t.first() == Some(&'.') && !pattern_first_is_literal_dot(&p) {
+    if t.first() == Some(&'.') && !leading_matches_literal_dot(&p) {
         return false;
     }
-    seg_match(&p, &t)
+    m(&p, &t, 0, &K::End, &K::End)
 }
 
-/// Whether the pattern segment's first unit is a literal `.` (bare or escaped) — the only thing that
-/// matches a leading-dot text segment under `dot:false`.
-fn pattern_first_is_literal_dot(p: &[char]) -> bool {
+/// Whether the segment pattern's first construct can match a leading `.` under `dot:false`: a
+/// literal `.` (bare or escaped), or — per minimatch's `parseClass` single-char rule — a non-negated
+/// single-char class `[.]`/`[\.]` (which compiles to the literal `\.`, so its regex does not start
+/// with `[` and thus is not blocked by `startNoDot`). This is the `[.]`-at-segment-start corner.
+fn leading_matches_literal_dot(p: &[char]) -> bool {
     match p.first().copied() {
         Some('.') => true,
         Some('\\') => p.get(1).copied() == Some('.'),
+        Some('[') => single_char_class_literal(p) == Some('.'),
         _ => false,
     }
 }
 
-/// Recursively match the entire pattern-segment `p` against the entire text-segment `t` (no `/` in
-/// either). Backtracks on `*` and on extglob repetition.
-fn seg_match(p: &[char], t: &[char]) -> bool {
+/// If `p` begins with a non-negated bracket class that (per minimatch's `parseClass` single-char
+/// shortcut) reduces to a single literal character (`[x]`, `[\x]`), return that character.
+fn single_char_class_literal(p: &[char]) -> Option<char> {
+    if p.first().copied() != Some('[') || matches!(p.get(1).copied(), Some('!') | Some('^')) {
+        return None;
+    }
+    match p.get(1).copied() {
+        // `[\X]` — escaped single member.
+        Some('\\') if p.get(3).copied() == Some(']') => p.get(2).copied(),
+        Some('\\') => None,
+        // `[X]` — a bare single member (a leading `]` is itself a literal member, so `[]]` -> ']').
+        Some(c) if p.get(2).copied() == Some(']') => Some(c),
+        _ => None,
+    }
+}
+
+/// If the pattern segment is purely literal (every unit is a fixed char: a bare literal, a `\x`
+/// escape, or a single-char class `[x]`/`[\x]`), return that literal string; else `None`. Used for
+/// the `justDots` rule (`.`/`..` only match an exactly-equal literal pattern).
+fn as_pure_literal(p: &[char]) -> Option<String> {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while let Some(c) = p.get(i).copied() {
+        match c {
+            '\\' => {
+                out.push(p.get(i + 1).copied()?);
+                i += 2;
+            }
+            '[' => {
+                out.push(single_char_class_literal(p.get(i..).unwrap_or(&[]))?);
+                i += if p.get(i + 1).copied() == Some('\\') { 4 } else { 3 };
+            }
+            '*' | '?' => return None,
+            '@' | '+' | '!' if p.get(i + 1).copied() == Some('(') => return None,
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Continuation for the CPS per-segment matcher. Two continuations are threaded: the ordinary
+/// consume-continuation `k` (what to match after the current construct), and the negation-tail `nt`
+/// (minimatch `fillNegs`: the pattern following the innermost enclosing group, used to bind a
+/// `!(..)`'s negative lookahead to the segment end). They coincide everywhere except inside a
+/// repeating extglob (`*`/`+`), where `k` loops but `nt` does not.
+enum K<'a> {
+    /// Require the whole segment to be consumed (regex `$`, i.e. `(?:$|/)` within a segment).
+    End,
+    /// Match pattern slice `p`, then continue with `next`.
+    Pat(&'a [char], &'a K<'a>),
+    /// Enter a `*(alts)rest`/`+(alts)` star: match `rest` then `outer`, or an alt then loop. `nt`
+    /// is the negation-tail that applies AFTER the whole repetition (never the loop itself).
+    StarEntry {
+        alts: &'a [Vec<char>],
+        rest: &'a [char],
+        outer: &'a K<'a>,
+        nt: &'a K<'a>,
+    },
+    /// A star iteration boundary: only continue looping if the position advanced past `start`.
+    StarLoop {
+        alts: &'a [Vec<char>],
+        rest: &'a [char],
+        outer: &'a K<'a>,
+        nt: &'a K<'a>,
+        start: usize,
+    },
+}
+
+fn run(k: &K, t: &[char], pos: usize) -> bool {
+    match k {
+        K::End => pos == t.len(),
+        K::Pat(p, next) => m(p, t, pos, next, next),
+        K::StarEntry {
+            alts,
+            rest,
+            outer,
+            nt,
+        } => star_entry(alts, rest, outer, nt, t, pos),
+        K::StarLoop {
+            alts,
+            rest,
+            outer,
+            nt,
+            start,
+        } => pos > *start && star_entry(alts, rest, outer, nt, t, pos),
+    }
+}
+
+fn star_entry<'a>(
+    alts: &'a [Vec<char>],
+    rest: &'a [char],
+    outer: &'a K<'a>,
+    nt: &'a K<'a>,
+    t: &[char],
+    pos: usize,
+) -> bool {
+    // Zero more repetitions: match the in-group siblings `rest`, then the outer continuation.
+    if m(rest, t, pos, outer, nt) {
+        return true;
+    }
+    // One more repetition: an alt (which must advance the position), then loop.
+    let neg_inside = K::Pat(rest, nt);
+    alts.iter().any(|alt| {
+        m(
+            alt,
+            t,
+            pos,
+            &K::StarLoop {
+                alts,
+                rest,
+                outer,
+                nt,
+                start: pos,
+            },
+            &neg_inside,
+        )
+    })
+}
+
+/// Match pattern `p` starting at position `pos` in segment `t`; on success continue via `k`. `nt`
+/// carries the negation-tail (see [`K`]) used by any `!(..)` encountered at this level.
+fn m(p: &[char], t: &[char], pos: usize, k: &K, nt: &K) -> bool {
     let Some(c0) = p.first().copied() else {
-        return t.is_empty();
+        return run(k, t, pos);
     };
-    // Extglob lead: `@(` / `?(` / `*(` / `+(`. (`!(` is a documented deferral — `!` is a literal.)
-    if matches!(c0, '@' | '?' | '*' | '+') && p.get(1).copied() == Some('(') {
-        return match_extglob(c0, p, t);
+    // Extglob lead: `@(` / `?(` / `*(` / `+(` / `!(`.
+    if matches!(c0, '@' | '?' | '*' | '+' | '!') && p.get(1).copied() == Some('(') {
+        return ext(c0, p, t, pos, k, nt);
     }
     let p_tail = p.get(1..).unwrap_or(&[]);
-    let t_tail = t.get(1..).unwrap_or(&[]);
     match c0 {
-        // `\x` → literal `x`. A trailing `\` (no following char) cannot match.
+        // `\x` -> literal `x`. A trailing `\` (no following char) cannot match.
         '\\' => match p.get(1).copied() {
-            Some(lit) => t.first() == Some(&lit) && seg_match(p.get(2..).unwrap_or(&[]), t_tail),
+            Some(lit) => {
+                t.get(pos) == Some(&lit) && m(p.get(2..).unwrap_or(&[]), t, pos + 1, k, nt)
+            }
             None => false,
         },
-        // `*` consumes zero or more chars within the segment.
-        '*' => (0..=t.len()).any(|k| seg_match(p_tail, t.get(k..).unwrap_or(&[]))),
-        // `?` consumes exactly one char.
-        '?' => !t.is_empty() && seg_match(p_tail, t_tail),
-        '[' => match_class_then(p, t),
-        lit => t.first() == Some(&lit) && seg_match(p_tail, t_tail),
+        // `*` = `[^/]*` (any chars within a segment; greedy/non-greedy is irrelevant to booleans).
+        '*' => (pos..=t.len()).any(|p2| m(p_tail, t, p2, k, nt)),
+        '?' => pos < t.len() && m(p_tail, t, pos + 1, k, nt),
+        '[' => match_class(p, t, pos, k, nt),
+        lit => t.get(pos) == Some(&lit) && m(p_tail, t, pos + 1, k, nt),
     }
 }
 
-/// Match a `[...]` class at the head of `p` against `t[0]`, then continue. Mirrors the prior
-/// `match_unit` class handling (negation `[!..]`/`[^..]`, a leading `]` as a literal member, ranges;
-/// an unterminated `[` is a literal `[`).
-fn match_class_then(p: &[char], t: &[char]) -> bool {
-    let mut j = 1;
-    let negate = matches!(p.get(j).copied(), Some('!') | Some('^'));
-    if negate {
-        j += 1;
-    }
-    let class_start = j;
-    while let Some(cur) = p.get(j).copied() {
-        if cur == ']' && j != class_start {
-            break;
-        }
-        j += 1;
-    }
-    let t_tail = t.get(1..).unwrap_or(&[]);
-    if p.get(j).copied() == Some(']') {
-        let Some(c) = t.first().copied() else {
-            return false;
-        };
-        let inset = class_matches(p, class_start, j, c);
-        inset != negate && seg_match(p.get(j + 1..).unwrap_or(&[]), t_tail)
-    } else {
-        // Unterminated class → treat `[` as a literal.
-        t.first() == Some(&'[') && seg_match(p.get(1..).unwrap_or(&[]), t_tail)
-    }
-}
-
-/// Match an extglob `K(alt|alt|..)rest` at the head of `p` against `t`, where `K ∈ {@,?,*,+}`.
-fn match_extglob(kind: char, p: &[char], t: &[char]) -> bool {
+/// Match an extglob `K(alt|alt|..)rest` at the head of `p` against `t[pos..]`, where
+/// `K ∈ {@,?,*,+,!}`. Mirrors minimatch's extglob-to-regex semantics, including the `!` negative
+/// extglob (`(?:(?!(?:alt·tail(?:$|/)))[^/]*?)`) whose lookahead binds to the segment end via `nt`.
+fn ext(kind: char, p: &[char], t: &[char], pos: usize, k: &K, nt: &K) -> bool {
     // Find the matching `)` (the `(` is at p[1]); track nesting.
     let mut depth = 0usize;
     let mut close = None;
@@ -432,55 +546,91 @@ fn match_extglob(kind: char, p: &[char], t: &[char]) -> bool {
         i += 1;
     }
     let Some(close) = close else {
-        // Unterminated `K(` → match the lead char literally.
-        return t.first() == Some(&kind) && seg_match(p.get(1..).unwrap_or(&[]), t.get(1..).unwrap_or(&[]));
+        // Unterminated `K(` -> match the lead char literally.
+        return t.get(pos) == Some(&kind) && m(p.get(1..).unwrap_or(&[]), t, pos + 1, k, nt);
     };
     let body = p.get(2..close).unwrap_or(&[]);
     let rest = p.get(close + 1..).unwrap_or(&[]);
     let alts = split_top_alternatives(body);
+    // Negation-tail seen from INSIDE this group: the in-group siblings `rest`, then the tail after
+    // the whole group (`fillNegs`).
+    let neg_inner = K::Pat(rest, nt);
     match kind {
-        // Exactly one of the alternatives, then `rest`.
-        '@' => one_alt_then(&alts, rest, t),
+        // Exactly one alternative, then `rest`.
+        '@' => alts
+            .iter()
+            .any(|alt| m(alt, t, pos, &K::Pat(rest, k), &neg_inner)),
         // Zero or one.
-        '?' => seg_match(rest, t) || one_alt_then(&alts, rest, t),
+        '?' => {
+            m(rest, t, pos, k, nt)
+                || alts
+                    .iter()
+                    .any(|alt| m(alt, t, pos, &K::Pat(rest, k), &neg_inner))
+        }
         // Zero or more.
-        '*' => star_alts(&alts, rest, t),
+        '*' => star_entry(&alts, rest, k, nt, t, pos),
         // One or more = one alternative, then zero-or-more.
-        '+' => plus_alts(&alts, rest, t),
+        '+' => alts.iter().any(|alt| {
+            m(
+                alt,
+                t,
+                pos,
+                &K::StarEntry {
+                    alts: &alts,
+                    rest,
+                    outer: k,
+                    nt,
+                },
+                &neg_inner,
+            )
+        }),
+        // Negative extglob. Lookahead: NO alternative followed by the in-group siblings `rest` and
+        // the negation-tail `nt` reaches the segment end (minimatch `fillNegs`'s `alt·tail(?:$|/)`).
+        // Otherwise consume `[^/]*?` (any prefix, no `/` in-segment) then `rest`, then `k`.
+        '!' => {
+            let looka = alts
+                .iter()
+                .any(|alt| m(alt, t, pos, &neg_inner, &neg_inner));
+            if looka {
+                return false;
+            }
+            (pos..=t.len()).any(|p2| m(rest, t, p2, k, nt))
+        }
         _ => false,
     }
 }
 
-/// `@(alts)rest`: some alternative matches a prefix `t[..k]`, then `rest` matches `t[k..]`.
-fn one_alt_then(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
-    alts.iter().any(|alt| {
-        (0..=t.len()).any(|k| {
-            seg_match(alt, t.get(..k).unwrap_or(&[])) && seg_match(rest, t.get(k..).unwrap_or(&[]))
-        })
-    })
-}
-
-/// `*(alts)rest`: zero or more alternatives (each consuming ≥1 char), then `rest`.
-fn star_alts(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
-    if seg_match(rest, t) {
-        return true;
+/// Match a `[...]` class at the head of `p` against `t[pos]`, then continue via `k`/`nt`. Handles
+/// negation (`[!..]`/`[^..]`), a leading `]` as a literal member, ranges, `\x` escaped members, and
+/// an unterminated `[` as a literal `[`.
+fn match_class(p: &[char], t: &[char], pos: usize, k: &K, nt: &K) -> bool {
+    let mut j = 1;
+    let negate = matches!(p.get(j).copied(), Some('!') | Some('^'));
+    if negate {
+        j += 1;
     }
-    alts.iter().any(|alt| {
-        (1..=t.len()).any(|k| {
-            seg_match(alt, t.get(..k).unwrap_or(&[]))
-                && star_alts(alts, rest, t.get(k..).unwrap_or(&[]))
-        })
-    })
-}
-
-/// `+(alts)rest`: one alternative (≥1 char), then `*(alts)rest`.
-fn plus_alts(alts: &[Vec<char>], rest: &[char], t: &[char]) -> bool {
-    alts.iter().any(|alt| {
-        (1..=t.len()).any(|k| {
-            seg_match(alt, t.get(..k).unwrap_or(&[]))
-                && star_alts(alts, rest, t.get(k..).unwrap_or(&[]))
-        })
-    })
+    let class_start = j;
+    while let Some(cur) = p.get(j).copied() {
+        if cur == ']' && j != class_start {
+            break;
+        }
+        // A `\x` inside the class is a two-char literal member; the `x` (even `]`) is not a close.
+        if cur == '\\' && p.get(j + 1).is_some() {
+            j += 2;
+            continue;
+        }
+        j += 1;
+    }
+    if p.get(j).copied() == Some(']') {
+        let Some(c) = t.get(pos).copied() else {
+            return false;
+        };
+        let inset = class_matches(p, class_start, j, c);
+        inset != negate && m(p.get(j + 1..).unwrap_or(&[]), t, pos + 1, k, nt)
+    } else {
+        // Unterminated class -> treat `[` as a literal.
+        t.get(pos) == Some(&'[') && m(p.get(1..).unwrap_or(&[]), t, pos + 1, k, nt)
+    }
 }
 
 /// Split an extglob body into alternatives at the top-level `|` (respecting nested `(...)`).
@@ -683,32 +833,37 @@ fn format_range_num(x: i64, padded: bool, width: usize) -> String {
     }
 }
 
-/// Whether char `c` is in the class body `p[start..end)` (ranges like `a-z` and bare chars).
+/// Whether char `c` is in the class body `p[start..end)` (ranges like `a-z`, bare chars, and `\x`
+/// escaped members — a `\x` inside `[...]` is the literal `x`, per minimatch's brace-expression
+/// escaping). A `-` that is the last body char (or has no member after it) is a literal `-`.
 fn class_matches(p: &[char], start: usize, end: usize, c: char) -> bool {
     let mut j = start;
     while j < end {
-        let cur = match p.get(j).copied() {
-            Some(ch) => ch,
-            None => break,
-        };
-        let dash = p.get(j + 1).copied();
-        let hi = p.get(j + 2).copied();
-        if j + 2 < end && dash == Some('-') && hi.is_some_and(|h| h != ']') {
-            if let Some(h) = hi
-                && c >= cur
-                && c <= h
-            {
+        let (lo, after_lo) = read_class_member(p, j, end);
+        if p.get(after_lo).copied() == Some('-') && after_lo + 1 < end {
+            let (hi, after_hi) = read_class_member(p, after_lo + 1, end);
+            if c >= lo && c <= hi {
                 return true;
             }
-            j += 3;
+            j = after_hi;
         } else {
-            if cur == c {
+            if c == lo {
                 return true;
             }
-            j += 1;
+            j = after_lo;
         }
     }
     false
+}
+
+/// Read one class member at `j`: a `\x` escape yields the literal `x` (consuming 2), otherwise the
+/// bare char (consuming 1). Returns the member char and the next index.
+fn read_class_member(p: &[char], j: usize, end: usize) -> (char, usize) {
+    if p.get(j).copied() == Some('\\') && j + 1 < end {
+        (p.get(j + 1).copied().unwrap_or('\\'), j + 2)
+    } else {
+        (p.get(j).copied().unwrap_or('\0'), j + 1)
+    }
 }
 
 /// Cursor over candidate models for Ctrl+P / Ctrl+N cycling (R-07-022).
@@ -1662,11 +1817,15 @@ mod tests {
         // `minimatch(text, pattern, { nocase: true })` (the exact call at model-resolver.ts:282),
         // committed to `src/testdata/glob_minimatch.json`. Assert the Rust matcher agrees on all
         // cases — covering the proven miss (`anthropic*` does NOT cross `/`, so it matches 0),
-        // brace lists, globstar `**`, `?`, `[...]`, class negation, nocase, AND the residual-#4
-        // feature classes: brace RANGES (`{1..3}`/`{a..c}`/`{01..03}`/`{3..1}`/`{1..5..2}`), the
-        // extglobs `@(..)`/`?(..)`/`*(..)`/`+(..)`, backslash escaping, and the dot-rule (`dot:false`
-        // — `*`/`?`/`**`/`[` do not match a leading-dot segment). (The `!(..)` negation extglob is a
-        // documented agreed-deferral, excluded from the fixture; see the residual ledger.)
+        // brace lists, globstar `**`, `?`, `[...]`, class negation, nocase, brace RANGES
+        // (`{1..3}`/`{a..c}`/`{01..03}`/`{3..1}`/`{1..5..2}`), the extglobs
+        // `@(..)`/`?(..)`/`*(..)`/`+(..)`, backslash escaping, and the dot-rule (`dot:false`). It
+        // ALSO covers the residual-#3 minimatch corners now implemented 1:1: the `!(..)` negative
+        // extglob in every position (mid-segment `a!(foo)b`/`x!(a|b)y`, across groups `a@(!(x))b`,
+        // nested in repetition `+(!(a))`/`*(!(a|b))`, and after `/`), the leading-`!` whole-pattern
+        // negation "standalone `!()` quirk" (`!(foo)`, `!!foo`, `!a/b`), the `[.]`-at-segment-start
+        // dot-bracket corner (`[.]x` matches `.x`, `[.x]`/`[!.]` do not), class `\x` escaping
+        // (`[\.]`), and the `justDots`/`needNoTrav` rule for `.`/`..` text segments.
         let fixture = include_str!("testdata/glob_minimatch.json");
         let cases: Vec<(String, String, bool)> =
             serde_json::from_str(fixture).expect("valid fixture");
@@ -1685,6 +1844,45 @@ mod tests {
             "glob_match diverges from Pi minimatch:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    #[test]
+    fn glob_negation_and_dot_bracket_corners() {
+        // Focused assertions for residual-#3 (each value is Pi's `minimatch(text, pat, nocase)`).
+        // Negative extglob `!(..)` (mid-segment; excludes the alternatives, includes the tail):
+        assert!(glob_match("a!(foo)b", "axb"));
+        assert!(!glob_match("a!(foo)b", "afoob"));
+        assert!(!glob_match("x!(a|b)y", "xay"));
+        assert!(glob_match("x!(a|b)y", "xcy"));
+        // `!(..)` after `/` is a real extglob; `foo/!(bar)` excludes `bar`.
+        assert!(glob_match("foo/!(bar)", "foo/baz"));
+        assert!(!glob_match("foo/!(bar)", "foo/bar"));
+        // fillNegs spans enclosing groups: `a@(!(x))b` lookahead is `xb(?:$|/)`.
+        assert!(!glob_match("a@(!(x))b", "axb"));
+        assert!(glob_match("a@(!(x))b", "axxb"));
+        // `!(..)` nested in a repetition uses a segment-end lookahead, NOT the loop.
+        assert!(!glob_match("+(!(foo))", "foo"));
+        assert!(glob_match("+(!(foo))", "foobar"));
+        assert!(!glob_match("*(!(foo))", "foo"));
+        // Leading-`!` whole-pattern negation ("standalone `!()` quirk"): `!(foo)` == `!`+`(foo)`.
+        assert!(glob_match("!(foo)", "foo")); // negate + literal `(foo)`; `foo` != `(foo)`
+        assert!(glob_match("!(foo)", "(bar)"));
+        assert!(!glob_match("!(foo)", "(foo)"));
+        assert!(!glob_match("!foo", "foo")); // simple whole-pattern negation
+        assert!(glob_match("!foo", "bar"));
+        assert!(glob_match("!!foo", "foo")); // double negation
+        assert!(!glob_match("!a/b", "a/b"));
+        assert!(glob_match("!a/b", "a/c"));
+        // `[.]`-at-segment-start dot-bracket corner: single-char `[.]`/`[\.]` == literal `.`.
+        assert!(glob_match("[.]x", ".x"));
+        assert!(!glob_match("[.x]", "."));
+        assert!(!glob_match("[!.]", "."));
+        assert!(glob_match("[\\.]", "."));
+        assert!(!glob_match("[\\.]", "\\")); // class `\x` escaping: `[\.]` is `.`, not `\`
+        // `justDots`: `.`/`..` only match a purely-literal equal pattern.
+        assert!(glob_match("[.]", "."));
+        assert!(!glob_match("[.]*", ".")); // has a wildcard -> not "just dots"
+        assert!(!glob_match(".*", "."));
     }
 
     #[test]

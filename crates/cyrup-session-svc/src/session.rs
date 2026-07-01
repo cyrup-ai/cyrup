@@ -725,15 +725,58 @@ impl AgentSession {
             return false;
         }
         let cancel = self.session_cancel.child_token();
+        // NATIVE built-ins first (R-08-016): route to the owning native extension.
         match self.services.ext_host.execute_native_command(name, args, &cancel).await {
             // A native extension owned + serviced the command (Pi short-circuits regardless of the
             // handler's own Ok/Err — the command was "handled").
-            Ok(Some(_)) => true,
-            // No native owner for this command name: not an extension command, fall through.
-            Ok(None) => false,
+            Ok(Some(_)) => return true,
+            // No NATIVE owner: the name may still belong to a LIVE wasm guest command. Pi keeps
+            // native + wasm commands in ONE map (`getCommand`, agent-session.ts:1183), so both
+            // routes are tried before falling through to normal prompt handling.
+            Ok(None) => {}
             // Routing failure (e.g. poisoned lock): degrade to "not handled" (never panic).
-            Err(_) => false,
+            Err(_) => return false,
         }
+        self.try_execute_wasm_command(name, args, &cancel).await
+    }
+
+    /// Execute a LIVE wasm-guest-registered slash command through the real run path (R-08-016; Pi
+    /// `command.handler(args, ctx)`, agent-session.ts:1189-1200). Runs the guest's `execute-command`
+    /// export at command tier, then drains + applies the session-tier control ops the guest queued
+    /// via its `control` capability — Pi runs those inline in the handler's `createCommandContext`
+    /// (agent-session.ts:1158); cyrup bridges the SYNC guest `control()` call to the ASYNC session
+    /// effect here (arch-08 §6.3, mirrors [`Self::apply_pending_control`]). Returns `true` whenever a
+    /// registered guest command was serviced — Pi returns `true` even when the handler throws
+    /// (:1192-1200) — and `false` when no guest owns the name (fall through to a normal prompt).
+    #[cfg(feature = "wasm-host")]
+    async fn try_execute_wasm_command(&self, name: &str, args: &str, cancel: &CancelToken) -> bool {
+        // Only a REGISTERED command routes here; an unknown `/name` falls through (Pi `getCommand`
+        // returns `undefined` ⇒ `false`, agent-session.ts:1184).
+        if !matches!(self.services.ext_host.registry().command_owner(name), Ok(Some(_))) {
+            return false;
+        }
+        // Run the guest handler. Pi discards the handler's return value (the command manages its own
+        // LLM interaction via `pi.sendMessage`), and treats a thrown handler as still "handled"
+        // (agent-session.ts:1192-1200) — so a guest fault does not fall through to a prompt.
+        let _ = self.services.ext_host.run_command(name, args, cancel).await;
+        // Apply the session-tier control ops the guest queued (compact / set-model / send-message /
+        // set-thinking-level). Runtime-tier ops are handed back for the runtime to act on. Boxed: a
+        // `send_user_message` op re-enters the prompt path (Pi `pi.sendMessage` from a command
+        // handler), so the async future must introduce indirection to stay finitely sized.
+        let _deferred = Box::pin(self.apply_pending_control()).await;
+        true
+    }
+
+    /// Native-host fallback (no `wasm-host` feature): no live guest can own a command, so an
+    /// unmatched slash falls through to normal prompt handling.
+    #[cfg(not(feature = "wasm-host"))]
+    async fn try_execute_wasm_command(
+        &self,
+        _name: &str,
+        _args: &str,
+        _cancel: &CancelToken,
+    ) -> bool {
+        false
     }
 
     /// Run the pre-send sequence Pi's `prompt` performs before dispatching the run
@@ -1819,7 +1862,11 @@ impl AgentSession {
                     }
                 }
                 ControlOp::SendUserMessage { content, .. } => {
-                    let _ = self.send_user_message(content, None).await;
+                    // A guest `sendUserMessage` op re-enters the prompt path (`send_user_message` →
+                    // `prompt_accepted` → `prepare` → `try_execute_extension_command`), closing an
+                    // `async fn` cycle. Box this cold re-entry edge so the future stays finitely
+                    // sized (E0733) without adding indirection to the hot prompt path.
+                    let _ = Box::pin(self.send_user_message(content, None)).await;
                 }
                 ControlOp::Compact => {
                     let _ = self.compact(None).await;
@@ -2403,8 +2450,10 @@ impl AgentSession {
     /// `agent-session-services.ts` extension load). This is THE injection seam that retires the
     /// cyrup-ext §08 ledger row: the same `host_services` that drives live model/session/control
     /// state is what the guest's `models`/`session`/`control` imports reach. Behind the `wasm-host`
-    /// feature (the host is built with the Wasmtime engine); the default native-only build keeps a
-    /// guest-free host (full guest E2E is gated on the wasm32-wasip2 toolchain — residual ledger).
+    /// feature (ON by default — the host is built with the Wasmtime engine). A guest that registers a
+    /// slash command via this seam executes through the real run path end-to-end (proven by
+    /// `tests/wasm_slash_command.rs`: `prompt("/greet …")` → `_tryExecuteExtensionCommand` → the
+    /// guest's `execute-command` export).
     #[cfg(feature = "wasm-host")]
     pub async fn load_wasm_extension(
         &self,

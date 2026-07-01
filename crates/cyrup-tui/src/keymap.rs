@@ -176,6 +176,27 @@ impl SelectAction {
     }
 }
 
+/// The modifier bits Pi's `matchesKey` considers (`shift|ctrl|alt|super`, keys.ts:779). Every other
+/// bit crossterm may report — `HYPER`, `META`, and the Caps-Lock/Num-Lock lock mask (Pi `LOCK_MASK`,
+/// keys.ts:299) — is stripped before comparison so a lock-key state never defeats a binding.
+const SUPPORTED_MODS: KeyModifiers = KeyModifiers::SHIFT
+    .union(KeyModifiers::CONTROL)
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER);
+
+/// Pi `normalizeShiftedLetterIdentityCodepoint` (keys.ts:360-366): with `shift` held, an ASCII
+/// `A..=Z` collapses to its lowercase codepoint so a `shift+a` spec and a reported `Char('A')`+`SHIFT`
+/// event compare equal. Non-letters and unshifted codes pass through unchanged.
+fn normalize_shifted_letter(code: KeyCode, mods: KeyModifiers) -> KeyCode {
+    if mods.contains(KeyModifiers::SHIFT)
+        && let KeyCode::Char(c) = code
+        && c.is_ascii_uppercase()
+    {
+        return KeyCode::Char(c.to_ascii_lowercase());
+    }
+    code
+}
+
 /// A parsed key spec: a base code plus modifiers (R-10-023).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -235,9 +256,24 @@ impl Key {
         }
     }
 
-    /// Whether a raw `KeyEvent` matches this spec (pi `matchesKey` parity).
+    /// Whether a raw `KeyEvent` matches this spec (Pi `matchesKey` parity, `tui/src/keys.ts:640-772`).
+    ///
+    /// Two Pi normalizations are applied before comparing so bindings match the way Pi's do:
+    /// 1. **Lock-mask + unsupported-modifier stripping** (`modifier & ~LOCK_MASK`, keys.ts:361,656): a
+    ///    Caps-Lock / Num-Lock chord (or any modifier outside the supported `shift|ctrl|alt|super`
+    ///    set — e.g. crossterm's `HYPER`/`META`) must not defeat a binding. Both the event and the
+    ///    spec are masked to [`SUPPORTED_MODS`] before the modifier comparison.
+    /// 2. **Shifted-letter identity** (`normalizeShiftedLetterIdentityCodepoint`, keys.ts:360-366):
+    ///    with `shift` held, an ASCII `A..=Z` normalizes to its lowercase codepoint, so a `shift+a`
+    ///    binding matches a terminal that reports `Char('A')` + `SHIFT` (the Kitty/disambiguate path
+    ///    this TUI enables), and vice-versa.
     pub fn matches(&self, ev: &KeyEvent) -> bool {
-        ev.code == self.code && ev.modifiers == self.mods
+        let ev_mods = ev.modifiers & SUPPORTED_MODS;
+        let self_mods = self.mods & SUPPORTED_MODS;
+        if ev_mods != self_mods {
+            return false;
+        }
+        normalize_shifted_letter(ev.code, ev_mods) == normalize_shifted_letter(self.code, self_mods)
     }
 
     /// A short human label for the key (`esc`, `ctrl+c`, `shift+tab`) — the inverse of [`Key::parse`],
@@ -410,6 +446,97 @@ impl SelectKeymap {
     pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
         for (id, value) in keybindings_object(json)? {
             if let Some(action) = SelectAction::from_id(&id) {
+                self.set_action(action, parse_key_values(&value)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The configurable autocomplete-popup actions (item #6; `tui.autocomplete.*`). Pi's autocomplete
+/// dropdown navigation was matched inline; cyrup routes it through this table so a `keybindings.json`
+/// rebind of the popup keys takes effect (consistent with the `tui.select.*` pattern). Defaults:
+/// `↑`/`↓` navigate, `Tab` accepts + keeps editing, `Enter` accepts (submitting for a slash item),
+/// `Esc` dismisses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutocompleteAction {
+    /// Move the highlight up one row — `tui.autocomplete.previous`.
+    Previous,
+    /// Move the highlight down one row — `tui.autocomplete.next`.
+    Next,
+    /// Accept the highlighted item and keep editing — `tui.autocomplete.accept` (`Tab`).
+    Accept,
+    /// Accept the highlighted item, submitting for a slash item — `tui.autocomplete.acceptSubmit` (`Enter`).
+    AcceptSubmit,
+    /// Dismiss the popup — `tui.autocomplete.cancel` (`Esc`).
+    Cancel,
+}
+
+impl AutocompleteAction {
+    /// Resolve a `tui.autocomplete.*` binding id (item #6).
+    pub fn from_id(id: &str) -> Option<AutocompleteAction> {
+        match id {
+            "tui.autocomplete.previous" => Some(AutocompleteAction::Previous),
+            "tui.autocomplete.next" => Some(AutocompleteAction::Next),
+            "tui.autocomplete.accept" => Some(AutocompleteAction::Accept),
+            "tui.autocomplete.acceptSubmit" => Some(AutocompleteAction::AcceptSubmit),
+            "tui.autocomplete.cancel" => Some(AutocompleteAction::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable autocomplete-popup binding table (item #6). Defaults mirror the previously-
+/// hardcoded keys; multiple keys may bind one action, first match wins.
+#[derive(Clone, Debug)]
+pub struct AutocompleteKeymap {
+    bindings: Vec<(Key, AutocompleteAction)>,
+}
+
+impl Default for AutocompleteKeymap {
+    fn default() -> Self {
+        use AutocompleteAction as A;
+        AutocompleteKeymap {
+            bindings: vec![
+                (Key::plain(KeyCode::Up), A::Previous),
+                (Key::plain(KeyCode::Down), A::Next),
+                (Key::plain(KeyCode::Tab), A::Accept),
+                (Key::plain(KeyCode::Enter), A::AcceptSubmit),
+                (Key::plain(KeyCode::Esc), A::Cancel),
+            ],
+        }
+    }
+}
+
+impl AutocompleteKeymap {
+    /// An empty popup keymap.
+    pub fn empty() -> Self {
+        AutocompleteKeymap { bindings: Vec::new() }
+    }
+
+    /// Bind (or override) a key to a popup action.
+    pub fn bind(&mut self, key: Key, action: AutocompleteAction) {
+        self.bindings.retain(|(k, _)| *k != key);
+        self.bindings.push((key, action));
+    }
+
+    /// Resolve the popup action for an event, if any (R-10-018: never compare keys inline).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<AutocompleteAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: AutocompleteAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the `tui.autocomplete.*` ids (item #6).
+    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
+        for (id, value) in keybindings_object(json)? {
+            if let Some(action) = AutocompleteAction::from_id(&id) {
                 self.set_action(action, parse_key_values(&value)?);
             }
         }

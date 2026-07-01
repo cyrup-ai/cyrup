@@ -337,10 +337,10 @@ impl Selector for SessionSelector {
                 Span::styled(buf.clone(), theme.base_style()),
             ]));
         } else {
-            lines.push(Line::from(vec![
-                Span::styled(" > ", theme.accent_style()),
-                Span::styled(self.query.clone(), theme.base_style()),
-            ]));
+            // Search box with a visible block cursor (feature #9 "selector IME cursor").
+            let mut spans = vec![Span::styled(" > ", theme.accent_style())];
+            spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
         lines.extend(self.body_lines(theme, &filtered));

@@ -515,6 +515,40 @@ impl ExtensionHost {
             .ok_or_else(|| ExtError::Component(format!("command `{name}` has no live owner")))
     }
 
+    /// Every key-id an extension has registered a keyboard shortcut for (R-08-017; Pi
+    /// `registerShortcut`). The L6 TUI reads this at boot / on rebind so a matching key press routes
+    /// to [`ExtensionHost::run_shortcut`] instead of the editor. Registry-backed, so it is available
+    /// with or without the `wasm-host` feature (an empty list when nothing is registered).
+    pub fn shortcut_keys(&self) -> Vec<String> {
+        self.registry.shortcut_keys().unwrap_or_default()
+    }
+
+    /// Execute the extension-registered keyboard shortcut bound to `key` (R-08-017; Pi
+    /// `registerShortcut` handler). Resolves the owning live extension from the registry and runs its
+    /// [`crate::host::LiveExtension::execute_shortcut`] at command tier. An unregistered key or a
+    /// shortcut with no live owner is a typed `ExtError`.
+    #[cfg(feature = "wasm-host")]
+    pub async fn run_shortcut(&self, key: &str, cancel: &CancelToken) -> Result<(), ExtError> {
+        let owner = self
+            .registry
+            .shortcut_owner(key)?
+            .ok_or_else(|| ExtError::Component(format!("no such shortcut: {key}")))?;
+        let ext = self
+            .live
+            .read()
+            .ok()
+            .and_then(|g| g.get(&owner).cloned())
+            .ok_or_else(|| ExtError::Component(format!("shortcut `{key}` has no live owner")))?;
+        ext.execute_shortcut(key, cancel).await
+    }
+
+    /// Native-host fallback for [`ExtensionHost::run_shortcut`] (no `wasm-host` feature): no live
+    /// guest can own a shortcut, so a fired key is a typed error rather than a silent success.
+    #[cfg(not(feature = "wasm-host"))]
+    pub async fn run_shortcut(&self, key: &str, _cancel: &CancelToken) -> Result<(), ExtError> {
+        Err(ExtError::Component(format!("shortcut `{key}` has no live owner (wasm-host disabled)")))
+    }
+
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
     /// (drop the dispatcher + registry + live table + loaded ids), re-discover + re-load across the
     /// three roots, then emit `session_start{reload}`. Returns the fresh [`LoadExtensionsResult`].

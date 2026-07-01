@@ -7,11 +7,44 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyrup_tui::{App, InputEvent, SelectorKind, UiTheme};
+use cyrup_tui::{search_input_spans, App, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 
 fn key(code: KeyCode) -> InputEvent {
     InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+#[test]
+fn selector_search_input_renders_a_block_cursor() {
+    // Feature #9 "selector IME cursor" — the embedded search Input draws a reverse-video caret at the
+    // cursor byte offset (Pi's `Input`), where cyrup previously drew the query text with no caret.
+    let theme = UiTheme::dark();
+
+    // Caret in the middle: the char under it is reversed; text on either side keeps the base style.
+    let spans = search_input_spans("abc", 1, &theme);
+    let reversed: Vec<&str> = spans
+        .iter()
+        .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(reversed, vec!["b"], "the caret must reverse exactly the char under it");
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "abc", "the query text is preserved around the caret");
+
+    // Caret at end: drawn as a reversed trailing space so an empty/末-position caret is still visible.
+    let end = search_input_spans("hi", 2, &theme);
+    let end_cursor: Vec<&str> = end
+        .iter()
+        .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(end_cursor, vec![" "], "end-of-query caret is a reversed space");
+
+    // Empty query: a single reversed space caret.
+    let empty = search_input_spans("", 0, &theme);
+    assert_eq!(empty.len(), 1);
+    assert!(empty[0].style.add_modifier.contains(Modifier::REVERSED));
 }
 fn ctrl(c: char) -> InputEvent {
     InputEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))

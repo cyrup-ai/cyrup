@@ -341,19 +341,55 @@ impl UiTheme {
     /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3): an escalating per-level color that is the
     /// editor's primary always-visible mode signal. Falls back to the `border` role for unknown levels.
     pub fn thinking_border_style(&self, level: &str) -> Style {
-        let (key, default_hex) = match level {
-            "off" => ("thinkingOff", "#666666"),
-            "minimal" => ("thinkingMinimal", "#6e6e6e"),
-            "low" => ("thinkingLow", "#5f87af"),
-            "medium" => ("thinkingMedium", "#81a2be"),
-            "high" => ("thinkingHigh", "#b294bb"),
-            "xhigh" => ("thinkingXhigh", "#d183e8"),
+        let thinking = self.thinking();
+        let color = match level {
+            "off" => thinking.off,
+            "minimal" => thinking.minimal,
+            "low" => thinking.low,
+            "medium" => thinking.medium,
+            "high" => thinking.high,
+            "xhigh" => thinking.xhigh,
             // An unrecognized level keeps the neutral border color.
             _ => return self.border_style(),
         };
-        match self.roles.get(key).copied() {
-            Some(c) => Style::default().fg(c),
-            None => Style::default().fg(self.role_color(key, default_hex)),
+        Style::default().fg(color)
+    }
+
+    // --- structured sub-themes (feature #3) -----------------------------------------------------
+    //
+    // The audit's root cause of the remaining bg/thinking-border misses was a *flat* role map: every
+    // background/thinking-border color was reachable only by an ad-hoc `roles.get("…")` string lookup,
+    // so the fields were not addressable and easy to miss. These sub-theme structs project the flat map
+    // into typed, exhaustive fields — every background role and every thinking-border level is now a
+    // named field (`ThemeData` mirrors Pi's structured `Theme.colors`, theme.ts:34-93). The component
+    // accessors below delegate to them, so there is one structured source of truth.
+
+    /// The structured per-role **background** sub-theme (Pi's background tokens, theme.ts:48-55). Every
+    /// message/tool/selected background is a named `Option<Color>` field (`None` ⇒ terminal default).
+    pub fn backgrounds(&self) -> BackgroundTheme {
+        let g = |k: &str| self.roles.get(k).copied();
+        BackgroundTheme {
+            selected: g("selectedBg"),
+            user_message: g("userMessageBg"),
+            custom_message: g("customMessageBg"),
+            tool_pending: g("toolPendingBg"),
+            tool_success: g("toolSuccessBg"),
+            tool_error: g("toolErrorBg"),
+        }
+    }
+
+    /// The structured **thinking-border** sub-theme (Pi `thinking{Off..Xhigh}`, interactive-mode.ts:
+    /// 3533-3541): the escalating per-reasoning-level editor rule color, one typed field per level,
+    /// each resolved from the live theme with the spec/tui/03 §3.3 dark-hex fallback so it is total.
+    pub fn thinking(&self) -> ThinkingTheme {
+        let level = |key: &str, default_hex: &str| self.role_color(key, default_hex);
+        ThinkingTheme {
+            off: level("thinkingOff", "#666666"),
+            minimal: level("thinkingMinimal", "#6e6e6e"),
+            low: level("thinkingLow", "#5f87af"),
+            medium: level("thinkingMedium", "#81a2be"),
+            high: level("thinkingHigh", "#b294bb"),
+            xhigh: level("thinkingXhigh", "#d183e8"),
         }
     }
 
@@ -364,9 +400,19 @@ impl UiTheme {
     // theme.ts:48-55). These were dead (every `.bg()` hardwired to `None`, audit #6); projecting the
     // resolved roles restores the message-role + selected-row affordance.
 
-    /// The resolved color for a background role key, if the live theme defines it.
+    /// The resolved color for a background role key, if the live theme defines it (delegates to the
+    /// structured [`BackgroundTheme`] so the flat lookup is not duplicated).
     fn bg_role(&self, key: &str) -> Option<Color> {
-        self.roles.get(key).copied()
+        let bg = self.backgrounds();
+        match key {
+            "selectedBg" => bg.selected,
+            "userMessageBg" => bg.user_message,
+            "customMessageBg" => bg.custom_message,
+            "toolPendingBg" => bg.tool_pending,
+            "toolSuccessBg" => bg.tool_success,
+            "toolErrorBg" => bg.tool_error,
+            _ => self.roles.get(key).copied(),
+        }
     }
 
     /// Apply a background role onto `style` when the theme defines it (else leave `style` unchanged so
@@ -535,6 +581,45 @@ impl UiTheme {
         }
         Some(s)
     }
+}
+
+/// The structured per-role **background** sub-theme (feature #3; Pi background tokens, theme.ts:48-55).
+/// Every message/tool/selected background is a named field, so the whole background surface is
+/// addressable at once instead of via ad-hoc flat-map string lookups. `None` ⇒ terminal default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackgroundTheme {
+    /// Selected-row fill in selectors (`selectedBg`).
+    pub selected: Option<Color>,
+    /// User-message block fill (`userMessageBg`).
+    pub user_message: Option<Color>,
+    /// Custom/notice block fill (`customMessageBg`).
+    pub custom_message: Option<Color>,
+    /// Tool block fill while running (`toolPendingBg`).
+    pub tool_pending: Option<Color>,
+    /// Tool block fill on success (`toolSuccessBg`).
+    pub tool_success: Option<Color>,
+    /// Tool block fill on error (`toolErrorBg`).
+    pub tool_error: Option<Color>,
+}
+
+/// The structured **thinking-border** sub-theme (feature #3; Pi `thinking{Off..Xhigh}`,
+/// interactive-mode.ts:3533-3541): the editor's escalating per-reasoning-level rule color, one typed
+/// field per level. Each field is always populated (the spec/tui/03 §3.3 dark-hex fallback fills a
+/// level the live theme omits), so the border is total and never a stray flat-map miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkingTheme {
+    /// `off` — reasoning disabled.
+    pub off: Color,
+    /// `minimal`.
+    pub minimal: Color,
+    /// `low`.
+    pub low: Color,
+    /// `medium` (the default level).
+    pub medium: Color,
+    /// `high`.
+    pub high: Color,
+    /// `xhigh` — maximum reasoning.
+    pub xhigh: Color,
 }
 
 /// Map a resolved color role onto a `ratatui::Color`. `Inherit` ⇒ `None` (terminal default).

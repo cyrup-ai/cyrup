@@ -50,14 +50,27 @@ impl ImageRenderer {
         ImageRenderer { picker: Picker::halfblocks() }
     }
 
-    /// Probe the controlling TTY for its image protocol + font-cell size (`Picker::from_query_stdio`,
-    /// the `terminal-image.ts` capability handshake). Falls back to [`Self::halfblocks`] when the
-    /// query fails (no TTY, unsupported terminal, pipe) so the front-end always has a working renderer.
+    /// Choose the image protocol from the **environment**, not an APC round-trip (feature #7; Pi
+    /// `detectCapabilities`, terminal-image.ts:65-125). The old `Picker::from_query_stdio` sent an
+    /// escape query to the TTY and blocked reading its reply — fragile under multiplexers and on
+    /// terminals that never answer. This env-sniff (`TERM`/`TERM_PROGRAM`/`KITTY_WINDOW_ID`/… + the
+    /// tmux/screen suppression) matches Pi's probe and never touches stdin. The negotiated protocol is
+    /// forced onto a half-block picker (whose portable raster is the correct Pi fallback for a terminal
+    /// with no native graphics).
     pub fn detect() -> Self {
-        match Picker::from_query_stdio() {
-            Ok(picker) => ImageRenderer { picker },
-            Err(_) => ImageRenderer::halfblocks(),
+        Self::from_capabilities(detect_capabilities())
+    }
+
+    /// Build a renderer for a resolved [`TerminalCapabilities`] set (the env-sniff result). `Kitty`/
+    /// `Iterm2` force the matching `ratatui-image` protocol; `None` keeps the half-block raster.
+    pub fn from_capabilities(caps: TerminalCapabilities) -> Self {
+        let mut picker = Picker::halfblocks();
+        match caps.images {
+            Some(ImageProtocol::Kitty) => picker.set_protocol_type(ProtocolType::Kitty),
+            Some(ImageProtocol::Iterm2) => picker.set_protocol_type(ProtocolType::Iterm2),
+            None => {}
         }
+        ImageRenderer { picker }
     }
 
     /// The negotiated protocol (`Kitty`/`Iterm2`/`Sixel`/`Halfblocks`) — drives the `/debug` report and
@@ -162,4 +175,123 @@ impl ImageBlock {
             Span::styled(format!(" ({w}×{h})"), theme.dim_style()),
         ])
     }
+}
+
+/// A terminal's native inline-image protocol (Pi `ImageProtocol`, terminal-image.ts:3). `None` (in the
+/// [`TerminalCapabilities`] wrapper) is Pi's "no native graphics" — cyrup then renders the half-block
+/// raster instead of dropping the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageProtocol {
+    /// The Kitty graphics protocol (kitty, ghostty, wezterm, warp).
+    Kitty,
+    /// The iTerm2 inline-image protocol (iTerm2).
+    Iterm2,
+}
+
+/// The env-sniffed terminal capabilities (Pi `TerminalCapabilities`, terminal-image.ts:65-125): the
+/// inline-image protocol, whether 24-bit color is advertised, and whether OSC-8 hyperlinks are
+/// forwarded to the outer terminal. Drives [`ImageRenderer::from_capabilities`] (feature #7) and the
+/// OSC-8 hyperlink gate in rendered output (feature #8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalCapabilities {
+    /// The negotiated inline-image protocol, or `None` for the half-block fallback.
+    pub images: Option<ImageProtocol>,
+    /// Whether the terminal advertises 24-bit color (`COLORTERM=truecolor`/`24bit`).
+    pub true_color: bool,
+    /// Whether OSC-8 hyperlinks reach the outer terminal (off under screen / unidentified terminals).
+    pub hyperlinks: bool,
+}
+
+impl TerminalCapabilities {
+    /// The conservative default a headless / unidentified terminal gets: no inline images, no
+    /// hyperlinks, truecolor only if `COLORTERM` hinted it (Pi terminal-image.ts:124).
+    fn conservative(true_color: bool) -> Self {
+        TerminalCapabilities { images: None, true_color, hyperlinks: false }
+    }
+}
+
+/// Env-sniff the terminal capabilities (feature #7; Pi `detectCapabilities`, terminal-image.ts:65).
+/// Reads the real process environment and, when running under tmux, probes whether the outer terminal
+/// forwards OSC-8 hyperlinks (`tmux display-message -p '#{client_termfeatures}'`, Pi
+/// `probeTmuxHyperlinks`; any error ⇒ `false`).
+pub fn detect_capabilities() -> TerminalCapabilities {
+    detect_capabilities_from(|k| std::env::var(k).ok(), probe_tmux_hyperlinks())
+}
+
+/// The pure core of [`detect_capabilities`] (Pi `detectCapabilities`, terminal-image.ts:65-125),
+/// parameterised over an environment lookup + the tmux-hyperlink-forwarding flag so both branches are
+/// deterministically testable. The ordered checks mirror Pi's exactly (multiplexer suppression first,
+/// then the positively-identified terminals, then the conservative default).
+pub fn detect_capabilities_from(
+    env: impl Fn(&str) -> Option<String>,
+    tmux_forwards_hyperlinks: bool,
+) -> TerminalCapabilities {
+    let has = |k: &str| env(k).is_some_and(|v| !v.is_empty());
+    let lower = |k: &str| env(k).unwrap_or_default().to_ascii_lowercase();
+    let term_program = lower("TERM_PROGRAM");
+    let terminal_emulator = lower("TERMINAL_EMULATOR");
+    let term = lower("TERM");
+    let color_term = lower("COLORTERM");
+    let has_true_color = color_term.contains("truecolor") || color_term.contains("24bit");
+    let identified = |images: Option<ImageProtocol>, hyperlinks: bool| TerminalCapabilities {
+        images,
+        true_color: true,
+        hyperlinks,
+    };
+
+    // Multiplexers first: image protocols are unreliable under tmux, so leave `images: None`; OSC-8
+    // is emitted only when tmux confirms it forwards, and screen never forwards (terminal-image.ts:74-81).
+    if has("TMUX") || term.starts_with("tmux") {
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color,
+            hyperlinks: tmux_forwards_hyperlinks,
+        };
+    }
+    if term.starts_with("screen") {
+        return TerminalCapabilities { images: None, true_color: has_true_color, hyperlinks: false };
+    }
+    // Positively-identified terminals (terminal-image.ts:83-118).
+    if has("KITTY_WINDOW_ID") || term_program == "kitty" {
+        return identified(Some(ImageProtocol::Kitty), true);
+    }
+    if term_program == "ghostty" || term.contains("ghostty") || has("GHOSTTY_RESOURCES_DIR") {
+        return identified(Some(ImageProtocol::Kitty), true);
+    }
+    if has("WEZTERM_PANE") || term_program == "wezterm" {
+        return identified(Some(ImageProtocol::Kitty), true);
+    }
+    if term_program == "warpterminal"
+        || has("WARP_SESSION_ID")
+        || has("WARP_TERMINAL_SESSION_UUID")
+    {
+        return identified(Some(ImageProtocol::Kitty), true);
+    }
+    if has("ITERM_SESSION_ID") || term_program == "iterm.app" {
+        return identified(Some(ImageProtocol::Iterm2), true);
+    }
+    if has("WT_SESSION") || term_program == "vscode" || term_program == "alacritty" {
+        return identified(None, true);
+    }
+    if terminal_emulator == "jetbrains-jediterm" {
+        return identified(None, false);
+    }
+    // Unknown terminal: conservative — OSC-8 off (an unforwarded hyperlink would vanish from output).
+    TerminalCapabilities::conservative(has_true_color)
+}
+
+/// Probe whether the attached tmux client forwards OSC-8 hyperlinks (Pi `probeTmuxHyperlinks`,
+/// terminal-image.ts:45-63): tmux only re-emits them when `client_termfeatures` lists `hyperlinks`.
+/// Any error (not in tmux, tmux absent) ⇒ `false`.
+fn probe_tmux_hyperlinks() -> bool {
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{client_termfeatures}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("hyperlinks"))
+        .unwrap_or(false)
 }

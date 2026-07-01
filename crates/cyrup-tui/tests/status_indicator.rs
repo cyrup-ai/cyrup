@@ -95,6 +95,47 @@ fn agent_start_renders_band_and_agent_end_clears_it() {
 }
 
 #[test]
+fn auto_retry_event_renders_pi_exact_copy_with_delay_seconds() {
+    // Item #9 — the retry band copy is Pi's exact "Retrying (a/max) in Ns…" (status-indicator.ts:47),
+    // driven end-to-end through `ingest_event` from the `AutoRetryStart` event (delay in whole
+    // seconds, rounded up), with the live-keymap cancel hint appended by the band.
+    let mut app = App::new(TestBackend::new(70, 16), UiTheme::dark()).unwrap();
+    app.ingest_event(&AgentSessionEvent::AutoRetryStart {
+        attempt: 2,
+        max_attempts: 5,
+        delay_ms: 1500,
+        error_message: "429".into(),
+    });
+    app.draw().unwrap();
+    let out = buf_text(&app);
+    assert!(out.contains("Retrying (2/5) in 2s"), "retry copy missing/incorrect:\n{out}");
+    assert!(out.contains("to cancel"), "cancel hint missing:\n{out}");
+    assert_eq!(app.state().indicator.kind(), IndicatorKind::Retry);
+}
+
+#[test]
+fn overflow_compaction_event_prefixes_context_overflow_copy() {
+    // Item #9 — an OVERFLOW auto-compaction reads "Context overflow detected, Auto-compacting…"
+    // (status-indicator.ts:82), while a MANUAL one reads "Compacting context…".
+    use cyrup_session_svc::CompactionReason;
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+    app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Overflow });
+    app.draw().unwrap();
+    assert!(
+        buf_text(&app).contains("Context overflow detected, Auto-compacting…"),
+        "overflow compaction copy missing:\n{}",
+        buf_text(&app)
+    );
+
+    let mut app2 = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+    app2.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Manual });
+    app2.draw().unwrap();
+    let m = buf_text(&app2);
+    assert!(m.contains("Compacting context…"), "manual compaction copy missing:\n{m}");
+    assert!(!m.contains("Auto-compacting"), "manual must not say Auto-compacting:\n{m}");
+}
+
+#[test]
 fn compaction_band_renders_its_message() {
     // The compaction indicator (driven by `CompactionStart` in `ingest_event`) renders its default
     // message in the band. Exercised via the public indicator API to avoid a session-crate dev-dep.

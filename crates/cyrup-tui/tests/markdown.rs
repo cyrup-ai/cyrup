@@ -53,6 +53,13 @@ fn headings_drop_hash_for_h1_h2_and_keep_it_for_h3_plus() {
     // H4 keeps a literal `#### ` prefix (markdown.ts:336-362).
     let h4 = render_markdown("#### Deep\n", 80, &theme);
     assert!(rows(&h4).join("\n").contains("#### Deep"), "H4 lost its hash prefix");
+
+    // Item #9 — H1 is heading + bold + UNDERLINE (Pi markdown.ts:344-345); H2 is bold only, NOT
+    // underlined.
+    let h1 = render_markdown("# Title\n", 80, &theme);
+    assert!(has_span_mod(&h1, "Title", Modifier::BOLD), "H1 not bold");
+    assert!(has_span_mod(&h1, "Title", Modifier::UNDERLINED), "H1 must be underlined");
+    assert!(!has_span_mod(&lines, "Plan", Modifier::UNDERLINED), "H2 must NOT be underlined");
 }
 
 #[test]

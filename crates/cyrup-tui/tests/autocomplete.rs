@@ -156,6 +156,54 @@ fn esc_cancels_popup_keeps_text() {
 }
 
 #[test]
+fn autocomplete_max_visible_is_plumbed_and_clamped() {
+    // Item #6 — the `autocompleteMaxVisible` setting drives the dropdown height (clamped 3–20).
+    let mut ed = InputEditor::new();
+    ed.set_autocomplete_max_visible(8);
+    type_str(&mut ed, "/s");
+    assert_eq!(ed.autocomplete().unwrap().list.max_visible(), 8, "popup height not plumbed");
+    // Out-of-range values clamp to 3–20 (and re-apply to the open popup).
+    ed.set_autocomplete_max_visible(99);
+    assert_eq!(ed.autocomplete().unwrap().list.max_visible(), 20);
+    ed.set_autocomplete_max_visible(1);
+    assert_eq!(ed.autocomplete().unwrap().list.max_visible(), 3);
+}
+
+#[test]
+fn best_match_is_preselected() {
+    // Item #6 — the popup preselects the best fuzzy match (row 0 after the score sort), so a bare
+    // Tab/Enter accepts the strongest candidate without navigating.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "/sett");
+    let ac = ed.autocomplete().unwrap();
+    assert_eq!(ac.list.selected(), 0, "best match must be preselected at row 0");
+    assert_eq!(ac.list.selected_item().unwrap().label, "settings");
+}
+
+#[test]
+fn autocomplete_popup_keys_are_configurable() {
+    // Item #6 — the popup nav/accept/cancel keys are no longer hardcoded: a `keybindings.json` rebind
+    // (`tui.autocomplete.*`) takes effect. Rebind cancel from Esc to Ctrl+G, and accept to Ctrl+Y.
+    let mut ed = InputEditor::new();
+    ed.merge_keybindings_json(
+        r#"{ "tui.autocomplete.cancel": "ctrl+g", "tui.autocomplete.accept": "ctrl+y" }"#,
+    )
+    .unwrap();
+    type_str(&mut ed, "/sett");
+    assert!(ed.autocomplete_open());
+    // The rebound accept key applies the completion.
+    ed.handle_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(ed.text(), "/settings ");
+
+    // The rebound cancel key dismisses a fresh popup (clear the buffer so `/mod` is a command again).
+    ed.clear();
+    type_str(&mut ed, "/mod");
+    assert!(ed.autocomplete_open());
+    ed.handle_key(&KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert!(!ed.autocomplete_open(), "rebound cancel key did not dismiss the popup");
+}
+
+#[test]
 fn popup_renders_below_editor_in_viewport() {
     // The popup is appended below the editor in the live region (spec/tui/04 §7).
     let mut app = App::new(TestBackend::new(70, 16), UiTheme::dark()).unwrap();

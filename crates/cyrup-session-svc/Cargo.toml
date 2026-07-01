@@ -12,11 +12,14 @@ authors.workspace = true
 workspace = true
 
 [features]
-# Off by default (native-only build, no wasmtime). Enabling forwards to cyrup-ext's existing
-# `wasm-host` feature so the extension host spins up the Wasmtime engine and `LiveHostServices` is
-# injected into live wasm extension loads. Enabling is gated on the wasm32-wasip2 guest toolchain
-# for a full end-to-end (see the residual ledger, cyrup-session-svc L7 row); the injection SEAM and
-# the control→session-effect bridge are always compiled + tested.
+# ON by default (matching cyrup-ext), so the default entry path spins up the Wasmtime engine, loads
+# live wasm extensions with `LiveHostServices` injected, and routes guest-registered slash commands
+# through the real run path (`_tryExecuteExtensionCommand`, agent-session.ts:1148-1172). The
+# wasm32-wasip2 guest toolchain drives the full end-to-end (see tests/wasm_slash_command.rs).
+default = ["wasm-host"]
+# Forwards to cyrup-ext's `wasm-host` feature (Wasmtime Component Model host). Disable for a
+# native-only build (no wasmtime); the native-command routing + control→session-effect bridge still
+# compile and are exercised.
 wasm-host = ["cyrup-ext/wasm-host"]
 
 [dependencies]

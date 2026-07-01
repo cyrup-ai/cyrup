@@ -135,9 +135,13 @@ impl BashExecution {
         cancel_hint: Option<&str>,
         expand_hint: Option<&str>,
     ) -> Vec<Line<'static>> {
+        // The BORDER color is dim for a `!!` (excluded-from-context) run, bash-green otherwise — set
+        // once at construction and sticky (Pi bash-execution.ts:37-44,64). The `$ command` HEADER,
+        // however, is **always** bash-green (Pi's `updateDisplay` header, bash-execution.ts:138, uses
+        // `theme.fg("bashMode", …)` regardless of `excludeFromContext`) — item #5 "!! header green".
         let border_style =
             if self.excluded { theme.dim_style() } else { theme.bash_mode_style() };
-        let header_style = border_style.add_modifier(Modifier::BOLD);
+        let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
         let rule = "─".repeat(width.max(1));
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::default());
@@ -329,12 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn excluded_uses_dim_border_style() {
+    fn excluded_uses_dim_border_but_green_header() {
         let theme = UiTheme::dark();
         let b = BashExecution::new("secret", true);
         assert!(b.excluded());
         let lines = b.render_lines(20, &theme, None, None);
         // Top border (line index 1, after the spacer) carries the dim style for `!!`.
         assert_eq!(lines[1].style, theme.dim_style());
+        // The `$ command` header (line index 2), however, is ALWAYS bash-green + bold even for a `!!`
+        // excluded run (Pi `updateDisplay` header, bash-execution.ts:138) — item #5 "!! header green".
+        let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
+        assert_eq!(lines[2].style, header_style, "!! header must stay bash-green, not dim");
+        assert!(plain(&lines[2]).contains("$ secret"));
+        // And a `!` (included) run's border matches the same green header.
+        let inc = BashExecution::new("secret", false);
+        let inc_lines = inc.render_lines(20, &theme, None, None);
+        assert_eq!(inc_lines[2].style, header_style);
     }
 }

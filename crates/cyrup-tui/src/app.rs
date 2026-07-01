@@ -18,7 +18,7 @@ use std::time::Duration;
 use cyrup_core::{CancelToken, EventStream};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, InputSource, UserInput};
+use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, InputSource, UserInput};
 use cyrup_session_svc::{
     AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
 };
@@ -41,8 +41,8 @@ use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
-use crate::image::{ImageBlock, ImageRenderer};
-use crate::keymap::{Action, EditorAction, Keymap, SelectKeymap, TreeKeymap};
+use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
+use crate::keymap::{Action, EditorAction, Key, Keymap, SelectKeymap, TreeKeymap};
 use crate::model_selector::{ModelEntry, ModelSelector};
 use crate::overlay::{HotkeyRow, HotkeysOverlay, Overlay, OverlayOutcome};
 use crate::selector::{
@@ -85,6 +85,10 @@ pub enum AppAction {
     /// interactive-mode.ts:2549-2734). The run loop executes it against the [`AgentSession`] (open a
     /// data-bound selector after sourcing its rows, drive the session lifecycle, export, copy, …).
     Command(AppCommand),
+    /// A registered extension keyboard shortcut fired (R-08-017; Pi `registerShortcut`). Carries the
+    /// shortcut key-id; the run loop dispatches it to the session's extension host
+    /// (`ExtensionHost::run_shortcut` → `LiveExtension::execute_shortcut`).
+    ExtensionShortcut(String),
     /// State changed; the frame should be redrawn.
     Redraw,
     /// Nothing to do.
@@ -198,6 +202,17 @@ pub struct AppState {
     /// (R-ARCH-TUI-003). Kept as a test-visible accumulator mirroring exactly what was handed to
     /// `insert_before`; never re-rendered inside the inline viewport.
     pub scrollback: Vec<Line<'static>>,
+    /// Extension-registered keyboard shortcuts (R-08-017; Pi `registerShortcut`): each parsed
+    /// [`Key`] spec paired with the raw key-id string the host routes on. Sourced from
+    /// `ExtensionHost::shortcut_keys()` at boot and refreshed on session swap; a matching key press
+    /// (checked at the global-keymap tier, after built-in bindings) becomes an
+    /// [`AppAction::ExtensionShortcut`]. Empty when no extension registered a shortcut.
+    pub extension_shortcuts: Vec<(Key, String)>,
+    /// The env-sniffed terminal capabilities (feature #7/#8; Pi `getCapabilities`): image protocol +
+    /// truecolor + OSC-8-hyperlink forwarding. Boot default is conservative (half-block, no
+    /// hyperlinks); the binary refines it via [`App::detect_image_support`]. The `hyperlinks` flag
+    /// gates OSC-8 emission in rendered links (`osc::hyperlink`).
+    pub capabilities: TerminalCapabilities,
 }
 
 impl AppState {
@@ -227,7 +242,24 @@ impl AppState {
             should_quit: false,
             pending_swap_status: None,
             scrollback: Vec::new(),
+            extension_shortcuts: Vec::new(),
+            capabilities: TerminalCapabilities {
+                images: None,
+                true_color: true,
+                hyperlinks: false,
+            },
         }
+    }
+
+    /// Install the extension-registered keyboard shortcuts (R-08-017): each raw key-id is parsed to a
+    /// [`Key`] spec (unparseable ids are dropped, never panicking) and retained with its id so a
+    /// matching press routes to the owning extension. Called by the binary at boot and after a
+    /// session swap, so a `/reload` that changes the registered set takes effect.
+    pub fn set_extension_shortcuts(&mut self, key_ids: impl IntoIterator<Item = String>) {
+        self.extension_shortcuts = key_ids
+            .into_iter()
+            .filter_map(|id| Key::parse(&id).ok().map(|k| (k, id)))
+            .collect();
     }
 }
 
@@ -311,6 +343,40 @@ impl<B: Backend> App<B> {
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
     }
+    /// Install the extension-registered keyboard shortcuts (R-08-017; delegates to
+    /// [`AppState::set_extension_shortcuts`]). The binary calls this at boot from
+    /// `ExtensionHost::shortcut_keys()`.
+    pub fn set_extension_shortcuts(&mut self, key_ids: impl IntoIterator<Item = String>) {
+        self.state.set_extension_shortcuts(key_ids);
+    }
+
+    /// Plumb the `autocompleteMaxVisible` setting (Pi, item #6) into the editor's autocomplete popup
+    /// (clamped 3–20). The binary calls this from `settings.autocompleteMaxVisible` at boot.
+    pub fn set_autocomplete_max_visible(&mut self, n: u16) {
+        self.state.editor.set_autocomplete_max_visible(n);
+    }
+
+    /// Whether the idle 2-row status band is reserved (kept present) to avoid an editor/footer reflow
+    /// when a spinner appears (item #9). Plumbed from Pi's `terminal.clearOnShrink` setting
+    /// (interactive-mode.ts:1638-1642: an idle status container is cleared only when clearOnShrink is
+    /// off — so `reserve_status_rows == clearOnShrink`). Default `false` matches Pi's default.
+    pub fn set_reserve_status_rows(&mut self, reserve: bool) {
+        self.state.reserve_status_rows = reserve;
+    }
+
+    /// Load a user `keybindings.json` document and merge it into every live keymap (R-10-018; Pi
+    /// `KeybindingsManager.create`, keybindings.ts:348-352). Each map's `merge_json` applies only the
+    /// ids in its own namespace (`app.*` / `editor.*` / `tui.select.*` / `app.tree.*`) and ignores the
+    /// rest, so one document configures the global, editor, selector and tree maps in a single pass.
+    /// A malformed document or key spec is surfaced as a typed error (the binary logs + continues with
+    /// the defaults) — never a panic.
+    pub fn load_keybindings_json(&mut self, json: &str) -> Result<(), TuiError> {
+        self.state.keymap.merge_json(json)?;
+        self.state.select_keymap.merge_json(json)?;
+        self.state.tree_keymap.merge_json(json)?;
+        self.state.editor.merge_keybindings_json(json)?;
+        Ok(())
+    }
     /// The transcript view.
     pub fn transcript_mut(&mut self) -> &mut TranscriptView {
         &mut self.state.transcript
@@ -375,11 +441,15 @@ impl<B: Backend> App<B> {
         &self.state.pending_images
     }
 
-    /// Probe the controlling TTY for its real image protocol (Kitty/iTerm2/sixel), upgrading from the
-    /// portable half-block default (`terminal-image.ts` capability handshake). Called by the binary at
-    /// startup; tests keep the half-block default so the inline path renders to `TestBackend`.
+    /// Env-sniff the controlling terminal's capabilities (feature #7; Pi `detectCapabilities`) and
+    /// upgrade the portable half-block default to the negotiated image protocol (Kitty/iTerm2), while
+    /// caching the resolved [`TerminalCapabilities`] so the OSC-8 hyperlink gate (feature #8) can read
+    /// them. Called by the binary at startup; tests keep the half-block default (the inline path still
+    /// renders to `TestBackend`).
     pub fn detect_image_support(&mut self) {
-        self.state.image_renderer = ImageRenderer::detect();
+        let caps = crate::image::detect_capabilities();
+        self.state.capabilities = caps;
+        self.state.image_renderer = ImageRenderer::from_capabilities(caps);
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is
@@ -537,6 +607,15 @@ impl<B: Backend> App<B> {
                     if !defer_to_editor {
                         return self.apply_action(action);
                     }
+                }
+                // An extension-registered keyboard shortcut (R-08-017; Pi `registerShortcut`) fires at
+                // the global-keymap tier — after the built-in bindings (so an extension can't shadow
+                // `Ctrl+D`/`Esc`) but before the editor (so the key never leaks in as text). The run
+                // loop dispatches the matched key-id to the session's extension host.
+                if let Some((_, id)) =
+                    self.state.extension_shortcuts.iter().find(|(k, _)| k.matches(key))
+                {
+                    return AppAction::ExtensionShortcut(id.clone());
                 }
                 match self.state.editor.handle_key(key) {
                     EditorOutcome::Submit(text) => self.dispatch_submission(&text),
@@ -1663,9 +1742,20 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
                 self.state.status.set_queued(steering.len().saturating_add(follow_up.len()));
             }
-            AgentSessionEvent::CompactionStart { .. } => {
-                self.state.indicator.set(IndicatorKind::Compaction, None);
-                self.state.transcript.push_status("compacting context…");
+            AgentSessionEvent::CompactionStart { reason } => {
+                // Pi's exact status copy (status-indicator.ts:80-82): a MANUAL `/compact` reads
+                // "Compacting context…"; an automatic compaction reads "Auto-compacting…", prefixed
+                // "Context overflow detected, " when the overflow path triggered it (item #9). The
+                // ` (<key> to cancel)` suffix is appended by the band from the live keymap.
+                let msg = match reason {
+                    CompactionReason::Manual => "Compacting context…".to_string(),
+                    CompactionReason::Overflow => {
+                        "Context overflow detected, Auto-compacting…".to_string()
+                    }
+                    CompactionReason::Threshold => "Auto-compacting…".to_string(),
+                };
+                self.state.indicator.set(IndicatorKind::Compaction, Some(msg.clone()));
+                self.state.transcript.push_status(msg);
             }
             AgentSessionEvent::CompactionEnd { .. } => {
                 // Back to working if the turn is still streaming, else idle.
@@ -1676,11 +1766,14 @@ impl<B: Backend> App<B> {
                 }
                 self.state.transcript.push_status("compaction complete");
             }
-            AgentSessionEvent::AutoRetryStart { attempt, max_attempts, .. } => {
-                self.state
-                    .indicator
-                    .set(IndicatorKind::Retry, Some(format!("Retrying ({attempt}/{max_attempts})…")));
-                self.state.transcript.push_status(format!("retrying ({attempt}/{max_attempts})…"));
+            AgentSessionEvent::AutoRetryStart { attempt, max_attempts, delay_ms, .. } => {
+                // Pi's exact retry copy (status-indicator.ts:46-47): "Retrying (a/max) in Ns…" where
+                // N is the backoff delay in whole seconds, rounded up (item #9). The ` (<key> to
+                // cancel)` suffix is appended by the band from the live keymap.
+                let seconds = delay_ms.div_ceil(1000);
+                let msg = format!("Retrying ({attempt}/{max_attempts}) in {seconds}s…");
+                self.state.indicator.set(IndicatorKind::Retry, Some(msg.clone()));
+                self.state.transcript.push_status(msg);
             }
             AgentSessionEvent::AutoRetryEnd { success, .. } => {
                 if self.state.status.streaming {
@@ -2473,6 +2566,21 @@ impl App<CrosstermBackend<Stdout>> {
                         AppAction::Command(cmd) => {
                             self.execute_command(cmd, &session, runtime.as_ref()).await
                         }
+                        AppAction::ExtensionShortcut(key) => {
+                            // Route the fired shortcut to the owning live extension (R-08-017; Pi
+                            // `registerShortcut` handler). A guest fault is surfaced as a status
+                            // block, never a panic; the run loop keeps going.
+                            if let Err(e) = session
+                                .services()
+                                .ext_host
+                                .run_shortcut(&key, &cancel)
+                                .await
+                            {
+                                self.state.transcript.push_status(format!(
+                                    "shortcut {key}: {e}"
+                                ));
+                            }
+                        }
                         AppAction::Redraw | AppAction::None => {}
                     }
                     self.draw_synchronized()?;
@@ -2528,6 +2636,10 @@ impl App<CrosstermBackend<Stdout>> {
                         events = new_session.subscribe();
                         session = new_session;
                         self.rebind_session();
+                        // The swapped-in session owns a fresh extension host; re-source its
+                        // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
+                        let shortcuts = session.services().ext_host.shortcut_keys();
+                        self.state.set_extension_shortcuts(shortcuts);
                         self.draw_synchronized()?;
                     }
                 }

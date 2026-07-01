@@ -167,8 +167,15 @@ impl<'t> MdRenderer<'t> {
 
     /// The base text style with the active inline modifiers applied.
     fn inline_style(&self) -> Style {
-        let mut s = if self.heading.is_some() {
-            self.theme.md_heading_style()
+        let mut s = if let Some(level) = self.heading {
+            // H1 is heading + bold + **underline**; H2–H6 are heading + bold only (Pi markdown.ts:
+            // 344-348) — item #9 "markdown H1 underline".
+            let base = self.theme.md_heading_style();
+            if level == HeadingLevel::H1 {
+                base.add_modifier(Modifier::UNDERLINED)
+            } else {
+                base
+            }
         } else if self.link.is_some() {
             self.theme.md_link_style()
         } else if self.quote > 0 {

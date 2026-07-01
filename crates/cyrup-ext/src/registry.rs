@@ -301,6 +301,12 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.shortcuts.keys().cloned().collect())
     }
 
+    /// The extension that registered the shortcut bound to `key`, if any (R-08-017). Used by the host
+    /// to route a fired key press to its owning live instance's `execute-shortcut` export.
+    pub fn shortcut_owner(&self, key: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.shortcuts.get(key).cloned())
+    }
+
     /// Register a custom LLM provider (R-08-019; A-08-7). Parses the typed config, resolves the API
     /// key (env / `!command` / literal), and routes it through the [`ProviderHub`] (immediate upsert
     /// if the model registry is bound, else queued for the next bind). A parse/resolution failure is

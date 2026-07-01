@@ -83,6 +83,11 @@ impl SelectList {
         self.max_visible = n.clamp(3, 20);
     }
 
+    /// The current max visible rows (Pi `autocompleteMaxVisible`; test/inspection).
+    pub fn max_visible(&self) -> u16 {
+        self.max_visible
+    }
+
     /// Replace the items, clamping the selection into range.
     pub fn set_items(&mut self, items: Vec<SelectItem>) {
         self.items = items;

@@ -249,6 +249,50 @@ fn bash_mode_detected_on_leading_bang() {
 }
 
 #[test]
+fn bash_mode_detected_after_leading_whitespace() {
+    // Pi enters bash mode on `text.trimStart().startsWith("!")` (interactive-mode.ts:2525): a leading
+    // indent before `!` still shows the bash-green border (item #5 "trim_start on bash input").
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "   !ls");
+    assert!(ed.is_bash_mode(), "leading whitespace before ! must still be bash mode");
+    // A non-`!` first non-space char is not bash mode.
+    ed.set_text("  echo hi");
+    assert!(!ed.is_bash_mode());
+}
+
+#[test]
+fn ctrl_w_at_line_start_kills_across_the_line_join() {
+    // Cross-line char/word kill (item #5): at column 0 the word-left target is the end of the previous
+    // line, so Ctrl+W deletes the newline and joins the two rows — `take_range` now spans logical
+    // lines (previously it returned empty, moving the cursor but deleting nothing).
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "hello");
+    newline(&mut ed);
+    type_str(&mut ed, "again");
+    ed.handle_key(&KeyCode::Home.into()); // row 1, col 0
+    assert_eq!(ed.cursor(), (1, 0));
+    ed.handle_key(&ctrl('w')); // kill back across the join
+    assert_eq!(ed.text(), "helloagain");
+    assert_eq!(ed.line_count(), 1);
+    assert_eq!(ed.cursor(), (0, 5));
+    // The killed newline yanks back verbatim, restoring the two lines.
+    ed.handle_key(&ctrl('y'));
+    assert_eq!(ed.text(), "hello\nagain");
+}
+
+#[test]
+fn undo_whitespace_boundary_removes_last_word_not_whole_line() {
+    // Pi's fish-style rule (editor.ts:1085-1094): each whitespace captures the state before itself, so
+    // a single undo removes the most-recent word (+ its leading space), not the entire typed line.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "foo bar baz");
+    ed.handle_key(&ctrl('-')); // undo → drops " baz"
+    assert_eq!(ed.text(), "foo bar");
+    ed.handle_key(&ctrl('-')); // undo → drops " bar"
+    assert_eq!(ed.text(), "foo");
+}
+
+#[test]
 fn char_jump_forward_moves_to_target() {
     // spec/tui/03 §5.10 — Ctrl+] then a target char jumps to its next occurrence.
     let mut ed = InputEditor::new();

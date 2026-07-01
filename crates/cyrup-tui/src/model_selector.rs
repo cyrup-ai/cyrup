@@ -250,11 +250,13 @@ impl Selector for ModelSelector {
             border_rule_line(area.width, theme),
             self.scope_line(theme),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(" ▏", theme.accent_style()),
-                Span::styled(self.query.clone(), theme.base_style()),
-                Span::styled("▏", theme.accent_style()),
-            ]),
+            {
+                // Search box with a visible block cursor (feature #9 "selector IME cursor").
+                let mut spans = vec![Span::styled(" ▏", theme.accent_style())];
+                spans.extend(crate::selector::search_input_spans(&self.query, self.cursor, theme));
+                spans.push(Span::styled("▏", theme.accent_style()));
+                Line::from(spans)
+            },
             Line::from(""),
         ];
         lines.extend(self.body_lines(&filtered, theme));

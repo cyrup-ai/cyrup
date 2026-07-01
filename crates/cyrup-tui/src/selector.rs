@@ -24,6 +24,36 @@ use crate::keymap::{ModelsAction, ModelsKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
 use crate::theme::UiTheme;
 
+/// Render an embedded selector **search `Input`** with a visible block cursor at the byte offset
+/// `cursor` (feature #9 "selector IME cursor"). Pi's selector search boxes render a reverse-video
+/// cursor (an `Input` component) so the caret + any IME pre-edit is visible; cyrup's selectors tracked
+/// the cursor offset but never drew it, leaving the search box caret-less. The character under the
+/// caret (or a trailing space when the cursor is at the end) is drawn reversed over the base style;
+/// text before/after keeps the base style. Shared by the model / session / scoped search boxes.
+pub fn search_input_spans(query: &str, cursor: usize, theme: &UiTheme) -> Vec<Span<'static>> {
+    let cursor = cursor.min(query.len());
+    // Snap to a char boundary so slicing never panics on a multi-byte caret position.
+    let cursor = (0..=cursor).rev().find(|i| query.is_char_boundary(*i)).unwrap_or(0);
+    let before = query.get(..cursor).unwrap_or("");
+    let rest = query.get(cursor..).unwrap_or("");
+    let mut chars = rest.chars();
+    let (under, after) = match chars.next() {
+        Some(c) => (c.to_string(), chars.as_str().to_string()),
+        // Cursor at end of the query: draw the caret as a reversed space.
+        None => (" ".to_string(), String::new()),
+    };
+    let cursor_style = theme.base_style().add_modifier(ratatui::style::Modifier::REVERSED);
+    let mut spans = Vec::with_capacity(3);
+    if !before.is_empty() {
+        spans.push(Span::styled(before.to_string(), theme.base_style()));
+    }
+    spans.push(Span::styled(under, cursor_style));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, theme.base_style()));
+    }
+    spans
+}
+
 /// Which first-party selector occupies the input slot (spec/tui/05 §7 `SelectorKind`). The chrome
 /// interprets a [`SelectorOutcome::Confirm`] / [`SelectorOutcome::Preview`] against this kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

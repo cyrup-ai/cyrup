@@ -100,6 +100,13 @@ pub struct InputEditor {
     jump: Option<JumpDir>,
     registry: CommandRegistry,
     autocomplete: Option<Autocomplete>,
+    /// Max visible rows in the autocomplete dropdown (Pi `autocompleteMaxVisible`, default 5, clamped
+    /// 3–20; item #6). Plumbed from `settings.autocompleteMaxVisible` by the binary; applied to every
+    /// opened popup's [`crate::SelectList`].
+    autocomplete_max_visible: u16,
+    /// The configurable autocomplete-popup key table (item #6; `tui.autocomplete.*`). The popup's
+    /// navigate/accept/cancel keys are no longer hardcoded — a `keybindings.json` rebind flows through.
+    autocomplete_keymap: crate::keymap::AutocompleteKeymap,
     cwd: PathBuf,
     /// Cached whole-tree file list for `@`-mention search (`autocomplete.ts` populates once, then
     /// fuzzy-filters in-process per keystroke). Lazily built on the first `@`-mention, invalidated on
@@ -164,6 +171,8 @@ impl InputEditor {
             jump: None,
             registry: CommandRegistry::new(),
             autocomplete: None,
+            autocomplete_max_visible: crate::select_list::DEFAULT_MAX_VISIBLE,
+            autocomplete_keymap: crate::keymap::AutocompleteKeymap::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             mention_files: None,
             view_width: 80,
@@ -188,6 +197,32 @@ impl InputEditor {
     /// The editor keymap (for `/hotkeys` to resolve editor-action key labels, `getEditorKeyDisplay`).
     pub fn keymap_ref(&self) -> &EditorKeymap {
         &self.keymap
+    }
+
+    /// Merge a JSON keybindings document into the editor keymap **and** the autocomplete-popup keymap
+    /// (R-10-018; the `editor.*` + `tui.autocomplete.*` ids). Called by the binary at boot with the
+    /// user's `keybindings.json` so custom editor + popup bindings take effect (item #6).
+    pub fn merge_keybindings_json(&mut self, json: &str) -> Result<(), crate::TuiError> {
+        self.keymap.merge_json(json)?;
+        self.autocomplete_keymap.merge_json(json)
+    }
+
+    /// Set the max visible rows in the autocomplete dropdown (Pi `autocompleteMaxVisible`, item #6):
+    /// clamped to 3–20 and applied to any already-open popup + every future one. Called by the binary
+    /// from `settings.autocompleteMaxVisible`.
+    pub fn set_autocomplete_max_visible(&mut self, n: u16) {
+        self.autocomplete_max_visible = n.clamp(3, 20);
+        if let Some(ac) = self.autocomplete.as_mut() {
+            ac.list.set_max_visible(self.autocomplete_max_visible);
+        }
+    }
+
+    /// Install a freshly-computed autocomplete popup, applying the configured `autocompleteMaxVisible`
+    /// dropdown height (item #6). Centralises the `self.autocomplete = Some(ac)` assignment so every
+    /// entry point (slash / `@`-mention / forced Tab) honours the setting.
+    fn open_popup(&mut self, mut ac: Autocomplete) {
+        ac.list.set_max_visible(self.autocomplete_max_visible);
+        self.autocomplete = Some(ac);
     }
 
     /// Override the working directory used for path completion (defaults to the process cwd). Clears
@@ -221,9 +256,15 @@ impl InputEditor {
         self.autocomplete.as_ref()
     }
 
-    /// True while the buffer text begins with `!` (bash mode → green border, spec/tui/03 §7.1).
+    /// True while the buffer's first line — **after leading whitespace** — begins with `!` (bash mode
+    /// → green border, spec/tui/03 §7.1). Mirrors Pi's `text.trimStart().startsWith("!")`
+    /// (interactive-mode.ts:2525): a leading indent before `!` (e.g. `  !ls`) still enters bash mode,
+    /// matching the dispatcher, which `trim()`s before the `!` check (item #5 "trim_start on bash").
     pub fn is_bash_mode(&self) -> bool {
-        self.lines.first().is_some_and(|l| l.first() == Some(&'!'))
+        self.lines
+            .first()
+            .and_then(|l| l.iter().find(|c| !c.is_whitespace()))
+            .is_some_and(|c| *c == '!')
     }
 
     /// The full buffer text with `\n` line joins.
@@ -500,6 +541,20 @@ impl InputEditor {
         }
     }
 
+    /// Push an undo snapshot for a typed character, honoring Pi's fish-style **whitespace boundary**
+    /// (`editor.ts:1085-1094`, item #5 "undo-whitespace coalescing"): consecutive word characters
+    /// coalesce into one unit, but a whitespace character *always* captures the state before itself
+    /// (`isWhitespaceChar(char) || lastAction !== "type-word"`), so a single `Ctrl+-` removes the last
+    /// word without swallowing the whole line, and each space is a separate undo step.
+    fn push_undo_for_type(&mut self, c: char) {
+        if c.is_whitespace() || self.last_action != LastAction::Type {
+            self.undo.push(self.snapshot());
+            if self.undo.len() > 500 {
+                self.undo.remove(0);
+            }
+        }
+    }
+
     /// Restore the most recent undo snapshot (Ctrl+-). No redo (Pi parity, `editor.ts:1974-1984`).
     fn undo(&mut self) {
         if let Some(snap) = self.undo.pop() {
@@ -667,20 +722,65 @@ impl InputEditor {
         self.push_kill(&killed, true);
     }
 
-    /// Remove and return the text between two same-or-adjacent positions on the current line.
-    /// (Multi-line kills are out of scope here; ranges are within one logical line.)
+    /// Remove and return the text between two positions, **crossing logical lines** (item #5: cross-
+    /// line word/char ops). A same-line range drains within the row; a multi-line range removes the
+    /// tail of `start.0`, every whole line strictly between, and the head of `end.0`, then joins the
+    /// two boundary rows — so a `Ctrl+W`/`Alt+D` (or `Backspace`/`Delete`) at a line edge deletes into
+    /// the neighbouring line and re-joins it (`editor.ts` word/char deletion; `word-navigation.ts`
+    /// returns cross-line targets). The removed text carries the `\n`s so it yanks back verbatim.
     fn take_range(&mut self, start: (usize, usize), end: (usize, usize)) -> String {
-        if start.0 != end.0 {
+        // Normalize so `start <= end`.
+        let (start, end) =
+            if (start.0, start.1) <= (end.0, end.1) { (start, end) } else { (end, start) };
+        if start == end {
             return String::new();
         }
-        let Some(line) = self.lines.get_mut(start.0) else { return String::new() };
-        let lo = start.1.min(line.len());
-        let hi = end.1.min(line.len());
-        if lo >= hi {
+        // Same-line: drain within the row.
+        if start.0 == end.0 {
+            let Some(line) = self.lines.get_mut(start.0) else { return String::new() };
+            let lo = start.1.min(line.len());
+            let hi = end.1.min(line.len());
+            if lo >= hi {
+                return String::new();
+            }
+            return line.drain(lo..hi).collect();
+        }
+        // Multi-line: guard the boundary rows.
+        if start.0 >= self.lines.len() || end.0 >= self.lines.len() {
             return String::new();
         }
-        let drained: String = line.drain(lo..hi).collect();
-        drained
+        let start_col = start.1.min(self.lines.get(start.0).map_or(0, Vec::len));
+        let end_col = end.1.min(self.lines.get(end.0).map_or(0, Vec::len));
+
+        // Collect the removed text (start tail + whole inner rows + end head), `\n`-joined, so it
+        // yanks back verbatim.
+        let mut killed = String::new();
+        if let Some(first) = self.lines.get(start.0) {
+            killed.extend(first.iter().skip(start_col));
+        }
+        for r in (start.0 + 1)..end.0 {
+            killed.push('\n');
+            if let Some(row) = self.lines.get(r) {
+                killed.extend(row.iter());
+            }
+        }
+        killed.push('\n');
+        if let Some(last) = self.lines.get(end.0) {
+            killed.extend(last.iter().take(end_col));
+        }
+
+        // Splice: keep the head of `start.0`, append the tail of `end.0`, drop the rows between.
+        let tail: Vec<char> = self
+            .lines
+            .get(end.0)
+            .map(|l| l.iter().skip(end_col).copied().collect())
+            .unwrap_or_default();
+        if let Some(first) = self.lines.get_mut(start.0) {
+            first.truncate(start_col);
+            first.extend(tail);
+        }
+        self.lines.drain((start.0 + 1)..=end.0);
+        killed
     }
 
     /// Push killed text onto the ring, accumulating into the top entry when the previous action was
@@ -951,7 +1051,7 @@ impl InputEditor {
         let was_open = self.autocomplete.is_some();
         // `@`-mention search auto-pops the moment an `@` token forms (whole-tree fuzzy file search).
         if let Some(ac) = self.compute_mention() {
-            self.autocomplete = Some(ac);
+            self.open_popup(ac);
             return;
         }
         let computed = Autocomplete::compute(
@@ -962,10 +1062,10 @@ impl InputEditor {
             false,
             &self.cwd,
         );
-        self.autocomplete = match computed {
-            Some(ac) if ac.context == CompletionContext::Slash || was_open => Some(ac),
-            _ => None,
-        };
+        match computed {
+            Some(ac) if ac.context == CompletionContext::Slash || was_open => self.open_popup(ac),
+            _ => self.autocomplete = None,
+        }
     }
 
     /// The text left of the cursor on the current line (the autocomplete context window).
@@ -991,7 +1091,7 @@ impl InputEditor {
     fn trigger_completion(&mut self) -> EditorOutcome {
         // `@`-mention takes precedence on an explicit Tab too (whole-tree fuzzy file search).
         if let Some(ac) = self.compute_mention() {
-            self.autocomplete = Some(ac);
+            self.open_popup(ac);
             return EditorOutcome::Edited;
         }
         let computed = Autocomplete::compute(
@@ -1004,12 +1104,12 @@ impl InputEditor {
         );
         match computed {
             Some(ac) if ac.list.len() == 1 && ac.context == CompletionContext::Path => {
-                self.autocomplete = Some(ac);
+                self.open_popup(ac);
                 self.accept_completion();
                 EditorOutcome::Edited
             }
             Some(ac) => {
-                self.autocomplete = Some(ac);
+                self.open_popup(ac);
                 EditorOutcome::Edited
             }
             None => EditorOutcome::Ignored,
@@ -1062,7 +1162,7 @@ impl InputEditor {
                 && !ev.modifiers.contains(KeyModifiers::SUPER)
                 && !ev.modifiers.contains(KeyModifiers::ALT)
             {
-                self.push_undo_for(LastAction::Type);
+                self.push_undo_for_type(c);
                 self.insert_char(c);
                 self.last_action = LastAction::Type;
                 self.exit_history();
@@ -1072,32 +1172,35 @@ impl InputEditor {
         EditorOutcome::Ignored
     }
 
-    /// Route a key while the popup is open. Returns `Some` if consumed; `None` to fall through.
+    /// Route a key while the popup is open through the configurable [`AutocompleteKeymap`] (item #6 —
+    /// the nav/accept/cancel keys are no longer hardcoded). Returns `Some` if consumed; `None` to
+    /// fall through to normal editing.
     fn handle_popup_key(&mut self, ev: &KeyEvent) -> Option<EditorOutcome> {
-        match ev.code {
-            KeyCode::Esc => {
+        use crate::keymap::AutocompleteAction as A;
+        match self.autocomplete_keymap.action_for(ev)? {
+            A::Cancel => {
                 self.autocomplete = None;
                 Some(EditorOutcome::Edited)
             }
-            KeyCode::Up => {
+            A::Previous => {
                 if let Some(ac) = self.autocomplete.as_mut() {
                     ac.list.select_up();
                 }
                 Some(EditorOutcome::Edited)
             }
-            KeyCode::Down => {
+            A::Next => {
                 if let Some(ac) = self.autocomplete.as_mut() {
                     ac.list.select_down();
                 }
                 Some(EditorOutcome::Edited)
             }
-            KeyCode::Tab => {
+            A::Accept => {
                 // Accept, keep editing (no submit), then recompute (may close if out of context).
                 self.accept_completion();
                 self.update_autocomplete();
                 Some(EditorOutcome::Edited)
             }
-            KeyCode::Enter => {
+            A::AcceptSubmit => {
                 let is_slash = self
                     .autocomplete
                     .as_ref()
@@ -1116,7 +1219,6 @@ impl InputEditor {
                     Some(EditorOutcome::Edited)
                 }
             }
-            _ => None,
         }
     }
 

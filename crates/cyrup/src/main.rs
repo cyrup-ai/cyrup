@@ -34,6 +34,7 @@ use cyrup_session_svc::{
     SessionBuilder, SessionConfig, SessionFactory, SessionInfo, SessionLayout, SessionServiceError,
     SessionTarget, SessionsRoot, UserInput,
 };
+use cyrup_resources::theme::ThemeWatcher;
 use cyrup_tui::{crossterm_input_stream, App, ThemeController, UiTheme};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -798,6 +799,44 @@ async fn run_interactive(
         App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
+
+    // Configurable keybindings (feature #2; Pi `KeybindingsManager.create`, keybindings.ts:348-352):
+    // load the user's `~/.cyrup/keybindings.json` and merge it into every live keymap (global/editor/
+    // selector/tree). Absent file ⇒ defaults; a malformed file logs to stderr and keeps the defaults.
+    let keybindings_path = session.services().agent_dir.join("keybindings.json");
+    if let Ok(json) = std::fs::read_to_string(&keybindings_path)
+        && let Err(e) = app.load_keybindings_json(&json)
+    {
+        eprintln!("warning: ignoring {}: {e}", keybindings_path.display());
+    }
+
+    // Autocomplete dropdown height (feature #6; Pi `autocompleteMaxVisible`, default 5, clamped 3–20).
+    let max_visible = session.services().settings.effective().autocomplete_max_visible();
+    app.set_autocomplete_max_visible(max_visible.clamp(3, 20) as u16);
+
+    // Reserve the idle status band to avoid reflow (feature #9; Pi `terminal.clearOnShrink`,
+    // interactive-mode.ts:1638-1642 — an idle status container is cleared only when clearOnShrink is
+    // off, so `reserve_status_rows == clearOnShrink`).
+    let env_vars = cyrup_session_svc::EnvVars::from_process();
+    let reserve = session.services().settings.effective().clear_on_shrink(&env_vars);
+    app.set_reserve_status_rows(reserve);
+
+    // Extension keyboard shortcuts (feature #10; Pi `registerShortcut`): source the registered
+    // shortcut key-ids from the session's extension host so a matching press routes to the owning
+    // live extension's `execute-shortcut` (refreshed after a session swap inside the run loop).
+    app.set_extension_shortcuts(session.services().ext_host.shortcut_keys());
+
+    // Theme hot-reload (feature #1; Pi `ThemeWatcher`, theme.ts watch path): when the active theme
+    // resolves to an on-disk file, watch it so `/theme` edits repaint live. The watcher must outlive
+    // `app.run`, so it is bound here; a built-in (no `origin_path`) has nothing to watch (`None`).
+    let mut _theme_watcher: Option<ThemeWatcher> = None;
+    let theme_rx = build_theme_watcher(&session, controller.active_name(), &cancel)
+        .map(|w| {
+            let rx = w.subscribe();
+            _theme_watcher = Some(w);
+            rx
+        });
+
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
 
@@ -814,10 +853,32 @@ async fn run_interactive(
     }
 
     let result =
-        app.run(input_stream, events, session.clone(), Some(runtime), None, cancel).await;
+        app.run(input_stream, events, session.clone(), Some(runtime), theme_rx, cancel).await;
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
+}
+
+/// Build a [`ThemeWatcher`] for the active theme when it resolves to an on-disk file (feature #1).
+/// Returns `None` for a compiled-in built-in (no `origin_path` — nothing editable to watch) or when
+/// the file watcher cannot be spawned (hot-reload simply stays off; never fatal). The watcher's
+/// channel seeds with the theme's current [`ThemeData`], so the run loop's `theme_changed` arm fires
+/// on every subsequent edit of that file (`/theme` edits + a settings.theme pointed at a file theme).
+fn build_theme_watcher(
+    session: &AgentSession,
+    active_name: &str,
+    cancel: &CancelToken,
+) -> Option<ThemeWatcher> {
+    let theme = session.services().resources.themes.get_name(active_name)?;
+    let path = theme.origin_path.clone()?;
+    let seed = Arc::new(theme.data.clone());
+    match ThemeWatcher::spawn(seed, path.clone(), cancel.clone()) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("warning: theme hot-reload disabled for {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Seed the footer + editor from the **live session/runtime** before the interactive loop starts

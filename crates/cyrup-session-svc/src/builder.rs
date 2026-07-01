@@ -439,6 +439,22 @@ impl SessionBuilder {
         let base_tools = select_active_tools(&visible, &cfg);
         let read_available = base_tools.iter().any(|t| t.name() == "read");
 
+        // ---- 4a. the LIVE host-services backend (arch-08 §5.6) — built BEFORE the extension host so
+        // the SAME instance is injected into every wasm load (auto-discovery here + an explicit
+        // `AgentSession::load_wasm_extension`) AND stored on the session. A single instance is
+        // load-bearing: a loaded guest's `control` capability routes to whichever `LiveHostServices`
+        // was injected at load time, and `AgentSession::apply_pending_control` drains the one on
+        // `services.host_services`; if these differ the guest's `control` op is silently lost. Seed the
+        // active model + wire the command-tier control channel up front so guest reads/ops are live.
+        let host_services =
+            Arc::new(crate::host_services::LiveHostServices::new(self.provider.clone()));
+        host_services.update_model(
+            model_ref.clone(),
+            resolved_model.context_window,
+            Some(thinking_level_to_str(thinking)),
+        );
+        host_services.wire_control_channel();
+
         // ---- 4b. extension host (cyrup-ext) — built BEFORE resource discovery so the
         // `resources_discover` aggregate (extendResourcesFromExtensions, Pi agent-session.ts:2112)
         // can merge extension-contributed skill/prompt/theme paths into the registry the skill
@@ -465,12 +481,12 @@ impl SessionBuilder {
         let ext_roots = extension_discovery_roots(&cfg);
         #[cfg(feature = "wasm-host")]
         {
-            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(
-                crate::host_services::LiveHostServices::new(self.provider.clone()),
-            );
+            // Inject the session's OWN `host_services` (built at 4a) so a disk-discovered guest's
+            // `control` capability reaches the same queue `apply_pending_control` drains.
+            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
             // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
             // diagnostics, main.ts:679-682) surface to the caller once the diagnostics channel reaches
-            // the bin; today they are recorded on the result (the wasm-host E2E is tooling-gated).
+            // the bin; today they are recorded on the result.
             let _load_result =
                 ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
         }
@@ -693,21 +709,10 @@ impl SessionBuilder {
         let agent = Arc::new(agent);
 
         // ---- 10. assemble the session --------------------------------------------------------
-        // The concrete host-services backend, seeded with the active model so a loaded extension's
-        // `models`/`current_model`/`context_usage` imports reflect live state (arch-08 §5.6).
-        let host_services =
-            Arc::new(crate::host_services::LiveHostServices::new(self.provider.clone()));
-        host_services.update_model(
-            model_ref.clone(),
-            resolved_model.context_window,
-            Some(thinking_level_to_str(thinking)),
-        );
-        // Wire the command-tier control channel so a loaded extension's `control` capability
-        // (new/switch/fork/compact/set-model/…) reaches a real session effect: the SYNC guest call
-        // queues a `ControlOp` that `AgentSession::apply_pending_control` drains + applies (Pi
-        // `createCommandContext`, agent-session.ts:1158). The same `host_services` is the
-        // `Arc<dyn HostServices>` a wasm host load injects, so guest capabilities reach live state.
-        host_services.wire_control_channel();
+        // `host_services` (the concrete arch-08 §5.6 backend) was built + seeded + control-wired at
+        // step 4a and injected into every wasm load; it is moved into the services bundle below so
+        // `AgentSession::apply_pending_control` drains the SAME queue guest `control` ops reach (Pi
+        // `createCommandContext`, agent-session.ts:1158).
 
         // Resolve the settings-driven knobs for the retry / auto-compaction subsystems BEFORE the
         // `settings` value is moved into the services bundle.

@@ -239,6 +239,37 @@ fn command_invocation_names_are_disambiguated_in_load_order() {
 }
 
 // ---------------------------------------------------------------------------
+// Extension keyboard shortcuts (R-08-017; feature #10 host-side routing).
+// ---------------------------------------------------------------------------
+#[test]
+fn registered_shortcut_resolves_owner_and_lists_keys() {
+    use cyrup_ext::ExtensionRegistry;
+    let reg = ExtensionRegistry::new();
+    reg.register_shortcut(ExtensionId::from("a"), "ctrl+j").unwrap();
+    reg.register_shortcut(ExtensionId::from("b"), "alt+k").unwrap();
+
+    let mut keys = reg.shortcut_keys().unwrap();
+    keys.sort();
+    assert_eq!(keys, vec!["alt+k".to_string(), "ctrl+j".to_string()]);
+    // The key-id routes back to the registering extension (the seam `run_shortcut` uses).
+    assert_eq!(reg.shortcut_owner("ctrl+j").unwrap(), Some(ExtensionId::from("a")));
+    assert_eq!(reg.shortcut_owner("alt+k").unwrap(), Some(ExtensionId::from("b")));
+    assert_eq!(reg.shortcut_owner("ctrl+z").unwrap(), None);
+}
+
+#[tokio::test]
+async fn host_run_shortcut_reports_unregistered_key() {
+    use cyrup_core::CancelToken;
+    use cyrup_ext::{ExtensionHost, HostConfig};
+    // A native-only host: `shortcut_keys` is empty and firing an unregistered key is a typed error,
+    // not a panic (the live-guest dispatch path is exercised under the `wasm-host` E2E, ledger 09).
+    let host = ExtensionHost::new(HostConfig::default());
+    assert!(host.shortcut_keys().is_empty());
+    let err = host.run_shortcut("ctrl+j", &CancelToken::new()).await;
+    assert!(err.is_err(), "an unregistered / owner-less shortcut is a typed error");
+}
+
+// ---------------------------------------------------------------------------
 // Rich native HostCtx fields (gap-08 #6).
 // ---------------------------------------------------------------------------
 #[test]

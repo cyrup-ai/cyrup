@@ -60,6 +60,9 @@ pub use session::{
 };
 pub use state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
 pub use tools::ToolInfo;
+// The compaction `reason` carried by `AgentSessionEvent::Compaction{Start,End}` (so a front-end can
+// branch its status copy on manual/threshold/overflow without depending on `cyrup-session` directly).
+pub use cyrup_session::compaction::CompactionReason;
 
 // Load-bearing re-exports so embedders need not depend on every subsystem directly.
 pub use cyrup_core::EventStream;

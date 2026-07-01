@@ -35,6 +35,35 @@ fn key_matches_event() {
 }
 
 #[test]
+fn matches_ignores_lock_and_unsupported_modifier_masks() {
+    // Pi strips the Caps/Num lock mask (and any unsupported modifier bit) before comparing
+    // (keys.ts:361,656,779). crossterm surfaces `HYPER`/`META` as the closest analogues to the JS
+    // `LOCK_MASK`; a Ctrl+D chord with a stray lock/hyper bit still resolves to the exit binding.
+    let d_with_hyper =
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::HYPER);
+    assert_eq!(Keymap::default().action_for(&d_with_hyper), Some(Action::Quit));
+    // A bare key carrying only a lock/hyper bit still matches a no-modifier binding.
+    let a_with_meta = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::META);
+    assert!(Key::plain(KeyCode::Char('a')).matches(&a_with_meta));
+}
+
+#[test]
+fn matches_normalizes_shifted_letters() {
+    // Pi normalizes a shifted ASCII letter to its lowercase codepoint (keys.ts:360-366): a `shift+a`
+    // binding matches a terminal reporting `Char('A')` + SHIFT (the disambiguate/Kitty path).
+    let shift_a_upper = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+    let binding = Key { code: KeyCode::Char('a'), mods: KeyModifiers::SHIFT };
+    assert!(binding.matches(&shift_a_upper));
+    // Symmetric: a spec written as `shift+A` matches a `Char('a')` + SHIFT event too.
+    let shift_a_lower = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+    let binding_upper = Key { code: KeyCode::Char('A'), mods: KeyModifiers::SHIFT };
+    assert!(binding_upper.matches(&shift_a_lower));
+    // Without shift, an uppercase letter is a distinct key (no spurious collapse).
+    let plain_upper = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE);
+    assert!(!Key::plain(KeyCode::Char('a')).matches(&plain_upper));
+}
+
+#[test]
 fn default_keymap_binds_pi_app_actions() {
     // Pi defaults (core/keybindings.ts:63-202): Ctrl+D exit, Ctrl+C clear, Esc interrupt.
     let km = Keymap::default();

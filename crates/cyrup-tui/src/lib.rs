@@ -86,16 +86,20 @@ pub use editor::{EditorOutcome, InputEditor, VisualLine};
 pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
-pub use image::{ImageBlock, ImageRenderer};
+pub use image::{
+    detect_capabilities, detect_capabilities_from, ImageBlock, ImageProtocol, ImageRenderer,
+    TerminalCapabilities,
+};
 pub use keymap::{
-    Action, EditorAction, EditorKeymap, Key, Keymap, ModelsAction, ModelsKeymap, SelectAction,
-    SelectKeymap, TreeAction, TreeKeymap,
+    Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
+    ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, TreeAction, TreeKeymap,
 };
 pub use markdown::{render as render_markdown, trim_partial_closing_fence};
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
 pub use selector::{
-    CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome, SCOPED_MODELS_ALL,
+    search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
+    SCOPED_MODELS_ALL,
 };
 pub use session_search::{
     filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,
@@ -108,7 +112,10 @@ pub use startup_selector::run_startup_selector;
 pub use status::{format_tokens, StatusLine};
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
-pub use theme::{color_of, rgb_to_256, ColorMode, ThemeController, TerminalTheme, UiTheme};
+pub use theme::{
+    color_of, rgb_to_256, BackgroundTheme, ColorMode, TerminalTheme, ThemeController, ThinkingTheme,
+    UiTheme,
+};
 pub use transcript::{
     content_text, parse_skill_block, Entry, ParsedSkillBlock, TranscriptView,
 };
