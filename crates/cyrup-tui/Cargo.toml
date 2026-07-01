@@ -20,7 +20,10 @@ cyrup-resources = { workspace = true }
 # stream.rs:306) can be matched in `App::ingest_event` (gap 1 — live token-by-token render).
 cyrup-provider = { workspace = true }
 thiserror = { workspace = true }
-ratatui = "0.30.2"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count(width)` — used to measure the WRAPPED
+# display-row height of prose so the content-sized viewport + scrollback flush match what render wraps
+# (fixes the single-long-paragraph PROSE-WRAP truncation; spec/tui/01 §3 overflow).
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 tokio.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true

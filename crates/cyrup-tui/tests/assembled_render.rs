@@ -231,6 +231,82 @@ fn assembled_hotkeys_overlay_opens_and_dismisses_on_esc() {
     assert!(!app.overlay_open(), "Esc did not close the overlay");
 }
 
+// -------------------------------------- state 4: long single-paragraph PROSE-WRAP (no void) ----
+
+/// A single long paragraph with NO hard newlines (30 sentences). `markdown::render` emits ONE
+/// un-wrapped `Line` for it, so the pre-fix `content_height`/`flush_committed` under-counted the
+/// wrapped display rows: the live region was sized to a single row (newest text + the `▌` stream
+/// caret clipped away), and the committed answer was truncated to 1 row in native scrollback. This
+/// asserts the WRAP-AWARE height fix: the streaming turn grows to its true wrapped height + stays
+/// tail-anchored (newest sentence + caret visible, spec/tui/01 §3 overflow; Pi `assistant-message.ts`
+/// wraps its `Markdown` body), and the committed flush lands the full wrapped answer in scrollback.
+fn long_single_paragraph() -> String {
+    // No `\n` anywhere — one logical paragraph. The last sentence carries a unique single-word token
+    // (`OMEGAEND`) that word-wrap can never split across a row boundary, so a substring search proves
+    // the NEWEST text survived to the buffer.
+    let mut para = String::new();
+    for i in 1..=29 {
+        para.push_str(&format!("Sentence {i} adds another independent clause to the paragraph body. "));
+    }
+    para.push_str("And the very final sentence closes with the sentinel token OMEGAEND.");
+    para
+}
+
+#[test]
+fn assembled_long_streaming_paragraph_shows_newest_text_and_caret_and_grows() {
+    let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
+    app.status_mut().set_model("anthropic/claude-opus-4-8");
+    // Stream the whole paragraph as one delta (no hard newlines): one logical `Line`, many wrapped
+    // display rows.
+    app.transcript_mut().push_assistant_delta(&long_single_paragraph());
+    app.draw().unwrap();
+
+    let live = live_text(&app);
+    // (a) The live region grew PAST the 6-row empty-turn minimum to fit the wrapped paragraph (the
+    // pre-fix bug sized it to ~1 content row because `content_height` counted logical lines).
+    assert!(
+        app.viewport_height() > 6,
+        "live region did not grow for the wrapped paragraph (still {}):\n{}",
+        app.viewport_height(),
+        buf_text(&app)
+    );
+    // (a) The NEWEST text (last sentence's sentinel) is visible — the turn is tail-anchored, not
+    // clipped to its first wrapped row.
+    assert!(
+        live.contains("OMEGAEND"),
+        "newest text (last sentence) missing from live region — PROSE-WRAP truncation:\n{live}"
+    );
+    // (a) The `▌` stream caret trails the newest grapheme and is visible.
+    assert!(live.contains('▌'), "stream caret `▌` missing from live region:\n{live}");
+    // Sanity: the accent label + some earlier text render too (it is the whole paragraph, wrapped).
+    assert!(live.contains("assistant:"), "assistant label missing:\n{live}");
+}
+
+#[test]
+fn assembled_committed_long_paragraph_flushes_full_wrapped_text_to_scrollback() {
+    let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
+    app.status_mut().set_model("anthropic/claude-opus-4-8");
+    app.transcript_mut().push_assistant_delta(&long_single_paragraph());
+    // Commit the streaming turn → it drains into native scrollback via `insert_before` on the next
+    // draw (`flush_committed`).
+    app.transcript_mut().commit_assistant(None);
+    app.draw().unwrap();
+
+    // (b) The full wrapped answer reached native scrollback: the sentinel (last sentence) is painted
+    // into the TestBackend buffer ABOVE the live region. Pre-fix, `insert_before(height = 1, …)` with
+    // no `.wrap()` truncated the answer to its first row and the sentinel was lost.
+    let screen = buf_text(&app);
+    assert!(
+        screen.contains("OMEGAEND"),
+        "committed answer truncated: last sentence missing from flushed scrollback:\n{screen}"
+    );
+    // The committed turn is NOT in the live region anymore (streaming is done); it lives in scrollback.
+    let live = live_text(&app);
+    assert!(!live.contains("OMEGAEND"), "committed paragraph leaked into live region:\n{live}");
+    // The in-memory accumulator carries the full text too (test-visible mirror of the flush payload).
+    assert!(app.scrollback_text().contains("OMEGAEND"), "flush accumulator missing the full text");
+}
+
 #[test]
 fn assembled_ctrl_d_does_not_quit_a_non_empty_buffer_but_exits_when_empty() {
     // (#4) Ctrl+D is forward-delete while text remains; it only exits on an empty buffer.
@@ -247,3 +323,4 @@ fn assembled_ctrl_d_does_not_quit_a_non_empty_buffer_but_exits_when_empty() {
     let action = app.handle_input(&ctrl(KeyCode::Char('d')));
     assert_eq!(action, AppAction::Quit, "Ctrl+D on an empty buffer must exit");
 }
+

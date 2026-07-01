@@ -370,7 +370,13 @@ impl TranscriptView {
     /// height, used to **content-size** the inline viewport (ADR-0001 commitment #1, audit #1) so the
     /// empty turn never balloons into a void. `0` when nothing is streaming.
     pub fn content_height(&self, width: usize, theme: &UiTheme) -> usize {
-        self.lines(width, theme).len()
+        // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE un-wrapped
+        // `Line` per prose paragraph (width is only consumed for tables/hr/code), so counting
+        // `lines().len()` under-counts a long streaming paragraph and the region is sized too short —
+        // clipping the newest text + the `▌` caret. `wrapped_height` measures with the SAME word-wrap
+        // `render` applies (`Paragraph::line_count`), so the active turn grows + stays tail-anchored
+        // (spec/tui/01 §3 overflow; the doc at [`TranscriptView::render`]).
+        wrapped_height(&self.lines(width, theme), width)
     }
 
     fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
@@ -506,6 +512,22 @@ fn looks_like_diff(text: &str) -> bool {
         }
     }
     total > 0 && diffish * 2 >= total
+}
+
+/// The number of WRAPPED display rows `lines` occupy at `width`, using the **same** word-wrap
+/// `ratatui`'s `Paragraph::render` applies with `.wrap(Wrap { trim: false })`. ratatui 0.30's
+/// `Paragraph::line_count(width)` runs the identical `WordWrapper` the renderer does, so the measured
+/// height EXACTLY matches what render produces — the fix for the PROSE-WRAP truncation: a single
+/// long paragraph (one logical [`Line`]) wraps to many display rows, and both the content-sized live
+/// viewport ([`Transcript::content_height`]) and the scrollback flush must size to the wrapped count,
+/// not the logical line count. `width == 0` degrades to the logical count (nothing renders anyway).
+pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width.min(u16::MAX as usize) as u16)
 }
 
 /// Render a single committed [`Entry`] into its styled scrollback line(s) at content `width`

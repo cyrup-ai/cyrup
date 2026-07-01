@@ -32,7 +32,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{execute, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use crate::commands::{CommandRegistry, Dispatch};
@@ -459,10 +459,15 @@ impl<B: Backend> App<B> {
             .collect();
         self.state.scrollback.extend(lines.iter().cloned());
         let style = self.state.theme.base_style();
-        let height = lines.len().min(u16::MAX as usize) as u16;
+        // Size the scrollback slot to the WRAPPED display-row count (not `lines.len()`) and render
+        // WITH `.wrap()`: `entry_lines` emits one un-wrapped `Line` per prose paragraph, so a long
+        // committed answer must wrap to width and reserve its wrapped height — otherwise
+        // `insert_before` clips it to a single row and the full text is lost from native scrollback
+        // (the PROSE-WRAP truncation; R-ARCH-TUI-003/-005, spec/tui/01 §3 overflow).
+        let height = crate::transcript::wrapped_height(&lines, width).min(u16::MAX as usize) as u16;
         self.terminal
             .insert_before(height, move |buf| {
-                Paragraph::new(lines).style(style).render(buf.area, buf);
+                Paragraph::new(lines).style(style).wrap(Wrap { trim: false }).render(buf.area, buf);
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
         Ok(())
