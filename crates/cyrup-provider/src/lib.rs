@@ -16,6 +16,7 @@ pub mod api;
 pub mod auth;
 pub mod catalog;
 pub mod collection;
+pub mod config_provider;
 pub mod context;
 pub mod env_api_keys;
 pub mod error;
@@ -53,6 +54,7 @@ pub use collection::{
     CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, clamp_thinking_level, create_models,
     get_supported_thinking_levels, has_api, models_are_equal,
 };
+pub use config_provider::ConfigProvider;
 pub use context::{Context, ToolDef};
 pub use cyrup_core::ApiId;
 pub use env_api_keys::{

@@ -506,6 +506,13 @@ impl SessionBuilder {
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
 
+        // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
+        // + disk extensions loaded (Pi `runner.bindCore` pending-flush, runner.ts:345-362). The SAME
+        // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
+        // view (its catalog is UNIONed into the model registry, and its provider installed on select).
+        let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
+        ext_host.registry().bind_model_registry(guest_providers.clone())?;
+
         // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
         // R6: plumb the user-tier cross-tool `~/.agents` base (Pi `getHomeDir()/.agents`,
@@ -813,6 +820,7 @@ impl SessionBuilder {
             resources,
             context: context_store,
             ext_host,
+            guest_providers,
             model: resolved_model,
             system_prompt,
             host_services,

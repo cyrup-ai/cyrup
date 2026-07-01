@@ -25,6 +25,7 @@ mod error;
 mod event;
 pub mod export;
 mod factory;
+mod guest_providers;
 mod host_services;
 mod hooks;
 mod provider_swap;
@@ -49,6 +50,7 @@ pub use event::{
     UserInput,
 };
 pub use factory::SessionFactory;
+pub use guest_providers::GuestProviderRegistry;
 pub use host_services::{ControlSink, LiveHostServices};
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{

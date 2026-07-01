@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_config::AuthStore;
-use cyrup_core::ProviderId;
+use cyrup_core::{ExtensionId, ProviderId};
 use cyrup_provider::faux::{FauxConfig, FauxModelDefinition, FauxProvider};
 use cyrup_provider::{CreateModelsOptions, Provider};
 use cyrup_session_svc::{ProviderResolver, SessionBuilder, SessionConfig};
@@ -133,6 +133,83 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
     assert!(
         !catalog.iter().any(|m| m.provider.as_str() == "faux"),
         "the faux catalog is no longer the current provider"
+    );
+}
+
+/// L4 gap #4: a guest `pi.registerProvider()` routed through the assembled session's extension host
+/// must reach the shared model registry so the registered model is SELECTABLE (in
+/// `available_model_catalog()`) and its owning provider is INSTALLED on a matching `set_model` — Pi
+/// `bindCore` → `ModelRegistry.registerProvider` folds the models into the one registry
+/// `getAvailable`/`find`/`setModel` all read (model-registry.ts:917-940). No provider resolver is
+/// wired: a guest provider is a realized `Provider` the session installs DIRECTLY.
+#[tokio::test]
+async fn guest_registered_provider_is_selectable_and_installed() {
+    let fx = fixture();
+    let provider: Arc<dyn Provider> = two_model_faux();
+    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let mut cfg = base_config(&fx);
+    cfg.model_pattern = Some("faux-1".to_string());
+    let session = SessionBuilder::new(provider, cfg).auth(auth).build().await.unwrap();
+
+    // Before registration, the guest model is absent.
+    assert!(
+        !session.available_model_catalog().iter().any(|m| m.provider.as_str() == "acme"),
+        "no guest provider registered yet"
+    );
+
+    // A guest extension registers a custom provider + model (Pi `pi.registerProvider`). This routes
+    // through the SAME extension host + bound sink the builder wired, so it upserts live.
+    session
+        .services()
+        .ext_host
+        .registry()
+        .register_provider(
+            ExtensionId::from("acme-ext"),
+            "acme",
+            serde_json::json!({
+                "name": "Acme",
+                "baseUrl": "https://acme.test/v1",
+                "api": "openai-completions",
+                "apiKey": "sk-acme-123",
+                "models": [{
+                    "id": "acme-fast",
+                    "name": "Acme Fast",
+                    "contextWindow": 64000,
+                    "maxTokens": 4096,
+                }],
+            }),
+        )
+        .expect("guest registerProvider succeeds");
+
+    // SELECTABLE: the registered model now appears in the cross-provider selector catalog.
+    let target = session
+        .available_model_catalog()
+        .into_iter()
+        .find(|m| m.provider.as_str() == "acme" && m.id.as_str() == "acme-fast")
+        .expect("the guest-registered model is selectable");
+    assert_eq!(target.base_url, "https://acme.test/v1");
+    assert_eq!(target.context_window, 64000);
+
+    // Starts on the injected faux provider.
+    assert_eq!(session.model().provider.as_str(), "faux");
+
+    // set_model resolves the guest model AND installs the guest provider in place (no resolver seam
+    // needed — the guest provider is a realized `Provider`).
+    let new_ref = session.set_model("acme/acme-fast").await.expect("guest set_model succeeds");
+    assert_eq!(new_ref.provider.as_str(), "acme");
+    assert_eq!(session.model().provider.as_str(), "acme");
+    assert_eq!(session.model().model.as_str(), "acme-fast");
+
+    // STREAMABLE: the installed provider is the guest one, exposing the registered model in its
+    // catalog (what `ProviderStreamFn` resolves against when the agent loop streams).
+    let catalog = session.model_catalog();
+    assert!(
+        catalog.iter().any(|m| m.provider.as_str() == "acme" && m.id.as_str() == "acme-fast"),
+        "the installed (guest) provider exposes the registered model"
+    );
+    assert!(
+        catalog.iter().all(|m| m.provider.as_str() == "acme"),
+        "the swapped provider's catalog is the guest provider's"
     );
 }
 

@@ -130,6 +130,107 @@ impl ProviderRegistration {
     pub fn has_stream_simple(&self) -> bool {
         self.config.has_stream_simple
     }
+
+    /// Realize this registration as a concrete [`cyrup_provider::Provider`] (Pi
+    /// `ModelRegistry.applyProviderConfig`, model-registry.ts:917-940): a [`cyrup_provider::ConfigProvider`]
+    /// over the parsed model catalog + the resolved api key. The model registry (arch-08 §5.6) installs
+    /// the returned provider so a guest `registerProvider` model becomes selectable AND streamable in
+    /// the assembled run.
+    ///
+    /// Per-model wire fields are folded exactly as Pi does: `api = model.api || config.api`
+    /// (model-registry.ts:923), `baseUrl = model.baseUrl ?? config.baseUrl` (:931), `contextWindow`
+    /// defaults to 128000 and `maxTokens` to 16384 (Pi's `models.json` parse defaults,
+    /// model-registry.ts:621-622). A model that resolves no `api` or `baseUrl` is skipped (Pi rejects
+    /// such a registration at `validateProviderConfig`; here it is dropped rather than panicking).
+    pub fn build_provider(&self) -> std::sync::Arc<dyn cyrup_provider::Provider> {
+        let name =
+            if self.config.name.is_empty() { self.id.clone() } else { self.config.name.clone() };
+        cyrup_provider::ConfigProvider::new(
+            self.id.clone(),
+            name,
+            self.resolved_api_key.clone(),
+            self.build_models(),
+        )
+        .into_arc()
+    }
+
+    /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s (Pi
+    /// model-registry.ts:922-940). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
+    /// from their carried JSON; a malformed block is dropped (never a panic) rather than failing the
+    /// whole registration.
+    pub fn build_models(&self) -> Vec<cyrup_provider::Model> {
+        use cyrup_provider::{Modality, Model, ModelCost};
+
+        let mut out: Vec<Model> = Vec::with_capacity(self.config.models.len());
+        for m in &self.config.models {
+            // `api = model.api || config.api` (Pi model-registry.ts:923); required.
+            let Some(api) = m.api.clone().or_else(|| self.config.api.clone()) else {
+                continue;
+            };
+            // `baseUrl = model.baseUrl ?? config.baseUrl` (Pi :931); required.
+            let Some(base_url) = m.base_url.clone().or_else(|| self.config.base_url.clone()) else {
+                continue;
+            };
+            let input: Vec<Modality> = if m.input.is_empty() {
+                vec![Modality::Text]
+            } else {
+                m.input
+                    .iter()
+                    .filter_map(|s| match s.as_str() {
+                        "image" => Some(Modality::Image),
+                        "text" => Some(Modality::Text),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let thinking_level_map = m
+                .thinking_level_map
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let compat = m.compat.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok());
+            let headers = Self::merge_headers(&self.config.headers, &m.headers);
+
+            out.push(Model {
+                id: m.id.as_str().into(),
+                name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+                api: api.into(),
+                provider: self.id.as_str().into(),
+                base_url,
+                reasoning: m.reasoning,
+                input,
+                cost: ModelCost {
+                    input: m.cost.input,
+                    output: m.cost.output,
+                    cache_read: m.cost.cache_read,
+                    cache_write: m.cost.cache_write,
+                },
+                context_window: m.context_window.unwrap_or(128_000),
+                max_tokens: m.max_tokens.unwrap_or(16_384),
+                thinking_level_map,
+                compat,
+                headers,
+            });
+        }
+        out
+    }
+
+    /// Merge provider-level and per-model custom headers into a [`cyrup_provider::HeaderMap`] (per-model
+    /// wins). Pi tracks these in `modelRequestHeaders` and injects them per request; cyrup carries them
+    /// on `Model.headers` (the request header overlay), so the registered provider sends them too.
+    /// Returns `None` when neither level supplies a header.
+    fn merge_headers(
+        provider_headers: &BTreeMap<String, String>,
+        model_headers: &BTreeMap<String, String>,
+    ) -> Option<cyrup_provider::HeaderMap> {
+        if provider_headers.is_empty() && model_headers.is_empty() {
+            return None;
+        }
+        let mut out: cyrup_provider::HeaderMap = std::collections::BTreeMap::new();
+        for (k, v) in provider_headers.iter().chain(model_headers.iter()) {
+            out.insert(k.clone(), Some(v.clone()));
+        }
+        Some(out)
+    }
 }
 
 /// Resolve an API-key spec per Pi's rules (types.ts apiKey doc): a leading `!` runs a shell command

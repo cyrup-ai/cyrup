@@ -33,6 +33,11 @@ pub struct AgentSessionServices {
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.
     pub ext_host: Arc<ExtensionHost>,
+    /// The shared model-registry sink bound to `ext_host` (Pi `bindCore`): guest-registered providers
+    /// realized as concrete `Provider`s. The session UNIONs their catalogs into the model registry and
+    /// installs the owning provider on a matching `set_model` (arch-08 §5.6). Empty until a guest
+    /// `registerProvider` fires.
+    pub guest_providers: Arc<crate::guest_providers::GuestProviderRegistry>,
     /// The resolved active model for this session.
     pub model: Model,
     /// The assembled system prompt for this session (arch-06).

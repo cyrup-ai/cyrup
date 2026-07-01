@@ -1782,13 +1782,21 @@ impl AgentSession {
         // Cross-provider select: rebuild + install the owning provider so the agent loop streams
         // against it (Pi switches model+provider live). A same-provider change is a no-op here.
         if self.provider.current().id().as_str() != model.provider.as_str() {
-            self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
-                SessionServiceError::NoConfiguredAuth(format!(
-                    "{}/{}: {e}",
-                    model.provider.as_str(),
-                    model.id.as_str()
-                ))
-            })?;
+            // A guest-registered provider is already a realized `Provider` in the shared registry
+            // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
+            // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
+            // provider. Falls back to the resolver for a built-in cross-provider swap.
+            if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
+                self.provider.store(guest);
+            } else {
+                self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
+                    SessionServiceError::NoConfiguredAuth(format!(
+                        "{}/{}: {e}",
+                        model.provider.as_str(),
+                        model.id.as_str()
+                    ))
+                })?;
+            }
         }
         let previous = Self::lock(&self.model).clone();
         self.apply_model_change(&model, &previous, "set", None).await?;
@@ -1807,6 +1815,13 @@ impl AgentSession {
     /// active/offline model stays selectable exactly as before.
     pub fn has_configured_auth(&self, model: &Model) -> bool {
         if self.provider_has_configured_auth(&model.provider) {
+            return true;
+        }
+        // A guest-registered provider carries its own credentials (apiKey/oauth in the registration,
+        // Pi `providerRequestConfigs`, model-registry.ts:659-662), so its models are always available
+        // in the selector — exactly as Pi's `hasConfiguredAuth` returns true when a provider request
+        // config supplies a key.
+        if self.services.guest_providers.has_provider(model.provider.as_str()) {
             return true;
         }
         self.provider
@@ -1831,6 +1846,14 @@ impl AgentSession {
     /// which single provider is currently installed.
     fn full_model_registry(&self) -> Vec<Model> {
         let mut out: Vec<Model> = self.provider.current().models().to_vec();
+        // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
+        // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940). Unioned FIRST after
+        // the current provider so a guest override of a built-in id wins over the built-in entry.
+        for m in self.services.guest_providers.models() {
+            if !out.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+                out.push(m);
+            }
+        }
         let full = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
             credentials: None,
             auth_context: None,
