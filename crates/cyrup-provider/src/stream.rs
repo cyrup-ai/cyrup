@@ -41,14 +41,73 @@ pub struct ProviderResponse {
 
 /// Inspect or replace a provider payload before sending (Pi `StreamOptions.onPayload`,
 /// types.ts:130-134). Returning `None` keeps the payload unchanged.
+///
+/// ASYNC (gap-08 #2): the extension `before_provider_request` producer dispatches into wasm, which
+/// is async; the hook is invoked with `.await` in the (already async) wire `run` fns. It is NOT
+/// bridged sync→async via `block_on` (that panics on a current-thread runtime — no-panic DENY).
 pub type OnPayload = std::sync::Arc<
-    dyn Fn(&serde_json::Value, &crate::model::Model) -> Option<serde_json::Value> + Send + Sync,
+    dyn Fn(serde_json::Value, crate::model::Model) -> futures::future::BoxFuture<'static, Option<serde_json::Value>>
+        + Send
+        + Sync,
 >;
 
 /// Invoked after an HTTP response is received and before its body stream is consumed (Pi
 /// `StreamOptions.onResponse`, types.ts:135-139).
-pub type OnResponseHook =
-    std::sync::Arc<dyn Fn(&ProviderResponse, &crate::model::Model) + Send + Sync>;
+///
+/// ASYNC (gap-08 #3): the extension `after_provider_response` producer dispatches into wasm; see
+/// [`OnPayload`] for the rationale.
+pub type OnResponseHook = std::sync::Arc<
+    dyn Fn(ProviderResponse, crate::model::Model) -> futures::future::BoxFuture<'static, ()>
+        + Send
+        + Sync,
+>;
+
+/// Apply the async `on_payload` hook (gap-08 #2) to an outbound request body: if a hook is set,
+/// `.await` it and adopt any replacement wholesale (Pi `emitBeforeProviderRequest` REPLACES the
+/// payload, sdk.ts:332-338). Called by each wire `run` fn just before constructing the request.
+pub async fn apply_on_payload(
+    opts: &StreamOptions,
+    model: &crate::model::Model,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(h) = &opts.on_payload
+        && let Some(replaced) = h(body.clone(), model.clone()).await
+    {
+        return replaced;
+    }
+    body
+}
+
+/// Bridges the sync `open_sse` response-observation point (func-01 R-01-049) to the async
+/// `on_response` hook (gap-08 #3): the sync shim records `{status, headers}` into a shared cell
+/// during connect; after `open_sse` returns, [`ResponseCapture::fire`] `.await`s the async hook.
+#[derive(Clone, Default)]
+pub struct ResponseCapture(std::sync::Arc<std::sync::Mutex<Option<ProviderResponse>>>);
+
+impl ResponseCapture {
+    /// The sync `open_sse` callback that records the response metadata (`None` when no hook is set,
+    /// so `open_sse` skips it entirely).
+    pub fn sse_hook(&self, opts: &StreamOptions) -> Option<self::sse::OnResponse> {
+        opts.on_response.as_ref()?;
+        let cell = self.0.clone();
+        Some(std::sync::Arc::new(move |status: u16, headers: &reqwest::header::HeaderMap| {
+            let map = headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+                .collect();
+            *cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(ProviderResponse { status, headers: map });
+        }))
+    }
+
+    /// Fire the async `on_response` hook with the captured metadata (no-op when unset).
+    pub async fn fire(&self, opts: &StreamOptions, model: &crate::model::Model) {
+        if let Some(h) = &opts.on_response {
+            let resp = self.0.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            h(resp, model.clone()).await;
+        }
+    }
+}
 
 /// Provider-scoped environment overrides (Pi `ProviderEnv`, types.ts:100-101). Values take
 /// precedence over the process environment for provider configuration.

@@ -159,7 +159,13 @@ impl ApiImpl for AnthropicMessagesApi {
             .as_deref()
             .map(is_oauth_token)
             .unwrap_or(false);
-        let body = build_params(model, ctx, opts, auth.env.as_ref(), is_oauth);
+        // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
+        let body = crate::stream::apply_on_payload(
+            opts,
+            model,
+            build_params(model, ctx, opts, auth.env.as_ref(), is_oauth),
+        )
+        .await;
         let headers = build_headers(model, ctx, auth, opts, is_oauth);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -185,7 +191,10 @@ impl ApiImpl for AnthropicMessagesApi {
             }
         };
 
-        let frames = match open_sse(&client, req, cancel, None, None).await {
+        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
+        let capture = crate::stream::ResponseCapture::default();
+        let on_resp = capture.sse_hook(opts);
+        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -193,6 +202,7 @@ impl ApiImpl for AnthropicMessagesApi {
                 return;
             }
         };
+        capture.fire(opts, model).await;
 
         decode_stream(frames, model, &self.api, &sink, is_oauth, &ctx.tools).await;
     }

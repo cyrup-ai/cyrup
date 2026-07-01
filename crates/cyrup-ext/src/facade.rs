@@ -298,7 +298,17 @@ impl ExtensionHost {
         let ev = HostEvent::MessageEnd { message };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Pass(ev) => match *ev {
-                HostEvent::MessageEnd { message } if message != orig => Some(message),
+                // Same-role enforcement (Pi `runner.ts:796-803`): a genuine change is accepted only
+                // when the replacement preserves the original role; a mismatched-role replacement is
+                // rejected and the original kept (never a panic). `Message`'s variant discriminant is
+                // exactly its role (User|Assistant|ToolResult), so a discriminant match is the role
+                // guard.
+                HostEvent::MessageEnd { message }
+                    if message != orig
+                        && std::mem::discriminant(&message) == std::mem::discriminant(&orig) =>
+                {
+                    Some(message)
+                }
                 _ => None,
             },
             _ => None,

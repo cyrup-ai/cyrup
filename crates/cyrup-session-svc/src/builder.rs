@@ -15,7 +15,7 @@ use cyrup_config::{
     decide_trust, has_trust_requiring_resources, AppMode, AuthStore, InMemorySettingsStore,
     ModelResolver, Settings, SettingsManager, SettingsStore, TrustInputs, TrustOutcome,
 };
-use cyrup_ext::{ExtMode, ExtensionHost, HostConfig, NativeExtension};
+use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
 use cyrup_provider::{Model, Provider};
 use cyrup_resources::{discover, DiscoveryConfig, ResourceOverrides, SkillPointer};
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
@@ -700,6 +700,47 @@ impl SessionBuilder {
         {
             agent_builder = agent_builder.timeout_ms(timeout_ms);
         }
+
+        // gap-08 #2/#3: install the provider transport extension seams. `on_payload` routes the
+        // outbound body through the tested `before_provider_request` [mutate] facade (Pi
+        // `emitBeforeProviderRequest` in sdk.ts onPayload, :332-338); `on_response` constructs the
+        // previously-NOWHERE `HostEvent::AfterProviderResponse` notify ({status, headers}, Pi
+        // sdk.ts:339-348). Both are gated on a live subscriber so the common no-extension path pays
+        // nothing. The dispatch is async (wasm) — hence the async hook signatures (no block_on).
+        {
+            let h = ext_host.clone();
+            agent_builder = agent_builder.on_payload(Arc::new(move |payload, _model| {
+                let h = h.clone();
+                Box::pin(async move {
+                    if h.dispatcher().no_subscribers(EventKind::BeforeProviderRequest) {
+                        return None;
+                    }
+                    let out =
+                        h.emit_before_provider_request(payload.clone(), &CancelToken::new()).await;
+                    (out != payload).then_some(out)
+                })
+            }));
+            let h = ext_host.clone();
+            agent_builder = agent_builder.on_response(Arc::new(move |resp, _model| {
+                let h = h.clone();
+                Box::pin(async move {
+                    if h.dispatcher().no_subscribers(EventKind::AfterProviderResponse) {
+                        return;
+                    }
+                    let headers = serde_json::to_value(&resp.headers).unwrap_or_default();
+                    h.dispatcher()
+                        .dispatch_notify(
+                            &HostEvent::AfterProviderResponse {
+                                status: u32::from(resp.status),
+                                headers,
+                            },
+                            &CancelToken::new(),
+                        )
+                        .await;
+                })
+            }));
+        }
+
         let agent = agent_builder.build();
 
         // Seed the model + thinking-level change entries so a future resume can restore them, and
@@ -721,7 +762,13 @@ impl SessionBuilder {
 
         // Attach the extension notify seam, then the facade's persist+fan-out subscriber.
         agent.subscribe(ext_subscriber);
-        agent.subscribe(Arc::new(SvcSubscriber::new(fanout.clone(), manager.clone(), handle.clone())));
+        agent.subscribe(Arc::new(SvcSubscriber::new(
+            fanout.clone(),
+            manager.clone(),
+            handle.clone(),
+            ext_host.clone(),
+            session_cancel.clone(),
+        )));
         let agent = Arc::new(agent);
 
         // ---- 10. assemble the session --------------------------------------------------------

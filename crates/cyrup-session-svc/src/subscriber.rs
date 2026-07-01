@@ -9,12 +9,13 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber};
-use cyrup_core::EventStream;
+use cyrup_core::{CancelToken, EventStream};
+use cyrup_ext::ExtensionHost;
 use cyrup_session::manager::SessionManager;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::event::{agent_message_to_core, AgentSessionEvent};
+use crate::event::{agent_message_to_core, core_message_to_agent, AgentSessionEvent};
 use crate::session::SessionHandle;
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -96,6 +97,12 @@ pub(crate) struct SvcSubscriber {
     fanout: Arc<Fanout>,
     manager: Arc<AsyncMutex<SessionManager>>,
     handle: Arc<SessionHandle>,
+    /// The extension host (gap-08 #1): the `message_end` [mutate] re-dispatch seam. Sourced here —
+    /// NOT via `handle.get()` — because `message_end` fires on unbound sessions too.
+    ext_host: Arc<ExtensionHost>,
+    /// The session cancel token; `message_end` re-dispatch runs under a child of it so a session
+    /// teardown cancels an in-flight guest call (never hangs).
+    session_cancel: CancelToken,
 }
 
 impl SvcSubscriber {
@@ -103,8 +110,10 @@ impl SvcSubscriber {
         fanout: Arc<Fanout>,
         manager: Arc<AsyncMutex<SessionManager>>,
         handle: Arc<SessionHandle>,
+        ext_host: Arc<ExtensionHost>,
+        session_cancel: CancelToken,
     ) -> Self {
-        Self { fanout, manager, handle }
+        Self { fanout, manager, handle, ext_host, session_cancel }
     }
 }
 
@@ -123,9 +132,38 @@ impl EventSubscriber for SvcSubscriber {
 
         // 1. Durable persistence: a finalized message lands in the session tree on `message_end`
         //    (arch-04 §6). User → assistant(toolCall) → toolResult → assistant, in event order.
+        //
+        //    gap-08 #1: BEFORE persistence, re-dispatch `message_end` through the tested
+        //    [`ExtensionHost::emit_message_end`] facade seam so a guest's enforced same-role
+        //    replacement (Pi `emitMessageEnd`, runner.ts:781-821) actually mutates the durable +
+        //    fanned-out copy instead of being silently dropped. Gated on a live subscriber so the
+        //    common (no-extension) path keeps its behavior with zero extra work (mirrors
+        //    session.rs:1041/…). NOTE (documented delta, risks §3): this replaces only the persisted
+        //    + fanned-out copy, not the agent's already-emitted in-memory transcript.
+        let mut replaced_end: Option<AgentMessage> = None;
         if let AgentEvent::MessageEnd { message } = event {
-            if let Some(core) = agent_message_to_core(message) {
-                // Append the finalized message to the session tree (durable across the turn).
+            let effective: Option<cyrup_core::Message> = if !self
+                .ext_host
+                .dispatcher()
+                .no_subscribers(cyrup_ext::EventKind::MessageEnd)
+                && let Some(core) = agent_message_to_core(message)
+            {
+                let cancel = self.session_cancel.child_token();
+                match self.ext_host.emit_message_end(core.clone(), &cancel).await {
+                    // Same-role replacement enforced host-side (facade.rs): adopt it for BOTH the
+                    // durable append AND the fan-out below.
+                    Some(repl) => {
+                        replaced_end = Some(core_message_to_agent(&repl));
+                        Some(repl)
+                    }
+                    None => Some(core),
+                }
+            } else {
+                agent_message_to_core(message)
+            };
+
+            if let Some(core) = effective {
+                // Append the finalized (possibly guest-replaced) message to the session tree.
                 let _ = self.manager.lock().await.append_message(core);
             } else if let AgentMessage::Custom { kind, payload, .. } = message {
                 // Custom messages (queued via `send_custom_message` deliver_as steer/followUp and
@@ -153,6 +191,12 @@ impl EventSubscriber for SvcSubscriber {
             (AgentEvent::AgentEnd { messages }, Some(s)) => AgentSessionEvent::AgentEnd {
                 messages: messages.clone(),
                 will_retry: s.will_retry_after_agent_end(messages),
+            },
+            // gap-08 #1: a guest-replaced `message_end` message is fanned out (not the original) so
+            // downstream observers (TUI / SDK) see the replacement, matching the persisted tree.
+            (AgentEvent::MessageEnd { .. }, _) if replaced_end.is_some() => match replaced_end {
+                Some(m) => AgentSessionEvent::MessageEnd { message: m },
+                None => AgentSessionEvent::from_agent(event),
             },
             _ => AgentSessionEvent::from_agent(event),
         };

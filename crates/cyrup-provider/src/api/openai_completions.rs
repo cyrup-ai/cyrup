@@ -96,7 +96,13 @@ impl ApiImpl for OpenAiCompletionsApi {
             _ => opts.session_id.as_ref().map(|s| s.as_str()),
         };
 
-        let body = build_body_with_env(model, ctx, opts, auth.env.as_ref());
+        // gap-08 #2: let a `before_provider_request` extension inspect/replace the outbound body.
+        let body = crate::stream::apply_on_payload(
+            opts,
+            model,
+            build_body_with_env(model, ctx, opts, auth.env.as_ref()),
+        )
+        .await;
         let headers = build_headers(model, auth, opts, &compat, cache_session_id);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -122,7 +128,10 @@ impl ApiImpl for OpenAiCompletionsApi {
             }
         };
 
-        let frames = match open_sse(&client, req, cancel, None, None).await {
+        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
+        let capture = crate::stream::ResponseCapture::default();
+        let on_resp = capture.sse_hook(opts);
+        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
             Ok(s) => s,
             Err(e) => {
                 // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
@@ -131,6 +140,7 @@ impl ApiImpl for OpenAiCompletionsApi {
                 return;
             }
         };
+        capture.fire(opts, model).await;
 
         decode_stream(frames, model, &self.api, &sink).await;
     }
