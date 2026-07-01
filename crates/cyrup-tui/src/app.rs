@@ -1187,8 +1187,12 @@ impl<B: Backend> App<B> {
                     .into_iter()
                     .map(|sm| sm.model.id.to_string())
                     .collect();
+                // Enumerate the FULL multi-provider registry filtered to CONFIGURED providers (Pi
+                // `modelRegistry.getAvailable()`, model-selector.ts:152 + model-registry.ts:644) —
+                // NOT just the single injected provider. `together` appears once `TOGETHER_API_KEY`
+                // is set; the offline faux default stays selectable.
                 let models: Vec<ModelEntry> = session
-                    .model_catalog()
+                    .available_model_catalog()
                     .iter()
                     .map(|m| ModelEntry {
                         id: m.id.to_string(),

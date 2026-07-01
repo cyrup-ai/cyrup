@@ -15,6 +15,7 @@ use cyrup_session::manager::SessionManager;
 
 use crate::builder::{SessionBuilder, SessionConfig, SessionTarget};
 use crate::error::SessionServiceError;
+use crate::provider_swap::ProviderResolver;
 use crate::session::AgentSession;
 
 /// A reusable factory that rebuilds an [`AgentSession`] per cwd-switch (arch-11 §3.4).
@@ -25,6 +26,7 @@ pub struct SessionFactory {
     auth: Option<Arc<AuthStore>>,
     native_extensions: Vec<Arc<dyn NativeExtension>>,
     cli_settings: Settings,
+    provider_resolver: Option<Arc<dyn ProviderResolver>>,
 }
 
 impl SessionFactory {
@@ -38,7 +40,16 @@ impl SessionFactory {
             auth: None,
             native_extensions: Vec::new(),
             cli_settings: Settings::new(),
+            provider_resolver: None,
         }
+    }
+
+    /// Wire the provider resolver seam (the bin's `select_provider`) into every session this factory
+    /// builds, enabling live cross-provider `/model` swaps (arch-11 §3.4).
+    #[must_use]
+    pub fn provider_resolver(mut self, resolver: Arc<dyn ProviderResolver>) -> Self {
+        self.provider_resolver = Some(resolver);
+        self
     }
 
     /// Override the settings store (default: in-memory).
@@ -117,6 +128,9 @@ impl SessionFactory {
         let mut builder = SessionBuilder::new(self.provider.clone(), cfg)
             .settings_store(self.settings_store.clone())
             .cli_settings(self.cli_settings.clone());
+        if let Some(resolver) = &self.provider_resolver {
+            builder = builder.provider_resolver(resolver.clone());
+        }
         if let Some(auth) = &self.auth {
             builder = builder.auth(auth.clone());
         }
@@ -140,6 +154,9 @@ impl SessionFactory {
             .settings_store(self.settings_store.clone())
             .cli_settings(self.cli_settings.clone())
             .with_manager(manager);
+        if let Some(resolver) = &self.provider_resolver {
+            builder = builder.provider_resolver(resolver.clone());
+        }
         if let Some(auth) = &self.auth {
             builder = builder.auth(auth.clone());
         }

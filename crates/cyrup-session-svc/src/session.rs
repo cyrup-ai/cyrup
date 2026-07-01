@@ -15,7 +15,7 @@ use cyrup_core::{
 };
 use cyrup_ext::host::ControlOp;
 use cyrup_ext::{HostEvent, InputEventSource, InputStreamingBehavior, Reduced};
-use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model, Provider};
+use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model};
 use cyrup_session::compaction::{
     context_tokens_from_usage, estimate_context_tokens, BranchSummarySettings, CompactionReason,
     CompactionSettings, Compactor, NoHooks,
@@ -32,6 +32,7 @@ use crate::event::{
     core_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted, PromptOptions,
     StreamingBehavior, UserInput,
 };
+use crate::provider_swap::ProviderSwap;
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
 use crate::tools::{DynamicToolState, ToolInfo};
@@ -257,7 +258,11 @@ pub struct AgentSession {
     agent: Arc<Agent>,
     manager: Arc<AsyncMutex<SessionManager>>,
     fanout: Arc<Fanout>,
-    provider: Arc<dyn Provider>,
+    /// The swappable stream source the agent loop streams through (`ProviderSwap`). Holds the
+    /// currently-installed provider (faux offline default, or a resolved real provider) and is
+    /// mutated in place on a cross-provider `/model` select so the agent streams against the new
+    /// provider without rebuilding — 1:1 with Pi's live model+provider switch.
+    provider: Arc<ProviderSwap>,
     services: AgentSessionServices,
     /// The active model address (mutated by `set_model`).
     model: Mutex<ModelRef>,
@@ -350,7 +355,7 @@ impl AgentSession {
         agent: Arc<Agent>,
         manager: Arc<AsyncMutex<SessionManager>>,
         fanout: Arc<Fanout>,
-        provider: Arc<dyn Provider>,
+        provider: Arc<ProviderSwap>,
         services: AgentSessionServices,
         model: ModelRef,
         session_cancel: CancelToken,
@@ -1056,7 +1061,7 @@ impl AgentSession {
         }
 
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
         let compactor = Compactor::new(summarizer, NoHooks);
 
         let mut guard = self.manager.lock().await;
@@ -1171,7 +1176,7 @@ impl AgentSession {
         user_wants_summary: bool,
     ) -> Result<Option<String>, SessionServiceError> {
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -1407,7 +1412,7 @@ impl AgentSession {
             _ => BRANCH_SUMMARY_PROMPT.to_string(),
         };
         let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
-        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
         let req = SummarizationRequest {
             system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
             prompt_text: prompt,
@@ -1744,20 +1749,28 @@ impl AgentSession {
 
     /// Switch the active model by pattern (`provider/id[:level]`), updating the agent, the
     /// compaction model, and recording a model-change entry (R-11-014 `set_model`).
+    ///
+    /// The pattern resolves against the FULL multi-provider registry (Pi resolves against the whole
+    /// `modelRegistry`, not just the active provider) so a `/model` selection targeting a DIFFERENT
+    /// provider than the current one resolves cleanly; [`Self::set_model_resolved`] then swaps the
+    /// owning provider. Falls back to the current provider's own catalog for custom-id / offline faux
+    /// models that are not part of the built-in registry.
     pub async fn set_model(&self, pattern: &str) -> Result<ModelRef, SessionServiceError> {
         let resolved = {
-            let available = self.provider.models();
-            let resolver = cyrup_config::ModelResolver::new(available);
-            let parsed = resolver.parse_pattern(pattern, true);
-            parsed.model.ok_or_else(|| SessionServiceError::ModelNotFound(pattern.to_string()))?
-        };
+            let candidates = self.full_model_registry();
+            let resolver = cyrup_config::ModelResolver::new(&candidates);
+            resolver.parse_pattern(pattern, true).model
+        }
+        .ok_or_else(|| SessionServiceError::ModelNotFound(pattern.to_string()))?;
         self.set_model_resolved(resolved).await
     }
 
     /// Switch to a resolved [`Model`] (Pi `setModel(Model)`, agent-session.ts:1448-1463), running the
-    /// `hasConfiguredAuth` precheck first (our auth proxy: the model must be in the live provider
-    /// catalog). Updates the agent + compaction model + attribution headers + host-services view and
-    /// records a `model_change` entry.
+    /// `hasConfiguredAuth` precheck first. When the target model's provider differs from the currently
+    /// installed one, the owning provider is resolved (env-backed credentials installed) and swapped
+    /// into the agent's stream source in place — 1:1 with Pi switching model+provider together.
+    /// Updates the agent + compaction model + attribution headers + host-services view and records a
+    /// `model_change` entry.
     pub async fn set_model_resolved(&self, model: Model) -> Result<ModelRef, SessionServiceError> {
         if !self.has_configured_auth(&model) {
             return Err(SessionServiceError::NoConfiguredAuth(format!(
@@ -1765,6 +1778,17 @@ impl AgentSession {
                 model.provider.as_str(),
                 model.id.as_str()
             )));
+        }
+        // Cross-provider select: rebuild + install the owning provider so the agent loop streams
+        // against it (Pi switches model+provider live). A same-provider change is a no-op here.
+        if self.provider.current().id().as_str() != model.provider.as_str() {
+            self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
+                SessionServiceError::NoConfiguredAuth(format!(
+                    "{}/{}: {e}",
+                    model.provider.as_str(),
+                    model.id.as_str()
+                ))
+            })?;
         }
         let previous = Self::lock(&self.model).clone();
         self.apply_model_change(&model, &previous, "set", None).await?;
@@ -1775,14 +1799,59 @@ impl AgentSession {
         })
     }
 
-    /// Whether the model has usable auth (Pi `modelRegistry.hasConfiguredAuth`, agent-session.ts:1449).
-    /// cyrup's auth proxy (gap doc §3): a model the injected provider exposes in its catalog is
-    /// usable — the provider already resolved its credentials when it was constructed.
+    /// Whether the model has usable auth (Pi `modelRegistry.hasConfiguredAuth`, agent-session.ts:1449
+    /// / model-registry.ts:658-664). Pi's check: the model's provider has configured auth — a stored
+    /// credential, a runtime `--api-key`, or a known env var (e.g. `TOGETHER_API_KEY` for `together`).
+    /// cyrup layers its offline-faux accommodation on top: a model the CURRENT injected provider
+    /// exposes in its catalog is always usable (the scripted faux provider needs no key), so the
+    /// active/offline model stays selectable exactly as before.
     pub fn has_configured_auth(&self, model: &Model) -> bool {
+        if self.provider_has_configured_auth(&model.provider) {
+            return true;
+        }
         self.provider
+            .current()
             .models()
             .iter()
             .any(|m| m.provider == model.provider && m.id == model.id)
+    }
+
+    /// Whether `provider` has configured auth in the Pi sense (stored credential / runtime `--api-key`
+    /// / known env var), via `cyrup-config`'s [`cyrup_config::AuthStore::has_auth`] (which consults
+    /// `env_keys`, e.g. `together` → `TOGETHER_API_KEY`). Does NOT count the offline faux
+    /// accommodation — [`Self::has_configured_auth`] adds that separately.
+    fn provider_has_configured_auth(&self, provider: &ProviderId) -> bool {
+        self.services.auth.has_auth(provider, None)
+    }
+
+    /// The FULL multi-provider model registry (Pi `providers/all.ts` → `getModels(None)`), unioned
+    /// with the current provider's own catalog (which includes the offline faux models + any custom-id
+    /// models that are not part of the built-in registry). Deduped by `provider/id`, current-provider
+    /// entries first. This is the resolution/enumeration source that spans providers, independent of
+    /// which single provider is currently installed.
+    fn full_model_registry(&self) -> Vec<Model> {
+        let mut out: Vec<Model> = self.provider.current().models().to_vec();
+        let full = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+            credentials: None,
+            auth_context: None,
+        })
+        .get_models(None);
+        for m in full {
+            if !out.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// The models the `/model` selector offers: the FULL registry filtered to CONFIGURED providers
+    /// (Pi `modelRegistry.getAvailable()` = `getAll().filter(hasConfiguredAuth)`,
+    /// model-registry.ts:644-646, surfaced by the selector at model-selector.ts:152). A provider is
+    /// configured when it has a stored credential / runtime `--api-key` / known env var (so `together`
+    /// appears once `TOGETHER_API_KEY` is set), plus cyrup's offline-faux accommodation keeps the
+    /// current provider's own catalog (the scripted faux default) selectable. Deduped by `provider/id`.
+    pub fn available_model_catalog(&self) -> Vec<Model> {
+        self.full_model_registry().into_iter().filter(|m| self.has_configured_auth(m)).collect()
     }
 
     /// The provider-attribution + session-affinity headers this session attaches to provider requests
@@ -2362,7 +2431,7 @@ impl AgentSession {
         &self,
         forward: bool,
     ) -> Result<Option<ModelCycleResult>, SessionServiceError> {
-        let candidates = self.provider.models().to_vec();
+        let candidates = self.provider.current().models().to_vec();
         if candidates.len() <= 1 {
             return Ok(None);
         }
@@ -2425,9 +2494,12 @@ impl AgentSession {
         &self.services.resources.prompts
     }
 
-    /// The live provider model catalog (Pi `modelRegistry` getter, agent-session.ts:1412).
-    pub fn model_catalog(&self) -> &[cyrup_provider::Model] {
-        self.provider.models()
+    /// The currently-installed provider's model catalog (Pi `modelRegistry` getter,
+    /// agent-session.ts:1412). Returned by value because the underlying provider is now swappable
+    /// (see [`ProviderSwap`]); for the cross-provider `/model` list use
+    /// [`Self::available_model_catalog`], which spans the full configured registry.
+    pub fn model_catalog(&self) -> Vec<cyrup_provider::Model> {
+        self.provider.current().models().to_vec()
     }
 
     /// The session-scoped resource registry (Pi `resourceLoader` getter, agent-session.ts:363).
@@ -2755,7 +2827,7 @@ impl AgentSession {
         }
 
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.clone(), model.clone());
+        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
         let compactor = Compactor::new(summarizer, NoHooks);
         let settings = self.effective_compaction_settings();
         let mut guard = self.manager.lock().await;

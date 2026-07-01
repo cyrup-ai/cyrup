@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_agent::{Agent, ProviderStreamFn};
+use cyrup_agent::Agent;
 use cyrup_core::{CancelToken, ModelRef, RunCancel, ModelThinkingLevel};
 use cyrup_config::{
     decide_trust, has_trust_requiring_resources, AppMode, AuthStore, InMemorySettingsStore,
@@ -32,6 +32,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::SessionServiceError;
 use crate::event::core_message_to_agent;
+use crate::provider_swap::{ProviderResolver, ProviderSwap};
 use crate::services::AgentSessionServices;
 use crate::session::AgentSession;
 use crate::subscriber::{Fanout, SvcSubscriber};
@@ -263,6 +264,9 @@ pub struct SessionBuilder {
     /// agent-session-services.ts:187). Used by the runtime fork path, where the branched manager is
     /// mutated in place and handed over directly (its file write may still be deferred on disk).
     prebuilt_manager: Option<SessionManager>,
+    /// Provider resolver seam (the bin's `select_provider`) enabling live cross-provider `/model`
+    /// swaps. `None` ⇒ only same-provider model changes are possible (tests / offline builds).
+    provider_resolver: Option<Arc<dyn ProviderResolver>>,
 }
 
 impl SessionBuilder {
@@ -276,7 +280,16 @@ impl SessionBuilder {
             native_extensions: Vec::new(),
             cli_settings: Settings::new(),
             prebuilt_manager: None,
+            provider_resolver: None,
         }
+    }
+
+    /// Wire the provider resolver seam (the bin's `select_provider`) so a `/model` selection that
+    /// targets a different provider than the current one swaps the owning provider live.
+    #[must_use]
+    pub fn provider_resolver(mut self, resolver: Arc<dyn ProviderResolver>) -> Self {
+        self.provider_resolver = Some(resolver);
+        self
     }
 
     /// Adopt a caller-supplied, already-constructed [`SessionManager`] (the runtime fork path),
@@ -643,10 +656,13 @@ impl SessionBuilder {
             Some(&session_id),
             &[],
         );
-        let mut agent_builder = Agent::builder(
-            model_ref.clone(),
-            Arc::new(ProviderStreamFn::new(self.provider.clone())),
-        )
+        // The swappable stream source the agent loop streams through: it wraps the resolved provider
+        // and the (optional) resolver seam so a cross-provider `/model` select can install a new
+        // provider in place without rebuilding the agent (Pi live model+provider switch). The SAME
+        // `Arc` is handed to the agent (as its `StreamFn`) and to the session (to mutate on select).
+        let provider_swap =
+            Arc::new(ProviderSwap::new(self.provider.clone(), self.provider_resolver.clone()));
+        let mut agent_builder = Agent::builder(model_ref.clone(), provider_swap.clone())
         .system_prompt(system_prompt.clone())
         .thinking_level(thinking)
         .tools(active_tools)
@@ -760,7 +776,7 @@ impl SessionBuilder {
             agent,
             manager,
             fanout,
-            self.provider,
+            provider_swap,
             services,
             model_ref,
             session_cancel,

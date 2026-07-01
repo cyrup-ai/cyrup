@@ -28,6 +28,19 @@ pub fn all_available_models() -> Vec<cyrup_provider::Model> {
     models.get_models(None)
 }
 
+/// A [`cyrup_session_svc::ProviderResolver`] backed by [`select_provider`]: rebuilds the owning
+/// built-in provider — installing its env-backed credentials — for a target provider id. Wired into
+/// the session so a `/model` selection that targets a DIFFERENT provider than the current one swaps
+/// the owning provider live (Pi model+provider switch, model-selector.ts:328-332). The provider's
+/// key resolves at stream time from the environment (e.g. `TOGETHER_API_KEY`), matching Pi.
+pub struct BuiltinProviderResolver;
+
+impl cyrup_session_svc::ProviderResolver for BuiltinProviderResolver {
+    fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+        select_provider(Some(provider_id), None, None).map_err(|e| e.to_string())
+    }
+}
+
 /// The provider id a model pattern addresses, if it carries an explicit `provider/...` prefix.
 fn provider_prefix(model_pattern: Option<&str>) -> Option<&str> {
     let pattern = model_pattern?;

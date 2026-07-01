@@ -234,7 +234,9 @@ async fn run() -> anyhow::Result<i32> {
         let target = config.target.clone();
         let fresh = is_fresh_target(&target);
         let factory = Arc::new(
-            SessionFactory::new(provider, config).settings_store(settings_store.clone()),
+            SessionFactory::new(provider, config)
+                .settings_store(settings_store.clone())
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver)),
         );
         let runtime = Arc::new(
             AgentSessionRuntime::create(factory, target)
@@ -281,7 +283,9 @@ async fn run() -> anyhow::Result<i32> {
             let target = config.target.clone();
             let fresh = is_fresh_target(&target);
             let factory = Arc::new(
-                SessionFactory::new(provider, config).settings_store(settings_store.clone()),
+                SessionFactory::new(provider, config)
+                    .settings_store(settings_store.clone())
+                    .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver)),
             );
             let runtime = match AgentSessionRuntime::create(factory, target).await {
                 Ok(r) => Arc::new(r),
@@ -306,6 +310,7 @@ async fn run() -> anyhow::Result<i32> {
             let fresh = is_fresh_target(&config.target);
             let session = match SessionBuilder::new(provider, config)
                 .settings_store(settings_store.clone())
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
                 .build()
                 .await
             {
@@ -344,7 +349,7 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
         let _ = session.set_session_name(name).await;
     }
     if !cli.models.is_empty() {
-        let scoped = resolve_scoped_models(session.model_catalog(), &cli.models);
+        let scoped = resolve_scoped_models(&session.model_catalog(), &cli.models);
         if !scoped.is_empty() {
             // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
             // when `--models` scopes the set and `--model` is omitted, the active model is the saved

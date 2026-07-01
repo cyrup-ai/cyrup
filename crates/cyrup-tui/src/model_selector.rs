@@ -301,7 +301,10 @@ impl Selector for ModelSelector {
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Confirm) => match self.current() {
-                Some(m) => SelectorOutcome::Confirm(m.id.clone()),
+                // Confirm the fully-qualified `provider/id` (Pi `handleSelect` →
+                // `setDefaultModelAndProvider(model.provider, model.id)`, model-selector.ts:330) so a
+                // cross-provider selection resolves against the right provider and swaps it.
+                Some(m) => SelectorOutcome::Confirm(format!("{}/{}", m.provider, m.id)),
                 None => SelectorOutcome::Redraw,
             },
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,

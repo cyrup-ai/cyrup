@@ -27,6 +27,7 @@ pub mod export;
 mod factory;
 mod host_services;
 mod hooks;
+mod provider_swap;
 mod runtime;
 mod services;
 mod session;
@@ -49,6 +50,7 @@ pub use event::{
 };
 pub use factory::SessionFactory;
 pub use host_services::{ControlSink, LiveHostServices};
+pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{
     AgentSessionRuntime, NewSessionOptions, RuntimeDiagnostic, RuntimeForkResult,
     SwitchResult, SwitchSessionOptions,
