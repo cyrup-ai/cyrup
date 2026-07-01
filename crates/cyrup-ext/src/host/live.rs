@@ -280,13 +280,23 @@ impl bindings::cyrup::ext::session::Host for HostState {
         let data: Value = serde_json::from_str(&data_json).map_err(|e| e.to_string())?;
         guest.services.append_entry(&custom_type, &data)
     }
-    async fn set_session_name(&mut self, _name: String) {
-        // Recorded via services in a full host; no-op in the default backend.
+    async fn set_session_name(&mut self, name: String) {
+        // Route to the pluggable backend: the default host no-ops, the session service renames the
+        // live session tree (Pi `setSessionName`, agent-session.ts:2272-2274).
+        if let Ok(guest) = guest_of(self) {
+            guest.services.set_session_name(&name);
+        }
     }
     async fn get_session_name(&mut self) -> Option<String> {
         guest_of(self).ok().and_then(|g| g.services.session_name())
     }
-    async fn set_label(&mut self, _entry_id: String, _label: String) {}
+    async fn set_label(&mut self, entry_id: String, label: String) {
+        // Route to the pluggable backend (Pi `setLabel`, agent-session.ts:2276-2279); the session
+        // service applies it to the live tree via `append_label`.
+        if let Ok(guest) = guest_of(self) {
+            guest.services.set_label(&entry_id, &label);
+        }
+    }
 }
 
 impl bindings::cyrup::ext::models::Host for HostState {

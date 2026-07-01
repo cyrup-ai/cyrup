@@ -11,11 +11,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::ModelRef;
+use cyrup_core::{EntryId, ModelRef};
 use cyrup_ext::host::{ControlOp, HostServices};
 use cyrup_provider::Provider;
+use cyrup_session::manager::SessionManager;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex as AsyncMutex;
+
+use crate::event::AgentSessionEvent;
 
 /// A command-tier control sink: a loaded extension's `control` import (new/switch/fork/…) is routed
 /// here so the runtime can act on it (Pi `createCommandContext`, agent-session.ts:1158). Set by the
@@ -43,6 +47,15 @@ pub struct LiveHostServices {
     /// drains + applies it at a command-tier-safe point (Pi runs `createCommandContext` ops directly,
     /// agent-session.ts:1158 — cyrup bridges the sync→async gap via this queue).
     control_rx: Mutex<Option<UnboundedReceiver<ControlOp>>>,
+    /// The running session's tree manager, attached post-build via [`Self::attach_session`]. A guest's
+    /// `append_entry`/`set_session_name`/`set_label` capability mutates it DIRECTLY (Pi appends
+    /// synchronously — `SessionManager.appendCustomEntry`/`setSessionName`/`setLabel`,
+    /// agent-session.ts:2265-2279). `None` until attached (default host: no session-mutation authority).
+    manager: Mutex<Option<Arc<AsyncMutex<SessionManager>>>>,
+    /// Facade events a guest state-mutation queued (`entry_appended`/`session_info_changed`), drained
+    /// and fanned out by [`crate::AgentSession::apply_pending_control`] after the guest call settles —
+    /// the same sync→async bridge point the control queue uses.
+    pending_events: Mutex<Vec<AgentSessionEvent>>,
 }
 
 impl LiveHostServices {
@@ -54,6 +67,8 @@ impl LiveHostServices {
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
             control_rx: Mutex::new(None),
+            manager: Mutex::new(None),
+            pending_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -107,6 +122,33 @@ impl LiveHostServices {
         }
         out
     }
+
+    /// Attach the running session's tree manager so a guest's state-mutating capabilities
+    /// (`append_entry`/`set_session_name`/`set_label`) reach the REAL session tree (arch-08 §5.6).
+    /// The builder calls this once the `Arc<AsyncMutex<SessionManager>>` exists (step 10).
+    pub fn attach_session(&self, manager: Arc<AsyncMutex<SessionManager>>) {
+        *Self::lock(&self.manager) = Some(manager);
+    }
+
+    /// Drain the facade events queued by guest state mutations (entry_appended/session_info_changed);
+    /// [`crate::AgentSession::apply_pending_control`] fans them out on the live streams. The guest is
+    /// wasm-suspended across the SYNC mutation, so — mirroring the control queue — the ASYNC fan-out
+    /// runs at the next command-tier-safe drain.
+    pub fn take_pending_events(&self) -> Vec<AgentSessionEvent> {
+        std::mem::take(&mut *Self::lock(&self.pending_events))
+    }
+
+    /// Acquire the attached manager without blocking (the guest host call runs on the session task
+    /// while the manager lock is free — Pi appends synchronously). `Err` (never a panic) when the
+    /// session is unattached or transiently busy, surfaced to the guest as a WIT `result` error.
+    fn with_manager<R>(
+        &self,
+        f: impl FnOnce(&mut SessionManager) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let manager = Self::lock(&self.manager).clone().ok_or("session not attached")?;
+        let mut guard = manager.try_lock().map_err(|_| "session busy".to_string())?;
+        f(&mut guard)
+    }
 }
 
 impl HostServices for LiveHostServices {
@@ -149,6 +191,43 @@ impl HostServices for LiveHostServices {
             Some(f) => f(op),
             None => Err("control capability not yet wired to a runtime".into()),
         }
+    }
+
+    fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
+        // Persist the custom (non-LLM) entry into the LIVE session tree (Pi
+        // `sessionManager.appendCustomEntry`, agent-session.ts:2265-2271) and snapshot the persisted
+        // entry for the `entry_appended` fan-out.
+        let (id, entry) = self.with_manager(|mgr| {
+            let id = mgr.append_custom_entry(custom_type, Some(data.clone())).map_err(|e| e.to_string())?;
+            let entry = mgr.entry(&id).and_then(|e| serde_json::to_value(e).ok()).unwrap_or(Value::Null);
+            Ok((id, entry))
+        })?;
+        Self::lock(&self.pending_events).push(AgentSessionEvent::EntryAppended { entry });
+        Ok(id.to_string())
+    }
+
+    fn set_session_name(&self, name: &str) {
+        // Rename the live session (Pi `setSessionName` → `appendSessionInfo`, agent-session.ts:2690).
+        let resolved = self.with_manager(|mgr| {
+            mgr.append_session_info(name).map_err(|e| e.to_string())?;
+            Ok(mgr.session_name())
+        });
+        if let Ok(resolved) = resolved {
+            // Keep the sync read-view snapshot current (guest `getSessionName` reflects the rename)
+            // and queue the `session_info_changed` fan-out (Pi `_emit`, agent-session.ts:2714).
+            Self::lock(&self.snapshot).session_name = resolved.clone();
+            Self::lock(&self.pending_events)
+                .push(AgentSessionEvent::SessionInfoChanged { name: resolved });
+        }
+    }
+
+    fn set_label(&self, entry_id: &str, label: &str) {
+        // Set/replace the entry's label on the live tree (Pi `setLabel` → `appendLabel`,
+        // agent-session.ts:2276-2279). A no-op result (unknown id / busy) degrades silently.
+        let _ = self.with_manager(|mgr| {
+            mgr.append_label(&EntryId::from(entry_id), Some(label)).map_err(|e| e.to_string())?;
+            Ok(())
+        });
     }
 }
 

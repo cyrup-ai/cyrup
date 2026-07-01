@@ -171,6 +171,20 @@ pub fn build() -> ExtensionApi {
         },
     );
 
+    // A command exercising the state-mutation seams (R-08-026; Pi `appendEntry`/`setSessionName`/
+    // `setLabel`, agent-session.ts:2265-2279): append a custom entry to the live tree, rename the
+    // session, then label the just-appended entry. Proves each no-op FIRES against the real session.
+    api.register_command(
+        "statedemo",
+        CommandDescriptor::new("Append a custom entry, rename the session, label the entry (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let id = ctx.ctx().session().append_entry("demoNote", json!({ "note": "from guest" }))?;
+            ctx.ctx().session().set_session_name("renamed-by-guest");
+            ctx.ctx().session().set_label(&id, "guest-label");
+            Ok(Some(format!("appended {id}")))
+        },
+    );
+
     // A custom message renderer (R-08-020) keyed by a custom tool type.
     api.register_message_renderer("demo", DemoRenderer);
 

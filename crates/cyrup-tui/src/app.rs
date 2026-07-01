@@ -1872,6 +1872,16 @@ impl<B: Backend> App<B> {
                 let label = name.clone().unwrap_or_default();
                 self.state.transcript.push_status(format!("session renamed → {label}"));
             }
+            AgentSessionEvent::EntryAppended { entry } => {
+                // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
+                // `entry_appended`, agent-session.ts:140). Surface its type as a status line.
+                let ty = entry
+                    .get("type")
+                    .or_else(|| entry.get("customType"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom");
+                self.state.transcript.push_status(format!("entry appended → {ty}"));
+            }
             // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
             // re-subscribes to the runtime's new generation on `SessionReplaced` (R-11-021); the
             // re-subscription itself is driven by the app's runtime watch, not this transcript hook.

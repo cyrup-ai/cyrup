@@ -762,6 +762,10 @@ impl SessionBuilder {
         }
 
         let manager = Arc::new(AsyncMutex::new(manager));
+        // Attach the live tree manager to the (already control-wired) host-services backend so a
+        // loaded guest's `append_entry`/`set_session_name`/`set_label` capability mutates THIS
+        // session's real tree (arch-08 §5.6; Pi appends synchronously, agent-session.ts:2265-2279).
+        host_services.attach_session(manager.clone());
         let fanout = Arc::new(Fanout::new());
         // The shared self-handle: bound to the owning `Arc<AgentSession>` by `into_shared`, and read by
         // the persist+fan-out subscriber (`_handleAgentEvent`) + the post-run driver.

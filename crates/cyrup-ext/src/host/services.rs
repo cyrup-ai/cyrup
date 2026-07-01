@@ -155,6 +155,15 @@ pub trait HostServices: Send + Sync {
     fn append_entry(&self, _custom_type: &str, _data: &Value) -> Result<String, String> {
         Err("append_entry not available".into())
     }
+
+    /// Rename the running session (Pi `setSessionName`, agent-session.ts:2272-2274). No-op by
+    /// default (the default host grants no session-mutation authority); the session service routes
+    /// this to the live tree's `set_session_name`/`append_session_info`.
+    fn set_session_name(&self, _name: &str) {}
+
+    /// Set (or replace) an entry's label (Pi `setLabel`, agent-session.ts:2276-2279). No-op by
+    /// default; the session service routes this to the live tree's `append_label`.
+    fn set_label(&self, _entry_id: &str, _label: &str) {}
 }
 
 /// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, types.ts:124-275). These
@@ -235,6 +244,10 @@ struct RecordingState {
     exec_calls: Vec<(String, Vec<String>)>,
     entries: Vec<(String, Value)>,
     next_entry: u64,
+    /// The last session name set via `set_session_name` (Pi `setSessionName`).
+    session_name: Option<String>,
+    /// The `(entry_id, label)` pairs set via `set_label` (Pi `setLabel`).
+    labels: Vec<(String, String)>,
 }
 
 impl RecordingServices {
@@ -255,6 +268,11 @@ impl RecordingServices {
     /// The persisted custom entries (R-08-026).
     pub fn entries_persisted(&self) -> Vec<(String, Value)> {
         self.state.lock().map(|g| g.entries.clone()).unwrap_or_default()
+    }
+
+    /// The `(entry_id, label)` pairs set via `set_label` (Pi `setLabel`).
+    pub fn labels_set(&self) -> Vec<(String, String)> {
+        self.state.lock().map(|g| g.labels.clone()).unwrap_or_default()
     }
 }
 
@@ -321,6 +339,20 @@ impl HostServices for RecordingServices {
         let id = format!("entry-{}", g.next_entry);
         g.entries.push((custom_type.to_string(), data.clone()));
         Ok(id)
+    }
+    fn session_name(&self) -> Option<String> {
+        // Read back whatever `set_session_name` last recorded (proves the rename round-trips).
+        self.state.lock().ok().and_then(|g| g.session_name.clone())
+    }
+    fn set_session_name(&self, name: &str) {
+        if let Ok(mut g) = self.state.lock() {
+            g.session_name = Some(name.to_string());
+        }
+    }
+    fn set_label(&self, entry_id: &str, label: &str) {
+        if let Ok(mut g) = self.state.lock() {
+            g.labels.push((entry_id.to_string(), label.to_string()));
+        }
     }
 }
 

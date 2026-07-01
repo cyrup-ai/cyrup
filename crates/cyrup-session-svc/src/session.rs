@@ -2076,6 +2076,12 @@ impl AgentSession {
     /// reload/wait-idle/send-message) are returned so the runtime can act on them. Mutating from a
     /// command tier respects the deadlock rule (R-08-008): never called from inside the agent loop.
     pub async fn apply_pending_control(&self) -> Vec<ControlOp> {
+        // Fan out the facade events a guest state-mutation queued (entry_appended/session_info_changed):
+        // the guest appended/renamed synchronously via `LiveHostServices`; emit here — the same
+        // command-tier-safe bridge point the control ops drain at — so listeners observe them.
+        for ev in self.services.host_services.take_pending_events() {
+            self.fanout_emit(ev).await;
+        }
         let ops = self.services.host_services.take_pending_control();
         let mut deferred = Vec::new();
         for op in ops {

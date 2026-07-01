@@ -194,6 +194,13 @@ pub enum AgentSessionEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// A loaded extension appended a custom (non-LLM) entry to the running session tree (Pi
+    /// `entry_appended`, agent-session.ts:140/2265-2271). Emitted by
+    /// [`crate::host_services::LiveHostServices::append_entry`] once the entry is persisted; `entry`
+    /// is the serialized [`cyrup_session::entry::Entry`] that now lives in the tree.
+    EntryAppended {
+        entry: Value,
+    },
     /// A session was started/replaced by the runtime (Pi `session_start`,
     /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
     SessionStart {
@@ -284,6 +291,7 @@ impl AgentSessionEvent {
             AgentSessionEvent::ModelChanged { .. } => "model_changed",
             AgentSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
             AgentSessionEvent::SessionInfoChanged { .. } => "session_info_changed",
+            AgentSessionEvent::EntryAppended { .. } => "entry_appended",
             AgentSessionEvent::SessionStart { .. } => "session_start",
             AgentSessionEvent::SessionShutdown { .. } => "session_shutdown",
             AgentSessionEvent::SessionReplaced { .. } => "session_replaced",

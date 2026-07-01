@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cyrup_core::{ExtensionId, Message, StopReason};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
@@ -150,6 +151,124 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
     assert!(
         user_texts(&session.messages().await).iter().any(|t| t.contains("/unknown please run")),
         "an unmatched slash command falls through to normal prompt handling"
+    );
+}
+
+/// L5 G7+G8 assembled proof: a LIVE wasm guest's `appendEntry`/`setSessionName`/`setLabel`
+/// capabilities (previously host-side no-ops) FIRE and mutate the REAL running session (Pi
+/// `appendEntry`/`setSessionName`/`setLabel`, agent-session.ts:2265-2279). The demo's `/statedemo`
+/// command appends a `demoNote` custom entry, renames the session, and labels that entry; we then
+/// observe — in the assembled session, not a stub — that (1) the custom entry is in the tree, (2) the
+/// session is renamed, (3) the label is set, and (4) an `entry_appended` event reached a subscriber.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_state_mutations_fire_against_the_live_session() {
+    use futures::StreamExt;
+
+    let wasm_path = fixture_component();
+    let bytes = std::fs::read(&wasm_path).expect("read fixture component bytes");
+
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
+    let _ext = session
+        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .await
+        .expect("load + init the live wasm extension");
+
+    // The guest's `init` registered `/statedemo`.
+    assert!(
+        session
+            .services()
+            .ext_host
+            .registry()
+            .command_names()
+            .unwrap()
+            .iter()
+            .any(|n| n == "statedemo"),
+        "the guest-registered `/statedemo` command is in the host command registry"
+    );
+
+    // Baseline: no `demoNote` entry yet, and the default (unnamed) session.
+    let before = session.entries_json().await;
+    assert!(
+        !before.iter().any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("demoNote")),
+        "no guest-appended entry before the command"
+    );
+    assert_ne!(session.session_name().await.as_deref(), Some("renamed-by-guest"));
+
+    // Observe the fan-out: a persistent subscription must receive `entry_appended`.
+    let mut sub = session.subscribe();
+
+    // Drive the guest command through the REAL run path (prompt → _tryExecuteExtensionCommand →
+    // execute-command → the guest's append/rename/label capability calls → apply_pending_control).
+    let _ = session.prompt("/statedemo").await.unwrap();
+    session.wait_for_idle().await;
+
+    // (1) The custom entry is now in the REAL session tree.
+    let entries = session.entries_json().await;
+    let appended = entries
+        .iter()
+        .find(|e| e.get("customType").and_then(|v| v.as_str()) == Some("demoNote"))
+        .expect("the guest-appended `demoNote` custom entry is in the tree");
+    assert_eq!(appended.get("type").and_then(|v| v.as_str()), Some("custom"));
+    assert_eq!(
+        appended.get("data").and_then(|d| d.get("note")).and_then(|v| v.as_str()),
+        Some("from guest"),
+        "the guest's entry payload persisted verbatim"
+    );
+    let appended_id =
+        appended.get("id").and_then(|v| v.as_str()).expect("appended entry has an id").to_string();
+
+    // (2) The session was renamed by the guest.
+    assert_eq!(
+        session.session_name().await.as_deref(),
+        Some("renamed-by-guest"),
+        "the guest `setSessionName` renamed the live session"
+    );
+
+    // (3) The label was set on the appended entry (a persisted `label` entry targets it).
+    assert!(
+        entries.iter().any(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("label")
+                && e.get("targetId").and_then(|v| v.as_str()) == Some(appended_id.as_str())
+                && e.get("label").and_then(|v| v.as_str()) == Some("guest-label")
+        }),
+        "the guest `setLabel` persisted a label targeting the appended entry: {entries:?}"
+    );
+    // …and the tree resolves that label onto the node.
+    let tree = session.tree_json().await;
+    fn find_label(nodes: &[serde_json::Value], id: &str) -> Option<String> {
+        for n in nodes {
+            if n.get("entry").and_then(|e| e.get("id")).and_then(|v| v.as_str()) == Some(id) {
+                return n.get("label").and_then(|v| v.as_str()).map(str::to_string);
+            }
+            if let Some(children) = n.get("children").and_then(|c| c.as_array())
+                && let Some(found) = find_label(children, id)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    assert_eq!(
+        find_label(&tree, &appended_id).as_deref(),
+        Some("guest-label"),
+        "the appended entry's node carries the guest-set label"
+    );
+
+    // (4) A subscriber observed the `entry_appended` fan-out.
+    let mut kinds = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+        kinds.push(ev.kind());
+        if kinds.contains(&"entry_appended") {
+            break;
+        }
+    }
+    assert!(
+        kinds.contains(&"entry_appended"),
+        "a live subscriber observed the entry_appended event: {kinds:?}"
     );
 }
 
