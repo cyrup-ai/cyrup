@@ -239,6 +239,76 @@ impl UiTheme {
         Style::default().fg(self.bash_mode.or(self.success).unwrap_or(Color::Green))
     }
 
+    /// The editor's top/bottom rule style for a reasoning `level` — Pi `thinking{Off..Xhigh}`
+    /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3): an escalating per-level color that is the
+    /// editor's primary always-visible mode signal. Falls back to the `border` role for unknown levels.
+    pub fn thinking_border_style(&self, level: &str) -> Style {
+        let (key, default_hex) = match level {
+            "off" => ("thinkingOff", "#666666"),
+            "minimal" => ("thinkingMinimal", "#6e6e6e"),
+            "low" => ("thinkingLow", "#5f87af"),
+            "medium" => ("thinkingMedium", "#81a2be"),
+            "high" => ("thinkingHigh", "#b294bb"),
+            "xhigh" => ("thinkingXhigh", "#d183e8"),
+            // An unrecognized level keeps the neutral border color.
+            _ => return self.border_style(),
+        };
+        match self.roles.get(key).copied() {
+            Some(c) => Style::default().fg(c),
+            None => Style::default().fg(self.role_color(key, default_hex)),
+        }
+    }
+
+    // --- per-role background fills (spec/tui/02 §9.2; the affordance is the bg, not a box) ----------
+    //
+    // Pi has no global background token; message/tool/selected rows are tinted by per-role bg fills
+    // (`selectedBg` / `userMessageBg` / `toolPendingBg|SuccessBg|ErrorBg` / `customMessageBg`,
+    // theme.ts:48-55). These were dead (every `.bg()` hardwired to `None`, audit #6); projecting the
+    // resolved roles restores the message-role + selected-row affordance.
+
+    /// The resolved color for a background role key, if the live theme defines it.
+    fn bg_role(&self, key: &str) -> Option<Color> {
+        self.roles.get(key).copied()
+    }
+
+    /// Apply a background role onto `style` when the theme defines it (else leave `style` unchanged so
+    /// the terminal default shows through — never a hardcoded fill).
+    fn with_bg(&self, style: Style, key: &str) -> Style {
+        match self.bg_role(key) {
+            Some(bg) => style.bg(bg),
+            None => style,
+        }
+    }
+
+    /// Selected-row fill in selectors (`selectedBg`, select-list.ts:160-162).
+    pub fn selected_bg_style(&self) -> Style {
+        self.with_bg(self.accent_style(), "selectedBg")
+    }
+
+    /// User-message block fill (`userMessageBg`, user-message rendering).
+    pub fn user_message_bg_style(&self) -> Style {
+        self.with_bg(self.base_style(), "userMessageBg")
+    }
+
+    /// Custom/notice block fill (`customMessageBg`).
+    pub fn custom_message_bg_style(&self) -> Style {
+        self.with_bg(self.dim_style(), "customMessageBg")
+    }
+
+    /// Tool-execution block fill keyed by state (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`,
+    /// tool-execution.ts:253-258, spec/tui/06 §5.1). `base` carries the foreground role; the bg is the
+    /// state tint when the theme defines it.
+    pub fn tool_bg_style(&self, base: Style, done: bool, is_error: bool) -> Style {
+        let key = if is_error {
+            "toolErrorBg"
+        } else if done {
+            "toolSuccessBg"
+        } else {
+            "toolPendingBg"
+        };
+        self.with_bg(base, key)
+    }
+
     // --- rich-rendering roles (spec/tui/06 §11) -------------------------------------------------
 
     /// Resolve a Pi color-token role by name (`syntaxKeyword`, `mdHeading`, …), falling back to the

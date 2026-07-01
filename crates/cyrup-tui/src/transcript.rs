@@ -366,6 +366,13 @@ impl TranscriptView {
     /// streams (spec/tui/01 §3) — the hardware cursor stays on the editor. The buffer is run through
     /// [`trim_partial_closing_fence`](crate::markdown::trim_partial_closing_fence) so a streaming code
     /// fence does not flicker open/closed (`markdown.ts:25-48`).
+    /// The number of visual lines the active turn occupies at `width` — the message region's content
+    /// height, used to **content-size** the inline viewport (ADR-0001 commitment #1, audit #1) so the
+    /// empty turn never balloons into a void. `0` when nothing is streaming.
+    pub fn content_height(&self, width: usize, theme: &UiTheme) -> usize {
+        self.lines(width, theme).len()
+    }
+
     fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(partial) = &self.streaming {
@@ -410,13 +417,18 @@ pub(crate) fn tool_lines(
     width: usize,
     theme: &UiTheme,
 ) -> Vec<Line<'static>> {
-    let header_style = if run.is_error {
+    let header_fg = if run.is_error {
         theme.error_style()
     } else if run.done {
         theme.success_style()
     } else {
         theme.dim_style()
     };
+    // The whole block is tinted by execution state (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`,
+    // tool-execution.ts:253-258, spec/tui/06 §5.1) — the bg is the affordance, not a box (audit #7).
+    let header_style = theme.tool_bg_style(header_fg, run.done, run.is_error);
+    let body_style = theme.tool_bg_style(theme.muted_style(), run.done, run.is_error);
+    let hint_style = theme.tool_bg_style(theme.dim_style(), run.done, run.is_error);
     let mark = if !run.done {
         "⚙"
     } else if run.is_error {
@@ -431,36 +443,50 @@ pub(crate) fn tool_lines(
     if !run.done {
         head.push('…');
     }
-    let mut out = vec![Line::styled(head, header_style)];
+    let mut out = vec![Line::styled(pad_to(head, width), header_style)];
     if let Some(result) = run.result.as_deref().filter(|r| !r.trim().is_empty()) {
         if looks_like_diff(result) {
             // Diffs always render in full (the change set is the point), 2-space indented.
             for mut line in crate::diff::render_diff(result, theme) {
-                line.spans.insert(0, Span::styled("    ".to_string(), theme.dim_style()));
+                line.spans.insert(0, Span::styled("    ".to_string(), body_style));
                 out.push(line);
             }
-        } else if expanded {
-            for raw in result.split('\n') {
-                out.push(Line::styled(format!("    {raw}"), theme.muted_style()));
-            }
         } else {
-            // Collapsed: first non-empty line, width-truncated, with a `(N more lines)` hint.
-            let mut iter = result.split('\n').filter(|l| !l.trim().is_empty());
-            if let Some(first) = iter.next() {
-                let avail = width.saturating_sub(6).max(1);
-                let preview: String = first.chars().take(avail).collect();
-                out.push(Line::styled(format!("    {preview}"), theme.muted_style()));
-            }
-            let remaining = result.split('\n').count().saturating_sub(1);
-            if remaining > 0 {
+            // The dominant agent surface is the spec block (spec/tui/06 §5.4), NOT a head-1 one-liner
+            // (audit #7): collapsed shows the **tail** of the last `TOOL_PREVIEW_LINES` logical lines
+            // (`bash-execution.ts:19`), expanded shows all; a `… N more lines (ctrl+o)` hint counts the
+            // hidden head.
+            let all: Vec<&str> = result.split('\n').collect();
+            let total = all.len();
+            let shown = if expanded { total } else { total.min(TOOL_PREVIEW_LINES) };
+            let hidden = total.saturating_sub(shown);
+            if hidden > 0 {
                 out.push(Line::styled(
-                    format!("    … {remaining} more lines (ctrl+o)"),
-                    theme.dim_style(),
+                    pad_to(format!("    … {hidden} more lines (ctrl+o)"), width),
+                    hint_style,
                 ));
+            }
+            for raw in all.into_iter().skip(hidden) {
+                out.push(Line::styled(pad_to(format!("    {raw}"), width), body_style));
             }
         }
     }
     out
+}
+
+/// Collapsed tool/bash result preview length — the tail of this many logical lines
+/// (`bash-execution.ts:19`; the tool path mirrors it, spec/tui/06 §5.4).
+pub(crate) const TOOL_PREVIEW_LINES: usize = 20;
+
+/// Right-pad `s` with spaces to `width` columns so a background tint fills the full content width
+/// (`applyBackgroundToLine`, markdown.ts:216). Char-based; CJK visible-width is a tracked residual.
+fn pad_to(s: String, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        s
+    } else {
+        format!("{s}{:pad$}", "", pad = width - len)
+    }
 }
 
 /// Heuristic: does `text` look like a pre-formatted unified diff (a majority of non-empty lines start
@@ -504,6 +530,13 @@ pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<L
             }
             if let Some(first) = md.first_mut() {
                 first.spans.insert(0, Span::styled("you: ", theme.user_style()));
+            }
+            // Project the `userMessageBg` role onto the block (audit #6: the bg roles were dead; the
+            // "ratatui can't carry bg" claim was wrong — `insert_before` writes cell bg fine). No-op
+            // when the theme omits the role (terminal default shows through).
+            let user_bg = theme.user_message_bg_style();
+            for line in &mut md {
+                line.style = line.style.patch(user_bg);
             }
             md
         }

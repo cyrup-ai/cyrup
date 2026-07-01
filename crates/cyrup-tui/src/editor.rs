@@ -23,8 +23,9 @@ use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::symbols::border;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
@@ -35,6 +36,12 @@ use crate::commands::CommandRegistry;
 use crate::component::Component;
 use crate::keymap::{EditorAction, EditorKeymap};
 use crate::theme::UiTheme;
+
+/// The accent prompt glyph drawn at the head of the editor's first line (overview §1.1 glyph
+/// vocabulary `prompt ›`; ADR-0001 live-region mockup). Two columns wide (`› `).
+const PROMPT: &str = "› ";
+/// Visible column width of [`PROMPT`].
+const PROMPT_W: u16 = 2;
 
 /// History ring capacity (`editor.ts:381`).
 const HISTORY_CAP: usize = 100;
@@ -113,6 +120,11 @@ pub struct InputEditor {
     pastes: BTreeMap<u32, String>,
     /// Monotonic id for the next large paste (`editor.ts:82` `paste_counter`).
     paste_counter: u32,
+    /// The current reasoning level (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) — the editor's
+    /// top/bottom rule color is the primary always-visible thinking-level signal
+    /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3). Recolored green in bash mode. Updated by
+    /// the app on `ThinkingLevelChanged`; `"medium"` until set.
+    thinking_level: String,
 }
 
 /// One **visual** line of the wrapped editor: a contiguous slice of a logical line that fits the
@@ -158,7 +170,14 @@ impl InputEditor {
             preferred_visual_col: None,
             pastes: BTreeMap::new(),
             paste_counter: 0,
+            thinking_level: "medium".to_string(),
         }
+    }
+
+    /// Set the reasoning level driving the editor's rule color (spec/tui/03 §3.3). Called by the app
+    /// on `ThinkingLevelChanged` / thinking-selector confirm.
+    pub fn set_thinking_level(&mut self, level: impl Into<String>) {
+        self.thinking_level = level.into();
     }
 
     /// Replace the command registry used for slash autocomplete (rebuilt on `/reload`).
@@ -1249,7 +1268,12 @@ impl InputEditor {
         if !self.focused {
             return None;
         }
-        let x = area.x.saturating_add(self.col.min(u16::MAX as usize) as u16);
+        // The first line is offset by the prompt glyph (`› `); later lines start flush.
+        let prompt = if self.row == 0 { PROMPT_W } else { 0 };
+        let x = area
+            .x
+            .saturating_add(prompt)
+            .saturating_add(self.col.min(u16::MAX as usize) as u16);
         let y = area.y.saturating_add(1).saturating_add(self.row.min(u16::MAX as usize) as u16);
         let max_x = area.x.saturating_add(area.width).saturating_sub(1);
         let max_y = area.y.saturating_add(area.height).saturating_sub(1);
@@ -1345,23 +1369,50 @@ impl Component for InputEditor {
         // The editor has no side borders; one column is reserved for the end-of-line cursor cell
         // (`editor.ts:471` `layout_width = content_width - 1`).
         self.view_width = (area.width.saturating_sub(1)).max(1) as usize;
+        // The rule color is the primary always-visible mode signal (spec/tui/03 §3.3): bash-green
+        // while the buffer starts with `!`, else the escalating thinking-level color. The previous
+        // hardwired bright-blue accent-on-focus was wrong (audit #3).
         let rule_style = if self.is_bash_mode() {
             theme.bash_mode_style()
-        } else if self.focused {
-            theme.accent_style()
         } else {
-            theme.border_style()
+            theme.thinking_border_style(&self.thinking_level)
         };
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_set(border::PLAIN)
             .border_style(rule_style);
-        let lines: Vec<Line> = self
-            .lines
-            .iter()
-            .map(|l| Line::styled(l.iter().collect::<String>(), theme.base_style()))
-            .collect();
-        let para = Paragraph::new(lines).block(block).style(theme.base_style());
+        // An accent prompt glyph `›` anchors the editor's first line; a reverse-video soft cursor cell
+        // makes the caret visible every idle frame (overview §1.1 glyph vocab `prompt ›`; spec/tui/03
+        // §3.4 reverse-video cursor; Pi `editor.ts:545-551`). Without these the body row paints blank
+        // because the hardware cursor (`set_cursor_position`) is invisible in a headless buffer.
+        let base = theme.base_style();
+        let prompt_style = theme.accent_style();
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let mut lines: Vec<Line> = Vec::with_capacity(self.lines.len());
+        for (r, logical) in self.lines.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if r == 0 {
+                spans.push(Span::styled(PROMPT, prompt_style));
+            }
+            if self.focused && r == self.row {
+                let col = self.col.min(logical.len());
+                let before: String = logical.iter().take(col).collect();
+                spans.push(Span::styled(before, base));
+                match logical.get(col) {
+                    Some(c) => {
+                        spans.push(Span::styled(c.to_string(), cursor_style));
+                        let after: String = logical.iter().skip(col + 1).collect();
+                        spans.push(Span::styled(after, base));
+                    }
+                    // End-of-line caret: a reverse-video space (Pi `editor.ts:550`).
+                    None => spans.push(Span::styled(" ", cursor_style)),
+                }
+            } else {
+                spans.push(Span::styled(logical.iter().collect::<String>(), base));
+            }
+            lines.push(Line::from(spans));
+        }
+        let para = Paragraph::new(lines).block(block).style(base);
         frame.render_widget(para, area);
         if let Some((x, y)) = self.cursor_in(area) {
             frame.set_cursor_position((x, y));

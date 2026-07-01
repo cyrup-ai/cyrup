@@ -62,7 +62,9 @@ mod theme;
 mod transcript;
 mod tree_selector;
 
-pub use app::{crossterm_input_stream, render, App, AppAction, AppCommand, AppState};
+pub use app::{
+    crossterm_input_stream, render, App, AppAction, AppCommand, AppState, RebuildBackend,
+};
 pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,

@@ -214,9 +214,9 @@ impl SelectList {
         if !two_col || item.description.is_none() {
             let avail = width.saturating_sub(prefix_w);
             let label = truncate(&item.label, avail);
-            let style = if is_sel { theme.accent_style() } else { theme.base_style() };
+            let style = if is_sel { theme.selected_bg_style() } else { theme.base_style() };
             return Line::from(vec![
-                Span::styled(prefix.to_string(), if is_sel { theme.accent_style() } else { theme.base_style() }),
+                Span::styled(prefix.to_string(), if is_sel { theme.selected_bg_style() } else { theme.base_style() }),
                 Span::styled(label, style),
             ]);
         }
@@ -230,7 +230,7 @@ impl SelectList {
         let desc = item.description.as_deref().unwrap_or("");
         if desc_avail < MIN_DESCRIPTION_WIDTH {
             // Drop the description column when it cannot fit (`select-list.ts:169-175`).
-            let style = if is_sel { theme.accent_style() } else { theme.base_style() };
+            let style = if is_sel { theme.selected_bg_style() } else { theme.base_style() };
             return Line::from(vec![
                 Span::styled(prefix.to_string(), style),
                 Span::styled(label, style),
@@ -240,10 +240,10 @@ impl SelectList {
         if is_sel {
             // The whole selected row is accent (description not separately muted, `:160-162`).
             Line::from(vec![
-                Span::styled(prefix.to_string(), theme.accent_style()),
-                Span::styled(format!("{label}{:pad$}", "", pad = pad), theme.accent_style()),
-                Span::styled(" ".repeat(PRIMARY_COLUMN_GAP), theme.accent_style()),
-                Span::styled(desc, theme.accent_style()),
+                Span::styled(prefix.to_string(), theme.selected_bg_style()),
+                Span::styled(format!("{label}{:pad$}", "", pad = pad), theme.selected_bg_style()),
+                Span::styled(" ".repeat(PRIMARY_COLUMN_GAP), theme.selected_bg_style()),
+                Span::styled(desc, theme.selected_bg_style()),
             ])
         } else {
             Line::from(vec![

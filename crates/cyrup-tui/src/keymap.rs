@@ -610,6 +610,11 @@ impl Default for EditorKeymap {
                 // Deletion + kill ring (`:79-110`).
                 (Key::plain(Backspace), E::DeleteCharBackward),
                 (Key::plain(Delete), E::DeleteCharForward),
+                // Ctrl+D is forward-delete inside the editor (`keybindings.ts` `deleteCharForward`);
+                // the global `app.exit` (also Ctrl+D) only fires on an *empty* buffer — the routing
+                // guard in `App::handle_input` defers to the editor while text remains (spec/tui/03
+                // §6, spec/tui/07 §3.3).
+                (ctrl('d'), E::DeleteCharForward),
                 (ctrl('w'), E::DeleteWordBackward),
                 (alt_code(Backspace), E::DeleteWordBackward),
                 (alt('d'), E::DeleteWordForward),

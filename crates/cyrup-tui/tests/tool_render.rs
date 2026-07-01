@@ -36,18 +36,22 @@ fn running_tool_shows_gear_marker_with_args() {
 fn finished_tool_collapses_result_until_expanded() {
     let mut view = TranscriptView::new();
     view.push_tool_start("bash", Some("ls".to_string()));
-    view.push_tool_end("bash", false, Some("one\ntwo\nthree\nfour".to_string()));
-    // Collapsed: ✓ marker + first line + a "more lines" hint, NOT every line.
-    let collapsed = render(&mut view, 60, 10);
+    // 25 lines so the collapsed tail-20 block (spec/tui/06 §5.4) hides the first 5 (audit #7: the
+    // dominant agent surface is the spec block — a tail-20 preview, NOT a head-1 one-liner).
+    let body: String = (1..=25).map(|i| format!("ln{i:02}")).collect::<Vec<_>>().join("\n");
+    view.push_tool_end("bash", false, Some(body));
+    let collapsed = render(&mut view, 60, 30);
     assert!(collapsed.contains("✓ bash(ls)"), "done marker: {collapsed:?}");
-    assert!(collapsed.contains("one"), "first result line previewed: {collapsed:?}");
-    assert!(collapsed.contains("more lines"), "collapsed hint present: {collapsed:?}");
-    assert!(!collapsed.contains("four"), "later lines hidden when collapsed: {collapsed:?}");
+    // The tail is shown (ln25), the head is hidden (ln01..ln05), with a hidden-count hint.
+    assert!(collapsed.contains("ln25"), "tail line previewed: {collapsed:?}");
+    assert!(collapsed.contains("ln06"), "20-line tail starts at ln06: {collapsed:?}");
+    assert!(collapsed.contains("5 more lines"), "collapsed hidden-head hint present: {collapsed:?}");
+    assert!(!collapsed.contains("ln01"), "head hidden when collapsed: {collapsed:?}");
 
-    // Ctrl+O expand → every line visible.
+    // Ctrl+O expand → every line visible, including the head.
     assert!(view.toggle_tool_expanded());
-    let expanded = render(&mut view, 60, 12);
-    assert!(expanded.contains("four"), "all lines visible when expanded: {expanded:?}");
+    let expanded = render(&mut view, 60, 30);
+    assert!(expanded.contains("ln01"), "all lines visible when expanded: {expanded:?}");
 }
 
 #[test]

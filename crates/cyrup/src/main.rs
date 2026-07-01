@@ -790,6 +790,7 @@ async fn run_interactive(
 ) -> anyhow::Result<()> {
     let mut app = App::into_stdout(UiTheme::default()).context("initialising the terminal UI")?;
     app.detect_image_support();
+    seed_footer(&mut app, &runtime, &session).await;
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
 
@@ -810,6 +811,75 @@ async fn run_interactive(
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
+}
+
+/// Seed the footer + editor from the **live session/runtime** before the interactive loop starts
+/// (audit #2/#5): the footer's model/provider/cwd/context/reasoning and the editor's thinking-level
+/// rule are only ever moved by *change* events (`ModelChanged`/`ThinkingLevelChanged`), which never
+/// fire for the initial selection — so without this the footer shows the literal `no-model` and a
+/// blank location line all session, and the editor's border ignores the active reasoning level. This
+/// is the `FooterDataProvider` the audit calls for: `cyrup-session-svc` → `cyrup-tui` footer data.
+async fn seed_footer<B: cyrup_tui::RebuildBackend>(
+    app: &mut App<B>,
+    runtime: &AgentSessionRuntime,
+    session: &AgentSession,
+) {
+    let model = session.model();
+    let provider = model.provider.as_str().to_string();
+    let model_id = model.model.as_str().to_string();
+    let status = app.status_mut();
+    status.set_model(format!("{provider}/{model_id}"));
+    status.set_provider(Some(provider.clone()));
+
+    // Reasoning support + provider breadth from the resolved catalog (drives the ` • {level}` suffix
+    // and the `(provider)` prefix gate, footer.ts:184-199).
+    let catalog = session.model_catalog();
+    let reasoning = catalog
+        .iter()
+        .find(|m| m.provider.as_str() == provider && m.id.as_str() == model_id)
+        .map(|m| m.reasoning)
+        .unwrap_or(false);
+    status.set_reasoning(reasoning);
+    let mut providers: Vec<&str> = catalog.iter().map(|m| m.provider.as_str()).collect();
+    providers.sort_unstable();
+    providers.dedup();
+    status.set_provider_count(providers.len());
+
+    // Location line (`cwd (branch) • name`, footer.ts:116-130).
+    status.set_cwd(home_relative(runtime.cwd()));
+
+    // Thinking level → footer suffix + editor rule color (spec/tui/03 §3.3, footer.ts:186-188).
+    let level = thinking_level_str(session.thinking_level().await);
+    app.status_mut().set_thinking_level(level);
+    app.editor_mut().set_thinking_level(level);
+}
+
+/// The lowercase footer/editor string for a [`ModelThinkingLevel`] (matches the thinking-selector
+/// values + the `theme.thinking_border_style` keys).
+fn thinking_level_str(level: cyrup_sdk::core::ModelThinkingLevel) -> &'static str {
+    use cyrup_sdk::core::ModelThinkingLevel as L;
+    match level {
+        L::Off => "off",
+        L::Minimal => "minimal",
+        L::Low => "low",
+        L::Medium => "medium",
+        L::High => "high",
+        L::Xhigh => "xhigh",
+    }
+}
+
+/// Render `path` with the home prefix collapsed to `~` (Pi footer cwd display, footer.ts:120).
+fn home_relative(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(rel) = path.strip_prefix(home) {
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// Report parse/settings diagnostics to **stderr** (Pi `reportDiagnostics`, main.ts:87-93): warnings

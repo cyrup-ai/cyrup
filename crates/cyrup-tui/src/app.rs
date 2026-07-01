@@ -235,23 +235,64 @@ pub struct ActiveSelector {
     restore_theme: Option<UiTheme>,
 }
 
+/// A backend that can rebuild a fresh handle over the **same** underlying terminal, so the inline
+/// viewport can be re-sized to the live region's content height (ratatui's `Viewport::Inline` height
+/// is fixed at construction; ADR-0001 commitment #1 / audit #1 require a content-sized region). The
+/// rebuilt backend must preserve the cursor anchor used to place the inline viewport: `TestBackend`
+/// copies its grid cursor; `CrosstermBackend` re-wraps `stdout`, where the real terminal cursor is
+/// already authoritative.
+pub trait RebuildBackend: Backend + Sized {
+    /// A fresh backend over the same terminal, preserving the inline-viewport cursor anchor.
+    fn rebuild(&self) -> Self;
+}
+
+impl RebuildBackend for ratatui::backend::TestBackend {
+    fn rebuild(&self) -> Self {
+        let area = self.buffer().area;
+        let mut next = ratatui::backend::TestBackend::new(area.width, area.height);
+        // Anchor the inline viewport at the **bottom** of the screen, exactly as a real terminal does
+        // at launch (the cursor sits after the shell prompt). This makes `insert_before` scroll
+        // committed history up off the top into native scrollback (out of the visible buffer) instead
+        // of leaving it on-screen above a top-anchored viewport (ADR-0001; audit #1).
+        let bottom = ratatui::layout::Position { x: 0, y: area.height.saturating_sub(1) };
+        let _ = Backend::set_cursor_position(&mut next, bottom);
+        next
+    }
+}
+
+impl RebuildBackend for CrosstermBackend<Stdout> {
+    fn rebuild(&self) -> Self {
+        // The real terminal cursor is authoritative; a fresh wrapper over stdout re-reads it.
+        CrosstermBackend::new(io::stdout())
+    }
+}
+
 /// The interactive front-end over an injectable backend.
 pub struct App<B: Backend> {
     terminal: Terminal<B>,
     state: AppState,
+    /// The current inline-viewport height (the live region's content height). Recomputed each
+    /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
+    viewport_height: u16,
 }
 
 impl<B: Backend> App<B> {
-    /// Build an app over `backend` using an **inline viewport** sized to the backend height
-    /// (R-ARCH-TUI-003). No alternate screen is entered.
+    /// Build an app over `backend` using a **content-sized inline viewport** (R-ARCH-TUI-003,
+    /// ADR-0001 #1): the live region holds only the active turn + status band + editor/selector +
+    /// footer, so finished history flushes to native scrollback (`insert_before`) instead of the
+    /// inline region swallowing the whole screen. No alternate screen is entered.
     pub fn new(backend: B, theme: UiTheme) -> Result<Self, TuiError> {
         let size = backend.size().map_err(|e| TuiError::Backend(e.to_string()))?;
+        let state = AppState::new(theme);
+        let height = live_region_height(&state, size.width, size.height.max(1));
         let terminal = Terminal::with_options(
             backend,
-            TerminalOptions { viewport: Viewport::Inline(size.height.max(1)) },
+            TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
         )
         .map_err(|e| TuiError::Backend(e.to_string()))?;
-        Ok(App { terminal, state: AppState::new(theme) })
+        // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
+        // `Terminal` is top-anchored at the backend's initial cursor; the rebuild fixes the anchor).
+        Ok(App { terminal, state, viewport_height: 0 })
     }
 
     /// Immutable state access.
@@ -282,6 +323,13 @@ impl<B: Backend> App<B> {
     /// The committed scrollback lines already emitted via `insert_before` (test/inspection access).
     pub fn scrollback_lines(&self) -> &[Line<'static>] {
         &self.state.scrollback
+    }
+
+    /// The current inline-viewport (live-region) height in rows — the bottom band of the screen the
+    /// app repaints each frame (ADR-0001 #1). Committed history scrolls *above* this band into native
+    /// scrollback; tests use it to read only the live region (the bottom `viewport_height` rows).
+    pub fn viewport_height(&self) -> u16 {
+        self.viewport_height
     }
 
     /// The committed scrollback content as text, one entry per line (test/inspection access). This is
@@ -352,12 +400,45 @@ impl<B: Backend> App<B> {
 
     /// Render one frame: first flush newly-committed entries to native scrollback (R-ARCH-TUI-003),
     /// then draw the active region into the inline viewport (pure: `state -> frame`).
-    pub fn draw(&mut self) -> Result<(), TuiError> {
+    pub fn draw(&mut self) -> Result<(), TuiError>
+    where
+        B: RebuildBackend,
+    {
+        // Content-size the inline viewport to the live region (active turn + band + slot + footer),
+        // recomputed every frame as content grows/shrinks (ADR-0001 #1, audit #1). The viewport is
+        // rebuilt only when its height actually changes so steady-state frames keep their cell-diff.
+        // Resize **before** flushing so the committed `insert_before` lines scroll above the
+        // correctly-anchored viewport (the active turn's height is unaffected by the flush).
+        let size = self.terminal.backend().size().ok();
+        let term_h = size.map(|s| s.height).unwrap_or(self.viewport_height).max(1);
+        let term_w = size.map(|s| s.width).unwrap_or(80);
+        let desired = live_region_height(&self.state, term_w, term_h);
+        if desired != self.viewport_height {
+            self.resize_viewport(desired)?;
+            self.viewport_height = desired;
+        }
         self.flush_committed()?;
-        let App { terminal, state } = self;
+        let App { terminal, state, .. } = self;
         terminal
             .draw(|frame| render(frame, state))
             .map_err(|e| TuiError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Rebuild the terminal with a new inline-viewport `height` over a fresh handle to the same
+    /// backend (ratatui's inline height is immutable after construction; audit #1). The cursor anchor
+    /// is preserved by [`RebuildBackend::rebuild`], so the re-placed viewport stays where it was.
+    fn resize_viewport(&mut self, height: u16) -> Result<(), TuiError>
+    where
+        B: RebuildBackend,
+    {
+        let backend = self.terminal.backend().rebuild();
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
+        )
+        .map_err(|e| TuiError::Backend(e.to_string()))?;
+        self.terminal = terminal;
         Ok(())
     }
 
@@ -407,8 +488,23 @@ impl<B: Backend> App<B> {
                 if self.state.selector.is_some() {
                     return self.handle_selector_key(key);
                 }
+                // Routing chain: overlay > completion > editor > app (spec/tui/07 §2). A global key is
+                // resolved here, but two context guards defer it to the editor so the chain holds
+                // (audit #4 — the previous unconditional global resolution made Ctrl+D quit and Esc
+                // abort an open popup):
+                //   • Esc with the completion popup open dismisses the popup, never aborts the run
+                //     (spec/tui/04 §5, spec/tui/07 §7).
+                //   • Ctrl+D on a non-empty buffer is forward-delete; it only exits on empty
+                //     (spec/tui/03 §6, spec/tui/07 §3.3).
                 if let Some(action) = self.state.keymap.action_for(key) {
-                    return self.apply_action(action);
+                    let defer_to_editor = match action {
+                        Action::Interrupt => self.state.editor.autocomplete_open(),
+                        Action::Quit => !self.state.editor.is_empty(),
+                        _ => false,
+                    };
+                    if !defer_to_editor {
+                        return self.apply_action(action);
+                    }
                 }
                 match self.state.editor.handle_key(key) {
                     EditorOutcome::Submit(text) => self.dispatch_submission(&text),
@@ -863,6 +959,9 @@ impl<B: Backend> App<B> {
             SelectorKind::Thinking => {
                 self.state.thinking_level = value.to_string();
                 self.state.status.set_thinking_level(value);
+                // The editor's rule color is the always-visible thinking-level signal (spec/tui/03
+                // §3.3) — keep it in lockstep with the selected level.
+                self.state.editor.set_thinking_level(value);
                 self.state.transcript.push_status(format!("thinking → {value}"));
                 None
             }
@@ -1555,8 +1654,10 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("model → {label}"));
             }
             AgentSessionEvent::ThinkingLevelChanged { level } => {
-                // Mirror the level into the footer right cluster (`• {level}`, footer.ts:186-188).
+                // Mirror the level into the footer right cluster (`• {level}`, footer.ts:186-188)
+                // and the editor's rule color (spec/tui/03 §3.3).
                 self.state.status.set_thinking_level(level.clone());
+                self.state.editor.set_thinking_level(level.clone());
                 self.state.transcript.push_status(format!("thinking → {level}"));
             }
             AgentSessionEvent::SessionInfoChanged { name } => {
@@ -1944,66 +2045,87 @@ fn armin_art() -> String {
     out
 }
 
-/// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
-pub fn render(frame: &mut Frame, state: &mut AppState) {
-    let area = frame.area();
-    let max_editor = area.height.saturating_sub(2).max(3);
-    // A selector occupies the editor slot at its desired (dynamic) height; otherwise the editor sizes
-    // to its line count + the two rule rows (spec/tui/05 §1.1: the selector "grows the live region").
-    let slot_h = match state.selector.as_ref() {
-        Some(active) => active.inner.desired_height(area.width).clamp(3, max_editor),
-        None => {
-            let editor_rows =
-                (state.editor.line_count().min(u16::MAX as usize) as u16).saturating_add(2);
-            editor_rows.clamp(3, max_editor)
-        }
+/// The six live-region row heights `[msg, band, images, slot, popup, footer]` for a viewport of
+/// `avail` rows (audit #1). Filled by priority **from the bottom** — footer, then the editor/selector
+/// slot (+completion popup), then the status band, then the inline image strip — and the message
+/// region takes the remainder, **capped to the active turn's content height** so an empty turn never
+/// balloons into a void (the old `Constraint::Min(1)` flex). The function is idempotent: feeding back
+/// its own sum reproduces the same split, so [`render`] (called with the viewport height) and
+/// [`live_region_height`] (called with the terminal height) never disagree on row counts.
+fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
+    let avail = avail.max(1);
+    let max_editor = avail.saturating_sub(2).max(3);
+    // A selector owns the slot at its desired height; otherwise the editor sizes to its line count +
+    // the two rule rows (spec/tui/05 §1.1, spec/tui/03 §3.1).
+    let want_slot = match state.selector.as_ref() {
+        Some(active) => active.inner.desired_height(width).clamp(3, max_editor),
+        None => (state.editor.line_count().min(u16::MAX as usize) as u16)
+            .saturating_add(2)
+            .clamp(3, max_editor),
     };
-    // The autocomplete popup is appended directly below the editor's bottom rule, inside the live
-    // region (spec/tui/04 §7) — not a floating overlay. Suppressed while a selector owns the slot.
-    let popup_h = if state.selector.is_some() {
+    // The completion popup is appended below the editor's bottom rule (spec/tui/04 §7); suppressed
+    // while a selector owns the slot.
+    let want_popup = if state.selector.is_some() {
         0
     } else {
         state.editor.autocomplete().map(|ac| ac.list.rendered_height()).unwrap_or(0)
     };
-    // The footer is two rows (location + usage/model) per spec/tui/01 §4; it collapses to one when
-    // the viewport is too short to spare the second row.
-    let chrome_h = slot_h.saturating_add(popup_h);
-    // The footer is up to three rows (location · usage/model · extension statuses, spec/tui/01 §4 +
-    // footer.ts:232-241). The third row only appears when an extension published a status; each row
-    // is dropped when the viewport is too short to spare it (always keeping ≥1 message row).
     let footer_max: u16 = if state.status.has_extension_statuses() { 3 } else { 2 };
-    let footer_h = if area.height >= chrome_h.saturating_add(footer_max.saturating_add(1)) {
-        footer_max
-    } else if area.height >= chrome_h.saturating_add(3) {
-        2
-    } else {
-        1
-    };
-    // The working/idle status band (spec/tui/01 §6) is a 2-row region between the active turn and the
-    // editor — reserved only when an indicator is active AND there is comfortable room, so an idle
-    // viewport (and the short footer-only test layouts) keep their exact prior geometry (§6.3: Pi's
-    // non-`clearOnShrink` default is 0 idle rows). `reserve_status_rows` forces the 2 rows always.
     let want_status = state.indicator.is_active() || state.reserve_status_rows;
-    let room = area.height >= chrome_h.saturating_add(footer_h).saturating_add(3);
-    let band_h: u16 = if want_status && room { 2 } else { 0 };
-    // Attached images render inline above the editor (`components/image.ts`): each block reserves its
-    // natural cell height (clamped so they never crowd out the message/editor rows). The strip is
-    // suppressed while a selector owns the slot (the editor is hidden then).
-    let images_h: u16 = if state.selector.is_some() || state.pending_images.is_empty() {
+    let want_images: u16 = if state.selector.is_some() || state.pending_images.is_empty() {
         0
     } else {
-        let budget = area
-            .height
-            .saturating_sub(chrome_h.saturating_add(footer_h).saturating_add(band_h).saturating_add(1));
-        let natural: u16 = state
+        state
             .pending_images
             .iter()
-            .map(|b| state.image_renderer.cell_size(b, area.width).1)
-            .fold(0u16, |a, h| a.saturating_add(h));
-        natural.min(budget)
+            .map(|b| state.image_renderer.cell_size(b, width).1)
+            .fold(0u16, |a, h| a.saturating_add(h))
     };
+
+    let mut remaining = avail;
+    let footer = footer_max.min(remaining).max(1);
+    remaining = remaining.saturating_sub(footer);
+    let slot = want_slot.min(remaining);
+    remaining = remaining.saturating_sub(slot);
+    let popup = want_popup.min(remaining);
+    remaining = remaining.saturating_sub(popup);
+    let band = if want_status { 2u16.min(remaining) } else { 0 };
+    remaining = remaining.saturating_sub(band);
+    let images = want_images.min(remaining);
+    remaining = remaining.saturating_sub(images);
+    // The message region = the active turn's content, plus the one startup-hint row at idle, capped
+    // to whatever rows remain (so the inline viewport stays content-sized, not full-screen).
+    let active = state.transcript.content_height(width as usize, &state.theme).min(u16::MAX as usize)
+        as u16;
+    let hint = u16::from(
+        state.show_startup_hints && state.selector.is_none() && !state.transcript.has_active(),
+    );
+    let msg = active.max(hint).min(remaining);
+    [msg, band, images, slot, popup, footer]
+}
+
+/// The inline-viewport height = the sum of the live-region rows (audit #1). Driven by
+/// [`region_constraints`] against the **terminal** height so the content-sized viewport never
+/// exceeds the screen.
+fn live_region_height(state: &AppState, width: u16, term_height: u16) -> u16 {
+    // A floating overlay (hotkeys/help; spec/tui/05 §2) is a modal that draws *over* the whole live
+    // region — it needs the full screen to center its box, so the inline viewport expands to the
+    // terminal height while one is open (the editor/footer still render behind it).
+    if !state.overlays.is_empty() {
+        return term_height.max(1);
+    }
+    region_constraints(state, width, term_height).iter().copied().fold(0u16, u16::saturating_add)
+}
+
+/// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
+pub fn render(frame: &mut Frame, state: &mut AppState) {
+    let area = frame.area();
+    let [msg_h, band_h, images_h, slot_h, popup_h, footer_h] =
+        region_constraints(state, area.width, area.height);
+    let _ = msg_h; // the message region absorbs the remainder via `Min(0)` below.
     let [msg_area, band_area, images_area, slot_area, popup_area, status_area] = Layout::vertical([
-        Constraint::Min(1),
+        // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
+        Constraint::Min(0),
         Constraint::Length(band_h),
         Constraint::Length(images_h),
         Constraint::Length(slot_h),

@@ -31,6 +31,26 @@ fn buf_text(app: &App<TestBackend>) -> String {
     out
 }
 
+/// Flatten only the **live region** — the bottom `viewport_height` rows the app repaints each frame
+/// (ADR-0001 #1). Committed history scrolls *above* this band into native scrollback, so this is what
+/// "is in the viewport" means once the inline region is content-sized (audit #1).
+fn live_region_text(app: &App<TestBackend>) -> String {
+    let buf = app.terminal().backend().buffer();
+    let area = buf.area;
+    let h = app.viewport_height().min(area.height);
+    let start = area.height - h;
+    let mut out = String::new();
+    for y in start..area.height {
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// True if any non-blank cell carries the given foreground color.
 fn has_fg(app: &App<TestBackend>, color: Color) -> bool {
     let buf = app.terminal().backend().buffer();
@@ -54,12 +74,12 @@ fn committed_entries_move_to_scrollback_and_only_active_turn_renders() {
     assert!(sb.contains("you: hello world"), "scrollback missing user line:\n{sb}");
     assert!(sb.contains("assistant: hi there"), "scrollback missing assistant line:\n{sb}");
 
-    // (b) The viewport no longer contains the committed text, but DOES show the active streaming turn
-    //     plus the editor + status line.
-    let text = buf_text(&app);
-    assert!(!text.contains("hello world"), "committed user leaked into viewport:\n{text}");
-    assert!(!text.contains("hi there"), "committed assistant leaked into viewport:\n{text}");
-    assert!(text.contains("streaming…"), "active streaming turn missing from viewport:\n{text}");
+    // (b) The live region no longer contains the committed text (it scrolled into native scrollback
+    //     above the inline band, audit #1), but DOES show the active streaming turn + editor + footer.
+    let text = live_region_text(&app);
+    assert!(!text.contains("hello world"), "committed user leaked into live region:\n{text}");
+    assert!(!text.contains("hi there"), "committed assistant leaked into live region:\n{text}");
+    assert!(text.contains("streaming…"), "active streaming turn missing from live region:\n{text}");
     // The footer right cluster is the model (here unset → Pi's "no-model", footer.ts:170), never an
     // invented streaming/idle word; the active turn renders inline with NO box/title (footer.ts:84-93).
     assert!(text.contains("no-model"), "footer model cluster missing from viewport:\n{text}");
@@ -181,10 +201,14 @@ fn ingest_events_drive_status_and_transcript() {
     let text = buf_text(&app);
     assert!(text.contains("openai/gpt"), "model not reflected:\n{text}");
     assert!(text.contains("3 queued"), "queue depth not reflected:\n{text}");
-    // The model-change notification is a committed entry: it lives in scrollback, not the viewport.
+    // The model-change notification is a committed entry: it lives in scrollback, not the live region.
     let sb = app.scrollback_text();
     assert!(sb.contains("model → openai/gpt"), "model change not logged to scrollback:\n{sb}");
-    assert!(!text.contains("model → openai/gpt"), "status entry leaked into viewport:\n{text}");
+    assert!(
+        !live_region_text(&app).contains("model → openai/gpt"),
+        "status entry leaked into live region:\n{}",
+        live_region_text(&app)
+    );
 
     // AgentEnd clears the streaming flag; the footer keeps showing the model (no idle word).
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
@@ -222,11 +246,11 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     app.transcript_mut().push_assistant_delta("ans");
     app.transcript_mut().push_assistant_delta("wer");
 
-    // Mid-turn: the user line has committed to scrollback; the assistant is still active (viewport).
+    // Mid-turn: the user line has committed to scrollback; the assistant is still active (live region).
     app.draw().unwrap();
-    let mid = buf_text(&app);
-    assert!(mid.contains("answer"), "active streaming turn missing from viewport mid-turn:\n{mid}");
-    assert!(!mid.contains("question?"), "committed user leaked into viewport:\n{mid}");
+    let mid = live_region_text(&app);
+    assert!(mid.contains("answer"), "active streaming turn missing from live region mid-turn:\n{mid}");
+    assert!(!mid.contains("question?"), "committed user leaked into live region:\n{mid}");
     assert!(app.scrollback_text().contains("you: question?"), "user not flushed to scrollback");
 
     // AgentEnd finalizes the streaming assistant turn.
@@ -237,8 +261,8 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     assert!(sb.contains("you: question?"), "user missing from scrollback:\n{sb}");
     assert!(sb.contains("assistant: answer"), "finalized assistant missing from scrollback:\n{sb}");
 
-    let view = buf_text(&app);
-    assert!(!view.contains("answer"), "finalized assistant still in viewport:\n{view}");
+    let view = live_region_text(&app);
+    assert!(!view.contains("answer"), "finalized assistant still in live region:\n{view}");
     // The footer persists (model cluster present); no invented idle word (gap 22).
     assert!(view.contains("no-model"), "footer missing from viewport after finalize:\n{view}");
     assert!(!view.contains("idle"), "footer invented an idle word after finalize:\n{view}");
