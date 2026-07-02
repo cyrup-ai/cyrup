@@ -18,6 +18,25 @@ use std::sync::{Arc, Mutex};
 pub use crate::caps::http::{HttpRequest, HttpResponse, HttpStreamResponse};
 pub use crate::caps::proc::ProcSpawnSpec;
 
+/// Bounds how many DISTINCT ids [`GuestState::aborted_signals`] can ever hold. `ui.abort-signal`
+/// (the WIT `abort-signal: func(signal-id: string)`) carries no error channel and is reachable by
+/// a guest at ANY trust tier (`live.rs`'s `ui::Host` impl applies no tier guard), unlike the
+/// `http-client`/`proc` registries this same DoS-cap effort already bounded (`faaf191`/`907a6f8`):
+/// an unbounded `Mutex<HashSet<String>>` that unconditionally `insert`s any guest-supplied string
+/// lets a malicious/broken guest grow host memory without bound simply by calling `abort-signal`
+/// with a fresh id in a loop. A legitimate guest only ever aborts signal ids it itself minted for
+/// its OWN in-flight dialogs/tool calls (Pi `ExtensionUIDialogOptions.signal`), a count bounded by
+/// how many concurrent dialogs/tool calls that guest could possibly have open — comfortably under
+/// this cap. As with `MAX_OPEN_STREAMS`/`MAX_SPAWNED_PROCESSES`, the point is FINITE, not a
+/// specific magic number, and there is no Pi-derived exact count to port (Pi's `AbortController`
+/// objects are ordinary garbage-collected JS values with no analogous host-side registry at all).
+/// Once at the cap, a NEW distinct id is silently dropped (never marked aborted) rather than
+/// erroring — the WIT signature has no error channel to surface a rejection through, and a dialog
+/// bound to a dropped id simply never observes a programmatic abort (degrades to "wait for the
+/// human"/"wait for the real host-side timeout", never a host crash or unbounded growth). An id
+/// already tracked stays tracked (this is a bound on DISTINCT ids, not a re-insert budget).
+const MAX_ABORTED_SIGNALS: usize = 4096;
+
 /// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
 /// exec.ts:23-28). `killed` is true when the host SIGTERM/SIGKILLed the process on a timeout/abort.
 #[derive(Clone, Debug, Default)]
@@ -1030,8 +1049,13 @@ impl GuestState {
     // --- named abort signals (Pi ExtensionUIDialogOptions.signal / execute signal; sdk gap #1/#2) ---
 
     /// Mark a named signal aborted (Pi `signal.abort()`): the guest called `ui.abort-signal`.
+    /// Bounded by [`MAX_ABORTED_SIGNALS`] (its doc explains why no Pi-derived exact value exists):
+    /// once at the cap, a NEW distinct id is silently dropped rather than tracked — an id already
+    /// present is unaffected (this bounds DISTINCT ids, not re-inserts of the same one).
     pub fn abort_signal(&self, id: String) {
-        if let Ok(mut g) = self.aborted_signals.lock() {
+        if let Ok(mut g) = self.aborted_signals.lock()
+            && (g.contains(&id) || g.len() < MAX_ABORTED_SIGNALS)
+        {
             g.insert(id);
         }
     }
@@ -1282,5 +1306,46 @@ mod tests {
         // second call's later start (~70ms / 14 ticks) — i.e. `forgiven` skews toward the larger,
         // first-anchored value.
         assert!(forgiven >= 15, "must anchor to the FIRST wait in the batch, got {forgiven} ticks");
+    }
+
+    /// THE regression this fix closes: `abort_signal` used to unconditionally `insert` any
+    /// guest-supplied string with no cap at all — a guest calling it with a fresh id in a loop
+    /// could grow `aborted_signals` without bound. With the fix, once `MAX_ABORTED_SIGNALS`
+    /// distinct ids are tracked, a NEW distinct id is silently dropped (never marked aborted).
+    #[test]
+    fn abort_signal_caps_total_distinct_ids_tracked() {
+        let s = state();
+        for i in 0..MAX_ABORTED_SIGNALS {
+            s.abort_signal(format!("sig-{i}"));
+        }
+        assert_eq!(s.aborted_signals().len(), MAX_ABORTED_SIGNALS, "primed exactly at the cap");
+        for id in 0..MAX_ABORTED_SIGNALS {
+            assert!(s.is_signal_aborted(&format!("sig-{id}")), "every id under the cap stays tracked");
+        }
+
+        // One more DISTINCT id beyond the cap must be silently dropped, not tracked.
+        s.abort_signal("sig-over-the-cap".to_string());
+        assert_eq!(
+            s.aborted_signals().len(),
+            MAX_ABORTED_SIGNALS,
+            "the registry must never grow past the cap"
+        );
+        assert!(
+            !s.is_signal_aborted("sig-over-the-cap"),
+            "an id that arrived after the cap was reached must not be marked aborted"
+        );
+    }
+
+    /// Re-aborting an id that is ALREADY tracked is always a no-op success, even once the registry
+    /// is fully at the cap — the cap bounds DISTINCT ids, not re-inserts of the same one.
+    #[test]
+    fn abort_signal_re_marking_an_already_tracked_id_at_the_cap_still_works() {
+        let s = state();
+        for i in 0..MAX_ABORTED_SIGNALS {
+            s.abort_signal(format!("sig-{i}"));
+        }
+        s.abort_signal("sig-0".to_string()); // already tracked — must remain a harmless no-op.
+        assert!(s.is_signal_aborted("sig-0"));
+        assert_eq!(s.aborted_signals().len(), MAX_ABORTED_SIGNALS);
     }
 }
