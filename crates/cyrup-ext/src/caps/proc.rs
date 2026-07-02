@@ -43,6 +43,24 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
 /// even past SIGKILL, e.g. stuck in uninterruptible D-state I/O, is the only way this is ever hit).
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bounds how long [`ProcCaps::write_stdin`] will block waiting for a real pipe write to complete.
+/// Unlike [`DEFAULT_KILL_GRACE`]/[`KILL_CONFIRM_TIMEOUT`], there is no Pi/real-consumer exact
+/// value to port here: Node's `ChildProcess.stdin.write()` (the real `StdioClientTransport.send`,
+/// `@modelcontextprotocol/sdk@1.25.1` `dist/cjs/client/stdio.js:189-207`) is asynchronous and
+/// non-blocking by construction — it returns `false` immediately once the OS pipe fills and lets
+/// the caller await a later `'drain'` event, so the real transport never blocks a Node event-loop
+/// tick on a slow/non-reading child the way `stdin.write_all(data).await` (a direct `.await` on
+/// the SAME multi-threaded tokio worker `write_stdin`'s `block_in_place`+`block_on` bridge runs
+/// on, `cyrup-session-svc/src/host_services.rs`) can. Without SOME bound, a guest that spawns a
+/// child which never reads its stdin (or reads too slowly to keep up) can hang that worker thread
+/// — and therefore the whole session's `write-stdin` call — indefinitely; `note_dialog_wait`
+/// (closing the SEPARATE epoch-wedge finding this shares a root cause with) only forgives the WASM
+/// epoch deadline, it does nothing to bound the underlying real wall-clock block. As with
+/// [`MAX_PIPE_BUFFER_BYTES`]/[`MAX_SPAWNED_PROCESSES`] below, the point is FINITE, not a specific
+/// magic number — this is a deliberately generous cap comfortably above any legitimate write to a
+/// live, cooperating child, while still guaranteeing the call can never hang forever.
+const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Bounds how many `proc.spawn` entries a single `ProcCaps` (one per session) can ever create.
 /// Unlike [`crate::caps::http::HttpCaps`]'s `streams` registry, entries here are NEVER evicted by
 /// design (doc on [`ProcCaps`] below: "no close/dispose call... entries live for the engine's
@@ -173,6 +191,11 @@ pub struct ProcCaps {
     /// ([`DEFAULT_KILL_GRACE`]); overridable ONLY for tests ([`Self::with_kill_grace`]) so the
     /// SIGKILL-escalation path is exercisable without a real test waiting 2+ real seconds per leg.
     kill_grace: Duration,
+    /// How long [`Self::write_stdin`] blocks on a single write before giving up — the production
+    /// default is [`WRITE_STDIN_TIMEOUT`] (30s); overridable ONLY for tests
+    /// ([`Self::with_write_stdin_timeout`]) so the timeout-firing path is exercisable without a
+    /// real test waiting 30 real seconds.
+    write_stdin_timeout: Duration,
 }
 
 impl std::fmt::Debug for ProcCaps {
@@ -222,7 +245,23 @@ impl ProcCaps {
     /// Build with a caller-supplied per-leg grace period (tests only; production always gets the
     /// real transport's exact 2s-per-leg via [`Self::new`]).
     pub fn with_kill_grace(kill_grace: Duration) -> Self {
-        Self { registry: Mutex::new(HashMap::new()), next_handle: AtomicU32::new(1), kill_grace }
+        Self {
+            registry: Mutex::new(HashMap::new()),
+            next_handle: AtomicU32::new(1),
+            kill_grace,
+            write_stdin_timeout: WRITE_STDIN_TIMEOUT,
+        }
+    }
+
+    /// Build with a caller-supplied [`Self::write_stdin`] timeout (tests only; production always
+    /// gets the real generous default, [`WRITE_STDIN_TIMEOUT`], via [`Self::new`]).
+    pub fn with_write_stdin_timeout(write_stdin_timeout: Duration) -> Self {
+        Self {
+            registry: Mutex::new(HashMap::new()),
+            next_handle: AtomicU32::new(1),
+            kill_grace: DEFAULT_KILL_GRACE,
+            write_stdin_timeout,
+        }
     }
 
     fn registry(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Arc<ProcEntry>>> {
@@ -310,19 +349,38 @@ impl ProcCaps {
 
     /// Write to the child's REAL stdin (the WIT `proc.write-stdin`). `Err` once the pipe is closed
     /// (child exited / closed stdin) — mirrors a real broken-pipe write failure, never a panic.
+    /// Bounded by [`WRITE_STDIN_TIMEOUT`] (its doc explains why no Pi-derived exact value exists):
+    /// a child that never reads its stdin (or reads too slowly to keep up) gets a bounded `Err`
+    /// instead of hanging this call — and the real tokio worker thread backing it — forever.
     pub async fn write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
         let entry = self.entry(handle)?;
         let mut guard = entry.stdin.lock().await;
         let Some(stdin) = guard.as_mut() else {
             return Err(format!("stdin is closed for handle {handle}"));
         };
-        if let Err(e) = stdin.write_all(data).await {
-            // A closed/broken pipe is terminal — drop the handle so future writes fail fast with the
-            // SAME message instead of a fresh (possibly different) io error each time.
-            *guard = None;
-            return Err(format!("write_stdin: {e}"));
+        match tokio::time::timeout(self.write_stdin_timeout, stdin.write_all(data)).await {
+            Ok(Ok(())) => Ok(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+            Ok(Err(e)) => {
+                // A closed/broken pipe is terminal — drop the handle so future writes fail fast
+                // with the SAME message instead of a fresh (possibly different) io error each time.
+                *guard = None;
+                Err(format!("write_stdin: {e}"))
+            }
+            Err(_) => {
+                // Timed out with the write still in flight: `write_all` may have already flushed
+                // SOME of `data` to the real pipe before the deadline (an inherent, unavoidable
+                // ambiguity of bounding a partial-write future — the SAME ambiguity a socket-write
+                // timeout has everywhere else). The stdin handle itself is left open (unlike the
+                // broken-pipe arm above) — a slow-but-alive child may still finish draining the
+                // pipe and read the bytes that did land; only a REAL io error, not a mere timeout,
+                // is treated as terminal.
+                Err(format!(
+                    "write_stdin: timed out after {:?} writing to handle {handle} (the child may \
+                     not be reading its stdin)",
+                    self.write_stdin_timeout
+                ))
+            }
         }
-        Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
     }
 
     /// Drain whatever REAL stdout bytes are currently buffered (the WIT `proc.read-stdout`) — empty
@@ -928,5 +986,41 @@ mod tests {
             alive_after.map(|s| !s.success()).unwrap_or(true),
             "kill -0 must fail after dropping ProcCaps — the child must not outlive it unkilled"
         );
+    }
+
+    /// THE regression this fix closes: `write_stdin` against a child that never reads its stdin
+    /// must eventually give up with a bounded `Err`, not hang the calling task (and, in production,
+    /// the real tokio worker thread `block_in_place`+`block_on` bridges this call onto) forever.
+    /// `sleep` never touches its stdin at all, so once the payload exceeds the OS pipe's kernel
+    /// buffer capacity, `write_all` genuinely blocks on write-readiness that will never come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_stdin_times_out_against_a_child_that_never_reads_its_stdin() {
+        let caps = ProcCaps::with_write_stdin_timeout(Duration::from_millis(200));
+        let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
+        // Far larger than any realistic OS pipe buffer (typically 16-64KB) so `write_all` is
+        // GUARANTEED to still be in flight, genuinely blocked on write-readiness, when the 200ms
+        // timeout fires — not just fast enough to complete before it.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+
+        let started = tokio::time::Instant::now();
+        let result = caps.write_stdin(handle, &payload).await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err(
+            "a write against a child that never reads its stdin must time out, not succeed",
+        );
+        assert!(
+            err.contains("timed out"),
+            "the error must identify itself as a timeout, not some other failure: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the bounded 200ms timeout must fire — this must NEVER hang for the full write \
+             duration (which, against a non-reading child, would be forever): got {elapsed:?}"
+        );
+
+        // The stdin handle is left open after a mere timeout (not a real io error) — a subsequent
+        // `kill` must still work normally, proving the capability itself is not left wedged.
+        caps.kill(handle).await.expect("the capability survives a write_stdin timeout intact");
     }
 }
