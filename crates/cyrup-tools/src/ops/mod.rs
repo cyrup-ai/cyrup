@@ -218,9 +218,15 @@ pub struct ExecSpec {
 }
 
 /// A DIRECT argv (shell:false) exec request (Pi `execCommand`, exec.ts:34-46): `program` is run with
-/// `args` as a real argv vector — NO shell, NO word-splitting — in `cwd` with `env` overrides. This is
-/// the capability-scoped `exec` grant path (arch-08 exec), distinct from the shell-based [`ExecSpec`]
-/// the `bash` tool uses.
+/// `args` as a real argv vector — NO shell, NO word-splitting — in `cwd`. This is the capability-scoped
+/// `exec` grant path (arch-08 exec), distinct from the shell-based [`ExecSpec`] the `bash` tool uses.
+///
+/// `env` is ADDITIVE on top of the spawned process's normal (fully inherited) environment, never a
+/// full replacement — but the `exec` grant's own host boundary (`cyrup-session-svc::host_services
+/// ::exec`) never actually populates it from guest input and always passes an empty `Vec`: Pi's real
+/// `execCommand` (exec.ts:41-45) never accepts an env override at all, so honoring a guest-supplied
+/// one would be new ambient authority with no Pi equivalent. The field itself stays generic backend
+/// plumbing for any FUTURE trusted (non-guest-controlled) caller that legitimately needs it.
 #[derive(Clone, Debug)]
 pub struct ArgvSpec {
     pub program: String,

@@ -397,10 +397,15 @@ impl HostServices for LiveHostServices {
         // yes (`is_trusted = origin.is_pre_trust() || project_trusted`, loader.rs:57-60, enforced
         // facade.rs:563) — an untrusted extension gets `DenyServices` and never lands here. So this
         // adds NO extra trust/tier check; it just runs the command, 1:1 with Pi `execCommand`
-        // (exec.ts:34-46): shell:false argv, `cwd ?? sessionCwd`, `env` overrides, and a `timeoutMs`
-        // that SIGTERMs then, after a 5s grace period, SIGKILLs (killed=true) the process GROUP on
-        // expiry — Pi's exact `killProcess` escalation (exec.ts:52-63), implemented by
-        // `LocalProc::exec_argv`'s SIGTERM/grace/SIGKILL loop (`cyrup-tools/src/ops/local.rs`).
+        // (exec.ts:34-46): shell:false argv, `cwd ?? sessionCwd`, and a `timeoutMs` that SIGTERMs
+        // then, after a 5s grace period, SIGKILLs (killed=true) the process GROUP on expiry — Pi's
+        // exact `killProcess` escalation (exec.ts:52-63), implemented by `LocalProc::exec_argv`'s
+        // SIGTERM/grace/SIGKILL loop (`cyrup-tools/src/ops/local.rs`). Deliberately does NOT honor a
+        // guest-supplied `env` key: Pi's real `execCommand` never passes an `env` override to
+        // `spawn()` at all (`exec.ts:41-45`) — the child only ever inherits the host's own ambient
+        // environment. Accepting one here would be new ambient authority (arbitrary env injection
+        // for a spawned process) with no Pi equivalent (`cyrup-ext-sdk::descriptor::ExecOptions` has
+        // no `env` field for exactly this reason) — do not re-add without a real Pi citation.
         let cwd = opts
             .get("cwd")
             .and_then(Value::as_str)
@@ -411,16 +416,8 @@ impl HostServices for LiveHostServices {
             .and_then(Value::as_u64)
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis);
-        let env: Vec<(String, String)> = opts
-            .get("env")
-            .and_then(Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let spec = ArgvSpec { program: cmd.to_string(), args: args.to_vec(), cwd, env };
+        let spec =
+            ArgvSpec { program: cmd.to_string(), args: args.to_vec(), cwd, env: Vec::new() };
         let proc = self.proc.clone();
         // The `HostServices` trait is sync (the guest is wasm-suspended across the call); drive the
         // async process ops to completion on the current multi-threaded runtime worker.
@@ -657,16 +654,26 @@ mod tests {
         let printed = std::fs::canonicalize(out.stdout.trim_end()).unwrap_or_default();
         assert_eq!(printed, std::fs::canonicalize(&tmp).unwrap_or(tmp), "exec ran in the given cwd");
 
-        // 4) `env` overrides threaded to the child (Pi `ExecOptions.env`).
+        // 4) a guest-supplied `env` key is IGNORED — Pi's real `execCommand` (exec.ts:41-45) never
+        //    accepts an env override at all; the child only inherits the host's own ambient
+        //    environment (Node `spawn()`'s default when no `env` key is passed). If the `exec` grant
+        //    honored a guest's `env`, `printenv` would see the injected value; instead the lookup
+        //    variable must be genuinely UNSET in the child (nonzero exit, empty stdout) — proving
+        //    this is NOT new ambient authority beyond Pi's real surface.
         let out = svc
             .exec(
                 "printenv",
-                &["CYRUP_EXEC_TEST".to_string()],
-                &json!({ "env": { "CYRUP_EXEC_TEST": "grant" } }),
+                &["CYRUP_EXEC_TEST_ENV_MUST_BE_IGNORED".to_string()],
+                &json!({ "env": { "CYRUP_EXEC_TEST_ENV_MUST_BE_IGNORED": "injected" } }),
                 CancelToken::new(),
             )
-            .expect("printenv runs");
-        assert_eq!(out.stdout, "grant\n");
+            .expect("printenv runs (even though the variable it looks up is unset)");
+        assert_ne!(
+            out.code, 0,
+            "a guest-supplied `env` override must be ignored — printenv must NOT find an injected \
+             value"
+        );
+        assert!(out.stdout.is_empty(), "no injected value may ever reach the child's environment");
 
         // 5) `timeoutMs` ⇒ the host SIGTERMs the group, then (since `sleep` obeys SIGTERM and dies
         //    well within the 5s grace period, no SIGKILL escalation needed here) reports

@@ -104,7 +104,13 @@ impl CommandDescriptor {
     }
 }
 
-/// Options for [`crate::Ctx::exec`] (Pi `ExecOptions`, types.ts:1254).
+/// Options for [`crate::Ctx::exec`] — 1:1 with Pi's REAL `ExecOptions` (the type `Ctx.exec` actually
+/// uses, `extensions/types.ts:47,1277` imports it straight from `core/exec.ts:11-18`):
+/// `{signal?, timeout?, cwd?}` only. Deliberately has NO `env` field — Pi's `execCommand`
+/// (`exec.ts:41-45`) never passes an `env` override to `spawn()` at all, so the child only ever
+/// inherits the host's own ambient environment (Node's default when `env` is omitted). Adding one
+/// here would be new ambient authority (arbitrary env injection for a spawned process) with no Pi
+/// equivalent — do not re-add it without a real Pi ground-truth citation.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOptions {
@@ -112,8 +118,6 @@ pub struct ExecOptions {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// UI dialog options for `confirm`/`input`/`select` (Pi `ExtensionUIDialogOptions`, types.ts:89;
