@@ -2,11 +2,17 @@
 //!
 //! `LocalFs` is an indirection over the real filesystem; `LocalProc` runs commands through the
 //! detected shell, streams combined stdout+stderr, and kills the whole process tree on
-//! cancel/timeout (R-03-024/027) via Pi's own SIGTERM-then-5s-grace-then-SIGKILL escalation
-//! (`killProcess`, `exec.ts:52-63`) — the group-scoped analog of `cyrup-ext`'s `proc.rs::kill`
-//! (single-pid escalation for the non-`setsid`'d `proc` capability). The only `unsafe` in the
-//! crate lives here, isolated to the unix process-group calls (`setsid`/`killpg`) with safety
-//! comments.
+//! cancel/timeout (R-03-024/027). The two `ProcOps` methods intentionally use DIFFERENT
+//! escalations, 1:1 with their DIFFERENT real Pi consumers: [`LocalProc::exec`] backs both the
+//! `bash` tool (`bash.ts:82-148`'s `createLocalBashOperations`) and the immediate-bash RPC seam
+//! (`bash-executor.ts:108`'s `executeBashWithOperations`, which calls the SAME `BashOperations`),
+//! and both paths' abort/timeout handlers call `killProcessTree` (`shell.ts:200-225`) — an
+//! IMMEDIATE `killpg(SIGKILL)`, no `SIGTERM`, no grace period, ever. [`LocalProc::exec_argv`] backs
+//! the WASM `exec` capability grant instead, whose real consumer is `exec.ts:34-63`'s
+//! `execCommand`/`killProcess` — a `SIGTERM`-then-grace-then-`SIGKILL` escalation (the group-scoped
+//! analog of `cyrup-ext`'s `proc.rs::kill`, single-pid escalation for the non-`setsid`'d `proc`
+//! capability). The only `unsafe` in the crate lives here, isolated to the unix process-group calls
+//! (`setsid`/`killpg`) with safety comments.
 
 use super::{
     Access, ArgvOutput, ArgvSpec, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig,
@@ -174,9 +180,11 @@ impl FsOps for LocalFs {
     }
 }
 
-/// How long [`LocalProc::exec`]/[`LocalProc::exec_argv`] wait after `SIGTERM` before escalating to
-/// `SIGKILL` — Pi's exact `killProcess` timing (`exec.ts:56-61`: `setTimeout(..., 5000)`). Mirrors
-/// `cyrup-ext::caps::proc::DEFAULT_KILL_GRACE`.
+/// How long [`LocalProc::exec_argv`] waits after `SIGTERM` before escalating to `SIGKILL` — Pi's
+/// exact `killProcess` timing (`exec.ts:56-61`: `setTimeout(..., 5000)`). Mirrors
+/// `cyrup-ext::caps::proc::DEFAULT_KILL_GRACE`. NOT used by [`LocalProc::exec`] (the `bash`
+/// tool/immediate-bash backend), which mirrors `killProcessTree`'s immediate, graceless `SIGKILL`
+/// instead (`shell.ts:200-225`) — see the module doc comment.
 const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// How long [`LocalProc::exec`]/[`LocalProc::exec_argv`] wait, once the child process ITSELF has
@@ -457,16 +465,16 @@ impl ProcOps for LocalProc {
         };
         tokio::pin!(timeout_fut);
 
-        // SIGTERM-then-grace-then-SIGKILL escalation (Pi `killProcess`, `exec.ts:52-63`): `pending`
-        // records which trigger (cancel vs timeout) asked for termination — so the eventual
-        // `ExitStatus` reports the right reason even if the tree exits gracefully mid-grace — and
-        // gates the one-shot SIGTERM send; `grace` is (re)armed the instant SIGTERM goes out and
-        // forces SIGKILL if the tree is still alive once it elapses. Draining continues throughout
-        // the grace window (Pi's `data` handlers stay attached across `killProcess` too), so output
-        // a well-behaved SIGTERM handler flushes while cleaning up is not lost.
+        // Immediate, graceless SIGKILL-the-whole-tree escalation — Pi's real `killProcessTree`
+        // (`shell.ts:200-225`: `process.kill(-pid, "SIGKILL")`), called unconditionally by BOTH real
+        // consumers of this method on abort/timeout: the `bash` tool's `onAbort`/timeout handler
+        // (`bash.ts:111-121`) and the immediate-bash RPC seam (`bash-executor.ts:108` calling the
+        // SAME `BashOperations.exec`). Unlike [`Self::exec_argv`] (which backs the WASM `exec`
+        // capability's DIFFERENT real consumer, `exec.ts:52-63`'s `killProcess`), there is no
+        // `SIGTERM`, no grace window, and no escalation step here — `pending` only records which
+        // trigger (cancel vs timeout) asked for termination so the eventual `ExitStatus` reports the
+        // right reason.
         let mut pending: Option<ExitStatus> = None;
-        let grace = tokio::time::sleep(self.kill_grace);
-        tokio::pin!(grace);
 
         // Idle-grace fallback (Pi `waitForChildProcess`, `child-process.ts:49-137`): once the child
         // process itself exits, if its stdio isn't already fully drained (a backgrounded descendant
@@ -481,28 +489,12 @@ impl ProcOps for LocalProc {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled(), if pending.is_none() => {
-                    // Skip the grace-period wait entirely when nothing was actually sent (non-unix,
-                    // or the group is already gone) — waiting it out has zero chance of a graceful
-                    // exit landing, mirroring `ProcCaps::kill`'s identical fix for this bug class
-                    // (`cyrup-ext/src/caps/proc.rs:347-355`, commit `0790ace`).
-                    let sigterm_sent = send_sigterm_tree(&child);
+                    send_sigkill_tree(&mut child);
                     pending = Some(ExitStatus::Killed);
-                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
-                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut timeout_fut, if pending.is_none() => {
-                    let sigterm_sent = send_sigterm_tree(&child);
-                    pending = Some(ExitStatus::TimedOut);
-                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
-                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
-                }
-                _ = &mut grace, if pending.is_some() => {
-                    // Grace period elapsed (or was skipped outright, above) and the tree is still
-                    // alive (a natural exit would already have hit the `child.wait()` arm below and
-                    // broken the loop) — force it.
                     send_sigkill_tree(&mut child);
-                    let _ = child.wait().await;
-                    break pending.unwrap_or(ExitStatus::TimedOut);
+                    pending = Some(ExitStatus::TimedOut);
                 }
                 _ = &mut idle_grace, if idle_armed => {
                     // The child exited and its inherited stdio has been quiet for
@@ -710,6 +702,75 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: Vec::new(),
         }
+    }
+
+    fn exec_spec(command: &str) -> ExecSpec {
+        ExecSpec {
+            command: command.to_string(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            shell: ShellConfig::detect(),
+        }
+    }
+
+    /// `LocalProc::exec` (the `bash` tool / immediate-bash backend) must SIGKILL a SIGTERM-ignoring
+    /// tree IMMEDIATELY on timeout — Pi's real `killProcessTree` (`shell.ts:200-225`), called
+    /// directly by `bash.ts:118-121`'s timeout handler with NO intervening `SIGTERM`/grace step.
+    /// Configuring an intentionally huge `kill_grace` (5s, the SAME value `exec_argv` actually
+    /// waits out) and still finishing in well under a second proves `exec` never consults
+    /// `kill_grace` at all — the exact regression this fix closes (it previously reused
+    /// `exec_argv`'s `SIGTERM`-then-5s-grace-then-`SIGKILL` escalation, giving a SIGTERM-ignoring
+    /// child up to 5s of extra unsupervised runtime Pi's bash tool never grants).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_timeout_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+        let started = tokio::time::Instant::now();
+        let status = proc
+            .exec(
+                exec_spec("trap '' TERM; while true; do sleep 1; done"),
+                CancelToken::new(),
+                Some(Duration::from_millis(100)),
+                &mut |_data: &[u8]| {},
+            )
+            .await
+            .expect("exec runs");
+        assert_eq!(
+            status,
+            ExitStatus::TimedOut,
+            "the timeout reason is reported even though the tree never gracefully exited"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a SIGTERM-ignoring tree must still die within ~100ms of the timeout via immediate \
+             SIGKILL — no 5s grace wait like `exec_argv`'s `killProcess` escalation — got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The same immediate-SIGKILL behavior on the `cancel` path (Pi `bash.ts:111-113`'s `onAbort`,
+    /// which also calls `killProcessTree` directly with no grace step).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_cancel_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+        let cancel = CancelToken::new();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            let spec = exec_spec("trap '' TERM; while true; do sleep 1; done");
+            async move { proc.exec(spec, cancel, None, &mut |_data: &[u8]| {}).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let status = task.await.expect("task joins").expect("exec runs");
+        assert_eq!(status, ExitStatus::Killed, "the cancel reason is reported");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a SIGTERM-ignoring tree must still die within ~100ms of cancel via immediate SIGKILL, \
+             got {:?}",
+            started.elapsed()
+        );
     }
 
     /// A normal (SIGTERM-obeying) child dies well within the grace period on timeout — no SIGKILL
