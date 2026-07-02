@@ -606,7 +606,7 @@ pub fn build() -> ExtensionApi {
         "editordemo",
         CommandDescriptor::new("Open an external-editor dialog seeded with fixed text (demo)."),
         |_args: &str, ctx: &crate::CommandCtx| {
-            let edited = ctx.ui().editor("seed text from the guest");
+            let edited = ctx.ui().editor("edit demo", "seed text from the guest");
             let text = format!("edited: {}", edited.as_deref().unwrap_or("none"));
             ctx.ui().notify(&text);
             // Visible LIVE proof (see `confirmdemo`'s comment): echo the received text in a follow-up

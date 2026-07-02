@@ -168,8 +168,8 @@ async fn wasm_guest_select_dialog_receives_the_real_scripted_answer() {
     );
 }
 
-/// `editordemo`: `ctx.ui().editor("seed text from the guest")` then a follow-up `confirm` embedding
-/// the edited text.
+/// `editordemo`: `ctx.ui().editor("edit demo", "seed text from the guest")` then a follow-up
+/// `confirm` embedding the edited text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wasm_guest_editor_dialog_receives_the_real_scripted_answer() {
     let (session, _ext) = build_session().await;
@@ -181,7 +181,12 @@ async fn wasm_guest_editor_dialog_receives_the_real_scripted_answer() {
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(seen.len(), 2, "editordemo opens exactly two dialogs: {seen:?}");
     assert_eq!(seen[0].0, UiKind::Editor);
-    assert_eq!(seen[0].1, "seed text from the guest");
+    // L4 review §2 (editor title fix): `req.prompt` is now genuinely the guest's `title` argument
+    // (Pi `editor(title, prefill)`, types.ts:216; world.wit:267) — a REAL wasm guest call, not the
+    // hardcoded `""` the pre-fix wire request sent. The seed text arrives separately on
+    // `req.message`, unit-proven distinctly in `host_services.rs`'s
+    // `ui_grant_round_trips_through_a_scripted_sink`.
+    assert_eq!(seen[0].1, "edit demo", "the LIVE wasm guest's real editor title arrived, not \"\"");
     assert_eq!(
         seen[1],
         (UiKind::Confirm, "edited: edited by the scripted sink".to_string()),

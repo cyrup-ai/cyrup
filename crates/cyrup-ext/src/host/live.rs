@@ -205,12 +205,12 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         guest.note_dialog_wait(started);
         result
     }
-    async fn editor(&mut self, initial: String) -> Option<String> {
+    async fn editor(&mut self, title: String, initial: String) -> Option<String> {
         let guest = guest_of(self).ok()?;
         // `ui.editor` blocks the same way (tears the TUI down and waits for `$EDITOR` to exit, an
         // equally human-paced wait) — the SAME epoch-budget exemption applies.
         let started = std::time::Instant::now();
-        let result = guest.services.editor(&initial);
+        let result = guest.services.editor(&title, &initial);
         guest.note_dialog_wait(started);
         result
     }

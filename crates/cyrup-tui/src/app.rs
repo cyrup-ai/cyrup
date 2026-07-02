@@ -2985,8 +2985,13 @@ impl App<CrosstermBackend<Stdout>> {
                     // input-slot selector via `open_extension_dialog` and waits for a future key event
                     // to confirm/cancel it (`AppState::pending_ui_reply`).
                     if req.kind == UiKind::Editor {
-                        let UiRequest { prompt, reply, .. } = req;
-                        let edited = self.edit_in_external_editor(&prompt)?;
+                        // `prompt` now carries the guest's real dialog `title` (Pi `editor(title,
+                        // prefill)`, types.ts:216; world.wit:267; L4 review §2) — `message` carries
+                        // the seed text (Pi `prefill`) `edit_in_external_editor` seeds the buffer
+                        // with. The TUI's teardown-to-`$EDITOR` path has no in-place heading to show
+                        // `title` in (unlike the RPC wire request, which now forwards it verbatim).
+                        let UiRequest { message, reply, .. } = req;
+                        let edited = self.edit_in_external_editor(&message)?;
                         let _ = reply.send(UiReply::Text(edited));
                     } else {
                         self.open_extension_dialog(req);

@@ -559,15 +559,16 @@ impl Ui {
             None
         }
     }
-    /// Multiline editor seeded with `initial`; returns the edited text (None = cancelled).
-    pub fn editor(&self, initial: &str) -> Option<String> {
+    /// Multiline editor labeled `title`, seeded with `initial` (Pi `editor(title, prefill):
+    /// Promise<string|undefined>`, types.ts:216); returns the edited text (None = cancelled).
+    pub fn editor(&self, title: &str, initial: &str) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::ui::editor(initial);
+            return crate::guest::bindings::cyrup::ext::ui::editor(title, initial);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = initial;
+            let _ = (title, initial);
             None
         }
     }

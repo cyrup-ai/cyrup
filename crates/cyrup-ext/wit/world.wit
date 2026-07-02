@@ -263,8 +263,9 @@ interface ui {
   input:      func(prompt: string, placeholder: option<string>, opts-json: string) -> option<string>;
   // single-choice select over a json array of options; returns the chosen string (none = cancel).
   select:     func(prompt: string, options-json: string, opts-json: string) -> option<string>;
-  // multiline editor seeded with `initial`; returns the edited text (none = cancelled).
-  editor:     func(initial: string) -> option<string>;
+  // multiline editor seeded with `initial`, labeled `title` (Pi `editor(title, prefill)`,
+  // types.ts:216); returns the edited text (none = cancelled).
+  editor:     func(title: string, initial: string) -> option<string>;
   set-widget: func(widget-json: string);
 
   // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---

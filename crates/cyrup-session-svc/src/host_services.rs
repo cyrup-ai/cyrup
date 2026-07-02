@@ -62,12 +62,13 @@ pub enum UiReply {
 /// so the host BLOCKS on `reply` until the renderer answers, rather than queueing and returning `()`.
 pub struct UiRequest {
     pub kind: UiKind,
-    /// The dialog prompt/title (Pi `title`); for `editor`, the seed text (Pi `prefill`).
+    /// The dialog title (Pi `title`) — for ALL FOUR kinds, including `editor` (Pi `editor(title,
+    /// prefill)`, types.ts:216; world.wit:267).
     pub prompt: String,
     /// For `select`, the JSON array of option strings (Pi `options`); `Null` for the other kinds.
     pub options: Value,
-    /// `confirm`'s message body (Pi `confirm(title, message, opts)`, rpc-types.ts:232); empty string
-    /// for the other kinds (L4 review §2.6).
+    /// `confirm`'s message body (Pi `confirm(title, message, opts)`, rpc-types.ts:232); `editor`'s
+    /// seed text (Pi `prefill`, rpc-types.ts:241); empty string for `input`/`select`.
     pub message: String,
     /// `input`'s placeholder (Pi `input(title, placeholder, opts)`, rpc-types.ts:233-240); `None` for
     /// the other kinds, or when the guest omitted it (L4 review §2.7).
@@ -335,14 +336,16 @@ impl HostServices for LiveHostServices {
         }
     }
 
-    fn editor(&self, initial: &str) -> Option<String> {
-        // The WIT `editor(initial) -> option<string>` carries no options bag (world.wit:261); use the
-        // empty default so the roundtrip signature stays uniform.
+    fn editor(&self, title: &str, initial: &str) -> Option<String> {
+        // The WIT `editor(title, initial) -> option<string>` carries no options bag (world.wit:267);
+        // use the empty default so the roundtrip signature stays uniform. `title` rides `prompt`
+        // (uniform across all four dialog kinds); `initial` rides `message` (mirroring `confirm`'s
+        // reuse of the same field for its second string argument).
         match self.ui_roundtrip(
             UiKind::Editor,
-            initial,
+            title,
             Value::Null,
-            String::new(),
+            initial.to_string(),
             None,
             &DialogOptions::default(),
         ) {
@@ -789,7 +792,7 @@ mod tests {
         assert!(!svc.confirm("ok?", "body", &DialogOptions::default()));
         assert_eq!(svc.input("name?", Some("placeholder"), &DialogOptions::default()), None);
         assert_eq!(svc.select("pick", &json!(["a", "b"]), &DialogOptions::default()), None);
-        assert_eq!(svc.editor("seed"), None);
+        assert_eq!(svc.editor("title", "seed"), None);
     }
 
     /// The ui GRANT round-trips a dialog through a scripted [`UiSink`] renderer: the guest-facing
@@ -837,7 +840,10 @@ mod tests {
                             .map(str::to_owned);
                         UiReply::Text(chosen)
                     }
-                    UiKind::Editor => UiReply::Text(Some(format!("edited:{}", req.prompt))),
+                    // Echo the seed text (Pi `prefill`, now `req.message` — L4 review §2, editor
+                    // title fix): proves `editor`'s two strings arrive on distinct fields, not both
+                    // squashed onto `prompt`.
+                    UiKind::Editor => UiReply::Text(Some(format!("edited:{}", req.message))),
                 };
                 let _ = req.reply.send(reply);
             }
@@ -862,18 +868,19 @@ mod tests {
 
         // §2.6: the confirm `message` reached the renderer verbatim, distinct from `prompt` (title).
         // §2.7: the input `placeholder` reached the renderer verbatim (`Some`, not dropped).
-        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let seen_snapshot = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
-            seen.iter()
+            seen_snapshot
+                .iter()
                 .find(|s| s.kind == UiKind::Confirm)
                 .map(|s| (s.prompt.as_str(), s.message.as_str())),
             Some(("proceed?", "a large formatted body, distinct from the title")),
-            "confirm's message body round-trips separately from its title: {seen:?}"
+            "confirm's message body round-trips separately from its title: {seen_snapshot:?}"
         );
         assert_eq!(
-            seen.iter().find(|s| s.kind == UiKind::Input).map(|s| s.placeholder.clone()),
+            seen_snapshot.iter().find(|s| s.kind == UiKind::Input).map(|s| s.placeholder.clone()),
             Some(Some("e.g. Ada Lovelace".to_string())),
-            "input's placeholder round-trips instead of being dropped: {seen:?}"
+            "input's placeholder round-trips instead of being dropped: {seen_snapshot:?}"
         );
 
         let s3 = svc.clone();
@@ -889,10 +896,22 @@ mod tests {
         );
 
         let s4 = svc.clone();
-        let editor = tokio::task::spawn_blocking(move || s4.editor("hello"))
+        let editor = tokio::task::spawn_blocking(move || s4.editor("edit this file", "hello"))
             .await
             .expect("editor task");
         assert_eq!(editor.as_deref(), Some("edited:hello"));
+
+        // L4 review §2 (editor title fix) live proof: `editor`'s title reached the renderer on
+        // `prompt`, distinct from its seed text on `message` — mirrors the confirm/input assertions
+        // above, closing the same class of dropped-field bug for `editor`.
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen.iter()
+                .find(|s| s.kind == UiKind::Editor)
+                .map(|s| (s.prompt.as_str(), s.message.as_str())),
+            Some(("edit this file", "hello")),
+            "editor's title round-trips separately from its seed text: {seen:?}"
+        );
     }
 
     /// L4 review §2.2: a dialog whose renderer NEVER answers still resolves within `opts.timeout_ms` —

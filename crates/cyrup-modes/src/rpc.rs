@@ -323,14 +323,16 @@ fn extension_ui_request_json(id: &str, req: &UiRequest) -> Value {
             }
             v
         }),
-        // Pi `editor(title, prefill)` → `{method:"editor", prefill}`. The cyrup WIT `editor(initial)`
-        // carries only the seed text → `prefill`.
+        // Pi `editor(title, prefill)` → `{method:"editor", title, prefill}` (rpc-mode.ts:253-268;
+        // rpc-types.ts:241). The cyrup WIT `editor(title, initial)` (world.wit:267; L4 review §2)
+        // carries both: `req.prompt` is the real title, `req.message` the seed text — same field
+        // mapping `LiveHostServices::editor` uses (`cyrup-session-svc/src/host_services.rs`).
         UiKind::Editor => json!({
             "type": "extension_ui_request",
             "id": id,
             "method": "editor",
-            "title": "",
-            "prefill": req.prompt,
+            "title": req.prompt,
+            "prefill": req.message,
         }),
     }
 }
@@ -1011,5 +1013,40 @@ async fn read_lines<R: AsyncBufRead + Unpin>(mut reader: R, tx: mpsc::Sender<Str
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use cyrup_ext::DialogOptions;
+
+    fn editor_request(title: &str, initial: &str) -> UiRequest {
+        let (reply, _rx) = oneshot::channel();
+        UiRequest {
+            kind: UiKind::Editor,
+            prompt: title.to_string(),
+            options: Value::Null,
+            message: initial.to_string(),
+            placeholder: None,
+            opts: DialogOptions::default(),
+            reply,
+        }
+    }
+
+    /// L4 review §2 (`ui.editor` WIT signature drops Pi's `title` param; RPC hardcodes `"title":
+    /// ""`): the wire request sent to an RPC client for `ui.editor` must carry the guest's REAL
+    /// title (Pi `editor(title, prefill)` → `{method:"editor", title, prefill}`,
+    /// `rpc-mode.ts:253-268`, `rpc-types.ts:241`) — never the pre-fix hardcoded `""`, and `prefill`
+    /// must be the seed text, not the title again.
+    #[test]
+    fn editor_wire_request_carries_the_real_title_not_a_hardcoded_empty_string() {
+        let req = editor_request("edit the changelog", "## seed content");
+        let wire = extension_ui_request_json("req-1", &req);
+        assert_eq!(wire["method"], "editor");
+        assert_eq!(wire["title"], "edit the changelog", "the real guest title must reach the wire");
+        assert_ne!(wire["title"], "", "title must never be the pre-fix hardcoded empty string");
+        assert_eq!(wire["prefill"], "## seed content", "prefill carries the seed text, not the title");
     }
 }

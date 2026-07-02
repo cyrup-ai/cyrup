@@ -114,7 +114,7 @@ pub trait HostServices: Send + Sync {
     fn oauth_select(&self, _message: &str, _options: &Value) -> Option<String> {
         None
     }
-    fn editor(&self, _initial: &str) -> Option<String> {
+    fn editor(&self, _title: &str, _initial: &str) -> Option<String> {
         None
     }
     /// A custom overlay component; returns an optional serialized result (Pi `custom()`).
@@ -491,7 +491,7 @@ impl HostServices for RecordingServices {
     fn oauth_select(&self, _message: &str, _options: &Value) -> Option<String> {
         self.responses.oauth_select.clone()
     }
-    fn editor(&self, _initial: &str) -> Option<String> {
+    fn editor(&self, _title: &str, _initial: &str) -> Option<String> {
         self.responses.editor.clone()
     }
     fn custom(&self, _spec: &Value) -> Option<String> {
