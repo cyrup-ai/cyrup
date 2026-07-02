@@ -24,4 +24,5 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
+cyrup-ext = { workspace = true }
 tempfile.workspace = true

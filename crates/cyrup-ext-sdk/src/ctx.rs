@@ -250,12 +250,13 @@ impl Ui {
             None
         }
     }
-    /// Single-choice select; returns the chosen index.
-    pub fn select(&self, prompt: &str, options: &[&str]) -> Option<u32> {
+    /// Single-choice select; returns the chosen option string (Pi `select(title, options, opts):
+    /// Promise<string|undefined>`, types.ts:127).
+    pub fn select(&self, prompt: &str, options: &[&str]) -> Option<String> {
         self.select_with(prompt, options, &DialogOptions::default())
     }
     /// Single-choice select with a [`DialogOptions`] bag (Pi `select(title, options, {timeout, signal})`).
-    pub fn select_with(&self, prompt: &str, options: &[&str], opts: &DialogOptions) -> Option<u32> {
+    pub fn select_with(&self, prompt: &str, options: &[&str], opts: &DialogOptions) -> Option<String> {
         let options_json = serde_json::to_string(options).unwrap_or_else(|_| "[]".into());
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         #[cfg(target_arch = "wasm32")]

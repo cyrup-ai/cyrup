@@ -536,3 +536,108 @@ async fn rpc_extended_command_surface() {
     assert_eq!(new["success"], true);
     assert_eq!(new["data"]["cancelled"], false, "new_session not vetoed: {new}");
 }
+
+/// Read one non-empty JSONL record from an async reader (test helper for the interactive RPC flow).
+async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Value {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await.expect("read a line");
+        assert!(n > 0, "unexpected EOF while awaiting a json line");
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return serde_json::from_str(trimmed).expect("valid json line");
+    }
+}
+
+/// Mode #4 end-to-end: a loaded guest's synchronous `ui.{select,confirm,input}` capability round-trips
+/// through the RPC transport — the loop emits an `extension_ui_request` on stdout and the client's
+/// `extension_ui_response` resumes the wasm-suspended guest (Pi `createExtensionUIContext` +
+/// `handleInputLine`, rpc-mode.ts:135-160,739-753). Multi-thread so the guest's `block_in_place`
+/// reply-wait is legal. The transport is an in-memory duplex pair standing in for real stdio.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_extension_ui_request_response_round_trips() {
+    use cyrup_ext::host::{DialogOptions, HostServices};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    // The SAME session Arc the loop installs its ui sink onto (shared through the runtime).
+    let session = runtime.session().await;
+    let host_services = session.services().host_services.clone();
+
+    // In-memory bidirectional transport (client <-> server) in place of stdio.
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    // A get_state first: its response proves the loop is up and the ui sink is installed (set before
+    // the select! loop), so the following guest dialog cannot race the sink.
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    let boot = read_json_line(&mut client_reader).await;
+    assert_eq!(boot["command"], "get_state");
+
+    // (1) select → the loop emits the Pi request; the client answers with the chosen STRING, which
+    //     reaches the guest UNCHANGED — the WIT `select` return is now the chosen STRING itself
+    //     (world.wit:259), byte-for-byte Pi's `select(...): Promise<string|undefined>` (types.ts:127),
+    //     with NO index translation anywhere in the round-trip.
+    let hs = host_services.clone();
+    let guest_select = tokio::spawn(async move {
+        hs.select("Pick one", &serde_json::json!(["alpha", "beta", "gamma"]), &DialogOptions::default())
+    });
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["type"], "extension_ui_request");
+    assert_eq!(req["method"], "select");
+    assert_eq!(req["title"], "Pick one");
+    assert_eq!(req["options"], serde_json::json!(["alpha", "beta", "gamma"]));
+    let id = req["id"].as_str().unwrap().to_string();
+    client_tx
+        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"value\":\"gamma\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        guest_select.await.unwrap().as_deref(),
+        Some("gamma"),
+        "select's wire {{value}} string passes straight through, with no index math"
+    );
+
+    // (2) confirm → `{confirmed:true}` resumes the guest with true.
+    let hs = host_services.clone();
+    let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", &DialogOptions::default()) });
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "confirm");
+    assert_eq!(req["title"], "Proceed?");
+    let id = req["id"].as_str().unwrap().to_string();
+    client_tx
+        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"confirmed\":true}}\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(guest_confirm.await.unwrap(), "confirm round-trips true");
+
+    // (3) input cancelled → `{cancelled:true}` yields None (Pi `parseResponse` default).
+    let hs = host_services.clone();
+    let guest_input = tokio::spawn(async move { hs.input("Name?", &DialogOptions::default()) });
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "input");
+    let id = req["id"].as_str().unwrap().to_string();
+    client_tx
+        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"cancelled\":true}}\n").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(guest_input.await.unwrap(), None, "cancelled input -> None");
+
+    // EOF → the loop drains and returns.
+    drop(client_tx);
+    rpc.await.unwrap();
+}

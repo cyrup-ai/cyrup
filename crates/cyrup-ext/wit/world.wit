@@ -255,8 +255,8 @@ interface ui {
   // a live-countdown timeout and/or a programmatic-dismiss signal id (none = `{}`).
   confirm:    func(prompt: string, opts-json: string) -> bool;
   input:      func(prompt: string, opts-json: string) -> option<string>;
-  // single-choice select over a json array of options; returns the chosen index.
-  select:     func(prompt: string, options-json: string, opts-json: string) -> option<u32>;
+  // single-choice select over a json array of options; returns the chosen string (none = cancel).
+  select:     func(prompt: string, options-json: string, opts-json: string) -> option<string>;
   // multiline editor seeded with `initial`; returns the edited text (none = cancelled).
   editor:     func(initial: string) -> option<string>;
   set-widget: func(widget-json: string);

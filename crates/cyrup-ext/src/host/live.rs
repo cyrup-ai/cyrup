@@ -182,7 +182,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         }
         guest.services.input(&prompt, &opts)
     }
-    async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<u32> {
+    async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
         let guest = guest_of(self).ok()?;
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         let opts = DialogOptions::parse(&opts_json);

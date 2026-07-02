@@ -22,15 +22,17 @@
 //! one it is rejected. While not streaming, `prompt` starts a fresh run. The active session's
 //! `prompt_with` performs this preflight (the `input` ext event + steer/follow-up routing).
 
+use std::collections::HashMap;
+
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
     ForkPosition, InputSource, ModelThinkingLevel, PromptAccepted, PromptOptions, QueueMode,
-    StreamingBehavior, UserInput,
+    StreamingBehavior, UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ModesError;
 
@@ -260,6 +262,92 @@ impl RpcResponse {
 pub enum RpcOut {
     Response(RpcResponse),
     Event(Box<AgentSessionEvent>),
+    /// A synchronous extension dialog request (`ui.{confirm,input,select,editor}`) emitted on stdout
+    /// for the RPC client to render + answer via an `extension_ui_response` (Pi
+    /// `createExtensionUIContext` → `output({type:"extension_ui_request", …})`, rpc-mode.ts:128-160,
+    /// 253-268). Carries the pre-shaped Pi wire object so field names/order match byte-for-byte.
+    ExtensionUiRequest(Value),
+}
+
+/// A pending extension dialog awaiting its `extension_ui_response` (mirrors Pi's
+/// `pendingExtensionRequests` map, rpc-mode.ts:79-82). `kind` is retained so a `{value}`/`{confirmed}`/
+/// `{cancelled}` response can be mapped back to the guest's expected reply shape. `select`'s WIT
+/// return is now the chosen option STRING (world.wit:259), byte-for-byte the Pi wire `value`
+/// (rpc-types.ts:273) — no index translation, so no options bag needs to be retained here.
+struct PendingUi {
+    kind: UiKind,
+    reply: oneshot::Sender<UiReply>,
+}
+
+/// Shape a guest [`UiRequest`] into the exact Pi `extension_ui_request` wire object
+/// (rpc-types.ts:230-265). `id` correlates the later `extension_ui_response`.
+fn extension_ui_request_json(id: &str, req: &UiRequest) -> Value {
+    // Serialize a `{timeout}` field only when the guest supplied one (Pi omits it otherwise).
+    let with_timeout = |mut v: Value| -> Value {
+        if let (Some(ms), Some(obj)) = (req.opts.timeout_ms, v.as_object_mut()) {
+            obj.insert("timeout".to_string(), json!(ms));
+        }
+        v
+    };
+    match req.kind {
+        // Pi `select(title, options, opts)` → `{method:"select", title, options, timeout?}`.
+        UiKind::Select => with_timeout(json!({
+            "type": "extension_ui_request",
+            "id": id,
+            "method": "select",
+            "title": req.prompt,
+            "options": req.options,
+        })),
+        // Pi `confirm(title, message, opts)` → `{method:"confirm", title, message, timeout?}`. The
+        // cyrup guest `confirm(prompt)` carries a single string → `title`; `message` is empty.
+        UiKind::Confirm => with_timeout(json!({
+            "type": "extension_ui_request",
+            "id": id,
+            "method": "confirm",
+            "title": req.prompt,
+            "message": "",
+        })),
+        // Pi `input(title, placeholder, opts)` → `{method:"input", title, timeout?}` (the cyrup WIT
+        // `input(prompt)` has no placeholder).
+        UiKind::Input => with_timeout(json!({
+            "type": "extension_ui_request",
+            "id": id,
+            "method": "input",
+            "title": req.prompt,
+        })),
+        // Pi `editor(title, prefill)` → `{method:"editor", prefill}`. The cyrup WIT `editor(initial)`
+        // carries only the seed text → `prefill`.
+        UiKind::Editor => json!({
+            "type": "extension_ui_request",
+            "id": id,
+            "method": "editor",
+            "title": "",
+            "prefill": req.prompt,
+        }),
+    }
+}
+
+/// Map an `extension_ui_response` body onto the guest's expected [`UiReply`] for `pending` (Pi
+/// `parseResponse`, rpc-mode.ts:137-149,257-264). A `{cancelled:true}` yields the per-kind default; a
+/// `{confirmed}` a confirm; a `{value}` maps straight to text (input/editor/select) — Pi's
+/// `select(...): Promise<string|undefined>` (types.ts:127) passes the chosen STRING straight through
+/// to the guest, with NO index translation.
+fn map_ui_response(pending: &PendingUi, body: &Value) -> UiReply {
+    let cancelled = body.get("cancelled").and_then(Value::as_bool) == Some(true);
+    match pending.kind {
+        UiKind::Confirm => {
+            if cancelled {
+                return UiReply::Confirm(false);
+            }
+            UiReply::Confirm(body.get("confirmed").and_then(Value::as_bool).unwrap_or(false))
+        }
+        UiKind::Input | UiKind::Editor | UiKind::Select => {
+            if cancelled {
+                return UiReply::Text(None);
+            }
+            UiReply::Text(body.get("value").and_then(Value::as_str).map(str::to_owned))
+        }
+    }
 }
 
 /// The disposition of a dispatched command: the correlated [`RpcResponse`] plus whether the active
@@ -295,6 +383,15 @@ where
     let mut session = runtime.session().await;
     let mut events = session.subscribe();
 
+    // The synchronous extension-dialog sink (mode #4): a loaded guest's `ui.{confirm,input,select,
+    // editor}` capability blocks on a one-shot while this loop emits an `extension_ui_request` and
+    // awaits the client's `extension_ui_response` (Pi `createExtensionUIContext`, rpc-mode.ts:135-160).
+    // Installed on the active session's `LiveHostServices` (re-installed on every rebind, since a
+    // replacement brings a fresh backend). `pending` mirrors Pi's `pendingExtensionRequests`.
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
+    session.services().host_services.set_ui_sink(ui_tx.clone());
+    let mut pending: HashMap<String, PendingUi> = HashMap::new();
+
     // Dedicated reader task → mpsc of raw JSONL lines (strict LF framing; cancel-safe vs. events).
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
     let reader_task = tokio::spawn(read_lines(reader, cmd_tx));
@@ -308,6 +405,17 @@ where
             maybe_line = cmd_rx.recv(), if reader_open => {
                 match maybe_line {
                     Some(line) => {
+                        // Intercept an `extension_ui_response` BEFORE command dispatch (Pi
+                        // `handleInputLine`, rpc-mode.ts:739-753): look up the pending dialog by `id`,
+                        // resolve its one-shot, and never route it to the command switch.
+                        if let Some(id) = extension_ui_response_id(&line) {
+                            if let Some(p) = pending.remove(&id) {
+                                let body: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                                let reply = map_ui_response(&p, &body);
+                                let _ = p.reply.send(reply);
+                            }
+                            continue;
+                        }
                         let dispatched = dispatch(runtime, &session, &line, &mut in_flight).await;
                         write_out(writer, &RpcOut::Response(dispatched.response)).await?;
                         if dispatched.rebind {
@@ -315,11 +423,22 @@ where
                             // and re-subscribe (the prior subscription was terminated, R-11-021).
                             session = runtime.session().await;
                             events = session.subscribe();
+                            // The replacement brought a fresh `LiveHostServices`; re-install the ui
+                            // sink so a post-swap guest dialog still reaches this loop.
+                            session.services().host_services.set_ui_sink(ui_tx.clone());
                             in_flight = false;
                         }
                     }
                     None => reader_open = false,
                 }
+            }
+            Some(req) = ui_rx.recv() => {
+                // A guest opened a dialog: allocate a correlation id, emit the Pi `extension_ui_request`
+                // on stdout, and stash the one-shot until the client's `extension_ui_response` arrives.
+                let id = new_request_id();
+                let wire = extension_ui_request_json(&id, &req);
+                pending.insert(id, PendingUi { kind: req.kind, reply: req.reply });
+                write_out(writer, &RpcOut::ExtensionUiRequest(wire)).await?;
             }
             maybe_ev = events.next() => {
                 if let Some(ev) = maybe_ev {
@@ -747,6 +866,26 @@ async fn handle(
             RpcResponse::err(String::new(), raw_id.clone(), "Unknown command: undefined")
         }
     }
+}
+
+/// A fresh correlation id for an `extension_ui_request` (Pi `crypto.randomUUID`, rpc-mode.ts:98). A
+/// process-monotonic counter suffices: the id is opaque and only has to be unique among the dialogs
+/// in flight on this loop, and the client echoes it back verbatim on the `extension_ui_response`.
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("ext-ui-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// If `line` is an `extension_ui_response` envelope, return its correlation `id` (Pi intercepts these
+/// before command dispatch, rpc-mode.ts:739-753). Returns `None` for any other line so it falls
+/// through to the normal command path.
+fn extension_ui_response_id(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("extension_ui_response") {
+        return None;
+    }
+    value.get("id").and_then(Value::as_str).map(str::to_owned)
 }
 
 /// Build an RPC-sourced [`UserInput`] from text + optional image content blocks.

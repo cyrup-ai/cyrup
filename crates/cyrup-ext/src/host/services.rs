@@ -69,7 +69,7 @@ pub trait HostServices: Send + Sync {
     fn input(&self, _prompt: &str, _opts: &DialogOptions) -> Option<String> {
         None
     }
-    fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<u32> {
+    fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {
         None
     }
 
@@ -205,7 +205,7 @@ impl HostServices for DenyServices {}
 pub struct CannedResponses {
     pub confirm: bool,
     pub input: Option<String>,
-    pub select: Option<u32>,
+    pub select: Option<String>,
     pub editor: Option<String>,
     pub custom: Option<String>,
     pub exec: ExecOutput,
@@ -225,7 +225,7 @@ impl Default for CannedResponses {
         Self {
             confirm: true,
             input: Some(String::new()),
-            select: Some(0),
+            select: Some(String::new()),
             editor: Some(String::new()),
             custom: None,
             exec: ExecOutput::default(),
@@ -295,8 +295,8 @@ impl HostServices for RecordingServices {
     fn input(&self, _prompt: &str, _opts: &DialogOptions) -> Option<String> {
         self.responses.input.clone()
     }
-    fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<u32> {
-        self.responses.select
+    fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {
+        self.responses.select.clone()
     }
     fn oauth_prompt(
         &self,

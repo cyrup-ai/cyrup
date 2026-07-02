@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{CancelToken, EntryId, ModelRef};
-use cyrup_ext::host::{ControlOp, ExecOutput, HostServices};
+use cyrup_ext::host::{ControlOp, DialogOptions, ExecOutput, HostServices};
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
@@ -28,6 +28,50 @@ use crate::event::AgentSessionEvent;
 /// here so the runtime can act on it (Pi `createCommandContext`, agent-session.ts:1158). Set by the
 /// runtime once it owns the session; until then control ops are reported as unavailable.
 pub type ControlSink = Arc<dyn Fn(ControlOp) -> Result<(), String> + Send + Sync>;
+
+/// Which dialog family a [`UiRequest`] carries (Pi `ExtensionUIContext.{confirm,input,select,editor}`,
+/// types.ts:127-133,216).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiKind {
+    Confirm,
+    Input,
+    Select,
+    Editor,
+}
+
+/// The value a dialog renderer sends back to the wasm-suspended guest (the REPLY half of the
+/// request/reply [`UiSink`]). `Confirm` -> `confirm` bool; `Text` -> `input`/`editor`/`select`
+/// `option<string>` (Pi `select(title, options, opts): Promise<string|undefined>`, types.ts:127,
+/// and the WIT `select` return, world.wit:259 — the chosen option STRING, zero index bookkeeping).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiReply {
+    Confirm(bool),
+    Text(Option<String>),
+}
+
+/// A single dialog request routed from a loaded extension's `ui.{confirm,input,select,editor}`
+/// capability to the mode's dialog renderer (the interactive TUI selector, or the RPC
+/// `extension_ui_request`/`extension_ui_response` round-trip). This is the REQUEST/REPLY inverse of
+/// the fire-and-forget [`ControlSink`]: the guest coroutine is wasm-suspended across the SYNC host
+/// call (Pi's `ExtensionUIContext` methods RETURN a value the extension awaits, types.ts:127-133,216),
+/// so the host BLOCKS on `reply` until the renderer answers, rather than queueing and returning `()`.
+pub struct UiRequest {
+    pub kind: UiKind,
+    /// The dialog prompt/title (Pi `title`); for `editor`, the seed text (Pi `prefill`).
+    pub prompt: String,
+    /// For `select`, the JSON array of option strings (Pi `options`); `Null` for the other kinds.
+    pub options: Value,
+    /// The Pi `ExtensionUIDialogOptions` bag (`{timeoutMs, signalId}`, types.ts:89).
+    pub opts: DialogOptions,
+    /// The one-shot the renderer fulfils to resume the suspended guest.
+    pub reply: tokio::sync::oneshot::Sender<UiReply>,
+}
+
+/// A request/reply dialog sink: a loaded extension's `ui.*` capability is routed here so the active
+/// mode's renderer (TUI / RPC) can service it and reply. Set by the mode entry point via
+/// [`LiveHostServices::set_ui_sink`]; absent (`None`) in headless (print/json), where the ui methods
+/// fall back to the deny defaults (== Pi `noOpUIContext`, runner.ts:230-261).
+pub type UiSink = UnboundedSender<UiRequest>;
 
 /// The sync snapshot the session keeps current for the (sync) host-services reads.
 #[derive(Clone, Debug, Default)]
@@ -51,6 +95,12 @@ pub struct LiveHostServices {
     cwd: PathBuf,
     snapshot: Mutex<LiveSnapshot>,
     control: Mutex<Option<ControlSink>>,
+    /// The active mode's dialog renderer (interactive TUI / RPC), attached post-build via
+    /// [`Self::set_ui_sink`]. A guest's `ui.{confirm,input,select,editor}` capability reaches the SYNC
+    /// [`HostServices`] method (the guest is wasm-suspended and cannot await), which forwards a
+    /// [`UiRequest`] here and BLOCKS on the one-shot reply. `None` in headless (print/json): the
+    /// overrides then fall through to the trait deny defaults (== Pi `noOpUIContext`) and never block.
+    ui_sink: Mutex<Option<UiSink>>,
     /// Receiver half of the command-tier control channel (see [`Self::wire_control_channel`]). A
     /// guest's `control` capability call reaches the SYNC [`HostServices::control`] method (the
     /// guest is wasm-suspended and cannot await), which forwards the [`ControlOp`] here; the session
@@ -79,6 +129,7 @@ impl LiveHostServices {
             cwd,
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
+            ui_sink: Mutex::new(None),
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
@@ -107,6 +158,37 @@ impl LiveHostServices {
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
     pub fn set_control_sink(&self, sink: ControlSink) {
         *Self::lock(&self.control) = Some(sink);
+    }
+
+    /// Attach the mode's dialog renderer (the interactive TUI selector arm, or the RPC
+    /// `extension_ui_request` emitter). Only interactive/rpc call this; headless (print/json) leaves it
+    /// `None`, which is what keeps the ui overrides returning the deny defaults WITHOUT blocking — the
+    /// absence of a sink IS the headless policy, mirroring Pi's absence of a `uiContext`.
+    pub fn set_ui_sink(&self, sink: UiSink) {
+        *Self::lock(&self.ui_sink) = Some(sink);
+    }
+
+    /// Route one dialog request to the attached renderer and BLOCK (the guest is wasm-suspended) on the
+    /// reply — the request/reply counterpart to the fire-and-forget [`Self::control`]. Returns `None`
+    /// when there is no sink (headless: the ui method then yields its deny default WITHOUT blocking) or
+    /// when the renderer dropped the reply (cancelled / shut down). Uses the SAME `block_in_place` +
+    /// `block_on` pattern the `exec` grant uses ([`Self::exec`]); requires a multi-threaded runtime,
+    /// which interactive/rpc guarantee (`#[tokio::main(flavor = "multi_thread")]`, main.rs:40).
+    fn ui_roundtrip(
+        &self,
+        kind: UiKind,
+        prompt: &str,
+        options: Value,
+        opts: &DialogOptions,
+    ) -> Option<UiReply> {
+        let sink = Self::lock(&self.ui_sink).clone()?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = UiRequest { kind, prompt: prompt.to_string(), options, opts: opts.clone(), reply: reply_tx };
+        if sink.send(request).is_err() {
+            // The renderer (TUI loop / RPC loop) is gone — degrade to the deny default, never a panic.
+            return None;
+        }
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(reply_rx)).ok()
     }
 
     /// Wire the command-tier control channel: a loaded extension's `control` capability (new/switch/
@@ -165,6 +247,43 @@ impl LiveHostServices {
 }
 
 impl HostServices for LiveHostServices {
+    // --- ui dialog grant (arch-08 §5.6; Pi `ExtensionUIContext`, types.ts:127-133,216) ---
+    // Reaching here means the load-time trust gate already passed (an untrusted extension gets
+    // `DenyServices`, whose ui methods return false/None), so like the `exec` grant there is NO extra
+    // per-call trust/tier check: ui works at both Event and Command tier, purely a function of whether
+    // a mode installed a `ui_sink`. With NO sink (headless print/json) every method falls through to
+    // the deny default WITHOUT blocking — byte-for-byte Pi `noOpUIContext` (runner.ts:230-261).
+
+    fn confirm(&self, prompt: &str, opts: &DialogOptions) -> bool {
+        match self.ui_roundtrip(UiKind::Confirm, prompt, Value::Null, opts) {
+            Some(UiReply::Confirm(b)) => b,
+            _ => false,
+        }
+    }
+
+    fn input(&self, prompt: &str, opts: &DialogOptions) -> Option<String> {
+        match self.ui_roundtrip(UiKind::Input, prompt, Value::Null, opts) {
+            Some(UiReply::Text(t)) => t,
+            _ => None,
+        }
+    }
+
+    fn select(&self, prompt: &str, options: &Value, opts: &DialogOptions) -> Option<String> {
+        match self.ui_roundtrip(UiKind::Select, prompt, options.clone(), opts) {
+            Some(UiReply::Text(t)) => t,
+            _ => None,
+        }
+    }
+
+    fn editor(&self, initial: &str) -> Option<String> {
+        // The WIT `editor(initial) -> option<string>` carries no options bag (world.wit:261); use the
+        // empty default so the roundtrip signature stays uniform.
+        match self.ui_roundtrip(UiKind::Editor, initial, Value::Null, &DialogOptions::default()) {
+            Some(UiReply::Text(t)) => t,
+            _ => None,
+        }
+    }
+
     fn models(&self) -> Value {
         serde_json::to_value(self.provider.models()).unwrap_or_else(|_| json!([]))
     }
@@ -414,6 +533,86 @@ mod tests {
             .exec("sleep", &["30".to_string()], &json!({}), cancelled)
             .expect("a pre-cancelled exec resolves");
         assert!(out.killed, "a pre-aborted signal kills the exec");
+    }
+
+    /// With NO ui sink attached (headless print/json: `set_ui_sink` is never called), the ui grant
+    /// falls through to the trait deny defaults WITHOUT blocking — byte-for-byte Pi `noOpUIContext`
+    /// (confirm=false, input/select/editor=None). A single-thread runtime proves it never touches
+    /// `block_in_place` (which would panic here) on the headless path.
+    #[test]
+    fn headless_ui_returns_deny_defaults_without_a_sink() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        assert!(!svc.confirm("ok?", &DialogOptions::default()));
+        assert_eq!(svc.input("name?", &DialogOptions::default()), None);
+        assert_eq!(svc.select("pick", &json!(["a", "b"]), &DialogOptions::default()), None);
+        assert_eq!(svc.editor("seed"), None);
+    }
+
+    /// The ui GRANT round-trips a dialog through a scripted [`UiSink`] renderer: the guest-facing
+    /// (sync) `confirm`/`input`/`select`/`editor` block on a one-shot while a concurrent responder
+    /// answers each [`UiRequest`], exactly as the interactive TUI selector / RPC round-trip does at
+    /// runtime. Multi-thread so the `block_in_place` + `block_on` reply-wait is legal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_grant_round_trips_through_a_scripted_sink() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+
+        // The scripted renderer: reply to each request by kind (like a user picking in the selector).
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let reply = match req.kind {
+                    UiKind::Confirm => UiReply::Confirm(true),
+                    UiKind::Input => UiReply::Text(Some(format!("answer:{}", req.prompt))),
+                    UiKind::Select => {
+                        // Echo back the LAST option string as the chosen value proof.
+                        let chosen = req
+                            .options
+                            .as_array()
+                            .and_then(|a| a.last())
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        UiReply::Text(chosen)
+                    }
+                    UiKind::Editor => UiReply::Text(Some(format!("edited:{}", req.prompt))),
+                };
+                let _ = req.reply.send(reply);
+            }
+        });
+
+        // Each guest-facing call blocks until the responder answers (run on a blocking-capable worker).
+        let s1 = svc.clone();
+        let confirm = tokio::task::spawn_blocking(move || s1.confirm("proceed?", &DialogOptions::default()))
+            .await
+            .expect("confirm task");
+        assert!(confirm, "confirm round-trips the scripted `true`");
+
+        let s2 = svc.clone();
+        let input = tokio::task::spawn_blocking(move || s2.input("name?", &DialogOptions::default()))
+            .await
+            .expect("input task");
+        assert_eq!(input.as_deref(), Some("answer:name?"));
+
+        let s3 = svc.clone();
+        let select = tokio::task::spawn_blocking(move || {
+            s3.select("pick one", &json!(["x", "y", "z"]), &DialogOptions::default())
+        })
+        .await
+        .expect("select task");
+        assert_eq!(
+            select.as_deref(),
+            Some("z"),
+            "select returns the chosen option STRING (Pi types.ts:127, world.wit:259)"
+        );
+
+        let s4 = svc.clone();
+        let editor = tokio::task::spawn_blocking(move || s4.editor("hello"))
+            .await
+            .expect("editor task");
+        assert_eq!(editor.as_deref(), Some("edited:hello"));
     }
 
     /// The DEFAULT (deny-all) backend denies exec with Pi's "not granted" message — the untrusted

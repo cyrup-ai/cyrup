@@ -51,7 +51,7 @@ pub use event::{
 };
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
-pub use host_services::{ControlSink, LiveHostServices};
+pub use host_services::{ControlSink, LiveHostServices, UiKind, UiReply, UiRequest, UiSink};
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{
     AgentSessionRuntime, NewSessionOptions, RuntimeDiagnostic, RuntimeForkResult,
