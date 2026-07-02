@@ -181,6 +181,30 @@ async fn execute_bash_records_result_and_persists() {
     session.abort_bash();
 }
 
+/// The immediate-bash (`!!`/RPC) seam must prepend the managed `agent_dir/bin` onto the child
+/// `PATH` exactly like the agent-loop `bash` tool does (Pi `getShellEnv()`'s unconditional
+/// `getBinDir()` prefix, `utils/shell.ts:122-128`, reached via `createLocalBashOperations`'s
+/// `env: env ?? getShellEnv()`, `core/tools/bash.ts:100`) — mirrors
+/// `cyrup-tools/tests/tools.rs::bash_bin_dir_prepended_to_path` for the `bash` tool itself.
+#[tokio::test]
+async fn execute_bash_prepends_agent_bin_dir_to_path() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+
+    let result = session
+        .execute_bash(r#"printf '%s' "$PATH""#, BashOptions::default(), None)
+        .await
+        .expect("printf runs");
+    assert_eq!(result.exit_code, Some(0));
+    let bin_dir = fx.agent_dir.join("bin");
+    assert!(
+        result.output.starts_with(&bin_dir.to_string_lossy().into_owned()),
+        "expected PATH to start with the managed bin dir {bin_dir:?}, got: {:?}",
+        result.output
+    );
+}
+
 /// The immediate-bash seam sanitizes output exactly like Pi's `bash-executor.ts`'s `onData`
 /// (`sanitizeBinaryOutput(stripAnsi(decoder.decode(data,{stream:true}))).replace(/\r/g,"")`,
 /// line 82): raw ANSI SGR codes and carriage returns from a REAL child process must never reach the

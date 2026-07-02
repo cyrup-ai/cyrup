@@ -3166,7 +3166,19 @@ impl AgentSession {
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.bash_cancel) = Some(cancel.clone());
         let cwd = self.services.cwd.clone();
-        let outcome = run_bash(&self.proc, &self.shell, cwd, command.to_string(), cancel, on_chunk).await;
+        // Managed bin dir (Pi `getBinDir()`, `config.ts:549`: `join(getAgentDir(), "bin")`), matching
+        // `cyrup_config::ConfigDirs::bin_dir()`'s layout — see `run_bash`'s doc comment.
+        let bin_dir = self.services.agent_dir.join("bin");
+        let outcome = run_bash(
+            &self.proc,
+            &self.shell,
+            cwd,
+            command.to_string(),
+            Some(bin_dir.as_path()),
+            cancel,
+            on_chunk,
+        )
+        .await;
         *Self::lock(&self.bash_cancel) = None;
         let result = outcome?;
         self.record_bash_result(command, &result, options).await;

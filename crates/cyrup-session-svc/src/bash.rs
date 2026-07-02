@@ -8,6 +8,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cyrup_tools::ops::shell_env;
 use cyrup_tools::truncate::{TruncOpts, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use cyrup_tools::{ExecSpec, ExitStatus, ProcOps, ShellConfig};
 
@@ -48,6 +49,12 @@ pub struct BashOptions {
 /// Run `command` against `proc` in `cwd`, streaming combined output to `on_chunk`, honoring `cancel`
 /// (Pi `executeBashWithOperations`). The default local backend kills the whole tree on cancel.
 ///
+/// `bin_dir`, when set, is prepended to the child `PATH` exactly like the agent-loop `bash` tool
+/// (Pi `createLocalBashOperations`'s `env: env ?? getShellEnv()`, `core/tools/bash.ts:100`, which
+/// falls through to `getShellEnv()`'s unconditional `getBinDir()` prefix, `utils/shell.ts:122-128`).
+/// Without this, the `!!`/RPC `executeBash` seam would silently diverge from the normal `bash` tool
+/// (`cyrup-tools/src/tools/bash.rs:98`, `shell_env(opts.bin_dir)`) on which binaries resolve on PATH.
+///
 /// A genuine backend failure (spawn error, missing cwd, …) is returned as a real `Err`, NOT
 /// fabricated into a "successful" [`BashResult`] — Pi's `executeBashWithOperations` only catches the
 /// abort case in its `catch` block (`bash-executor.ts:130-155`); every other error hits `throw err`
@@ -58,10 +65,11 @@ pub(crate) async fn run_bash(
     shell: &ShellConfig,
     cwd: PathBuf,
     command: String,
+    bin_dir: Option<&std::path::Path>,
     cancel: cyrup_core::CancelToken,
     mut on_chunk: BashChunkSink,
 ) -> Result<BashResult, cyrup_core::ToolError> {
-    let spec = ExecSpec { command, cwd, env: Vec::new(), shell: shell.clone() };
+    let spec = ExecSpec { command, cwd, env: shell_env(bin_dir), shell: shell.clone() };
     let mut buffer = BashOutputBuffer::new();
     let status = proc
         .exec(spec, cancel, None, &mut |data: &[u8]| {
