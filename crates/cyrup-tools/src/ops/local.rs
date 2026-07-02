@@ -605,15 +605,20 @@ impl ProcOps for LocalProc {
                     grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
                 }
                 _ = &mut grace, if pending.is_some() => {
+                    // Grace elapsed with NO natural exit yet (a graceful mid-grace exit already
+                    // broke the loop via the `child.wait()`/drain arms below, which keep the REAL
+                    // code). Force it, but still capture whatever real status `wait()` reports
+                    // (Pi: SIGKILL ⇒ `exit(null)` ⇒ `code ?? 0`, matched by `exit_from`'s
+                    // no-code-⇒-`Signaled` mapping) rather than discarding it outright.
                     send_sigkill_tree(&mut child);
-                    let _ = child.wait().await;
-                    break pending.unwrap_or(ExitStatus::TimedOut);
+                    let real = child.wait().await.ok().map(exit_from);
+                    break real.unwrap_or_else(|| pending.unwrap_or(ExitStatus::TimedOut));
                 }
                 _ = &mut idle_grace, if idle_armed => {
-                    break match pending {
-                        Some(reason) => reason,
-                        None => exit_status.unwrap_or(ExitStatus::Exited(-1)),
-                    };
+                    // `idle_armed` is only set after `child.wait()` already captured the real
+                    // status below, so `exit_status` is always `Some` here — Pi's `killed` never
+                    // masks the real code (`child-process.ts:73-80`).
+                    break exit_status.unwrap_or(ExitStatus::Exited(-1));
                 }
                 chunk = read_chunk(&mut stdout) => {
                     match chunk {
@@ -627,7 +632,7 @@ impl ProcOps for LocalProc {
                             stdout = None;
                             if let Some(done) = exit_status
                                 && stderr.is_none() {
-                                    break pending.unwrap_or(done);
+                                    break done;
                                 }
                         }
                     }
@@ -644,7 +649,7 @@ impl ProcOps for LocalProc {
                             stderr = None;
                             if let Some(done) = exit_status
                                 && stdout.is_none() {
-                                    break pending.unwrap_or(done);
+                                    break done;
                                 }
                         }
                     }
@@ -656,14 +661,17 @@ impl ProcOps for LocalProc {
                     };
                     exit_status = Some(mapped);
                     if stdout.is_none() && stderr.is_none() {
-                        break pending.unwrap_or(mapped);
+                        break mapped;
                     }
                     idle_armed = true;
                     idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
                 }
             }
         };
-        Ok(ArgvOutput { status, stdout: out_buf, stderr: err_buf })
+        // `killed` (Pi's `killed` local, exec.ts:49) is set the instant a SIGTERM/SIGKILL
+        // escalation is INITIATED — orthogonal to `status`, which always carries the REAL observed
+        // code/signal outcome above (see `ArgvOutput` doc comment).
+        Ok(ArgvOutput { status, stdout: out_buf, stderr: err_buf, killed: pending.is_some() })
     }
 }
 
@@ -686,6 +694,12 @@ mod tests {
     /// escalation needed. Guards against a regression that makes EVERY timeout/cancel wait out the
     /// full grace period regardless of whether the tree already died (mirrors
     /// `cyrup_ext::caps::proc::kill_terminates_a_real_running_child_and_the_os_process_is_gone`).
+    ///
+    /// `sleep` does not trap SIGTERM, so it dies to the RAW signal (no exit code) — Pi's own
+    /// `code ?? 0` null-coalescing case (`exec.ts:97`) — which `exit_from` reports as `Signaled`;
+    /// `killed` is still `true` because a termination WAS initiated (orthogonal to `status`, see
+    /// `ArgvOutput`'s doc comment). This must NOT collapse to the bare `TimedOut` reason tag — that
+    /// was the bug (a real terminal status discarded whenever `pending` was `Some`).
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exec_argv_timeout_kills_a_normal_child_well_within_grace() {
@@ -695,12 +709,43 @@ mod tests {
             .exec_argv(argv("sleep", &["30"]), CancelToken::new(), Some(Duration::from_millis(200)))
             .await
             .expect("exec_argv runs");
-        assert_eq!(out.status, ExitStatus::TimedOut, "timeout still reports TimedOut");
+        assert_eq!(
+            out.status,
+            ExitStatus::Signaled,
+            "the REAL observed status (died to the raw signal) is reported, not the bare TimedOut tag"
+        );
+        assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `status`");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a SIGTERM-obeying child (`sleep`) must die well within the 5s grace period, got {:?}",
             started.elapsed()
         );
+    }
+
+    /// THE regression this fix closes: a well-behaved child that TRAPS SIGTERM and exits itself
+    /// with its OWN real, nonzero exit code mid-grace must have that REAL code reported — 1:1 with
+    /// Pi's `waitForChildProcess`/`finalize(exitCode)` (`child-process.ts:73-80`), which always
+    /// resolves with the actual observed `code`, `killed` bolted on separately (`exec.ts:97`). The
+    /// old cyrup behavior collapsed this to a hard-coded `code 0` any time a kill was in flight.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_timeout_preserves_the_real_code_of_a_graceful_sigterm_handler() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+        let out = proc
+            .exec_argv(
+                argv("sh", &["-c", "trap 'exit 7' TERM; while true; do sleep 1; done"]),
+                CancelToken::new(),
+                Some(Duration::from_millis(200)),
+            )
+            .await
+            .expect("exec_argv runs");
+        assert_eq!(
+            out.status,
+            ExitStatus::Exited(7),
+            "the child's OWN real exit code from its SIGTERM handler must survive, not be \
+             discarded to 0 because a kill was in flight"
+        );
+        assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `status`");
     }
 
     /// The FORCED SIGKILL escalation, exercised deterministically (mirrors
@@ -722,7 +767,12 @@ mod tests {
             )
             .await
             .expect("exec_argv runs");
-        assert_eq!(out.status, ExitStatus::TimedOut, "timeout still reports TimedOut");
+        assert_eq!(
+            out.status,
+            ExitStatus::Signaled,
+            "a forced SIGKILL reports the real (signal, no code) status, not the bare TimedOut tag"
+        );
+        assert!(out.killed, "a timeout-initiated kill is still `killed`");
         assert!(
             started.elapsed() >= Duration::from_millis(200),
             "the 100ms timeout + 150ms grace period was genuinely waited out before escalating to \
@@ -747,7 +797,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
         let out = task.await.expect("task joins").expect("exec_argv runs");
-        assert_eq!(out.status, ExitStatus::Killed, "cancel still reports Killed");
+        assert_eq!(
+            out.status,
+            ExitStatus::Signaled,
+            "a forced SIGKILL reports the real (signal, no code) status, not the bare Killed tag"
+        );
+        assert!(out.killed, "a cancel-initiated kill is still `killed`");
         assert!(
             started.elapsed() >= Duration::from_millis(200),
             "the grace period was genuinely waited out before escalating to SIGKILL, got {:?}",
@@ -805,6 +860,7 @@ mod tests {
         .expect("exec_argv must not hang past the idle-grace fallback")
         .expect("exec_argv runs");
         assert_eq!(out.status, ExitStatus::Exited(0), "the parent's own clean exit is reported");
+        assert!(!out.killed, "a natural exit with no cancel/timeout is never `killed`");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "must finalize within EXIT_STDIO_GRACE of the parent's exit, not wait on the \

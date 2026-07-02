@@ -231,11 +231,19 @@ pub struct ArgvSpec {
 
 /// Captured output of an argv exec (Pi `ExecResult`, exec.ts:23-28): stdout and stderr collected
 /// SEPARATELY (unlike the `bash` streaming seam which merges them), plus the exit status.
+///
+/// `killed` mirrors Pi's `killed` flag (exec.ts:49,97): it is set the instant a SIGTERM/SIGKILL
+/// escalation is INITIATED (cancel or timeout) and is otherwise completely orthogonal to `status` —
+/// exactly like Pi's `killProcess()` sets its own `killed` local independent of the `code` that
+/// `waitForChildProcess` resolves with (`child-process.ts:73-80`: `finalize(exitCode)` always
+/// carries the REAL observed exit code, even for a process that catches SIGTERM and exits itself
+/// mid-grace). Callers must NOT infer "was killed" from `status` alone.
 #[derive(Clone, Debug)]
 pub struct ArgvOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub killed: bool,
 }
 
 /// Process outcome. `Killed` (cancel) and `TimedOut` are returned as `Ok` so `bash` can craft the

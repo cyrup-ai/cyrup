@@ -434,13 +434,15 @@ impl HostServices for LiveHostServices {
                 return Ok(ExecOutput { code: 1, stdout: String::new(), stderr: String::new(), killed: false });
             }
         };
-        // Map the process status onto Pi's `{code, killed}` (exec.ts:52-63,97): a natural exit keeps
-        // its code; a host-driven kill (cancel/timeout) is `killed=true` with `code 0` (Pi's SIGTERM
-        // ⇒ exit null ⇒ `code ?? 0`); an external signal we did NOT send is `killed=false, code 0`.
-        let (code, killed) = match out.status {
-            ExitStatus::Exited(n) => (n, false),
-            ExitStatus::Signaled => (0, false),
-            ExitStatus::Killed | ExitStatus::TimedOut => (0, true),
+        // Map onto Pi's `{code, killed}` (exec.ts:49,97; `child-process.ts:73-80`): `killed` is set
+        // the instant a SIGTERM/SIGKILL escalation is INITIATED and is completely orthogonal to
+        // `code` — a process that catches SIGTERM and exits itself mid-grace still reports its REAL
+        // exit code, `killed` never masks it. `out.killed`/`out.status` already preserve exactly that
+        // split (`LocalProc::exec_argv`); do not re-derive `killed` from the status variant.
+        let killed = out.killed;
+        let code = match out.status {
+            ExitStatus::Exited(n) => n,
+            ExitStatus::Signaled | ExitStatus::Killed | ExitStatus::TimedOut => 0,
         };
         Ok(ExecOutput {
             code,
@@ -681,6 +683,21 @@ mod tests {
             .exec("sleep", &["30".to_string()], &json!({}), cancelled)
             .expect("a pre-cancelled exec resolves");
         assert!(out.killed, "a pre-aborted signal kills the exec");
+
+        // 7) a well-behaved child that TRAPS SIGTERM and exits itself with its OWN real code must
+        //    have that REAL code surfaced through the grant end-to-end — `killed` is orthogonal,
+        //    never masking it — 1:1 with Pi's `{code, killed}` (`exec.ts:97`; `child-process.ts:73-
+        //    80`'s `finalize(exitCode)` always carries the real observed code).
+        let out = svc
+            .exec(
+                "sh",
+                &["-c".to_string(), "trap 'exit 7' TERM; while true; do sleep 1; done".to_string()],
+                &json!({ "timeoutMs": 100 }),
+                CancelToken::new(),
+            )
+            .expect("the SIGTERM-trapping child runs then exits itself");
+        assert_eq!(out.code, 7, "the child's own real exit code survives a host-initiated kill");
+        assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `code`");
     }
 
     /// The `proc` grant's `spawn` defaults an OMITTED `cwd` to the session's own project directory —
