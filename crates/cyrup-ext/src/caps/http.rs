@@ -541,10 +541,13 @@ fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().no_gzip().no_brotli().no_deflate().no_zstd()
 }
 
-/// The response's `Content-Encoding` value, if any (lowercased is NOT applied — matches
-/// `tower_http`'s own byte-exact, case-SENSITIVE match against `gzip`/`deflate`/`br`/`zstd`; an
-/// unrecognized casing/value is treated as `identity`, exactly like the real decompression layer
-/// this replaces).
+/// The response's `Content-Encoding` value, verbatim (original casing preserved — this is also the
+/// exact string handed back to the guest as the real wire header, which must round-trip
+/// byte-for-byte; see [`HttpCaps::request`]'s doc). Matching against known codings is
+/// case-INSENSITIVE (RFC 9110 §8.4.1 / RFC 7231 §3.1.2.1: "All content-coding values are
+/// case-insensitive"; real consumer: `undici/lib/web/fetch/index.js:2267`'s
+/// `contentEncoding.toLowerCase().split(',')`) — done separately, on a lowercase COPY, by
+/// [`decode_buffered`]/[`decode_stream`], never here.
 fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers.get(reqwest::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }
@@ -578,9 +581,16 @@ const MAX_CONTENT_ENCODINGS: usize = 5;
 /// recognize degrades to identity for JUST that stage (matching the existing single-token fallback),
 /// not the whole chain, so a trailing/leading unknown token never silently defeats decoding of the
 /// KNOWN codings around it.
+///
+/// Matching is case-INSENSITIVE, on a lowercased COPY of `encoding` — RFC 9110 §8.4.1 / RFC 7231
+/// §3.1.2.1: "All content-coding values are case-insensitive"; real consumer:
+/// `undici/lib/web/fetch/index.js:2267`'s `contentEncoding.toLowerCase().split(',')`, run BEFORE
+/// the split, exactly mirrored here. The ORIGINAL `encoding` (and the untouched header this crate
+/// hands back to the guest, [`content_encoding_of`]) is never itself modified.
 async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let Some(encoding) = encoding else { return Ok(raw) };
-    let tokens: Vec<&str> = encoding.split(',').collect();
+    let lower = encoding.to_lowercase();
+    let tokens: Vec<&str> = lower.split(',').collect();
     if tokens.len() > MAX_CONTENT_ENCODINGS {
         return Err(format!(
             "too many content-encodings in response: {}, maximum allowed is {MAX_CONTENT_ENCODINGS}",
@@ -594,11 +604,15 @@ async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>
     Ok(body)
 }
 
-/// Decompress `raw` per a SINGLE `Content-Encoding` token (one stage of [`decode_buffered`]'s chain).
+/// Decompress `raw` per a SINGLE, already-lowercased `Content-Encoding` token (one stage of
+/// [`decode_buffered`]'s chain). `"x-gzip"` is `"gzip"`'s RFC 9112 §7.2 legacy alias — real
+/// consumer: `undici/lib/web/fetch/index.js:2280`'s `coding === 'x-gzip' || coding === 'gzip'`.
 async fn decode_buffered_one(encoding: &str, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let reader = tokio::io::BufReader::new(std::io::Cursor::new(raw));
     match encoding {
-        "gzip" => read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await,
+        "gzip" | "x-gzip" => {
+            read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await
+        }
         "br" => read_capped(async_compression::tokio::bufread::BrotliDecoder::new(reader)).await,
         "deflate" => {
             read_capped(async_compression::tokio::bufread::DeflateDecoder::new(reader)).await
@@ -648,7 +662,9 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Result<Vec<u8
 /// identity for just that one stage. Also matches [`decode_buffered`]'s [`MAX_CONTENT_ENCODINGS`]
 /// chain-depth cap — `Err` here means [`HttpCaps::request_stream`] fails the WHOLE call before ever
 /// registering a stream handle, matching undici's `reject(...)` (`index.js:2272-2275`), not a
-/// stream that silently opens and then errors on first poll.
+/// stream that silently opens and then errors on first poll. Matching is case-INSENSITIVE, on a
+/// lowercased COPY of `encoding` — see [`decode_buffered`]'s doc for the same RFC citation; the
+/// original header this crate hands back to the guest is never touched.
 fn decode_stream(
     encoding: Option<&str>,
     raw: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -658,7 +674,8 @@ fn decode_stream(
     // stream.
     let mut stream: ChunkStream = Box::pin(raw.map(|r| r.map_err(std::io::Error::other)));
     let Some(encoding) = encoding else { return Ok(stream) };
-    let tokens: Vec<&str> = encoding.split(',').collect();
+    let lower = encoding.to_lowercase();
+    let tokens: Vec<&str> = lower.split(',').collect();
     if tokens.len() > MAX_CONTENT_ENCODINGS {
         return Err(format!(
             "too many content-encodings in response: {}, maximum allowed is {MAX_CONTENT_ENCODINGS}",
@@ -671,11 +688,12 @@ fn decode_stream(
     Ok(stream)
 }
 
-/// Wrap `raw` through the decoder for a SINGLE `Content-Encoding` token (one stage of
-/// [`decode_stream`]'s chain).
+/// Wrap `raw` through the decoder for a SINGLE, already-lowercased `Content-Encoding` token (one
+/// stage of [`decode_stream`]'s chain). `"x-gzip"` is `"gzip"`'s RFC 9112 §7.2 legacy alias — see
+/// [`decode_buffered_one`]'s doc for the same citation.
 fn decode_stream_one(encoding: &str, raw: ChunkStream) -> ChunkStream {
     match encoding {
-        "gzip" => {
+        "gzip" | "x-gzip" => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
@@ -812,6 +830,97 @@ mod tests {
             "Content-Length must still report the ORIGINAL (compressed, wire) size, matching real \
              fetch(), not the decompressed body's length: {:?}",
             resp.headers
+        );
+    }
+
+    /// THE finding this closes, half 1: `Content-Encoding` matching must be case-INSENSITIVE (RFC
+    /// 9110 §8.4.1 / RFC 7231 §3.1.2.1, `undici/lib/web/fetch/index.js:2267`'s
+    /// `.toLowerCase()`) — a real server sending `Content-Encoding: GZIP` (mixed/upper case is
+    /// legal per the RFC, and observed from real servers) must still decompress, not silently pass
+    /// the compressed bytes through as if `gzip` were unrecognized. The ORIGINAL header casing
+    /// must still round-trip byte-for-byte to the guest, matching real `fetch()`.
+    #[tokio::test]
+    async fn request_decodes_an_uppercase_content_encoding_and_preserves_its_original_casing() {
+        let plaintext = b"case-insensitive decompression world, repeated: \
+            case-insensitive decompression world, case-insensitive decompression world"
+            .to_vec();
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Encoding: GZIP\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(
+            resp.body, plaintext,
+            "an uppercase `GZIP` Content-Encoding must still be decompressed, matching real fetch()"
+        );
+        let get = |name: &str| {
+            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("content-encoding"),
+            Some("GZIP"),
+            "the ORIGINAL casing must still round-trip untouched, matching real fetch(): {:?}",
+            resp.headers
+        );
+    }
+
+    /// THE finding this closes, half 2: `x-gzip` is `gzip`'s RFC 9112 §7.2 legacy alias —
+    /// `undici/lib/web/fetch/index.js:2280`'s `coding === 'x-gzip' || coding === 'gzip'` — and must
+    /// decompress identically to `gzip`, not fall through to the unrecognized-token identity path.
+    #[tokio::test]
+    async fn request_decodes_the_x_gzip_legacy_alias() {
+        let plaintext = b"x-gzip legacy alias decompression world, repeated: \
+            x-gzip legacy alias decompression world, x-gzip legacy alias decompression world"
+            .to_vec();
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Encoding: x-gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(
+            resp.body, plaintext,
+            "`x-gzip` must decompress exactly like `gzip`, matching real fetch()'s legacy alias"
+        );
+    }
+
+    /// Same finding, the streaming path: `x-gzip` must decompress identically to `gzip` when
+    /// draining chunks via `request_stream`/`poll_stream_chunk`, not just the buffered path.
+    #[tokio::test]
+    async fn request_stream_decodes_the_x_gzip_legacy_alias() {
+        let plaintext = b"streaming x-gzip legacy alias world, repeated: \
+            streaming x-gzip legacy alias world, streaming x-gzip legacy alias world"
+            .to_vec();
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Encoding: x-gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, plaintext,
+            "`x-gzip` must decompress exactly like `gzip` over the streaming path too"
         );
     }
 
