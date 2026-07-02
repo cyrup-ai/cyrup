@@ -8,6 +8,7 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cyrup_modes::{run_json, run_print, run_rpc, PrintOptions, SessionCommand};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
@@ -638,6 +639,134 @@ async fn rpc_extension_ui_request_response_round_trips() {
     assert_eq!(guest_input.await.unwrap(), None, "cancelled input -> None");
 
     // EOF → the loop drains and returns.
+    drop(client_tx);
+    rpc.await.unwrap();
+}
+
+/// L4 review §2.2 (CRITICAL): a `timeout_ms`-bearing dialog whose RPC client NEVER answers must still
+/// resolve within that window — Pi's `createDialogPromise` host-armed `setTimeout`
+/// (`rpc-mode.ts:114-119`) ALWAYS settles the Promise regardless of client behavior. Proves the fix
+/// end-to-end over the real wire protocol: the client sees the `timeout` field on the outgoing request
+/// (rpc-types.ts shape) but deliberately never answers it, and the loop stays alive/responsive
+/// afterward (a subsequent `get_state` still gets served — the turn was never left hung).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_responds() {
+    use cyrup_ext::host::{DialogOptions, HostServices};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let session = runtime.session().await;
+    let host_services = session.services().host_services.clone();
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    let boot = read_json_line(&mut client_reader).await;
+    assert_eq!(boot["command"], "get_state");
+
+    // Open a confirm dialog with a short live countdown; the guest call is driven on a blocking task
+    // exactly as the wasm-suspended host import would be.
+    let hs = host_services.clone();
+    let opts = DialogOptions { timeout_ms: Some(80), signal_id: None };
+    let started = tokio::time::Instant::now();
+    let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", &opts) });
+
+    // The client sees the request, including Pi's `timeout` field — and simply never answers it.
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "confirm");
+    assert_eq!(req["timeout"], 80, "the wire `timeout` field carries opts.timeout_ms verbatim");
+
+    // The guest call must settle to the confirm default (`false`) on its own, well inside a generous
+    // bound — proving the host, not the client, is what unblocks it.
+    let resolved = tokio::time::timeout(Duration::from_secs(5), guest_confirm)
+        .await
+        .expect("the dialog must not hang past its timeout_ms")
+        .expect("confirm task");
+    assert!(!resolved, "an unanswered confirm settles to Pi's `false` default on timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "must settle close to the 80ms timeout, not linger: {:?}",
+        started.elapsed()
+    );
+
+    // The loop is still alive and serving requests — the abandoned dialog never hung the session.
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    let after = read_json_line(&mut client_reader).await;
+    assert_eq!(after["command"], "get_state");
+    assert_eq!(after["id"], "after");
+
+    drop(client_tx);
+    rpc.await.unwrap();
+}
+
+/// L4 review §2.5 (MAJOR): aborting the in-flight turn immediately dismisses any dialog that turn's
+/// extension currently has open, rather than only pre-empting a dialog before it opens. The client
+/// deliberately never sends an `extension_ui_response` for the open dialog — only `abort` unblocks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_abort_force_resolves_a_pending_dialog() {
+    use cyrup_ext::host::{DialogOptions, HostServices};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let session = runtime.session().await;
+    let host_services = session.services().host_services.clone();
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    let boot = read_json_line(&mut client_reader).await;
+    assert_eq!(boot["command"], "get_state");
+
+    // Open a `select` dialog with NO timeout at all — only a live abort can ever unblock it.
+    let hs = host_services.clone();
+    let guest_select =
+        tokio::spawn(async move {
+            hs.select("Pick one", &serde_json::json!(["a", "b"]), &DialogOptions::default())
+        });
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "select");
+
+    // The client never answers the dialog — it aborts the turn instead.
+    client_tx.write_all(b"{\"type\":\"abort\",\"id\":\"stop\"}\n").await.unwrap();
+    let abort_resp = read_json_line(&mut client_reader).await;
+    assert_eq!(abort_resp["command"], "abort");
+    assert_eq!(abort_resp["success"], true);
+
+    // The guest's still-open dialog must resolve immediately, bounded well under what a "never
+    // answered, no timeout" dialog would otherwise do (hang forever).
+    let resolved = tokio::time::timeout(Duration::from_secs(2), guest_select)
+        .await
+        .expect("abort must force-resolve the pending dialog, not leave it hanging")
+        .expect("select task");
+    assert_eq!(resolved, None, "an aborted select settles to Pi's `undefined` default");
+
+    // The loop is still alive afterward.
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    let after = read_json_line(&mut client_reader).await;
+    assert_eq!(after["command"], "get_state");
+
     drop(client_tx);
     rpc.await.unwrap();
 }

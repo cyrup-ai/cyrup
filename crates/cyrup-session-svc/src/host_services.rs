@@ -184,10 +184,18 @@ impl LiveHostServices {
 
     /// Route one dialog request to the attached renderer and BLOCK (the guest is wasm-suspended) on the
     /// reply — the request/reply counterpart to the fire-and-forget [`Self::control`]. Returns `None`
-    /// when there is no sink (headless: the ui method then yields its deny default WITHOUT blocking) or
-    /// when the renderer dropped the reply (cancelled / shut down). Uses the SAME `block_in_place` +
-    /// `block_on` pattern the `exec` grant uses ([`Self::exec`]); requires a multi-threaded runtime,
-    /// which interactive/rpc guarantee (`#[tokio::main(flavor = "multi_thread")]`, main.rs:40).
+    /// when there is no sink (headless: the ui method then yields its deny default WITHOUT blocking),
+    /// when the renderer dropped the reply (cancelled / shut down), OR when `opts.timeout_ms` elapses
+    /// with no reply — the caller then falls through to its per-kind deny default, matching Pi's
+    /// `createDialogPromise`'s host-armed `setTimeout(() => resolve(defaultValue), opts.timeout)`
+    /// (`rpc-mode.ts:114-119`), which ALWAYS settles the dialog within `opts.timeout` ms regardless of
+    /// client behavior (closes L4 review §2.2). A renderer can ALSO force-resolve an already-open
+    /// dialog early by sending on the SAME `reply` one-shot this call is waiting on (e.g. the RPC loop's
+    /// `pending` map on `abort`/`abort_retry`, `rpc.rs` — closes L4 review §2.5); that arrives on the
+    /// `reply_rx` branch below like any ordinary answer, no extra wiring needed here. Uses the SAME
+    /// `block_in_place` + `block_on` pattern the `exec` grant uses ([`Self::exec`]); requires a
+    /// multi-threaded runtime, which interactive/rpc guarantee
+    /// (`#[tokio::main(flavor = "multi_thread")]`, main.rs:40).
     fn ui_roundtrip(
         &self,
         kind: UiKind,
@@ -202,7 +210,22 @@ impl LiveHostServices {
             // The renderer (TUI loop / RPC loop) is gone — degrade to the deny default, never a panic.
             return None;
         }
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(reply_rx)).ok()
+        let timeout = opts.timeout_ms.map(Duration::from_millis);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                match timeout {
+                    // Race the reply against a live countdown — Pi's `setTimeout` safety net. Whichever
+                    // settles first wins; on timeout the reply half is dropped (never polled again), so
+                    // a late answer simply finds its `reply.send` fail harmlessly (`Err`, never a panic).
+                    Some(d) => tokio::select! {
+                        biased;
+                        reply = reply_rx => reply.ok(),
+                        () = tokio::time::sleep(d) => None,
+                    },
+                    None => reply_rx.await.ok(),
+                }
+            })
+        })
     }
 
     /// Wire the command-tier control channel: a loaded extension's `control` capability (new/switch/
@@ -696,6 +719,91 @@ mod tests {
             .await
             .expect("editor task");
         assert_eq!(editor.as_deref(), Some("edited:hello"));
+    }
+
+    /// L4 review §2.2: a dialog whose renderer NEVER answers still resolves within `opts.timeout_ms` —
+    /// Pi's `createDialogPromise` host-armed `setTimeout(() => resolve(defaultValue), opts.timeout)`
+    /// (`rpc-mode.ts:114-119`) ALWAYS settles the awaited Promise regardless of client behavior. The
+    /// scripted renderer here receives every request and drops it on the floor (never replies), proving
+    /// `ui_roundtrip` races the reply against a REAL timer rather than blocking forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_grant_honors_timeout_ms_and_resolves_to_the_default_on_no_response() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+        // The "hung client": receives every request and HOLDS it (keeping `req.reply` open, exactly
+        // like the RPC loop's `pending` map keeps a live entry) but never sends a reply — the real
+        // shape of a non-responding client, as opposed to a dropped sender (which would resolve the
+        // receiver immediately with an error and prove nothing about the timeout race).
+        let held: Arc<Mutex<Vec<UiRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let held2 = held.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                held2.lock().unwrap_or_else(|e| e.into_inner()).push(req);
+            }
+        });
+
+        let opts = DialogOptions { timeout_ms: Some(50), signal_id: None };
+
+        let s1 = svc.clone();
+        let o1 = opts.clone();
+        let started = tokio::time::Instant::now();
+        let confirm =
+            tokio::task::spawn_blocking(move || s1.confirm("proceed?", &o1)).await.expect("confirm task");
+        let elapsed = started.elapsed();
+        assert!(!confirm, "an unanswered confirm resolves to Pi's `false` default, not a hang");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "confirm must settle close to the 50ms timeout, not hang indefinitely (took {elapsed:?})"
+        );
+
+        let s2 = svc.clone();
+        let o2 = opts.clone();
+        let input = tokio::task::spawn_blocking(move || s2.input("name?", &o2)).await.expect("input task");
+        assert_eq!(input, None, "an unanswered input resolves to Pi's `undefined` default");
+
+        let s3 = svc.clone();
+        let o3 = opts;
+        let select = tokio::task::spawn_blocking(move || s3.select("pick", &json!(["a", "b"]), &o3))
+            .await
+            .expect("select task");
+        assert_eq!(select, None, "an unanswered select resolves to Pi's `undefined` default");
+    }
+
+    /// L4 review §2.5 (the shared mechanism half): a reply sent on the SAME one-shot `ui_roundtrip` is
+    /// waiting on unblocks it immediately, well before a long `timeout_ms` would otherwise elapse. This
+    /// is exactly what the RPC loop's `force_resolve_pending` (`rpc.rs`, wired to `abort`/`abort_retry`)
+    /// does to LIVE-dismiss an already-open dialog — no separate cancellation channel is needed because
+    /// forcing the existing reply is sufficient, and this proves that path is genuinely live, not merely
+    /// a pre-flight snapshot check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_grant_force_resolved_reply_unblocks_before_a_long_timeout_elapses() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+        // Simulate a live "abort": as soon as the dialog opens, force-resolve it directly (the same
+        // action `force_resolve_pending` takes) instead of waiting for a real user response.
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                let _ = req.reply.send(UiReply::Confirm(false));
+            }
+        });
+
+        // A 10-second timeout that must NOT be what unblocks this call.
+        let opts = DialogOptions { timeout_ms: Some(10_000), signal_id: None };
+        let started = tokio::time::Instant::now();
+        let confirm =
+            tokio::task::spawn_blocking(move || svc.confirm("proceed?", &opts)).await.expect("confirm task");
+        let elapsed = started.elapsed();
+        assert!(!confirm);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a force-resolved reply must win the race immediately, not wait out the 10s timeout (took {elapsed:?})"
+        );
     }
 
     /// The DEFAULT (deny-all) backend denies exec with Pi's "not granted" message — the untrusted

@@ -327,26 +327,48 @@ fn extension_ui_request_json(id: &str, req: &UiRequest) -> Value {
     }
 }
 
+/// The per-kind deny default a dialog resolves to when it is never genuinely answered — Pi's
+/// `createDialogPromise` `defaultValue` argument (`select`/`input` → `undefined`, `confirm` → `false`,
+/// rpc-mode.ts:136-149): `{cancelled:true}`, an unresponded timeout (§2.2), and a force-resolved
+/// `abort`/`abort_retry` (§2.5) all settle here.
+fn default_ui_reply(kind: UiKind) -> UiReply {
+    match kind {
+        UiKind::Confirm => UiReply::Confirm(false),
+        UiKind::Input | UiKind::Editor | UiKind::Select => UiReply::Text(None),
+    }
+}
+
 /// Map an `extension_ui_response` body onto the guest's expected [`UiReply`] for `pending` (Pi
 /// `parseResponse`, rpc-mode.ts:137-149,257-264). A `{cancelled:true}` yields the per-kind default; a
 /// `{confirmed}` a confirm; a `{value}` maps straight to text (input/editor/select) — Pi's
 /// `select(...): Promise<string|undefined>` (types.ts:127) passes the chosen STRING straight through
 /// to the guest, with NO index translation.
 fn map_ui_response(pending: &PendingUi, body: &Value) -> UiReply {
-    let cancelled = body.get("cancelled").and_then(Value::as_bool) == Some(true);
+    if body.get("cancelled").and_then(Value::as_bool) == Some(true) {
+        return default_ui_reply(pending.kind);
+    }
     match pending.kind {
         UiKind::Confirm => {
-            if cancelled {
-                return UiReply::Confirm(false);
-            }
             UiReply::Confirm(body.get("confirmed").and_then(Value::as_bool).unwrap_or(false))
         }
         UiKind::Input | UiKind::Editor | UiKind::Select => {
-            if cancelled {
-                return UiReply::Text(None);
-            }
             UiReply::Text(body.get("value").and_then(Value::as_str).map(str::to_owned))
         }
+    }
+}
+
+/// Force-resolve every dialog the current turn's extension(s) have open to its per-kind default and
+/// drop it from `pending` (closes L4 review §2.5). RPC serves one turn at a time (`in_flight`), so
+/// every entry still in `pending` at the moment of `abort`/`abort_retry` belongs to the turn being
+/// aborted — matching Pi's usual pattern of binding a dialog's `ExtensionUIDialogOptions.signal` to
+/// the current run's `AbortSignal` (`ctx.signal`, types.ts:320-321), which Pi's `createDialogPromise`
+/// live abort listener resolves immediately (`rpc-mode.ts:108-112`). Sending on `p.reply` here is
+/// exactly what a genuine `extension_ui_response` does — it resumes [`LiveHostServices::ui_roundtrip`]
+/// (`host_services.rs`) the SAME way, no separate cancellation channel required.
+fn force_resolve_pending(pending: &mut HashMap<String, PendingUi>) {
+    for (_, p) in pending.drain() {
+        let reply = default_ui_reply(p.kind);
+        let _ = p.reply.send(reply);
     }
 }
 
@@ -416,7 +438,7 @@ where
                             }
                             continue;
                         }
-                        let dispatched = dispatch(runtime, &session, &line, &mut in_flight).await;
+                        let dispatched = dispatch(runtime, &session, &line, &mut in_flight, &mut pending).await;
                         write_out(writer, &RpcOut::Response(dispatched.response)).await?;
                         if dispatched.rebind {
                             // Pi `rebindSession`: the active session was replaced — re-acquire it
@@ -435,6 +457,11 @@ where
             Some(req) = ui_rx.recv() => {
                 // A guest opened a dialog: allocate a correlation id, emit the Pi `extension_ui_request`
                 // on stdout, and stash the one-shot until the client's `extension_ui_response` arrives.
+                // First prune any entry whose `reply` half [`LiveHostServices::ui_roundtrip`] already
+                // gave up on (a §2.2 timeout fired, or the guest's reply channel was otherwise dropped)
+                // — cheap (bounded by the open-dialog count) and keeps a long-running session's `pending`
+                // map from growing unboundedly across many timed-out dialogs.
+                pending.retain(|_, p| !p.reply.is_closed());
                 let id = new_request_id();
                 let wire = extension_ui_request_json(&id, &req);
                 pending.insert(id, PendingUi { kind: req.kind, reply: req.reply });
@@ -488,6 +515,7 @@ async fn dispatch(
     session: &AgentSession,
     line: &str,
     in_flight: &mut bool,
+    pending: &mut HashMap<String, PendingUi>,
 ) -> Dispatched {
     // (1) Parse the raw line. A malformed line is Pi's `"parse"` error with NO id.
     let value: Value = match serde_json::from_str(line) {
@@ -518,7 +546,7 @@ async fn dispatch(
             Dispatched { response: RpcResponse::err(name, raw_id, message), rebind: false }
         }
         Ok(cmd) => {
-            let response = handle(runtime, session, cmd, raw_id, in_flight).await;
+            let response = handle(runtime, session, cmd, raw_id, in_flight, pending).await;
             // The session-replacing commands rebind on success (non-cancelled).
             let rebind = response.success
                 && matches!(
@@ -561,6 +589,7 @@ async fn handle(
     cmd: SessionCommand,
     raw_id: Option<Value>,
     in_flight: &mut bool,
+    pending: &mut HashMap<String, PendingUi>,
 ) -> RpcResponse {
     // Pi reads the id once at the top of `handleCommand` (`const id = command.id`, rpc-mode.ts:383);
     // cyrup recovered it in `dispatch` and threads it in as `raw_id`. Each arm clones it into the
@@ -598,6 +627,10 @@ async fn handle(
         }
         SessionCommand::Abort => {
             session.abort();
+            // Dismiss any dialog the aborted turn's extension currently has open (L4 review §2.5) —
+            // Pi's live `AbortSignal` listener resolving `createDialogPromise` immediately
+            // (`rpc-mode.ts:108-112`), instead of leaving it to hang until a client response arrives.
+            force_resolve_pending(pending);
             RpcResponse::ok("abort", raw_id.clone(), None)
         }
         SessionCommand::NewSession { parent_session } => {
@@ -717,6 +750,9 @@ async fn handle(
         }
         SessionCommand::AbortRetry => {
             session.abort_retry();
+            // Same live-dismiss treatment as `abort` (L4 review §2.5) — a queued auto-retry being
+            // called off should not leave a dialog its extension opened hanging either.
+            force_resolve_pending(pending);
             RpcResponse::ok("abort_retry", raw_id.clone(), None)
         }
 
