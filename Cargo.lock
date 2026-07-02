@@ -1276,6 +1276,7 @@ version = "0.0.0"
 dependencies = [
  "cyrup-agent",
  "cyrup-core",
+ "cyrup-ext",
  "cyrup-provider",
  "cyrup-resources",
  "cyrup-session-svc",

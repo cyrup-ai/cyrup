@@ -295,6 +295,18 @@ pub struct ActiveSelector {
 struct PendingUiReply {
     kind: UiKind,
     reply: tokio::sync::oneshot::Sender<UiReply>,
+    /// The dialog's title WITHOUT any countdown suffix, so each tick recomputes `"{base_title}
+    /// ({s}s)"` fresh off the current remaining time rather than accumulating appended text.
+    base_title: String,
+    /// When this dialog auto-resolves to its per-kind deny default if the user hasn't answered by
+    /// then — Pi's `CountdownTimer` (`countdown-timer.ts:7-38`), armed from the guest's
+    /// `opts.timeout_ms` exactly like `LiveHostServices::ui_roundtrip`'s OWN independent host-side
+    /// timeout race (`host_services.rs`) arms from the SAME value; the two are deliberately separate
+    /// clocks (mirroring Pi's `createDialogPromise`'s host-armed `setTimeout` vs. the renderer's own
+    /// `CountdownTimer`, `rpc-mode.ts:114-119`) — whichever fires first wins the reply, and the loser
+    /// finds it a harmless no-op. `None` when the guest set no timeout (dialog waits indefinitely for
+    /// a key, matching `ui_roundtrip`'s own `None` branch).
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// The per-kind deny default a dialog resolves to when the user cancels it (`Esc`) rather than
@@ -305,6 +317,17 @@ fn default_ui_reply(kind: UiKind) -> UiReply {
         UiKind::Confirm => UiReply::Confirm(false),
         UiKind::Input | UiKind::Editor | UiKind::Select => UiReply::Text(None),
     }
+}
+
+/// Format `base` with a live "(Ns)" countdown suffix — Pi's `CountdownTimer`'s exact title format
+/// (`` `${this.baseTitle} (${s}s)` ``, `countdown-timer.ts:14,23,55`). Rounds UP (Pi's own
+/// `Math.ceil(timeoutMs / 1000)`, `countdown-timer.ts:18`) so e.g. 4500ms remaining reads "5s", not
+/// "4s"; a `deadline` already in the past reads "0s" (the tick loop closes the dialog that same
+/// pass, so this is never rendered for more than one frame).
+fn countdown_title(base: &str, deadline: tokio::time::Instant) -> String {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let secs = remaining.as_millis().div_ceil(1000);
+    format!("{base} ({secs}s)")
 }
 
 /// A backend that can rebuild a fresh handle over the **same** underlying terminal, so the inline
@@ -1119,7 +1142,11 @@ impl<B: Backend> App<B> {
     /// floating overlay is already open when a guest dialog arrives, it is denied immediately with its
     /// per-kind deny default (there is nowhere to render it) rather than queued or silently dropped —
     /// the guest's `ui_roundtrip` never blocks past this call regardless.
-    fn open_extension_dialog(&mut self, req: UiRequest) {
+    ///
+    /// `pub` (not called outside [`App::run`]'s `ui_rx` arm in production) so `tests/*.rs` can drive
+    /// it directly with a synthetic [`UiRequest`] — the crate's established pattern for exercising
+    /// run-loop-only logic (mirrors [`Self::open_boxed_selector`]/[`Self::active_selector_kind`]).
+    pub fn open_extension_dialog(&mut self, req: UiRequest) {
         if self.state.selector.is_some() || !self.state.overlays.is_empty() {
             self.state.transcript.push_status(format!(
                 "extension {:?} dialog: another dialog/selector is already open, denied",
@@ -1128,32 +1155,43 @@ impl<B: Backend> App<B> {
             let _ = req.reply.send(default_ui_reply(req.kind));
             return;
         }
-        let UiRequest { kind, prompt, options, message, placeholder, reply, .. } = req;
-        let (selector_kind, inner): (SelectorKind, Box<dyn Selector>) = match kind {
+        let UiRequest { kind, prompt, options, message, placeholder, opts, reply } = req;
+        let (selector_kind, base_title, mut inner): (SelectorKind, String, Box<dyn Selector>) = match kind
+        {
             UiKind::Confirm => {
                 let title = if message.is_empty() { prompt } else { format!("{prompt} — {message}") };
                 let rows = vec![
                     ("yes".to_string(), "Yes".to_string(), None),
                     ("no".to_string(), "No".to_string(), None),
                 ];
-                (SelectorKind::ExtensionConfirm, Box::new(ListSelector::prompt(title, rows, 0)))
+                (
+                    SelectorKind::ExtensionConfirm,
+                    title.clone(),
+                    Box::new(ListSelector::prompt(title, rows, 0)),
+                )
             }
             UiKind::Select => {
-                let opts: Vec<String> = options
+                let picked: Vec<String> = options
                     .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                     .unwrap_or_default();
-                if opts.is_empty() {
+                if picked.is_empty() {
                     let _ = reply.send(UiReply::Text(None));
                     return;
                 }
                 let rows: Vec<(String, String, Option<String>)> =
-                    opts.into_iter().map(|o| (o.clone(), o, None)).collect();
-                (SelectorKind::ExtensionSelect, Box::new(ListSelector::prompt(prompt, rows, 0)))
+                    picked.into_iter().map(|o| (o.clone(), o, None)).collect();
+                (
+                    SelectorKind::ExtensionSelect,
+                    prompt.clone(),
+                    Box::new(ListSelector::prompt(prompt, rows, 0)),
+                )
             }
-            UiKind::Input => {
-                (SelectorKind::ExtensionInput, Box::new(TextInputSelector::new(prompt, placeholder)))
-            }
+            UiKind::Input => (
+                SelectorKind::ExtensionInput,
+                prompt.clone(),
+                Box::new(TextInputSelector::new(prompt, placeholder)),
+            ),
             UiKind::Editor => {
                 // Unreachable: `App::run`'s `ui_rx` arm intercepts `UiKind::Editor` and handles it
                 // synchronously via `edit_in_external_editor` before ever calling this method.
@@ -1161,8 +1199,53 @@ impl<B: Backend> App<B> {
                 return;
             }
         };
+        // Pi's `CountdownTimer` (`countdown-timer.ts:7-38`, wired by `ExtensionSelectorComponent`/
+        // `ExtensionInputComponent`): a guest-set `opts.timeout_ms > 0` arms a live 1s-cadence
+        // countdown, shown in the title from the INSTANT the dialog opens (Pi calls `onTick`
+        // synchronously in its constructor, `countdown-timer.ts:19`) and ticked forward by
+        // [`App::tick_extension_dialog_countdown`] — closing the gap where the dialog otherwise never
+        // showed the deadline `LiveHostServices::ui_roundtrip` already enforces host-side, and stayed
+        // open on screen (stale) after that host-side timeout had already resolved the guest's call.
+        let deadline = opts
+            .timeout_ms
+            .filter(|&ms| ms > 0)
+            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        if let Some(deadline) = deadline {
+            inner.set_title(countdown_title(&base_title, deadline));
+        }
         self.open_boxed_selector(selector_kind, inner);
-        self.state.pending_ui_reply = Some(PendingUiReply { kind, reply });
+        self.state.pending_ui_reply = Some(PendingUiReply { kind, reply, base_title, deadline });
+    }
+
+    /// Advance the open extension-UI dialog's countdown by one tick (Pi's `CountdownTimer`'s 1s
+    /// `setInterval`, `countdown-timer.ts:21-30`): live-updates the selector's title with the
+    /// remaining seconds, or — once the deadline has passed — auto-resolves the dialog to its
+    /// per-kind deny default and closes the slot (Pi's `onExpire` → `onCancelCallback`,
+    /// `extension-selector.ts:56`/`extension-input.ts:59`), exactly like an `Esc` cancel
+    /// ([`App::handle_selector_key`]'s `Cancel` arm). A stale reply send (the host's OWN independent
+    /// `ui_roundtrip` timeout already won the race) is a harmless no-op, same as every other reply
+    /// site in this module. A no-op when no extension dialog is open or it has no timeout armed —
+    /// callers gate the driving interval on this same condition so it costs nothing otherwise.
+    ///
+    /// `pub` for the same reason as [`Self::open_extension_dialog`]: `tests/*.rs` calls it directly
+    /// to simulate the run loop's 1s tick without needing a real `tokio::time::sleep`.
+    pub fn tick_extension_dialog_countdown(&mut self) {
+        let Some((base_title, deadline)) = self
+            .state
+            .pending_ui_reply
+            .as_ref()
+            .and_then(|p| p.deadline.map(|d| (p.base_title.clone(), d)))
+        else {
+            return;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(pending) = self.state.pending_ui_reply.take() {
+                let _ = pending.reply.send(default_ui_reply(pending.kind));
+            }
+            self.close_selector(true);
+        } else if let Some(active) = self.state.selector.as_mut() {
+            active.inner.set_title(countdown_title(&base_title, deadline));
+        }
     }
 
     /// Route one key to the active selector and act on the outcome (spec/tui/05 §3.1). `Confirm`
@@ -2736,6 +2819,12 @@ impl App<CrosstermBackend<Stdout>> {
         // session never busy-loops (the branch is `if`-gated on `indicator.is_active()`).
         let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
         spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The extension-UI dialog countdown tick (Pi's `CountdownTimer`, `countdown-timer.ts:21-30`):
+        // a 1s redraw used **only while** an open `ui.{confirm,select,input}` dialog has a
+        // guest-set `opts.timeout_ms` armed, so an idle session (or a dialog with no timeout) never
+        // pays for it — mirrors the spinner's own `if`-gated pattern immediately above.
+        let mut dialog_countdown = tokio::time::interval(Duration::from_secs(1));
+        dialog_countdown.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A live `!`/`!!` bash subprocess: its output receiver + a cancel token to kill it (`Esc`).
         // Kept as run-loop locals (not on `self`) so the `select!` borrow does not collide with the
         // input-arm `&mut self`.
@@ -2769,6 +2858,12 @@ impl App<CrosstermBackend<Stdout>> {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = spinner.tick(), if self.state.indicator.is_active() => {
+                    self.draw_synchronized()?;
+                }
+                _ = dialog_countdown.tick(),
+                    if self.state.pending_ui_reply.as_ref().is_some_and(|p| p.deadline.is_some()) =>
+                {
+                    self.tick_extension_dialog_countdown();
                     self.draw_synchronized()?;
                 }
                 maybe_in = input.next() => {

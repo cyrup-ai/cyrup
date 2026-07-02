@@ -147,6 +147,10 @@ impl Selector for TextInputSelector {
             _ => SelectorOutcome::Ignored,
         }
     }
+
+    fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
 }
 
 #[cfg(test)]

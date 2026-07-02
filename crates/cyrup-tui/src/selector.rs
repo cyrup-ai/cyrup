@@ -168,6 +168,12 @@ pub trait Selector: Send {
     fn cursor(&self) -> Option<(u16, u16)> {
         None
     }
+    /// Overwrite the selector's rendered title, if it has one (a no-op default for the selectors
+    /// that don't). Used by the extension-UI countdown (Pi's `CountdownTimer`, `countdown-timer.ts:
+    /// 7-38`) to live-update an open `ui.{confirm,select,input}` dialog's title with its remaining
+    /// `(Ns)` once per second, exactly like `ExtensionSelectorComponent`/`ExtensionInputComponent`'s
+    /// `titleText.setText` — see [`App::tick_extension_dialog_countdown`](crate::app::App).
+    fn set_title(&mut self, _title: String) {}
 }
 
 /// The shared list-selector engine (spec/tui/05 §3.2 `ListView<T>`): a [`SelectList`] body wrapped in
@@ -345,6 +351,10 @@ impl Selector for ListSelector {
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => SelectorOutcome::Ignored,
         }
+    }
+
+    fn set_title(&mut self, title: String) {
+        self.title = Some(title);
     }
 }
 

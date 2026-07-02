@@ -45,4 +45,8 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 # Dev-only: lets the streaming-delta render test build the `AgentMessage` carried by
 # `AgentSessionEvent::MessageUpdate` (the runtime payload the TUI ignores but the variant requires).
 cyrup-agent = { workspace = true }
+# Dev-only: `DialogOptions` (the type of `UiRequest::opts`, cyrup-session-svc's own public API) lives
+# in cyrup-ext and isn't re-exported by cyrup-session-svc; the extension-dialog-countdown test needs
+# it to build a synthetic `UiRequest`. Already a transitive dep via cyrup-session-svc.
+cyrup-ext = { workspace = true }
 tempfile.workspace = true
