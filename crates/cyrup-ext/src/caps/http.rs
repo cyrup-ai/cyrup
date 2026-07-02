@@ -551,12 +551,31 @@ fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
 
 /// Decompress a fully-buffered body per `encoding` (the real consumer's `fetch()` semantics — an
 /// unrecognized/absent encoding passes the bytes through unchanged, matching `identity`). Bounds the
-/// DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`], the SAME cap [`read_bounded_body`] already
-/// applies to the wire (possibly-compressed) transfer — now that decompression happens manually
-/// here rather than inside `reqwest`, a small compressed body must not be able to expand into an
-/// unbounded allocation (a decompression bomb).
+/// DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`] on EVERY chained stage (see below), the SAME cap
+/// [`read_bounded_body`] already applies to the wire (possibly-compressed) transfer — now that
+/// decompression happens manually here rather than inside `reqwest`, a small compressed body must not
+/// be able to expand into an unbounded allocation (a decompression bomb).
+///
+/// `Content-Encoding` may list MULTIPLE codings, e.g. `"gzip, br"` (RFC 9110 §8.4.1: "the codings are
+/// listed in the order in which they were applied" — `gzip` first, `br` second, on top). Decoding must
+/// undo them in REVERSE: the LAST-listed coding is the OUTERMOST layer, so it comes off first. Verified
+/// live against real Node `fetch()` (`zlib.gzipSync` then `brotliCompressSync`, header `gzip, br`):
+/// Node decodes both layers back to the original plaintext while still exposing the untouched
+/// `content-encoding: gzip, br` header — this loop reproduces that. A token this decoder doesn't
+/// recognize degrades to identity for JUST that stage (matching the existing single-token fallback),
+/// not the whole chain, so a trailing/leading unknown token never silently defeats decoding of the
+/// KNOWN codings around it.
 async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let Some(encoding) = encoding else { return Ok(raw) };
+    let mut body = raw;
+    for token in encoding.split(',').map(str::trim).rev() {
+        body = decode_buffered_one(token, body).await?;
+    }
+    Ok(body)
+}
+
+/// Decompress `raw` per a SINGLE `Content-Encoding` token (one stage of [`decode_buffered`]'s chain).
+async fn decode_buffered_one(encoding: &str, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let reader = tokio::io::BufReader::new(std::io::Cursor::new(raw));
     match encoding {
         "gzip" => read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await,
@@ -565,9 +584,9 @@ async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>
             read_capped(async_compression::tokio::bufread::DeflateDecoder::new(reader)).await
         }
         "zstd" => read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await,
-        // Unrecognized Content-Encoding ⇒ identity, matching the real decompression layer this
-        // replaces (`tower_http`'s `_ => identity` fallback). `reader` (holding `raw`) is simply
-        // dropped here; recover the original bytes from its inner cursor.
+        // Unrecognized Content-Encoding token ⇒ identity for this stage, matching the real
+        // decompression layer this replaces (`tower_http`'s `_ => identity` fallback). `reader`
+        // (holding `raw`) is simply dropped here; recover the original bytes from its inner cursor.
         _ => Ok(reader.into_inner().into_inner()),
     }
 }
@@ -593,44 +612,60 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Result<Vec<u8
     Ok(out)
 }
 
-/// Wrap a raw response byte stream through the `async-compression` decoder matching `encoding` (the
-/// real consumer's `fetch()` semantics — an unrecognized/absent encoding passes chunks through
+/// Wrap a raw response byte stream through the `async-compression` decoder chain matching `encoding`
+/// (the real consumer's `fetch()` semantics — an unrecognized/absent encoding passes chunks through
 /// unchanged, matching `identity`), used by [`HttpCaps::request_stream`]. Unlike the buffered path,
 /// there is no additional cap here: the host never accumulates a streaming body (the guest drains it
 /// one already-network-bounded chunk at a time via [`HttpCaps::poll_stream_chunk`] — the same
 /// reasoning [`MAX_RESPONSE_BODY_BYTES`]'s doc comment already gives for why streaming doesn't need
 /// it), and a decoder that never learns the true end of a bomb-sized declared stream is nothing new:
 /// an identity stream of the same declared size is already unbounded in the exact same way.
+///
+/// `Content-Encoding` may list MULTIPLE codings — see [`decode_buffered`]'s doc for the full
+/// RFC 9110 §8.4.1 rationale and the live Node `fetch()` verification. Decoded here the same way:
+/// wrap the stream with one decoder per token, applied in REVERSE of the listed order (the
+/// LAST-listed coding is the outermost layer, unwrapped first). An unrecognized token degrades to
+/// identity for just that one stage.
 fn decode_stream(
     encoding: Option<&str>,
     raw: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 ) -> ChunkStream {
     // `reqwest::Error` doesn't satisfy `StreamReader`'s `Into<std::io::Error>` bound directly —
-    // map it explicitly once, up front, so every decoder branch below shares one `io::Error`-typed
+    // map it explicitly once, up front, so every decoder stage below shares one `io::Error`-typed
     // stream.
-    let raw = raw.map(|r| r.map_err(std::io::Error::other));
+    let mut stream: ChunkStream = Box::pin(raw.map(|r| r.map_err(std::io::Error::other)));
+    let Some(encoding) = encoding else { return stream };
+    for token in encoding.split(',').map(str::trim).rev() {
+        stream = decode_stream_one(token, stream);
+    }
+    stream
+}
+
+/// Wrap `raw` through the decoder for a SINGLE `Content-Encoding` token (one stage of
+/// [`decode_stream`]'s chain).
+fn decode_stream_one(encoding: &str, raw: ChunkStream) -> ChunkStream {
     match encoding {
-        Some("gzip") => {
+        "gzip" => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        Some("br") => {
+        "br" => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::BrotliDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        Some("deflate") => {
+        "deflate" => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::DeflateDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        Some("zstd") => {
+        "zstd" => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::ZstdDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        _ => Box::pin(raw),
+        _ => raw,
     }
 }
 
@@ -747,6 +782,90 @@ mod tests {
             "Content-Length must still report the ORIGINAL (compressed, wire) size, matching real \
              fetch(), not the decompressed body's length: {:?}",
             resp.headers
+        );
+    }
+
+    /// L4 round-12 finding #2b: `Content-Encoding` may CHAIN multiple codings (RFC 9110 §8.4.1 — "the
+    /// codings are listed in the order in which they were applied"). Verified live against real Node
+    /// `fetch()` (`zlib.gzipSync` then `brotliCompressSync`, header `gzip, br`): Node decodes BOTH
+    /// layers back to the original plaintext while still exposing `content-encoding: gzip, br` on
+    /// `resp.headers`. Reproduces that exact scenario with REAL system `gzip`+`brotli` binaries (gzip
+    /// applied first, brotli second, on top — the wire header lists them in THAT order) against
+    /// `HttpCaps::request`, matching real `fetch()` byte-for-byte.
+    #[tokio::test]
+    async fn request_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding() {
+        let plaintext = b"chained decompression world, repeated for a real ratio: \
+            chained decompression world, chained decompression world"
+            .to_vec();
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let double_compressed = compress_with("brotli", &["-c"], &gzipped);
+        assert_ne!(
+            double_compressed, plaintext,
+            "sanity: the double-compressed wire bytes differ from the plaintext"
+        );
+
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Encoding: gzip, br\r\nContent-Length: {}\r\n",
+            double_compressed.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![double_compressed.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, plaintext,
+            "both chained layers (gzip, then br) must be undone, matching real fetch()'s chained decode"
+        );
+        let get = |name: &str| {
+            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("content-encoding"),
+            Some("gzip, br"),
+            "the untouched, full chained Content-Encoding must survive decompression: {:?}",
+            resp.headers
+        );
+    }
+
+    /// Same finding, the streaming path (`request_stream`/`poll_stream_chunk`): the SAME chained
+    /// `gzip, br` `Content-Encoding` must decompress correctly while draining chunks, not just the
+    /// buffered `request` path.
+    #[tokio::test]
+    async fn request_stream_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding() {
+        let plaintext = b"streaming chained decompression world, repeated for a real ratio: \
+            streaming chained decompression world, streaming chained decompression world"
+            .to_vec();
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let double_compressed = compress_with("brotli", &["-c"], &gzipped);
+        assert_ne!(
+            double_compressed, plaintext,
+            "sanity: the double-compressed wire bytes differ from the plaintext"
+        );
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: gzip, br\r\nContent-Length: {}\r\n",
+            double_compressed.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![double_compressed.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        assert_eq!(opened.status, 200);
+        let get = |name: &str| {
+            opened.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-encoding"), Some("gzip, br"), "headers: {:?}", opened.headers);
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, plaintext,
+            "drained chunks concatenate back to the plaintext with BOTH chained layers undone"
         );
     }
 
