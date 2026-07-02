@@ -59,6 +59,19 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Se
 /// accumulates their body — the guest drains it one already-bounded network chunk at a time.
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bounds how many streaming HTTP bodies (`request-stream` handles) can be open at once.
+/// `HttpCaps` is ONE shared engine behind a single `Arc` on `LiveHostServices` (same doc as
+/// [`MAX_RESPONSE_BODY_BYTES`]) — an unbounded, ever-growing `streams` registry lets a guest that
+/// keeps opening streams without ever draining/closing them exhaust host memory/fd/connection-pool
+/// resources over time, even though each INDIVIDUAL stream's chunks are already bounded (the guest
+/// drains one already-bounded network chunk at a time). No Pi-derived exact count to port here —
+/// the real consumer, `pi-mcp-adapter/server-manager.ts:41-83`'s `connections`/`connectPromises`
+/// maps, dedupes/reuses connections keyed by CONFIGURED server name, giving it an implicit bound
+/// this lower-level primitive lacks by construction — so, like [`MAX_RESPONSE_BODY_BYTES`], this is
+/// a deliberately generous cap (comfortably above any realistic legitimate concurrent-stream count)
+/// that still guarantees bounded worst-case growth.
+const MAX_OPEN_STREAMS: usize = 256;
+
 /// The real HTTP capability engine: one shared `reqwest::Client` plus a registry of open streaming
 /// bodies keyed by an opaque `u32` handle (`request-stream` / `poll-stream-chunk` / `close-stream`).
 /// A registry entry of `None` means the underlying stream already reached natural EOF (or errored)
@@ -69,6 +82,11 @@ pub struct HttpCaps {
     client: reqwest::Client,
     streams: Mutex<HashMap<u32, Option<ChunkStream>>>,
     next_handle: AtomicU32,
+    /// [`MAX_OPEN_STREAMS`] in production; overridable ONLY for tests
+    /// ([`Self::with_max_open_streams`]) so the cap-rejection path is exercisable without actually
+    /// opening 256 real concurrent sockets (flaky under full-suite parallel test execution, which
+    /// contends for the same loopback networking resources across many unrelated tests at once).
+    max_open_streams: usize,
 }
 
 impl std::fmt::Debug for HttpCaps {
@@ -94,7 +112,28 @@ impl HttpCaps {
 
     /// Build around a caller-supplied client (tests, or a client the host already built).
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client, streams: Mutex::new(HashMap::new()), next_handle: AtomicU32::new(1) }
+        Self {
+            client,
+            streams: Mutex::new(HashMap::new()),
+            next_handle: AtomicU32::new(1),
+            max_open_streams: MAX_OPEN_STREAMS,
+        }
+    }
+
+    /// Build with a caller-supplied open-stream cap (tests only; production always gets the real
+    /// [`MAX_OPEN_STREAMS`] via [`Self::new`]/[`Self::with_client`]). Also disables connection
+    /// pooling (`pool_max_idle_per_host(0)`): a test proving the cap works needs many streams to
+    /// stay genuinely OPEN (their bodies deliberately undrained) at once against a short-lived local
+    /// mock server whose per-connection handler task closes its socket right after writing — with
+    /// pooling on, `reqwest` can hand a later call a since-closed pooled connection, an unrelated
+    /// flake this test must not be sensitive to.
+    #[cfg(test)]
+    fn with_max_open_streams(max_open_streams: usize) -> Self {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { max_open_streams, ..Self::with_client(client) }
     }
 
     /// Shared request-building: method parse + headers + optional body + optional timeout.
@@ -131,6 +170,18 @@ impl HttpCaps {
     /// drain. Like [`Self::request`], a non-2xx status is not itself an error (fetch semantics) — the
     /// caller inspects [`HttpStreamResponse::status`] itself; the body is stored regardless of status.
     pub async fn request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
+        // Reject BEFORE spending a real network round-trip if already at the cap (checked again,
+        // atomically with the insert, below — this is a fast up-front rejection, not the only gate).
+        {
+            let g = self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
+            if g.len() >= self.max_open_streams {
+                return Err(format!(
+                    "too many open http streams ({} already open) — close some via close-stream \
+                     before opening more",
+                    self.max_open_streams
+                ));
+            }
+        }
         let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
@@ -138,6 +189,16 @@ impl HttpCaps {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut g =
             self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
+        // Re-checked atomically with the insert (the up-front check above is a fast-path only — a
+        // concurrent `request_stream` could have raced past it in between): dropping `stream` here
+        // (never inserted) cancels the connection we just opened, same as `close_stream` would.
+        if g.len() >= self.max_open_streams {
+            return Err(format!(
+                "too many open http streams ({} already open) — close some via close-stream \
+                 before opening more",
+                self.max_open_streams
+            ));
+        }
         g.insert(handle, Some(stream));
         Ok(HttpStreamResponse { handle, status, headers })
     }
@@ -483,6 +544,61 @@ mod tests {
             err.contains("no open http stream"),
             "the handle must stay closed after racing with an in-flight poll, got: {err}"
         );
+    }
+
+    /// A mock server that accepts MANY connections (not just one, unlike [`spawn_mock`]), each
+    /// answered with a small keep-nothing-open response — needed to open enough concurrent streams
+    /// to actually reach [`MAX_OPEN_STREAMS`] in a test.
+    async fn spawn_persistent_mock() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}/probe")
+    }
+
+    /// Closes the shared-host-memory-exhaustion finding: `request_stream` is rejected once the cap
+    /// is reached (a guest that keeps opening streams without ever closing/draining them must NOT
+    /// be able to grow the registry without bound) — and, once one is genuinely closed, a fresh
+    /// `request_stream` succeeds again (the cap is a real, live gate on CURRENTLY open streams, not
+    /// a one-shot lifetime limit). Uses [`HttpCaps::with_max_open_streams`]'s test-only SMALL cap
+    /// rather than the real [`MAX_OPEN_STREAMS`] (256) — opening that many real concurrent sockets
+    /// is flaky under full-suite parallel test execution (contends for loopback networking
+    /// resources with every other test running at the same time); the cap-enforcement MECHANISM
+    /// being tested is identical regardless of the configured limit's value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn request_stream_rejects_once_the_open_stream_cap_is_reached() {
+        const SMALL_CAP: usize = 4;
+        let url = spawn_persistent_mock().await;
+        let caps = HttpCaps::with_max_open_streams(SMALL_CAP);
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+
+        let mut handles = Vec::with_capacity(SMALL_CAP);
+        for _ in 0..SMALL_CAP {
+            let opened = caps.request_stream(&req).await.expect("stream opens under the cap");
+            handles.push(opened.handle);
+        }
+        assert_eq!(handles.len(), SMALL_CAP);
+
+        let err = caps
+            .request_stream(&req)
+            .await
+            .expect_err("one more open stream must be rejected once the cap is reached");
+        assert!(err.contains("too many open http streams"), "got: {err}");
+
+        // Close exactly one, freeing a slot — a fresh stream must now succeed again.
+        let freed = handles.pop().expect("at least one handle to close");
+        caps.close_stream(freed);
+        caps.request_stream(&req).await.expect("a stream opens again once a slot is freed by closing");
     }
 
     /// Closes the shared-host-memory-exhaustion finding: a response that DECLARES (via
