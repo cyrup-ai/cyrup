@@ -22,6 +22,7 @@ use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, Input
 use cyrup_session_svc::{
     AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
 };
+use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -54,6 +55,7 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
+use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
 use crate::transcript::{content_text, entry_lines, TranscriptView};
 use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
@@ -215,6 +217,14 @@ pub struct AppState {
     /// hyperlinks); the binary refines it via [`App::detect_image_support`]. The `hyperlinks` flag
     /// gates OSC-8 emission in rendered links (`osc::hyperlink`).
     pub capabilities: TerminalCapabilities,
+    /// The REPLY half of the extension-UI dialog currently occupying [`Self::selector`] (`kind ==
+    /// SelectorKind::Extension{Confirm,Select,Input}`), if any (L4 review §2.1). A loaded guest's
+    /// synchronous `ui.{confirm,select,input}` call blocks its own tokio task on this one-shot
+    /// (`LiveHostServices::ui_roundtrip`) until the selector confirms or cancels; `App::run`'s `ui_rx`
+    /// arm sets it when it opens the dialog, and [`App::confirm_selector`] /
+    /// [`App::handle_selector_key`]'s `Cancel` arm take + resolve it. `None` whenever no extension
+    /// dialog is open (including every ordinary first-party selector).
+    pending_ui_reply: Option<PendingUiReply>,
 }
 
 impl AppState {
@@ -250,6 +260,7 @@ impl AppState {
                 true_color: true,
                 hyperlinks: false,
             },
+            pending_ui_reply: None,
         }
     }
 
@@ -275,6 +286,25 @@ pub struct ActiveSelector {
     saved_editor: String,
     /// Theme to restore if a previewing selector is cancelled (theme picker only).
     restore_theme: Option<UiTheme>,
+}
+
+/// The REQUEST/REPLY pairing an open extension-UI dialog (`SelectorKind::Extension{Confirm,Select,
+/// Input}`) resolves against (L4 review §2.1): `kind` is retained so a `Cancel` can resolve to the
+/// correct per-kind deny default ([`default_ui_reply`]) without re-deriving it from the selector kind
+/// at the call site.
+struct PendingUiReply {
+    kind: UiKind,
+    reply: tokio::sync::oneshot::Sender<UiReply>,
+}
+
+/// The per-kind deny default a dialog resolves to when the user cancels it (`Esc`) rather than
+/// answering — Pi's `noOpUIContext` shape (`runner.ts:230-261`), the same mapping
+/// `crates/cyrup-modes/src/rpc.rs`'s `default_ui_reply` uses for a timed-out/force-resolved RPC dialog.
+fn default_ui_reply(kind: UiKind) -> UiReply {
+    match kind {
+        UiKind::Confirm => UiReply::Confirm(false),
+        UiKind::Input | UiKind::Editor | UiKind::Select => UiReply::Text(None),
+    }
 }
 
 /// A backend that can rebuild a fresh handle over the **same** underlying terminal, so the inline
@@ -1076,6 +1106,65 @@ impl<B: Backend> App<B> {
         self.state.selector.as_ref().map(|s| s.kind)
     }
 
+    /// Render a loaded extension's `ui.{confirm,select,input}` dialog request in the input slot (L4
+    /// review §2.1; `ui.editor` is handled synchronously by the caller, never reaching here — see
+    /// [`App::run`]'s `ui_rx` arm). Mirrors Pi's `createExtensionUIContext`
+    /// (`interactive-mode.ts:2060-2111`): `confirm` opens a Yes/No [`ListSelector`] exactly like Pi's
+    /// confirm-as-select (`:2172-2179`); `select` opens a [`ListSelector`] over the guest's option
+    /// strings; `input` opens a [`TextInputSelector`]. The dialog's `reply` one-shot is stashed on
+    /// [`AppState::pending_ui_reply`]; [`App::confirm_selector`] and the selector-cancel arm of
+    /// [`App::handle_selector_key`] take + resolve it when the user answers.
+    ///
+    /// The input slot holds at most one occupant: if a selector (first-party or extension) or a
+    /// floating overlay is already open when a guest dialog arrives, it is denied immediately with its
+    /// per-kind deny default (there is nowhere to render it) rather than queued or silently dropped —
+    /// the guest's `ui_roundtrip` never blocks past this call regardless.
+    fn open_extension_dialog(&mut self, req: UiRequest) {
+        if self.state.selector.is_some() || !self.state.overlays.is_empty() {
+            self.state.transcript.push_status(format!(
+                "extension {:?} dialog: another dialog/selector is already open, denied",
+                req.kind
+            ));
+            let _ = req.reply.send(default_ui_reply(req.kind));
+            return;
+        }
+        let UiRequest { kind, prompt, options, message, placeholder, reply, .. } = req;
+        let (selector_kind, inner): (SelectorKind, Box<dyn Selector>) = match kind {
+            UiKind::Confirm => {
+                let title = if message.is_empty() { prompt } else { format!("{prompt} — {message}") };
+                let rows = vec![
+                    ("yes".to_string(), "Yes".to_string(), None),
+                    ("no".to_string(), "No".to_string(), None),
+                ];
+                (SelectorKind::ExtensionConfirm, Box::new(ListSelector::prompt(title, rows, 0)))
+            }
+            UiKind::Select => {
+                let opts: Vec<String> = options
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                if opts.is_empty() {
+                    let _ = reply.send(UiReply::Text(None));
+                    return;
+                }
+                let rows: Vec<(String, String, Option<String>)> =
+                    opts.into_iter().map(|o| (o.clone(), o, None)).collect();
+                (SelectorKind::ExtensionSelect, Box::new(ListSelector::prompt(prompt, rows, 0)))
+            }
+            UiKind::Input => {
+                (SelectorKind::ExtensionInput, Box::new(TextInputSelector::new(prompt, placeholder)))
+            }
+            UiKind::Editor => {
+                // Unreachable: `App::run`'s `ui_rx` arm intercepts `UiKind::Editor` and handles it
+                // synchronously via `edit_in_external_editor` before ever calling this method.
+                let _ = reply.send(UiReply::Text(None));
+                return;
+            }
+        };
+        self.open_boxed_selector(selector_kind, inner);
+        self.state.pending_ui_reply = Some(PendingUiReply { kind, reply });
+    }
+
     /// Route one key to the active selector and act on the outcome (spec/tui/05 §3.1). `Confirm`
     /// applies the selection by kind and closes the slot; `Cancel` restores the prior theme (if any)
     /// and closes; `Preview` re-themes live without closing. A no-op if no selector is open.
@@ -1129,6 +1218,13 @@ impl<B: Backend> App<B> {
                 }
             }
             SelectorOutcome::Cancel => {
+                // A cancelled extension-UI dialog resolves to its per-kind deny default (Pi's
+                // `Esc`-cancelled select yields `undefined`, which `confirm`'s `result === Yes` then
+                // reads as `false` — `interactive-mode.ts:2172-2179`) rather than hanging the
+                // wasm-suspended guest until `ui_roundtrip`'s timeout (or forever, with none set).
+                if let Some(pending) = self.state.pending_ui_reply.take() {
+                    let _ = pending.reply.send(default_ui_reply(pending.kind));
+                }
                 self.close_selector(true);
                 AppAction::Redraw
             }
@@ -1161,6 +1257,18 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("images → {label}"));
                 None
             }
+            SelectorKind::ExtensionConfirm => {
+                if let Some(pending) = self.state.pending_ui_reply.take() {
+                    let _ = pending.reply.send(UiReply::Confirm(value == "yes"));
+                }
+                None
+            }
+            SelectorKind::ExtensionSelect | SelectorKind::ExtensionInput => {
+                if let Some(pending) = self.state.pending_ui_reply.take() {
+                    let _ = pending.reply.send(UiReply::Text(Some(value.to_string())));
+                }
+                None
+            }
             other => Some(AppCommand::ConfirmSelection { kind: other, value: value.to_string() }),
         }
     }
@@ -1170,6 +1278,23 @@ impl<B: Backend> App<B> {
     /// selectors source their rows here (spec/tui/05 §8 late-data population) and open via
     /// [`open_data_selector`](Self::open_data_selector); lifecycle/IO commands call the matching
     /// session method and surface a status line / info block. Errors degrade to a status line.
+    ///
+    /// KNOWN RESIDUAL (L4 review §2.1): this is still awaited **inline** in `App::run`'s `select!`
+    /// loop, unlike [`AppAction::ExtensionShortcut`] (spawned — see that arm's comment for the
+    /// deadlock this avoids). None of the match arms below call a guest capability directly, but a
+    /// FEW `.await` a session-lifecycle op (`Reload`/`NewSession`/`Import`/the `Session`/`UserMessage`
+    /// `ConfirmSelection` switch+fork paths/`Compact`) that dispatches `HostEvent::Session{Start,
+    /// Shutdown,BeforeSwitch,BeforeFork,Compact}` to every live extension's hook
+    /// (`session.rs` `dispatch_notify`/`vetoed`), and a guest SDK hook handler is handed the SAME
+    /// `Ctx` a tool/shortcut handler gets (`cyrup-ext-sdk/src/ctx.rs`), so it COULD call
+    /// `ctx.ui().*` mid-hook. If one ever does, this call site would deadlock exactly like the
+    /// shortcut path did before the fix above — closing that residual needs restructuring
+    /// `execute_command`'s state-mutating match arms so only the actual session/runtime `.await` runs
+    /// off-task (mirroring the `bash_rx`/`shortcut_status_rx` channel-back pattern), which is a much
+    /// larger refactor deliberately out of scope here. No Pi extension in the wild is known to call a
+    /// UI dialog from a session-lifecycle hook (tool/shortcut/command handlers are the realistic
+    /// corpus, both of which are deadlock-safe today), so this is a documented, narrow, follow-up-
+    /// tracked gap rather than a silently-dropped one.
     pub async fn execute_command(
         &mut self,
         cmd: AppCommand,
@@ -2508,18 +2633,40 @@ impl App<CrosstermBackend<Stdout>> {
     /// edited text (trailing newline stripped). The terminal is always restored, even on error. No
     /// `unsafe`, no new dependency (`std::process` + `std::fs`).
     pub fn open_external_editor(&mut self) -> Result<(), TuiError> {
+        let current = self.state.editor.text();
+        if let Some(new_text) = self.edit_in_external_editor(&current)? {
+            self.state.editor.set_text(&new_text);
+        }
+        self.draw_synchronized()
+    }
+
+    /// Run `$VISUAL`/`$EDITOR` (falling back to `nano`/`notepad`) over `initial` text and return the
+    /// edited result on a clean exit (`Ok(None)` on a non-zero exit / spawn failure / unwritable temp
+    /// file — Pi's "no change"). Tears the TUI down for the duration and always restores it before
+    /// returning, even on failure — the caller is left with a usable terminal either way.
+    ///
+    /// The synchronous, TUI-suspending core [`Self::open_external_editor`] (Ctrl+G, editing the live
+    /// input buffer) shares; also drives the `ui.editor` extension dialog (L4 review §2.1): `App::run`'s
+    /// `ui_rx` arm calls this directly with the guest-seeded `prompt` text and replies with the result,
+    /// WITHOUT touching [`AppState::editor`] — unlike Ctrl+G this never reads or writes the live input
+    /// buffer, so an in-progress prompt draft is untouched by a guest's editor dialog.
+    ///
+    /// This runs entirely synchronously on the caller's task (no `.await`) — reused directly inside
+    /// `App::run`'s `select!` loop is safe (nothing here can deadlock against a concurrently-blocked
+    /// guest, unlike the `execute_command`/`run_shortcut` paths, which must never await guest-reentrant
+    /// work inline for exactly that reason; see `App::run`'s `AppAction::ExtensionShortcut` arm).
+    fn edit_in_external_editor(&mut self, initial: &str) -> Result<Option<String>, TuiError> {
         let editor_cmd = std::env::var("VISUAL")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
             .unwrap_or_else(|| if cfg!(windows) { "notepad".to_string() } else { "nano".to_string() });
 
-        let current = self.state.editor.text();
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("cyrup-editor-{}.pi.md", std::process::id()));
-        if std::fs::write(&tmp, &current).is_err() {
+        if std::fs::write(&tmp, initial).is_err() {
             self.state.transcript.push_status("external editor: could not write temp file");
-            return self.draw_synchronized();
+            return Ok(None);
         }
 
         // Release the terminal (cooked mode, no inline viewport) so the editor owns the screen.
@@ -2533,17 +2680,18 @@ impl App<CrosstermBackend<Stdout>> {
                 .status()
         });
 
-        // Reload on a clean exit; keep the original buffer otherwise (Pi: non-zero exit = no change).
+        // A clean exit reloads the edited text; a non-zero exit yields `None` (Pi: no change).
+        let mut result = None;
         if let Some(Ok(s)) = status
             && s.success()
             && let Ok(new_text) = std::fs::read_to_string(&tmp)
         {
             let trimmed = new_text.strip_suffix('\n').unwrap_or(&new_text);
-            self.state.editor.set_text(trimmed);
+            result = Some(trimmed.to_string());
         }
         let _ = std::fs::remove_file(&tmp);
 
-        // Re-enter raw mode + bracketed paste + Kitty flags, then redraw the live region.
+        // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws.
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
@@ -2552,7 +2700,7 @@ impl App<CrosstermBackend<Stdout>> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
         let _ = self.terminal.clear();
-        self.draw_synchronized()
+        Ok(result)
     }
 
     /// The interactive event loop: `select!` over terminal input, the agent event stream, theme
@@ -2573,6 +2721,15 @@ impl App<CrosstermBackend<Stdout>> {
         // session, and re-binds the UI ([`App::rebind_session`]). Without a runtime they are fixed.
         let mut session = session;
         let mut gen_rx = runtime.as_ref().map(|r| r.watch_generation());
+        // The synchronous extension-dialog sink (L4 review §2.1): a loaded guest's `ui.{confirm,input,
+        // select,editor}` capability blocks its OWN tokio task on a one-shot
+        // (`LiveHostServices::ui_roundtrip`) while this loop's `ui_rx` arm renders the matching dialog
+        // and replies once the user answers — the interactive-TUI mirror of `crates/cyrup-modes/src/
+        // rpc.rs`'s `run_rpc`, which wires the SAME `UiSink` mechanism for RPC mode. Installed here
+        // (only when a TUI is present — `App::run` is never invoked headless) and re-installed on every
+        // session swap below, since a replacement session brings a fresh `LiveHostServices`.
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        session.services().host_services.set_ui_sink(ui_tx.clone());
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -2584,6 +2741,10 @@ impl App<CrosstermBackend<Stdout>> {
         // input-arm `&mut self`.
         let mut bash_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BashMsg>> = None;
         let mut bash_cancel: Option<CancelToken> = None;
+        // A fired extension shortcut is spawned onto its own tokio task (see the
+        // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
+        // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
+        let (shortcut_status_tx, mut shortcut_status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         loop {
             let theme_changed = async {
                 match theme_rx.as_mut() {
@@ -2634,30 +2795,54 @@ impl App<CrosstermBackend<Stdout>> {
                             bash_cancel = Some(c);
                         }
                         AppAction::Submit(text) => {
-                            let ui = UserInput::text(text, InputSource::Tui);
-                            if session.is_streaming().await {
-                                let _ = session.steer(ui).await;
-                            } else {
-                                let _ = session.prompt_accepted(ui).await;
-                            }
+                            // Spawned, not awaited inline (L4 review §2.1 — the SAME deadlock reason
+                            // as `ExtensionShortcut` below): `prompt_accepted`/`steer` run Pi's
+                            // pre-send extension-command dispatch + `input`-hook fan-out INLINE, before
+                            // the run itself is spawned (`session.rs` `prepare` →
+                            // `try_execute_extension_command` / `emit_input_event`), and either can
+                            // call a guest's synchronous `ui.*` capability — this is in fact the MOST
+                            // common guest-reentrant path (an extension's own `/command` handler, or an
+                            // `on_input` hook, prompting for confirmation). This arm never touches
+                            // `self.state` — the optimistic transcript echo already happened
+                            // synchronously in `dispatch_submission` — so no channel-back is needed.
+                            let session = session.clone();
+                            tokio::spawn(async move {
+                                let ui = UserInput::text(text, InputSource::Tui);
+                                if session.is_streaming().await {
+                                    let _ = session.steer(ui).await;
+                                } else {
+                                    let _ = session.prompt_accepted(ui).await;
+                                }
+                            });
                         }
                         AppAction::Command(cmd) => {
                             self.execute_command(cmd, &session, runtime.as_ref()).await
                         }
                         AppAction::ExtensionShortcut(key) => {
                             // Route the fired shortcut to the owning live extension (R-08-017; Pi
-                            // `registerShortcut` handler). A guest fault is surfaced as a status
-                            // block, never a panic; the run loop keeps going.
-                            if let Err(e) = session
-                                .services()
-                                .ext_host
-                                .run_shortcut(&key, &cancel)
-                                .await
-                            {
-                                self.state.transcript.push_status(format!(
-                                    "shortcut {key}: {e}"
-                                ));
-                            }
+                            // `registerShortcut` handler) — SPAWNED, not awaited inline (L4 review
+                            // §2.1). The shortcut handler may itself call a synchronous
+                            // `ui.{confirm,input,select,editor}` capability, which blocks ITS calling
+                            // tokio task on `ui_roundtrip`'s one-shot reply until this very `select!`
+                            // loop services `ui_rx` and answers it. Awaiting `run_shortcut` inline HERE
+                            // would make that blocked task and the loop that must unblock it the SAME
+                            // task — a single task's `poll()` can never reach a sibling `select!` arm
+                            // while it is synchronously blocked deeper in its own call stack (tokio's
+                            // `block_in_place` frees a WORKER THREAD for other tasks, not this task's
+                            // own other branches) — a genuine self-deadlock. Spawning it as its own task
+                            // keeps the main loop free to poll `ui_rx` concurrently, exactly why
+                            // `SessionManager::spawn_run` already spawns agent-turn tool execution
+                            // (session.rs `drive_run`) instead of awaiting it inline. A guest fault
+                            // (or, now, a spawn-side error) is surfaced as a status block via
+                            // `shortcut_status_tx`, never a panic; the run loop keeps going regardless.
+                            let ext_host = session.services().ext_host.clone();
+                            let shortcut_cancel = cancel.clone();
+                            let status_tx = shortcut_status_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = ext_host.run_shortcut(&key, &shortcut_cancel).await {
+                                    let _ = status_tx.send(format!("shortcut {key}: {e}"));
+                                }
+                            });
                         }
                         AppAction::Redraw | AppAction::None => {}
                     }
@@ -2692,6 +2877,26 @@ impl App<CrosstermBackend<Stdout>> {
                     }
                     self.draw_synchronized()?;
                 }
+                Some(req) = ui_rx.recv() => {
+                    // A loaded guest opened a `ui.*` dialog (L4 review §2.1). `editor` is handled
+                    // synchronously right here — it tears the TUI down for `$VISUAL`/`$EDITOR` and
+                    // restores it before returning, exactly like the Ctrl+G path
+                    // ([`Self::open_external_editor`]) — while every other kind opens the matching
+                    // input-slot selector via `open_extension_dialog` and waits for a future key event
+                    // to confirm/cancel it (`AppState::pending_ui_reply`).
+                    if req.kind == UiKind::Editor {
+                        let UiRequest { prompt, reply, .. } = req;
+                        let edited = self.edit_in_external_editor(&prompt)?;
+                        let _ = reply.send(UiReply::Text(edited));
+                    } else {
+                        self.open_extension_dialog(req);
+                    }
+                    self.draw_synchronized()?;
+                }
+                Some(msg) = shortcut_status_rx.recv() => {
+                    self.state.transcript.push_status(msg);
+                    self.draw_synchronized()?;
+                }
                 maybe_ev = events.next() => {
                     let Some(ev) = maybe_ev else { continue };
                     self.ingest_event(&ev);
@@ -2714,6 +2919,11 @@ impl App<CrosstermBackend<Stdout>> {
                         events = new_session.subscribe();
                         session = new_session;
                         self.rebind_session();
+                        // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
+                        // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
+                        // same re-install this run loop's `AppAction::Command` rebind mirrors from
+                        // `crates/cyrup-modes/src/rpc.rs`'s `run_rpc`).
+                        session.services().host_services.set_ui_sink(ui_tx.clone());
                         // The swapped-in session owns a fresh extension host; re-source its
                         // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
                         let shortcuts = session.services().ext_host.shortcut_keys();

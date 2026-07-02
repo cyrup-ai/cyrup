@@ -556,6 +556,12 @@ pub fn build() -> ExtensionApi {
                 "this is the message body, distinct from the title",
                 &DialogOptions::default(),
             );
+            ctx.ui().notify(&format!("confirmed: {ok}"));
+            // Visible LIVE proof the guest received the REAL answer, not just that the dialog closed:
+            // a second dialog whose PROMPT embeds the value just received — no dependency on `notify`/
+            // `append_entry`'s host-side-only recording (a command handler's plain return value is
+            // itself discarded too, Pi-faithfully, `session.rs` `try_execute_wasm_command`).
+            let _ = ctx.ui().confirm(&format!("you answered: {ok}"));
             Ok(Some(format!("confirmed: {ok}")))
         },
     );
@@ -569,9 +575,60 @@ pub fn build() -> ExtensionApi {
         |_args: &str, ctx: &crate::CommandCtx| {
             let answer =
                 ctx.ui().input_with("name?", Some("e.g. Ada Lovelace"), &DialogOptions::default());
+            ctx.ui().notify(&format!("input: {answer:?}"));
+            // Visible LIVE proof (see `confirmdemo`'s comment): echo the received text in a follow-up
+            // dialog's prompt.
+            let _ = ctx.ui().confirm(&format!("you typed: {answer:?}"));
             Ok(Some(format!("input: {answer:?}")))
         },
     );
+
+    // A command exercising `select` (Pi `select(title, options, opts): Promise<string|undefined>`,
+    // types.ts:127; L4 review §2.1 interactive-TUI wiring): offers three options and surfaces the
+    // chosen STRING (or "none" if dismissed).
+    api.register_command(
+        "selectdemo",
+        CommandDescriptor::new("Open a select dialog over three options (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let chosen = ctx.ui().select("pick one", &["alpha", "beta", "gamma"]);
+            let text = format!("selected: {}", chosen.as_deref().unwrap_or("none"));
+            ctx.ui().notify(&text);
+            // Visible LIVE proof (see `confirmdemo`'s comment): echo the received choice in a follow-up
+            // dialog's prompt.
+            let _ = ctx.ui().confirm(&format!("you picked: {}", chosen.as_deref().unwrap_or("none")));
+            Ok(Some(text))
+        },
+    );
+
+    // A command exercising `editor` (Pi's external-editor dialog; L4 review §2.1): seeds the buffer
+    // with fixed text and surfaces the edited result (or "none" if cancelled/non-zero exit).
+    api.register_command(
+        "editordemo",
+        CommandDescriptor::new("Open an external-editor dialog seeded with fixed text (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let edited = ctx.ui().editor("seed text from the guest");
+            let text = format!("edited: {}", edited.as_deref().unwrap_or("none"));
+            ctx.ui().notify(&text);
+            // Visible LIVE proof (see `confirmdemo`'s comment): echo the received text in a follow-up
+            // dialog's prompt.
+            let _ = ctx.ui().confirm(&text);
+            Ok(Some(text))
+        },
+    );
+
+    // A keyboard shortcut (R-08-017) whose handler itself opens a SYNCHRONOUS `ui.confirm` dialog (L4
+    // review §2.1): proves the run loop's `AppAction::ExtensionShortcut` no longer self-deadlocks now
+    // that it is spawned rather than awaited inline (a shortcut handler blocking on `ui_roundtrip`
+    // while the SAME task also owns `ui_rx` would otherwise hang forever).
+    api.register_shortcut("ctrl+t", "Open a confirm dialog from a shortcut (demo)", |ctx: &crate::Ctx| {
+        let ok = ctx.ui().confirm("shortcut confirm — proceed?");
+        let text = format!("shortcut confirmed: {ok}");
+        ctx.ui().notify(&text);
+        // Visible LIVE proof (see `confirmdemo`'s comment) — also proves TWO SEQUENTIAL synchronous
+        // `ui.*` round trips from the SAME spawned shortcut task both reach the run loop correctly.
+        let _ = ctx.ui().confirm(&text);
+        Ok(())
+    });
 
     // A command exercising the `withSession` re-binding callback (Pi `ReplacedSessionContext`,
     // sdk gap #3): start a new session and move post-replacement work into the closure, which the host

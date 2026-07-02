@@ -59,6 +59,7 @@ mod settings_selector;
 mod startup_selector;
 mod status;
 mod status_indicator;
+mod text_input;
 mod theme;
 mod transcript;
 mod tree_selector;
@@ -111,6 +112,7 @@ pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 pub use settings_selector::{SettingRow, SettingsSelector, TrustSelector, FIELD_SEP};
 pub use startup_selector::run_startup_selector;
 pub use status::{format_tokens, StatusLine};
+pub use text_input::TextInputSelector;
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
 pub use theme::{

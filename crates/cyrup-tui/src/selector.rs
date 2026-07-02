@@ -82,14 +82,33 @@ pub enum SelectorKind {
     Login,
     /// Provider logout picker (`/logout`, `oauth-selector.ts`).
     Logout,
+    /// A loaded extension's `ui.confirm` dialog (L4 review §2.1): a Yes/No [`ListSelector`], exactly
+    /// Pi's confirm-as-select (`interactive-mode.ts:2172-2179`). Resolved fully in-crate against the
+    /// [`crate::app::AppState::pending_ui_reply`] one-shot — never becomes an `AppCommand`.
+    ExtensionConfirm,
+    /// A loaded extension's `ui.select` dialog (L4 review §2.1): a [`ListSelector`] over the guest's
+    /// option strings. Resolved fully in-crate, same as [`Self::ExtensionConfirm`].
+    ExtensionSelect,
+    /// A loaded extension's `ui.input` dialog (L4 review §2.1): a [`crate::text_input::TextInputSelector`].
+    /// Resolved fully in-crate, same as [`Self::ExtensionConfirm`].
+    ExtensionInput,
 }
 
 impl SelectorKind {
-    /// Whether confirming this selector applies in-crate (theme/thinking/show-images) or hands the
-    /// chosen value to the run loop as an [`crate::app::AppCommand`] (the data-bound selectors, whose
-    /// effect — set model, switch branch, login — lives at the session layer).
+    /// Whether confirming this selector applies in-crate (theme/thinking/show-images/the extension-UI
+    /// dialogs) or hands the chosen value to the run loop as an [`crate::app::AppCommand`] (the
+    /// data-bound selectors, whose effect — set model, switch branch, login — lives at the session
+    /// layer).
     pub fn is_data_bound(self) -> bool {
-        !matches!(self, SelectorKind::Thinking | SelectorKind::ShowImages | SelectorKind::Theme)
+        !matches!(
+            self,
+            SelectorKind::Thinking
+                | SelectorKind::ShowImages
+                | SelectorKind::Theme
+                | SelectorKind::ExtensionConfirm
+                | SelectorKind::ExtensionSelect
+                | SelectorKind::ExtensionInput
+        )
     }
 
     /// The selector's title shown above the list (`*-selector.ts` headers).
@@ -107,6 +126,9 @@ impl SelectorKind {
             SelectorKind::UserMessage => "Fork from Message",
             SelectorKind::Login => "Login",
             SelectorKind::Logout => "Logout",
+            SelectorKind::ExtensionConfirm => "Confirm",
+            SelectorKind::ExtensionSelect => "Select",
+            SelectorKind::ExtensionInput => "Input",
         }
     }
 }
