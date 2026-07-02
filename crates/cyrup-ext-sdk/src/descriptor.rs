@@ -106,11 +106,20 @@ impl CommandDescriptor {
 
 /// Options for [`crate::Ctx::exec`] — 1:1 with Pi's REAL `ExecOptions` (the type `Ctx.exec` actually
 /// uses, `extensions/types.ts:47,1277` imports it straight from `core/exec.ts:11-18`):
-/// `{signal?, timeout?, cwd?}` only. Deliberately has NO `env` field — Pi's `execCommand`
+/// `{signal?, timeout?, cwd?}`. Deliberately has NO `env` field — Pi's `execCommand`
 /// (`exec.ts:41-45`) never passes an `env` override to `spawn()` at all, so the child only ever
 /// inherits the host's own ambient environment (Node's default when `env` is omitted). Adding one
 /// here would be new ambient authority (arbitrary env injection for a spawned process) with no Pi
 /// equivalent — do not re-add it without a real Pi ground-truth citation.
+///
+/// `signal_id` is the WASM-boundary adaptation of Pi's `options.signal: AbortSignal` (`exec.ts:65-
+/// 72`): Pi extensions run in-process and can hand `execCommand` a live `AbortSignal` object
+/// directly; a WASM guest cannot pass an object reference across the component boundary, so it
+/// instead references a signal it already registered by ID via [`crate::Ctx::abort_signal`] (the
+/// SAME id namespace [`DialogOptions::signal_id`] uses). Since the guest is wasm-suspended for the
+/// whole duration of a host `exec` call, only Pi's "already aborted before the call" branch
+/// (`exec.ts:66-68`) is reachable — the host checks `signal_id` once, at call time, and starts the
+/// process pre-cancelled if it was already aborted (`cyrup-ext/src/host/live.rs`'s `exec::Host::run`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOptions {
@@ -118,6 +127,28 @@ pub struct ExecOptions {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_id: Option<String>,
+}
+
+impl ExecOptions {
+    /// Set the child's working directory (builder-style).
+    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+    /// Kill the child if it's still running after `ms` (builder-style).
+    pub fn timeout_ms(mut self, ms: u64) -> Self {
+        self.timeout_ms = Some(ms);
+        self
+    }
+    /// Bind an already-registered programmatic abort signal (builder-style; Pi `options.signal`,
+    /// `exec.ts:65-72`): if `id` was aborted via [`crate::Ctx::abort_signal`] before this call, the
+    /// exec starts pre-cancelled instead of running at all.
+    pub fn signal_id(mut self, id: impl Into<String>) -> Self {
+        self.signal_id = Some(id.into());
+        self
+    }
 }
 
 /// UI dialog options for `confirm`/`input`/`select` (Pi `ExtensionUIDialogOptions`, types.ts:89;

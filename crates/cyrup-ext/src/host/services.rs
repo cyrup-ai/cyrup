@@ -152,8 +152,9 @@ pub trait HostServices: Send + Sync {
     }
 
     // --- exec capability (R-08-030); denied by default ---
-    /// Run a DIRECT argv (shell:false) command (Pi `execCommand`, exec.ts:34-46). `opts` is the Pi
-    /// `ExecOptions` bag (`{cwd, timeoutMs, env}`); `cancel` carries an already-aborted `signalId`
+    /// Run a DIRECT argv (shell:false) command (Pi `execCommand`, exec.ts:34-46). `opts` is the
+    /// `ExecOptions` bag (`{cwd, timeoutMs, signalId}`; NO `env` — Pi's real `execCommand` never
+    /// accepts an env override, `exec.ts:41-45`); `cancel` carries an already-aborted `signalId`
     /// (the guest is wasm-suspended across this call, so the signal can only have been aborted
     /// beforehand — Pi `signal.aborted`). Denied by default (no ambient authority, R-ARCH-EXT-011).
     fn exec(
@@ -349,6 +350,11 @@ pub struct RecordingServices {
 struct RecordingState {
     control_ops: Vec<ControlOp>,
     exec_calls: Vec<(String, Vec<String>)>,
+    /// Whether `cancel.is_cancelled()` was already true at the moment each `exec` call reached the
+    /// `HostServices` boundary, in call order — proves a `signalId` that was aborted before the call
+    /// actually produced a pre-cancelled token (Pi `options.signal.aborted`, `exec.ts:66-68`), not
+    /// just that the id was recorded somewhere.
+    exec_call_pre_cancelled: Vec<bool>,
     /// The `message` body of each `confirm` call (L4 review §2.6), in call order.
     confirm_messages: Vec<String>,
     /// The `placeholder` of each `input` call (L4 review §2.7), in call order.
@@ -389,6 +395,11 @@ impl RecordingServices {
     /// The `(cmd, args)` of each capability-scoped `exec.run`.
     pub fn exec_calls(&self) -> Vec<(String, Vec<String>)> {
         self.state.lock().map(|g| g.exec_calls.clone()).unwrap_or_default()
+    }
+
+    /// Whether `cancel.is_cancelled()` was already true when each `exec` call arrived, in call order.
+    pub fn exec_call_pre_cancelled(&self) -> Vec<bool> {
+        self.state.lock().map(|g| g.exec_call_pre_cancelled.clone()).unwrap_or_default()
     }
 
     /// The requests recorded via `http_request`/`http_request_stream`.
@@ -490,10 +501,11 @@ impl HostServices for RecordingServices {
         cmd: &str,
         args: &[String],
         _opts: &Value,
-        _cancel: CancelToken,
+        cancel: CancelToken,
     ) -> Result<ExecOutput, String> {
         if let Ok(mut g) = self.state.lock() {
             g.exec_calls.push((cmd.to_string(), args.to_vec()));
+            g.exec_call_pre_cancelled.push(cancel.is_cancelled());
         }
         Ok(self.responses.exec.clone())
     }

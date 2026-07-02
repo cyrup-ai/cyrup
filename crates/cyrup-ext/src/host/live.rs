@@ -1409,3 +1409,68 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::host::services::{CannedResponses, RecordingServices};
+    use crate::registry::ExtensionRegistry;
+    use bindings::cyrup::ext::exec::Host as ExecHost;
+
+    /// A bare [`HostState`] backed by a [`GuestState`]/[`RecordingServices`] pair — no `wasmtime::
+    /// Store`/component instantiation needed, since `exec::Host::run` is a plain async trait method
+    /// callable directly. Exercises the REAL production `exec::Host::run` implementation, not a
+    /// reimplementation of its logic.
+    fn state_with(services: Arc<RecordingServices>) -> HostState {
+        let guest =
+            GuestState::with_services(ExtensionId::from("test"), Arc::new(ExtensionRegistry::new()), services);
+        HostState::with_guest(StoreLimits::default(), Arc::new(guest))
+    }
+
+    /// Closes the SDK gap this fix addresses: `ExecOptions::signal_id` (`cyrup-ext-sdk::descriptor`)
+    /// now round-trips through `exec::Host::run` into a REAL pre-cancelled `CancelToken` — 1:1 with
+    /// Pi's `options.signal.aborted` branch (`exec.ts:66-68`) — proven by actually calling the
+    /// production host-import implementation, not just asserting the struct field exists.
+    #[tokio::test]
+    async fn signal_id_already_aborted_starts_exec_pre_cancelled() {
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec.clone());
+        // The guest already aborted this signal id (Pi `signal.abort()`, mirrors a prior
+        // `ctx.abort_signal("my-signal")` call reaching `ui::Host::abort_signal`).
+        guest_of(&state).expect("guest state present").abort_signal("my-signal".into());
+
+        let opts_json = serde_json::json!({ "signalId": "my-signal" }).to_string();
+        let result = ExecHost::run(&mut state, "echo".into(), vec!["hi".into()], opts_json).await;
+        assert!(result.is_ok(), "exec still runs (a pre-cancelled token is not a host error)");
+
+        assert_eq!(
+            rec.exec_call_pre_cancelled(),
+            vec![true],
+            "an already-aborted `signalId` must reach `HostServices::exec` as an ALREADY-cancelled \
+             token, not merely be recorded and ignored"
+        );
+    }
+
+    /// The negative case: an UN-aborted `signalId` (or none at all) must NOT pre-cancel — proves the
+    /// check is a real conditional, not a hard-coded always-cancel.
+    #[tokio::test]
+    async fn signal_id_not_aborted_does_not_pre_cancel() {
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec.clone());
+        // Registered but never aborted.
+        let _ = guest_of(&state).expect("guest state present");
+
+        let opts_json = serde_json::json!({ "signalId": "never-aborted" }).to_string();
+        ExecHost::run(&mut state, "echo".into(), vec!["hi".into()], opts_json)
+            .await
+            .expect("exec runs");
+        assert_eq!(rec.exec_call_pre_cancelled(), vec![false]);
+
+        // No `signalId` in opts at all — same result.
+        ExecHost::run(&mut state, "echo".into(), vec!["hi".into()], "{}".into())
+            .await
+            .expect("exec runs");
+        assert_eq!(rec.exec_call_pre_cancelled(), vec![false, false]);
+    }
+}
