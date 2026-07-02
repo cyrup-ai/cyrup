@@ -348,16 +348,26 @@ impl ProcCaps {
         // `terminate_pid` is a best-effort no-op (no portable single-pid graceful-signal primitive
         // there) and reports `Ok(false)` — skip the grace-period wait entirely rather than paying
         // a needless ~2s delay for a signal that was genuinely never sent.
-        let sigterm_sent = cyrup_tools::terminate_pid(entry.pid)
-            .map_err(|e| format!("SIGTERM pid {}: {e}", entry.pid))?;
+        //
+        // A SEND failure (most commonly `ESRCH`: the process already exited in the race between our
+        // own `entry.exit_code` check above and this syscall — the OS process can die at any instant
+        // between the two) must NOT abort the escalation: the real transport wraps this exact call in
+        // try/catch-ignore (`stdio.js:162-166`: `try { kill('SIGTERM') } catch { /* ignore */ }`).
+        // Treat any error identically to `Ok(false)` (nothing confirmed sent) — matches the existing
+        // `Drop for ProcCaps`'s own `let _ = kill_pid(...)` idiom just below.
+        let sigterm_sent = cyrup_tools::terminate_pid(entry.pid).unwrap_or(false);
         if sigterm_sent && Self::wait_exited(&entry, self.kill_grace).await {
             return Ok(()); // SIGTERM worked within the grace period — no further escalation needed.
         }
 
         // Phase 3 — SIGKILL (stdio.js:171). The real transport fires-and-forgets this and returns
         // immediately; this capability's own `Ok`-means-confirmed-gone contract (doc above) instead
-        // waits out a bounded confirmation ([`KILL_CONFIRM_TIMEOUT`]'s doc).
-        cyrup_tools::kill_pid(entry.pid).map_err(|e| format!("SIGKILL pid {}: {e}", entry.pid))?;
+        // waits out a bounded confirmation ([`KILL_CONFIRM_TIMEOUT`]'s doc). Same rationale as phase
+        // 2: the real transport ignores a SIGKILL send failure too (`stdio.js:169-174`), most
+        // commonly `ESRCH` if SIGTERM (or the process's own natural exit) already reaped it in the
+        // interim. The `wait_exited` call below — not this send — is what actually confirms
+        // termination; a failed SEND must not itself be treated as failed confirmation.
+        let _ = cyrup_tools::kill_pid(entry.pid);
 
         if Self::wait_exited(&entry, KILL_CONFIRM_TIMEOUT).await {
             Ok(())
@@ -616,6 +626,63 @@ mod tests {
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 on the EOF-exited pid must fail — the OS process is really gone"
         );
+    }
+
+    /// Establishes the PREMISE of the ESRCH-on-natural-exit-race fix: `cyrup_tools::terminate_pid`/
+    /// `kill_pid` DO return a real `Err` when signaling a pid that's already gone — exactly the
+    /// class of error `ProcCaps::kill`'s phases 2/3 used to propagate via `?` (turning a successful
+    /// kill into a hard `Err` whenever the target process happened to exit in the race between
+    /// `kill`'s own liveness check and the signal syscall). Deterministic (no timing race needed):
+    /// spawns a real child, waits for it to genuinely exit and be reaped (confirmed via `kill -0`
+    /// failing), THEN signals the now-dead pid directly.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_pid_and_kill_pid_report_err_for_an_already_reaped_pid() {
+        let mut child = tokio::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("`true` spawns");
+        let pid = child.id().expect("spawned child has a pid");
+        child.wait().await.expect("`true` exits and is reaped almost immediately");
+
+        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(
+            alive.map(|s| !s.success()).unwrap_or(true),
+            "the pid must be genuinely gone before this test proceeds"
+        );
+
+        let sigterm_err = cyrup_tools::terminate_pid(pid);
+        assert!(
+            sigterm_err.is_err(),
+            "signaling an already-reaped pid must report a real error (ESRCH), got {sigterm_err:?}"
+        );
+        let sigkill_err = cyrup_tools::kill_pid(pid);
+        assert!(
+            sigkill_err.is_err(),
+            "SIGKILLing an already-reaped pid must report a real error (ESRCH), got {sigkill_err:?}"
+        );
+    }
+
+    /// `ProcCaps::kill` must NEVER surface the ESRCH-class error the previous test proves is real:
+    /// this is a structural (not timing-based) proof — `kill`'s phases 2/3 no longer have a `?`
+    /// after `terminate_pid`/`kill_pid` at all (`unwrap_or(false)` / `let _ =`), so a signal-send
+    /// failure literally cannot reach this function's `Result` anymore, regardless of how the OS
+    /// schedules the race. This test exercises the NORMAL (non-race) full escalation end-to-end —
+    /// covered already by the tests above — plus explicitly documents why no dedicated live-race
+    /// repro is included: forcing this EXACT kernel-level race deterministically (the target process
+    /// dying in the microsecond window between `ProcCaps::kill`'s own liveness check and the
+    /// `kill(2)` syscall) is not reliably controllable from outside the OS scheduler without
+    /// mocking `terminate_pid`/`kill_pid` behind an injectable seam, which `ProcCaps` does not
+    /// (and, for a two-line libc wrapper, should not) have.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_still_confirms_termination_with_the_error_propagation_removed() {
+        let caps = ProcCaps::new();
+        let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
+        caps.kill(handle).await.expect("kill still confirms real termination");
+        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
     }
 
     /// A busy/slow guest that never calls `read_stdout` against a maximally-bursty child (`yes`,
