@@ -369,8 +369,18 @@ impl bindings::cyrup::ext::exec::Host for HostState {
         {
             cancel.cancel();
         }
-        let ExecOutput { code, stdout, stderr, killed } =
-            guest.services.exec(&cmd, &args, &opts, cancel)?;
+        // Closes the SAME class of CRITICAL finding `845f707`/`9ffec1a` closed for `ui.*`/
+        // `http-client`: `guest.services.exec` blocks synchronously in host Rust code
+        // (`block_in_place`+`block_on` over `LocalProc::exec_argv`, `host_services.rs`) for up to
+        // the guest-settable `timeoutMs` PLUS the SIGTERM/SIGKILL grace escalation — potentially far
+        // longer than the WASM epoch budget. With no `note_dialog_wait` call, a slow/killed command
+        // left the epoch deadline already expired by the time the guest resumed wasm execution right
+        // after this call returns, tripping the SAME permanent instance-wedging trap `ui.*` dialogs
+        // and `http-client` used to. Record the wait exactly like those do.
+        let started = std::time::Instant::now();
+        let result = guest.services.exec(&cmd, &args, &opts, cancel);
+        guest.note_dialog_wait(started);
+        let ExecOutput { code, stdout, stderr, killed } = result?;
         Ok(wit_types::ExecResult { code, stdout, stderr, killed })
     }
 }
@@ -407,7 +417,15 @@ impl bindings::cyrup::ext::proc::Host for HostState {
     }
     async fn write_stdin(&mut self, handle: u32, data: Vec<u8>) -> Result<u32, String> {
         let guest = guest_of(self)?;
-        guest.services.proc_write_stdin(handle, &data)
+        // Same rationale as `exec::Host::run`/`http_client::Host::request` above — `ProcCaps::write_stdin`
+        // `.await`s a real pipe write (`stdin.write_all`, `caps/proc.rs`), which can legitimately
+        // block for a while if the child isn't currently reading its stdin. No `note_dialog_wait`
+        // here left a slow write to re-wedge the instance exactly like the `ui.*`/`http-client` bug
+        // class this same mechanism closed.
+        let started = std::time::Instant::now();
+        let result = guest.services.proc_write_stdin(handle, &data);
+        guest.note_dialog_wait(started);
+        result
     }
     async fn read_stdout(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
         let guest = guest_of(self)?;
@@ -422,7 +440,14 @@ impl bindings::cyrup::ext::proc::Host for HostState {
     }
     async fn kill(&mut self, handle: u32) -> Result<(), String> {
         let guest = guest_of(self)?;
-        guest.services.proc_kill(handle)
+        // Same rationale — `ProcCaps::kill` runs the real stdin-EOF/SIGTERM/SIGKILL escalation
+        // (`caps/proc.rs`), up to `DEFAULT_KILL_GRACE`*2 + `KILL_CONFIRM_TIMEOUT` (~6s worst case)
+        // of real wall-clock blocking, far past the WASM epoch budget. Without this, the SAME
+        // permanent instance-wedging trap the `ui.*`/`http-client` fix closed re-opens here.
+        let started = std::time::Instant::now();
+        let result = guest.services.proc_kill(handle);
+        guest.note_dialog_wait(started);
+        result
     }
 }
 
