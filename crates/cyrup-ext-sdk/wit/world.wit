@@ -309,6 +309,40 @@ interface exec {
   run: func(cmd: string, args: list<string>, opts-json: string) -> result<exec-result, string>;
 }
 
+// A long-lived, duplex-pipe child process — the L4 `proc` capability (pi-mcp-adapter-port.md §3.1,
+// the locked drafted shape) backing MCP stdio transport (`StdioClientTransport`, the majority
+// real-world MCP server shape). Distinct from `exec.run`'s bounded run-capture-return one-shot:
+// `proc` stays open across many host calls, with a live stdin the guest can keep writing to and a
+// live stdout/stderr the guest polls incrementally as the child produces output over time. Gated by
+// the SAME load-time trust check `exec`/`ui`/`http-client` use (`is_trusted =
+// origin.is_pre_trust() || project_trusted`, loader.rs:57-60); an untrusted extension gets
+// `DenyServices` and this interface is unreachable, exactly like `exec`/`http-client`.
+//
+// The host owns actual process lifetime and byte-stream buffering (a real `tokio::process::Child` +
+// buffered pipe-reader tasks keyed by an opaque `handle`, `cyrup-ext/src/caps/proc.rs`); the guest
+// polls (the SAME request/poll bridge `http-client`'s stream registry uses, arch-08 §5.2) rather
+// than holding a live process handle across the wasm boundary.
+interface proc {
+  // Spawn a long-lived child; returns a handle or an error. `capture-stderr` mirrors Pi's
+  // debug-mode "inherit" vs "ignore" (server-manager.ts:111).
+  spawn: func(cmd: string, args: list<string>, env-json: string, cwd: option<string>,
+              capture-stderr: bool) -> result<u32, string>;   // u32 = proc-handle
+
+  // Write to the child's stdin. Returns bytes written or an error (e.g. pipe closed).
+  write-stdin: func(handle: u32, data: list<u8>) -> result<u32, string>;
+
+  // Read the next chunk of stdout (non-blocking poll; empty list = no data yet, not EOF).
+  // EOF is signalled by a subsequent `poll-exit` returning `some`.
+  read-stdout: func(handle: u32, max-bytes: u32) -> result<list<u8>, string>;
+  read-stderr: func(handle: u32, max-bytes: u32) -> result<list<u8>, string>;
+
+  // Poll whether the child has exited; `some(code)` once terminated.
+  poll-exit: func(handle: u32) -> option<s32>;
+
+  // Terminate the child (SIGTERM then SIGKILL after a grace period, host-side policy).
+  kill: func(handle: u32) -> result<_, string>;
+}
+
 // Outbound HTTP only (no raw TCP-connect; no ambient authority) — the L4 `http-client` capability
 // (pi-mcp-adapter-port.md §3.2, the locked drafted shape). Gated by the SAME load-time trust check
 // `exec`/`ui` use (`is_trusted = origin.is_pre_trust() || project_trusted`, loader.rs:57-60); an
@@ -416,6 +450,7 @@ world extension {
   import session;
   import models;
   import exec;
+  import proc;
   import http-client;
   import ext-fs;
   import bus;

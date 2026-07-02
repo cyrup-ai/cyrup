@@ -355,6 +355,57 @@ impl bindings::cyrup::ext::exec::Host for HostState {
     }
 }
 
+impl bindings::cyrup::ext::proc::Host for HostState {
+    async fn spawn(
+        &mut self,
+        cmd: String,
+        args: Vec<String>,
+        env_json: String,
+        cwd: Option<String>,
+        capture_stderr: bool,
+    ) -> Result<u32, String> {
+        let guest = guest_of(self)?;
+        // `env-json` is a serde_json object map (guest `ctx.proc_spawn`'s `env` bag); an unparsable
+        // or non-object payload degrades to no overrides rather than erroring (mirrors `exec.run`'s
+        // permissive `opts-json` handling — never a trap-worthy host failure over a guest payload
+        // shape mistake).
+        let env: Vec<(String, String)> = serde_json::from_str::<Value>(&env_json)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .map(|m| {
+                m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect()
+            })
+            .unwrap_or_default();
+        let spec = crate::caps::proc::ProcSpawnSpec {
+            cmd,
+            args,
+            env,
+            cwd: cwd.map(std::path::PathBuf::from),
+            capture_stderr,
+        };
+        guest.services.proc_spawn(&spec)
+    }
+    async fn write_stdin(&mut self, handle: u32, data: Vec<u8>) -> Result<u32, String> {
+        let guest = guest_of(self)?;
+        guest.services.proc_write_stdin(handle, &data)
+    }
+    async fn read_stdout(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
+        let guest = guest_of(self)?;
+        guest.services.proc_read_stdout(handle, max_bytes)
+    }
+    async fn read_stderr(&mut self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
+        let guest = guest_of(self)?;
+        guest.services.proc_read_stderr(handle, max_bytes)
+    }
+    async fn poll_exit(&mut self, handle: u32) -> Option<i32> {
+        guest_of(self).ok().and_then(|g| g.services.proc_poll_exit(handle))
+    }
+    async fn kill(&mut self, handle: u32) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.services.proc_kill(handle)
+    }
+}
+
 impl bindings::cyrup::ext::http_client::Host for HostState {
     async fn request(
         &mut self,

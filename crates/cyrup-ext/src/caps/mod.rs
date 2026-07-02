@@ -5,8 +5,10 @@
 //! unit-testable without a live wasm guest — the analog of `cyrup_tools::ProcOps` backing the `exec`
 //! grant, except these engines live in-crate (no cross-crate DTO duplication needed).
 //!
-//! `http` (outbound HTTP, pi-mcp-adapter-port.md §3.2) is the first; future capability additions
-//! (`proc`, `tcp-listen`, `browser` — see the same spec's §3.1/§3.3) are expected to land the same
-//! way, one submodule per capability.
+//! `http` (outbound HTTP, pi-mcp-adapter-port.md §3.2) and `proc` (the long-lived duplex-pipe
+//! child-process grant, pi-mcp-adapter-port.md §3.1) are the first two; future capability additions
+//! (`tcp-listen`, `browser` — see the same spec's §3.3) are expected to land the same way, one
+//! submodule per capability.
 
 pub mod http;
+pub mod proc;

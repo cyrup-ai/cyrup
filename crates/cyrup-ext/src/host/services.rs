@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 // Re-exported for downstream backends (e.g. `cyrup-session-svc::LiveHostServices`), which reach
 // these DTOs the same way it reaches `ExecOutput`/`DialogOptions` (`cyrup_ext::host::{..}`).
 pub use crate::caps::http::{HttpRequest, HttpResponse};
+pub use crate::caps::proc::ProcSpawnSpec;
 
 /// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
 /// exec.ts:23-28). `killed` is true when the host SIGTERM/SIGKILLed the process on a timeout/abort.
@@ -186,6 +187,43 @@ pub trait HostServices: Send + Sync {
     /// `http-client.close-stream`). No-op by default.
     fn http_close_stream(&self, _handle: u32) {}
 
+    // --- proc capability (arch-08 §5.2 request/poll bridge; pi-mcp-adapter-port.md §3.1); gated by
+    // the SAME load-time trust check `exec`/`http-client`/`ui` use (no new bool, no per-host
+    // allowlist) — denied by default (no ambient process authority, R-ARCH-EXT-011). A long-lived,
+    // duplex-pipe child process (MCP stdio transport), distinct from the bounded `exec` grant. ---
+
+    /// Spawn a long-lived child (the WIT `proc.spawn`); returns an opaque handle the guest polls
+    /// via [`Self::proc_read_stdout`]/[`Self::proc_poll_exit`]. Denied by default.
+    fn proc_spawn(&self, _spec: &ProcSpawnSpec) -> Result<u32, String> {
+        Err("proc capability not granted".into())
+    }
+    /// Write to a spawned child's stdin (the WIT `proc.write-stdin`); returns bytes written.
+    /// Denied by default.
+    fn proc_write_stdin(&self, _handle: u32, _data: &[u8]) -> Result<u32, String> {
+        Err("proc capability not granted".into())
+    }
+    /// Drain currently-buffered stdout (the WIT `proc.read-stdout`; non-blocking poll, empty = no
+    /// data yet, NOT EOF). Denied by default.
+    fn proc_read_stdout(&self, _handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
+        Err("proc capability not granted".into())
+    }
+    /// Drain currently-buffered stderr (the WIT `proc.read-stderr`). Denied by default.
+    fn proc_read_stderr(&self, _handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
+        Err("proc capability not granted".into())
+    }
+    /// Poll whether a spawned child has exited (the WIT `proc.poll-exit`); `Some(code)` once
+    /// terminated. No error channel in the WIT signature; an ungranted/unknown handle degrades to
+    /// `None` ("not exited") rather than a hang, matching an always-running-forever illusion for a
+    /// capability that was never granted a process to begin with.
+    fn proc_poll_exit(&self, _handle: u32) -> Option<i32> {
+        None
+    }
+    /// Terminate a spawned child (SIGTERM then SIGKILL after a grace period; the WIT `proc.kill`).
+    /// Denied by default.
+    fn proc_kill(&self, _handle: u32) -> Result<(), String> {
+        Err("proc capability not granted".into())
+    }
+
     // --- command-tier control (arch-08 §6.3); the deadlock guard is applied BEFORE this is called ---
     fn control(&self, _op: ControlOp) -> Result<(), String> {
         Err("control capability not available".into())
@@ -241,6 +279,15 @@ pub struct CannedResponses {
     pub http_response: HttpResponse,
     /// The canned chunks a `http_request_stream` grant yields in order, then EOF (`Ok(None)`).
     pub http_stream_chunks: Vec<Vec<u8>>,
+    /// The canned chunks a `proc_spawn` grant yields across repeated `proc_read_stdout` calls (one
+    /// chunk per call, then empty forever — an empty read is never a fabricated EOF; see
+    /// [`Self::proc_exit_code`]).
+    pub proc_stdout_chunks: Vec<Vec<u8>>,
+    /// As [`Self::proc_stdout_chunks`], for `proc_read_stderr`.
+    pub proc_stderr_chunks: Vec<Vec<u8>>,
+    /// The canned answer `proc_poll_exit` returns for every spawned handle (`None` = still
+    /// running, the default — a canned process never "exits" on its own).
+    pub proc_exit_code: Option<i32>,
     pub current_model: Option<String>,
     pub models: Value,
     pub theme: Option<String>,
@@ -263,6 +310,9 @@ impl Default for CannedResponses {
             exec: ExecOutput::default(),
             http_response: HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
             http_stream_chunks: Vec::new(),
+            proc_stdout_chunks: Vec::new(),
+            proc_stderr_chunks: Vec::new(),
+            proc_exit_code: None,
             current_model: None,
             models: json!([]),
             theme: None,
@@ -293,6 +343,16 @@ struct RecordingState {
     /// Open streaming grants: handle -> cursor into `responses.http_stream_chunks`.
     http_streams: HashMap<u32, usize>,
     next_http_stream_handle: u32,
+    /// `(cmd, args)` of each `proc_spawn` grant.
+    proc_spawns: Vec<(String, Vec<String>)>,
+    /// `(handle, data)` of each `proc_write_stdin` call.
+    proc_writes: Vec<(u32, Vec<u8>)>,
+    /// Handles `proc_kill` was called on.
+    proc_kills: Vec<u32>,
+    next_proc_handle: u32,
+    /// Open spawn grants: handle -> cursor into `responses.proc_stdout_chunks`/`proc_stderr_chunks`.
+    proc_stdout_cursors: HashMap<u32, usize>,
+    proc_stderr_cursors: HashMap<u32, usize>,
     entries: Vec<(String, Value)>,
     next_entry: u64,
     /// The last session name set via `set_session_name` (Pi `setSessionName`).
@@ -319,6 +379,21 @@ impl RecordingServices {
     /// The requests recorded via `http_request`/`http_request_stream`.
     pub fn http_requests(&self) -> Vec<HttpRequest> {
         self.state.lock().map(|g| g.http_requests.clone()).unwrap_or_default()
+    }
+
+    /// The `(cmd, args)` of each `proc_spawn` grant.
+    pub fn proc_spawns(&self) -> Vec<(String, Vec<String>)> {
+        self.state.lock().map(|g| g.proc_spawns.clone()).unwrap_or_default()
+    }
+
+    /// The `(handle, data)` of each `proc_write_stdin` call.
+    pub fn proc_writes(&self) -> Vec<(u32, Vec<u8>)> {
+        self.state.lock().map(|g| g.proc_writes.clone()).unwrap_or_default()
+    }
+
+    /// The handles `proc_kill` was called on.
+    pub fn proc_kills(&self) -> Vec<u32> {
+        self.state.lock().map(|g| g.proc_kills.clone()).unwrap_or_default()
     }
 
     /// The persisted custom entries (R-08-026).
@@ -422,6 +497,59 @@ impl HostServices for RecordingServices {
         if let Ok(mut g) = self.state.lock() {
             g.http_streams.remove(&handle);
         }
+    }
+    fn proc_spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        g.proc_spawns.push((spec.cmd.clone(), spec.args.clone()));
+        let handle = g.next_proc_handle;
+        g.next_proc_handle += 1;
+        g.proc_stdout_cursors.insert(handle, 0);
+        g.proc_stderr_cursors.insert(handle, 0);
+        Ok(handle)
+    }
+    fn proc_write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        g.proc_writes.push((handle, data.to_vec()));
+        Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+    }
+    fn proc_read_stdout(&self, handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let cursor = g
+            .proc_stdout_cursors
+            .get_mut(&handle)
+            .ok_or_else(|| format!("no live process for handle {handle}"))?;
+        Ok(match self.responses.proc_stdout_chunks.get(*cursor) {
+            Some(chunk) => {
+                let chunk = chunk.clone();
+                *cursor += 1;
+                chunk
+            }
+            None => Vec::new(),
+        })
+    }
+    fn proc_read_stderr(&self, handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let cursor = g
+            .proc_stderr_cursors
+            .get_mut(&handle)
+            .ok_or_else(|| format!("no live process for handle {handle}"))?;
+        Ok(match self.responses.proc_stderr_chunks.get(*cursor) {
+            Some(chunk) => {
+                let chunk = chunk.clone();
+                *cursor += 1;
+                chunk
+            }
+            None => Vec::new(),
+        })
+    }
+    fn proc_poll_exit(&self, _handle: u32) -> Option<i32> {
+        self.responses.proc_exit_code
+    }
+    fn proc_kill(&self, handle: u32) -> Result<(), String> {
+        if let Ok(mut g) = self.state.lock() {
+            g.proc_kills.push(handle);
+        }
+        Ok(())
     }
     fn control(&self, op: ControlOp) -> Result<(), String> {
         if let Ok(mut g) = self.state.lock() {

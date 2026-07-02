@@ -275,6 +275,49 @@ fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
+/// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`kill_tree`], which
+/// targets the whole `setsid` group a shell-spawned tree needs, R-03-027). This is the graceful
+/// half of a two-step escalation for a caller that owns exactly one non-group-leader child directly
+/// (e.g. cyrup-ext's long-lived `proc` capability, arch-08 §5.2/pi-mcp-adapter-port.md §3.1, which
+/// spawns a plain — not `setsid`'d — child, mirroring Pi's own non-detached `StdioClientTransport`
+/// spawn 1:1). A best-effort no-op on non-unix (no portable single-pid graceful-signal primitive
+/// there without holding the `Child` itself, which this pid-only API deliberately doesn't require);
+/// [`kill_pid`] is the forceful escalation that DOES work everywhere.
+#[allow(unsafe_code)]
+pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` only reads its two integer args (pid, signal); it touches no memory. A
+        // non-zero return is an `errno` (e.g. `ESRCH` if the pid is already gone), surfaced as an
+        // `io::Error`, never a panic.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+/// Force-kill a SINGLE process by pid (SIGKILL / non-unix `taskkill /F /PID`, no `/T` — this
+/// targets exactly the one pid, never a subtree; contrast [`kill_tree`]). The escalation half of
+/// [`terminate_pid`]; works everywhere (unlike the graceful half).
+#[allow(unsafe_code)]
+pub fn kill_pid(pid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: same as `terminate_pid` — `kill(2)` reads two integers, touches no memory.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output()?;
+        Ok(())
+    }
+}
+
 fn exit_from(status: std::process::ExitStatus) -> ExitStatus {
     match status.code() {
         Some(code) => ExitStatus::Exited(code),

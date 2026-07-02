@@ -227,6 +227,25 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         "the deny-all backend refuses the guest's http_request_stream"
     );
 
+    // 9) the proc capability is likewise DENIED for this DenyServices-backed guest (the untrusted
+    //    analog, arch-08 §5.2 request/poll bridge / pi-mcp-adapter-port.md §3.1): the guest's
+    //    `/procspawn` calls `ctx.proc_spawn(...)` across the WIT boundary, the host router routes it
+    //    to `DenyServices::proc_spawn` which returns "proc capability not granted", and the guest
+    //    surfaces that denial — the SAME trust gate as `exec`/`http-client`. Denied STRUCTURALLY: an
+    //    untrusted guest never reaches a real `ProcCaps` at all (`DenyServices` holds none), so there
+    //    is no path to ever spawn a real process.
+    let out = ext.execute_command("procspawn", "denial-marker", &cancel).await.expect("procspawn runs");
+    assert_eq!(
+        out.as_deref(),
+        Some("proc denied: proc capability not granted"),
+        "the deny-all backend refuses the guest's proc_spawn"
+    );
+    assert!(
+        ext.guest().notifications().iter().any(|n| n.contains("proc denied: proc capability not granted")),
+        "the guest observed the proc denial across the boundary: {:?}",
+        ext.guest().notifications()
+    );
+
     // an unknown command surfaces an error (never a host crash).
     let err = ext.execute_command("nope", "", &cancel).await.unwrap_err();
     assert!(err.to_string().contains("no such command"), "unknown command surfaced: {err}");

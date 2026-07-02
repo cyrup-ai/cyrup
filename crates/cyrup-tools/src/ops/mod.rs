@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use local::{kill_pid, terminate_pid};
 pub use shell::{shell_env, ShellConfig, Transport};
 
 /// Access mode for [`FsOps::access`].

@@ -40,7 +40,7 @@ pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
 };
 pub use ctx::{
-    CommandCtx, Ctx, ExecResult, HttpRequest, HttpResponse, Models, NotifyKind,
+    CommandCtx, Ctx, ExecResult, HttpRequest, HttpResponse, Models, NotifyKind, ProcSpawnOptions,
     ReplacedSessionContext, Session, Signal, ToolCall, Ui,
 };
 pub use descriptor::{
@@ -64,8 +64,8 @@ pub mod prelude {
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
     };
     pub use crate::ctx::{
-        CommandCtx, Ctx, HttpRequest, HttpResponse, Models, NotifyKind, ReplacedSessionContext,
-        Session, Signal, ToolCall, Ui,
+        CommandCtx, Ctx, HttpRequest, HttpResponse, Models, NotifyKind, ProcSpawnOptions,
+        ReplacedSessionContext, Session, Signal, ToolCall, Ui,
     };
     pub use crate::descriptor::{
         CommandDescriptor, DialogOptions, ExecMode, FlagSpec, ForkOptions, ForkPosition,

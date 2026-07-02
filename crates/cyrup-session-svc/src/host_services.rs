@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use cyrup_core::{CancelToken, EntryId, ModelRef};
 use cyrup_ext::caps::http::HttpCaps;
-use cyrup_ext::host::{ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse};
+use cyrup_ext::caps::proc::ProcCaps;
+use cyrup_ext::host::{
+    ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse, ProcSpawnSpec,
+};
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
@@ -98,6 +101,9 @@ pub struct LiveHostServices {
     /// pi-mcp-adapter-port.md §3.2). Gated by the SAME load-time trust check as `exec` (reaching this
     /// backend at all means the guest already passed the trust gate) — no per-call check here either.
     http: HttpCaps,
+    /// The `proc` capability grant's real long-lived-child engine (arch-08 §5.2 request/poll bridge;
+    /// pi-mcp-adapter-port.md §3.1). Gated by the SAME load-time trust check as `exec`/`http-client`.
+    proc_caps: ProcCaps,
     snapshot: Mutex<LiveSnapshot>,
     control: Mutex<Option<ControlSink>>,
     /// The active mode's dialog renderer (interactive TUI / RPC), attached post-build via
@@ -133,6 +139,7 @@ impl LiveHostServices {
             proc,
             cwd,
             http: HttpCaps::new(),
+            proc_caps: ProcCaps::new(),
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
@@ -422,6 +429,41 @@ impl HostServices for LiveHostServices {
 
     fn http_close_stream(&self, handle: u32) {
         self.http.close_stream(handle);
+    }
+
+    // --- proc GRANT (arch-08 §5.2 request/poll bridge; pi-mcp-adapter-port.md §3.1) ---
+    // Reaching here means the load-time trust gate already said yes (the SAME gate `exec`/
+    // `http-client` use) — no extra trust/tier check. `spawn`/`read_stdout`/`read_stderr`/
+    // `poll_exit` are sync (no `.await` in `ProcCaps` for those); `write_stdin`/`kill` need to
+    // `.await` real pipe I/O / process-termination confirmation, driven to completion via the SAME
+    // `block_in_place` + `block_on` bridge `exec`/`http_request` use.
+
+    fn proc_spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
+        self.proc_caps.spawn(spec)
+    }
+
+    fn proc_write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.proc_caps.write_stdin(handle, data))
+        })
+    }
+
+    fn proc_read_stdout(&self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
+        self.proc_caps.read_stdout(handle, max_bytes)
+    }
+
+    fn proc_read_stderr(&self, handle: u32, max_bytes: u32) -> Result<Vec<u8>, String> {
+        self.proc_caps.read_stderr(handle, max_bytes)
+    }
+
+    fn proc_poll_exit(&self, handle: u32) -> Option<i32> {
+        self.proc_caps.poll_exit(handle)
+    }
+
+    fn proc_kill(&self, handle: u32) -> Result<(), String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.proc_caps.kill(handle))
+        })
     }
 
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {

@@ -9,8 +9,8 @@
 use crate::{
     AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, DialogOptions, ExecOptions,
     ExtensionApi, HttpRequest, MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider,
-    Outcome, ProviderConfig, ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor,
-    ToolOutput,
+    Outcome, ProcSpawnOptions, ProviderConfig, ProviderHandlers, ReplacedSessionContext, ToolCall,
+    ToolDescriptor, ToolOutput,
 };
 use serde_json::{json, Value};
 
@@ -271,6 +271,155 @@ pub fn build() -> ExtensionApi {
             let body = String::from_utf8_lossy(&body).into_owned();
             ctx.ui().notify(&format!("http stream chunks: {chunks} body: {body}"));
             Ok(Some(format!("http stream chunks {chunks} body {body}")))
+        },
+    );
+
+    // Commands exercising the capability-scoped `proc` grant (arch-08 §5.2 request/poll bridge;
+    // pi-mcp-adapter-port.md §3.1): a long-lived, duplex-pipe child, distinct from the bounded
+    // `execdemo` one-shot. Split into separate commands (rather than one big demo like
+    // `execdemo`/`httpdemo`) so a HOST-side test can drive each step as its own top-level
+    // `session.prompt(...)` round trip — proving stdin/stdout stay live across genuinely separate
+    // calls, not just an internal loop within one guest invocation — and interleave real OS-level
+    // process checks between `procspawn` and `prockill`.
+    //
+    // `procspawn` runs a marker-tagged shell read-echo loop (`sh -c 'while IFS= read -r line; do
+    // printf "echo:%s\n" "$line"; done' <marker>`) — a genuine long-lived duplex process (not a
+    // one-shot), with the marker as a trailing shell positional arg so a host-side `pgrep -f
+    // <marker>` can find (and later confirm the disappearance of) the exact real OS process.
+    api.register_command(
+        "procspawn",
+        CommandDescriptor::new(
+            "Spawn a marker-tagged shell read-echo loop via the proc capability (demo). \
+             args: <marker>",
+        ),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let marker = args.trim();
+            match ctx.ctx().proc_spawn(
+                "sh",
+                &["-c", "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done", marker],
+                &ProcSpawnOptions::default(),
+            ) {
+                Ok(handle) => {
+                    ctx.ui().notify(&format!("proc spawned handle:{handle}"));
+                    Ok(Some(format!("proc spawned handle:{handle}")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("proc denied: {e}"));
+                    Ok(Some(format!("proc denied: {e}")))
+                }
+            }
+        },
+    );
+
+    // `procspawnexit` (no args): spawns a child that exits ON ITS OWN shortly after starting
+    // (`sh -c "sleep 0.1; exit 7"`) — no `kill` involved — so a host-side test can prove `poll-exit`
+    // reports the REAL natural exit code, not just a `kill`-driven one.
+    api.register_command(
+        "procspawnexit",
+        CommandDescriptor::new("Spawn a proc that exits on its own with code 7 (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            match ctx.ctx().proc_spawn(
+                "sh",
+                &["-c", "sleep 0.1; exit 7"],
+                &ProcSpawnOptions::default(),
+            ) {
+                Ok(handle) => {
+                    ctx.ui().notify(&format!("proc spawned handle:{handle}"));
+                    Ok(Some(format!("proc spawned handle:{handle}")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("proc denied: {e}"));
+                    Ok(Some(format!("proc denied: {e}")))
+                }
+            }
+        },
+    );
+
+    // `procwrite <handle> <text>`: write `<text>\n` to the child's REAL stdin.
+    api.register_command(
+        "procwrite",
+        CommandDescriptor::new("Write a line to a spawned proc's stdin (demo). args: <handle> <text>"),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let mut it = args.trim().splitn(2, ' ');
+            let handle: u32 = it.next().unwrap_or_default().parse().unwrap_or(0);
+            let text = it.next().unwrap_or_default();
+            let mut line = text.to_string();
+            line.push('\n');
+            match ctx.ctx().proc_write_stdin(handle, line.as_bytes()) {
+                Ok(n) => {
+                    ctx.ui().notify(&format!("proc wrote handle:{handle} bytes:{n}"));
+                    Ok(Some(format!("proc wrote {n} bytes")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("proc write denied: {e}"));
+                    Ok(Some(format!("proc write denied: {e}")))
+                }
+            }
+        },
+    );
+
+    // `procreadpoll <handle> <needle>`: poll REAL stdout — across MULTIPLE `read-stdout` calls in a
+    // bounded loop (empty = no data yet, never treated as EOF) — until the accumulated bytes
+    // contain `<needle>`, proving the pipe is genuinely live, not a captured one-shot.
+    api.register_command(
+        "procreadpoll",
+        CommandDescriptor::new(
+            "Poll a spawned proc's stdout until a needle appears (demo). args: <handle> <needle>",
+        ),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let mut it = args.trim().splitn(2, ' ');
+            let handle: u32 = it.next().unwrap_or_default().parse().unwrap_or(0);
+            let needle = it.next().unwrap_or_default().as_bytes();
+            let mut acc: Vec<u8> = Vec::new();
+            let mut seen = false;
+            for _ in 0..20_000u32 {
+                match ctx.ctx().proc_read_stdout(handle, 4096) {
+                    Ok(chunk) => acc.extend_from_slice(&chunk),
+                    Err(e) => {
+                        ctx.ui().notify(&format!("proc read denied: {e}"));
+                        return Ok(Some(format!("proc read denied: {e}")));
+                    }
+                }
+                if !needle.is_empty() && acc.windows(needle.len()).any(|w| w == needle) {
+                    seen = true;
+                    break;
+                }
+            }
+            let acc_text = String::from_utf8_lossy(&acc).into_owned();
+            ctx.ui().notify(&format!("proc read handle:{handle} seen:{seen} acc:{acc_text}"));
+            Ok(Some(format!("proc read seen:{seen}")))
+        },
+    );
+
+    // `procpollexit <handle>`: a single non-blocking `poll-exit` (none = still running).
+    api.register_command(
+        "procpollexit",
+        CommandDescriptor::new("Poll a spawned proc's exit status once (demo). args: <handle>"),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let handle: u32 = args.trim().parse().unwrap_or(0);
+            let code = ctx.ctx().proc_poll_exit(handle);
+            ctx.ui().notify(&format!("proc pollexit handle:{handle} code:{code:?}"));
+            Ok(Some(format!("proc pollexit code:{code:?}")))
+        },
+    );
+
+    // `prockill <handle>`: terminate the child (SIGTERM then SIGKILL after a grace period,
+    // host-side policy) and report both the kill outcome and the exit status observed right after.
+    api.register_command(
+        "prockill",
+        CommandDescriptor::new("Kill a spawned proc (demo). args: <handle>"),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let handle: u32 = args.trim().parse().unwrap_or(0);
+            let kill_result = ctx.ctx().proc_kill(handle);
+            let code = ctx.ctx().proc_poll_exit(handle);
+            ctx.ui().notify(&format!(
+                "proc kill handle:{handle} ok:{} code:{code:?}",
+                kill_result.is_ok()
+            ));
+            match kill_result {
+                Ok(()) => Ok(Some(format!("proc killed code:{code:?}"))),
+                Err(e) => Ok(Some(format!("proc kill denied: {e}"))),
+            }
         },
     );
 
