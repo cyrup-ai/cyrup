@@ -165,19 +165,35 @@ impl HttpCaps {
         };
         match stream.next().await {
             Some(Ok(bytes)) => {
-                if let Ok(mut g) = self.streams.lock() {
+                // TOCTOU guard: `close_stream` may have removed this handle entirely (not just
+                // taken its slot) while we were awaiting the chunk above — re-inserting
+                // unconditionally would resurrect a handle the guest already explicitly closed
+                // (and which `close_stream`'s own `g.remove` found nothing to cancel, since the
+                // live `stream` was sitting in OUR local variable, outside the registry, the whole
+                // time). Only put it back if the key is STILL present; otherwise honor the close by
+                // letting `stream` drop here (cancels the in-flight download, matching
+                // `close_stream`'s documented contract) instead of reviving a closed handle. The
+                // chunk we already fetched is still returned — it was real data read off the wire
+                // before the close happened, independent of the registry's bookkeeping.
+                if let Ok(mut g) = self.streams.lock()
+                    && g.contains_key(&handle)
+                {
                     g.insert(handle, Some(stream));
                 }
                 Ok(Some(bytes.to_vec()))
             }
             Some(Err(e)) => {
-                if let Ok(mut g) = self.streams.lock() {
+                if let Ok(mut g) = self.streams.lock()
+                    && g.contains_key(&handle)
+                {
                     g.insert(handle, None); // terminal: subsequent polls degrade to EOF
                 }
                 Err(e.to_string())
             }
             None => {
-                if let Ok(mut g) = self.streams.lock() {
+                if let Ok(mut g) = self.streams.lock()
+                    && g.contains_key(&handle)
+                {
                     g.insert(handle, None); // natural EOF
                 }
                 Ok(None)
@@ -238,6 +254,7 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -406,6 +423,66 @@ mod tests {
         caps.close_stream(opened.handle);
         let err = caps.poll_stream_chunk(opened.handle).await.expect_err("closed handle is unknown");
         assert!(err.contains("no open http stream"), "got: {err}");
+    }
+
+    /// TOCTOU regression: `close_stream` racing a genuinely in-flight `poll_stream_chunk` (the
+    /// `stream.next().await` window, where the live stream sits OUTSIDE the registry in
+    /// `poll_stream_chunk`'s own local variable) must NOT resurrect the handle. Before the fix,
+    /// `poll_stream_chunk` unconditionally re-inserted `Some(stream)`/`None` after the await,
+    /// silently undoing the concurrent `close_stream`'s removal. Uses a REAL mock server with a
+    /// real delay BEFORE its first (and only) chunk, and REAL concurrent tasks (`tokio::spawn`, not
+    /// a single-threaded interleaving trick) — the poll is provably in-flight (awaiting the network)
+    /// at the moment `close_stream` runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn poll_racing_close_does_not_resurrect_the_closed_handle() {
+        let body = b"the one real chunk".to_vec();
+        let server_body = body.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // Headers land immediately (so `request_stream` returns fast and we get a handle),
+                // but the body is delayed — this is the window `poll_stream_chunk` blocks in.
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = sock.write_all(&server_body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{addr}/probe");
+
+        let caps = Arc::new(HttpCaps::new());
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        let handle = opened.handle;
+
+        // Start the poll — it immediately blocks on `stream.next().await` for ~200ms.
+        let poll_caps = caps.clone();
+        let poll_task = tokio::spawn(async move { poll_caps.poll_stream_chunk(handle).await });
+
+        // Give the poll a real head start so it is GENUINELY in-flight (awaiting the network), then
+        // close the handle WHILE the poll is still pending.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        caps.close_stream(handle);
+
+        // The in-flight poll still returns the REAL chunk it was already fetching — closing doesn't
+        // retroactively fail an already-started read.
+        let polled = poll_task.await.expect("poll task joins").expect("poll succeeds");
+        assert_eq!(polled, Some(body), "the in-flight poll still returns the real chunk it fetched");
+
+        // THE fix: the handle must NOT have been resurrected by the poll's post-await re-insert —
+        // it must stay genuinely closed (`Err`, matching `close_stream_invalidates_the_handle`
+        // above), never silently degrade to `Ok(None)` (which would mean the registry entry came
+        // back to life).
+        let err = caps.poll_stream_chunk(handle).await.expect_err("closed handle stays closed");
+        assert!(
+            err.contains("no open http stream"),
+            "the handle must stay closed after racing with an in-flight poll, got: {err}"
+        );
     }
 
     /// Closes the shared-host-memory-exhaustion finding: a response that DECLARES (via
