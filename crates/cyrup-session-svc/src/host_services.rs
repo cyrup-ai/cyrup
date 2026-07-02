@@ -226,7 +226,13 @@ impl LiveHostServices {
             // The renderer (TUI loop / RPC loop) is gone — degrade to the deny default, never a panic.
             return None;
         }
-        let timeout = opts.timeout_ms.map(Duration::from_millis);
+        // `0` means NO timeout, not an instant one — Pi's `createDialogPromise` only arms the timer
+        // `if (opts?.timeout)` (`rpc-mode.ts:114`; falsy-zero in JS ⇒ no timer at all), and both real
+        // dialog callers double down on the same check (`opts.timeout && opts.timeout > 0`,
+        // `extension-selector.ts:51`, `extension-input.ts:54`). Mirror the `> 0` guard the sibling
+        // `exec` grant already applies to `timeoutMs` just below ([`Self::exec`]) and the TUI's own
+        // countdown applies to the same field (`cyrup-tui/src/app.rs`'s `.filter(|&ms| ms > 0)`).
+        let timeout = opts.timeout_ms.filter(|ms| *ms > 0).map(Duration::from_millis);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 match timeout {
@@ -941,6 +947,47 @@ mod tests {
             .await
             .expect("select task");
         assert_eq!(select, None, "an unanswered select resolves to Pi's `undefined` default");
+    }
+
+    /// `timeout_ms: 0` means NO timeout, not an instant one — Pi's `createDialogPromise` only arms
+    /// its `setTimeout` `if (opts?.timeout)` (`rpc-mode.ts:114`; falsy-zero ⇒ no timer at all). Proven
+    /// here the same way the honors-timeout test proves the OPPOSITE: a REAL (delayed, non-default)
+    /// reply arrives well after `Duration::from_millis(0)` would already have elapsed under the old
+    /// unconditional `.map(Duration::from_millis)` — if `0` were mistakenly armed as a real timer, the
+    /// race would resolve to the default (`false`) near-instantly and NEVER see this later reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_grant_timeout_ms_zero_means_no_timeout_not_an_instant_one() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                // A REAL answer, deliberately delayed well past when a (bugged) 0ms timer would have
+                // already fired and resolved the call to the default.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = req.reply.send(UiReply::Confirm(true));
+            }
+        });
+
+        let opts = DialogOptions { timeout_ms: Some(0), signal_id: None };
+        let started = tokio::time::Instant::now();
+        let confirm = tokio::task::spawn_blocking(move || svc.confirm("proceed?", "body", &opts))
+            .await
+            .expect("confirm task");
+        let elapsed = started.elapsed();
+
+        assert!(
+            confirm,
+            "timeout_ms:0 must wait for the REAL reply (true), not short-circuit to the `false` \
+             default the way a genuine 0ms timeout would"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "the call must have actually WAITED for the delayed reply, not resolved near-instantly \
+             to the default (took {elapsed:?}, expected >= ~150ms)"
+        );
     }
 
     /// L4 review §2.5 (the shared mechanism half): a reply sent on the SAME one-shot `ui_roundtrip` is
