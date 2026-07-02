@@ -455,11 +455,37 @@ impl ProcCaps {
         // stdio-loop MCP servers `read()` until EOF then exit cleanly on their own, needing no
         // signal at all. Dropping (never re-storing) the `ChildStdin` closes the real underlying
         // fd — the same effect as Node's `stdin.end()`.
-        {
-            let mut guard = entry.stdin.lock().await;
-            *guard = None;
-        }
-        if Self::wait_exited(&entry, self.kill_grace).await {
+        //
+        // `try_lock`, NOT `.lock().await`: Node's `stream.end()` (the real `stdin?.end()` this
+        // ports) is itself non-blocking — it returns immediately regardless of any buffered/
+        // in-flight write, structurally independent of `send()`/`write()`
+        // (`@modelcontextprotocol/sdk@1.25.1` `dist/cjs/client/stdio.js:144-179` vs `189-207`).
+        // A blocking `.lock().await` here would instead let a concurrent [`Self::write_stdin`] —
+        // which holds this SAME mutex for up to [`WRITE_STDIN_TIMEOUT`] (30s) against a slow/non-
+        // reading child — stall `kill`'s entire escalation by up to 30s on top of its own ~6s
+        // budget (`host/live.rs`'s epoch-forgiveness doc), a real, reachable divergence given Pi's
+        // own parallel tool-execution model (`types.ts:455-462`). If the lock is busy, hand the
+        // close off to a detached task that finishes it once the writer releases the mutex — kill
+        // proceeds immediately to phase 2 instead of waiting on it (see the `stdin_closed` doc just
+        // below for why skipping the grace-wait here is still correct).
+        let stdin_closed = match entry.stdin.try_lock() {
+            Ok(mut guard) => {
+                *guard = None;
+                true
+            }
+            Err(_) => {
+                let entry_bg = entry.clone();
+                tokio::spawn(async move {
+                    *entry_bg.stdin.lock().await = None;
+                });
+                false
+            }
+        };
+        // Only wait out the grace period when stdin was ACTUALLY closed just now — if a concurrent
+        // write held the lock, stdin is still open (the background task above hasn't run yet), so a
+        // grace-period wait here could only ever catch an unrelated natural exit, never a genuine
+        // EOF-driven one; skip straight to SIGTERM instead of paying a needless `kill_grace` delay.
+        if stdin_closed && Self::wait_exited(&entry, self.kill_grace).await {
             return Ok(()); // exited on stdin EOF alone — no signal needed (stdio.js:159-160).
         }
 
@@ -1085,5 +1111,51 @@ mod tests {
         // The stdin handle is left open after a mere timeout (not a real io error) — a subsequent
         // `kill` must still work normally, proving the capability itself is not left wedged.
         caps.kill(handle).await.expect("the capability survives a write_stdin timeout intact");
+    }
+
+    /// L4 review §5 — `kill`'s phase-1 stdin-close must NEVER be blocked by a CONCURRENT
+    /// `write_stdin` against the SAME handle. Before the fix, both held `entry.stdin`'s mutex for
+    /// the write's full in-flight duration (up to `write_stdin_timeout`, 30s in production) —
+    /// `kill` could stall up to 30s on top of its own ~`kill_grace`*2 + `KILL_CONFIRM_TIMEOUT`
+    /// budget. `write_stdin_timeout` is set deliberately long here (30s) so the write is
+    /// GUARANTEED to still be genuinely in flight (blocked on write-readiness against `sleep`,
+    /// which never reads its stdin) when `kill` races it — proving `kill` doesn't merely finish
+    /// before some short timeout, but is structurally independent of the write's own deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn kill_is_never_blocked_by_a_concurrent_write_stdin_against_the_same_handle() {
+        let caps = Arc::new(ProcCaps {
+            registry: Mutex::new(HashMap::new()),
+            next_handle: AtomicU32::new(1),
+            kill_grace: Duration::from_millis(150),
+            write_stdin_timeout: Duration::from_secs(30),
+        });
+        let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
+        // Far larger than any realistic OS pipe buffer so `write_all` is genuinely still blocked,
+        // not merely fast, once `kill` races it (same margin as the timeout test above).
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+
+        let caps_w = caps.clone();
+        let write_task = tokio::spawn(async move { caps_w.write_stdin(handle, &payload).await });
+        // Let the write actually start and fill the OS pipe buffer so it is DEMONSTRABLY in flight
+        // (not merely queued) by the time `kill` runs.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = tokio::time::Instant::now();
+        let result = caps.kill(handle).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "kill must still succeed while a write is in flight: {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "kill must not be blocked by the concurrent write_stdin's 30s timeout (its own budget \
+             is ~kill_grace*2 + KILL_CONFIRM_TIMEOUT, well under a second here): took {elapsed:?}"
+        );
+
+        // The in-flight write eventually resolves too (SIGKILL tears down the pipe, turning the
+        // still-blocked `write_all` into a real broken-pipe `Err` well before its 30s timeout) —
+        // clean up rather than leak the task.
+        let _ = tokio::time::timeout(Duration::from_secs(5), write_task)
+            .await
+            .expect("the write must resolve once its target process is gone, not hang");
     }
 }
