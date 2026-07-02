@@ -154,6 +154,33 @@ impl std::fmt::Debug for ProcCaps {
     }
 }
 
+impl Drop for ProcCaps {
+    /// Restores the safety net [`Self::spawn`]'s `cmd.kill_on_drop(true)` comment promises but never
+    /// actually delivers: that flag only fires when tokio's OWN `Child` value is dropped, but
+    /// `spawn` immediately moves the `Child` into a DETACHED `tokio::spawn` waiter task (so the exit
+    /// code keeps getting reaped/published even if the caller never polls again) — so `kill_on_drop`
+    /// never fires when THIS `ProcCaps` (the registry of `pid`s) goes away, and any child a guest
+    /// never explicitly `kill`ed leaks as a real, still-running OS process for the rest of the host
+    /// process's lifetime (confirmed empirically: dropping `ProcCaps` with a live `sleep` child left
+    /// its pid alive under `pgrep` well past the drop).
+    ///
+    /// Mirrors tokio's OWN `kill_on_drop` semantics exactly — a direct SIGKILL, no graceful
+    /// escalation (`Drop::drop` cannot `.await` the multi-second grace [`Self::kill`] runs; tokio's
+    /// own `ChildDropGuard::drop`, `tokio::process::Command`'s doc, does the identical direct-SIGKILL
+    /// thing for the same reason) — for every entry that hasn't already published an exit code. The
+    /// still-running waiter task spawned in [`Self::spawn`] is untouched by this drop and keeps
+    /// running independently: it observes the SIGKILL-induced exit via its own `child.wait()` and
+    /// reaps the OS process (no zombie left behind) even though nothing is left to read the exit
+    /// code by that point — the entry (and this whole registry) is gone with `self`.
+    fn drop(&mut self) {
+        for entry in self.registry().values() {
+            if entry.exit_code.borrow().is_none() {
+                let _ = cyrup_tools::kill_pid(entry.pid);
+            }
+        }
+    }
+}
+
 impl Default for ProcCaps {
     fn default() -> Self {
         Self::new()
@@ -670,5 +697,38 @@ mod tests {
         assert!(caps.read_stderr(999, 10).is_err());
         assert!(caps.kill(999).await.is_err());
         assert_eq!(caps.poll_exit(999), None);
+    }
+
+    /// Closes the confirmed audit finding: a still-running child that the guest never explicitly
+    /// `kill`ed must NOT leak as a live OS process once `ProcCaps` itself goes away (session
+    /// teardown / extension unload) — restoring the safety net [`ProcCaps::spawn`]'s
+    /// `kill_on_drop(true)` comment promises. Verified at the OS level (never just our own
+    /// accounting): `kill -0` on the pid must fail shortly after `drop(caps)`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_proc_caps_kills_a_still_running_child_no_leak() {
+        let caps = ProcCaps::new();
+        let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
+        assert_eq!(caps.poll_exit(handle), None, "genuinely still running before drop");
+
+        let pid = {
+            let reg = caps.registry();
+            reg.get(&handle).expect("entry present").pid
+        };
+        // Independently confirm the OS process is alive BEFORE the drop, so a later "not found" is
+        // meaningful rather than a false positive from a pid that never existed.
+        let alive_before =
+            std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(alive_before.map(|s| s.success()).unwrap_or(false), "sleep must be alive pre-drop");
+
+        drop(caps); // NO explicit `kill(handle)` call — this is the leak scenario.
+
+        // Give the synchronous SIGKILL a brief moment to actually land at the OS level.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let alive_after = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(
+            alive_after.map(|s| !s.success()).unwrap_or(true),
+            "kill -0 must fail after dropping ProcCaps — the child must not outlive it unkilled"
+        );
     }
 }
