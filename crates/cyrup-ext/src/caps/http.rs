@@ -108,15 +108,35 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// not to cap how long the connection itself may legitimately stay open.
 const HTTP_POLL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The state of a single handle in [`HttpCaps`]'s stream registry. THREE distinct states — not a
+/// bare `Option<ChunkStream>` — are needed to correctly account for [`MAX_OPEN_STREAMS`] while a
+/// poll is genuinely in flight (L4 round-12 finding #2a): collapsing "already reached terminal EOF,
+/// nothing left to free" and "currently being awaited by `poll_stream_chunk`, the real connection AND
+/// a host blocking thread (`cyrup-session-svc::host_services::http_poll_stream_chunk`'s
+/// `block_in_place`+`block_on`) stay pinned for up to [`HTTP_POLL_IDLE_TIMEOUT`]" into the same `None`
+/// representation let `close_stream`'s unconditional `remove` free the [`MAX_OPEN_STREAMS`] accounting
+/// slot the INSTANT it ran, long before the real resource was actually released — letting a guest
+/// evade the cap simply by racing `close_stream` against every `poll_stream_chunk`.
+enum StreamSlot {
+    /// Live and not currently being awaited by a poll.
+    Idle(ChunkStream),
+    /// Reached terminal EOF or a stream read error; repeat polls keep degrading to `Ok(None)`.
+    Eof,
+    /// The `ChunkStream` has been taken out of the registry to `.await` its next chunk
+    /// (`poll_stream_chunk`). `closed` records whether `close_stream` ran while this poll was in
+    /// flight — actual removal (and so the real connection's drop) is deferred to that poll's own
+    /// completion, so the [`MAX_OPEN_STREAMS`] slot is never freed before the resource genuinely is.
+    Polling { closed: bool },
+}
+
 /// The real HTTP capability engine: one shared `reqwest::Client` plus a registry of open streaming
 /// bodies keyed by an opaque `u32` handle (`request-stream` / `poll-stream-chunk` / `close-stream`).
-/// A registry entry of `None` means the underlying stream already reached natural EOF (or errored)
-/// but the handle stays registered — repeat polls keep returning `Ok(None)` until the guest calls
-/// `close-stream`, matching Pi's SSE/StreamableHTTP "done" semantics for the eventual MCP transport
-/// consumer.
+/// See [`StreamSlot`] for what each registry entry means; repeat polls of a [`StreamSlot::Eof`] entry
+/// keep returning `Ok(None)` until the guest calls `close-stream`, matching Pi's SSE/StreamableHTTP
+/// "done" semantics for the eventual MCP transport consumer.
 pub struct HttpCaps {
     client: reqwest::Client,
-    streams: Mutex<HashMap<u32, Option<ChunkStream>>>,
+    streams: Mutex<HashMap<u32, StreamSlot>>,
     next_handle: AtomicU32,
     /// [`MAX_OPEN_STREAMS`] in production; overridable ONLY for tests
     /// ([`Self::with_max_open_streams`]) so the cap-rejection path is exercisable without actually
@@ -354,94 +374,122 @@ impl HttpCaps {
                 self.max_open_streams
             ));
         }
-        g.insert(handle, Some(stream));
+        g.insert(handle, StreamSlot::Idle(stream));
         Ok(HttpStreamResponse { handle, status, headers })
     }
 
     /// Drain the next chunk of an open stream (the WIT `poll-stream-chunk`); `Ok(None)` = EOF. A
     /// stream that already hit EOF (or errored) keeps returning `Ok(None)` on repeat polls; only an
-    /// unknown/already-closed handle is an `Err`.
+    /// unknown handle is an `Err`. A handle already being polled by a concurrent call degrades to
+    /// `Ok(None)` for THIS call too (the pre-existing, unchanged, ambiguous-taken-slot behavior —
+    /// this fix touches only the `close_stream`-races-an-in-flight-poll accounting, not this).
     pub async fn poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
         // Take the live stream out of the registry while we `.await` it (a `MutexGuard` cannot be
-        // held across an await point — the compiler enforces this since the guard isn't `Send`).
-        let slot = {
+        // held across an await point — the compiler enforces this since the guard isn't `Send`),
+        // marking the slot `Polling { closed: false }` so a racing `close_stream` (see its doc) knows
+        // NOT to free the [`MAX_OPEN_STREAMS`] accounting slot until this poll actually completes.
+        let stream = {
             let mut g = self
                 .streams
                 .lock()
                 .map_err(|_| "http stream registry lock poisoned".to_string())?;
             match g.get_mut(&handle) {
-                Some(slot) => slot.take(),
+                Some(slot @ StreamSlot::Idle(_)) => {
+                    let StreamSlot::Idle(stream) =
+                        std::mem::replace(slot, StreamSlot::Polling { closed: false })
+                    else {
+                        unreachable!("just matched StreamSlot::Idle above")
+                    };
+                    Some(stream)
+                }
+                Some(StreamSlot::Eof | StreamSlot::Polling { .. }) => None,
                 None => return Err(format!("no open http stream for handle {handle}")),
             }
         };
-        let Some(mut stream) = slot else {
-            // Already EOF'd/errored on a prior poll; the handle stays open (only `close-stream`
-            // removes it) but every further poll degrades to EOF, never a re-raised error.
+        let Some(mut stream) = stream else {
+            // Already EOF'd/errored on a prior poll (or a concurrent poll already has it out); the
+            // handle stays registered (only `close-stream` removes it) but this call degrades to EOF.
             return Ok(None);
+        };
+        // Restore the registry entry once this poll concludes, UNLESS `close_stream` ran while it was
+        // in flight (`Polling { closed: true }`) — in that case remove the handle HERE instead,
+        // exactly when the real resource (the local `stream`, about to drop) is actually released,
+        // never earlier (L4 round-12 finding #2a). `next` is the state to install when NOT closed;
+        // ignored (removal wins) when closed.
+        let finalize = |next: StreamSlot| {
+            if let Ok(mut g) = self.streams.lock() {
+                match g.get_mut(&handle) {
+                    Some(StreamSlot::Polling { closed: true }) => {
+                        g.remove(&handle);
+                    }
+                    Some(slot @ StreamSlot::Polling { closed: false }) => {
+                        *slot = next;
+                    }
+                    // Defensive only — the state machine above never lets `handle` be in any other
+                    // shape (or vanish) while a poll owns it; a silent no-op is the no-panic-safe
+                    // fallback if it somehow did.
+                    _ => {}
+                }
+            }
         };
         // L4 review §6: bound THIS SINGLE poll's wait, never the stream's overall lifetime — a
         // legitimate long-lived SSE/StreamableHTTP connection (the real consumer's actual protocol
         // need, MCP SDK `streamableHttp.js:75-105`) can go quiet between server-pushed messages for a
         // while; see [`HTTP_POLL_IDLE_TIMEOUT`]'s doc for why this must not fire eagerly. On timeout
-        // the stream is put straight BACK (never marked EOF/terminal) so a guest that simply polls
-        // again keeps draining the SAME still-open connection.
+        // the stream is put straight BACK to `Idle` (never marked EOF/terminal) so a guest that simply
+        // polls again keeps draining the SAME still-open connection.
         let poll_idle_timeout = self.poll_idle_timeout;
         match tokio::time::timeout(poll_idle_timeout, stream.next()).await {
             Err(_) => {
-                if let Ok(mut g) = self.streams.lock()
-                    && g.contains_key(&handle)
-                {
-                    g.insert(handle, Some(stream));
-                }
+                finalize(StreamSlot::Idle(stream));
                 Err(format!(
                     "poll_stream_chunk: no chunk within {poll_idle_timeout:?} — the connection \
                      may still be open, poll again"
                 ))
             }
             Ok(Some(Ok(bytes))) => {
-                // TOCTOU guard: `close_stream` may have removed this handle entirely (not just
-                // taken its slot) while we were awaiting the chunk above — re-inserting
-                // unconditionally would resurrect a handle the guest already explicitly closed
-                // (and which `close_stream`'s own `g.remove` found nothing to cancel, since the
-                // live `stream` was sitting in OUR local variable, outside the registry, the whole
-                // time). Only put it back if the key is STILL present; otherwise honor the close by
-                // letting `stream` drop here (cancels the in-flight download, matching
-                // `close_stream`'s documented contract) instead of reviving a closed handle. The
-                // chunk we already fetched is still returned — it was real data read off the wire
-                // before the close happened, independent of the registry's bookkeeping.
-                if let Ok(mut g) = self.streams.lock()
-                    && g.contains_key(&handle)
-                {
-                    g.insert(handle, Some(stream));
-                }
+                // The chunk we already fetched is returned regardless of a racing close — it was real
+                // data read off the wire before the close happened, independent of the registry's
+                // bookkeeping (`finalize` above still honors the close: removes rather than
+                // reinstates `Idle`).
+                finalize(StreamSlot::Idle(stream));
                 Ok(Some(bytes.to_vec()))
             }
             Ok(Some(Err(e))) => {
-                if let Ok(mut g) = self.streams.lock()
-                    && g.contains_key(&handle)
-                {
-                    g.insert(handle, None); // terminal: subsequent polls degrade to EOF
-                }
+                finalize(StreamSlot::Eof); // terminal: subsequent polls degrade to EOF
                 Err(e.to_string())
             }
             Ok(None) => {
-                if let Ok(mut g) = self.streams.lock()
-                    && g.contains_key(&handle)
-                {
-                    g.insert(handle, None); // natural EOF
-                }
+                finalize(StreamSlot::Eof); // natural EOF
                 Ok(None)
             }
         }
     }
 
-    /// Close (drop/cancel) a stream (the WIT `close-stream`). Dropping the underlying
-    /// `reqwest::Response` body cancels the in-flight download. Unconditionally removes the handle
-    /// (never an error — mirrors the WIT signature's `()` return); closing an unknown handle is a
-    /// silent no-op.
+    /// Close (drop/cancel) a stream (the WIT `close-stream`). Never an error — mirrors the WIT
+    /// signature's `()` return; closing an unknown handle is a silent no-op.
+    ///
+    /// An `Idle`/`Eof` entry is removed right here — dropping the underlying `reqwest::Response` body
+    /// (if any) cancels the in-flight download immediately, and freeing the [`MAX_OPEN_STREAMS`]
+    /// accounting slot the same instant is correct: nothing is still using it.
+    ///
+    /// A `Polling` entry (a [`Self::poll_stream_chunk`] call currently has the real stream taken out,
+    /// `.await`-ing its next chunk) is NOT removed here — the real connection and a host blocking
+    /// thread stay pinned for up to [`HTTP_POLL_IDLE_TIMEOUT`] regardless of what this function does,
+    /// so removing the registry entry now would free the accounting slot long before the resource
+    /// is actually released, letting a guest evade [`MAX_OPEN_STREAMS`] by racing `close_stream`
+    /// against every `poll_stream_chunk` (L4 round-12 finding #2a). Instead this only flags the entry
+    /// `closed`; the in-flight poll's own completion (`poll_stream_chunk`'s `finalize`) performs the
+    /// actual removal at the moment the resource genuinely frees.
     pub fn close_stream(&self, handle: u32) {
         if let Ok(mut g) = self.streams.lock() {
-            g.remove(&handle);
+            match g.get_mut(&handle) {
+                Some(StreamSlot::Polling { closed }) => *closed = true,
+                Some(_) => {
+                    g.remove(&handle);
+                }
+                None => {}
+            }
         }
     }
 }
@@ -971,6 +1019,70 @@ mod tests {
             err.contains("no open http stream"),
             "the handle must stay closed after racing with an in-flight poll, got: {err}"
         );
+    }
+
+    /// L4 round-12 finding #2a: `close_stream` racing an in-flight `poll_stream_chunk` must NOT free
+    /// the [`MAX_OPEN_STREAMS`] accounting slot before the real resource (the connection + a host
+    /// blocking thread, `cyrup-session-svc::host_services::http_poll_stream_chunk`'s
+    /// `block_in_place`+`block_on`) is actually released. Uses a real mock server with a delayed body
+    /// chunk (so the poll is genuinely in flight, awaiting the network — same proof technique as
+    /// [`poll_racing_close_does_not_resurrect_the_closed_handle`]) and
+    /// `HttpCaps::with_max_open_streams(1)` so a SECOND `request_stream` attempt directly observes
+    /// whether the cap was (wrongly) freed early by the racing `close_stream`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_stream_racing_an_in_flight_poll_does_not_free_the_cap_slot_early() {
+        let body = b"the delayed chunk".to_vec();
+        let server_body = body.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", server_body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = sock.write_all(&server_body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let url = format!("http://{addr}/probe");
+
+        let caps = Arc::new(HttpCaps::with_max_open_streams(1));
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("first stream opens under the cap of 1");
+        let handle = opened.handle;
+
+        // Start the poll — it immediately blocks on `stream.next().await` for ~200ms.
+        let poll_caps = caps.clone();
+        let poll_task = tokio::spawn(async move { poll_caps.poll_stream_chunk(handle).await });
+
+        // Give the poll a real head start so it is genuinely in-flight, then close the handle WHILE
+        // the poll is still pending — the exact race this finding is about.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        caps.close_stream(handle);
+
+        // THE fix: even though `close_stream` already ran, the real resource (the poll) is still in
+        // flight — a second `request_stream` must still be rejected by the cap of 1, proving the
+        // accounting slot was NOT freed early.
+        let second_url = spawn_persistent_mock().await;
+        let second_req = HttpRequest { method: "GET".into(), url: second_url, ..Default::default() };
+        let err = caps
+            .request_stream(&second_req)
+            .await
+            .expect_err("the cap slot must stay held while the closed stream's poll is still in flight");
+        assert!(err.contains("too many open http streams"), "got: {err}");
+
+        // Let the in-flight poll actually finish — it observes the close and releases the slot for
+        // real at that point, not before.
+        let polled = poll_task.await.expect("poll task joins").expect("poll succeeds");
+        assert_eq!(polled, Some(body), "the in-flight poll still returns the real chunk it fetched");
+
+        // NOW the slot is genuinely free: a fresh request_stream succeeds.
+        caps.request_stream(&second_req)
+            .await
+            .expect("a stream opens once the raced-closed stream's poll has genuinely completed");
     }
 
     /// A mock server that accepts MANY connections (not just one, unlike [`spawn_mock`]), each
