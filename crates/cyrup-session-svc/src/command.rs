@@ -142,7 +142,7 @@ impl AgentSession {
                     crate::BashOptions { exclude_from_context },
                     None,
                 )
-                .await,
+                .await?,
             ),
             C::AbortBash => {
                 self.abort_bash();

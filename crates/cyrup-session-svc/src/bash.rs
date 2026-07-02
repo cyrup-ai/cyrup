@@ -33,6 +33,12 @@ pub struct BashOptions {
 
 /// Run `command` against `proc` in `cwd`, streaming combined output to `on_chunk`, honoring `cancel`
 /// (Pi `executeBashWithOperations`). The default local backend kills the whole tree on cancel.
+///
+/// A genuine backend failure (spawn error, missing cwd, …) is returned as a real `Err`, NOT
+/// fabricated into a "successful" [`BashResult`] — Pi's `executeBashWithOperations` only catches the
+/// abort case in its `catch` block (`bash-executor.ts:130-155`); every other error hits `throw err`
+/// (line 154), discarding whatever partial output had been captured. Mirror that exactly: the
+/// caller must NOT record a history entry for a call that never really completed.
 pub(crate) async fn run_bash(
     proc: &Arc<dyn ProcOps>,
     shell: &ShellConfig,
@@ -40,7 +46,7 @@ pub(crate) async fn run_bash(
     command: String,
     cancel: cyrup_core::CancelToken,
     mut on_chunk: BashChunkSink,
-) -> BashResult {
+) -> Result<BashResult, cyrup_core::ToolError> {
     let spec = ExecSpec { command, cwd, env: Vec::new(), shell: shell.clone() };
     let mut buf: Vec<u8> = Vec::new();
     let status = proc
@@ -53,12 +59,13 @@ pub(crate) async fn run_bash(
         .await;
     let output = String::from_utf8_lossy(&buf).into_owned();
     match status {
-        Ok(ExitStatus::Exited(code)) => BashResult { output, exit_code: Some(code), cancelled: false },
-        Ok(ExitStatus::Signaled) => BashResult { output, exit_code: None, cancelled: false },
-        Ok(ExitStatus::Killed) => BashResult { output, exit_code: None, cancelled: true },
-        Ok(ExitStatus::TimedOut) => BashResult { output, exit_code: None, cancelled: false },
-        // A backend failure surfaces as cancelled-with-message so the caller still records history.
-        Err(e) => BashResult { output: format!("{output}{e}"), exit_code: None, cancelled: false },
+        Ok(ExitStatus::Exited(code)) => {
+            Ok(BashResult { output, exit_code: Some(code), cancelled: false })
+        }
+        Ok(ExitStatus::Signaled) => Ok(BashResult { output, exit_code: None, cancelled: false }),
+        Ok(ExitStatus::Killed) => Ok(BashResult { output, exit_code: None, cancelled: true }),
+        Ok(ExitStatus::TimedOut) => Ok(BashResult { output, exit_code: None, cancelled: false }),
+        Err(e) => Err(e),
     }
 }
 

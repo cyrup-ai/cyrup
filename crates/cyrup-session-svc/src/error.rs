@@ -68,4 +68,15 @@ pub enum SessionServiceError {
 
     #[error("session io: {0}")]
     Io(String),
+
+    /// A genuine immediate-bash backend failure (spawn error, missing cwd, …) — Pi's
+    /// `executeBashWithOperations` only catches the abort case in its `catch` block; every other
+    /// error hits `throw err` (`bash-executor.ts:154`), which propagates out of
+    /// `AgentSession.executeBash` uncaught (`agent-session.ts:2628-2643`: `recordBashResult` is only
+    /// reached on the success path inside `try`) straight to the RPC dispatcher's `catch`
+    /// (`rpc-mode.ts:756-772`), which converts it into an `error(...)` response with NO history
+    /// entry ever recorded. Mirror that: never fabricate a "successful" [`crate::BashResult`] out of
+    /// a real backend error.
+    #[error("bash: {0}")]
+    Bash(#[from] cyrup_core::ToolError),
 }

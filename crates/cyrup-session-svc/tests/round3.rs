@@ -162,7 +162,10 @@ async fn execute_bash_records_result_and_persists() {
 
     assert!(!session.is_bash_running());
     assert!(!session.has_pending_bash_messages());
-    let result = session.execute_bash("echo hello-bash", BashOptions::default(), None).await;
+    let result = session
+        .execute_bash("echo hello-bash", BashOptions::default(), None)
+        .await
+        .expect("a well-formed local echo command succeeds");
     assert_eq!(result.exit_code, Some(0), "echo exits 0");
     assert!(result.output.contains("hello-bash"), "captured stdout: {:?}", result.output);
     assert!(!result.cancelled);

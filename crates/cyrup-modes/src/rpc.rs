@@ -767,10 +767,20 @@ async fn handle(
         // ------------------------------------------------------------------- Bash ----
         SessionCommand::Bash { command, exclude_from_context } => {
             let id = raw_id.clone();
-            let result = session
-                .execute_bash(&command, BashOptions { exclude_from_context }, None)
-                .await;
-            RpcResponse::ok("bash", id, Some(serde_json::to_value(result).unwrap_or(Value::Null)))
+            // A genuine backend failure (spawn error, missing cwd, …) must NOT be reported as a
+            // success — Pi's `executeBashWithOperations` only catches the abort case; every other
+            // error `throw`s (`bash-executor.ts:154`) straight through `executeBash` to the RPC
+            // dispatcher's `catch` (`rpc-mode.ts:756-772`), which emits an `error(...)` response
+            // with no history entry ever recorded. Mirror that via the same `Ok`/`Err` pattern every
+            // other fallible command here uses (e.g. `compact` above).
+            match session.execute_bash(&command, BashOptions { exclude_from_context }, None).await {
+                Ok(result) => RpcResponse::ok(
+                    "bash",
+                    id,
+                    Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+                ),
+                Err(e) => RpcResponse::err("bash", id, e.to_string()),
+            }
         }
         SessionCommand::AbortBash => {
             session.abort_bash();

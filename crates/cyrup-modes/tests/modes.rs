@@ -538,6 +538,55 @@ async fn rpc_extended_command_surface() {
     assert_eq!(new["data"]["cancelled"], false, "new_session not vetoed: {new}");
 }
 
+/// A genuine immediate-bash backend failure (not a cancellation) must be reported as a real RPC
+/// `error(...)` response, NEVER fabricated into a "successful" `bash` response — and must NEVER be
+/// recorded into transcript history. Pi's `executeBashWithOperations` only catches the abort case in
+/// its `catch` block (`bash-executor.ts:130-155`); every other error `throw`s (line 154),
+/// propagating through `AgentSession.executeBash` uncaught (`agent-session.ts:2628-2643`:
+/// `recordBashResult` is only reached on the success path inside `try`) to the RPC dispatcher's
+/// `catch` (`rpc-mode.ts:756-772`), which converts it into an `error(...)` response with no history
+/// entry ever recorded.
+#[tokio::test]
+async fn rpc_bash_backend_failure_is_not_fabricated_into_a_success() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+    let session = runtime.session().await;
+
+    // Doom every real spawn attempt: `LocalProc::exec` checks the session cwd exists BEFORE ever
+    // spawning (mirrors Pi's `fsAccess(cwd, F_OK)`, bash.ts:70-74) — remove it out from under the
+    // already-built session so the bash command below hits a genuine backend error, not a
+    // cancellation and not a real process failure racy across platforms.
+    std::fs::remove_dir_all(&fx.cwd).expect("remove the session cwd out from under the session");
+
+    let input = concat!(r#"{"type":"bash","id":"b1","command":"echo hi"}"#, "\n");
+    let reader = Cursor::new(input.as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+
+    let lines = parse_lines(&out);
+    let bash_resp = lines.iter().find(|l| l["id"] == "b1").expect("bash response");
+    assert_eq!(
+        bash_resp["success"], false,
+        "a genuine backend failure must not report success: {bash_resp}"
+    );
+    assert!(
+        bash_resp["error"].as_str().unwrap_or_default().contains("Working directory does not exist"),
+        "the real backend error message must surface verbatim: {bash_resp}"
+    );
+    assert!(bash_resp["data"].is_null(), "a failed bash call carries no data payload: {bash_resp}");
+
+    // `cyrup_agent::AgentMessage` isn't a direct dependency of this crate; serialize the live agent
+    // state generically (its `Custom{kind:"bashExecution",..}` variant always serializes with that
+    // literal string, `session.rs`'s `record_bash_result`) rather than naming the foreign type.
+    let msgs = session.agent_messages().await;
+    let msgs_json = serde_json::to_value(&msgs).expect("agent messages serialize");
+    assert!(
+        !msgs_json.to_string().contains("bashExecution"),
+        "a genuine backend failure must NEVER be recorded into transcript history: {msgs_json}"
+    );
+}
+
 /// Read one non-empty JSONL record from an async reader (test helper for the interactive RPC flow).
 async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Value {
     use tokio::io::AsyncBufReadExt;

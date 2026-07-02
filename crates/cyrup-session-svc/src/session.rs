@@ -3141,12 +3141,18 @@ impl AgentSession {
     /// Execute a bash command out-of-band and record its result (Pi `executeBash`,
     /// agent-session.ts:2588). Streams combined output to `on_chunk`; the result is recorded into the
     /// transcript (or deferred while a run streams).
+    ///
+    /// A genuine backend failure is returned as `Err` and NEVER recorded into history — Pi's
+    /// `executeBash` only calls `recordBashResult` on the success path inside its `try` block
+    /// (`agent-session.ts:2628-2643`); a rejection from `executeBashWithOperations` propagates
+    /// straight through the `finally` (which only clears `_bashAbortController`) uncaught, all the
+    /// way to the RPC dispatcher's `catch` (`rpc-mode.ts:756-772`).
     pub async fn execute_bash(
         &self,
         command: &str,
         options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
-    ) -> BashResult {
+    ) -> Result<BashResult, SessionServiceError> {
         // `user_bash` extension event (Pi `extensionRunner.emitUserBash`,
         // interactive-mode.ts:5616 / rpc-mode.ts:551). Fired from this submission pipeline BEFORE
         // execution with the LIVE `{command, excludeFromContext, cwd}`. A handler that returns a full
@@ -3155,15 +3161,16 @@ impl AgentSession {
         // per-call bash-backend override seam — `self.proc` is the fixed backend.)
         if let Some(result) = self.emit_user_bash_event(command, options.exclude_from_context).await {
             self.record_bash_result(command, &result, options).await;
-            return result;
+            return Ok(result);
         }
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.bash_cancel) = Some(cancel.clone());
         let cwd = self.services.cwd.clone();
-        let result = run_bash(&self.proc, &self.shell, cwd, command.to_string(), cancel, on_chunk).await;
+        let outcome = run_bash(&self.proc, &self.shell, cwd, command.to_string(), cancel, on_chunk).await;
         *Self::lock(&self.bash_cancel) = None;
+        let result = outcome?;
         self.record_bash_result(command, &result, options).await;
-        result
+        Ok(result)
     }
 
     /// Emit the `user_bash` extension event and, if a handler fully serviced the command (Pi
