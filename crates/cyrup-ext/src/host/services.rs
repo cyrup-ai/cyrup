@@ -704,21 +704,22 @@ pub struct GuestState {
     /// `withSessionCallbackId`; the host invokes the `with-session` export for each after the command
     /// body returns (Pi `finishSessionReplacement`, agent-session-runtime.ts:184; sdk gap #3).
     pending_with_session: Mutex<Vec<String>>,
-    /// Epoch ticks to forgive at the NEXT epoch-deadline check, accumulated by a `ui.{confirm,select,
-    /// input}` call that blocked on a human answer (`live.rs`'s `ui::Host` impl records the REAL
-    /// wall-clock duration of each `guest.services.{confirm,input,select}` call here). Closes the
-    /// still-open finding that the WASM epoch budget (`ExtensionHost::WASM_EPOCH_BUDGET_TICKS`,
-    /// facade.rs, ~5s) bounds the ENTIRE dialog wait: a human taking longer than the budget used to
-    /// leave the deadline already expired by the time the guest resumed wasm execution right after
-    /// the host call returned, tripping an epoch trap that (component-model reentrance bookkeeping
-    /// never seeing a clean completion) permanently wedges the instance for the rest of the session —
-    /// reproduced empirically (a 6s-delayed reply still resolved the call `Ok`, but every subsequent
-    /// call against the same instance silently no-op'd). The `epoch_deadline_callback` registered at
-    /// Store-construction time (`live.rs`) reads + resets this via [`Self::take_dialog_extra_ticks`]
-    /// and extends the deadline by EXACTLY that much (never a blanket/unlimited grant) instead of
-    /// trapping — so legitimate human-paced dialog time is fully exempted from the budget while a
-    /// GENUINE runaway loop (which never touches this field) still traps at its original budget.
-    dialog_extra_ticks: std::sync::atomic::AtomicU64,
+    /// Wall-clock ESTIMATE of when the currently-armed `wasmtime::Store::set_epoch_deadline` will be
+    /// reached — our own mirror of wasmtime's epoch bookkeeping, since `Store`/`Engine` expose NO
+    /// public getter for either the live epoch counter or the armed deadline (verified against
+    /// wasmtime 46.0.1's `store.rs`/`engine.rs`: `current_epoch`/`get_epoch_deadline` are both
+    /// `pub(crate)`). Computed as `Instant::now() + ticks * epoch::DEFAULT_TICK` and (re)armed by
+    /// [`Self::arm_epoch_deadline_estimate`] every time the host calls `set_epoch_deadline` — see
+    /// [`Self::take_dialog_extra_ticks`]'s doc for why this is needed to compute forgiveness
+    /// correctly instead of doubling it.
+    deadline_estimate: Mutex<Option<std::time::Instant>>,
+    /// Wall-clock instant the FIRST `ui.{confirm,select,input,editor}` call in the current
+    /// forgiveness batch began blocking (`None` between batches) — anchors the "how much budget was
+    /// still unused when the guest chose to block" computation to when it ACTUALLY stopped consuming
+    /// budget, not to whichever (possibly later, if several dialogs chain back-to-back with no
+    /// intervening checkpoint) dialog happened to resolve last. Set by [`Self::note_dialog_wait`],
+    /// consumed + reset by [`Self::take_dialog_extra_ticks`].
+    first_wait_started: Mutex<Option<std::time::Instant>>,
 }
 
 /// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
@@ -775,7 +776,8 @@ impl GuestState {
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
-            dialog_extra_ticks: std::sync::atomic::AtomicU64::new(0),
+            deadline_estimate: Mutex::new(None),
+            first_wait_started: Mutex::new(None),
         }
     }
 
@@ -1049,22 +1051,68 @@ impl GuestState {
         opts.signal_id.as_deref().is_some_and(|id| self.is_signal_aborted(id))
     }
 
-    /// Record that a `ui.{confirm,select,input}` call just blocked for `elapsed` real wall-clock time
-    /// waiting on a human — converts it to the epoch driver's own tick granularity
-    /// ([`crate::host::epoch::DEFAULT_TICK`], 5ms) and accumulates it to forgive at the next epoch
-    /// deadline check (see [`Self::dialog_extra_ticks`]'s doc for the full rationale). Rounds UP so a
-    /// sub-tick remainder is never under-credited (a spurious trap is the failure mode being closed;
-    /// over-crediting by at most one 5ms tick is harmless).
-    pub fn note_dialog_wait(&self, elapsed: std::time::Duration) {
-        let ticks = elapsed.as_millis().div_ceil(crate::host::epoch::DEFAULT_TICK.as_millis()).max(1);
-        let ticks = u64::try_from(ticks).unwrap_or(u64::MAX);
-        self.dialog_extra_ticks.fetch_add(ticks, std::sync::atomic::Ordering::Relaxed);
+    /// (Re)arm [`Self::deadline_estimate`] to `Instant::now() + ticks * epoch::DEFAULT_TICK` — call
+    /// this EVERY time the host calls `store.set_epoch_deadline(ticks)` (every dispatch entry point
+    /// in `live.rs`, plus every forgiveness grant via [`Self::take_dialog_extra_ticks`]) so the
+    /// estimate never drifts out of sync with wasmtime's real (unreadable) internal deadline.
+    pub fn arm_epoch_deadline_estimate(&self, ticks: u64) {
+        let ticks_u32 = u32::try_from(ticks).unwrap_or(u32::MAX);
+        let budget = crate::host::epoch::DEFAULT_TICK.checked_mul(ticks_u32).unwrap_or(std::time::Duration::MAX);
+        let deadline = std::time::Instant::now().checked_add(budget);
+        if let Ok(mut g) = self.deadline_estimate.lock() {
+            *g = deadline;
+        }
     }
 
-    /// Atomically take (reset to zero) the epoch ticks accumulated by [`Self::note_dialog_wait`] —
-    /// the `epoch_deadline_callback` (`live.rs`) calls this exactly once per deadline-reached event.
+    /// Record that a `ui.{confirm,select,input,editor}` call is about to block on a human answer,
+    /// starting at `started` (real wall-clock `Instant`). Only the FIRST call of a back-to-back batch
+    /// (no intervening successful checkpoint) is kept — see [`Self::first_wait_started`]'s doc.
+    pub fn note_dialog_wait(&self, started: std::time::Instant) {
+        if let Ok(mut g) = self.first_wait_started.lock()
+            && g.is_none()
+        {
+            *g = Some(started);
+        }
+    }
+
+    /// Atomically take (reset) the wait batch recorded by [`Self::note_dialog_wait`] and compute how
+    /// many epoch ticks to forgive — the `epoch_deadline_callback` (`live.rs`) calls this exactly
+    /// once per deadline-reached event.
+    ///
+    /// Returns the REMAINING (unused) budget the store still had, in ticks, at the moment the guest
+    /// entered its dialog wait — NOT the wait duration itself. This is the fix for the CRITICAL
+    /// double-forgiveness bug: `wasmtime::UpdateDeadline::Continue(delta)` extends the deadline from
+    /// the CURRENT epoch (`Store::set_epoch_deadline`, wasmtime 46.0.1 `store.rs:2366-2375`:
+    /// `epoch_deadline = current_epoch + delta`), and by the time this callback fires, `current_epoch`
+    /// has ALREADY advanced by (approximately) the full wait duration — so passing the wait duration
+    /// itself as `delta` double-counts it (`current_epoch(≈old_deadline+wait) + wait ≈
+    /// old_deadline + 2*wait`, roughly DOUBLE the intended forgiveness). Passing the pre-wait
+    /// REMAINING budget instead gives `current_epoch(≈old_deadline+wait) + remaining ≈
+    /// old_deadline + wait` — extended by EXACTLY the wait, as originally intended — and is
+    /// inherently bounded by the per-dispatch tick budget (remaining can never exceed what was
+    /// originally granted), so it cannot be exploited by chaining many quick dialogs to accumulate
+    /// unbounded compute time the way a flat "always grant a fresh full budget" policy could.
+    ///
+    /// A recorded wait NEVER produces zero forgiveness (floor of 1 tick): the whole point of this
+    /// mechanism (`845f707`) is that a genuine dialog wait must never trap — a trap here permanently
+    /// wedges the instance (component-model reentrance bookkeeping never sees a clean completion).
     pub fn take_dialog_extra_ticks(&self) -> u64 {
-        self.dialog_extra_ticks.swap(0, std::sync::atomic::Ordering::Relaxed)
+        let Some(first_started) = self.first_wait_started.lock().ok().and_then(|mut g| g.take()) else {
+            return 0;
+        };
+        let deadline = self.deadline_estimate.lock().ok().and_then(|g| *g);
+        let remaining_ticks = deadline
+            .map(|d| {
+                let remaining = d.saturating_duration_since(first_started);
+                let tick_ms = crate::host::epoch::DEFAULT_TICK.as_millis().max(1);
+                u64::try_from(remaining.as_millis().div_ceil(tick_ms)).unwrap_or(u64::MAX)
+            })
+            .unwrap_or(0)
+            .max(1);
+        // Re-arm for the NEXT forgiveness round (chained dialogs within the same dispatch): the fresh
+        // deadline this grant produces is (approximately) `Instant::now() + remaining_ticks`.
+        self.arm_epoch_deadline_estimate(remaining_ticks);
+        remaining_ticks
     }
 
     /// Bind the currently-executing tool's `CancelToken` for the `is-cancelled` poll (sdk gap #1).
@@ -1145,5 +1193,94 @@ mod tests {
         assert_eq!(s.status_for("build"), Some("done".into()));
         assert_eq!(s.status_for("lint"), None); // cleared
         assert_eq!(s.status_for("absent"), None); // never set
+    }
+
+    /// THE CRITICAL fix this closes: `take_dialog_extra_ticks` must forgive the guest's REMAINING
+    /// (unused) budget at the moment it entered the dialog wait — NEVER the wait duration itself,
+    /// and NEVER more than the original per-dispatch budget. The pre-fix bug returned the wait
+    /// duration as `owed`, which `wasmtime::UpdateDeadline::Continue(owed)` then added to the
+    /// CURRENT epoch (already advanced by the full wait) — roughly DOUBLING (or, for a wait much
+    /// longer than the budget, far exceeding double) the intended forgiveness. Verified with REAL
+    /// `std::time::Instant`/wall-clock timing (not a mocked clock — `arm_epoch_deadline_estimate`
+    /// is a wall-clock-only mechanism specifically because wasmtime exposes no public epoch/deadline
+    /// getter, confirmed against wasmtime 46.0.1's source).
+    #[test]
+    fn take_dialog_extra_ticks_forgives_remaining_budget_not_the_disproportionate_wait_duration() {
+        let s = state();
+        // A 20-tick (100ms) per-dispatch budget, mirroring `LiveExtension::load`'s
+        // `guest.arm_epoch_deadline_estimate(epoch_ticks)` call.
+        s.arm_epoch_deadline_estimate(20);
+
+        // The guest burns roughly 40ms of its 100ms budget on real work before blocking on a dialog
+        // (leaving ~60ms / ~12 ticks of budget unused at wait-start).
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let wait_started = std::time::Instant::now();
+        s.note_dialog_wait(wait_started);
+        // The "human" takes 500ms to answer — 5x the ENTIRE original budget, and the exact class of
+        // scenario (`845f707`'s own live repro used 6s against a ~5s budget) that trips the epoch
+        // deadline and invokes this forgiveness path.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let forgiven = s.take_dialog_extra_ticks();
+        // The bug: `owed` (wait duration in ticks) would be ~100 ticks (500ms / 5ms) here — the
+        // fixed value must be decisively smaller, bounded by the ORIGINAL 20-tick budget.
+        assert!(
+            forgiven <= 20,
+            "forgiveness must never exceed the ORIGINAL per-dispatch budget (20 ticks): got \
+             {forgiven} — granting more re-introduces the double-forgiveness bug (old code would \
+             have granted ~100, the wait duration in ticks)"
+        );
+        // Never zero (a recorded wait must never trap — that permanently wedges the instance).
+        assert!(forgiven >= 1, "a recorded dialog wait must never produce zero forgiveness");
+        // Roughly matches the ~12 remaining ticks (60ms / 5ms), not the ~100-tick wait duration —
+        // generous bounds to absorb real scheduler jitter from the `thread::sleep` calls above.
+        assert!(
+            forgiven <= 16,
+            "forgiveness ({forgiven} ticks) should track the ~12 ticks of budget actually left \
+             unused at wait-start, not the unrelated 500ms wait duration"
+        );
+    }
+
+    /// A guest that enters a dialog wait with ALREADY-exhausted budget (e.g. it spun right up to its
+    /// deadline before calling the dialog) still gets the floor of 1 forgiven tick — enough to reach
+    /// its post-dialog return path without trapping, never zero.
+    #[test]
+    fn take_dialog_extra_ticks_floors_at_one_tick_even_with_no_remaining_budget() {
+        let s = state();
+        s.arm_epoch_deadline_estimate(0); // deadline is effectively "now" already
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.note_dialog_wait(std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(s.take_dialog_extra_ticks(), 1, "a recorded wait floors at 1 tick, never 0");
+    }
+
+    /// No recorded dialog wait ⇒ zero forgiveness (a genuine runaway/looping guest, which never
+    /// calls `note_dialog_wait`, must still trap at its original budget — unchanged by this fix).
+    #[test]
+    fn take_dialog_extra_ticks_is_zero_with_no_recorded_wait() {
+        let s = state();
+        s.arm_epoch_deadline_estimate(20);
+        assert_eq!(s.take_dialog_extra_ticks(), 0);
+    }
+
+    /// Back-to-back dialogs with no intervening checkpoint (`confirm()` immediately followed by
+    /// `input()`) are treated as ONE batch, anchored to the FIRST wait's start — not the second's
+    /// (later) start, which would forgive LESS than the guest is actually owed.
+    #[test]
+    fn take_dialog_extra_ticks_anchors_to_the_first_wait_in_a_batch() {
+        let s = state();
+        s.arm_epoch_deadline_estimate(20);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let first = std::time::Instant::now();
+        s.note_dialog_wait(first); // first dialog in the batch
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        s.note_dialog_wait(std::time::Instant::now()); // second dialog — should NOT move the anchor
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let forgiven = s.take_dialog_extra_ticks();
+        // Remaining budget computed from `first` (~90ms / 18 ticks) must be used, not from the
+        // second call's later start (~70ms / 14 ticks) — i.e. `forgiven` skews toward the larger,
+        // first-anchored value.
+        assert!(forgiven >= 15, "must anchor to the FIRST wait in the batch, got {forgiven} ticks");
     }
 }

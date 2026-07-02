@@ -179,7 +179,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         // execution right after this call returns.
         let started = std::time::Instant::now();
         let result = guest.services.confirm(&prompt, &message, &opts);
-        guest.note_dialog_wait(started.elapsed());
+        guest.note_dialog_wait(started);
         result
     }
     async fn input(&mut self, prompt: String, placeholder: Option<String>, opts_json: String) -> Option<String> {
@@ -190,7 +190,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         }
         let started = std::time::Instant::now();
         let result = guest.services.input(&prompt, placeholder.as_deref(), &opts);
-        guest.note_dialog_wait(started.elapsed());
+        guest.note_dialog_wait(started);
         result
     }
     async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
@@ -202,7 +202,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         }
         let started = std::time::Instant::now();
         let result = guest.services.select(&prompt, &options, &opts);
-        guest.note_dialog_wait(started.elapsed());
+        guest.note_dialog_wait(started);
         result
     }
     async fn editor(&mut self, initial: String) -> Option<String> {
@@ -211,7 +211,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         // equally human-paced wait) — the SAME epoch-budget exemption applies.
         let started = std::time::Instant::now();
         let result = guest.services.editor(&initial);
-        guest.note_dialog_wait(started.elapsed());
+        guest.note_dialog_wait(started);
         result
     }
     async fn set_widget(&mut self, widget_json: String) {
@@ -708,6 +708,7 @@ impl LiveExtension {
         let mut store = Store::new(engine, HostState::with_guest(limits, guest.clone()));
         store.limiter(|s| &mut s.limits);
         store.set_epoch_deadline(epoch_ticks);
+        guest.arm_epoch_deadline_estimate(epoch_ticks);
         // Closes the still-open finding that the epoch budget bounds the ENTIRE `ui.*` dialog wait: by
         // default a deadline reached mid-execution traps immediately (`epoch_deadline_trap`, wasmtime's
         // default) — but the epoch check only fires at a WASM checkpoint, which for a call like
@@ -716,12 +717,14 @@ impl LiveExtension {
         // for the rest of the session (component-model reentrance bookkeeping never sees a clean
         // completion — reproduced empirically: a 6s-delayed reply still resolved `Ok`, but every
         // later call against the same instance silently no-op'd). Replace the default trap with a
-        // callback that forgives EXACTLY the ticks `GuestState::note_dialog_wait` recorded for a
-        // legitimate dialog wait (`take_dialog_extra_ticks`'s doc) and extends the deadline by that
-        // much instead of trapping; a deadline reached with NO recorded dialog wait (a genuine
-        // runaway/looping guest) still traps exactly as before — `UpdateDeadline::Interrupt` is
-        // wasmtime's own explicit "halt and trap" variant, so this is not a weaker budget, only a
-        // correctly-scoped one.
+        // callback that forgives EXACTLY the guest's REMAINING (unused) budget at the moment it
+        // entered the dialog wait (`GuestState::take_dialog_extra_ticks`'s doc — NOT the wait duration
+        // itself, which double-counts: `UpdateDeadline::Continue(delta)` extends from the CURRENT
+        // epoch, which has already advanced by the wait duration by the time this callback fires) and
+        // extends the deadline by that much instead of trapping; a deadline reached with NO recorded
+        // dialog wait (a genuine runaway/looping guest) still traps exactly as before —
+        // `UpdateDeadline::Interrupt` is wasmtime's own explicit "halt and trap" variant, so this is
+        // not a weaker budget, only a correctly-scoped one.
         store.epoch_deadline_callback(|ctx| {
             let owed =
                 ctx.data().guest.as_ref().map(|g| g.take_dialog_extra_ticks()).unwrap_or(0);
@@ -778,6 +781,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
         // Bind this call's CancelToken so the guest's `signal` poll (`host-tool.is-cancelled`) reads
         // the live cancellation state during a long `execute` (Pi `signal` param, sdk gap #1).
@@ -836,6 +840,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         // Command tier: control ops are legal from a command handler (R-08-008).
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
@@ -856,6 +861,7 @@ impl LiveExtension {
         // callback is contained as a typed `ExtError` (the command's output is preserved on success).
         for callback_id in self.guest.take_pending_with_session() {
             inner.store.set_epoch_deadline(self.epoch_ticks);
+            self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
             self.guest.set_tier(CtxTier::Command);
             let api = inner.instance.cyrup_ext_events();
             let cb = api.call_with_session(&mut inner.store, &callback_id);
@@ -881,6 +887,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         let call = api.call_execute_shortcut(&mut inner.store, key);
@@ -906,6 +913,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_get_argument_completions(&mut inner.store, name, prefix).await {
@@ -940,6 +948,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_provider_login(&mut inner.store, id).await {
@@ -959,6 +968,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_provider_refresh_token(&mut inner.store, id, &creds).await {
@@ -978,6 +988,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_provider_get_api_key(&mut inner.store, id, &creds).await {
@@ -999,6 +1010,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_provider_modify_models(&mut inner.store, id, &models_s, &creds).await {
@@ -1025,6 +1037,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api
@@ -1051,6 +1064,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api.call_autocomplete_suggest(&mut inner.store, &base_s, &query_s).await {
@@ -1068,6 +1082,7 @@ impl LiveExtension {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
         let payload_s = payload.to_string();
         let api = inner.instance.cyrup_ext_events();
@@ -1147,6 +1162,7 @@ impl Extension for LiveExtension {
         let mut guard = self.inner.lock().await;
         // Re-arm the epoch deadline for this call and run at event tier (control ops illegal).
         guard.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
 
         let kind = ev.kind();
