@@ -590,6 +590,11 @@ impl ProcOps for LocalProc {
         let mut pending: Option<ExitStatus> = None;
         let grace = tokio::time::sleep(self.kill_grace);
         tokio::pin!(grace);
+        // Guards the grace arm below from re-firing on every subsequent loop iteration: a
+        // `tokio::time::Sleep` that has already elapsed keeps reporting `Ready` on every re-poll
+        // until it is `.reset()` to a future deadline, and (unlike the cancel/timeout arms above)
+        // the grace arm below deliberately does NOT reset `grace` — it needs to fire exactly once.
+        let mut sigkill_sent = false;
 
         // Idle-grace fallback (Pi `waitForChildProcess`, `child-process.ts:49-137`) — see
         // `LocalProc::exec`'s identical block above for the full rationale.
@@ -617,16 +622,21 @@ impl ProcOps for LocalProc {
                     let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
                     grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
-                _ = &mut grace, if pending.is_some() => {
+                _ = &mut grace, if pending.is_some() && !sigkill_sent => {
                     // Grace elapsed (or was skipped outright, above) with NO natural exit yet (a
-                    // graceful mid-grace exit already
-                    // broke the loop via the `child.wait()`/drain arms below, which keep the REAL
-                    // code). Force it, but still capture whatever real status `wait()` reports
-                    // (Pi: SIGKILL ⇒ `exit(null)` ⇒ `code ?? 0`, matched by `exit_from`'s
-                    // no-code-⇒-`Signaled` mapping) rather than discarding it outright.
+                    // graceful mid-grace exit already broke the loop via the `child.wait()`/drain
+                    // arms below, which keep the REAL code). Force it — but, unlike a `break` here,
+                    // KEEP DRAINING: the persistent `child.wait()` arm below still captures the REAL
+                    // post-SIGKILL status (Pi: SIGKILL ⇒ `exit(null)` ⇒ `code ?? 0`, matched by
+                    // `exit_from`'s no-code-⇒-`Signaled` mapping), and the `read_chunk` arms keep
+                    // pumping whatever bytes the child already wrote into the pipe before it died.
+                    // Breaking immediately here (the previous behavior) silently dropped exactly
+                    // that trailing output — bytes already sitting in the kernel pipe buffer at the
+                    // instant of SIGKILL are still readable via the still-open read end even after
+                    // the writer is gone, but only if something keeps calling `read_chunk` — mirrors
+                    // `LocalProc::exec`'s cancel/timeout arms above, which never `break` either.
+                    sigkill_sent = true;
                     send_sigkill_tree(&mut child);
-                    let real = child.wait().await.ok().map(exit_from);
-                    break real.unwrap_or_else(|| pending.unwrap_or(ExitStatus::TimedOut));
                 }
                 _ = &mut idle_grace, if idle_armed => {
                     // `idle_armed` is only set after `child.wait()` already captured the real
@@ -891,6 +901,75 @@ mod tests {
             "the grace period was genuinely waited out before escalating to SIGKILL, got {:?}",
             started.elapsed()
         );
+    }
+
+    /// THE regression this fix closes: bytes already sitting in the kernel pipe buffer at the
+    /// instant the grace-elapsed arm forces a SIGKILL must NOT be silently dropped. The old code
+    /// sent SIGKILL, `child.wait()`ed, and `break`ed immediately — never re-polling `read_chunk` —
+    /// so whatever the child had already written but this loop hadn't yet drained was lost.
+    ///
+    /// Ground-truth harness: a SIGTERM-ignoring child appends an increasing counter to an
+    /// independent file via an fd opened ONCE (`exec 3>>`, so the loop spins as fast as the shell
+    /// can manage rather than being disk-syscall-bound), written BEFORE the matching stdout
+    /// `printf` each iteration with no `sleep`, so the file's last line is always >= whatever made
+    /// it to stdout. With the fix, `read_chunk` keeps draining until TRUE EOF (the kernel only
+    /// signals EOF once every byte written before the writer's fd closed has been delivered to the
+    /// reader) — so captured stdout can lag the ground truth by AT MOST the single in-flight
+    /// iteration straddling the SIGKILL instant, never by a whole buffered chunk's worth. Repeated
+    /// several times since the exact SIGKILL timing relative to the child's write cadence is
+    /// inherently racy — verified live: with this exact script reverted to the pre-fix
+    /// (immediate-`break`) behavior, this test failed deterministically on trial 0 across 3
+    /// separate runs (deficits of 2-3 lines each); with the fix, 5 separate runs (40 trials total)
+    /// were all clean.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_forced_sigkill_does_not_drop_buffered_stdout_already_sitting_in_the_pipe() {
+        for trial in 0..8u32 {
+            let gt_path = std::env::temp_dir()
+                .join(format!("cyrup-exec-argv-gt-{}-{trial}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&gt_path);
+            let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(15));
+            // fd 3 is opened ONCE (`exec 3>>`) rather than re-opened every iteration (a fresh
+            // `>>` open/write/close per line is disk-syscall-bound and slow enough that the async
+            // reader never falls behind) — this lets the loop spin as fast as the shell can manage
+            // (bounded only by `printf`/arithmetic), maximizing how many iterations land inside the
+            // short grace window and thus the odds of catching the exact SIGKILL race.
+            let script = format!(
+                "exec 3>>{}; trap '' TERM; i=0; while true; do printf '%s\\n' \"$i\" >&3; \
+                 printf '%s\\n' \"$i\"; i=$((i+1)); done",
+                gt_path.display()
+            );
+            let out = proc
+                .exec_argv(
+                    argv("sh", &["-c", &script]),
+                    CancelToken::new(),
+                    Some(Duration::from_millis(15)),
+                )
+                .await
+                .expect("exec_argv runs");
+            assert!(out.killed, "trial {trial}: a SIGTERM-ignoring child must be force-killed");
+
+            let ground_truth = std::fs::read_to_string(&gt_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&gt_path);
+            let gt_last: i64 =
+                ground_truth.lines().next_back().and_then(|l| l.parse().ok()).unwrap_or(-1);
+            let captured = String::from_utf8_lossy(&out.stdout);
+            let stdout_last: i64 =
+                captured.lines().next_back().and_then(|l| l.parse().ok()).unwrap_or(-1);
+
+            assert!(
+                gt_last >= 0,
+                "trial {trial}: the child must have run at least one loop iteration before being \
+                 killed (ground truth file was empty)"
+            );
+            assert!(
+                gt_last - stdout_last <= 1,
+                "trial {trial}: captured stdout (last line {stdout_last}) lagged the ground-truth \
+                 file (last line {gt_last}) by more than the one single in-flight iteration the \
+                 SIGKILL can legitimately straddle — buffered pipe bytes were dropped at the \
+                 forced-SIGKILL boundary"
+            );
+        }
     }
 
     /// `terminate_pid`'s `bool` return is the signal callers (`cyrup_ext::caps::proc::ProcCaps::kill`)
