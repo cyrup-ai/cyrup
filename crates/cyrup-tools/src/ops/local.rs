@@ -430,6 +430,17 @@ impl ProcOps for LocalProc {
         if spec.shell.program.as_os_str().is_empty() {
             spec.shell = self.shell.clone();
         }
+        // Pi checks `signal?.aborted` before EVER spawning (bash.ts:86-88: `if (signal?.aborted) {
+        // throw new Error("aborted"); }`, ahead of even the cwd check below) — an already-cancelled
+        // token must guarantee zero process execution, not just a kill-after-spawn race. Report it
+        // as `Ok(Killed)`, the SAME outcome the mid-run cancel branch below reports (bash.ts's outer
+        // catch maps BOTH the pre-spawn and the post-spawn `Error("aborted")` to the identical
+        // `"Command aborted"` text, bash.ts:407-411) — every caller (`BashTool::execute`,
+        // `bash.rs:315`; `run_bash`, `cyrup-session-svc/src/bash.rs:58`) already renders `Killed`
+        // correctly, so this needs no new wiring.
+        if cancel.is_cancelled() {
+            return Ok(ExitStatus::Killed);
+        }
         // Pi checks the cwd exists before spawning (bash.ts:70-74) so the model gets an actionable
         // message instead of a raw spawn error.
         if tokio::fs::metadata(&spec.cwd).await.is_err() {
@@ -780,6 +791,35 @@ mod tests {
             "a SIGTERM-ignoring tree must still die within ~100ms of cancel via immediate SIGKILL, \
              got {:?}",
             started.elapsed()
+        );
+    }
+
+    /// An ALREADY-cancelled token must never spawn a process at all — Pi's real
+    /// `createLocalBashOperations.exec` checks `signal?.aborted` and throws BEFORE calling `spawn()`
+    /// (`bash.ts:86-88`), ahead of even the cwd-exists check. Proven here the same way the sibling
+    /// SIGKILL tests prove immediacy: a marker file the child would create if it ever ran must stay
+    /// absent, and the call must return near-instantly (no real process start/teardown latency).
+    #[tokio::test]
+    async fn exec_pre_cancelled_never_spawns() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+        let marker = std::env::temp_dir().join(format!("cyrup-exec-precancel-{}", unique_suffix()));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+        let status = proc
+            .exec(exec_spec(&format!("touch {}", marker.display())), cancel, None, &mut |_data: &[u8]| {})
+            .await
+            .expect("a pre-cancelled exec resolves Ok, not Err");
+        assert_eq!(status, ExitStatus::Killed, "pre-cancelled reports the same reason as mid-run cancel");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "must short-circuit before spawning, not pay real process start/teardown latency, got {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !marker.exists(),
+            "the shell command must NEVER have run — an already-cancelled token guarantees zero \
+             process execution, matching Pi's pre-spawn `signal?.aborted` check"
         );
     }
 
