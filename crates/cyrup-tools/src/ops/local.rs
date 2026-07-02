@@ -179,6 +179,17 @@ impl FsOps for LocalFs {
 /// `cyrup-ext::caps::proc::DEFAULT_KILL_GRACE`.
 const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// How long [`LocalProc::exec`]/[`LocalProc::exec_argv`] wait, once the child process ITSELF has
+/// exited, for its inherited stdout/stderr pipe(s) to fall idle before giving up on reading them —
+/// Pi's exact `EXIT_STDIO_GRACE_MS` (`child-process.ts:16`), armed by `waitForChildProcess`
+/// (`child-process.ts:49-137`). A short-lived command that backgrounds a descendant (`sh -c "(sleep
+/// 5 &); exit 0"`) leaves that descendant holding our stdout/stderr pipe open long after the
+/// process we spawned has exited, so waiting on EOF alone hangs forever — the exact class of hang
+/// Pi's grace timer exists to close (earendil-works/pi#5303). The timer is armed the instant the
+/// child exits and re-armed on every subsequent data chunk, so an actively-writing descendant keeps
+/// us reading, while a quiet inherited handle releases us after this much idle time.
+const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
+
 /// Local process operations.
 pub struct LocalProc {
     shell: ShellConfig,
@@ -449,6 +460,15 @@ impl ProcOps for LocalProc {
         let grace = tokio::time::sleep(self.kill_grace);
         tokio::pin!(grace);
 
+        // Idle-grace fallback (Pi `waitForChildProcess`, `child-process.ts:49-137`): once the child
+        // process itself exits, if its stdio isn't already fully drained (a backgrounded descendant
+        // may still hold the pipe open), arm a timer that finalizes after `EXIT_STDIO_GRACE` of
+        // silence — re-armed on every subsequent chunk — instead of waiting on EOF forever.
+        let mut exit_status: Option<ExitStatus> = None;
+        let mut idle_armed = false;
+        let idle_grace = tokio::time::sleep(EXIT_STDIO_GRACE);
+        tokio::pin!(idle_grace);
+
         let status = loop {
             tokio::select! {
                 biased;
@@ -469,26 +489,60 @@ impl ProcOps for LocalProc {
                     let _ = child.wait().await;
                     break pending.unwrap_or(ExitStatus::TimedOut);
                 }
+                _ = &mut idle_grace, if idle_armed => {
+                    // The child exited and its inherited stdio has been quiet for
+                    // `EXIT_STDIO_GRACE` — a still-open pipe held by a backgrounded descendant is
+                    // not coming back with more output soon enough to justify hanging forever.
+                    break match pending {
+                        Some(reason) => reason,
+                        None => exit_status.unwrap_or(ExitStatus::Exited(-1)),
+                    };
+                }
                 chunk = read_chunk(&mut stdout) => {
                     match chunk {
-                        Some(data) => on_data(&data),
-                        None => stdout = None,
+                        Some(data) => {
+                            on_data(&data);
+                            if idle_armed {
+                                idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
+                            }
+                        }
+                        None => {
+                            stdout = None;
+                            if let Some(done) = exit_status
+                                && stderr.is_none() {
+                                    break pending.unwrap_or(done);
+                                }
+                        }
                     }
                 }
                 chunk = read_chunk(&mut stderr) => {
                     match chunk {
-                        Some(data) => on_data(&data),
-                        None => stderr = None,
+                        Some(data) => {
+                            on_data(&data);
+                            if idle_armed {
+                                idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
+                            }
+                        }
+                        None => {
+                            stderr = None;
+                            if let Some(done) = exit_status
+                                && stdout.is_none() {
+                                    break pending.unwrap_or(done);
+                                }
+                        }
                     }
                 }
-                s = child.wait(), if stdout.is_none() && stderr.is_none() => {
-                    break match pending {
-                        Some(reason) => reason,
-                        None => match s {
-                            Ok(st) => exit_from(st),
-                            Err(_) => ExitStatus::Exited(-1),
-                        },
+                s = child.wait(), if exit_status.is_none() => {
+                    let mapped = match s {
+                        Ok(st) => exit_from(st),
+                        Err(_) => ExitStatus::Exited(-1),
                     };
+                    exit_status = Some(mapped);
+                    if stdout.is_none() && stderr.is_none() {
+                        break pending.unwrap_or(mapped);
+                    }
+                    idle_armed = true;
+                    idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
                 }
             }
         };
@@ -530,6 +584,13 @@ impl ProcOps for LocalProc {
         let grace = tokio::time::sleep(self.kill_grace);
         tokio::pin!(grace);
 
+        // Idle-grace fallback (Pi `waitForChildProcess`, `child-process.ts:49-137`) — see
+        // `LocalProc::exec`'s identical block above for the full rationale.
+        let mut exit_status: Option<ExitStatus> = None;
+        let mut idle_armed = false;
+        let idle_grace = tokio::time::sleep(EXIT_STDIO_GRACE);
+        tokio::pin!(idle_grace);
+
         let status = loop {
             tokio::select! {
                 biased;
@@ -548,26 +609,57 @@ impl ProcOps for LocalProc {
                     let _ = child.wait().await;
                     break pending.unwrap_or(ExitStatus::TimedOut);
                 }
+                _ = &mut idle_grace, if idle_armed => {
+                    break match pending {
+                        Some(reason) => reason,
+                        None => exit_status.unwrap_or(ExitStatus::Exited(-1)),
+                    };
+                }
                 chunk = read_chunk(&mut stdout) => {
                     match chunk {
-                        Some(data) => out_buf.extend_from_slice(&data),
-                        None => stdout = None,
+                        Some(data) => {
+                            out_buf.extend_from_slice(&data);
+                            if idle_armed {
+                                idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
+                            }
+                        }
+                        None => {
+                            stdout = None;
+                            if let Some(done) = exit_status
+                                && stderr.is_none() {
+                                    break pending.unwrap_or(done);
+                                }
+                        }
                     }
                 }
                 chunk = read_chunk(&mut stderr) => {
                     match chunk {
-                        Some(data) => err_buf.extend_from_slice(&data),
-                        None => stderr = None,
+                        Some(data) => {
+                            err_buf.extend_from_slice(&data);
+                            if idle_armed {
+                                idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
+                            }
+                        }
+                        None => {
+                            stderr = None;
+                            if let Some(done) = exit_status
+                                && stdout.is_none() {
+                                    break pending.unwrap_or(done);
+                                }
+                        }
                     }
                 }
-                s = child.wait(), if stdout.is_none() && stderr.is_none() => {
-                    break match pending {
-                        Some(reason) => reason,
-                        None => match s {
-                            Ok(st) => exit_from(st),
-                            Err(_) => ExitStatus::Exited(-1),
-                        },
+                s = child.wait(), if exit_status.is_none() => {
+                    let mapped = match s {
+                        Ok(st) => exit_from(st),
+                        Err(_) => ExitStatus::Exited(-1),
                     };
+                    exit_status = Some(mapped);
+                    if stdout.is_none() && stderr.is_none() {
+                        break pending.unwrap_or(mapped);
+                    }
+                    idle_armed = true;
+                    idle_grace.as_mut().reset(tokio::time::Instant::now() + EXIT_STDIO_GRACE);
                 }
             }
         };
@@ -687,5 +779,37 @@ mod tests {
             .expect("the SIGTERM-obeying child dies within the grace window")
             .expect("wait succeeds");
         assert!(!status.success(), "a SIGTERM-terminated child does not exit successfully");
+    }
+
+    /// Reproduces the exact hang class Pi's `EXIT_STDIO_GRACE_MS` idle timer exists to close
+    /// (`waitForChildProcess`, `child-process.ts:49-137`, earendil-works/pi#5303): the spawned
+    /// command backgrounds a descendant (`sleep 5 &`) that inherits our stdout pipe and then exits
+    /// itself immediately. Without an idle-grace fallback, `child.wait()` never runs (gated on both
+    /// streams reaching EOF) and the still-open pipe never reaches EOF either — an unconditional
+    /// hang. With the fix, the loop must finalize within `EXIT_STDIO_GRACE` of the parent's own
+    /// exit, well under the backgrounded descendant's 5s lifetime.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_does_not_hang_on_a_backgrounded_descendant_holding_the_pipe_open() {
+        let proc = LocalProc::new(ShellConfig::detect());
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(3),
+            proc.exec_argv(
+                argv("sh", &["-c", "(sleep 5 &) ; exit 0"]),
+                CancelToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("exec_argv must not hang past the idle-grace fallback")
+        .expect("exec_argv runs");
+        assert_eq!(out.status, ExitStatus::Exited(0), "the parent's own clean exit is reported");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must finalize within EXIT_STDIO_GRACE of the parent's exit, not wait on the \
+             backgrounded descendant's pipe, got {:?}",
+            started.elapsed()
+        );
     }
 }
