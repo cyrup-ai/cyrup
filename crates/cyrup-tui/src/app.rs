@@ -1182,14 +1182,19 @@ impl<B: Backend> App<B> {
                 )
             }
             UiKind::Select => {
+                // L4 review §4: an empty `options` list must still OPEN the dialog (Pi's
+                // `ExtensionSelectorComponent`, `extension-selector.ts:101-103`, renders whatever
+                // it's given including `[]`; Enter is a no-op with nothing selected, and resolution
+                // only ever happens via Esc/timeout/signal — same as any other select), not
+                // short-circuit to `None` before the guest's dialog is ever shown. `cyrup`'s RPC path
+                // (`rpc.rs`) already forwards `options: []` verbatim with no such short-circuit;
+                // `ListSelector`/`SelectList` already render an empty list safely (`"No matches"`,
+                // `current_value()` never panics) — no special-casing needed here beyond NOT
+                // early-returning.
                 let picked: Vec<String> = options
                     .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                     .unwrap_or_default();
-                if picked.is_empty() {
-                    let _ = reply.send(UiReply::Text(None));
-                    return;
-                }
                 let rows: Vec<(String, String, Option<String>)> =
                     picked.into_iter().map(|o| (o.clone(), o, None)).collect();
                 (
