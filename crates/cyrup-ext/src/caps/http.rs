@@ -227,7 +227,13 @@ impl HttpCaps {
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        if let Some(ms) = req.timeout_ms {
+        // `0` means NO explicit timeout, not an instant one — same `> 0` guard the sibling `ui_roundtrip`
+        // (`cyrup-session-svc/src/host_services.rs:236`) and `exec` (`host_services.rs:423-427`) grants
+        // already apply to their own `timeout_ms`/`timeoutMs` fields, ported here for consistency: a
+        // literal 0ms `reqwest` per-request timeout fires on (essentially) the very next poll, so
+        // `Some(0)` was silently indistinguishable from "fail immediately" instead of falling through to
+        // [`Self::request`]/[`Self::request_stream`]'s own [`DEFAULT_REQUEST_TIMEOUT`] fallback below.
+        if let Some(ms) = req.timeout_ms.filter(|ms| *ms > 0) {
             builder = builder.timeout(std::time::Duration::from_millis(u64::from(ms)));
         }
         Ok(builder)
@@ -245,12 +251,16 @@ impl HttpCaps {
     /// unbounded in-memory allocation (a decompression bomb) now that decoding happens manually.
     pub async fn request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
         // L4 review §6: the FULL round trip (connect through body-drain) is bounded by the guest's
-        // `timeout_ms` when given, else [`DEFAULT_REQUEST_TIMEOUT`] — never unbounded. `build_request`
-        // ALSO applies `timeout_ms` (when given) to `reqwest`'s own request-level timeout below;
-        // that's unchanged/redundant-but-harmless in that case, and this outer bound is what actually
-        // closes the gap for the (previously fully unbounded) `None` case.
-        let effective_timeout =
-            req.timeout_ms.map(|ms| Duration::from_millis(u64::from(ms))).unwrap_or(self.request_timeout);
+        // `timeout_ms` when given (and non-zero — `0` means NO explicit timeout, [`Self::build_request`]'s
+        // doc comment), else [`DEFAULT_REQUEST_TIMEOUT`] — never unbounded. `build_request`
+        // ALSO applies `timeout_ms` (when given and non-zero) to `reqwest`'s own request-level timeout
+        // below; that's unchanged/redundant-but-harmless in that case, and this outer bound is what
+        // actually closes the gap for the (previously fully unbounded) `None`/`Some(0)` cases.
+        let effective_timeout = req
+            .timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+            .unwrap_or(self.request_timeout);
         tokio::time::timeout(effective_timeout, async {
             let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
@@ -289,9 +299,13 @@ impl HttpCaps {
         // L4 review §6: only the CONNECT+response-headers phase is bounded here — never the body
         // stream itself, which is meant to stay open long-lived ([`Self::poll_stream_chunk`] bounds
         // each individual drain separately via [`HTTP_POLL_IDLE_TIMEOUT`], never the whole stream's
-        // lifetime). Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when the guest gave no `timeout_ms`.
-        let effective_timeout =
-            req.timeout_ms.map(|ms| Duration::from_millis(u64::from(ms))).unwrap_or(self.request_timeout);
+        // lifetime). Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when the guest gave no `timeout_ms`, or
+        // gave `Some(0)` — `0` means NO explicit timeout, [`Self::build_request`]'s doc comment.
+        let effective_timeout = req
+            .timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+            .unwrap_or(self.request_timeout);
         let resp = tokio::time::timeout(effective_timeout, self.build_request(req)?.send())
             .await
             .map_err(|_| {
@@ -1008,6 +1022,78 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "the fallback timeout must fire — this must NEVER hang forever: got {elapsed:?}"
+        );
+    }
+
+    /// L4 adversarial-verification fix: `timeout_ms: Some(0)` must behave exactly like `None` — the
+    /// REAL, non-instant [`DEFAULT_REQUEST_TIMEOUT`] fallback ceiling (overridden here via
+    /// [`HttpCaps::with_request_timeout`]) — not degrade to a literal 0ms `reqwest` timeout that fails
+    /// on (essentially) the very first poll. Mirrors the sibling `> 0` guard `ui_roundtrip`
+    /// (`cyrup-session-svc/src/host_services.rs:236`) and `exec` (`host_services.rs:423-427`) already
+    /// apply to their own timeout fields. Same stalled-server setup as
+    /// [`request_falls_back_to_a_bounded_timeout_when_the_guest_gives_none`], but with `timeout_ms:
+    /// Some(0)` supplied explicitly — must take (approximately) the SAME fallback duration to fail,
+    /// not near-zero.
+    #[tokio::test]
+    async fn request_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
+        let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/probe"),
+            timeout_ms: Some(0),
+            ..Default::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("a stalled server with timeout_ms:0 still fails eventually");
+        let elapsed = started.elapsed();
+        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "timeout_ms:0 must wait for the REAL fallback ceiling, not short-circuit to an instant \
+             0ms timeout: got {elapsed:?}"
+        );
+    }
+
+    /// Same finding, `request_stream`'s initial connect+headers phase.
+    #[tokio::test]
+    async fn request_stream_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
+        let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/probe"),
+            timeout_ms: Some(0),
+            ..Default::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = caps
+            .request_stream(&req)
+            .await
+            .expect_err("a stalled server with timeout_ms:0 still fails eventually");
+        let elapsed = started.elapsed();
+        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "timeout_ms:0 must wait for the REAL fallback ceiling, not short-circuit to an instant \
+             0ms timeout: got {elapsed:?}"
         );
     }
 
