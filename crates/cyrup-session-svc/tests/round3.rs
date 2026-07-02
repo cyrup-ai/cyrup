@@ -181,6 +181,105 @@ async fn execute_bash_records_result_and_persists() {
     session.abort_bash();
 }
 
+/// The immediate-bash seam sanitizes output exactly like Pi's `bash-executor.ts`'s `onData`
+/// (`sanitizeBinaryOutput(stripAnsi(decoder.decode(data,{stream:true}))).replace(/\r/g,"")`,
+/// line 82): raw ANSI SGR codes and carriage returns from a REAL child process must never reach the
+/// recorded transcript, only the plain text they decorate.
+#[tokio::test]
+async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+
+    // `printf` with a real ESC byte (\033) driving an SGR color code, plus a bare CR — exactly the
+    // kind of raw terminal control bytes a real command can legitimately emit.
+    let result = session
+        .execute_bash(
+            r#"printf '\033[31mred\033[0m\rtext\n'"#,
+            BashOptions::default(),
+            None,
+        )
+        .await
+        .expect("printf runs");
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        !result.output.contains('\u{1B}'),
+        "no raw ESC byte may reach the recorded output: {:?}",
+        result.output
+    );
+    assert!(!result.output.contains('\r'), "no raw CR may reach the recorded output: {:?}", result.output);
+    assert_eq!(result.output, "redtext\n", "the plain text survives, decorations stripped");
+
+    // The SAME sanitized text is what actually lands in the persisted transcript entry.
+    let msgs = session.agent_messages().await;
+    let bash_msg = msgs
+        .iter()
+        .find_map(|m| match m {
+            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .expect("a bashExecution message was recorded");
+    assert_eq!(bash_msg["output"], "redtext\n");
+}
+
+/// Output exceeding `DEFAULT_MAX_BYTES` (50KB) from a REAL child process is tail-truncated in the
+/// returned/recorded `output`, `truncated` is set, and the FULL sanitized output is spilled to a
+/// real temp file at `fullOutputPath` — Pi's `truncateTail(fullOutput)` +
+/// `ensureTempFile`/`BashResult.{truncated,fullOutputPath}` (`bash-executor.ts:57-124`).
+#[tokio::test]
+async fn execute_bash_truncates_and_spills_large_real_output() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+
+    // ~3000 lines x ~40 bytes ≈ 120KB, comfortably over both the 50KB byte cap and the 2000-line cap.
+    let result = session
+        .execute_bash(
+            "for i in $(seq 1 3000); do echo \"line-number-$i-padding-xxxxxxxxxx\"; done",
+            BashOptions::default(),
+            None,
+        )
+        .await
+        .expect("the loop runs");
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.truncated, "120KB of output must be reported as truncated");
+    assert!(
+        result.output.len() <= 2 * 50 * 1024,
+        "the returned preview must be tail-truncated, not the full 120KB: {} bytes",
+        result.output.len()
+    );
+
+    let full_path = result.full_output_path.clone().expect("a temp file path must be recorded");
+    let full_contents = std::fs::read_to_string(&full_path)
+        .unwrap_or_else(|e| panic!("full output temp file must be readable at {full_path}: {e}"));
+    assert!(
+        full_contents.contains("line-number-3000-padding-xxxxxxxxxx"),
+        "the FULL untruncated output (all 3000 lines) must be on disk, got {} bytes",
+        full_contents.len()
+    );
+    assert!(
+        full_contents.contains("line-number-1-padding-xxxxxxxxxx"),
+        "the first line must also be on disk (nothing dropped from the front)"
+    );
+    let _ = std::fs::remove_file(&full_path);
+
+    // The recorded transcript entry carries the SAME truncated/fullOutputPath fields.
+    let msgs = session.agent_messages().await;
+    let bash_msg = msgs
+        .iter()
+        .find_map(|m| match m {
+            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .expect("a bashExecution message was recorded");
+    assert_eq!(bash_msg["truncated"], true);
+    assert!(bash_msg["fullOutputPath"].is_string());
+}
+
 // ---------------------------------------------------------------------------- dynamic tools ----
 
 #[tokio::test]

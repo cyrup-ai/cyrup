@@ -18,6 +18,7 @@ members = [
     "crates/cyrup",
     "crates/cyrup-test-support",
     "crates/cyrup-ext-sdk",
+    "crates/cyrup-ext-subagents",
 ]
 # cyrup-ext-sdk is the GUEST sdk (compiled to wasm32-wasip2); it is NOT part of the
 # host binary build graph (arch-00 §2.2), so it is excluded from default-members.
@@ -37,6 +38,7 @@ default-members = [
     "crates/cyrup-session-svc",
     "crates/cyrup",
     "crates/cyrup-test-support",
+    "crates/cyrup-ext-subagents",
 ]
 
 [workspace.package]
@@ -97,6 +99,12 @@ feruca               = { version = "0.12.0" }    # pure-Rust UCA collation for `
 image                = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc                 = { version = "0.2.186" }
 tempfile             = { version = "3.27.0" }
+
+# arch-SA §7 — real OS-signal delivery (SIGINT/SIGTERM/SIGKILL escalation, PID liveness probes)
+# and filesystem-change notification (ResultsDir/control-inbox watch), first used by
+# cyrup-ext-subagents (arch-SA). New to the workspace.
+nix                  = { version = "0.31.3" }
+notify               = { version = "8.2.0" }
 
 # arch-00 §7 — first used by cyrup-session (arch-04).
 time                 = { version = "0.3", features = ["formatting", "parsing"] }

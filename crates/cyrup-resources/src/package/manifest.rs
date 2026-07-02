@@ -30,6 +30,9 @@ pub struct ManifestResources {
     pub prompts: Vec<PathBuf>,
     #[serde(default)]
     pub themes: Vec<PathBuf>,
+    /// Subagent persona/chain definitions declared by this package (arch-SA §4.1/R-SA-020).
+    #[serde(default)]
+    pub agents: Vec<PathBuf>,
 }
 
 /// Native `cyrup.toml` manifest.
@@ -66,6 +69,7 @@ pub struct ResolvedManifest {
     pub skills: Vec<PathBuf>,
     pub prompts: Vec<PathBuf>,
     pub themes: Vec<PathBuf>,
+    pub agents: Vec<PathBuf>,
 }
 
 /// Resolve a package tree's manifest into absolute resource paths (R-09-015/016).
@@ -93,6 +97,7 @@ pub fn resolve_manifest(dir: &Path) -> Result<ResolvedManifest, ResourceError> {
         (&mut res.skills, "skills"),
         (&mut res.prompts, "prompts"),
         (&mut res.themes, "themes"),
+        (&mut res.agents, "agents"),
     ] {
         if dir.join(name).is_dir() {
             field.push(PathBuf::from(name));
@@ -111,6 +116,9 @@ pub(crate) enum ManifestResourceType {
     /// Extensions resolve to crate directories (not files); no file-level expansion ([CYRUP-DELTA],
     /// npm `.ts`/`.js` channel dropped, R-09-021).
     Extensions,
+    /// Subagent persona/chain definitions (arch-SA §4.1/R-SA-020): `.md` files, same collection
+    /// shape as `Prompts`.
+    Agents,
 }
 
 fn absolutize(dir: &Path, kind: ManifestKind, res: ManifestResources) -> ResolvedManifest {
@@ -120,6 +128,7 @@ fn absolutize(dir: &Path, kind: ManifestKind, res: ManifestResources) -> Resolve
         skills: resolve_entries(dir, res.skills, ManifestResourceType::Skills),
         prompts: resolve_entries(dir, res.prompts, ManifestResourceType::Prompts),
         themes: resolve_entries(dir, res.themes, ManifestResourceType::Themes),
+        agents: resolve_entries(dir, res.agents, ManifestResourceType::Agents),
     }
 }
 
@@ -198,7 +207,9 @@ fn collect_files_from_paths(paths: &[PathBuf], rtype: ManifestResourceType) -> V
 fn collect_resource_files(dir: &Path, rtype: ManifestResourceType, out: &mut Vec<PathBuf>) {
     match rtype {
         ManifestResourceType::Skills => collect_skill_files(dir, true, out),
-        ManifestResourceType::Prompts => collect_files_with_ext(dir, "md", out),
+        ManifestResourceType::Prompts | ManifestResourceType::Agents => {
+            collect_files_with_ext(dir, "md", out)
+        }
         ManifestResourceType::Themes => collect_files_with_ext(dir, "json", out),
         ManifestResourceType::Extensions => out.push(dir.to_path_buf()),
     }

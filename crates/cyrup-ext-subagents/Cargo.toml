@@ -1,0 +1,56 @@
+[package]
+name = "cyrup-ext-subagents"
+description = "SubAgents: OS-subprocess delegation extension (arch-SA; native cyrup-ext extension)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Builds the scripted-NDJSON test-double binary (`cyrup-subagent-fixture`, arch-SA §11) used by
+# this crate's own integration tests and by later phases' spawn-boundary/model-fallback/
+# background-job tests. Never enabled for the real `cyrup` binary or any non-test build — the
+# `[[bin]]` target below is gated on `required-features` so it is not even compiled, let alone
+# shipped, unless a caller (this crate's own dev-dependency closure, via `cargo test`) explicitly
+# opts in.
+test-fixtures = []
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-ext = { workspace = true }
+cyrup-session = { workspace = true }
+cyrup-config = { workspace = true }
+cyrup-resources = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "signal", "macros", "rt-multi-thread"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+nix = { workspace = true, features = ["signal", "process"] }
+notify = { workspace = true }
+# `v4` added on top of the workspace-default `v7` feature: `background::RunId` (R-SA-072) needs
+# pure random entropy for an opaque, non-orderable run token, whereas `atomic.rs`'s temp-filename
+# nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
+uuid = { workspace = true, features = ["v4"] }
+libc = { workspace = true }
+tracing = "0.1.44"
+
+[[bin]]
+# The scripted-NDJSON test-double `cyrup`-shaped binary (arch-SA §11): emits scripted NDJSON
+# events on stdout and responds to signals deterministically, driven entirely by a JSON script
+# file named via `CYRUP_SUBAGENT_FIXTURE_SCRIPT`. Used as the `CYRUP_SUBAGENT_BINARY` override
+# target (R-SA-045 tier 1) in this crate's own integration tests and later phases' spawn-boundary/
+# model-fallback/background-job tests — never built for, or shipped inside, the real `cyrup`
+# binary (`crates/cyrup/`), which has no dependency on this crate's `test-fixtures` feature at
+# all.
+name = "cyrup-subagent-fixture"
+path = "src/bin/cyrup_subagent_fixture.rs"
+required-features = ["test-fixtures"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
