@@ -31,6 +31,19 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// The initiating response's metadata for a stream opened via [`HttpCaps::request_stream`] (mirrors
+/// the WIT `http-stream-response` record 1:1, world.wit): status+headers are captured off the SAME
+/// round trip that opens the long-lived body, so a caller can inspect them (e.g. a 401 => re-auth,
+/// `mcp-session-id`) before or independent of draining the body via [`HttpCaps::poll_stream_chunk`] —
+/// closes L4 §2.3 (the real consumer, the MCP SDK's `StreamableHTTPClientTransport`, needs exactly
+/// this off the response whose body it then streams).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpStreamResponse {
+    pub handle: u32,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
 /// A live streaming response body, boxed for storage in the registry.
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
@@ -100,19 +113,21 @@ impl HttpCaps {
         Ok(HttpResponse { status, headers, body })
     }
 
-    /// Start a streaming request (the WIT `request-stream`): opens the connection, then stores the
-    /// decoded byte stream keyed by a fresh handle for [`Self::poll_stream_chunk`] to drain. Like
-    /// [`Self::request`], a non-2xx status is not itself an error — the locked WIT shape gives the
-    /// guest no way to observe a streamed response's status/headers (`pi-mcp-adapter-port.md` §3.2),
-    /// so this stores whatever body the server sent regardless of status.
-    pub async fn request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+    /// Start a streaming request (the WIT `request-stream`): opens the connection, captures the
+    /// initiating response's status+headers (returned alongside the handle, closes L4 §2.3), then
+    /// stores the decoded byte stream keyed by a fresh handle for [`Self::poll_stream_chunk`] to
+    /// drain. Like [`Self::request`], a non-2xx status is not itself an error (fetch semantics) — the
+    /// caller inspects [`HttpStreamResponse::status`] itself; the body is stored regardless of status.
+    pub async fn request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let headers = collect_headers(resp.headers());
         let stream: ChunkStream = Box::pin(resp.bytes_stream());
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut g =
             self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
         g.insert(handle, Some(stream));
-        Ok(handle)
+        Ok(HttpStreamResponse { handle, status, headers })
     }
 
     /// Drain the next chunk of an open stream (the WIT `poll-stream-chunk`); `Ok(None)` = EOF. A
@@ -230,7 +245,9 @@ mod tests {
 
         let caps = HttpCaps::new();
         let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let handle = caps.request_stream(&req).await.expect("stream opens");
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        assert_eq!(opened.status, 200, "the initiating response's real status is captured");
+        let handle = opened.handle;
 
         let mut collected = Vec::new();
         let mut chunk_count = 0usize;
@@ -246,14 +263,57 @@ mod tests {
         assert_eq!(caps.poll_stream_chunk(handle).await.expect("poll after EOF"), None);
     }
 
+    /// Closes L4 §2.3: the initiating response's status+headers must be readable off
+    /// `request_stream`'s own return, from the SAME round trip that opens the body, BEFORE and
+    /// INDEPENDENT of ever draining a chunk — this is exactly what the real consumer (the MCP SDK's
+    /// `StreamableHTTPClientTransport`) needs (`response.status` for 401 => re-auth,
+    /// `response.headers.get('mcp-session-id')`) off the same response it then streams. Uses a
+    /// non-200 status and a distinguishing header to prove these are the REAL server values, not a
+    /// hardcoded default.
+    #[tokio::test]
+    async fn request_stream_exposes_real_status_and_headers_before_draining_the_body() {
+        let body = b"unauthorized-body-still-streamable".to_vec();
+        let headers = format!(
+            "Content-Type: text/event-stream\r\nMcp-Session-Id: sess-42\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        let url = spawn_mock("HTTP/1.1 401 Unauthorized", headers, vec![body.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens even on non-2xx status");
+
+        // Status+headers are already available here — no chunk has been polled yet.
+        assert_eq!(opened.status, 401, "the real non-2xx status is surfaced, not swallowed");
+        let content_type = opened
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(content_type, Some("text/event-stream"));
+        let session_id = opened
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(session_id, Some("sess-42"), "the real mcp-session-id header round-trips");
+
+        // The body is still fully drainable afterward — status/headers cost nothing extra.
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, body);
+    }
+
     #[tokio::test]
     async fn close_stream_invalidates_the_handle() {
         let url = spawn_mock("HTTP/1.1 200 OK", "Content-Length: 0\r\n".into(), vec![]).await;
         let caps = HttpCaps::new();
         let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let handle = caps.request_stream(&req).await.expect("stream opens");
-        caps.close_stream(handle);
-        let err = caps.poll_stream_chunk(handle).await.expect_err("closed handle is unknown");
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        caps.close_stream(opened.handle);
+        let err = caps.poll_stream_chunk(opened.handle).await.expect_err("closed handle is unknown");
         assert!(err.contains("no open http stream"), "got: {err}");
     }
 

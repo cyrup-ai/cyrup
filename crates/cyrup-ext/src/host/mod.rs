@@ -23,7 +23,7 @@ pub use limits::StoreLimits;
 pub use live::{LiveExtension, WasmTool};
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
-    HostServices, HttpRequest, HttpResponse, NotifyKind, OAuthEvent, ProcSpawnSpec,
-    RecordingServices, UiChrome,
+    HostServices, HttpRequest, HttpResponse, HttpStreamResponse, NotifyKind, OAuthEvent,
+    ProcSpawnSpec, RecordingServices, UiChrome,
 };
 pub use store_state::HostState;

@@ -164,14 +164,20 @@ impl Ctx {
     }
 
     /// Start a streaming outbound HTTP request (the `http-client.request-stream` capability grant);
-    /// returns an opaque stream handle the guest drains via [`Ctx::http_poll_stream_chunk`] — the
-    /// HOST owns the live Rust stream (a guest cannot hold one across the wasm boundary, arch-08
-    /// §5.2's request/poll bridge). Gated the same way as [`Ctx::http_request`].
-    pub fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+    /// returns the initiating response's status+headers TOGETHER with an opaque stream handle (the
+    /// guest drains the body via [`Ctx::http_poll_stream_chunk`]) — the HOST owns the live Rust stream
+    /// (a guest cannot hold one across the wasm boundary, arch-08 §5.2's request/poll bridge).
+    /// Status/headers arrive off the SAME round trip that opens the body (closes L4 §2.3): the real
+    /// consumer this backs, the MCP TS SDK's `StreamableHTTPClientTransport`/`SSEClientTransport`,
+    /// reads `response.status` (401 => re-auth) and `response.headers` (`mcp-session-id`,
+    /// `content-type`) off the SAME response whose body it then streams. Gated the same way as
+    /// [`Ctx::http_request`].
+    pub fn http_request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         #[cfg(target_arch = "wasm32")]
         {
             let wit = req.to_wit();
-            return crate::guest::bindings::cyrup::ext::http_client::request_stream(&wit);
+            return crate::guest::bindings::cyrup::ext::http_client::request_stream(&wit)
+                .map(HttpStreamResponse::from_wit);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -305,7 +311,8 @@ impl Ctx {
 }
 
 /// Result of [`Ctx::exec`] (Pi `ExecResult`, exec.ts:23-28). `killed` is true when the host
-/// SIGTERM/SIGKILLed the process on a timeout/abort.
+/// SIGTERMed, then (after a 5s grace period if still alive) SIGKILLed, the process GROUP on a
+/// timeout/abort — Pi's exact `killProcess` escalation (exec.ts:52-63).
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
     pub code: i32,
@@ -374,6 +381,25 @@ impl HttpResponse {
     #[cfg(target_arch = "wasm32")]
     fn from_wit(wit: crate::guest::bindings::cyrup::ext::http_client::HttpResponse) -> Self {
         Self { status: wit.status, headers: wit.headers, body: wit.body }
+    }
+}
+
+/// The initiating response's metadata for a stream opened via [`Ctx::http_request_stream`] (mirrors
+/// the WIT `http-stream-response` record 1:1): status+headers arrive TOGETHER with the stream handle,
+/// off the SAME round trip that opens the long-lived body, so callers can inspect
+/// [`Self::status`]/[`Self::headers`] (e.g. 401 => re-auth, `mcp-session-id`) before or independent of
+/// draining the body via [`Ctx::http_poll_stream_chunk`].
+#[derive(Clone, Debug, Default)]
+pub struct HttpStreamResponse {
+    pub handle: u32,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpStreamResponse {
+    #[cfg(target_arch = "wasm32")]
+    fn from_wit(wit: crate::guest::bindings::cyrup::ext::http_client::HttpStreamResponse) -> Self {
+        Self { handle: wit.handle, status: wit.status, headers: wit.headers }
     }
 }
 

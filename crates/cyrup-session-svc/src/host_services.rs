@@ -17,7 +17,8 @@ use cyrup_core::{CancelToken, EntryId, ModelRef};
 use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
-    ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse, ProcSpawnSpec,
+    ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse,
+    HttpStreamResponse, ProcSpawnSpec,
 };
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
@@ -350,7 +351,9 @@ impl HostServices for LiveHostServices {
         // facade.rs:563) — an untrusted extension gets `DenyServices` and never lands here. So this
         // adds NO extra trust/tier check; it just runs the command, 1:1 with Pi `execCommand`
         // (exec.ts:34-46): shell:false argv, `cwd ?? sessionCwd`, `env` overrides, and a `timeoutMs`
-        // that SIGTERM/SIGKILLs (killed=true) on expiry.
+        // that SIGTERMs then, after a 5s grace period, SIGKILLs (killed=true) the process GROUP on
+        // expiry — Pi's exact `killProcess` escalation (exec.ts:52-63), implemented by
+        // `LocalProc::exec_argv`'s SIGTERM/grace/SIGKILL loop (`cyrup-tools/src/ops/local.rs`).
         let cwd = opts
             .get("cwd")
             .and_then(Value::as_str)
@@ -415,7 +418,7 @@ impl HostServices for LiveHostServices {
         })
     }
 
-    fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+    fn http_request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.http.request_stream(req))
         })
@@ -598,7 +601,8 @@ mod tests {
             .expect("printenv runs");
         assert_eq!(out.stdout, "grant\n");
 
-        // 5) `timeoutMs` ⇒ the host kills the process (SIGTERM/SIGKILL the group) and reports
+        // 5) `timeoutMs` ⇒ the host SIGTERMs the group, then (since `sleep` obeys SIGTERM and dies
+        //    well within the 5s grace period, no SIGKILL escalation needed here) reports
         //    `killed=true` (Pi `killProcess` sets `killed`, exec.ts:52-63).
         let out = svc
             .exec("sleep", &["30".to_string()], &json!({ "timeoutMs": 100 }), CancelToken::new())

@@ -75,8 +75,9 @@ pub use subscriber::ExtSubscriber;
 #[cfg(feature = "wasm-host")]
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
-    GuestState, HostServices, HttpRequest, HttpResponse, InstancePool, LiveExtension, NotifyKind,
-    OAuthEvent, ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmExtension, WasmTool,
+    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, InstancePool,
+    LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome,
+    WasmExtension, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

@@ -58,13 +58,19 @@ fn faux_with_ok() -> Arc<FauxProvider> {
 /// observes them as distinct reads — proving genuine incremental delivery over the real wire (no
 /// external network dependency). Returns the server's `http://127.0.0.1:<port>/probe` URL.
 async fn spawn_mock(headers: String, parts: Vec<Vec<u8>>) -> String {
+    spawn_mock_with_status("HTTP/1.1 200 OK", headers, parts).await
+}
+
+/// As [`spawn_mock`], with a caller-chosen status line (proves the streamed response's status isn't
+/// hardcoded to 200 anywhere on the path from `HttpCaps` to the guest).
+async fn spawn_mock_with_status(status_line: &'static str, headers: String, parts: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let mut buf = [0u8; 1024];
             let _ = sock.read(&mut buf).await;
-            let head = format!("HTTP/1.1 200 OK\r\n{headers}\r\n");
+            let head = format!("{status_line}\r\n{headers}\r\n");
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.flush().await;
             for part in parts {
@@ -163,6 +169,19 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
     session.wait_for_idle().await;
 
     let notifications = ext.guest().notifications();
+
+    // Closes L4 §2.3: the initiating response's REAL status+headers are notified BEFORE any chunk is
+    // polled — off the SAME `request-stream` round trip that opened the body, exactly what the real
+    // consumer (the MCP SDK's `StreamableHTTPClientTransport`) needs off its one `fetch()` response.
+    let opened = notifications
+        .iter()
+        .find(|n| n.starts_with("http stream opened status: "))
+        .unwrap_or_else(|| panic!("no http-stream-open notification recorded: {notifications:?}"));
+    assert_eq!(
+        opened, "http stream opened status: 200 content-type: application/octet-stream",
+        "the REAL status+content-type came back off request-stream's own return"
+    );
+
     let streamed = notifications
         .iter()
         .find(|n| n.starts_with("http stream chunks: "))
@@ -178,4 +197,51 @@ async fn wasm_guest_http_stream_receives_real_chunks_in_order_then_eof() {
         chunk_count >= 2,
         "the delayed writes arrived as multiple distinct REAL chunks across the wasm boundary: {chunk_count}"
     );
+}
+
+/// THE headline proof (c), closing L4 §2.3 directly: a TRUSTED live wasm guest's
+/// `ctx.http_request_stream` surfaces the initiating response's REAL non-2xx status (401, as the MCP
+/// SDK's `StreamableHTTPClientTransport` needs to decide re-auth) and a distinguishing header
+/// (`mcp-session-id`) across the wasm boundary — proving these are genuinely read off the real HTTP
+/// response, not a hardcoded/omitted default, and that the guest can observe them independent of
+/// (indeed, strictly before) ever draining the streamed body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_guest_http_stream_surfaces_real_non_2xx_status_and_headers_before_draining_body() {
+    let bytes = std::fs::read(fixture_component()).expect("read fixture component bytes");
+    let session = trusted_session().await;
+
+    let ext = session
+        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .await
+        .expect("load + init the live wasm extension");
+
+    let body = b"unauthorized-but-still-a-real-streamable-body".to_vec();
+    let headers = format!(
+        "Content-Type: text/event-stream\r\nMcp-Session-Id: sess-live-42\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    let url = spawn_mock_with_status("HTTP/1.1 401 Unauthorized", headers, vec![body.clone()]).await;
+
+    let _ = session.prompt(format!("/httpstreamdemo {url}")).await.unwrap();
+    session.wait_for_idle().await;
+
+    let notifications = ext.guest().notifications();
+    let opened = notifications
+        .iter()
+        .find(|n| n.starts_with("http stream opened status: "))
+        .unwrap_or_else(|| panic!("no http-stream-open notification recorded: {notifications:?}"));
+    assert_eq!(
+        opened, "http stream opened status: 401 content-type: text/event-stream",
+        "the REAL non-2xx status + content-type header came back off request-stream's own return, \
+         BEFORE any chunk was polled"
+    );
+
+    // The body is still fully drained afterward — exposing status/headers didn't consume anything.
+    let streamed = notifications
+        .iter()
+        .find(|n| n.starts_with("http stream chunks: "))
+        .unwrap_or_else(|| panic!("no http-stream notification recorded: {notifications:?}"));
+    let rest = streamed.strip_prefix("http stream chunks: ").expect("prefix");
+    let (_count_str, streamed_body) = rest.split_once(" body: ").expect("split");
+    assert_eq!(streamed_body, String::from_utf8_lossy(&body), "the real body still drains after 401");
 }

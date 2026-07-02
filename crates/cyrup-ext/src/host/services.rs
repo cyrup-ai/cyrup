@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 // Re-exported for downstream backends (e.g. `cyrup-session-svc::LiveHostServices`), which reach
 // these DTOs the same way it reaches `ExecOutput`/`DialogOptions` (`cyrup_ext::host::{..}`).
-pub use crate::caps::http::{HttpRequest, HttpResponse};
+pub use crate::caps::http::{HttpRequest, HttpResponse, HttpStreamResponse};
 pub use crate::caps::proc::ProcSpawnSpec;
 
 /// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
@@ -171,11 +171,11 @@ pub trait HostServices: Send + Sync {
     fn http_request(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
         Err("http-client capability not granted".into())
     }
-    /// Start a streaming HTTP request (the WIT `http-client.request-stream`); returns an opaque
-    /// stream handle the guest drains via [`Self::http_poll_stream_chunk`] — the host owns the live
-    /// Rust stream (a guest cannot hold one across the wasm boundary, arch-08 §5.2). Denied by
-    /// default.
-    fn http_request_stream(&self, _req: &HttpRequest) -> Result<u32, String> {
+    /// Start a streaming HTTP request (the WIT `http-client.request-stream`); returns the initiating
+    /// response's status+headers TOGETHER with an opaque stream handle the guest drains via
+    /// [`Self::http_poll_stream_chunk`] — the host owns the live Rust stream (a guest cannot hold one
+    /// across the wasm boundary, arch-08 §5.2). Denied by default.
+    fn http_request_stream(&self, _req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         Err("http-client capability not granted".into())
     }
     /// Drain the next chunk of a stream opened via [`Self::http_request_stream`] (the WIT
@@ -277,6 +277,12 @@ pub struct CannedResponses {
     pub exec: ExecOutput,
     /// The canned answer to `http_request` (default: a bare `200` with an empty body).
     pub http_response: HttpResponse,
+    /// The canned status a `http_request_stream` grant returns alongside its handle (default 200;
+    /// `HttpStreamResponse.status`).
+    pub http_stream_status: u16,
+    /// The canned headers a `http_request_stream` grant returns alongside its handle (default empty;
+    /// `HttpStreamResponse.headers`).
+    pub http_stream_headers: Vec<(String, String)>,
     /// The canned chunks a `http_request_stream` grant yields in order, then EOF (`Ok(None)`).
     pub http_stream_chunks: Vec<Vec<u8>>,
     /// The canned chunks a `proc_spawn` grant yields across repeated `proc_read_stdout` calls (one
@@ -309,6 +315,8 @@ impl Default for CannedResponses {
             custom: None,
             exec: ExecOutput::default(),
             http_response: HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+            http_stream_status: 200,
+            http_stream_headers: Vec::new(),
             http_stream_chunks: Vec::new(),
             proc_stdout_chunks: Vec::new(),
             proc_stderr_chunks: Vec::new(),
@@ -470,13 +478,17 @@ impl HostServices for RecordingServices {
         }
         Ok(self.responses.http_response.clone())
     }
-    fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+    fn http_request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
         g.http_requests.push(req.clone());
         let handle = g.next_http_stream_handle;
         g.next_http_stream_handle += 1;
         g.http_streams.insert(handle, 0);
-        Ok(handle)
+        Ok(HttpStreamResponse {
+            handle,
+            status: self.responses.http_stream_status,
+            headers: self.responses.http_stream_headers.clone(),
+        })
     }
     fn http_poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
         let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;

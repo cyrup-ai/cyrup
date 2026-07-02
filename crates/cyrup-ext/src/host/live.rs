@@ -429,7 +429,7 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
     async fn request_stream(
         &mut self,
         req: bindings::cyrup::ext::http_client::HttpRequest,
-    ) -> Result<u32, String> {
+    ) -> Result<bindings::cyrup::ext::http_client::HttpStreamResponse, String> {
         let guest = guest_of(self)?;
         let request = crate::caps::http::HttpRequest {
             method: req.method,
@@ -438,7 +438,12 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
             body: req.body,
             timeout_ms: req.timeout_ms,
         };
-        guest.services.http_request_stream(&request)
+        let opened = guest.services.http_request_stream(&request)?;
+        Ok(bindings::cyrup::ext::http_client::HttpStreamResponse {
+            handle: opened.handle,
+            status: opened.status,
+            headers: opened.headers,
+        })
     }
     async fn poll_stream_chunk(&mut self, handle: u32) -> Result<Option<Vec<u8>>, String> {
         let guest = guest_of(self)?;

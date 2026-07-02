@@ -236,22 +236,38 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising the streaming half of the http-client grant (`request-stream` /
-    // `poll-stream-chunk`): open a stream to `args`, poll every chunk to EOF, and surface the real
-    // chunk count + concatenated body — proving the host-owned stream registry (arch-08 §5.2's
-    // request/poll bridge) delivers real bytes across the wasm boundary, in order.
+    // `poll-stream-chunk`): open a stream to `args`, immediately surface the initiating response's
+    // status+headers (closes L4 §2.3 — available BEFORE and INDEPENDENT of draining any chunk, off
+    // the SAME round trip `request-stream` used to open the body, exactly what the real consumer this
+    // backs — the MCP SDK's `StreamableHTTPClientTransport` — reads off its one `fetch()` response),
+    // then poll every chunk to EOF and surface the real chunk count + concatenated body — proving the
+    // host-owned stream registry (arch-08 §5.2's request/poll bridge) delivers real bytes across the
+    // wasm boundary, in order.
     api.register_command(
         "httpstreamdemo",
         CommandDescriptor::new(
-            "Stream a URL via the http-client capability and report chunks+body (demo).",
+            "Stream a URL via the http-client capability and report status+headers+chunks+body (demo).",
         ),
         |args: &str, ctx: &crate::CommandCtx| {
-            let handle = match ctx.ctx().http_request_stream(&HttpRequest::get(args.trim())) {
-                Ok(h) => h,
+            let opened = match ctx.ctx().http_request_stream(&HttpRequest::get(args.trim())) {
+                Ok(o) => o,
                 Err(e) => {
                     ctx.ui().notify(&format!("http stream denied: {e}"));
                     return Ok(Some(format!("http stream denied: {e}")));
                 }
             };
+            let content_type = opened
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            // Notified BEFORE any chunk is polled: proves status/headers are independent of the body.
+            ctx.ui().notify(&format!(
+                "http stream opened status: {} content-type: {content_type}",
+                opened.status
+            ));
+            let handle = opened.handle;
             let mut body = Vec::new();
             let mut chunks = 0u32;
             loop {
@@ -270,7 +286,10 @@ pub fn build() -> ExtensionApi {
             ctx.ctx().http_close_stream(handle);
             let body = String::from_utf8_lossy(&body).into_owned();
             ctx.ui().notify(&format!("http stream chunks: {chunks} body: {body}"));
-            Ok(Some(format!("http stream chunks {chunks} body {body}")))
+            Ok(Some(format!(
+                "http stream status {} content-type {content_type} chunks {chunks} body {body}",
+                opened.status
+            )))
         },
     );
 

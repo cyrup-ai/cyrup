@@ -364,15 +364,28 @@ interface http-client {
     headers: list<tuple<string, string>>,
     body: list<u8>,
   }
+  // The initiating response's metadata for a stream opened via `request-stream`, returned ALONGSIDE
+  // the stream handle from the SAME round trip that opens the long-lived body (closes L4 §2.3: the
+  // real consumer this capability backs — the MCP TS SDK's `StreamableHTTPClientTransport`/
+  // `SSEClientTransport` — reads `response.status` (401 => re-auth) and `response.headers`
+  // (`mcp-session-id`, `content-type`) off the SAME response whose body it then streams; there is no
+  // second request to recover this metadata from, and a POST with side effects can't be re-issued to
+  // do so). `body` is deliberately absent here — drain it via `poll-stream-chunk`.
+  record http-stream-response {
+    handle: u32,                          // stream-handle for poll-stream-chunk/close-stream
+    status: u16,
+    headers: list<tuple<string, string>>,
+  }
 
   // A single request/response call. A non-2xx status is NOT itself a WIT error (fetch semantics) —
   // only a transport failure (DNS, connect refused, TLS, timeout) is; the guest inspects `status`.
   request: func(req: http-request) -> result<http-response, string>;
 
-  // Streaming variant for SSE / StreamableHTTP's chunked responses. Returns a stream handle; the
-  // guest polls for the next chunk (request/poll bridge, arch-08 §5.2) rather than the host blocking
+  // Streaming variant for SSE / StreamableHTTP's chunked responses. Returns the initiating response's
+  // status+headers TOGETHER with a stream handle in one round trip; the guest polls for the next body
+  // chunk via `poll-stream-chunk` (request/poll bridge, arch-08 §5.2) rather than the host blocking
   // the guest's Store on an unbounded-duration long poll.
-  request-stream: func(req: http-request) -> result<u32, string>;   // u32 = stream-handle
+  request-stream: func(req: http-request) -> result<http-stream-response, string>;
   poll-stream-chunk: func(handle: u32) -> result<option<list<u8>>, string>;  // none-of-none = EOF
   close-stream: func(handle: u32);
 }
