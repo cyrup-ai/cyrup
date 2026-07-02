@@ -737,7 +737,10 @@ pub struct GuestState {
     /// still unused when the guest chose to block" computation to when it ACTUALLY stopped consuming
     /// budget, not to whichever (possibly later, if several dialogs chain back-to-back with no
     /// intervening checkpoint) dialog happened to resolve last. Set by [`Self::note_dialog_wait`],
-    /// consumed + reset by [`Self::take_dialog_extra_ticks`].
+    /// consumed + reset by [`Self::take_dialog_extra_ticks`] — and ALSO reset by every fresh dispatch
+    /// boundary via [`Self::arm_epoch_deadline_estimate`], so a dialog that resolved quickly (never
+    /// tripping `epoch_deadline_callback`, so `take_dialog_extra_ticks` never ran) can't leave a stale
+    /// anchor that a LATER, unrelated dispatch's genuine runaway would exploit for outsized forgiveness.
     first_wait_started: Mutex<Option<std::time::Instant>>,
 }
 
@@ -1079,12 +1082,28 @@ impl GuestState {
     /// this EVERY time the host calls `store.set_epoch_deadline(ticks)` (every dispatch entry point
     /// in `live.rs`, plus every forgiveness grant via [`Self::take_dialog_extra_ticks`]) so the
     /// estimate never drifts out of sync with wasmtime's real (unreadable) internal deadline.
+    ///
+    /// ALSO clears any stale [`Self::first_wait_started`] anchor. Every call site except the
+    /// self-re-arm inside [`Self::take_dialog_extra_ticks`] marks a brand-new dispatch boundary (it
+    /// is always paired 1:1 with a real `store.set_epoch_deadline` in `live.rs`) — a dialog wait that
+    /// resolved comfortably inside its OWN dispatch's budget never trips `epoch_deadline_callback`,
+    /// so `take_dialog_extra_ticks` (the only other thing that clears the anchor) never runs, and
+    /// without this the anchor would sit there indefinitely. A LATER, wholly unrelated dispatch that
+    /// then genuinely runs long would read that ancient timestamp as "still owed" and be granted
+    /// forgiveness computed from a deadline that has nothing to do with it — potentially far exceeding
+    /// its own per-dispatch budget and defeating the epoch trap entirely. Clearing here bounds the
+    /// anchor to at most the CURRENT dispatch (the self-re-arm inside `take_dialog_extra_ticks` is a
+    /// no-op against this field: it always runs immediately after that function's own `.take()`, so
+    /// the field is already `None`).
     pub fn arm_epoch_deadline_estimate(&self, ticks: u64) {
         let ticks_u32 = u32::try_from(ticks).unwrap_or(u32::MAX);
         let budget = crate::host::epoch::DEFAULT_TICK.checked_mul(ticks_u32).unwrap_or(std::time::Duration::MAX);
         let deadline = std::time::Instant::now().checked_add(budget);
         if let Ok(mut g) = self.deadline_estimate.lock() {
             *g = deadline;
+        }
+        if let Ok(mut g) = self.first_wait_started.lock() {
+            *g = None;
         }
     }
 
@@ -1306,6 +1325,44 @@ mod tests {
         // second call's later start (~70ms / 14 ticks) — i.e. `forgiven` skews toward the larger,
         // first-anchored value.
         assert!(forgiven >= 15, "must anchor to the FIRST wait in the batch, got {forgiven} ticks");
+    }
+
+    /// THE CRITICAL cross-dispatch fix this closes: a dialog wait that resolves comfortably inside its
+    /// OWN dispatch's budget never trips `epoch_deadline_callback`, so `take_dialog_extra_ticks` (the
+    /// only other thing that used to clear the anchor) never runs — pre-fix, `first_wait_started`
+    /// stayed set indefinitely. A LATER, wholly unrelated dispatch (fresh `arm_epoch_deadline_estimate`
+    /// call, mirroring `live.rs`'s `store.set_epoch_deadline` at every dispatch entry point) that then
+    /// genuinely runs long past ITS OWN budget must trap normally — it must NOT be handed forgiveness
+    /// computed from the ancient, unrelated anchor.
+    #[test]
+    fn arm_epoch_deadline_estimate_clears_a_stale_anchor_left_by_a_fast_dialog_in_an_earlier_dispatch() {
+        let s = state();
+
+        // Dispatch A: a small budget, and a dialog that resolves FAST (well inside budget) — the
+        // epoch deadline is never reached during dispatch A, so `take_dialog_extra_ticks` never runs
+        // and the anchor set by `note_dialog_wait` is never consumed by it.
+        s.arm_epoch_deadline_estimate(20);
+        s.note_dialog_wait(std::time::Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Dispatch A ends normally (no epoch trap) — nothing ever called `take_dialog_extra_ticks`.
+
+        // Time passes between dispatches (e.g. the guest is idle, or busy with unrelated host work).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Dispatch M: wholly unrelated to any dialog, mirrors a fresh `live.rs` dispatch entry point
+        // (`store.set_epoch_deadline` + `arm_epoch_deadline_estimate`) with its OWN small budget.
+        s.arm_epoch_deadline_estimate(20);
+        // The guest genuinely runs long in dispatch M (a runaway loop), well past its own 20-tick
+        // (100ms) budget, with NO dialog wait of its own.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let forgiven = s.take_dialog_extra_ticks();
+        assert_eq!(
+            forgiven, 0,
+            "a genuine runaway in an UNRELATED later dispatch must trap (0 forgiveness) — got \
+             {forgiven}, meaning a fast dialog in an earlier dispatch left a stale anchor that let \
+             this dispatch's own epoch trap be defeated"
+        );
     }
 
     /// THE regression this fix closes: `abort_signal` used to unconditionally `insert` any
