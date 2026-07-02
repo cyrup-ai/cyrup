@@ -345,7 +345,9 @@ interface proc {
   // Poll whether the child has exited; `some(code)` once terminated.
   poll-exit: func(handle: u32) -> option<s32>;
 
-  // Terminate the child (SIGTERM then SIGKILL after a grace period, host-side policy).
+  // Terminate the child: close stdin (EOF), then SIGTERM, then SIGKILL, each escalation gated on
+  // a grace period if the child is still alive (host-side policy; mirrors the real
+  // StdioClientTransport.close()'s three-phase escalation).
   kill: func(handle: u32) -> result<_, string>;
 }
 

@@ -22,14 +22,26 @@ use tokio::process::ChildStdin;
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
-/// The Pi `proc.kill("SIGTERM")` → `proc.kill("SIGKILL")` escalation's exact timing (Pi
-/// `packages/coding-agent/src/core/exec.ts:56-61`): 5 real seconds of grace before forcing.
-const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
-/// Bounded confirmation wait AFTER sending SIGKILL — SIGKILL is not interceptable, so this should
-/// resolve almost immediately once the waiter task reaps the child; a generous cap regardless (a
-/// process wedged even past SIGKILL, e.g. stuck in uninterruptible D-state I/O, is the only way this
-/// is ever hit).
-const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+/// The REAL `proc` teardown escalation's exact timing — the actual majority-case MCP-stdio
+/// consumer, `StdioClientTransport.close()` (`@modelcontextprotocol/sdk@1.25.1`
+/// `dist/cjs/client/stdio.js:144-179`): close stdin (EOF), wait 2000ms; if still alive, SIGTERM,
+/// wait ANOTHER 2000ms; if still alive, SIGKILL. The SAME 2000ms constant backs BOTH waits in the
+/// real transport (`setTimeout(resolve, 2000)` appears twice, stdio.js:159/167) — [`ProcCaps::kill`]
+/// reuses this ONE value for both of its own two waits for the same reason.
+///
+/// NOT Pi's `packages/coding-agent/src/core/exec.ts:52-63` `killProcess` (that escalation is the
+/// separate, bounded one-shot `exec`/`bash`-tool-run kill path — a genuinely different code path
+/// from a long-lived duplex-pipe MCP transport child; see `cyrup-tools::ops::local::send_sigterm_tree`
+/// for where that 5000ms timing is actually ported, `cyrup-session-svc`'s `exec` grant).
+const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Bounded confirmation wait AFTER sending SIGKILL. The real `StdioClientTransport.close()` fires
+/// SIGKILL and returns immediately (fire-and-forget, stdio.js:169-176, no further wait) — but
+/// [`ProcCaps::kill`]'s OWN contract (doc above) promises `Ok` only once the OS process is
+/// CONFIRMED gone, which the real transport's `onclose` callback (not its `close()` return value)
+/// is what actually signals in Node. SIGKILL is not interceptable, so this should resolve almost
+/// immediately once the waiter task reaps the child; a generous cap regardless (a process wedged
+/// even past SIGKILL, e.g. stuck in uninterruptible D-state I/O, is the only way this is ever hit).
+const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A spawn request for the `proc` capability (mirrors the WIT `proc.spawn` params 1:1). `env` is
 /// OVERLAID onto the host's own inherited environment (Pi `resolveEnv`, `server-manager.ts:422` —
@@ -48,8 +60,47 @@ pub struct ProcSpawnSpec {
     pub capture_stderr: bool,
 }
 
-/// A byte buffer a background pump task appends to and a `read-*` call drains from the front.
-type PipeBuf = Arc<Mutex<VecDeque<u8>>>;
+/// Per-pipe cap on buffered-but-unread bytes. `proc` is request/poll-shaped (a guest drains via
+/// `read-stdout`/`read-stderr` only across separate top-level host calls, potentially seconds apart
+/// mid-LLM-turn) — unlike the real `StdioClientTransport`, whose Node `Readable` stream bounds
+/// unread bytes via its own `highWaterMark` and lets the OS pipe itself throttle the child's
+/// `write()` once that fills (stdio.js:99-100/108-111, real SDK v1.25.1). A raw unbounded
+/// `VecDeque` here would let host memory grow without bound for a busy guest against a bursty child
+/// (confirmed unbounded-memory/DoS vector). There is no Pi-derived exact byte count to port — the
+/// point is FINITE, not a specific magic number — so this is a deliberately generous cap
+/// (comfortably larger than any single realistic JSON-RPC message or log burst) that still
+/// guarantees bounded worst-case growth; [`spawn_pump`] parks instead of reading once a pipe hits
+/// this cap, which lets the OS-level pipe buffer fill and the CHILD's own `write()` block — the
+/// same real backpressure the Node stream's `highWaterMark` provides.
+const MAX_PIPE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// A byte buffer a background pump task appends to and a `read-*` call drains from the front,
+/// capped at [`MAX_PIPE_BUFFER_BYTES`]. `space_freed` wakes a pump task parked at the cap the
+/// instant `drain` removes bytes (Tokio `Notify` stores one permit, so a `drain` that races ahead
+/// of a pump's `len` check is never missed — see `[Self::wait_for_room]`).
+struct PipeBufState {
+    data: Mutex<VecDeque<u8>>,
+    space_freed: tokio::sync::Notify,
+}
+
+impl PipeBufState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { data: Mutex::new(VecDeque::new()), space_freed: tokio::sync::Notify::new() })
+    }
+
+    /// Park until buffered bytes drop below the cap (immediately if already under it).
+    async fn wait_for_room(&self) {
+        loop {
+            let len = self.data.lock().map(|g| g.len()).unwrap_or(0);
+            if len < MAX_PIPE_BUFFER_BYTES {
+                return;
+            }
+            self.space_freed.notified().await;
+        }
+    }
+}
+
+type PipeBuf = Arc<PipeBufState>;
 
 /// One live child process the host owns on the guest's behalf. Background tasks continuously pump
 /// the REAL stdout/stderr pipes into these buffers so output produced between two guest polls is
@@ -73,26 +124,27 @@ struct ProcEntry {
 /// the engine's lifetime by design — the guest can still `poll-exit`/drain trailing buffered output
 /// after a `kill`, and a session's `ProcCaps` instance itself is bounded to the session's lifetime.
 ///
-/// **Kill semantics, justified.** Pi's own `proc.kill("SIGTERM")` (the escalation this mirrors,
-/// `exec.ts:52-63`) signals ONLY the immediate child — `StdioClientTransport`'s spawn
-/// (`server-manager.ts:105-112`) is a plain, non-detached `child_process.spawn`, never a process-
-/// group leader. [`ProcCaps::kill`] mirrors that 1:1: it signals the single child pid directly
+/// **Kill semantics, justified.** The real `StdioClientTransport.close()` (the escalation this
+/// mirrors, `@modelcontextprotocol/sdk@1.25.1` `dist/cjs/client/stdio.js:144-179`) signals ONLY
+/// the immediate child — `StdioClientTransport`'s spawn (`server-manager.ts:105-112`) is a plain,
+/// non-detached `child_process.spawn` (via `cross-spawn`), never a process-group leader.
+/// [`ProcCaps::kill`] mirrors that 1:1: it signals the single child pid directly
 /// (`cyrup_tools::terminate_pid`/`kill_pid`), NOT a `setsid`/`killpg` process-GROUP kill. Reusing
 /// `cyrup-tools`' `send_sigterm_tree`/`send_sigkill_tree` (the `exec`/`bash` seam's group-kill
-/// escalation, R-03-027) here would diverge from what Pi actually does for stdio MCP transport —
-/// that machinery exists because a SHELL-spawned command tree needs group cleanup; a directly-
-/// `spawn`ed single MCP server process does not, and killing a wider group than Pi itself would
-/// is an unjustified behavior change, not a
-/// strictly-more-correct one. Accordingly `spawn` does NOT `setsid` the child either (contrast
+/// escalation, R-03-027) here would diverge from what the real consumer does for stdio MCP
+/// transport — that machinery exists because a SHELL-spawned command tree needs group cleanup; a
+/// directly-`spawn`ed single MCP server process does not, and killing a wider group than the real
+/// transport itself would is an unjustified behavior change, not a strictly-more-correct one.
+/// Accordingly `spawn` does NOT `setsid` the child either (contrast
 /// `cyrup-tools::ops::local::build_argv_command`), keeping the child a plain, non-group-leader
-/// process exactly like Node's `spawn(..., {shell:false})` with no `detached` option.
+/// process exactly like `cross-spawn`'s `spawn(..., {shell:false})` with no `detached` option.
 pub struct ProcCaps {
     registry: Mutex<HashMap<u32, Arc<ProcEntry>>>,
     next_handle: AtomicU32,
-    /// How long [`Self::kill`] waits after SIGTERM before escalating to SIGKILL — Pi's exact
-    /// 5000ms by default ([`DEFAULT_KILL_GRACE`]); overridable ONLY for tests
-    /// ([`Self::with_kill_grace`]) so the SIGKILL-escalation path is exercisable without a real
-    /// test waiting 5+ real seconds.
+    /// How long [`Self::kill`] waits for the child to react to EACH of its two graceful legs
+    /// (stdin-EOF, then SIGTERM) before escalating — the real transport's exact 2000ms by default
+    /// ([`DEFAULT_KILL_GRACE`]); overridable ONLY for tests ([`Self::with_kill_grace`]) so the
+    /// SIGKILL-escalation path is exercisable without a real test waiting 2+ real seconds per leg.
     kill_grace: Duration,
 }
 
@@ -113,8 +165,8 @@ impl ProcCaps {
         Self::with_kill_grace(DEFAULT_KILL_GRACE)
     }
 
-    /// Build with a caller-supplied SIGTERM→SIGKILL grace period (tests only; production always
-    /// gets Pi's real 5s via [`Self::new`]).
+    /// Build with a caller-supplied per-leg grace period (tests only; production always gets the
+    /// real transport's exact 2s-per-leg via [`Self::new`]).
     pub fn with_kill_grace(kill_grace: Duration) -> Self {
         Self { registry: Mutex::new(HashMap::new()), next_handle: AtomicU32::new(1), kill_grace }
     }
@@ -160,8 +212,8 @@ impl ProcCaps {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let stdout_buf: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_buf: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+        let stdout_buf: PipeBuf = PipeBufState::new();
+        let stderr_buf: PipeBuf = PipeBufState::new();
 
         if let Some(out) = stdout {
             spawn_pump(out, stdout_buf.clone());
@@ -220,9 +272,15 @@ impl ProcCaps {
     }
 
     fn drain(buf: &PipeBuf, max_bytes: u32) -> Result<Vec<u8>, String> {
-        let mut g = buf.lock().map_err(|_| "proc pipe buffer lock poisoned".to_string())?;
-        let n = (max_bytes as usize).min(g.len());
-        Ok(g.drain(..n).collect())
+        let out = {
+            let mut g = buf.data.lock().map_err(|_| "proc pipe buffer lock poisoned".to_string())?;
+            let n = (max_bytes as usize).min(g.len());
+            g.drain(..n).collect::<Vec<u8>>()
+        };
+        // Wake a pump task parked at MAX_PIPE_BUFFER_BYTES regardless of whether this drain freed
+        // any bytes — a spurious wake just re-checks `len` and re-parks if still full, harmless.
+        buf.space_freed.notify_one();
+        Ok(out)
     }
 
     /// Poll whether the child has exited (the WIT `proc.poll-exit`); `Some(code)` once terminated,
@@ -233,25 +291,42 @@ impl ProcCaps {
         *entry.exit_code.borrow()
     }
 
-    /// Terminate the child (the WIT `proc.kill`): SIGTERM, then SIGKILL after the grace period IF
-    /// still alive — Pi's exact escalation (`exec.ts:52-63`). Returns `Ok` only once the OS process
-    /// is CONFIRMED gone (the waiter task observed real termination), never a fire-and-forget signal
-    /// send. Idempotent: killing an already-exited handle is a no-op `Ok`.
+    /// Terminate the child (the WIT `proc.kill`): close stdin (EOF), then SIGTERM, then SIGKILL,
+    /// each escalation gated on the child still being alive after the grace period — the real
+    /// `StdioClientTransport.close()`'s exact three-phase escalation (`@modelcontextprotocol/sdk
+    /// @1.25.1` `dist/cjs/client/stdio.js:144-179`), NOT Pi `exec.ts:52-63`'s unrelated bounded
+    /// one-shot tool-run kill (see [`DEFAULT_KILL_GRACE`]'s doc for why that citation was wrong).
+    /// Returns `Ok` only once the OS process is CONFIRMED gone (the waiter task observed real
+    /// termination), never a fire-and-forget signal send. Idempotent: killing an already-exited
+    /// handle is a no-op `Ok`.
     pub async fn kill(&self, handle: u32) -> Result<(), String> {
         let entry = self.entry(handle)?;
         if entry.exit_code.borrow().is_some() {
             return Ok(()); // already exited — never re-signal a reaped pid.
         }
 
-        cyrup_tools::terminate_pid(entry.pid)
-            .map_err(|e| format!("SIGTERM pid {}: {e}", entry.pid))?;
-
+        // Phase 1 — graceful stdin EOF (stdio.js:154's `processToClose.stdin?.end()`): many
+        // stdio-loop MCP servers `read()` until EOF then exit cleanly on their own, needing no
+        // signal at all. Dropping (never re-storing) the `ChildStdin` closes the real underlying
+        // fd — the same effect as Node's `stdin.end()`.
+        {
+            let mut guard = entry.stdin.lock().await;
+            *guard = None;
+        }
         if Self::wait_exited(&entry, self.kill_grace).await {
-            return Ok(()); // SIGTERM worked within the grace period — no escalation needed.
+            return Ok(()); // exited on stdin EOF alone — no signal needed (stdio.js:159-160).
         }
 
-        // Grace period elapsed and the child is still alive: force it (Pi's exact
-        // "if (!proc.killed) proc.kill('SIGKILL')" after 5s, exec.ts:57-61).
+        // Phase 2 — SIGTERM (stdio.js:162), same 2000ms-real grace (stdio.js:167).
+        cyrup_tools::terminate_pid(entry.pid)
+            .map_err(|e| format!("SIGTERM pid {}: {e}", entry.pid))?;
+        if Self::wait_exited(&entry, self.kill_grace).await {
+            return Ok(()); // SIGTERM worked within the grace period — no further escalation needed.
+        }
+
+        // Phase 3 — SIGKILL (stdio.js:171). The real transport fires-and-forgets this and returns
+        // immediately; this capability's own `Ok`-means-confirmed-gone contract (doc above) instead
+        // waits out a bounded confirmation ([`KILL_CONFIRM_TIMEOUT`]'s doc).
         cyrup_tools::kill_pid(entry.pid).map_err(|e| format!("SIGKILL pid {}: {e}", entry.pid))?;
 
         if Self::wait_exited(&entry, KILL_CONFIRM_TIMEOUT).await {
@@ -299,10 +374,16 @@ where
     tokio::spawn(async move {
         let mut chunk = [0u8; 8192];
         loop {
+            // Backpressure: park here (never reading the OS pipe) once the buffer is at the cap.
+            // This is what makes the cap a REAL bound rather than a drop-newest/drop-oldest hack —
+            // the kernel pipe buffer fills and the CHILD's own `write()` blocks, exactly the
+            // pressure a real Node `Readable` stream's `highWaterMark` applies (see
+            // [`MAX_PIPE_BUFFER_BYTES`]'s doc).
+            buf.wait_for_room().await;
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if let Ok(mut g) = buf.lock() {
+                    if let Ok(mut g) = buf.data.lock() {
                         g.extend(chunk.get(..n).unwrap_or(&[]).iter().copied());
                     }
                 }
@@ -398,8 +479,14 @@ mod tests {
         let started = tokio::time::Instant::now();
         caps.kill(handle).await.expect("kill terminates the real sleep");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "a SIGTERM-obeying child dies well within the grace period, no SIGKILL escalation needed"
+            // `sleep` never reads stdin, so phase 1 (stdin EOF) always eats its full REAL
+            // production grace period (~2s, DEFAULT_KILL_GRACE) with no reaction; `sleep` IS
+            // SIGTERM-obeying though, so phase 2 kills it near-instantly — well under a THIRD
+            // grace period's worth of extra time, which is what a SIGKILL escalation would cost.
+            started.elapsed() < Duration::from_secs(3),
+            "a SIGTERM-obeying child (after the futile stdin-EOF leg) dies well within the second \
+             grace period, no SIGKILL escalation needed: elapsed {:?}",
+            started.elapsed()
         );
         assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
 
@@ -423,8 +510,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_escalates_to_sigkill_when_the_child_ignores_sigterm() {
-        // A short grace period so this test stays fast — the escalation TIMING is Pi's real 5000ms
-        // in production ([`DEFAULT_KILL_GRACE`]); only the test injects a shorter one.
+        // A short grace period so this test stays fast — the escalation TIMING is the real
+        // transport's exact 2000ms-per-leg in production ([`DEFAULT_KILL_GRACE`]); only the test
+        // injects a shorter one. This shell also never reads stdin, so phase 1 (stdin EOF) always
+        // times out too — the full escalation now pays out TWO grace-period waits (stdin-EOF, then
+        // ignored-SIGTERM) before SIGKILL, not one.
         let caps = ProcCaps::with_kill_grace(Duration::from_millis(150));
         let handle = caps
             .spawn(&spec("sh", &["-c", "trap '' TERM; while true; do sleep 1; done"]))
@@ -432,7 +522,9 @@ mod tests {
         assert_eq!(caps.poll_exit(handle), None, "genuinely running before kill");
         // Let the shell actually REACH `trap '' TERM` before we signal it — otherwise SIGTERM can
         // race the trap install and kill it via the (still-default) terminate disposition, which
-        // would falsely "pass" this test without ever exercising the SIGKILL escalation.
+        // would falsely "pass" this test without ever exercising the SIGKILL escalation. The
+        // mandatory phase-1 stdin-EOF wait (150ms) already provides this margin on its own, but
+        // this sleep keeps the test robust even if phase 1 is ever removed/shortened further.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let pid = {
@@ -443,8 +535,10 @@ mod tests {
         let started = tokio::time::Instant::now();
         caps.kill(handle).await.expect("kill still terminates it via the SIGKILL escalation");
         assert!(
-            started.elapsed() >= Duration::from_millis(150),
-            "the grace period was genuinely waited out before escalating (elapsed {:?})",
+            // Two full grace-period legs (stdin-EOF, then ignored-SIGTERM) genuinely elapse before
+            // the SIGKILL escalation — not just one.
+            started.elapsed() >= Duration::from_millis(150) * 2,
+            "both grace-period legs were genuinely waited out before escalating (elapsed {:?})",
             started.elapsed()
         );
         assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the SIGKILL-forced termination");
@@ -455,6 +549,96 @@ mod tests {
             "kill -0 on the SIGKILLed pid must fail — the OS process is really gone, SIGTERM alone \
              would have left it running"
         );
+    }
+
+    /// The graceful stdin-EOF-alone leg (fixes the raw audit's confirmed Finding 1: `kill` used to
+    /// go straight to SIGTERM with no graceful phase at all). `cat`'s only exit condition is EOF on
+    /// its stdin — closing it must let `cat` exit ON ITS OWN, with `kill` returning `Ok` in well
+    /// under a single grace period. This is airtight by construction, not just by timing: SIGTERM
+    /// is unreachable code in [`ProcCaps::kill`] until AFTER phase 1's `wait_exited` call returns
+    /// `false`, so a fast `Ok` here can ONLY have come from the phase-1 early return — no signal
+    /// was sent.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_exits_a_child_via_graceful_stdin_eof_alone_no_signal_needed() {
+        let caps = ProcCaps::new(); // real production grace (2s/leg) — proves this returns FAST.
+        let handle = caps.spawn(&spec("sh", &["-c", "cat >/dev/null"])).expect("spawns");
+        assert_eq!(caps.poll_exit(handle), None, "genuinely running before kill");
+
+        let pid = {
+            let reg = caps.registry();
+            reg.get(&handle).expect("entry present").pid
+        };
+
+        let started = tokio::time::Instant::now();
+        caps.kill(handle).await.expect("kill terminates via graceful stdin EOF alone");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stdin-EOF-driven exit must be near-instant (well under the 2s production grace \
+             period) — a slow return here would mean the graceful phase 1 path was NOT taken: \
+             elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
+
+        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(
+            alive.map(|s| !s.success()).unwrap_or(true),
+            "kill -0 on the EOF-exited pid must fail — the OS process is really gone"
+        );
+    }
+
+    /// A busy/slow guest that never calls `read_stdout` against a maximally-bursty child (`yes`,
+    /// which writes as fast as the pipe accepts, forever) must NOT let host memory grow without
+    /// bound — the fix for the raw audit's confirmed Finding 2 (`spawn_pump`'s buffer used to be a
+    /// raw unbounded `VecDeque`, a genuine unbounded-memory/DoS vector: a guest busy mid-LLM-turn
+    /// against a bursty MCP server would grow host RAM without limit). Checks the REAL buffered
+    /// byte count directly (never draining) across two separate waits and confirms it plateaus at
+    /// [`MAX_PIPE_BUFFER_BYTES`] rather than climbing past it, then drains and confirms the pump
+    /// resumes (proving it was genuinely PARKED on backpressure, not dead/dropping data).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unread_stdout_from_a_bursty_child_is_bounded_not_unbounded() {
+        let caps = ProcCaps::new();
+        let handle = caps.spawn(&spec("yes", &[])).expect("yes spawns");
+
+        let buffered_len = |caps: &ProcCaps| -> usize {
+            let reg = caps.registry();
+            let entry = reg.get(&handle).expect("entry present");
+            entry.stdout_buf.data.lock().expect("stdout buffer lock").len()
+        };
+
+        // `yes` writes continuously; give the pump time to hit (and, correctly, stay pinned at)
+        // the cap — an unbounded buffer would already be well past MAX_PIPE_BUFFER_BYTES here.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let first = buffered_len(&caps);
+        assert!(
+            first <= MAX_PIPE_BUFFER_BYTES,
+            "buffered stdout ({first} bytes) exceeded the cap ({MAX_PIPE_BUFFER_BYTES}) — unbounded growth"
+        );
+
+        // Wait again with STILL no read — a genuinely unbounded buffer would have grown further; a
+        // correctly capped+backpressured one stays pinned at (never beyond) the cap.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let second = buffered_len(&caps);
+        assert!(
+            second <= MAX_PIPE_BUFFER_BYTES,
+            "buffered stdout grew past the cap on a second check ({second} bytes) — the pump did \
+             not actually stop reading at the cap"
+        );
+
+        // Drain a big chunk and confirm the pump resumes filling the buffer again shortly after —
+        // proving the parked pump (and the real `yes` child) are genuinely alive, gated by
+        // backpressure, not dead or silently discarding bytes past the cap.
+        let drained =
+            caps.read_stdout(handle, MAX_PIPE_BUFFER_BYTES as u32).expect("read_stdout drains");
+        assert!(!drained.is_empty(), "the buffered bytes were real, not silently dropped");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            buffered_len(&caps) > 0,
+            "the pump did not resume reading after space freed — it looks dead, not parked"
+        );
+
+        caps.kill(handle).await.expect("kill terminates the real yes");
     }
 
     /// `capture_stderr: false` routes stderr to the null device: `read_stderr` legitimately stays
