@@ -279,9 +279,10 @@ impl ProcCaps {
     /// itself sync; only `tokio::spawn`, which needs a runtime context, not an async fn, to start
     /// the pump/waiter tasks).
     pub fn spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
-        // Reject BEFORE spending a real process spawn if already at the cap (see
-        // [`MAX_SPAWNED_PROCESSES`]'s doc for why this bounds the registry's TOTAL size, not merely
-        // concurrently-live entries).
+        // Reject BEFORE spending a real process spawn if already at the cap (checked again,
+        // atomically with the insert, below — this is a fast up-front rejection, not the only
+        // gate: two concurrent `spawn` calls can both pass this check before either inserts,
+        // mirrors `HttpCaps::request_stream`'s identical two-step check, `caps/http.rs`).
         if self.registry().len() >= MAX_SPAWNED_PROCESSES {
             return Err(format!(
                 "too many processes spawned via this capability ({MAX_SPAWNED_PROCESSES} already \
@@ -343,7 +344,27 @@ impl ProcCaps {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let entry =
             Arc::new(ProcEntry { pid, stdin: AsyncMutex::new(stdin), stdout_buf, stderr_buf, exit_code: exit_rx });
-        self.registry().insert(handle, entry);
+        {
+            let mut reg = self.registry();
+            // Re-checked atomically with the insert (the up-front check above is a fast-path
+            // only — a concurrent `spawn` could have raced past it in between, see the doc on
+            // that check): a real process was already spawned above, so reject-after-the-fact
+            // means killing it directly (`kill_pid`, not the graceful `Self::kill` escalation —
+            // this entry was never accepted into the registry, so the guest has no handle to
+            // negotiate a graceful shutdown with) rather than leaking it. The pump/waiter tasks
+            // spawned above still end cleanly on their own once the process dies (`spawn_pump`
+            // reads EOF, the waiter reaps and publishes to an `exit_tx` nobody reads) — nothing
+            // here needs to cancel them explicitly.
+            if reg.len() >= MAX_SPAWNED_PROCESSES {
+                drop(reg);
+                let _ = cyrup_tools::kill_pid(pid);
+                return Err(format!(
+                    "too many processes spawned via this capability ({MAX_SPAWNED_PROCESSES} \
+                     already in the registry, killed or not) — this grant does not evict entries"
+                ));
+            }
+            reg.insert(handle, entry);
+        }
         Ok(handle)
     }
 
@@ -953,6 +974,48 @@ mod tests {
         }
         let err = caps.spawn(&spec("true", &[])).expect_err("one more spawn must be rejected at the cap");
         assert!(err.contains("too many processes spawned"), "got: {err}");
+    }
+
+    /// THE regression this fix closes: the cap check must be atomic WITH the registry insert, not
+    /// a separate lock acquisition with real spawn work in between (a TOCTOU race) — otherwise many
+    /// concurrent `spawn` calls that all observe "not yet at the cap" on the fast up-front check can
+    /// ALL proceed to spawn a real process and insert, overshooting [`MAX_SPAWNED_PROCESSES`].
+    ///
+    /// Deterministic trigger: fill the registry to exactly ONE BELOW the cap sequentially, then fire
+    /// many concurrent `spawn` calls at once — every single one is guaranteed to observe
+    /// `len() == cap - 1` on the fast-path check (nothing has raced ahead of any of them yet), so
+    /// without the atomic re-check at insert time, several would win the race to insert. With the
+    /// fix, EXACTLY one succeeds and the registry never exceeds the cap.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn spawn_cap_check_is_atomic_with_the_insert_under_concurrent_spawns() {
+        let caps = Arc::new(ProcCaps::new());
+        for _ in 0..MAX_SPAWNED_PROCESSES - 1 {
+            caps.spawn(&spec("true", &[])).expect("spawn succeeds under the cap");
+        }
+        assert_eq!(caps.registry().len(), MAX_SPAWNED_PROCESSES - 1, "primed one below the cap");
+
+        let mut tasks = Vec::new();
+        for _ in 0..50 {
+            let caps = Arc::clone(&caps);
+            tasks.push(tokio::spawn(async move { caps.spawn(&spec("true", &[])).is_ok() }));
+        }
+        let mut ok_count = 0usize;
+        for t in tasks {
+            if t.await.expect("task joins") {
+                ok_count += 1;
+            }
+        }
+
+        assert_eq!(
+            ok_count, 1,
+            "EXACTLY one of the 50 concurrent spawns racing the last cap slot must succeed"
+        );
+        assert_eq!(
+            caps.registry().len(),
+            MAX_SPAWNED_PROCESSES,
+            "the registry must never overshoot the cap even under a concurrent race"
+        );
     }
 
     /// Closes the confirmed audit finding: a still-running child that the guest never explicitly
