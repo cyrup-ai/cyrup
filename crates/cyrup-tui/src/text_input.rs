@@ -17,7 +17,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::SelectKeymap;
-use crate::selector::{search_input_spans, Selector, SelectorOutcome};
+use crate::selector::{search_input_spans, title_lines, title_wrapped_height, Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
 /// A single-line text-input selector: `title` is the dialog prompt shown above the field; `placeholder`
@@ -74,15 +74,16 @@ impl TextInputSelector {
 }
 
 impl Selector for TextInputSelector {
-    fn desired_height(&self, _width: u16) -> u16 {
-        // Top rule + title + input line + bottom rule.
-        4
+    fn desired_height(&self, width: u16) -> u16 {
+        // Top rule + (now auto-sizing, wrapped) title + input line + bottom rule.
+        title_wrapped_height(&self.title, width).saturating_add(3)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        let title_h = title_wrapped_height(&self.title, area.width);
         let [top, title_area, body, bottom] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(title_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -93,10 +94,9 @@ impl Selector for TextInputSelector {
             top,
         );
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {}", self.title),
-                theme.accent_style().add_modifier(Modifier::BOLD),
-            ))),
+            Paragraph::new(title_lines(&self.title))
+                .style(theme.accent_style().add_modifier(Modifier::BOLD))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
             title_area,
         );
         let mut spans = vec![Span::styled(" > ", theme.accent_style())];

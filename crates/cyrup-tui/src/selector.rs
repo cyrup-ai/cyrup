@@ -54,6 +54,27 @@ pub fn search_input_spans(query: &str, cursor: usize, theme: &UiTheme) -> Vec<Sp
     spans
 }
 
+/// Split a dialog title/message string on literal `\n` (Pi's `${title}\n${message}` confirm join,
+/// `interactive-mode.ts:2177`) into per-paragraph [`Line`]s, each carrying the same one-space left
+/// pad the single-line title used to (`" {title}"`). Word-wrap of any resulting long paragraph is
+/// applied separately, at render/measurement time, via ratatui's `Wrap`/`Paragraph::line_count`
+/// (see [`title_wrapped_height`]) — this function only splits on EXPLICIT newlines.
+pub(crate) fn title_lines(title: &str) -> Vec<Line<'static>> {
+    title.split('\n').map(|l| Line::from(format!(" {l}"))).collect()
+}
+
+/// The WRAPPED row count `title` occupies at `width` columns — closes the fixed-0-or-1-row dialog
+/// title/message truncation bug (L4 review §2.6): Pi's real `Text` component auto-sizes to its
+/// wrapped content (`pi-tui/src/components/text.ts`), while cyrup's title area used to be hardcoded
+/// to exactly one line (`u16::from(self.title.is_some())`) no matter how long the title/message
+/// was, silently clipping anything past the first terminal row. Uses the SAME `wrapped_height`
+/// (ratatui's own `Paragraph::line_count`, `transcript.rs`) the render call below applies via
+/// `Wrap { trim: false }`, so the measured height can never disagree with what actually renders.
+pub(crate) fn title_wrapped_height(title: &str, width: u16) -> u16 {
+    let lines = title_lines(title);
+    crate::transcript::wrapped_height(&lines, usize::from(width)).min(usize::from(u16::MAX)) as u16
+}
+
 /// Which first-party selector occupies the input slot (spec/tui/05 §7 `SelectorKind`). The chrome
 /// interprets a [`SelectorOutcome::Confirm`] / [`SelectorOutcome::Preview`] against this kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,14 +330,15 @@ impl ListSelector {
 }
 
 impl Selector for ListSelector {
-    fn desired_height(&self, _width: u16) -> u16 {
-        // Top `DynamicBorder` + optional title + list body + bottom `DynamicBorder` (spec/tui/05 §3).
-        let title_h = u16::from(self.title.is_some());
+    fn desired_height(&self, width: u16) -> u16 {
+        // Top `DynamicBorder` + optional (now auto-sizing, wrapped) title + list body + bottom
+        // `DynamicBorder` (spec/tui/05 §3).
+        let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, width));
         self.list.rendered_height().saturating_add(2).saturating_add(title_h)
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let title_h = u16::from(self.title.is_some());
+        let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
         let [top, title_area, body, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(title_h),
@@ -326,11 +348,13 @@ impl Selector for ListSelector {
         .areas(area);
         frame.render_widget(border_rule(top.width, theme), top);
         if let Some(title) = &self.title {
-            let styled = Span::styled(
-                format!(" {title}"),
-                theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD),
+            let style = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
+            frame.render_widget(
+                Paragraph::new(title_lines(title))
+                    .style(style)
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                title_area,
             );
-            frame.render_widget(Paragraph::new(Line::from(styled)), title_area);
         }
         let lines = self.list.lines(body.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);

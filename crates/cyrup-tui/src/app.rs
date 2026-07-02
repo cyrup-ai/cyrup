@@ -1159,7 +1159,12 @@ impl<B: Backend> App<B> {
         let (selector_kind, base_title, mut inner): (SelectorKind, String, Box<dyn Selector>) = match kind
         {
             UiKind::Confirm => {
-                let title = if message.is_empty() { prompt } else { format!("{prompt} — {message}") };
+                // Pi's EXACT join (`showExtensionConfirm`, `interactive-mode.ts:2177`):
+                // `` `${title}\n${message}` `` — a real newline, not an em-dash. The title area
+                // now auto-sizes + word-wraps (`ListSelector::desired_height`/`render`,
+                // `title_wrapped_height`) so a long title and/or multi-line message both render in
+                // full instead of being clipped to one row (L4 review §2.6).
+                let title = if message.is_empty() { prompt } else { format!("{prompt}\n{message}") };
                 let rows = vec![
                     ("yes".to_string(), "Yes".to_string(), None),
                     ("no".to_string(), "No".to_string(), None),
