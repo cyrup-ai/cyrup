@@ -613,12 +613,20 @@ async fn rpc_extension_ui_request_response_round_trips() {
         "select's wire {{value}} string passes straight through, with no index math"
     );
 
-    // (2) confirm → `{confirmed:true}` resumes the guest with true.
+    // (2) confirm → `{confirmed:true}` resumes the guest with true. L4 review §2.6: the guest's
+    //     `message` (a large formatted body, distinct from the `title`) reaches the wire verbatim,
+    //     not hard-coded to `""`.
     let hs = host_services.clone();
-    let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", &DialogOptions::default()) });
+    let guest_confirm = tokio::spawn(async move {
+        hs.confirm("Proceed?", "a large formatted body, distinct from the title", &DialogOptions::default())
+    });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "confirm");
     assert_eq!(req["title"], "Proceed?");
+    assert_eq!(
+        req["message"], "a large formatted body, distinct from the title",
+        "confirm's message body reaches the wire distinct from title, not hard-coded empty"
+    );
     let id = req["id"].as_str().unwrap().to_string();
     client_tx
         .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"confirmed\":true}}\n").as_bytes())
@@ -626,11 +634,18 @@ async fn rpc_extension_ui_request_response_round_trips() {
         .unwrap();
     assert!(guest_confirm.await.unwrap(), "confirm round-trips true");
 
-    // (3) input cancelled → `{cancelled:true}` yields None (Pi `parseResponse` default).
+    // (3) input cancelled → `{cancelled:true}` yields None (Pi `parseResponse` default). L4 review
+    //     §2.7: the guest's `placeholder` reaches the wire (present, not dropped).
     let hs = host_services.clone();
-    let guest_input = tokio::spawn(async move { hs.input("Name?", &DialogOptions::default()) });
+    let guest_input = tokio::spawn(async move {
+        hs.input("Name?", Some("e.g. Ada Lovelace"), &DialogOptions::default())
+    });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "input");
+    assert_eq!(
+        req["placeholder"], "e.g. Ada Lovelace",
+        "input's placeholder reaches the wire instead of being dropped"
+    );
     let id = req["id"].as_str().unwrap().to_string();
     client_tx
         .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"cancelled\":true}}\n").as_bytes())
@@ -680,7 +695,7 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
     let hs = host_services.clone();
     let opts = DialogOptions { timeout_ms: Some(80), signal_id: None };
     let started = tokio::time::Instant::now();
-    let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", &opts) });
+    let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", "body", &opts) });
 
     // The client sees the request, including Pi's `timeout` field — and simply never answers it.
     let req = read_json_line(&mut client_reader).await;

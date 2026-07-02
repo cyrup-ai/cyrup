@@ -68,10 +68,13 @@ pub enum ControlOp {
 /// guest is suspended across the call by Wasmtime's async support).
 pub trait HostServices: Send + Sync {
     // --- ui (R-08-022) ---
-    fn confirm(&self, _prompt: &str, _opts: &DialogOptions) -> bool {
+    /// `message` is Pi's `confirm(title, message, opts)` body (rpc-types.ts:232) — distinct from
+    /// `prompt` (the title); denied by default (empty confirm surfaces as `false`, same as before).
+    fn confirm(&self, _prompt: &str, _message: &str, _opts: &DialogOptions) -> bool {
         false
     }
-    fn input(&self, _prompt: &str, _opts: &DialogOptions) -> Option<String> {
+    /// `placeholder` is Pi's `input(title, placeholder, opts)` optional field (rpc-types.ts:233-240).
+    fn input(&self, _prompt: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
         None
     }
     fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {
@@ -346,6 +349,10 @@ pub struct RecordingServices {
 struct RecordingState {
     control_ops: Vec<ControlOp>,
     exec_calls: Vec<(String, Vec<String>)>,
+    /// The `message` body of each `confirm` call (L4 review §2.6), in call order.
+    confirm_messages: Vec<String>,
+    /// The `placeholder` of each `input` call (L4 review §2.7), in call order.
+    input_placeholders: Vec<Option<String>>,
     /// Requests recorded via `http_request`/`http_request_stream`.
     http_requests: Vec<HttpRequest>,
     /// Open streaming grants: handle -> cursor into `responses.http_stream_chunks`.
@@ -413,13 +420,31 @@ impl RecordingServices {
     pub fn labels_set(&self) -> Vec<(String, String)> {
         self.state.lock().map(|g| g.labels.clone()).unwrap_or_default()
     }
+
+    /// The `message` body of each `confirm` call, in call order (L4 review §2.6 live proof: a guest
+    /// `confirm_with(title, message, ..)` call's `message` reaches the host distinct from `title`).
+    pub fn confirm_messages(&self) -> Vec<String> {
+        self.state.lock().map(|g| g.confirm_messages.clone()).unwrap_or_default()
+    }
+
+    /// The `placeholder` of each `input` call, in call order (L4 review §2.7 live proof: a guest
+    /// `input_with(title, placeholder, ..)` call's `placeholder` reaches the host).
+    pub fn input_placeholders(&self) -> Vec<Option<String>> {
+        self.state.lock().map(|g| g.input_placeholders.clone()).unwrap_or_default()
+    }
 }
 
 impl HostServices for RecordingServices {
-    fn confirm(&self, _prompt: &str, _opts: &DialogOptions) -> bool {
+    fn confirm(&self, _prompt: &str, message: &str, _opts: &DialogOptions) -> bool {
+        if let Ok(mut g) = self.state.lock() {
+            g.confirm_messages.push(message.to_string());
+        }
         self.responses.confirm
     }
-    fn input(&self, _prompt: &str, _opts: &DialogOptions) -> Option<String> {
+    fn input(&self, _prompt: &str, placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+        if let Ok(mut g) = self.state.lock() {
+            g.input_placeholders.push(placeholder.map(str::to_string));
+        }
         self.responses.input.clone()
     }
     fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {

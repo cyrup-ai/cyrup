@@ -254,8 +254,13 @@ interface ui {
   abort-signal: func(signal-id: string);
   // `opts-json` is the Pi `ExtensionUIDialogOptions` bag (types.ts:89): `{timeoutMs, signal}` —
   // a live-countdown timeout and/or a programmatic-dismiss signal id (none = `{}`).
-  confirm:    func(prompt: string, opts-json: string) -> bool;
-  input:      func(prompt: string, opts-json: string) -> option<string>;
+  // Pi `confirm(title, message, opts)` (rpc-types.ts:232): `prompt` is the short `title`, `message`
+  // is the (often large, formatted) body — both genuinely used, e.g. pi-mcp-adapter's sampling
+  // handler passes a label as `title` and the full prompt/conversation text as `message`.
+  confirm:    func(prompt: string, message: string, opts-json: string) -> bool;
+  // Pi `input(title, placeholder, opts)` (rpc-types.ts:233-240): `placeholder` is optional
+  // (`none` = Pi omits the wire field entirely) and forwarded live to the renderer.
+  input:      func(prompt: string, placeholder: option<string>, opts-json: string) -> option<string>;
   // single-choice select over a json array of options; returns the chosen string (none = cancel).
   select:     func(prompt: string, options-json: string, opts-json: string) -> option<string>;
   // multiline editor seeded with `initial`; returns the edited text (none = cancelled).

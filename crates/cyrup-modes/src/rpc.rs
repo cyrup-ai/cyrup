@@ -298,23 +298,31 @@ fn extension_ui_request_json(id: &str, req: &UiRequest) -> Value {
             "title": req.prompt,
             "options": req.options,
         })),
-        // Pi `confirm(title, message, opts)` → `{method:"confirm", title, message, timeout?}`. The
-        // cyrup guest `confirm(prompt)` carries a single string → `title`; `message` is empty.
+        // Pi `confirm(title, message, opts)` → `{method:"confirm", title, message, timeout?}` (L4
+        // review §2.6): the cyrup WIT `confirm(prompt, message, opts-json)` now carries both strings
+        // — `req.message` is the guest's actual message body, not a hard-coded empty string.
         UiKind::Confirm => with_timeout(json!({
             "type": "extension_ui_request",
             "id": id,
             "method": "confirm",
             "title": req.prompt,
-            "message": "",
+            "message": req.message,
         })),
-        // Pi `input(title, placeholder, opts)` → `{method:"input", title, timeout?}` (the cyrup WIT
-        // `input(prompt)` has no placeholder).
-        UiKind::Input => with_timeout(json!({
-            "type": "extension_ui_request",
-            "id": id,
-            "method": "input",
-            "title": req.prompt,
-        })),
+        // Pi `input(title, placeholder, opts)` → `{method:"input", title, placeholder?, timeout?}`
+        // (rpc-types.ts:233-240; L4 review §2.7): `placeholder` is emitted only when the guest supplied
+        // one, matching Pi omitting the wire field for `undefined`.
+        UiKind::Input => with_timeout({
+            let mut v = json!({
+                "type": "extension_ui_request",
+                "id": id,
+                "method": "input",
+                "title": req.prompt,
+            });
+            if let (Some(placeholder), Some(obj)) = (&req.placeholder, v.as_object_mut()) {
+                obj.insert("placeholder".to_string(), json!(placeholder));
+            }
+            v
+        }),
         // Pi `editor(title, prefill)` → `{method:"editor", prefill}`. The cyrup WIT `editor(initial)`
         // carries only the seed text → `prefill`.
         UiKind::Editor => json!({

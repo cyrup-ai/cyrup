@@ -165,22 +165,22 @@ impl bindings::cyrup::ext::ui::Host for HostState {
             guest.abort_signal(signal_id);
         }
     }
-    async fn confirm(&mut self, prompt: String, opts_json: String) -> bool {
+    async fn confirm(&mut self, prompt: String, message: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
         let Ok(guest) = guest_of(self) else { return false };
         // Programmatic dismiss (Pi `signal`): a dialog bound to an aborted signal returns cancelled.
         if guest.dialog_dismissed(&opts) {
             return false;
         }
-        guest.services.confirm(&prompt, &opts)
+        guest.services.confirm(&prompt, &message, &opts)
     }
-    async fn input(&mut self, prompt: String, opts_json: String) -> Option<String> {
+    async fn input(&mut self, prompt: String, placeholder: Option<String>, opts_json: String) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
         let guest = guest_of(self).ok()?;
         if guest.dialog_dismissed(&opts) {
             return None;
         }
-        guest.services.input(&prompt, &opts)
+        guest.services.input(&prompt, placeholder.as_deref(), &opts)
     }
     async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
         let guest = guest_of(self).ok()?;

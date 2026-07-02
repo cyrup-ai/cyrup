@@ -170,6 +170,27 @@ async fn live_guest_provider_oauth_stream_autocomplete_activetools() {
         "guest aborted the named dialog signal: {:?}",
         ext.guest().aborted_signals()
     );
+    // 9b) L4 review §2.6 LIVE proof: the `confirmdemo` command's `confirm_with(title, message, opts)`
+    //     `message` body crosses the real wasm32-wasip2 component boundary distinct from `title` (the
+    //     backend's canned `confirm = true` proves the WIT call itself round-tripped, not just that the
+    //     export ran).
+    let out = host.run_command("confirmdemo", "", &cancel).await.expect("confirmdemo runs");
+    assert_eq!(out.as_deref(), Some("confirmed: true"), "confirmdemo's dialog is not dismissed");
+    assert!(
+        rec.confirm_messages().iter().any(|m| m == "this is the message body, distinct from the title"),
+        "the guest's confirm message reached the host across the wasm boundary: {:?}",
+        rec.confirm_messages()
+    );
+
+    // 9c) L4 review §2.7 LIVE proof: the `inputdemo` command's `input_with(title, placeholder, opts)`
+    //     placeholder crosses the real wasm32-wasip2 component boundary instead of being dropped.
+    let out = host.run_command("inputdemo", "", &cancel).await.expect("inputdemo runs");
+    assert!(out.as_deref().unwrap_or("").starts_with("input:"), "inputdemo ran: {out:?}");
+    assert!(
+        rec.input_placeholders().iter().any(|p| p.as_deref() == Some("e.g. Ada Lovelace")),
+        "the guest's input placeholder reached the host across the wasm boundary: {:?}",
+        rec.input_placeholders()
+    );
 
     // 10) withSession re-binding callback (Pi `ReplacedSessionContext`, sdk gap #3): the
     //     `withsessiondemo` command starts a new session; the host re-binds and then invokes the guest

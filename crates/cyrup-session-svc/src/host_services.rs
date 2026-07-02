@@ -66,6 +66,12 @@ pub struct UiRequest {
     pub prompt: String,
     /// For `select`, the JSON array of option strings (Pi `options`); `Null` for the other kinds.
     pub options: Value,
+    /// `confirm`'s message body (Pi `confirm(title, message, opts)`, rpc-types.ts:232); empty string
+    /// for the other kinds (L4 review §2.6).
+    pub message: String,
+    /// `input`'s placeholder (Pi `input(title, placeholder, opts)`, rpc-types.ts:233-240); `None` for
+    /// the other kinds, or when the guest omitted it (L4 review §2.7).
+    pub placeholder: Option<String>,
     /// The Pi `ExtensionUIDialogOptions` bag (`{timeoutMs, signalId}`, types.ts:89).
     pub opts: DialogOptions,
     /// The one-shot the renderer fulfils to resume the suspended guest.
@@ -201,11 +207,21 @@ impl LiveHostServices {
         kind: UiKind,
         prompt: &str,
         options: Value,
+        message: String,
+        placeholder: Option<String>,
         opts: &DialogOptions,
     ) -> Option<UiReply> {
         let sink = Self::lock(&self.ui_sink).clone()?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let request = UiRequest { kind, prompt: prompt.to_string(), options, opts: opts.clone(), reply: reply_tx };
+        let request = UiRequest {
+            kind,
+            prompt: prompt.to_string(),
+            options,
+            message,
+            placeholder,
+            opts: opts.clone(),
+            reply: reply_tx,
+        };
         if sink.send(request).is_err() {
             // The renderer (TUI loop / RPC loop) is gone — degrade to the deny default, never a panic.
             return None;
@@ -291,22 +307,23 @@ impl HostServices for LiveHostServices {
     // a mode installed a `ui_sink`. With NO sink (headless print/json) every method falls through to
     // the deny default WITHOUT blocking — byte-for-byte Pi `noOpUIContext` (runner.ts:230-261).
 
-    fn confirm(&self, prompt: &str, opts: &DialogOptions) -> bool {
-        match self.ui_roundtrip(UiKind::Confirm, prompt, Value::Null, opts) {
+    fn confirm(&self, prompt: &str, message: &str, opts: &DialogOptions) -> bool {
+        match self.ui_roundtrip(UiKind::Confirm, prompt, Value::Null, message.to_string(), None, opts) {
             Some(UiReply::Confirm(b)) => b,
             _ => false,
         }
     }
 
-    fn input(&self, prompt: &str, opts: &DialogOptions) -> Option<String> {
-        match self.ui_roundtrip(UiKind::Input, prompt, Value::Null, opts) {
+    fn input(&self, prompt: &str, placeholder: Option<&str>, opts: &DialogOptions) -> Option<String> {
+        let placeholder = placeholder.map(str::to_string);
+        match self.ui_roundtrip(UiKind::Input, prompt, Value::Null, String::new(), placeholder, opts) {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
     }
 
     fn select(&self, prompt: &str, options: &Value, opts: &DialogOptions) -> Option<String> {
-        match self.ui_roundtrip(UiKind::Select, prompt, options.clone(), opts) {
+        match self.ui_roundtrip(UiKind::Select, prompt, options.clone(), String::new(), None, opts) {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
@@ -315,7 +332,14 @@ impl HostServices for LiveHostServices {
     fn editor(&self, initial: &str) -> Option<String> {
         // The WIT `editor(initial) -> option<string>` carries no options bag (world.wit:261); use the
         // empty default so the roundtrip signature stays uniform.
-        match self.ui_roundtrip(UiKind::Editor, initial, Value::Null, &DialogOptions::default()) {
+        match self.ui_roundtrip(
+            UiKind::Editor,
+            initial,
+            Value::Null,
+            String::new(),
+            None,
+            &DialogOptions::default(),
+        ) {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
@@ -649,8 +673,8 @@ mod tests {
     fn headless_ui_returns_deny_defaults_without_a_sink() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let svc = svc_with(provider);
-        assert!(!svc.confirm("ok?", &DialogOptions::default()));
-        assert_eq!(svc.input("name?", &DialogOptions::default()), None);
+        assert!(!svc.confirm("ok?", "body", &DialogOptions::default()));
+        assert_eq!(svc.input("name?", Some("placeholder"), &DialogOptions::default()), None);
         assert_eq!(svc.select("pick", &json!(["a", "b"]), &DialogOptions::default()), None);
         assert_eq!(svc.editor("seed"), None);
     }
@@ -667,9 +691,26 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
         svc.set_ui_sink(tx);
 
+        // L4 review §2.6/§2.7 live proof: capture each request's `message`/`placeholder` as the
+        // scripted renderer sees them, so the test can assert they arrived distinct from `prompt`.
+        #[derive(Clone, Debug)]
+        struct Seen {
+            kind: UiKind,
+            prompt: String,
+            message: String,
+            placeholder: Option<String>,
+        }
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
         // The scripted renderer: reply to each request by kind (like a user picking in the selector).
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
+                seen2.lock().unwrap_or_else(|e| e.into_inner()).push(Seen {
+                    kind: req.kind,
+                    prompt: req.prompt.clone(),
+                    message: req.message.clone(),
+                    placeholder: req.placeholder.clone(),
+                });
                 let reply = match req.kind {
                     UiKind::Confirm => UiReply::Confirm(true),
                     UiKind::Input => UiReply::Text(Some(format!("answer:{}", req.prompt))),
@@ -691,16 +732,36 @@ mod tests {
 
         // Each guest-facing call blocks until the responder answers (run on a blocking-capable worker).
         let s1 = svc.clone();
-        let confirm = tokio::task::spawn_blocking(move || s1.confirm("proceed?", &DialogOptions::default()))
-            .await
-            .expect("confirm task");
+        let confirm = tokio::task::spawn_blocking(move || {
+            s1.confirm("proceed?", "a large formatted body, distinct from the title", &DialogOptions::default())
+        })
+        .await
+        .expect("confirm task");
         assert!(confirm, "confirm round-trips the scripted `true`");
 
         let s2 = svc.clone();
-        let input = tokio::task::spawn_blocking(move || s2.input("name?", &DialogOptions::default()))
-            .await
-            .expect("input task");
+        let input = tokio::task::spawn_blocking(move || {
+            s2.input("name?", Some("e.g. Ada Lovelace"), &DialogOptions::default())
+        })
+        .await
+        .expect("input task");
         assert_eq!(input.as_deref(), Some("answer:name?"));
+
+        // §2.6: the confirm `message` reached the renderer verbatim, distinct from `prompt` (title).
+        // §2.7: the input `placeholder` reached the renderer verbatim (`Some`, not dropped).
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen.iter()
+                .find(|s| s.kind == UiKind::Confirm)
+                .map(|s| (s.prompt.as_str(), s.message.as_str())),
+            Some(("proceed?", "a large formatted body, distinct from the title")),
+            "confirm's message body round-trips separately from its title: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter().find(|s| s.kind == UiKind::Input).map(|s| s.placeholder.clone()),
+            Some(Some("e.g. Ada Lovelace".to_string())),
+            "input's placeholder round-trips instead of being dropped: {seen:?}"
+        );
 
         let s3 = svc.clone();
         let select = tokio::task::spawn_blocking(move || {
@@ -750,8 +811,9 @@ mod tests {
         let s1 = svc.clone();
         let o1 = opts.clone();
         let started = tokio::time::Instant::now();
-        let confirm =
-            tokio::task::spawn_blocking(move || s1.confirm("proceed?", &o1)).await.expect("confirm task");
+        let confirm = tokio::task::spawn_blocking(move || s1.confirm("proceed?", "body", &o1))
+            .await
+            .expect("confirm task");
         let elapsed = started.elapsed();
         assert!(!confirm, "an unanswered confirm resolves to Pi's `false` default, not a hang");
         assert!(
@@ -761,7 +823,9 @@ mod tests {
 
         let s2 = svc.clone();
         let o2 = opts.clone();
-        let input = tokio::task::spawn_blocking(move || s2.input("name?", &o2)).await.expect("input task");
+        let input = tokio::task::spawn_blocking(move || s2.input("name?", Some("placeholder"), &o2))
+            .await
+            .expect("input task");
         assert_eq!(input, None, "an unanswered input resolves to Pi's `undefined` default");
 
         let s3 = svc.clone();
@@ -796,8 +860,9 @@ mod tests {
         // A 10-second timeout that must NOT be what unblocks this call.
         let opts = DialogOptions { timeout_ms: Some(10_000), signal_id: None };
         let started = tokio::time::Instant::now();
-        let confirm =
-            tokio::task::spawn_blocking(move || svc.confirm("proceed?", &opts)).await.expect("confirm task");
+        let confirm = tokio::task::spawn_blocking(move || svc.confirm("proceed?", "body", &opts))
+            .await
+            .expect("confirm task");
         let elapsed = started.elapsed();
         assert!(!confirm);
         assert!(

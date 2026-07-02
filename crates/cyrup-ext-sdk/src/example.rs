@@ -539,8 +539,37 @@ pub fn build() -> ExtensionApi {
         CommandDescriptor::new("Dismiss a dialog via a named signal, then confirm (demo)."),
         |_args: &str, ctx: &crate::CommandCtx| {
             ctx.ui().abort_signal("demo-dialog");
-            let ok = ctx.ui().confirm_with("proceed?", &DialogOptions::signal("demo-dialog"));
+            let ok = ctx.ui().confirm_with("proceed?", "unreachable body", &DialogOptions::signal("demo-dialog"));
             Ok(Some(format!("confirmed: {ok}")))
+        },
+    );
+
+    // A command exercising `confirm`'s `message` body (Pi `confirm(title, message, opts)`,
+    // rpc-types.ts:232; L4 review §2.6): threads live through `ctx.rs` -> WIT `confirm` -> the host
+    // backend, distinct from the prompt/title (not dismissed, so the backend actually sees it).
+    api.register_command(
+        "confirmdemo",
+        CommandDescriptor::new("Open a confirm dialog with a message body (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let ok = ctx.ui().confirm_with(
+                "proceed?",
+                "this is the message body, distinct from the title",
+                &DialogOptions::default(),
+            );
+            Ok(Some(format!("confirmed: {ok}")))
+        },
+    );
+
+    // A command exercising `input`'s `placeholder` (Pi `input(title, placeholder, opts)`,
+    // rpc-types.ts:233-240; L4 review §2.7): threads live through `ctx.rs` -> WIT `input` -> the host
+    // backend, distinct from the prompt/title.
+    api.register_command(
+        "inputdemo",
+        CommandDescriptor::new("Open an input dialog with a placeholder (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let answer =
+                ctx.ui().input_with("name?", Some("e.g. Ada Lovelace"), &DialogOptions::default());
+            Ok(Some(format!("input: {answer:?}")))
         },
     );
 

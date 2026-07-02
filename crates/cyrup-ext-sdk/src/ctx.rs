@@ -500,37 +500,43 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = signal_id;
     }
-    /// Confirmation dialog (Pi `confirm`). Indefinite; use [`Self::confirm_with`] for a timeout/signal.
+    /// Confirmation dialog (Pi `confirm`). Indefinite, no message body; use [`Self::confirm_with`]
+    /// for a message/timeout/signal.
     pub fn confirm(&self, prompt: &str) -> bool {
-        self.confirm_with(prompt, &DialogOptions::default())
+        self.confirm_with(prompt, "", &DialogOptions::default())
     }
-    /// Confirmation dialog with a [`DialogOptions`] bag (Pi `confirm(title, msg, {timeout, signal})`).
-    pub fn confirm_with(&self, prompt: &str, opts: &DialogOptions) -> bool {
+    /// Confirmation dialog with a message body and a [`DialogOptions`] bag (Pi
+    /// `confirm(title, message, {timeout, signal})`, rpc-types.ts:232): `prompt` is the short title,
+    /// `message` the (often large, formatted) body — e.g. pi-mcp-adapter's sampling handler passes a
+    /// label as `title` and the full prompt/conversation text as `message`.
+    pub fn confirm_with(&self, prompt: &str, message: &str, opts: &DialogOptions) -> bool {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::ui::confirm(prompt, &opts_json);
+            return crate::guest::bindings::cyrup::ext::ui::confirm(prompt, message, &opts_json);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (prompt, opts_json);
+            let _ = (prompt, message, opts_json);
             false
         }
     }
-    /// Text input dialog (Pi `input`).
+    /// Text input dialog (Pi `input`). No placeholder; use [`Self::input_with`] to set one.
     pub fn input(&self, prompt: &str) -> Option<String> {
-        self.input_with(prompt, &DialogOptions::default())
+        self.input_with(prompt, None, &DialogOptions::default())
     }
-    /// Text input dialog with a [`DialogOptions`] bag (Pi `input(title, placeholder, {timeout, signal})`).
-    pub fn input_with(&self, prompt: &str, opts: &DialogOptions) -> Option<String> {
+    /// Text input dialog with a placeholder and a [`DialogOptions`] bag (Pi
+    /// `input(title, placeholder, {timeout, signal})`, rpc-types.ts:233-240); forwarded live to the
+    /// renderer. `placeholder = None` omits the wire field entirely, matching Pi's optional field.
+    pub fn input_with(&self, prompt: &str, placeholder: Option<&str>, opts: &DialogOptions) -> Option<String> {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::ui::input(prompt, &opts_json);
+            return crate::guest::bindings::cyrup::ext::ui::input(prompt, placeholder, &opts_json);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (prompt, opts_json);
+            let _ = (prompt, placeholder, opts_json);
             None
         }
     }
