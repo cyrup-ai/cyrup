@@ -454,26 +454,42 @@ impl ProcCaps {
         // process (or the child's own stdio) themselves.
         let (exit_tx, exit_rx) = watch::channel(None);
 
+        // Built BEFORE the pump/waiter tasks spawn (rather than after, as before) so the waiter task
+        // below can hold its own `Arc` clone and close `entry.stdin` the instant it reaps a NATURAL
+        // exit — without this, a child that is never explicitly `kill`ed (the common case: most
+        // stdio-loop MCP servers just run until the guest stops talking to them, never a guest-
+        // initiated teardown) leaked its real `ChildStdin` write-end fd for the rest of the session,
+        // since neither `write_stdin`'s error path nor `kill`'s phase-1 close ever ran for it.
+        let entry = Arc::new(ProcEntry {
+            pid,
+            stdin: AsyncMutex::new(stdin),
+            stdout_buf: stdout_buf.clone(),
+            stderr_buf: stderr_buf.clone(),
+            exit_code: exit_rx.clone(),
+        });
+
         if let Some(out) = stdout {
-            spawn_pump(out, stdout_buf.clone(), exit_rx.clone());
+            spawn_pump(out, stdout_buf, exit_rx.clone());
         }
         if let Some(err) = stderr {
-            spawn_pump(err, stderr_buf.clone(), exit_rx.clone());
+            spawn_pump(err, stderr_buf, exit_rx.clone());
         }
 
         // Reap the child + publish its REAL exit code the instant it terminates (natural exit, or a
-        // signal `kill` sent).
+        // signal `kill` sent) — and close the stdin write end too (see the comment on `entry` above):
+        // this is the ONLY place a naturally-exiting child's stdin ever gets closed, since `kill`'s
+        // own phase-1 close only runs for a guest-initiated teardown.
+        let entry_for_waiter = entry.clone();
         tokio::spawn(async move {
             let code = match child.wait().await {
                 Ok(status) => status.code().unwrap_or(0),
                 Err(_) => -1,
             };
+            *entry_for_waiter.stdin.lock().await = None;
             let _ = exit_tx.send(Some(code));
         });
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let entry =
-            Arc::new(ProcEntry { pid, stdin: AsyncMutex::new(stdin), stdout_buf, stderr_buf, exit_code: exit_rx });
         {
             let mut reg = self.registry();
             // Re-checked atomically with the insert (the up-front check above is a fast-path
@@ -927,6 +943,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(code, Some(7), "the REAL natural exit code round-trips (no kill involved)");
+    }
+
+    /// THE regression this closes: a child that exits ON ITS OWN (never explicitly `kill`ed — the
+    /// common case for a well-behaved MCP stdio server the guest simply stops talking to) must still
+    /// have its stdin write-end fd closed by the background waiter, exactly like `kill`'s own phase-1
+    /// close does for a guest-initiated teardown. Pre-fix, `entry.stdin` was only ever cleared by
+    /// `write_stdin`'s failure path or `kill`'s phase-1 — neither of which a naturally-exiting,
+    /// never-`kill`ed, never-written-to child ever triggers — leaking one open `ChildStdin` fd to a
+    /// dead process for the rest of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_exit_closes_the_stdin_write_end_no_fd_leak() {
+        let caps = ProcCaps::new();
+        let handle = caps.spawn(&spec("sh", &["-c", "exit 0"])).expect("sh spawns");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && caps.poll_exit(handle).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(caps.poll_exit(handle), Some(0), "the child really did exit naturally");
+
+        // No extra wait needed: the waiter task closes `entry.stdin` BEFORE it sends on `exit_tx`
+        // (program order, same task — see `Self::spawn`'s doc), so `poll_exit` observing the exit
+        // code above already proves the stdin close happened.
+        let entry = caps.entry(handle).expect("entry still present after natural exit");
+        assert!(
+            entry.stdin.lock().await.is_none(),
+            "a naturally-exited child's stdin write-end must be closed, not left open to a dead \
+             process for the rest of the session"
+        );
     }
 
     /// `kill` on a NORMAL (SIGTERM-obeying) child terminates it well within the grace period, and
