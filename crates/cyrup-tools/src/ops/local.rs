@@ -262,7 +262,19 @@ fn build_command(spec: &ExecSpec) -> std::process::Command {
 fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     let mut std_cmd = std::process::Command::new(&spec.program);
     std_cmd.args(&spec.args);
-    std_cmd.current_dir(&spec.cwd);
+    // An empty `cwd` is skipped rather than passed to `current_dir` — matching Node's real
+    // `child_process.spawn`, which treats a falsy `cwd` as "no override" and inherits the parent's
+    // own ambient cwd (verified live: Node `spawn("pwd",[],{cwd:""})` exits 0, printing the ambient
+    // cwd), the exact real-consumer behavior `execCommand` (`exec.ts:41-45`) relies on. Unlike Node,
+    // `std::process::Command::current_dir("")` hard-fails the spawn (verified live: `Os { code: 2,
+    // kind: NotFound, .. }`) — this callers-owned defensive check (this crate has no upstream
+    // knowledge of WHY `spec.cwd` might be empty; `cyrup-session-svc::host_services::exec` already
+    // folds a guest-supplied empty `cwd` back to the session cwd before building an `ArgvSpec`, so
+    // this is defense in depth for any other/future caller of `exec_argv`) keeps that same graceful
+    // degrade rather than erroring on a `PathBuf::new()`.
+    if !spec.cwd.as_os_str().is_empty() {
+        std_cmd.current_dir(&spec.cwd);
+    }
     for (k, v) in &spec.env {
         std_cmd.env(k, v);
     }
@@ -852,6 +864,39 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "a SIGTERM-obeying child (`sleep`) must die well within the 5s grace period, got {:?}",
             started.elapsed()
+        );
+    }
+
+    /// L4 round-12 finding #3: an [`ArgvSpec`] with an EMPTY `cwd` must NOT hard-fail the spawn —
+    /// `build_argv_command` skips `current_dir` entirely for an empty path, matching Node's real
+    /// `child_process.spawn`, which treats a falsy `cwd` as "no override" and inherits the parent's
+    /// own ambient cwd (verified live: Node `spawn("pwd",[],{cwd:""})` exits 0), unlike
+    /// `std::process::Command::current_dir("")`, which hard-fails with `Os { code: 2, kind:
+    /// NotFound, .. }` (also verified live). Proven by actually running `pwd` with `cwd:
+    /// PathBuf::new()` and reading its REAL stdout: it must equal THIS TEST PROCESS's own ambient
+    /// cwd (Rust's `Command` default when `.current_dir()` is never called at all).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_with_an_empty_cwd_inherits_the_ambient_cwd_instead_of_hard_failing() {
+        let proc = LocalProc::new(ShellConfig::detect());
+        let spec = ArgvSpec {
+            program: "pwd".to_string(),
+            args: Vec::new(),
+            cwd: std::path::PathBuf::new(),
+            env: Vec::new(),
+        };
+        let out = proc
+            .exec_argv(spec, CancelToken::new(), None)
+            .await
+            .expect("exec_argv must not hard-fail on an empty cwd");
+        assert_eq!(out.status, ExitStatus::Exited(0), "pwd must run and exit cleanly");
+        let printed =
+            std::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim_end()).unwrap_or_default();
+        let ambient = std::env::current_dir().expect("this test process has a cwd");
+        assert_eq!(
+            printed,
+            std::fs::canonicalize(&ambient).unwrap_or(ambient),
+            "an empty cwd must inherit the ambient process cwd, not error or default to something else"
         );
     }
 

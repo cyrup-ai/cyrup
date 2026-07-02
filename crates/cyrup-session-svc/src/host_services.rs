@@ -449,9 +449,21 @@ impl HostServices for LiveHostServices {
         // environment. Accepting one here would be new ambient authority (arbitrary env injection
         // for a spawned process) with no Pi equivalent (`cyrup-ext-sdk::descriptor::ExecOptions` has
         // no `env` field for exactly this reason) — do not re-add without a real Pi citation.
+        // A guest-supplied `cwd: ""` must fall back to the session cwd exactly like an omitted
+        // `cwd` does (`.filter` below), not short-circuit `unwrap_or_else` with an empty override.
+        // Pi's real `ctx.exec` (`loader.ts:319`: `execCommand(command, args, options?.cwd ?? cwd,
+        // options)`) only falls back on `undefined`/`null` via `??` — a literal `""` stays `""` all
+        // the way to Node's `child_process.spawn({cwd:""})`, which treats a FALSY cwd as "no
+        // override" and inherits the parent's own ambient cwd (verified live) instead of erroring.
+        // cyrup's `self.cwd` (the session's project directory) is the analog of that ambient
+        // fallback here (same reasoning `HostServices::proc_spawn`'s omitted-cwd default already
+        // documents), so an empty guest string gets the SAME fallback an omitted one gets, rather
+        // than reaching `LocalProc::exec_argv`'s unconditional `cmd.current_dir(cwd)`
+        // (`cyrup-tools/src/ops/local.rs`) with an empty path and hard-failing the spawn.
         let cwd = opts
             .get("cwd")
             .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone());
         // L4 review: falls back to [`DEFAULT_EXEC_TIMEOUT`] (`self.exec_timeout`) when the guest gave
@@ -752,6 +764,37 @@ mod tests {
             .expect("the SIGTERM-trapping child runs then exits itself");
         assert_eq!(out.code, 7, "the child's own real exit code survives a host-initiated kill");
         assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `code`");
+    }
+
+    /// L4 round-12 finding #3: `exec`'s `cwd` option must treat a guest-supplied EMPTY string the
+    /// same as an OMITTED one — falling back to the session cwd — not short-circuit
+    /// `unwrap_or_else` with an empty override. Pi's real `ctx.exec` (`loader.ts:319`:
+    /// `options?.cwd ?? cwd`) only falls back via `??` on `undefined`/`null`; a literal `""` stays
+    /// `""` all the way to Node's `child_process.spawn({cwd:""})`, which (verified live) treats a
+    /// FALSY cwd as "no override" and inherits the parent's ambient cwd rather than erroring —
+    /// `self.cwd` (the session's project directory) is the cyrup-analog of that ambient fallback.
+    /// Verified by actually running `pwd` inside the spawned child and reading its REAL stdout +
+    /// exit code (pre-fix: `std::process::Command::current_dir("")` hard-fails the spawn, which
+    /// `exec`'s `Err(_) => Ok(ExecOutput{code:1,..})` mapping — Pi's `execCommand` never rejects,
+    /// exec.ts:99-105 — turned into a SILENT `code:1`/empty-stdout failure instead of running in the
+    /// session cwd).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_treats_an_empty_guest_cwd_the_same_as_omitted() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let session_cwd = std::env::temp_dir();
+        let svc = svc_with(provider);
+
+        let out = svc
+            .exec("pwd", &[], &json!({ "cwd": "" }), CancelToken::new())
+            .expect("pwd runs even though the guest passed an empty cwd");
+        assert_eq!(out.code, 0, "must NOT silently degrade to code:1 the way a hard current_dir(\"\") spawn failure would");
+        let printed = std::fs::canonicalize(out.stdout.trim_end()).unwrap_or_default();
+        assert_eq!(
+            printed,
+            std::fs::canonicalize(&session_cwd).unwrap_or(session_cwd),
+            "an empty guest cwd must fall back to the SESSION's cwd, exactly like an omitted one"
+        );
     }
 
     /// L4 review: `exec` must never be truly UNBOUNDED when the guest gives no `timeoutMs` (or `0`) —

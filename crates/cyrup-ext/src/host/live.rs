@@ -413,11 +413,27 @@ impl bindings::cyrup::ext::proc::Host for HostState {
         // mechanism with no Pi equivalent; resolving here, once, on the RAW guest string only, keeps
         // that trusted default from ever being re-interpolated (see `ProcSpawnSpec`'s doc,
         // `caps/proc.rs`, for the corruption this closes).
+        //
+        // A resolved value of `""` (the guest passed `cwd: ""`, or a `${VAR}`/`$env:VAR` placeholder
+        // that interpolated to empty — `pi-mcp-adapter/utils.ts:78-87`'s `resolveConfigPath("")`
+        // returns `""` verbatim) is folded to `None` here rather than threaded through as
+        // `Some("")`. Node's real `child_process.spawn` (`server-manager.ts:110` ->
+        // `StdioClientTransport` -> `client/stdio.js:72-82`'s `cross_spawn(...,{cwd:
+        // this._serverParams.cwd})`, verified live) treats a falsy `cwd` as "no override" — it
+        // inherits the parent's own ambient cwd rather than erroring, unlike
+        // `std::process::Command::current_dir("")` (verified live: `Os { code: 2, kind: NotFound,
+        // .. }`). Folding to `None` here reuses `HostServices::proc_spawn`'s EXISTING omitted-cwd
+        // fallback to the session's project cwd (`host_services.rs`) — the cyrup-analog of Node's
+        // ambient-cwd fallback, since that comment already establishes the two coincide by
+        // construction — rather than letting the empty string reach `ProcCaps::spawn`'s
+        // unconditional `cmd.current_dir(cwd)` (`caps/proc.rs`) and hard-fail the spawn.
         let spec = crate::caps::proc::ProcSpawnSpec {
             cmd,
             args,
             env,
-            cwd: cwd.map(|c| crate::caps::proc::resolve_config_path(&c)),
+            cwd: cwd
+                .map(|c| crate::caps::proc::resolve_config_path(&c))
+                .filter(|p| !p.as_os_str().is_empty()),
             capture_stderr,
         };
         guest.services.proc_spawn(&spec)
@@ -1570,6 +1586,53 @@ mod tests {
             Some(real_home.as_str()),
             "a raw guest `~` cwd must already be tilde-expanded by the time it reaches \
              HostServices::proc_spawn — NOT left for a later layer to (possibly never) resolve"
+        );
+    }
+
+    /// L4 round-12 finding #3: a guest `cwd: ""` must fold to `None` — NOT `Some(PathBuf::from(""))`
+    /// — before it reaches `HostServices::proc_spawn`, so that call's EXISTING omitted-cwd fallback
+    /// (`host_services.rs`, defaults to the session's project cwd) actually fires. This is the
+    /// cyrup-analog of Node's real `child_process.spawn` treating a falsy `cwd` as "no override"
+    /// (`pi-mcp-adapter/utils.ts:78-87`'s `resolveConfigPath("")` returns `""` verbatim, consumed at
+    /// `server-manager.ts:110` -> `client/stdio.js:72-82`'s `cross_spawn(...,{cwd:""})`, verified live
+    /// against Node: exits 0, inherits the parent's ambient cwd) — unlike
+    /// `std::process::Command::current_dir("")`, which hard-fails the spawn (verified live: `Os {
+    /// code: 2, kind: NotFound, .. }`). Also covers a `${UNDEFINED_VAR}` placeholder that
+    /// interpolates to empty, the SAME real-world case Pi's `resolveConfigPath` treats identically to
+    /// a literal `""` (both fail the `"~"` checks and return `""` verbatim).
+    #[tokio::test]
+    async fn spawn_folds_a_cwd_that_resolves_to_empty_to_none_not_some_empty_path() {
+        use bindings::cyrup::ext::proc::Host as ProcHost;
+
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec.clone());
+
+        // A literal empty string.
+        ProcHost::spawn(&mut state, "true".into(), vec![], "{}".into(), Some(String::new()), false)
+            .await
+            .expect("spawn succeeds");
+        // An undefined-var placeholder that interpolates to empty (`${DEFINITELY_NOT_SET_...}`).
+        ProcHost::spawn(
+            &mut state,
+            "true".into(),
+            vec![],
+            "{}".into(),
+            Some("${CYRUP_L4_ROUND12_FINDING3_UNDEFINED_VAR}".into()),
+            false,
+        )
+        .await
+        .expect("spawn succeeds");
+
+        let cwds = rec.proc_spawn_cwds();
+        assert_eq!(cwds.len(), 2);
+        assert_eq!(
+            cwds[0], None,
+            "a literal empty guest cwd must fold to None, letting proc_spawn's own omitted-cwd \
+             fallback fire — not reach it as Some(\"\")"
+        );
+        assert_eq!(
+            cwds[1], None,
+            "a cwd that INTERPOLATES to empty (an undefined ${{VAR}}) must fold to None the same way"
         );
     }
 }
