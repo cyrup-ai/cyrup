@@ -113,6 +113,12 @@ pub enum SelectorKind {
     /// A loaded extension's `ui.input` dialog (L4 review §2.1): a [`crate::text_input::TextInputSelector`].
     /// Resolved fully in-crate, same as [`Self::ExtensionConfirm`].
     ExtensionInput,
+    /// A loaded extension's `ui.editor` dialog rendered INLINE (Pi's DEFAULT `ExtensionEditorComponent`,
+    /// `interactive/components/extension-editor.ts`, not a teardown to `$EDITOR`): a
+    /// [`crate::extension_editor::ExtensionEditorSelector`]. Resolved fully in-crate, same as
+    /// [`Self::ExtensionConfirm`]. `$VISUAL`/`$EDITOR` is reachable only via the explicit `Ctrl+G`
+    /// (`app.editor.external`) escape hatch (`extension-editor.ts:107-111`), never the default.
+    ExtensionEditor,
 }
 
 impl SelectorKind {
@@ -129,6 +135,7 @@ impl SelectorKind {
                 | SelectorKind::ExtensionConfirm
                 | SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionInput
+                | SelectorKind::ExtensionEditor
         )
     }
 
@@ -150,6 +157,7 @@ impl SelectorKind {
             SelectorKind::ExtensionConfirm => "Confirm",
             SelectorKind::ExtensionSelect => "Select",
             SelectorKind::ExtensionInput => "Input",
+            SelectorKind::ExtensionEditor => "Editor",
         }
     }
 }
@@ -173,6 +181,13 @@ pub enum SelectorOutcome {
     Apply(String),
     /// The selector was dismissed (`tui.select.cancel` — `Esc`/`Ctrl+C`).
     Cancel,
+    /// `Ctrl+G` (`app.editor.external`) pressed inside [`crate::extension_editor::
+    /// ExtensionEditorSelector`] (Pi `ExtensionEditorComponent.openExternalEditor`,
+    /// `extension-editor.ts:119-157`): the chrome tears the terminal down for `$VISUAL`/`$EDITOR`,
+    /// seeded via [`Selector::external_edit_text`], and on success feeds the result back via
+    /// [`Selector::apply_external_edit`] WITHOUT closing the slot — only every other selector kind's
+    /// `handle` ever returns this (it is the default no-op there).
+    OpenExternalEditor,
 }
 
 /// The input-slot occupant contract (spec/tui/05 §3.1). Object-safe so the chrome can hold a
@@ -195,6 +210,18 @@ pub trait Selector: Send {
     /// `(Ns)` once per second, exactly like `ExtensionSelectorComponent`/`ExtensionInputComponent`'s
     /// `titleText.setText` — see [`App::tick_extension_dialog_countdown`](crate::app::App).
     fn set_title(&mut self, _title: String) {}
+    /// The current buffer text for a `Ctrl+G` external-editor round trip (Pi `app.editor.external`);
+    /// `None` (the default) for every selector kind except
+    /// [`crate::extension_editor::ExtensionEditorSelector`], which is the only one whose `handle` can
+    /// ever return [`SelectorOutcome::OpenExternalEditor`] in the first place.
+    fn external_edit_text(&self) -> Option<String> {
+        None
+    }
+    /// Feed the external editor's result back into the buffer (Pi `this.editor.setText(newContent)`,
+    /// `extension-editor.ts:152`) — a no-op default; only [`crate::extension_editor::
+    /// ExtensionEditorSelector`] overrides it. The chrome calls this ONLY on a clean exit (Pi's
+    /// `status === 0` gate), never on a cancelled/failed edit.
+    fn apply_external_edit(&mut self, _text: &str) {}
 }
 
 /// The shared list-selector engine (spec/tui/05 §3.2 `ListView<T>`): a [`SelectList`] body wrapped in

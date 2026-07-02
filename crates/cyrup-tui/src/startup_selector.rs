@@ -89,9 +89,12 @@ fn run_loop(
                     SelectorOutcome::Confirm(value) => return Ok(SelectorOutcome::Confirm(value)),
                     SelectorOutcome::Cancel => return Ok(SelectorOutcome::Cancel),
                     SelectorOutcome::Apply(payload) => on_apply(&payload),
+                    // Never produced by the startup selectors (only `ExtensionEditorSelector`'s
+                    // `handle` ever returns it) — treated as a no-op like `Redraw`'s siblings.
                     SelectorOutcome::Preview(_)
                     | SelectorOutcome::Redraw
-                    | SelectorOutcome::Ignored => {}
+                    | SelectorOutcome::Ignored
+                    | SelectorOutcome::OpenExternalEditor => {}
                 }
             }
             _ => {}

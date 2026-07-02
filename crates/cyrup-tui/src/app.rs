@@ -44,6 +44,7 @@ use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
+use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
 use crate::keymap::{Action, EditorAction, Key, Keymap, SelectKeymap, TreeKeymap};
 use crate::model_selector::{ModelEntry, ModelSelector};
@@ -85,6 +86,11 @@ pub enum AppAction {
     /// tears the terminal down, launches the editor on a temp file, then reloads the buffer
     /// (`openExternalEditor`, interactive-mode.ts:3611).
     OpenExternalEditor,
+    /// `Ctrl+G` pressed inside an open extension `ui.editor` dialog (L4 review §3): same teardown as
+    /// [`Self::OpenExternalEditor`], but seeded from — and written back into — the dialog's OWN
+    /// buffer rather than [`AppState::editor`] (Pi `ExtensionEditorComponent.openExternalEditor`,
+    /// `extension-editor.ts:119-157`).
+    OpenExternalEditorForSelector,
     /// A recognized slash command whose effect lives at the session/data layer (`setupEditorSubmitHandler`,
     /// interactive-mode.ts:2549-2734). The run loop executes it against the [`AgentSession`] (open a
     /// data-bound selector after sourcing its rows, drive the session lifecycle, export, copy, …).
@@ -1197,12 +1203,14 @@ impl<B: Backend> App<B> {
                 prompt.clone(),
                 Box::new(TextInputSelector::new(prompt, placeholder)),
             ),
-            UiKind::Editor => {
-                // Unreachable: `App::run`'s `ui_rx` arm intercepts `UiKind::Editor` and handles it
-                // synchronously via `edit_in_external_editor` before ever calling this method.
-                let _ = reply.send(UiReply::Text(None));
-                return;
-            }
+            // L4 review §3: the DEFAULT is an inline dialog (Pi's `ExtensionEditorComponent`,
+            // `extension-editor.ts`), not a teardown to `$EDITOR` — `title` on `prompt`, the seed
+            // text (Pi `prefill`) on `message` (L4 review §2's `editor(title, initial)` fix).
+            UiKind::Editor => (
+                SelectorKind::ExtensionEditor,
+                prompt.clone(),
+                Box::new(ExtensionEditorSelector::new(prompt, &message)),
+            ),
         };
         // Pi's `CountdownTimer` (`countdown-timer.ts:7-38`, wired by `ExtensionSelectorComponent`/
         // `ExtensionInputComponent`): a guest-set `opts.timeout_ms > 0` arms a live 1s-cadence
@@ -1316,6 +1324,12 @@ impl<B: Backend> App<B> {
                 self.close_selector(true);
                 AppAction::Redraw
             }
+            // `Ctrl+G` inside the extension `ui.editor` dialog (L4 review §3) — the actual
+            // teardown+spawn+restore needs `&mut self: &mut App` (terminal access), which
+            // `Selector::handle` doesn't have; bubble it up as an `AppAction` the run loop's
+            // fallible `match` dispatches (mirrors the plain `Ctrl+G`/`AppAction::OpenExternalEditor`
+            // arm right next to it).
+            SelectorOutcome::OpenExternalEditor => AppAction::OpenExternalEditorForSelector,
         }
     }
 
@@ -1351,7 +1365,9 @@ impl<B: Backend> App<B> {
                 }
                 None
             }
-            SelectorKind::ExtensionSelect | SelectorKind::ExtensionInput => {
+            SelectorKind::ExtensionSelect
+            | SelectorKind::ExtensionInput
+            | SelectorKind::ExtensionEditor => {
                 if let Some(pending) = self.state.pending_ui_reply.take() {
                     let _ = pending.reply.send(UiReply::Text(Some(value.to_string())));
                 }
@@ -2728,16 +2744,34 @@ impl App<CrosstermBackend<Stdout>> {
         self.draw_synchronized()
     }
 
+    /// `Ctrl+G` pressed inside the extension `ui.editor` dialog (L4 review §3;
+    /// [`AppAction::OpenExternalEditorForSelector`]): seed `$VISUAL`/`$EDITOR` with the OPEN
+    /// dialog's own buffer (never [`AppState::editor`], the live prompt draft — unrelated) and, on a
+    /// clean exit, write the result back into the SAME dialog buffer via
+    /// [`Selector::apply_external_edit`] — the dialog stays open (Pi never resolves it from this
+    /// path, `extension-editor.ts:119-157`); only `Enter`/`Esc` close it. A no-op if no selector is
+    /// open or the open one doesn't support external editing (`external_edit_text` returns `None`).
+    fn open_external_editor_for_selector(&mut self) -> Result<(), TuiError> {
+        let Some(current) = self.state.selector.as_ref().and_then(|a| a.inner.external_edit_text())
+        else {
+            return Ok(());
+        };
+        if let Some(new_text) = self.edit_in_external_editor(&current)?
+            && let Some(active) = self.state.selector.as_mut()
+        {
+            active.inner.apply_external_edit(&new_text);
+        }
+        self.draw_synchronized()
+    }
+
     /// Run `$VISUAL`/`$EDITOR` (falling back to `nano`/`notepad`) over `initial` text and return the
     /// edited result on a clean exit (`Ok(None)` on a non-zero exit / spawn failure / unwritable temp
     /// file — Pi's "no change"). Tears the TUI down for the duration and always restores it before
     /// returning, even on failure — the caller is left with a usable terminal either way.
     ///
-    /// The synchronous, TUI-suspending core [`Self::open_external_editor`] (Ctrl+G, editing the live
-    /// input buffer) shares; also drives the `ui.editor` extension dialog (L4 review §2.1): `App::run`'s
-    /// `ui_rx` arm calls this directly with the guest-seeded `prompt` text and replies with the result,
-    /// WITHOUT touching [`AppState::editor`] — unlike Ctrl+G this never reads or writes the live input
-    /// buffer, so an in-progress prompt draft is untouched by a guest's editor dialog.
+    /// The synchronous, TUI-suspending core both [`Self::open_external_editor`] (Ctrl+G on the live
+    /// input buffer) and [`Self::open_external_editor_for_selector`] (Ctrl+G inside the extension
+    /// `ui.editor` dialog, L4 review §3) share.
     ///
     /// This runs entirely synchronously on the caller's task (no `.await`) — reused directly inside
     /// `App::run`'s `select!` loop is safe (nothing here can deadlock against a concurrently-blocked
@@ -2877,6 +2911,9 @@ impl App<CrosstermBackend<Stdout>> {
                         AppAction::Quit => break,
                         AppAction::Suspend => self.suspend()?,
                         AppAction::OpenExternalEditor => self.open_external_editor()?,
+                        AppAction::OpenExternalEditorForSelector => {
+                            self.open_external_editor_for_selector()?;
+                        }
                         AppAction::Interrupt => {
                             session.abort();
                             // Also kill a running bash child (the block was already marked cancelled
@@ -2978,24 +3015,13 @@ impl App<CrosstermBackend<Stdout>> {
                     self.draw_synchronized()?;
                 }
                 Some(req) = ui_rx.recv() => {
-                    // A loaded guest opened a `ui.*` dialog (L4 review §2.1). `editor` is handled
-                    // synchronously right here — it tears the TUI down for `$VISUAL`/`$EDITOR` and
-                    // restores it before returning, exactly like the Ctrl+G path
-                    // ([`Self::open_external_editor`]) — while every other kind opens the matching
-                    // input-slot selector via `open_extension_dialog` and waits for a future key event
-                    // to confirm/cancel it (`AppState::pending_ui_reply`).
-                    if req.kind == UiKind::Editor {
-                        // `prompt` now carries the guest's real dialog `title` (Pi `editor(title,
-                        // prefill)`, types.ts:216; world.wit:267; L4 review §2) — `message` carries
-                        // the seed text (Pi `prefill`) `edit_in_external_editor` seeds the buffer
-                        // with. The TUI's teardown-to-`$EDITOR` path has no in-place heading to show
-                        // `title` in (unlike the RPC wire request, which now forwards it verbatim).
-                        let UiRequest { message, reply, .. } = req;
-                        let edited = self.edit_in_external_editor(&message)?;
-                        let _ = reply.send(UiReply::Text(edited));
-                    } else {
-                        self.open_extension_dialog(req);
-                    }
+                    // A loaded guest opened a `ui.*` dialog (L4 review §2.1). EVERY kind, including
+                    // `editor` (L4 review §3 — an INLINE dialog is now the default, matching Pi's
+                    // `ExtensionEditorComponent`; `$VISUAL`/`$EDITOR` is reachable only via the
+                    // dialog's own `Ctrl+G`, `AppAction::OpenExternalEditorForSelector`, above), opens
+                    // the matching input-slot selector via `open_extension_dialog` and waits for a
+                    // future key event to confirm/cancel it (`AppState::pending_ui_reply`).
+                    self.open_extension_dialog(req);
                     self.draw_synchronized()?;
                 }
                 Some(msg) = shortcut_status_rx.recv() => {

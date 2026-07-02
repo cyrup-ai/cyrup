@@ -45,6 +45,7 @@ mod diff;
 mod editor;
 mod error;
 mod export;
+mod extension_editor;
 mod fuzzy;
 mod image;
 mod keymap;
