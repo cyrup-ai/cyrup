@@ -406,11 +406,18 @@ impl bindings::cyrup::ext::proc::Host for HostState {
                 m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect()
             })
             .unwrap_or_default();
+        // Resolve a guest-supplied `cwd` HERE — the true guest/config-authored boundary, matching
+        // where Pi's own `resolveConfigPath(definition.cwd)` runs (`server-manager.ts:110`) — before
+        // it is ever handed to `HostServices::proc_spawn`. That call also injects ITS OWN
+        // host-computed default (the session's project cwd) when `cwd` is omitted, a cyrup-only
+        // mechanism with no Pi equivalent; resolving here, once, on the RAW guest string only, keeps
+        // that trusted default from ever being re-interpolated (see `ProcSpawnSpec`'s doc,
+        // `caps/proc.rs`, for the corruption this closes).
         let spec = crate::caps::proc::ProcSpawnSpec {
             cmd,
             args,
             env,
-            cwd: cwd.map(std::path::PathBuf::from),
+            cwd: cwd.map(|c| crate::caps::proc::resolve_config_path(&c)),
             capture_stderr,
         };
         guest.services.proc_spawn(&spec)
@@ -1536,5 +1543,33 @@ mod tests {
             .await
             .expect("exec runs");
         assert_eq!(rec.exec_call_pre_cancelled(), vec![false, false]);
+    }
+
+    /// The `proc::Host::spawn` WIT handler — the true guest/config-authored boundary — must resolve
+    /// a raw guest `cwd` string (`${VAR}`/`$env:VAR`/leading `~`) itself, matching where Pi's own
+    /// `resolveConfigPath(definition.cwd)` runs (`server-manager.ts:110`), BEFORE `HostServices::
+    /// proc_spawn` ever sees it. Proven by calling the REAL production `proc::Host::spawn`
+    /// implementation directly (no reimplementation) and inspecting the resolved `cwd`
+    /// `RecordingServices::proc_spawn` actually received.
+    #[tokio::test]
+    async fn spawn_resolves_a_raw_guest_cwd_before_it_reaches_host_services() {
+        use bindings::cyrup::ext::proc::Host as ProcHost;
+
+        let real_home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec.clone());
+
+        ProcHost::spawn(&mut state, "true".into(), vec![], "{}".into(), Some("~".into()), false)
+            .await
+            .expect("spawn succeeds");
+
+        let cwds = rec.proc_spawn_cwds();
+        assert_eq!(cwds.len(), 1);
+        assert_eq!(
+            cwds.first().and_then(|c| c.as_deref()).and_then(|p| p.to_str()),
+            Some(real_home.as_str()),
+            "a raw guest `~` cwd must already be tilde-expanded by the time it reaches \
+             HostServices::proc_spawn — NOT left for a later layer to (possibly never) resolve"
+        );
     }
 }

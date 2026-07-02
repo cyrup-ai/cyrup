@@ -400,6 +400,9 @@ struct RecordingState {
     next_http_stream_handle: u32,
     /// `(cmd, args)` of each `proc_spawn` grant.
     proc_spawns: Vec<(String, Vec<String>)>,
+    /// The `cwd` each `proc_spawn` grant actually received, in call order — used to prove the raw
+    /// guest string reaching the WIT boundary was resolved (`~`/`${VAR}` etc.) before it got here.
+    proc_spawn_cwds: Vec<Option<PathBuf>>,
     /// `(handle, data)` of each `proc_write_stdin` call.
     proc_writes: Vec<(u32, Vec<u8>)>,
     /// Handles `proc_kill` was called on.
@@ -444,6 +447,11 @@ impl RecordingServices {
     /// The `(cmd, args)` of each `proc_spawn` grant.
     pub fn proc_spawns(&self) -> Vec<(String, Vec<String>)> {
         self.state.lock().map(|g| g.proc_spawns.clone()).unwrap_or_default()
+    }
+
+    /// The `cwd` each `proc_spawn` grant actually received, in call order.
+    pub fn proc_spawn_cwds(&self) -> Vec<Option<PathBuf>> {
+        self.state.lock().map(|g| g.proc_spawn_cwds.clone()).unwrap_or_default()
     }
 
     /// The `(handle, data)` of each `proc_write_stdin` call.
@@ -584,6 +592,7 @@ impl HostServices for RecordingServices {
     fn proc_spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
         let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
         g.proc_spawns.push((spec.cmd.clone(), spec.args.clone()));
+        g.proc_spawn_cwds.push(spec.cwd.clone());
         let handle = g.next_proc_handle;
         g.next_proc_handle += 1;
         g.proc_stdout_cursors.insert(handle, 0);

@@ -840,6 +840,43 @@ mod tests {
         );
     }
 
+    /// Regression test: the session's OWN host-injected default `cwd` (the fallback `proc_spawn`
+    /// applies when a guest omits `cwd` entirely, above) must reach the real child VERBATIM, never
+    /// re-interpolated — even when that literal project-directory path happens to contain a
+    /// `${VAR}`-shaped substring. Before the fix (`caps/proc.rs`'s `ProcCaps::spawn` used to run
+    /// EVERY `Some(cwd)` — guest-supplied or host-injected — through `resolve_config_path`), this
+    /// spawn call failed outright with ENOENT: interpolating the unset `${MY_REPRO_VAR}` down to an
+    /// empty string produced a directory that doesn't exist on disk (only the literal
+    /// `${MY_REPRO_VAR}`-named one, created below, does). Verified live: actually spawns `pwd`
+    /// through the real `proc_spawn` grant and reads its real stdout.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proc_spawn_never_reinterpolates_the_host_injected_default_cwd() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let base = std::env::temp_dir();
+        let weird = base.join("cyrup-session-cwd-${MY_REPRO_VAR}-dir");
+        std::fs::create_dir_all(&weird).expect("create the literal, unusual session cwd");
+        let svc = LiveHostServices::new(provider, cyrup_tools::Backend::default().proc, weird.clone());
+
+        let spec = ProcSpawnSpec {
+            cmd: "pwd".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            capture_stderr: false,
+        };
+        let handle = svc
+            .proc_spawn(&spec)
+            .expect("pwd must spawn successfully in the session's literal cwd, not ENOENT");
+        let stdout = wait_for_exit_and_read_stdout(&svc, handle).await;
+        assert_eq!(
+            std::fs::canonicalize(stdout.trim_end()).unwrap_or_default(),
+            std::fs::canonicalize(&weird).unwrap_or(weird),
+            "the host-injected default cwd must survive byte-for-byte, not have ${{MY_REPRO_VAR}} \
+             interpolated out of it"
+        );
+    }
+
     /// Poll `proc_poll_exit` until the child reaps, then drain its real stdout — used by tests that
     /// need a spawned child's actual captured output rather than just an `Ok` handle.
     #[cfg(unix)]

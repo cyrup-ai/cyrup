@@ -91,15 +91,32 @@ const MAX_SPAWNED_PROCESSES: usize = 256;
 /// A spawn request for the `proc` capability (mirrors the WIT `proc.spawn` params 1:1). `env` is
 /// OVERLAID onto the host's own inherited environment (Pi `resolveEnv`, `server-manager.ts:422-435` —
 /// copies `process.env`, then applies each override VALUE through `interpolateEnvRecord`/
-/// `interpolateEnvVars`, `utils.ts:62-76`), never a full replacement; `cwd` is likewise resolved
-/// through Pi's `resolveConfigPath` (`server-manager.ts:110`, `utils.ts:78-87`): interpolate, then
-/// tilde-expand a leading `~`. [`ProcCaps::spawn`] applies both — see [`interpolate_env_vars`]/
-/// [`resolve_config_path`]. `capture_stderr` mirrors Pi's debug-mode "inherit" vs "ignore"
-/// (`server-manager.ts:111`): `true` pipes + buffers stderr for `read-stderr`; `false` routes it to
-/// the null device — NOT the host's own terminal (unlike Node's literal `"inherit"`, mixing an
-/// arbitrary guest-spawned child's stderr into the host process's own stdio would be an
-/// unrelated-output leak; routing to null instead achieves the same "don't surface it on the MCP
-/// protocol stream" effect while keeping host/guest output separate).
+/// `interpolateEnvVars`, `utils.ts:62-76`), never a full replacement — [`ProcCaps::spawn`] applies
+/// this itself, see [`interpolate_env_vars`].
+///
+/// `cwd`, by contrast, MUST already be fully resolved (Pi `resolveConfigPath`,
+/// `server-manager.ts:110`/`utils.ts:78-87`, already applied) by the time it reaches
+/// [`ProcCaps::spawn`] — `spawn` uses it verbatim, with NO further interpolation/tilde-expansion.
+/// This is a deliberate split from `env`: unlike Pi (where `resolveConfigPath(definition.cwd)` is
+/// the ONLY source of a `cwd`, so resolving it right where it's consumed is equivalent to resolving
+/// it right where it's guest/config-authored), cyrup's `LiveHostServices::proc_spawn`
+/// (`cyrup-session-svc/src/host_services.rs`) also injects its OWN host-computed, already-trusted
+/// default (the session's project directory) when a guest omits `cwd` entirely — a mechanism with no
+/// Pi equivalent. Resolving `cwd` here, unconditionally, would re-interpolate THAT host-injected
+/// default too, corrupting (or outright breaking spawn, if the resulting path doesn't exist) any
+/// session whose real project directory happens to literally contain a `${...}`/`$env:...`
+/// substring or start with `~`. So resolution now happens ONCE, at the true guest/config-authored
+/// boundary — `host/live.rs`'s `proc::Host::spawn` WIT handler, which calls
+/// [`resolve_config_path`] on the RAW guest-supplied string before it ever reaches
+/// `LiveHostServices::proc_spawn`'s defaulting step — exactly mirroring where Pi's own
+/// `resolveConfigPath(definition.cwd)` runs, on the config-authored value only.
+///
+/// `capture_stderr` mirrors Pi's debug-mode "inherit" vs "ignore" (`server-manager.ts:111`): `true`
+/// pipes + buffers stderr for `read-stderr`; `false` routes it to the null device — NOT the host's
+/// own terminal (unlike Node's literal `"inherit"`, mixing an arbitrary guest-spawned child's stderr
+/// into the host process's own stdio would be an unrelated-output leak; routing to null instead
+/// achieves the same "don't surface it on the MCP protocol stream" effect while keeping host/guest
+/// output separate).
 #[derive(Clone, Debug, Default)]
 pub struct ProcSpawnSpec {
     pub cmd: String,
@@ -444,9 +461,11 @@ impl ProcCaps {
         let mut cmd = tokio::process::Command::new(&spec.cmd);
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
-            // Pi `resolveConfigPath` (server-manager.ts:110, utils.ts:78-87): interpolate `${VAR}`/
-            // `$env:VAR`, then tilde-expand a leading `~`.
-            cmd.current_dir(resolve_config_path(&cwd.to_string_lossy()));
+            // `cwd` is used VERBATIM — NO interpolation/tilde-expansion here. It must already be
+            // fully resolved by the caller: see [`ProcSpawnSpec`]'s doc for why (a host-injected
+            // trusted default, with no Pi equivalent, shares this field with genuine guest/config
+            // values, and only the latter should ever be run through Pi's `resolveConfigPath`).
+            cmd.current_dir(cwd);
         }
         for (k, v) in &spec.env {
             // Pi `resolveEnv`/`interpolateEnvRecord` (server-manager.ts:422-435, utils.ts:68-76):
@@ -935,18 +954,21 @@ mod tests {
         );
     }
 
-    /// End-to-end live proof for the `cwd` half: `spawn`'s `cwd` is tilde-expanded against the REAL
-    /// host home directory before reaching the real child — a bare `~` resolves to the actual `$HOME`
-    /// a `pwd` run inside the spawned child then confirms.
+    /// End-to-end live proof for the `cwd` half of the split described on [`ProcSpawnSpec`]:
+    /// `spawn` no longer does ANY tilde-expansion itself — [`resolve_config_path`] (the same
+    /// function the real `host/live.rs` WIT boundary now calls on a raw guest string before ever
+    /// building a [`ProcSpawnSpec`]) is applied HERE, by the test, to simulate that boundary; `spawn`
+    /// is then proven to carry the ALREADY-resolved real host home directory through to a real child
+    /// verbatim, with a `pwd` run inside it confirming the real `$HOME`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_tilde_expands_cwd_against_the_real_host_home_directory() {
+    async fn spawn_honors_an_already_resolved_tilde_cwd_verbatim() {
         let real_home = std::fs::canonicalize(std::env::var("HOME").expect("HOME is set"))
             .expect("HOME resolves to a real, canonical directory");
         let caps = ProcCaps::new();
         let mut s = spec("pwd", &[]);
-        s.cwd = Some(PathBuf::from("~"));
-        let handle = caps.spawn(&s).expect("pwd spawns with a bare ~ cwd");
+        s.cwd = Some(resolve_config_path("~"));
+        let handle = caps.spawn(&s).expect("pwd spawns with an already-resolved ~ cwd");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while caps.poll_exit(handle).is_none() && tokio::time::Instant::now() < deadline {
