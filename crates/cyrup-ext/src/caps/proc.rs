@@ -43,6 +43,21 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
 /// even past SIGKILL, e.g. stuck in uninterruptible D-state I/O, is the only way this is ever hit).
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bounds how many `proc.spawn` entries a single `ProcCaps` (one per session) can ever create.
+/// Unlike [`crate::caps::http::HttpCaps`]'s `streams` registry, entries here are NEVER evicted by
+/// design (doc on [`ProcCaps`] below: "no close/dispose call... entries live for the engine's
+/// lifetime" — the guest can still drain trailing buffered output after a `kill`), so this is a cap
+/// on TOTAL processes ever spawned over the session's life, not merely concurrently-live ones — each
+/// entry holds a REAL OS process (until killed) plus two pump tasks (`spawn_pump`) and a waiter task,
+/// so an unbounded registry lets a guest that keeps spawning without ever reusing/limiting itself
+/// exhaust host process-table/task resources over time. No Pi-derived exact count to port — the real
+/// consumer, `pi-mcp-adapter/server-manager.ts:41,60-83`'s `connections` map, bounds real-world
+/// concurrent live children implicitly by the size of the user's OWN mcp server config (typically a
+/// handful) — so, like [`crate::caps::http::MAX_OPEN_STREAMS`], this is a deliberately generous cap
+/// comfortably above any realistic legitimate count, while still guaranteeing bounded worst-case
+/// growth.
+const MAX_SPAWNED_PROCESSES: usize = 256;
+
 /// A spawn request for the `proc` capability (mirrors the WIT `proc.spawn` params 1:1). `env` is
 /// OVERLAID onto the host's own inherited environment (Pi `resolveEnv`, `server-manager.ts:422` —
 /// copies `process.env` then applies overrides), never a full replacement. `capture_stderr` mirrors
@@ -225,6 +240,15 @@ impl ProcCaps {
     /// itself sync; only `tokio::spawn`, which needs a runtime context, not an async fn, to start
     /// the pump/waiter tasks).
     pub fn spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
+        // Reject BEFORE spending a real process spawn if already at the cap (see
+        // [`MAX_SPAWNED_PROCESSES`]'s doc for why this bounds the registry's TOTAL size, not merely
+        // concurrently-live entries).
+        if self.registry().len() >= MAX_SPAWNED_PROCESSES {
+            return Err(format!(
+                "too many processes spawned via this capability ({MAX_SPAWNED_PROCESSES} already \
+                 in the registry, killed or not) — this grant does not evict entries"
+            ));
+        }
         let mut cmd = tokio::process::Command::new(&spec.cmd);
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
@@ -852,6 +876,25 @@ mod tests {
         assert!(caps.read_stderr(999, 10).is_err());
         assert!(caps.kill(999).await.is_err());
         assert_eq!(caps.poll_exit(999), None);
+    }
+
+    /// Closes the shared-host-resource-exhaustion finding: `spawn` is rejected once
+    /// [`MAX_SPAWNED_PROCESSES`] entries already exist in the registry — a guest that keeps spawning
+    /// without ever being bounded must NOT be able to grow the registry without limit. Registry
+    /// entries never evict (by design — see `ProcCaps`'s own doc: no close/dispose call), so this is
+    /// deliberately a TOTAL-ever-spawned cap, not a concurrently-running one — using `true` (exits
+    /// almost instantly) for every spawn here means essentially all of them have already exited by
+    /// the time the cap is reached, yet the cap still fires (proving it counts REGISTRY entries, not
+    /// live processes).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_rejects_once_the_registry_cap_is_reached() {
+        let caps = ProcCaps::new();
+        for _ in 0..MAX_SPAWNED_PROCESSES {
+            caps.spawn(&spec("true", &[])).expect("spawn succeeds under the cap");
+        }
+        let err = caps.spawn(&spec("true", &[])).expect_err("one more spawn must be rejected at the cap");
+        assert!(err.contains("too many processes spawned"), "got: {err}");
     }
 
     /// Closes the confirmed audit finding: a still-running child that the guest never explicitly
