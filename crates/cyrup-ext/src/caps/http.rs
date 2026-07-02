@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -75,6 +76,38 @@ const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// that still guarantees bounded worst-case growth.
 const MAX_OPEN_STREAMS: usize = 256;
 
+/// Fallback ceiling for [`HttpCaps::request`]'s full round trip, and for [`HttpCaps::request_stream`]'s
+/// initial connect+response-headers phase, when the guest supplied NO `req.timeout_ms` (L4 review §6
+/// — `HttpCaps`'s three call sites had no fallback timeout ceiling AT ALL when `timeout_ms` was
+/// absent). Every one of these host calls is bridged onto a real OS thread via `block_in_place`+
+/// `block_on` (`cyrup-session-svc/src/host_services.rs`'s `http_request`/`http_request_stream`/
+/// `http_poll_stream_chunk`) while the wasm guest sits suspended across it — the SEPARATE
+/// `note_dialog_wait` epoch-forgiveness fix (`host/live.rs`) already stops that wait from tripping
+/// the WASM epoch deadline, but does nothing to bound the REAL wall-clock block on the host's own
+/// blocking-thread pool (bounded, but finite — `tokio::runtime::Builder::max_blocking_threads`,
+/// default 512), which an unbounded wait against a stalled/malicious server could still exhaust one
+/// thread of, indefinitely, no matter how many guests are involved. Like [`MAX_RESPONSE_BODY_BYTES`]/
+/// [`MAX_OPEN_STREAMS`], the point is FINITE, not a specific magic number — deliberately generous,
+/// comfortably above any realistic legitimate slow-server response time, while still guaranteeing
+/// the call can never hang literally forever. An EXPLICIT `req.timeout_ms` from the guest always
+/// wins; this only fills the gap when none was given.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Per-poll idle ceiling for [`HttpCaps::poll_stream_chunk`] — bounds how long a SINGLE poll may
+/// wait for the next chunk (or EOF) before giving up, not the stream's total lifetime. Unlike
+/// [`DEFAULT_REQUEST_TIMEOUT`], this applies UNCONDITIONALLY (the WIT `poll-stream-chunk(handle)`
+/// carries no request/timeout of its own, world.wit) and is deliberately several times longer:
+/// a legitimate long-lived stream — the real consumer's actual protocol need this capability exists
+/// to serve, the MCP SDK's `StreamableHTTPClientTransport`'s long-lived `GET`
+/// (`streamableHttp.js:75-105`, `Accept: text/event-stream`, explicitly "to listen for server
+/// messages") — can go genuinely quiet between server-pushed messages for a while; firing too
+/// eagerly would functionally break exactly the use case this finding says must not break. On
+/// timeout the stream is put BACK in the registry (never treated as EOF/terminal — `poll_stream_chunk`'s
+/// match arm below) so a guest that simply polls again keeps draining the SAME live connection; the
+/// bound exists purely to guarantee the host's blocking thread is eventually released either way,
+/// not to cap how long the connection itself may legitimately stay open.
+const HTTP_POLL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The real HTTP capability engine: one shared `reqwest::Client` plus a registry of open streaming
 /// bodies keyed by an opaque `u32` handle (`request-stream` / `poll-stream-chunk` / `close-stream`).
 /// A registry entry of `None` means the underlying stream already reached natural EOF (or errored)
@@ -90,6 +123,14 @@ pub struct HttpCaps {
     /// opening 256 real concurrent sockets (flaky under full-suite parallel test execution, which
     /// contends for the same loopback networking resources across many unrelated tests at once).
     max_open_streams: usize,
+    /// [`DEFAULT_REQUEST_TIMEOUT`] in production; overridable ONLY for tests
+    /// ([`Self::with_request_timeout`]) so the fallback-timeout path is exercisable without a real
+    /// test waiting the full production duration.
+    request_timeout: Duration,
+    /// [`HTTP_POLL_IDLE_TIMEOUT`] in production; overridable ONLY for tests
+    /// ([`Self::with_poll_idle_timeout`]) so the idle-timeout path is exercisable without a real
+    /// test waiting the full production duration.
+    poll_idle_timeout: Duration,
 }
 
 impl std::fmt::Debug for HttpCaps {
@@ -129,6 +170,8 @@ impl HttpCaps {
             streams: Mutex::new(HashMap::new()),
             next_handle: AtomicU32::new(1),
             max_open_streams: MAX_OPEN_STREAMS,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            poll_idle_timeout: HTTP_POLL_IDLE_TIMEOUT,
         }
     }
 
@@ -144,6 +187,22 @@ impl HttpCaps {
         let client =
             client_builder().pool_max_idle_per_host(0).build().unwrap_or_else(|_| reqwest::Client::new());
         Self { max_open_streams, ..Self::with_client(client) }
+    }
+
+    /// Build with a caller-supplied fallback request timeout (tests only; production always gets the
+    /// real [`DEFAULT_REQUEST_TIMEOUT`] via [`Self::new`]/[`Self::with_client`]) — L4 review §6.
+    #[cfg(test)]
+    fn with_request_timeout(request_timeout: Duration) -> Self {
+        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        Self { request_timeout, ..Self::with_client(client) }
+    }
+
+    /// Build with a caller-supplied per-poll idle timeout (tests only; production always gets the
+    /// real [`HTTP_POLL_IDLE_TIMEOUT`] via [`Self::new`]/[`Self::with_client`]) — L4 review §6.
+    #[cfg(test)]
+    fn with_poll_idle_timeout(poll_idle_timeout: Duration) -> Self {
+        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        Self { poll_idle_timeout, ..Self::with_client(client) }
     }
 
     /// Shared request-building: method parse + headers + optional body + optional timeout.
@@ -185,13 +244,24 @@ impl HttpCaps {
     /// DECOMPRESSED output at the same cap, so a small compressed body cannot expand into an
     /// unbounded in-memory allocation (a decompression bomb) now that decoding happens manually.
     pub async fn request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
-        let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let headers = collect_headers(resp.headers());
-        let encoding = content_encoding_of(resp.headers());
-        let raw = read_bounded_body(resp).await?;
-        let body = decode_buffered(encoding.as_deref(), raw).await?;
-        Ok(HttpResponse { status, headers, body })
+        // L4 review §6: the FULL round trip (connect through body-drain) is bounded by the guest's
+        // `timeout_ms` when given, else [`DEFAULT_REQUEST_TIMEOUT`] — never unbounded. `build_request`
+        // ALSO applies `timeout_ms` (when given) to `reqwest`'s own request-level timeout below;
+        // that's unchanged/redundant-but-harmless in that case, and this outer bound is what actually
+        // closes the gap for the (previously fully unbounded) `None` case.
+        let effective_timeout =
+            req.timeout_ms.map(|ms| Duration::from_millis(u64::from(ms))).unwrap_or(self.request_timeout);
+        tokio::time::timeout(effective_timeout, async {
+            let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status().as_u16();
+            let headers = collect_headers(resp.headers());
+            let encoding = content_encoding_of(resp.headers());
+            let raw = read_bounded_body(resp).await?;
+            let body = decode_buffered(encoding.as_deref(), raw).await?;
+            Ok(HttpResponse { status, headers, body })
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("request: timed out after {effective_timeout:?}")))
     }
 
     /// Start a streaming request (the WIT `request-stream`): opens the connection, captures the
@@ -216,7 +286,18 @@ impl HttpCaps {
                 ));
             }
         }
-        let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+        // L4 review §6: only the CONNECT+response-headers phase is bounded here — never the body
+        // stream itself, which is meant to stay open long-lived ([`Self::poll_stream_chunk`] bounds
+        // each individual drain separately via [`HTTP_POLL_IDLE_TIMEOUT`], never the whole stream's
+        // lifetime). Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when the guest gave no `timeout_ms`.
+        let effective_timeout =
+            req.timeout_ms.map(|ms| Duration::from_millis(u64::from(ms))).unwrap_or(self.request_timeout);
+        let resp = tokio::time::timeout(effective_timeout, self.build_request(req)?.send())
+            .await
+            .map_err(|_| {
+                format!("request_stream: timed out after {effective_timeout:?} waiting for the initial response")
+            })?
+            .map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
         let encoding = content_encoding_of(resp.headers());
@@ -259,8 +340,26 @@ impl HttpCaps {
             // removes it) but every further poll degrades to EOF, never a re-raised error.
             return Ok(None);
         };
-        match stream.next().await {
-            Some(Ok(bytes)) => {
+        // L4 review §6: bound THIS SINGLE poll's wait, never the stream's overall lifetime — a
+        // legitimate long-lived SSE/StreamableHTTP connection (the real consumer's actual protocol
+        // need, MCP SDK `streamableHttp.js:75-105`) can go quiet between server-pushed messages for a
+        // while; see [`HTTP_POLL_IDLE_TIMEOUT`]'s doc for why this must not fire eagerly. On timeout
+        // the stream is put straight BACK (never marked EOF/terminal) so a guest that simply polls
+        // again keeps draining the SAME still-open connection.
+        let poll_idle_timeout = self.poll_idle_timeout;
+        match tokio::time::timeout(poll_idle_timeout, stream.next()).await {
+            Err(_) => {
+                if let Ok(mut g) = self.streams.lock()
+                    && g.contains_key(&handle)
+                {
+                    g.insert(handle, Some(stream));
+                }
+                Err(format!(
+                    "poll_stream_chunk: no chunk within {poll_idle_timeout:?} — the connection \
+                     may still be open, poll again"
+                ))
+            }
+            Ok(Some(Ok(bytes))) => {
                 // TOCTOU guard: `close_stream` may have removed this handle entirely (not just
                 // taken its slot) while we were awaiting the chunk above — re-inserting
                 // unconditionally would resurrect a handle the guest already explicitly closed
@@ -278,7 +377,7 @@ impl HttpCaps {
                 }
                 Ok(Some(bytes.to_vec()))
             }
-            Some(Err(e)) => {
+            Ok(Some(Err(e))) => {
                 if let Ok(mut g) = self.streams.lock()
                     && g.contains_key(&handle)
                 {
@@ -286,7 +385,7 @@ impl HttpCaps {
                 }
                 Err(e.to_string())
             }
-            None => {
+            Ok(None) => {
                 if let Ok(mut g) = self.streams.lock()
                     && g.contains_key(&handle)
                 {
@@ -878,5 +977,146 @@ mod tests {
             HttpRequest { method: "GET".into(), url: format!("http://{addr}/nope"), ..Default::default() };
         let err = caps.request(&req).await.expect_err("connection refused surfaces as Err");
         assert!(!err.is_empty());
+    }
+
+    /// L4 review §6: a stalled server (accepts the connection, never responds) must NOT hang
+    /// `request` forever when the guest gave no `timeout_ms` — the fallback [`DEFAULT_REQUEST_TIMEOUT`]
+    /// (overridden here to a real, fast test duration via [`HttpCaps::with_request_timeout`]) must
+    /// fire on its own.
+    #[tokio::test]
+    async fn request_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
+        let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept the connection but never write a response — genuinely hangs from the client's
+        // perspective, exactly the stalled-server scenario the fallback ceiling exists for.
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/probe"),
+            ..Default::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = caps.request(&req).await.expect_err("a stalled server with no timeout_ms still fails");
+        let elapsed = started.elapsed();
+        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the fallback timeout must fire — this must NEVER hang forever: got {elapsed:?}"
+        );
+    }
+
+    /// Same finding, `request_stream`'s initial connect+headers phase.
+    #[tokio::test]
+    async fn request_stream_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
+        let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/probe"),
+            ..Default::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = caps
+            .request_stream(&req)
+            .await
+            .expect_err("a stalled server with no timeout_ms still fails");
+        let elapsed = started.elapsed();
+        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the fallback timeout must fire — this must NEVER hang forever: got {elapsed:?}"
+        );
+    }
+
+    /// A mock server that sends `first`, goes SILENT for `idle_for` (no data, no close — a real
+    /// still-open connection), then sends `second` and closes. No `Content-Length`/chunked framing
+    /// (`Connection: close`) so the client legitimately can't distinguish "more is coming" from
+    /// "idle" until either more bytes or a close arrives — simulating a real long-lived
+    /// SSE/StreamableHTTP connection that goes quiet between server-pushed messages (L4 review §6).
+    async fn spawn_idle_then_chunk_mock(
+        first: &'static [u8],
+        idle_for: Duration,
+        second: &'static [u8],
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").await;
+                let _ = sock.write_all(first).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(idle_for).await;
+                let _ = sock.write_all(second).await;
+                let _ = sock.flush().await;
+                // Dropping `sock` here closes it, signaling end-of-body to the client.
+            }
+        });
+        format!("http://{addr}/probe")
+    }
+
+    /// THE core claim of L4 review §6: an idle-timeout on `poll_stream_chunk` must NOT kill the
+    /// stream — a legitimate long-lived connection that merely went quiet for a while must still be
+    /// drainable on a later poll once the server actually sends something, exactly the real
+    /// consumer's protocol need (MCP SDK's long-lived StreamableHTTP `GET`,
+    /// `streamableHttp.js:75-105`) this capability exists to serve.
+    #[tokio::test]
+    async fn poll_stream_chunk_idle_timeout_does_not_kill_the_stream() {
+        let caps = HttpCaps::with_poll_idle_timeout(Duration::from_millis(80));
+        let url = spawn_idle_then_chunk_mock(b"first", Duration::from_millis(400), b"second").await;
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request_stream(&req).await.expect("stream opens");
+
+        let first =
+            caps.poll_stream_chunk(resp.handle).await.expect("first chunk arrives immediately");
+        assert_eq!(first, Some(b"first".to_vec()));
+
+        // The server goes silent for 400ms; the idle timeout is 80ms, so this poll must return
+        // QUICKLY — bounding the real OS thread `block_in_place` would otherwise pin — rather than
+        // blocking for the server's full silence.
+        let started = tokio::time::Instant::now();
+        let err = caps.poll_stream_chunk(resp.handle).await.expect_err("an idle poll times out");
+        let elapsed = started.elapsed();
+        assert!(err.contains("no chunk within"), "the error must identify itself as an idle timeout, \
+                 not a terminal failure: {err}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "the idle timeout must fire promptly, not block for the server's full silence: {elapsed:?}"
+        );
+
+        // The stream must have survived: it is NEITHER reported as closed NOR as EOF — a later poll
+        // (once the server finally sends its second chunk) still succeeds with REAL data, proving
+        // the connection was never torn down by the timeout.
+        let mut got_second = None;
+        for _ in 0..20 {
+            match caps.poll_stream_chunk(resp.handle).await {
+                Ok(Some(bytes)) => {
+                    got_second = Some(bytes);
+                    break;
+                }
+                Ok(None) => panic!("must not report EOF — the server has not closed yet"),
+                Err(e) if e.contains("no chunk within") => continue, // still idle, retry
+                Err(e) => panic!("unexpected terminal error after a mere idle timeout: {e}"),
+            }
+        }
+        assert_eq!(
+            got_second,
+            Some(b"second".to_vec()),
+            "the stream must still be live and draining after surviving an idle timeout"
+        );
     }
 }
