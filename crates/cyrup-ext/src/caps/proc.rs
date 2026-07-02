@@ -43,8 +43,9 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
 /// even past SIGKILL, e.g. stuck in uninterruptible D-state I/O, is the only way this is ever hit).
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bounds how long [`ProcCaps::write_stdin`] will block waiting for a real pipe write to complete.
-/// Unlike [`DEFAULT_KILL_GRACE`]/[`KILL_CONFIRM_TIMEOUT`], there is no Pi/real-consumer exact
+/// Bounds how long [`ProcCaps::write_stdin`] will block in TOTAL — waiting to acquire the per-handle
+/// stdin lock AND performing the real pipe write — a single ceiling over the WHOLE call, not just the
+/// write. Unlike [`DEFAULT_KILL_GRACE`]/[`KILL_CONFIRM_TIMEOUT`], there is no Pi/real-consumer exact
 /// value to port here: Node's `ChildProcess.stdin.write()` (the real `StdioClientTransport.send`,
 /// `@modelcontextprotocol/sdk@1.25.1` `dist/cjs/client/stdio.js:189-207`) is asynchronous and
 /// non-blocking by construction — it returns `false` immediately once the OS pipe fills and lets
@@ -59,6 +60,17 @@ const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 /// [`MAX_PIPE_BUFFER_BYTES`]/[`MAX_SPAWNED_PROCESSES`] below, the point is FINITE, not a specific
 /// magic number — this is a deliberately generous cap comfortably above any legitimate write to a
 /// live, cooperating child, while still guaranteeing the call can never hang forever.
+///
+/// L4 review: [`ProcCaps::write_stdin`] wraps BOTH `entry.stdin.lock().await` and `write_all` in ONE
+/// outer `tokio::time::timeout(WRITE_STDIN_TIMEOUT, ...)` — a version that bounded only the write
+/// itself (locking first, unbounded, THEN racing the write against this constant) let two concurrent
+/// `write_stdin` calls against the SAME handle compound to up to ~2x this ceiling: the second call's
+/// `write_all` cannot even START until the first's lock-holding write finishes, but its own timeout
+/// clock did not start ticking until it acquired the lock. Bounding lock-acquisition + write together
+/// under one deadline closes that compounding gap. This is a DIFFERENT scenario from the `kill`-vs-
+/// `write_stdin` race [`ProcCaps::kill`]'s `try_lock` (not `.lock().await`) already closes (`a9f776d`,
+/// doc above `kill`'s own `entry.stdin.try_lock()` call) — that fix is about `kill` never blocking on
+/// this mutex at all; this one is about two `write_stdin` calls contending for it.
 const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounds how many `proc.spawn` entries a single `ProcCaps` (one per session) can ever create.
@@ -490,32 +502,47 @@ impl ProcCaps {
     /// (child exited / closed stdin) — mirrors a real broken-pipe write failure, never a panic.
     /// Bounded by [`WRITE_STDIN_TIMEOUT`] (its doc explains why no Pi-derived exact value exists):
     /// a child that never reads its stdin (or reads too slowly to keep up) gets a bounded `Err`
-    /// instead of hanging this call — and the real tokio worker thread backing it — forever.
+    /// instead of hanging this call — and the real tokio worker thread backing it — forever. The
+    /// bound covers BOTH acquiring the per-handle stdin lock AND the write itself (one outer
+    /// `tokio::time::timeout` around both, [`WRITE_STDIN_TIMEOUT`]'s doc) — a version that only timed
+    /// the write let a SECOND concurrent `write_stdin` against the same handle wait unboundedly for
+    /// the first's lock, then get its own full timeout budget on top, compounding to ~2x the
+    /// documented ceiling.
     pub async fn write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
         let entry = self.entry(handle)?;
-        let mut guard = entry.stdin.lock().await;
-        let Some(stdin) = guard.as_mut() else {
-            return Err(format!("stdin is closed for handle {handle}"));
-        };
-        match tokio::time::timeout(self.write_stdin_timeout, stdin.write_all(data)).await {
-            Ok(Ok(())) => Ok(u32::try_from(data.len()).unwrap_or(u32::MAX)),
-            Ok(Err(e)) => {
-                // A closed/broken pipe is terminal — drop the handle so future writes fail fast
-                // with the SAME message instead of a fresh (possibly different) io error each time.
-                *guard = None;
-                Err(format!("write_stdin: {e}"))
+        let attempt = tokio::time::timeout(self.write_stdin_timeout, async {
+            let mut guard = entry.stdin.lock().await;
+            let Some(stdin) = guard.as_mut() else {
+                return Err(None); // Sentinel: pipe already closed — not a real io error.
+            };
+            match stdin.write_all(data).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // A closed/broken pipe is terminal — drop the handle so future writes fail fast
+                    // with the SAME message instead of a fresh (possibly different) io error each
+                    // time.
+                    *guard = None;
+                    Err(Some(e))
+                }
             }
+        })
+        .await;
+        match attempt {
+            Ok(Ok(())) => Ok(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+            Ok(Err(None)) => Err(format!("stdin is closed for handle {handle}")),
+            Ok(Err(Some(e))) => Err(format!("write_stdin: {e}")),
             Err(_) => {
-                // Timed out with the write still in flight: `write_all` may have already flushed
-                // SOME of `data` to the real pipe before the deadline (an inherent, unavoidable
-                // ambiguity of bounding a partial-write future — the SAME ambiguity a socket-write
-                // timeout has everywhere else). The stdin handle itself is left open (unlike the
-                // broken-pipe arm above) — a slow-but-alive child may still finish draining the
-                // pipe and read the bytes that did land; only a REAL io error, not a mere timeout,
-                // is treated as terminal.
+                // Timed out either waiting for the lock or with the write still in flight:
+                // `write_all` may have already flushed SOME of `data` to the real pipe before the
+                // deadline (an inherent, unavoidable ambiguity of bounding a partial-write future —
+                // the SAME ambiguity a socket-write timeout has everywhere else). The stdin handle
+                // itself is left open regardless — a slow-but-alive child may still finish draining
+                // the pipe and read the bytes that did land, or a concurrent write holding the lock
+                // may still complete; only a REAL io error is treated as terminal.
                 Err(format!(
-                    "write_stdin: timed out after {:?} writing to handle {handle} (the child may \
-                     not be reading its stdin)",
+                    "write_stdin: timed out after {:?} acquiring the stdin lock or writing to \
+                     handle {handle} (the child may not be reading its stdin, or a concurrent write \
+                     is still in flight)",
                     self.write_stdin_timeout
                 ))
             }
@@ -1352,6 +1379,54 @@ mod tests {
         // The stdin handle is left open after a mere timeout (not a real io error) — a subsequent
         // `kill` must still work normally, proving the capability itself is not left wedged.
         caps.kill(handle).await.expect("the capability survives a write_stdin timeout intact");
+    }
+
+    /// THE LOW finding this closes: `write_stdin`'s bound must cover BOTH acquiring the per-handle
+    /// stdin lock AND the write — a version that only timed the write let a SECOND concurrent
+    /// `write_stdin` against the SAME handle wait UNBOUNDED for the first call's lock, then get its
+    /// own full `write_stdin_timeout` budget on top once it finally acquired it, compounding to ~2x
+    /// the documented ceiling. Two concurrent calls race a real child that never reads its stdin, with
+    /// a payload guaranteed to keep the first call's `write_all` genuinely in flight (holding the
+    /// lock) for the WHOLE timeout window. Both must resolve within roughly ONE timeout window of
+    /// the SECOND call being issued, not two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_write_stdin_calls_against_the_same_handle_do_not_compound_the_timeout() {
+        let caps = Arc::new(ProcCaps::with_write_stdin_timeout(Duration::from_millis(300)));
+        let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
+        let payload = || vec![b'x'; 8 * 1024 * 1024];
+
+        let started = tokio::time::Instant::now();
+        let first = {
+            let caps = Arc::clone(&caps);
+            let payload = payload();
+            tokio::spawn(async move { caps.write_stdin(handle, &payload).await })
+        };
+        // Give the first call a head start so it genuinely holds the lock (mid-`write_all`) before
+        // the second one even attempts to acquire it — proving the second call's wait genuinely
+        // starts AFTER, not concurrently racing for, the same lock acquisition.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = {
+            let caps = Arc::clone(&caps);
+            let payload = payload();
+            tokio::spawn(async move { caps.write_stdin(handle, &payload).await })
+        };
+
+        let first_result = first.await.expect("first task joins");
+        let second_result = second.await.expect("second task joins");
+        let elapsed = started.elapsed();
+
+        assert!(first_result.is_err(), "the first write against a non-reading child must time out");
+        assert!(second_result.is_err(), "the second write must also time out, not hang unbounded");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "two concurrent writes against the same handle must resolve within roughly ONE \
+             300ms timeout window (~350ms with the 20ms head start + scheduling slack), NOT \
+             compound to ~2x it (~600ms — the pre-fix bug: the second call's lock-acquisition wait \
+             was unbounded, THEN it got a full fresh 300ms write timeout on top once it finally \
+             acquired the lock): got {elapsed:?}"
+        );
+
+        caps.kill(handle).await.expect("the capability survives concurrent write_stdin timeouts intact");
     }
 
     /// L4 review §5 — `kill`'s phase-1 stdin-close must NEVER be blocked by a CONCURRENT
