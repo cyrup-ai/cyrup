@@ -15,7 +15,7 @@ use cyrup_session_svc::AgentSession;
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         // If a handler cannot be installed, fall back to Ctrl-C alone rather than failing startup.
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {

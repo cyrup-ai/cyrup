@@ -50,6 +50,11 @@ pub enum SubagentError {
     #[error("agent not found: {0}")]
     AgentNotFound(String),
 
+    /// No saved chain definition matched the requested name (`/run-chain`, R-SA-129), applying
+    /// the identical exact-string-equality convention R-SA-008 mandates for agent names.
+    #[error("chain not found: {0}")]
+    ChainNotFound(String),
+
     /// A management (create/update/delete/rename) operation targeted a Builtin- or
     /// Package-sourced agent, which is read-only (R-SA-014).
     #[error("agent source is read-only: {0}")]
@@ -100,4 +105,9 @@ pub enum SubagentError {
     /// Propagated from `cyrup-ext` (extension-host registration/dispatch).
     #[error(transparent)]
     Ext(#[from] cyrup_ext::ExtError),
+
+    /// Propagated from `cyrup-config` (settings-store read/write, e.g. the targeted `subagents`
+    /// key merge a named-profile load performs, R-SA-141).
+    #[error(transparent)]
+    Config(#[from] cyrup_config::ConfigError),
 }

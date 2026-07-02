@@ -28,7 +28,10 @@ pub fn run_migrations(dirs: &ConfigDirs) -> MigrationResult {
     migrate_sessions_from_agent_root(&dirs.agent_dir);
     migrate_tools_to_bin(&dirs.agent_dir, &dirs.bin_dir());
     let deprecation_warnings = migrate_extension_system(&dirs.agent_dir, &dirs.cwd);
-    MigrationResult { migrated_auth_providers, deprecation_warnings }
+    MigrationResult {
+        migrated_auth_providers,
+        deprecation_warnings,
+    }
 }
 
 /// Migrate legacy `oauth.json` + `settings.json.apiKeys` into `auth.json` (Pi
@@ -149,8 +152,16 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path) {
 /// `/`/`\`/`:` with `-`, wrap in `--…--`).
 fn encode_cwd(cwd: &str) -> String {
     let trimmed = cwd.trim_start_matches(['/', '\\']);
-    let replaced: String =
-        trimmed.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c }).collect();
+    let replaced: String = trimmed
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
     format!("--{replaced}--")
 }
 
@@ -213,7 +224,9 @@ fn migrate_commands_to_prompts(base_dir: &Path, label: &str) -> bool {
 fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     if base_dir.join("hooks").exists() {
-        warnings.push(format!("{label} hooks/ directory found. Hooks have been renamed to extensions."));
+        warnings.push(format!(
+            "{label} hooks/ directory found. Hooks have been renamed to extensions."
+        ));
     }
     let tools_dir = base_dir.join("tools");
     if tools_dir.exists()
@@ -239,10 +252,8 @@ pub fn format_deprecation_warnings(warnings: &[String]) -> String {
     if warnings.is_empty() {
         return String::new();
     }
-    const MIGRATION_GUIDE_URL: &str =
-        "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
-    const EXTENSIONS_DOC_URL: &str =
-        "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
+    const MIGRATION_GUIDE_URL: &str = "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
+    const EXTENSIONS_DOC_URL: &str = "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
     let mut out = String::new();
     for warning in warnings {
         out.push_str(&format!("Warning: {warning}\n"));
@@ -254,7 +265,12 @@ pub fn format_deprecation_warnings(warnings: &[String]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -292,8 +308,16 @@ mod tests {
         .unwrap();
 
         let result = run_migrations(&d);
-        assert!(result.migrated_auth_providers.contains(&"anthropic".to_string()));
-        assert!(result.migrated_auth_providers.contains(&"openai".to_string()));
+        assert!(
+            result
+                .migrated_auth_providers
+                .contains(&"anthropic".to_string())
+        );
+        assert!(
+            result
+                .migrated_auth_providers
+                .contains(&"openai".to_string())
+        );
 
         let auth: Value =
             serde_json::from_str(&std::fs::read_to_string(d.agent_dir.join("auth.json")).unwrap())
@@ -304,9 +328,10 @@ mod tests {
         assert_eq!(auth["openai"]["key"], "sk-123");
 
         // apiKeys stripped from settings.json; oauth.json renamed away.
-        let settings: Value =
-            serde_json::from_str(&std::fs::read_to_string(d.agent_dir.join("settings.json")).unwrap())
-                .unwrap();
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(d.agent_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
         assert!(settings.get("apiKeys").is_none());
         assert_eq!(settings["theme"], "dark");
         assert!(!d.agent_dir.join("oauth.json").exists());
@@ -329,7 +354,11 @@ mod tests {
         .unwrap();
         run_migrations(&d);
         assert!(!stray.exists());
-        let moved = d.agent_dir.join("sessions").join("--home-u-p--").join("abc123.jsonl");
+        let moved = d
+            .agent_dir
+            .join("sessions")
+            .join("--home-u-p--")
+            .join("abc123.jsonl");
         assert!(moved.exists());
     }
 
@@ -342,7 +371,12 @@ mod tests {
         let result = run_migrations(&d);
         assert!(d.agent_dir.join("prompts").exists());
         assert!(!d.agent_dir.join("commands").exists());
-        assert!(result.deprecation_warnings.iter().any(|w| w.contains("hooks/")));
+        assert!(
+            result
+                .deprecation_warnings
+                .iter()
+                .any(|w| w.contains("hooks/"))
+        );
         let formatted = format_deprecation_warnings(&result.deprecation_warnings);
         assert!(formatted.contains("Warning:"));
         assert!(formatted.contains("extensions/ directory"));

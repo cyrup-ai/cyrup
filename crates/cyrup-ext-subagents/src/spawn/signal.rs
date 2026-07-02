@@ -203,7 +203,12 @@ fn send_signal(pid: u32, signal: nix::sys::signal::Signal) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -248,19 +253,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_escalates_through_sigint_and_sigterm_to_sigkill() {
+        let marker = tempfile::NamedTempFile::new()
+            .expect("real tempfile for the trap-installed marker")
+            .into_temp_path();
+        let marker_path = marker.to_path_buf();
+        std::fs::remove_file(&marker_path).ok();
+
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "trap '' INT TERM; while true; do sleep 1; done"]);
+        cmd.args([
+            "-c",
+            &format!(
+                "trap '' INT TERM; touch '{}'; while true; do sleep 1; done",
+                marker_path.display()
+            ),
+        ]);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         let child = cmd.spawn().expect("the signal-trapping shell spawns");
         let pid = child.id().expect("live child has a pid");
 
-        // Let the shell actually reach `trap '' INT TERM` before signaling it — otherwise SIGINT
-        // (still under the default terminate disposition at spawn time) can race the trap install
-        // and kill it before the trap takes effect, which would falsely "pass" this test without
-        // ever exercising the SIGTERM/SIGKILL escalation.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Poll for the marker file the shell touches immediately AFTER `trap '' INT TERM` takes
+        // effect, rather than sleeping a fixed guess — a fixed sleep can be too short under heavy
+        // concurrent test-suite CPU contention (the shell may not have reached the `trap` builtin
+        // yet), which would let SIGINT race the trap install and kill the child before the trap
+        // takes effect, falsely short-circuiting the escalation this test exists to exercise.
+        wait_for_marker(&marker_path, Duration::from_secs(10)).await;
 
         let cancel = CancelToken::new();
         let started = tokio::time::Instant::now();
@@ -291,14 +309,26 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_stops_at_sigterm_when_the_child_ignores_only_sigint() {
+        let marker = tempfile::NamedTempFile::new()
+            .expect("real tempfile for the trap-installed marker")
+            .into_temp_path();
+        let marker_path = marker.to_path_buf();
+        std::fs::remove_file(&marker_path).ok();
+
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "trap '' INT; while true; do sleep 1; done"]);
+        cmd.args([
+            "-c",
+            &format!(
+                "trap '' INT; touch '{}'; while true; do sleep 1; done",
+                marker_path.display()
+            ),
+        ]);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         let child = cmd.spawn().expect("the SIGINT-ignoring shell spawns");
         let pid = child.id().expect("live child has a pid");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for_marker(&marker_path, Duration::from_secs(10)).await;
 
         let cancel = CancelToken::new();
         let started = tokio::time::Instant::now();
@@ -332,14 +362,26 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_skips_grace_waits_once_cancelled() {
+        let marker = tempfile::NamedTempFile::new()
+            .expect("real tempfile for the trap-installed marker")
+            .into_temp_path();
+        let marker_path = marker.to_path_buf();
+        std::fs::remove_file(&marker_path).ok();
+
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "trap '' INT TERM; while true; do sleep 1; done"]);
+        cmd.args([
+            "-c",
+            &format!(
+                "trap '' INT TERM; touch '{}'; while true; do sleep 1; done",
+                marker_path.display()
+            ),
+        ]);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         let child = cmd.spawn().expect("the signal-trapping shell spawns");
         let pid = child.id().expect("live child has a pid");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for_marker(&marker_path, Duration::from_secs(10)).await;
 
         let cancel = CancelToken::new();
         cancel.cancel();
@@ -370,6 +412,30 @@ mod tests {
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 on pid {pid} must fail after terminate() returns — the OS process must be \
              really gone, not merely reported as such"
+        );
+    }
+
+    /// Poll for `path` to exist, up to `timeout`. Used to deterministically confirm a spawned
+    /// shell has genuinely reached its `trap` builtin (which the shell scripts in these tests
+    /// `touch` a marker file immediately after) before this test sends any signal — replacing a
+    /// fixed-duration sleep that can be too short under heavy concurrent test-suite CPU
+    /// contention (many other tests in this crate spawn real subprocesses at the same time) and
+    /// would otherwise let a signal race the trap install, falsely short-circuiting the
+    /// escalation these tests exist to exercise.
+    #[cfg(unix)]
+    async fn wait_for_marker(path: &std::path::Path, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "marker file {} never appeared within {:?} — the child shell did not reach its trap \
+             install in time (system may be extremely overloaded)",
+            path.display(),
+            timeout
         );
     }
 }

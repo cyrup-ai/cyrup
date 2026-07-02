@@ -56,6 +56,37 @@ pub enum ContextMode {
     Fork,
 }
 
+/// Resolve one call site's (possibly omitted) `context` request against the target agent's own
+/// persona-level `defaultContext` (func-SA §4.1 `AgentDefinition::default_context`; DI-SA-3,
+/// R-SA-138/R-SA-111).
+///
+/// This is the ONE place "an omitted call-site `context` falls back to the agent's own default"
+/// is decided — every caller building a batch of sibling tasks (a `ParallelGroup`/`DynamicGroup`
+/// fan-out, or the `subagent` tool's parallel-shape parameter surface once wired) MUST call this
+/// once per task, independently, rather than resolving a single shared default for the whole
+/// batch. Per DI-SA-3 ("Context-mode independence"): when `context` is omitted at a call site
+/// covering multiple tasks in one batch, each task resolves its OWN persona-level
+/// `defaultContext` independently — one sibling's resolved default MUST NOT leak into another
+/// sibling's resolution. Calling this function once per task, using that task's own
+/// `agent_default_context` argument, is what makes that independence hold: there is no shared,
+/// batch-wide state here at all — each call is a pure function of its own two arguments only.
+///
+/// Precedence, highest to lowest:
+/// 1. `call_site_context` — an explicit `context` on the task/step itself (e.g. `SingleStepSpec::
+///    context`) always wins when present.
+/// 2. `agent_default_context` — the resolved agent's own `AgentDefinition::default_context`
+///    frontmatter field, consulted only when (1) is `None`.
+/// 3. [`ContextMode::default`] (`Fresh`) — when neither is present.
+#[must_use]
+pub fn resolve_effective_context(
+    call_site_context: Option<ContextMode>,
+    agent_default_context: Option<ContextMode>,
+) -> ContextMode {
+    call_site_context
+        .or(agent_default_context)
+        .unwrap_or_default()
+}
+
 /// The resolved outcome of a fork-context request: either `Fresh` (no session file), or `Fork`
 /// with a concrete, on-disk session-file path ready to hand to a spawned child via `--session`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +246,73 @@ mod tests {
             error_message: None,
             timestamp: 0,
         })
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // resolve_effective_context: A-SA-5 (context independence, DI-SA-3, R-SA-138/R-SA-111)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_effective_context_prefers_an_explicit_call_site_value_over_the_agent_default() {
+        assert_eq!(
+            resolve_effective_context(Some(ContextMode::Fork), Some(ContextMode::Fresh)),
+            ContextMode::Fork,
+            "an explicit call-site context must win even when it disagrees with the agent's own default"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_context_falls_back_to_the_agent_default_when_call_site_omits_it() {
+        assert_eq!(
+            resolve_effective_context(None, Some(ContextMode::Fork)),
+            ContextMode::Fork
+        );
+        assert_eq!(
+            resolve_effective_context(None, Some(ContextMode::Fresh)),
+            ContextMode::Fresh
+        );
+    }
+
+    #[test]
+    fn resolve_effective_context_defaults_to_fresh_when_neither_is_present() {
+        assert_eq!(resolve_effective_context(None, None), ContextMode::Fresh);
+    }
+
+    /// A-SA-5, the exact scenario: in one parallel/batch call with `context` omitted at every call
+    /// site, a sibling task whose agent persona defaults to `fresh` and a sibling task whose agent
+    /// persona defaults to `fork` each resolve independently — resolving one MUST NOT be
+    /// influenced by, or leak into, resolving the other. Modeled here as two independent calls
+    /// into the same pure function (exactly how a real batch-builder is required to invoke it: once
+    /// per task, never once for the whole batch) sharing no state whatsoever between them, which is
+    /// what makes cross-sibling leakage structurally impossible rather than merely untested.
+    #[test]
+    fn resolve_effective_context_resolves_each_sibling_in_one_batch_independently() {
+        // Sibling A: agent persona's own default_context is Fresh, call site omits context.
+        let sibling_a_agent_default = Some(ContextMode::Fresh);
+        // Sibling B: agent persona's own default_context is Fork, call site omits context.
+        let sibling_b_agent_default = Some(ContextMode::Fork);
+
+        let resolved_a = resolve_effective_context(None, sibling_a_agent_default);
+        let resolved_b = resolve_effective_context(None, sibling_b_agent_default);
+
+        assert_eq!(
+            resolved_a,
+            ContextMode::Fresh,
+            "sibling A's own persona default (fresh) must be what it resolves to"
+        );
+        assert_eq!(
+            resolved_b,
+            ContextMode::Fork,
+            "sibling B's own persona default (fork) must be what it resolves to, unaffected by \
+             sibling A ever having been resolved to fresh in the same batch"
+        );
+
+        // Order independence: resolving B before A must produce the identical pair of outcomes —
+        // proof there is no hidden shared/mutable state a call ordering could leak through.
+        let resolved_b_first = resolve_effective_context(None, sibling_b_agent_default);
+        let resolved_a_second = resolve_effective_context(None, sibling_a_agent_default);
+        assert_eq!(resolved_b_first, ContextMode::Fork);
+        assert_eq!(resolved_a_second, ContextMode::Fresh);
     }
 
     /// A real, persisted parent session (tempdir-backed, on-disk JSONL — never mocked) branches

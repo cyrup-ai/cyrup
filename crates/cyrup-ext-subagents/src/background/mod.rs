@@ -26,8 +26,6 @@
 //! - Interrupt/resume/append-step file-based control protocol (R-SA-081..087, R-SA-094..097) —
 //!   owned by `background/control.rs`.
 //! - The orchestrator-side shared poller (R-SA-093/105) — owned by `background/tracker.rs`.
-//! - `ResultsDir` filesystem-watch completion notification (R-SA-098..102) — owned by
-//!   `background/watch.rs`.
 //! - Nested background-run storage-subpath *derivation as consumed by the runner* and root-run
 //!   "am I fully done" recursive reconciliation (R-SA-104) — this module defines the
 //!   [`NestedRoute`] addressing type and [`RunPaths::nested`]'s pure subpath-naming rule; the
@@ -37,6 +35,56 @@
 /// module in this subsystem (status.json, config.json, meta.json, control-inbox files) so there
 /// is exactly one temp-then-rename implementation, not one per call site.
 pub mod atomic;
+
+/// File-based interrupt/resume/append-step control protocol (R-SA-079..087, R-SA-094..097): dual-
+/// channel interrupt delivery, delete-then-act idempotent consumption, the resume running-
+/// selection-vs-terminal-revival fork, the append-step enqueue-then-consume race-safe protocol,
+/// safe-token path validation, and root-attachment polling. See [`control`] for the full subsystem
+/// doc.
+pub mod control;
+
+/// Hop-1 detached second-process spawn (`spawn_detached_runner`, R-SA-070/071): launches the
+/// `cyrup` binary's internal `__subagent-runner --config <path>` subcommand as a genuinely
+/// detached OS process (new process group / `DETACHED_PROCESS`, stdio redirected to files, the
+/// resulting child handle dropped without ever being awaited). See that module's docs for why
+/// "never awaited" is the entire point, not an oversight.
+pub mod spawn_detached;
+
+/// Stale-run liveness reconciliation (`reconcile`, R-SA-088..092): given a run id's resolved
+/// [`RunPaths`], applies the exact five-step algorithm — `ResultFile` presence is always
+/// authoritative; a missing `status.json` is provisional within the R-SA-090 spawn grace window
+/// and failed thereafter; a non-`Running`/no-pid status passes through unchanged; a `Running`
+/// status with a pid is probed via a real zero-signal liveness check (R-SA-089's three-outcome
+/// `Alive`/`Dead`/`Unknown` classification, never collapsing `Unknown` into `Dead`) and, if dead or
+/// alive-but-long-stale (R-SA-091), synthesizes a failure written to both files (R-SA-092). Every
+/// other module that needs "is this run actually still alive" (`background/control.rs`'s
+/// `status`/`interrupt`/`resume`/`append-step` handlers, R-SA-079; `background/tracker.rs`'s
+/// shared poller, R-SA-093) calls this module's `reconcile`/`reconcile_now`, never re-derives the
+/// algorithm.
+pub mod reconcile;
+
+/// Hop-2 detached-runner main loop (`run`, R-SA-073..077): reads+deletes the one-shot
+/// `runner-config.json` handoff file, writes the initial `Running` status, drives the step loop
+/// (interrupt/append-request checks every iteration, dispatch via the Phase-3 spawn boundary),
+/// and — on every single exit path — writes the terminal `status.json` strictly before the
+/// terminal [`ResultFile`] (R-SA-077), which is what makes [`watch`]'s orchestrator-side
+/// completion notification observable at all. See [`runner_main`] for the full subsystem doc.
+pub mod runner_main;
+
+/// `ResultsDir` filesystem-watch completion notification (R-SA-098..103): a `notify`-crate watch
+/// with poll-interval fallback over the shared `ResultsDir`, parse+session-verify+dedup+notify
+/// processing per R-SA-099, OR'd dual-signal terminal-state classification (R-SA-100), and bounded
+/// retry-in-place on transient processing failure (R-SA-102). Runs entirely in the ORCHESTRATOR
+/// process — see [`watch`] for the full subsystem doc, including the explicit scope note on why
+/// R-SA-101's turn/prompt-path re-entry is a later phase's hand-off, not implemented here.
+pub mod watch;
+
+/// Orchestrator-side shared poller (`JobTracker`, R-SA-093/105): one `tokio::time::interval`-
+/// driven task per owning extension instance, self-starting on the first tracked job and
+/// self-stopping once the tracked-job map empties. Tails newly-appended `events.jsonl` bytes per
+/// tracked job via a per-run byte cursor and invokes [`reconcile::reconcile_now`] every tick. See
+/// [`tracker`] for the full subsystem doc.
+pub mod tracker;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -592,7 +640,10 @@ pub struct RunPaths {
     pub run_dir: PathBuf,
     /// `<run_dir>/status.json` — [`RunStatus`], atomic writes only.
     pub status: PathBuf,
-    /// `<run_dir>/events.jsonl` — append-only, size-capped event log (R-SA-136).
+    /// `<run_dir>/events.jsonl` — append-only, size-capped event log (R-SA-136/146). Any writer
+    /// appending to this path MUST go through [`crate::jsonl::BoundedJsonlWriter`] (the same
+    /// shared primitive [`crate::spawn::SpawnedChild`]'s own per-attempt `.jsonl` tee uses) so the
+    /// 50MB-default byte-budget cap is enforced identically here, not re-implemented per writer.
     pub events: PathBuf,
     /// `<run_dir>/control/interrupt.json` — present only while an [`crate::error::SubagentError`]-
     /// free pending interrupt request exists (R-SA-081); a later phase's `InterruptRequest` type
@@ -664,6 +715,22 @@ impl RunPaths {
 /// — never a panic. Kept private: every other module in this crate obtains a timestamp through
 /// [`RunStatus`]'s own constructors/mutators rather than calling this directly, so there is one
 /// place the epoch-conversion policy lives.
+/// Public re-export of [`now_epoch_millis`]'s exact policy, for callers OUTSIDE this module that
+/// still need to stamp an individual [`StepStatus`]/[`ParallelGroupStatus`] field directly (e.g.
+/// `runner_main.rs`'s per-step `started_at`/`ended_at` bookkeeping, which mutates fields nested
+/// inside `RunStatus.steps`/`RunStatus.parallel_groups` that no [`RunStatus`] method itself
+/// exposes a setter for) — kept as a thin wrapper around the private [`now_epoch_millis`] rather
+/// than making that function itself `pub`, so the module's own doc comment ("kept private: every
+/// other module... obtains a timestamp through `RunStatus`'s own constructors/mutators") stays
+/// accurate for every USE CASE that constructor/mutator surface already covers, while still
+/// giving the narrow, genuinely-uncovered case (stamping a nested per-step field the top-level
+/// `RunStatus` API has no setter for) a sanctioned entry point instead of a second, independently
+/// reimplemented clamp-never-panic conversion.
+#[must_use]
+pub fn now_epoch_millis_pub() -> i64 {
+    now_epoch_millis()
+}
+
 fn now_epoch_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),

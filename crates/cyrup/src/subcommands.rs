@@ -13,9 +13,7 @@
 
 use anyhow::Result;
 use cyrup_config::{ConfigDirs, TrustStore};
-use cyrup_resources::{
-    InstallScope, PackageManager, PackageSource, PackageStore, UpdateTarget,
-};
+use cyrup_resources::{InstallScope, PackageManager, PackageSource, PackageStore, UpdateTarget};
 use cyrup_sdk::core::{CancelToken, PackageId};
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
@@ -365,8 +363,10 @@ pub async fn dispatch(
         eprintln!("Usage: {}", usage(opts.command));
         return Ok(Some(1));
     }
-    if matches!(opts.command, PackageCommand::Install | PackageCommand::Remove)
-        && opts.source.is_none()
+    if matches!(
+        opts.command,
+        PackageCommand::Install | PackageCommand::Remove
+    ) && opts.source.is_none()
     {
         eprintln!("Missing {} source.", opts.command.name());
         eprintln!("Usage: {}", usage(opts.command));
@@ -379,8 +379,10 @@ pub async fn dispatch(
     let effective_trusted = trust_override.unwrap_or_else(|| saved_trusted(dirs));
 
     // Project-package-config write requires trust (Pi package-manager-cli.ts:635-639).
-    let writes_project_config =
-        matches!(opts.command, PackageCommand::Install | PackageCommand::Remove) && opts.local;
+    let writes_project_config = matches!(
+        opts.command,
+        PackageCommand::Install | PackageCommand::Remove
+    ) && opts.local;
     if writes_project_config && !effective_trusted {
         eprintln!("Project is not trusted. Use --approve to modify local package config.");
         return Ok(Some(1));
@@ -394,7 +396,11 @@ async fn run(opts: &ParsedCommand, dirs: &ConfigDirs, trusted: bool) -> Result<i
     let store = PackageStore::new(dirs.package_dir.clone(), Some(dirs.cwd.clone()));
     let manager = PackageManager::new(store);
     let cancel = CancelToken::new();
-    let scope = if opts.local { InstallScope::Project } else { InstallScope::Global };
+    let scope = if opts.local {
+        InstallScope::Project
+    } else {
+        InstallScope::Global
+    };
 
     match opts.command {
         PackageCommand::Install => {
@@ -437,8 +443,14 @@ fn print_list(manager: &PackageManager, dirs: &ConfigDirs) {
         return;
     }
     let store = PackageStore::new(dirs.package_dir.clone(), Some(dirs.cwd.clone()));
-    let user: Vec<_> = packages.iter().filter(|p| p.scope == InstallScope::Global).collect();
-    let project: Vec<_> = packages.iter().filter(|p| p.scope == InstallScope::Project).collect();
+    let user: Vec<_> = packages
+        .iter()
+        .filter(|p| p.scope == InstallScope::Global)
+        .collect();
+    let project: Vec<_> = packages
+        .iter()
+        .filter(|p| p.scope == InstallScope::Project)
+        .collect();
 
     let format_one = |pkg: &cyrup_resources::InstalledPackage| {
         let filtered = !pkg.disabled.skills.is_empty()
@@ -482,12 +494,17 @@ async fn run_update(
     manager: &PackageManager,
     cancel: CancelToken,
 ) -> Result<i32> {
-    let target = opts.update_target.clone().unwrap_or(UpdateTargetSel::SelfUpdate);
+    let target = opts
+        .update_target
+        .clone()
+        .unwrap_or(UpdateTargetSel::SelfUpdate);
     if opts.show_extensions_skipped_note {
         println!("Extensions are skipped. Run cyrup update --extensions to update extensions.");
     }
-    let includes_extensions =
-        matches!(target, UpdateTargetSel::All | UpdateTargetSel::Extensions(_));
+    let includes_extensions = matches!(
+        target,
+        UpdateTargetSel::All | UpdateTargetSel::Extensions(_)
+    );
     let includes_self = matches!(target, UpdateTargetSel::All | UpdateTargetSel::SelfUpdate);
 
     let mut code = 0;
@@ -498,7 +515,12 @@ async fn run_update(
         };
         let report = match &update_source {
             Some(src) => {
-                manager.update(UpdateTarget::One(PackageId::from(src.as_str())), cancel.clone()).await?
+                manager
+                    .update(
+                        UpdateTarget::One(PackageId::from(src.as_str())),
+                        cancel.clone(),
+                    )
+                    .await?
             }
             None => manager.update(UpdateTarget::All, cancel.clone()).await?,
         };
@@ -591,7 +613,9 @@ mod tests {
     #[test]
     fn uninstall_is_remove_alias() {
         assert_eq!(
-            parse_package_command(&v(&["uninstall", "pkg"])).unwrap().command,
+            parse_package_command(&v(&["uninstall", "pkg"]))
+                .unwrap()
+                .command,
             PackageCommand::Remove
         );
     }
@@ -603,34 +627,48 @@ mod tests {
         assert!(bare.show_extensions_skipped_note);
 
         assert_eq!(
-            parse_package_command(&v(&["update", "self"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "self"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::SelfUpdate)
         );
         assert_eq!(
-            parse_package_command(&v(&["update", "pi"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "pi"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::SelfUpdate)
         );
         assert_eq!(
-            parse_package_command(&v(&["update", "--all"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "--all"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::All)
         );
         assert_eq!(
-            parse_package_command(&v(&["update", "--extensions"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "--extensions"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::Extensions(None))
         );
         // self + extensions ⇒ all.
         assert_eq!(
-            parse_package_command(&v(&["update", "--self", "--extensions"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "--self", "--extensions"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::All)
         );
         // --extension <source> value form.
         assert_eq!(
-            parse_package_command(&v(&["update", "--extension", "my-pkg"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "--extension", "my-pkg"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::Extensions(Some("my-pkg".into())))
         );
         // positional source ⇒ one extension.
         assert_eq!(
-            parse_package_command(&v(&["update", "my-pkg"])).unwrap().update_target,
+            parse_package_command(&v(&["update", "my-pkg"]))
+                .unwrap()
+                .update_target,
             Some(UpdateTargetSel::Extensions(Some("my-pkg".into())))
         );
     }
@@ -642,7 +680,10 @@ mod tests {
         let missing = parse_package_command(&v(&["update", "--extension"])).unwrap();
         assert_eq!(missing.missing_option_value.as_deref(), Some("--extension"));
         let missing2 = parse_package_command(&v(&["update", "--extension", "--all"])).unwrap();
-        assert_eq!(missing2.missing_option_value.as_deref(), Some("--extension"));
+        assert_eq!(
+            missing2.missing_option_value.as_deref(),
+            Some("--extension")
+        );
         let ext_conflict =
             parse_package_command(&v(&["update", "--extension", "a", "--all"])).unwrap();
         assert!(ext_conflict.conflicting_options.is_some());
@@ -650,7 +691,11 @@ mod tests {
 
     #[test]
     fn help_flag_and_usage_lines() {
-        assert!(parse_package_command(&v(&["install", "--help"])).unwrap().help);
+        assert!(
+            parse_package_command(&v(&["install", "--help"]))
+                .unwrap()
+                .help
+        );
         assert!(render_command_help(PackageCommand::Install).contains("Install a package"));
         assert!(render_command_help(PackageCommand::Update).contains("--extension <source>"));
         assert!(usage(PackageCommand::Install).contains("install <source>"));
@@ -658,7 +703,10 @@ mod tests {
 
     #[test]
     fn trust_override_parsing() {
-        assert_eq!(trust_override(&v(&["install", "x", "--approve"])), Some(true));
+        assert_eq!(
+            trust_override(&v(&["install", "x", "--approve"])),
+            Some(true)
+        );
         assert_eq!(trust_override(&v(&["install", "x", "-na"])), Some(false));
         assert_eq!(trust_override(&v(&["install", "x"])), None);
     }
@@ -676,7 +724,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
         // install -l with no saved trust + no --approve → guarded (exit 1).
-        let code = dispatch(&v(&["install", "./pkg", "-l"]), &d, None).await.unwrap();
+        let code = dispatch(&v(&["install", "./pkg", "-l"]), &d, None)
+            .await
+            .unwrap();
         assert_eq!(code, Some(1));
     }
 
@@ -685,9 +735,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
         assert_eq!(dispatch(&v(&["install"]), &d, None).await.unwrap(), Some(1));
-        assert_eq!(dispatch(&v(&["install", "x", "--bogus"]), &d, None).await.unwrap(), Some(1));
-        assert_eq!(dispatch(&v(&["update", "--all", "--self"]), &d, None).await.unwrap(), Some(1));
+        assert_eq!(
+            dispatch(&v(&["install", "x", "--bogus"]), &d, None)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            dispatch(&v(&["update", "--all", "--self"]), &d, None)
+                .await
+                .unwrap(),
+            Some(1)
+        );
         // help exits 0.
-        assert_eq!(dispatch(&v(&["install", "--help"]), &d, None).await.unwrap(), Some(0));
+        assert_eq!(
+            dispatch(&v(&["install", "--help"]), &d, None)
+                .await
+                .unwrap(),
+            Some(0)
+        );
     }
 }

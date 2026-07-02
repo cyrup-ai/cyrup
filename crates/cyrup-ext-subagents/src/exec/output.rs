@@ -44,9 +44,15 @@ use crate::exec::ndjson::SubagentEvent;
 /// others (pi-subagents' own `getFinalOutput`, `pi-subagents/src/shared/utils.ts:244-267`, is the
 /// direct source of truth this function ports verbatim — see that function's doc references
 /// below for the exact three detection rules).
-struct FencedBlock<'a> {
-    lang: &'a str,
-    body: &'a str,
+///
+/// `pub(crate)` (not private) so [`crate::exec::structured`]'s R-SA-030 structured-output
+/// extraction can reuse this exact fenced-block scanner — a fenced ` ```json `/`jsonc`/`json5`
+/// block is the same shape both R-SA-029's acceptance-report detection and R-SA-030's
+/// structured-output extraction key off, so this is one shared scanner, not two independent
+/// reimplementations of the same fence-matching state machine.
+pub(crate) struct FencedBlock<'a> {
+    pub(crate) lang: &'a str,
+    pub(crate) body: &'a str,
 }
 
 /// Scan `text` for every fenced code block (` ```lang\n...\n``` `), returning each one's lowercased
@@ -54,7 +60,7 @@ struct FencedBlock<'a> {
 /// being matched (a line starting with three backticks, optionally followed by a language tag,
 /// terminated by a line that is exactly three backticks) is simple enough that a byte-line walk is
 /// both correct and avoids adding a new dependency to this crate for one narrow use.
-fn fenced_blocks(text: &str) -> Vec<FencedBlock<'_>> {
+pub(crate) fn fenced_blocks(text: &str) -> Vec<FencedBlock<'_>> {
     let mut blocks = Vec::new();
     let mut open_fence_end: Option<usize> = None;
     let mut lang_start = 0usize;

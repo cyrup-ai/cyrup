@@ -19,14 +19,12 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use cyrup_config::trust::{
-    decide_trust, has_trust_requiring_resources, TrustInputs, TrustOption, TrustOutcome, TrustStore,
+    TrustInputs, TrustOption, TrustOutcome, TrustStore, decide_trust, has_trust_requiring_resources,
 };
-use cyrup_session_svc::{
-    AppMode, DefaultProjectTrust, SessionInfo, TrustDecision, TrustEntry,
-};
+use cyrup_session_svc::{AppMode, DefaultProjectTrust, SessionInfo, TrustDecision, TrustEntry};
 use cyrup_tui::{
-    run_startup_selector, ListSelector, SelectKeymap, SelectorOutcome, SessionRow, SessionSelector,
-    SessionSelectorOutcome, TrustSelector, UiTheme,
+    ListSelector, SelectKeymap, SelectorOutcome, SessionRow, SessionSelector,
+    SessionSelectorOutcome, TrustSelector, UiTheme, run_startup_selector,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -92,7 +90,9 @@ fn truncate_summary(s: &str) -> String {
 }
 
 fn system_time_nanos(t: SystemTime) -> u128 {
-    t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// What the `--resume` picker resolved to (Pi `selectSession` returns the chosen path or `null`).
@@ -175,7 +175,11 @@ pub fn format_saved_trust(saved: &Option<TrustEntry>) -> String {
     match saved {
         None => "none".to_string(),
         Some(entry) => {
-            let label = if entry.decision.is_trusted() { "trusted" } else { "untrusted" };
+            let label = if entry.decision.is_trusted() {
+                "trusted"
+            } else {
+                "untrusted"
+            };
             format!("{label} ({})", entry.path.display())
         }
     }
@@ -285,7 +289,9 @@ pub enum MissingCwdChoice {
 /// a continuation; a `Cancel` or any other row is a cancellation.
 pub fn interpret_missing_cwd(outcome: &SelectorOutcome) -> MissingCwdChoice {
     match outcome {
-        SelectorOutcome::Confirm(value) if value == MISSING_CWD_CONTINUE => MissingCwdChoice::Continue,
+        SelectorOutcome::Confirm(value) if value == MISSING_CWD_CONTINUE => {
+            MissingCwdChoice::Continue
+        }
         _ => MissingCwdChoice::Cancel,
     }
 }
@@ -301,12 +307,19 @@ pub fn run_missing_cwd_prompt(
 ) -> anyhow::Result<MissingCwdChoice> {
     // The title's first line (the `ListSelector` header is single-line); the full Pi body's cwd lines
     // are surfaced as the option descriptions.
-    let title = prompt_body.lines().next().unwrap_or(prompt_body).to_string();
+    let title = prompt_body
+        .lines()
+        .next()
+        .unwrap_or(prompt_body)
+        .to_string();
     let rows = vec![
         (
             MISSING_CWD_CONTINUE.to_string(),
             "Continue".to_string(),
-            Some(format!("continue in current cwd: {}", fallback_cwd.display())),
+            Some(format!(
+                "continue in current cwd: {}",
+                fallback_cwd.display()
+            )),
         ),
         ("cancel".to_string(), "Cancel".to_string(), None),
     ];
@@ -318,12 +331,20 @@ pub fn run_missing_cwd_prompt(
 
 /// Whether the cwd has trust-requiring project resources (Pi `hasTrustRequiringProjectResources`).
 /// Thin re-export so `main.rs` reads the predicate without a direct `cyrup-config` trust import.
-pub fn has_trust_requiring_project_resources(cwd: &std::path::Path, home: &std::path::Path) -> bool {
+pub fn has_trust_requiring_project_resources(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> bool {
     has_trust_requiring_resources(cwd, home)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use cyrup_sdk::core::SessionId;
@@ -374,9 +395,15 @@ mod tests {
             interpret_resume(&SelectorOutcome::Confirm("/s/aaa.jsonl".to_string())),
             ResumeChoice::Selected(PathBuf::from("/s/aaa.jsonl"))
         );
-        assert_eq!(interpret_resume(&SelectorOutcome::Cancel), ResumeChoice::Cancelled);
+        assert_eq!(
+            interpret_resume(&SelectorOutcome::Cancel),
+            ResumeChoice::Cancelled
+        );
         // A stray Redraw/Ignored is treated as "no selection yet" → cancelled by the mapper.
-        assert_eq!(interpret_resume(&SelectorOutcome::Redraw), ResumeChoice::Cancelled);
+        assert_eq!(
+            interpret_resume(&SelectorOutcome::Redraw),
+            ResumeChoice::Cancelled
+        );
     }
 
     #[test]
@@ -390,7 +417,13 @@ mod tests {
             AppMode::Interactive
         ));
         // Non-interactive never prompts (the non-interactive policy resolves it).
-        assert!(!trust_needs_prompt(true, None, None, DefaultProjectTrust::Ask, AppMode::Print));
+        assert!(!trust_needs_prompt(
+            true,
+            None,
+            None,
+            DefaultProjectTrust::Ask,
+            AppMode::Print
+        ));
         // An explicit override resolves without a prompt.
         assert!(!trust_needs_prompt(
             true,
@@ -436,8 +469,14 @@ mod tests {
             interpret_missing_cwd(&SelectorOutcome::Confirm("cancel".to_string())),
             MissingCwdChoice::Cancel
         );
-        assert_eq!(interpret_missing_cwd(&SelectorOutcome::Cancel), MissingCwdChoice::Cancel);
-        assert_eq!(interpret_missing_cwd(&SelectorOutcome::Redraw), MissingCwdChoice::Cancel);
+        assert_eq!(
+            interpret_missing_cwd(&SelectorOutcome::Cancel),
+            MissingCwdChoice::Cancel
+        );
+        assert_eq!(
+            interpret_missing_cwd(&SelectorOutcome::Redraw),
+            MissingCwdChoice::Cancel
+        );
     }
 
     #[test]
@@ -475,13 +514,19 @@ mod tests {
         // Confirm "0" → the first option (Trust → trusted=true).
         assert_eq!(
             interpret_trust(&SelectorOutcome::Confirm("0".to_string()), &options),
-            TrustChoice::Chosen { index: 0, trusted: true }
+            TrustChoice::Chosen {
+                index: 0,
+                trusted: true
+            }
         );
         // An out-of-range index is treated as a cancellation (no write).
         assert_eq!(
             interpret_trust(&SelectorOutcome::Confirm("99".to_string()), &options),
             TrustChoice::Cancelled
         );
-        assert_eq!(interpret_trust(&SelectorOutcome::Cancel, &options), TrustChoice::Cancelled);
+        assert_eq!(
+            interpret_trust(&SelectorOutcome::Cancel, &options),
+            TrustChoice::Cancelled
+        );
     }
 }

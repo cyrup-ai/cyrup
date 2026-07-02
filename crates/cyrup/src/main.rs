@@ -15,27 +15,27 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use cyrup::{
-    apply_arg_leniency, build_inputs, file_settings_store, format_no_models_available_message,
-    initial_input, migrations, normalize_short_aliases, partition_extension_flags, render_help,
-    resolve_app_mode, run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider,
-    should_take_over_stdout, spawn_abort_on_signal, subcommands, timings, AppMode, Cli, Diagnostic,
-    DiagnosticLevel, Inputs,
-};
 use cyrup::cli::{qualified_matches, split_model_level};
-use cyrup::session_resolve::{resolve_session_target, Outcome, SessionFlags, SessionRef};
+use cyrup::session_resolve::{Outcome, SessionFlags, SessionRef, resolve_session_target};
+use cyrup::{
+    AppMode, Cli, Diagnostic, DiagnosticLevel, Inputs, apply_arg_leniency, build_inputs,
+    file_settings_store, format_no_models_available_message, initial_input, migrations,
+    normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
+    run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider,
+    should_take_over_stdout, spawn_abort_on_signal, subcommands, timings,
+};
 use cyrup_config::{
     AuthStore, CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, Settings,
     SettingsManager, SettingsScope,
 };
+use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
-    list_all, list_in_dir, AgentSession, AgentSessionRuntime, InputSource, ScopedModel,
-    SessionBuilder, SessionConfig, SessionFactory, SessionInfo, SessionLayout, SessionServiceError,
-    SessionTarget, SessionsRoot, UserInput,
+    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionBuilder, SessionConfig,
+    SessionFactory, SessionInfo, SessionLayout, SessionServiceError, SessionTarget, SessionsRoot,
+    UserInput, list_all, list_in_dir,
 };
-use cyrup_resources::theme::ThemeWatcher;
-use cyrup_tui::{crossterm_input_stream, App, ThemeController, UiTheme};
+use cyrup_tui::{App, ThemeController, UiTheme, crossterm_input_stream};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -63,6 +63,19 @@ async fn run() -> anyhow::Result<i32> {
     let raw: Vec<String> = normalize_short_aliases(std::env::args());
     let argv: Vec<String> = raw.iter().skip(1).cloned().collect();
 
+    // Internal `__subagent-runner --config <path>` pre-dispatch (arch-SA §2.2/§6.5; func-SA §1.1):
+    // hop 2 of the SubAgents extension's mandated background-execution mechanism. This is an
+    // internal-only subcommand, never advertised to users (not in `--help`, not in
+    // `subcommands::SUBCOMMANDS`) — it MUST be recognized and dispatched before ANY user-facing arg
+    // leniency/clap parsing (and before the package/config subcommand pre-dispatch below, which has
+    // no knowledge of it and would otherwise fall through to ordinary clap parsing, misinterpreting
+    // `--config <path>` against the user-facing `Cli` surface). `raw` (not `argv`) is passed since
+    // `subagent_runner_cmd::is_selected` expects the binary name at index 0, matching
+    // `std::env::args()`'s own shape.
+    if cyrup::subagent_runner_cmd::is_selected(&raw) {
+        return Ok(cyrup::subagent_runner_cmd::dispatch(&raw).await);
+    }
+
     // Package/config subcommand pre-dispatch (Pi main.ts:486, before arg parsing). Resolve dirs with
     // no CLI overrides for the subcommand's package/project roots.
     if subcommands::first_subcommand(&argv).is_some() {
@@ -70,9 +83,7 @@ async fn run() -> anyhow::Result<i32> {
         let dirs = ConfigDirs::resolve(&CliConfigOverrides::default(), &env)
             .context("resolving config directories")?;
         let trust_override = subcommands::trust_override(&argv);
-        if let Some(code) =
-            subcommands::dispatch(&argv, &dirs, trust_override).await?
-        {
+        if let Some(code) = subcommands::dispatch(&argv, &dirs, trust_override).await? {
             return Ok(code);
         }
     }
@@ -94,7 +105,10 @@ async fn run() -> anyhow::Result<i32> {
 
     // Report parse diagnostics (Pi main.ts:504-512): warnings + errors to stderr, any error exits 1.
     report_diagnostics(&parse_diagnostics);
-    if parse_diagnostics.iter().any(|d| d.level == DiagnosticLevel::Error) {
+    if parse_diagnostics
+        .iter()
+        .any(|d| d.level == DiagnosticLevel::Error)
+    {
         return Ok(1);
     }
 
@@ -184,7 +198,11 @@ async fn run() -> anyhow::Result<i32> {
     if let Some(search) = &cli.list_models {
         return list_models(&cyrup::provider::all_available_models(), search);
     }
-    let mut provider = select_provider(cli.provider.as_deref(), cli.model.as_deref(), cli.api_key.as_deref())?;
+    let mut provider = select_provider(
+        cli.provider.as_deref(),
+        cli.model.as_deref(),
+        cli.api_key.as_deref(),
+    )?;
 
     // Unknown-model diagnostic (Pi `resolveCliModel`, main.ts:377-378 / model-resolver.ts:494-500):
     // a `--model` on a *known* provider whose id is not in the catalog warns (the build still proceeds
@@ -242,8 +260,7 @@ async fn run() -> anyhow::Result<i32> {
         // Pi `hasConfiguredAuth`: the model's provider has a stored credential / known env var
         // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds.
         let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
-        let has_configured_auth =
-            move |m: &cyrup_provider::Model| auth.has_auth(&m.provider, None);
+        let has_configured_auth = move |m: &cyrup_provider::Model| auth.has_auth(&m.provider, None);
         // Saved settings default `(provider, model)` (Pi step 3), read from the same file store.
         let settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
         let eff = settings.effective();
@@ -267,10 +284,17 @@ async fn run() -> anyhow::Result<i32> {
         // satisfied (interactive). In the one-shot/RPC arms below it is an error.
         let target = config.target.clone();
         let fresh = is_fresh_target(&target);
+        let session_cwd = config.cwd.clone();
         let factory = Arc::new(
             SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
-                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver)),
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
+                .with_native_extension(Arc::new(
+                    cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
+                        cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                        session_cwd,
+                    ),
+                )),
         );
         let runtime = Arc::new(
             AgentSessionRuntime::create(factory, target)
@@ -316,10 +340,17 @@ async fn run() -> anyhow::Result<i32> {
         AppMode::Rpc => {
             let target = config.target.clone();
             let fresh = is_fresh_target(&target);
+            let session_cwd = config.cwd.clone();
             let factory = Arc::new(
                 SessionFactory::new(provider, config)
                     .settings_store(settings_store.clone())
-                    .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver)),
+                    .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
+                    .with_native_extension(Arc::new(
+                        cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
+                            cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                            session_cwd,
+                        ),
+                    )),
             );
             let runtime = match AgentSessionRuntime::create(factory, target).await {
                 Ok(r) => Arc::new(r),
@@ -327,7 +358,7 @@ async fn run() -> anyhow::Result<i32> {
                 // login guidance + exit 1 instead of a generic build error.
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),
                 Err(e) => {
-                    return Err(anyhow::Error::new(e).context("building agent session runtime"))
+                    return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
             let session = runtime.session().await;
@@ -342,9 +373,16 @@ async fn run() -> anyhow::Result<i32> {
         AppMode::Print | AppMode::Json => {
             // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
             let fresh = is_fresh_target(&config.target);
+            let session_cwd = config.cwd.clone();
             let session = match SessionBuilder::new(provider, config)
                 .settings_store(settings_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
+                .with_native_extension(Arc::new(
+                    cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
+                        cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                        session_cwd,
+                    ),
+                ))
                 .build()
                 .await
             {
@@ -453,11 +491,14 @@ fn resolve_scoped_models(
         for model in catalog {
             let qualified = format!("{}/{}", model.provider.as_str(), model.id.as_str());
             if qualified_matches(&qualified, &base)
-                && !out.iter().any(|s| {
-                    s.model.provider == model.provider && s.model.id == model.id
-                })
+                && !out
+                    .iter()
+                    .any(|s| s.model.provider == model.provider && s.model.id == model.id)
             {
-                out.push(ScopedModel { model: model.clone(), thinking_level: level.map(|l| l.to_level()) });
+                out.push(ScopedModel {
+                    model: model.clone(),
+                    thinking_level: level.map(|l| l.to_level()),
+                });
             }
         }
     }
@@ -507,7 +548,8 @@ fn resolve_session(
     // the current cwd, or cancels to exit 0. The non-interactive arm already errored above.
     if let Some(issue) = resolution.missing_cwd {
         let theme = UiTheme::default();
-        let body = cyrup::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
+        let body =
+            cyrup::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
         return match cyrup::run_missing_cwd_prompt(&theme, &body, &issue.fallback_cwd)? {
             cyrup::MissingCwdChoice::Continue => {
                 // Reopen the session against the chosen (fallback) cwd (Pi `SessionManager.open(
@@ -577,8 +619,7 @@ fn resolve_startup_ui(
     // undefined`). Pi `createProjectTrustContext` (project-trust.ts:7-62) / `resolveProjectTrusted`
     // (main.ts:610-734).
     if config.trust_override.is_none() {
-        let trust_store =
-            cyrup_config::trust::TrustStore::new(dirs.agent_dir.join("trust.json"));
+        let trust_store = cyrup_config::trust::TrustStore::new(dirs.agent_dir.join("trust.json"));
         let saved = trust_store.nearest(&dirs.cwd).ok().flatten();
         let default_trust = default_project_trust(dirs);
         let has_resources =
@@ -629,10 +670,14 @@ fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
 fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) {
     let root = dirs.session_dir.clone();
     let layout = SessionLayout::new(root.clone(), dirs.cwd.clone());
-    let locals: Vec<SessionRef> =
-        list_in_dir(&layout.dir(), None, None).iter().map(SessionRef::from).collect();
-    let globals: Vec<SessionRef> =
-        list_all(&SessionsRoot(root)).iter().map(SessionRef::from).collect();
+    let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), None, None)
+        .iter()
+        .map(SessionRef::from)
+        .collect();
+    let globals: Vec<SessionRef> = list_all(&SessionsRoot(root))
+        .iter()
+        .map(SessionRef::from)
+        .collect();
     (locals, globals)
 }
 
@@ -716,7 +761,10 @@ fn fuzzy_match(haystack: &str, search: &str) -> bool {
     let hay = haystack.to_ascii_lowercase();
     search.split_whitespace().all(|token| {
         let mut hay_chars = hay.chars();
-        token.to_ascii_lowercase().chars().all(|c| hay_chars.any(|h| h == c))
+        token
+            .to_ascii_lowercase()
+            .chars()
+            .all(|c| hay_chars.any(|h| h == c))
     })
 }
 
@@ -736,7 +784,12 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
     } else {
         models
             .iter()
-            .filter(|m| fuzzy_match(&format!("{} {}", m.provider.as_str(), m.id.as_str()), search))
+            .filter(|m| {
+                fuzzy_match(
+                    &format!("{} {}", m.provider.as_str(), m.id.as_str()),
+                    search,
+                )
+            })
             .collect()
     };
     if filtered.is_empty() {
@@ -768,17 +821,54 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
             context: format_token_count(m.context_window),
             max_out: format_token_count(m.max_tokens),
             thinking: if m.reasoning { "yes" } else { "no" }.to_string(),
-            images: if m.input.contains(&Modality::Image) { "yes" } else { "no" }.to_string(),
+            images: if m.input.contains(&Modality::Image) {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
         })
         .collect();
 
-    let hdr = ("provider", "model", "context", "max-out", "thinking", "images");
-    let w_provider = rows.iter().map(|r| r.provider.len()).chain([hdr.0.len()]).max().unwrap_or(0);
-    let w_model = rows.iter().map(|r| r.model.len()).chain([hdr.1.len()]).max().unwrap_or(0);
-    let w_context = rows.iter().map(|r| r.context.len()).chain([hdr.2.len()]).max().unwrap_or(0);
-    let w_max = rows.iter().map(|r| r.max_out.len()).chain([hdr.3.len()]).max().unwrap_or(0);
-    let w_think = rows.iter().map(|r| r.thinking.len()).chain([hdr.4.len()]).max().unwrap_or(0);
-    let w_img = rows.iter().map(|r| r.images.len()).chain([hdr.5.len()]).max().unwrap_or(0);
+    let hdr = (
+        "provider", "model", "context", "max-out", "thinking", "images",
+    );
+    let w_provider = rows
+        .iter()
+        .map(|r| r.provider.len())
+        .chain([hdr.0.len()])
+        .max()
+        .unwrap_or(0);
+    let w_model = rows
+        .iter()
+        .map(|r| r.model.len())
+        .chain([hdr.1.len()])
+        .max()
+        .unwrap_or(0);
+    let w_context = rows
+        .iter()
+        .map(|r| r.context.len())
+        .chain([hdr.2.len()])
+        .max()
+        .unwrap_or(0);
+    let w_max = rows
+        .iter()
+        .map(|r| r.max_out.len())
+        .chain([hdr.3.len()])
+        .max()
+        .unwrap_or(0);
+    let w_think = rows
+        .iter()
+        .map(|r| r.thinking.len())
+        .chain([hdr.4.len()])
+        .max()
+        .unwrap_or(0);
+    let w_img = rows
+        .iter()
+        .map(|r| r.images.len())
+        .chain([hdr.5.len()])
+        .max()
+        .unwrap_or(0);
 
     println!(
         "{:<w_provider$}  {:<w_model$}  {:<w_context$}  {:<w_max$}  {:<w_think$}  {:<w_img$}",
@@ -834,8 +924,7 @@ async fn run_interactive(
     // into the detected `ColorMode` (feature #3) so 256-color terminals get indexed colors.
     let theme_setting = session.services().settings.effective().theme_setting();
     let controller = ThemeController::boot_from_env(theme_setting.as_deref());
-    let mut app =
-        App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
+    let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
 
@@ -850,14 +939,22 @@ async fn run_interactive(
     }
 
     // Autocomplete dropdown height (feature #6; Pi `autocompleteMaxVisible`, default 5, clamped 3–20).
-    let max_visible = session.services().settings.effective().autocomplete_max_visible();
+    let max_visible = session
+        .services()
+        .settings
+        .effective()
+        .autocomplete_max_visible();
     app.set_autocomplete_max_visible(max_visible.clamp(3, 20) as u16);
 
     // Reserve the idle status band to avoid reflow (feature #9; Pi `terminal.clearOnShrink`,
     // interactive-mode.ts:1638-1642 — an idle status container is cleared only when clearOnShrink is
     // off, so `reserve_status_rows == clearOnShrink`).
     let env_vars = cyrup_session_svc::EnvVars::from_process();
-    let reserve = session.services().settings.effective().clear_on_shrink(&env_vars);
+    let reserve = session
+        .services()
+        .settings
+        .effective()
+        .clear_on_shrink(&env_vars);
     app.set_reserve_status_rows(reserve);
 
     // Extension keyboard shortcuts (feature #10; Pi `registerShortcut`): source the registered
@@ -869,12 +966,11 @@ async fn run_interactive(
     // resolves to an on-disk file, watch it so `/theme` edits repaint live. The watcher must outlive
     // `app.run`, so it is bound here; a built-in (no `origin_path`) has nothing to watch (`None`).
     let mut _theme_watcher: Option<ThemeWatcher> = None;
-    let theme_rx = build_theme_watcher(&session, controller.active_name(), &cancel)
-        .map(|w| {
-            let rx = w.subscribe();
-            _theme_watcher = Some(w);
-            rx
-        });
+    let theme_rx = build_theme_watcher(&session, controller.active_name(), &cancel).map(|w| {
+        let rx = w.subscribe();
+        _theme_watcher = Some(w);
+        rx
+    });
 
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
@@ -891,8 +987,16 @@ async fn run_interactive(
         }
     }
 
-    let result =
-        app.run(input_stream, events, session.clone(), Some(runtime), theme_rx, cancel).await;
+    let result = app
+        .run(
+            input_stream,
+            events,
+            session.clone(),
+            Some(runtime),
+            theme_rx,
+            cancel,
+        )
+        .await;
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
@@ -914,7 +1018,10 @@ fn build_theme_watcher(
     match ThemeWatcher::spawn(seed, path.clone(), cancel.clone()) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!("warning: theme hot-reload disabled for {}: {e}", path.display());
+            eprintln!(
+                "warning: theme hot-reload disabled for {}: {e}",
+                path.display()
+            );
             None
         }
     }
@@ -1030,18 +1137,21 @@ fn no_models_available() -> anyhow::Result<i32> {
 /// Initialise `tracing` to **stderr**, honouring `RUST_LOG`. Off by default; `--verbose` raises the
 /// floor to `debug`. Idempotent and never fatal.
 fn init_tracing(verbose: bool) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let default = if verbose { "debug" } else { "warn" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
-    let _ = fmt().with_env_filter(filter).with_writer(io::stderr).try_init();
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .try_init();
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        format_token_count, fuzzy_match, is_fresh_target, pick_scoped_active_model, ScopedModel,
-        SessionTarget,
+        ScopedModel, SessionTarget, format_token_count, fuzzy_match, is_fresh_target,
+        pick_scoped_active_model,
     };
 
     fn scoped(provider: &str, id: &str) -> ScopedModel {
@@ -1053,7 +1163,10 @@ mod tests {
             .or_else(|| catalog.iter().find(|m| m.provider.as_str() == provider))
             .expect("a catalog model for the provider")
             .clone();
-        ScopedModel { model, thinking_level: None }
+        ScopedModel {
+            model,
+            thinking_level: None,
+        }
     }
 
     #[test]
@@ -1074,7 +1187,8 @@ mod tests {
         assert_eq!(picked.model.id, o.model.id);
 
         // Saved default NOT in scope → fall back to the first scoped model.
-        let picked = pick_scoped_active_model(&scope, Some("together"), Some("nope")).expect("a pick");
+        let picked =
+            pick_scoped_active_model(&scope, Some("together"), Some("nope")).expect("a pick");
         assert_eq!(picked.model.provider, a.model.provider);
 
         // No saved default → the first scoped model.
@@ -1096,7 +1210,9 @@ mod tests {
         assert!(is_fresh_target(&SessionTarget::New));
         assert!(is_fresh_target(&SessionTarget::CreateWithId("x".into())));
         assert!(!is_fresh_target(&SessionTarget::Continue));
-        assert!(!is_fresh_target(&SessionTarget::Resume("/s/a.jsonl".into())));
+        assert!(!is_fresh_target(&SessionTarget::Resume(
+            "/s/a.jsonl".into()
+        )));
         assert!(!is_fresh_target(&SessionTarget::Fork {
             source: "/s/a.jsonl".into(),
             id: None

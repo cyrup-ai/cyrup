@@ -74,10 +74,16 @@ pub fn match_session_arg(
         return SessionLookup::Path(resolved);
     }
     if let Some(m) = exact_then_prefix(arg, locals) {
-        return SessionLookup::Local { path: m.path.clone(), cwd: m.cwd.clone() };
+        return SessionLookup::Local {
+            path: m.path.clone(),
+            cwd: m.cwd.clone(),
+        };
     }
     if let Some(m) = exact_then_prefix(arg, globals) {
-        return SessionLookup::Global { path: m.path.clone(), cwd: m.cwd.clone() };
+        return SessionLookup::Global {
+            path: m.path.clone(),
+            cwd: m.cwd.clone(),
+        };
     }
     SessionLookup::NotFound
 }
@@ -85,7 +91,9 @@ pub fn match_session_arg(
 /// Pi `list.find(s => s.id === arg) ?? list.find(s => s.id.startsWith(arg))` (main.ts:171-176): an
 /// exact id wins, else the first prefix match.
 fn exact_then_prefix<'a>(arg: &str, list: &'a [SessionRef]) -> Option<&'a SessionRef> {
-    list.iter().find(|s| s.id == arg).or_else(|| list.iter().find(|s| s.id.starts_with(arg)))
+    list.iter()
+        .find(|s| s.id == arg)
+        .or_else(|| list.iter().find(|s| s.id.starts_with(arg)))
 }
 
 /// What the orchestration decided (the bin maps this onto building a session or an exit).
@@ -179,7 +187,10 @@ pub fn resolve_session_target(
         };
         // A fork always anchors a fresh session at the *current* cwd, so the stored-cwd guard never
         // applies here (Pi `forkFrom(.., cwd, ..)`).
-        return r.build(SessionTarget::Fork { source, id: flags.session_id.clone() });
+        return r.build(SessionTarget::Fork {
+            source,
+            id: flags.session_id.clone(),
+        });
     }
 
     // --session: open a local/path match; a global match prompts to fork into the cwd.
@@ -195,9 +206,13 @@ pub fn resolve_session_target(
             SessionLookup::Global { path, cwd: foreign } => {
                 let mut r = r;
                 // Pi: `Session found in different project: <cwd>` (stdout, main.ts:317).
-                r.stdout.push(format!("Session found in different project: {foreign}"));
+                r.stdout
+                    .push(format!("Session found in different project: {foreign}"));
                 if confirm_fork() {
-                    r.build(SessionTarget::Fork { source: path, id: None })
+                    r.build(SessionTarget::Fork {
+                        source: path,
+                        id: None,
+                    })
                 } else {
                     // Pi: `Aborted.` + exit 0 (main.ts:321-323).
                     r.stdout.push("Aborted.".to_string());
@@ -295,7 +310,11 @@ mod tests {
     use super::*;
 
     fn sref(id: &str, path: &str, cwd: &str) -> SessionRef {
-        SessionRef { id: id.into(), path: PathBuf::from(path), cwd: cwd.into() }
+        SessionRef {
+            id: id.into(),
+            path: PathBuf::from(path),
+            cwd: cwd.into(),
+        }
     }
 
     fn target_of(r: &Resolution) -> &SessionTarget {
@@ -334,15 +353,24 @@ mod tests {
         // A unique local prefix → Local.
         assert_eq!(
             match_session_arg("abc12", cwd, &locals, &globals),
-            SessionLookup::Local { path: PathBuf::from("/work/s/abc.jsonl"), cwd: "/work".into() }
+            SessionLookup::Local {
+                path: PathBuf::from("/work/s/abc.jsonl"),
+                cwd: "/work".into()
+            }
         );
         // A prefix only present globally → Global with the foreign cwd.
         assert_eq!(
             match_session_arg("def67", cwd, &locals, &globals),
-            SessionLookup::Global { path: PathBuf::from("/other/s/def.jsonl"), cwd: "/other".into() }
+            SessionLookup::Global {
+                path: PathBuf::from("/other/s/def.jsonl"),
+                cwd: "/other".into()
+            }
         );
         // Unmatched → NotFound.
-        assert_eq!(match_session_arg("zzz", cwd, &locals, &globals), SessionLookup::NotFound);
+        assert_eq!(
+            match_session_arg("zzz", cwd, &locals, &globals),
+            SessionLookup::NotFound
+        );
     }
 
     #[test]
@@ -355,14 +383,20 @@ mod tests {
         // "abc" matches the exact id, not the longer prefix-sharing one.
         assert_eq!(
             match_session_arg("abc", cwd, &locals, &[]),
-            SessionLookup::Local { path: PathBuf::from("/work/s/exact.jsonl"), cwd: "/work".into() }
+            SessionLookup::Local {
+                path: PathBuf::from("/work/s/exact.jsonl"),
+                cwd: "/work".into()
+            }
         );
     }
 
     #[test]
     fn session_id_creates_when_missing_and_opens_when_present() {
         let cwd = Path::new("/work");
-        let flags = SessionFlags { session_id: Some("fresh".into()), ..Default::default() };
+        let flags = SessionFlags {
+            session_id: Some("fresh".into()),
+            ..Default::default()
+        };
         let r = resolve_session_target(&flags, cwd, &[], &[], false, &mut || true);
         assert!(matches!(target_of(&r), SessionTarget::CreateWithId(id) if id == "fresh"));
 
@@ -371,7 +405,9 @@ mod tests {
         let here = here.to_string_lossy().to_string();
         let locals = vec![sref("fresh", "/work/s/fresh.jsonl", &here)];
         let r = resolve_session_target(&flags, cwd, &locals, &[], false, &mut || true);
-        assert!(matches!(target_of(&r), SessionTarget::Resume(p) if p == &PathBuf::from("/work/s/fresh.jsonl")));
+        assert!(
+            matches!(target_of(&r), SessionTarget::Resume(p) if p == &PathBuf::from("/work/s/fresh.jsonl"))
+        );
     }
 
     #[test]
@@ -404,28 +440,49 @@ mod tests {
         };
         let r = resolve_session_target(&flags, cwd, &locals, &[], false, &mut || true);
         assert!(matches!(r.outcome, Some(Outcome::ExitErr)));
-        assert!(r.stderr.iter().any(|l| l.contains("Session already exists with id 'taken'")));
+        assert!(
+            r.stderr
+                .iter()
+                .any(|l| l.contains("Session already exists with id 'taken'"))
+        );
     }
 
     #[test]
     fn fork_not_found_errors() {
-        let flags = SessionFlags { fork: Some("nope".into()), ..Default::default() };
+        let flags = SessionFlags {
+            fork: Some("nope".into()),
+            ..Default::default()
+        };
         let r = resolve_session_target(&flags, Path::new("/work"), &[], &[], false, &mut || true);
         assert!(matches!(r.outcome, Some(Outcome::ExitErr)));
-        assert!(r.stderr.iter().any(|l| l.contains("No session found matching 'nope'")));
+        assert!(
+            r.stderr
+                .iter()
+                .any(|l| l.contains("No session found matching 'nope'"))
+        );
     }
 
     #[test]
     fn session_global_match_prompts_to_fork_and_honours_yes() {
         let cwd = Path::new("/work");
         let globals = vec![sref("g1", "/other/s/g.jsonl", "/other/project")];
-        let flags = SessionFlags { session: Some("g1".into()), ..Default::default() };
+        let flags = SessionFlags {
+            session: Some("g1".into()),
+            ..Default::default()
+        };
 
         // yes → Fork; the "different project" line is surfaced.
         let mut yes = || true;
         let r = resolve_session_target(&flags, cwd, &[], &globals, false, &mut yes);
-        assert!(matches!(target_of(&r), SessionTarget::Fork { id: None, .. }));
-        assert!(r.stdout.iter().any(|l| l.contains("Session found in different project: /other/project")));
+        assert!(matches!(
+            target_of(&r),
+            SessionTarget::Fork { id: None, .. }
+        ));
+        assert!(
+            r.stdout
+                .iter()
+                .any(|l| l.contains("Session found in different project: /other/project"))
+        );
 
         // no → ExitOk + "Aborted.".
         let mut no = || false;
@@ -440,7 +497,10 @@ mod tests {
         let here = std::env::current_dir().unwrap();
         let here = here.to_string_lossy().to_string();
         let locals = vec![sref("loc", "/work/s/loc.jsonl", &here)];
-        let flags = SessionFlags { session: Some("loc".into()), ..Default::default() };
+        let flags = SessionFlags {
+            session: Some("loc".into()),
+            ..Default::default()
+        };
         let mut confirm_called = false;
         let r = resolve_session_target(&flags, cwd, &locals, &[], false, &mut || {
             confirm_called = true;
@@ -453,18 +513,39 @@ mod tests {
     #[test]
     fn continue_and_new_and_no_session() {
         let cwd = Path::new("/work");
-        let cont = SessionFlags { r#continue: true, ..Default::default() };
+        let cont = SessionFlags {
+            r#continue: true,
+            ..Default::default()
+        };
         assert!(matches!(
-            target_of(&resolve_session_target(&cont, cwd, &[], &[], false, &mut || true)),
+            target_of(&resolve_session_target(
+                &cont,
+                cwd,
+                &[],
+                &[],
+                false,
+                &mut || true
+            )),
             SessionTarget::Continue
         ));
         let new = SessionFlags::default();
         assert!(matches!(
-            target_of(&resolve_session_target(&new, cwd, &[], &[], false, &mut || true)),
+            target_of(&resolve_session_target(
+                &new,
+                cwd,
+                &[],
+                &[],
+                false,
+                &mut || true
+            )),
             SessionTarget::New
         ));
         // --no-session ignores resolution; with an id it seeds an ephemeral CreateWithId.
-        let ns = SessionFlags { no_session: true, session_id: Some("x".into()), ..Default::default() };
+        let ns = SessionFlags {
+            no_session: true,
+            session_id: Some("x".into()),
+            ..Default::default()
+        };
         assert!(matches!(
             target_of(&resolve_session_target(&ns, cwd, &[], &[], false, &mut || true)),
             SessionTarget::CreateWithId(id) if id == "x"
@@ -475,7 +556,10 @@ mod tests {
     fn interactive_missing_cwd_surfaces_issue_instead_of_erroring() {
         let cwd = Path::new("/work");
         let locals = vec![sref("loc", "/work/s/loc.jsonl", "/no/such/dir/xyzzy")];
-        let flags = SessionFlags { session: Some("loc".into()), ..Default::default() };
+        let flags = SessionFlags {
+            session: Some("loc".into()),
+            ..Default::default()
+        };
         // Interactive (non_interactive=false): the stored cwd is gone → the issue is surfaced for the
         // prompt; no outcome is set so the bin can run the Continue/Cancel selector.
         let r = resolve_session_target(&flags, cwd, &locals, &[], false, &mut || true);
@@ -496,7 +580,10 @@ mod tests {
         let here = std::env::current_dir().unwrap();
         let cwd = Path::new("/work");
         let locals = vec![sref("loc", "/work/s/loc.jsonl", &here.to_string_lossy())];
-        let flags = SessionFlags { session: Some("loc".into()), ..Default::default() };
+        let flags = SessionFlags {
+            session: Some("loc".into()),
+            ..Default::default()
+        };
         let r = resolve_session_target(&flags, cwd, &locals, &[], false, &mut || true);
         assert!(r.missing_cwd.is_none());
         assert!(matches!(target_of(&r), SessionTarget::Resume(_)));
@@ -523,12 +610,14 @@ mod tests {
     fn missing_cwd_error_only_when_stored_cwd_absent() {
         // An existing cwd (the test's own dir) → no issue.
         let here = std::env::current_dir().unwrap();
-        assert!(missing_session_cwd_error(
-            Some(Path::new("/s/a.jsonl")),
-            &here.to_string_lossy(),
-            Path::new("/fallback")
-        )
-        .is_none());
+        assert!(
+            missing_session_cwd_error(
+                Some(Path::new("/s/a.jsonl")),
+                &here.to_string_lossy(),
+                Path::new("/fallback")
+            )
+            .is_none()
+        );
         // A definitely-absent cwd → the multi-line Pi message.
         let msg = missing_session_cwd_error(
             Some(Path::new("/s/a.jsonl")),
@@ -536,7 +625,9 @@ mod tests {
             Path::new("/fallback"),
         )
         .expect("an issue");
-        assert!(msg.contains("Stored session working directory does not exist: /no/such/dir/xyzzy"));
+        assert!(
+            msg.contains("Stored session working directory does not exist: /no/such/dir/xyzzy")
+        );
         assert!(msg.contains("Session file: /s/a.jsonl"));
         assert!(msg.contains("Current working directory: /fallback"));
         // No session file → never an issue (a fresh session).

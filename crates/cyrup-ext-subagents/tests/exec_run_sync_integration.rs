@@ -331,3 +331,213 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     );
     assert_eq!(result.attempted_models[0].as_str(), "primary-model");
 }
+
+// -------------------------------------------------------------------------------------------
+// R-SA-055 (SAFETY-CRITICAL): the recursion-depth guard runs FIRST in `run_sync`, rejecting a
+// blocked attempt without EVER spawning the real fixture child — proven with
+// `CYRUP_SUBAGENT_BINARY` correctly pointed at the real, working fixture binary (never a bogus
+// path), so a failure to observe the fixture's own scripted marker output can only be attributed
+// to the depth guard itself, not to the fixture being unreachable for some unrelated reason.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_child() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    const NEVER_SPAWNED_MARKER: &str = "THIS-FIXTURE-MUST-NEVER-ACTUALLY-RUN";
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": message_end_line(NEVER_SPAWNED_MARKER, 1, 1)},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-depth-blocked.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Deliberately a
+    // REAL, working fixture (not a bogus path), so this test proves the depth guard is what
+    // prevents the spawn, not merely that a bad binary path would have failed anyway.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let mut agent = base_agent_config("fixture-model");
+    // current_depth == max_depth: is_blocked() must be true.
+    agent.depth = DepthEnvelope {
+        current_depth: 4,
+        max_depth: 4,
+    };
+    let opts = base_run_options(dir.path(), "fixture-model");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        cyrup_ext_subagents::exec::run_sync(&agent, "do something", &opts),
+    )
+    .await
+    .expect("a depth-blocked run_sync call must return near-instantly, never hang");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("depth limit exceeded"),
+        "expected a DepthExceeded-shaped error, got: {:?}",
+        result.error
+    );
+    assert!(
+        result.attempted_models.is_empty(),
+        "no model attempt (and therefore no real child process) may ever be made"
+    );
+    assert_ne!(
+        result.final_output.as_deref(),
+        Some(NEVER_SPAWNED_MARKER),
+        "the fixture's marker output must never appear — proving the real child was never spawned"
+    );
+    // The load-bearing proof, independent of the assertions above: `run_sync`'s spawn-scratch
+    // directory (the first filesystem side effect ANY spawn attempt, real or fixture, would ever
+    // create) must never have been created.
+    assert!(
+        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        "the depth guard must reject before the spawn-scratch directory is ever created, i.e. \
+         before any child process attempt"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// R-SA-030: structured-output extraction + parent-side JSON-Schema re-validation, against a
+// REAL scripted child process (no mocking, matching this file's own standing convention).
+// -------------------------------------------------------------------------------------------
+
+/// The declared JSON Schema shared by both R-SA-030 tests below: an object requiring a string
+/// `summary` and an integer `count`.
+fn sample_structured_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "count": {"type": "integer"}
+        },
+        "required": ["summary", "count"]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_field() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "emit", "line": message_end_line(
+                "Here is my structured result:\n```json\n{\"summary\": \"all good\", \"count\": 3}\n```",
+                10, 5,
+            )},
+            {"kind": "emit", "line": r#"{"type":"agent_end"}"#}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-structured-valid.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.structured_output_schema = Some(sample_structured_output_schema());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce the structured summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, well-behaved fixture child");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(result.exit_code, 0, "a schema-valid structured output must not fail the run: {result:?}");
+    assert!(result.error.is_none(), "got: {:?}", result.error);
+    assert_eq!(
+        result.structured_output,
+        Some(serde_json::json!({"summary": "all good", "count": 3})),
+        "R-SA-030: SingleResult::structured_output must be populated with the validated value, \
+         got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // "count" is a string here, not the schema-required integer — this must fail parent-side
+    // re-validation even though the child exited 0 and produced SOME structured-looking output.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "emit", "line": message_end_line(
+                "Here is my structured result:\n```json\n{\"summary\": \"all good\", \"count\": \"three\"}\n```",
+                10, 5,
+            )},
+            {"kind": "emit", "line": r#"{"type":"agent_end"}"#}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-structured-invalid.json", &script);
+
+    let fixture = fixture_binary_path();
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.structured_output_schema = Some(sample_structured_output_schema());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce the structured summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, well-behaved fixture child");
+
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_ne!(
+        result.exit_code, 0,
+        "R-SA-030: a structured output that fails parent-side schema validation MUST fail the \
+         run, got {result:?}"
+    );
+    assert!(
+        result.structured_output.is_none(),
+        "an invalid value must never be surfaced as the validated structured_output, got {:?}",
+        result.structured_output
+    );
+    let error = result.error.expect("a clear validation-error message must be present");
+    assert!(
+        error.contains("structured output validation failed") && error.contains("count"),
+        "expected a clear validation-error message naming the offending field, got: {error}"
+    );
+}

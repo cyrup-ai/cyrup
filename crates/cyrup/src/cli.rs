@@ -310,7 +310,10 @@ impl Cli {
                 conflicts.push("--no-session");
             }
             if !conflicts.is_empty() {
-                return Err(format!("--fork cannot be combined with {}", conflicts.join(", ")));
+                return Err(format!(
+                    "--fork cannot be combined with {}",
+                    conflicts.join(", ")
+                ));
             }
         }
         if let Some(id) = &self.session_id {
@@ -325,7 +328,10 @@ impl Cli {
                 conflicts.push("--resume");
             }
             if !conflicts.is_empty() {
-                return Err(format!("--session-id cannot be combined with {}", conflicts.join(", ")));
+                return Err(format!(
+                    "--session-id cannot be combined with {}",
+                    conflicts.join(", ")
+                ));
             }
             assert_valid_session_id(id)?;
         }
@@ -413,10 +419,11 @@ impl Cli {
             })
             .collect();
         config.target = self.session_target(&dirs.session_dir);
-        let explicit_session =
-            matches!(config.target, SessionTarget::Resume(_) | SessionTarget::Continue);
-        config.persist =
-            !self.no_session && (explicit_session || mode == AppMode::Interactive);
+        let explicit_session = matches!(
+            config.target,
+            SessionTarget::Resume(_) | SessionTarget::Continue
+        );
+        config.persist = !self.no_session && (explicit_session || mode == AppMode::Interactive);
         config
     }
 }
@@ -536,9 +543,14 @@ pub fn resolve_app_mode(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> AppMode
 /// alphanumeric at both ends. Returns Pi's exact error message on failure.
 pub fn assert_valid_session_id(id: &str) -> Result<(), String> {
     let valid = !id.is_empty()
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && id.chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric());
+        && id
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
     if valid {
         Ok(())
     } else {
@@ -655,23 +667,74 @@ pub fn partition_extension_flags(argv: &[String]) -> (Vec<String>, Vec<Extension
 /// Every long flag clap knows (used by [`partition_extension_flags`] to leave known flags + their
 /// values for clap). Kept in lockstep with the [`Cli`] struct.
 const KNOWN_LONG_FLAGS: &[&str] = &[
-    "--version", "--help", "--mode", "--print", "--output-format", "--json", "--rpc", "--provider",
-    "--model", "--api-key", "--thinking", "--models", "--system-prompt", "--append-system-prompt",
-    "--no-tools", "--no-builtin-tools", "--tools", "--exclude-tools", "--extension",
-    "--no-extensions", "--skill", "--no-skills", "--prompt-template", "--no-prompt-templates",
-    "--theme", "--no-themes", "--no-context-files", "--approve", "--no-approve", "--continue",
-    "--resume", "--session", "--session-id", "--fork", "--session-dir", "--no-session", "--name",
-    "--export", "--list-models", "--offline", "--verbose",
+    "--version",
+    "--help",
+    "--mode",
+    "--print",
+    "--output-format",
+    "--json",
+    "--rpc",
+    "--provider",
+    "--model",
+    "--api-key",
+    "--thinking",
+    "--models",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--no-tools",
+    "--no-builtin-tools",
+    "--tools",
+    "--exclude-tools",
+    "--extension",
+    "--no-extensions",
+    "--skill",
+    "--no-skills",
+    "--prompt-template",
+    "--no-prompt-templates",
+    "--theme",
+    "--no-themes",
+    "--no-context-files",
+    "--approve",
+    "--no-approve",
+    "--continue",
+    "--resume",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--no-session",
+    "--name",
+    "--export",
+    "--list-models",
+    "--offline",
+    "--verbose",
 ];
 
 /// The subset of [`KNOWN_LONG_FLAGS`] that take a value in their space-separated form (so the next
 /// token must be passed through to clap, never captured as an extension flag). `--list-models` is
 /// intentionally excluded — its value is optional and clap resolves it.
 const KNOWN_VALUE_LONG_FLAGS: &[&str] = &[
-    "--mode", "--output-format", "--provider", "--model", "--api-key", "--thinking", "--models",
-    "--system-prompt", "--append-system-prompt", "--tools", "--exclude-tools", "--extension",
-    "--skill", "--prompt-template", "--theme", "--session", "--session-id", "--fork",
-    "--session-dir", "--name", "--export",
+    "--mode",
+    "--output-format",
+    "--provider",
+    "--model",
+    "--api-key",
+    "--thinking",
+    "--models",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--tools",
+    "--exclude-tools",
+    "--extension",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--name",
+    "--export",
 ];
 
 /// Render Pi's rich `--help` body (args.ts:212-389): usage, the package/config commands, the full
@@ -690,7 +753,11 @@ pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
         let lines: Vec<String> = extension_flags
             .iter()
             .map(|f| {
-                let value = if matches!(f.value, ExtFlagValue::Str(_)) { " <value>" } else { "" };
+                let value = if matches!(f.value, ExtFlagValue::Str(_)) {
+                    " <value>"
+                } else {
+                    ""
+                };
                 format!("  --{}{}", f.name, value)
             })
             .collect();
@@ -864,7 +931,12 @@ Built-in Tool Names:
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -886,13 +958,31 @@ mod tests {
 
     #[test]
     fn mode_flag_and_aliases_take_precedence_over_tty() {
-        assert_eq!(resolve_app_mode(&parse(&["--mode", "rpc"]), true, true), AppMode::Rpc);
-        assert_eq!(resolve_app_mode(&parse(&["--rpc"]), true, true), AppMode::Rpc);
-        assert_eq!(resolve_app_mode(&parse(&["--mode", "json"]), true, true), AppMode::Json);
-        assert_eq!(resolve_app_mode(&parse(&["--json"]), true, true), AppMode::Json);
-        assert_eq!(resolve_app_mode(&parse(&["-p"]), true, true), AppMode::Print);
+        assert_eq!(
+            resolve_app_mode(&parse(&["--mode", "rpc"]), true, true),
+            AppMode::Rpc
+        );
+        assert_eq!(
+            resolve_app_mode(&parse(&["--rpc"]), true, true),
+            AppMode::Rpc
+        );
+        assert_eq!(
+            resolve_app_mode(&parse(&["--mode", "json"]), true, true),
+            AppMode::Json
+        );
+        assert_eq!(
+            resolve_app_mode(&parse(&["--json"]), true, true),
+            AppMode::Json
+        );
+        assert_eq!(
+            resolve_app_mode(&parse(&["-p"]), true, true),
+            AppMode::Print
+        );
         // `--mode text` is the default — interactive with a full TTY.
-        assert_eq!(resolve_app_mode(&parse(&["--mode", "text"]), true, true), AppMode::Interactive);
+        assert_eq!(
+            resolve_app_mode(&parse(&["--mode", "text"]), true, true),
+            AppMode::Interactive
+        );
     }
 
     #[test]
@@ -919,14 +1009,20 @@ mod tests {
         assert_eq!(parse(&["--no-approve"]).trust_override(), Some(false));
         assert_eq!(parse(&["-na"]).trust_override(), Some(false));
         assert_eq!(parse(&[]).trust_override(), None);
-        assert_eq!(parse(&["--approve", "--no-approve"]).trust_override(), Some(true));
+        assert_eq!(
+            parse(&["--approve", "--no-approve"]).trust_override(),
+            Some(true)
+        );
     }
 
     #[test]
     fn multi_char_short_aliases_normalize_to_longs() {
         assert!(parse(&["-nt"]).no_tools);
         assert!(parse(&["-nbt"]).no_builtin_tools);
-        assert_eq!(parse(&["-xt", "ask"]).exclude_tools, vec!["ask".to_string()]);
+        assert_eq!(
+            parse(&["-xt", "ask"]).exclude_tools,
+            vec!["ask".to_string()]
+        );
         assert!(parse(&["-ne"]).no_extensions);
         assert!(parse(&["-ns"]).no_skills);
         assert!(parse(&["-np"]).no_prompt_templates);
@@ -936,41 +1032,66 @@ mod tests {
     #[test]
     fn tool_flags_map_to_no_tools_modes_and_lists() {
         assert_eq!(parse(&["--no-tools"]).no_tools_mode(), Some(NoTools::All));
-        assert_eq!(parse(&["--no-builtin-tools"]).no_tools_mode(), Some(NoTools::Builtin));
+        assert_eq!(
+            parse(&["--no-builtin-tools"]).no_tools_mode(),
+            Some(NoTools::Builtin)
+        );
         // --no-tools wins when both are present.
         assert_eq!(
             parse(&["--no-tools", "--no-builtin-tools"]).no_tools_mode(),
             Some(NoTools::All)
         );
         let cli = parse(&["--tools", "read,grep,find", "--exclude-tools", "bash"]);
-        assert_eq!(cli.tools, vec!["read".to_string(), "grep".to_string(), "find".to_string()]);
+        assert_eq!(
+            cli.tools,
+            vec!["read".to_string(), "grep".to_string(), "find".to_string()]
+        );
         assert_eq!(cli.exclude_tools, vec!["bash".to_string()]);
     }
 
     #[test]
     fn provider_api_key_thinking_and_models_parse() {
         let cli = parse(&[
-            "--provider", "openai",
-            "--model", "openai/gpt-4o",
-            "--api-key", "sk-test",
-            "--thinking", "high",
-            "--models", "claude-sonnet,gpt-4o:low",
+            "--provider",
+            "openai",
+            "--model",
+            "openai/gpt-4o",
+            "--api-key",
+            "sk-test",
+            "--thinking",
+            "high",
+            "--models",
+            "claude-sonnet,gpt-4o:low",
         ]);
         assert_eq!(cli.provider.as_deref(), Some("openai"));
         assert_eq!(cli.model.as_deref(), Some("openai/gpt-4o"));
         assert_eq!(cli.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cli.thinking, Some(ThinkingArg::High));
-        assert_eq!(cli.models, vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()]);
+        assert_eq!(
+            cli.models,
+            vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()]
+        );
     }
 
     #[test]
     fn resource_flags_repeat_and_negate() {
         let cli = parse(&[
-            "--extension", "a.ts", "-e", "b.ts",
-            "--skill", "s1", "--theme", "t1", "--prompt-template", "p1",
+            "--extension",
+            "a.ts",
+            "-e",
+            "b.ts",
+            "--skill",
+            "s1",
+            "--theme",
+            "t1",
+            "--prompt-template",
+            "p1",
             "--no-themes",
         ]);
-        assert_eq!(cli.extension, vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")]);
+        assert_eq!(
+            cli.extension,
+            vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")]
+        );
         assert_eq!(cli.skill, vec![PathBuf::from("s1")]);
         assert_eq!(cli.theme, vec![PathBuf::from("t1")]);
         assert_eq!(cli.prompt_template, vec![PathBuf::from("p1")]);
@@ -980,28 +1101,58 @@ mod tests {
     #[test]
     fn list_models_optional_search_and_export() {
         assert_eq!(parse(&["--list-models"]).list_models.as_deref(), Some(""));
-        assert_eq!(parse(&["--list-models", "sonnet"]).list_models.as_deref(), Some("sonnet"));
+        assert_eq!(
+            parse(&["--list-models", "sonnet"]).list_models.as_deref(),
+            Some("sonnet")
+        );
         assert_eq!(parse(&[]).list_models, None);
-        assert_eq!(parse(&["--export", "s.jsonl"]).export, Some(PathBuf::from("s.jsonl")));
+        assert_eq!(
+            parse(&["--export", "s.jsonl"]).export,
+            Some(PathBuf::from("s.jsonl"))
+        );
     }
 
     #[test]
     fn session_target_precedence_and_validation() {
         let d = dirs();
-        assert!(matches!(parse(&["-c"]).session_target(&d.session_dir), SessionTarget::Continue));
-        assert!(matches!(parse(&[]).session_target(&d.session_dir), SessionTarget::New));
+        assert!(matches!(
+            parse(&["-c"]).session_target(&d.session_dir),
+            SessionTarget::Continue
+        ));
+        assert!(matches!(
+            parse(&[]).session_target(&d.session_dir),
+            SessionTarget::New
+        ));
         // A bare id resolves under the session dir with `.jsonl`.
         match parse(&["--session", "abc123"]).session_target(&d.session_dir) {
-            SessionTarget::Resume(p) => assert_eq!(p, PathBuf::from("/agent/sessions/abc123.jsonl")),
+            SessionTarget::Resume(p) => {
+                assert_eq!(p, PathBuf::from("/agent/sessions/abc123.jsonl"))
+            }
             other => panic!("expected resume, got {other:?}"),
         }
         // --fork wins over --continue (and conflicts are reported).
-        assert!(parse(&["--fork", "x", "--continue"]).validate_session_flags().is_err());
-        assert!(parse(&["--session", "a", "--session-id", "valid"]).validate_session_flags().is_err());
+        assert!(
+            parse(&["--fork", "x", "--continue"])
+                .validate_session_flags()
+                .is_err()
+        );
+        assert!(
+            parse(&["--session", "a", "--session-id", "valid"])
+                .validate_session_flags()
+                .is_err()
+        );
         // `--no-session --continue` is NOT a conflict in Pi (no-session just goes in-memory).
-        assert!(parse(&["--no-session", "--continue"]).validate_session_flags().is_ok());
+        assert!(
+            parse(&["--no-session", "--continue"])
+                .validate_session_flags()
+                .is_ok()
+        );
         // `--fork --session-id` is allowed (fork into a new id, Pi createSessionManager).
-        assert!(parse(&["--fork", "x", "--session-id", "newid"]).validate_session_flags().is_ok());
+        assert!(
+            parse(&["--fork", "x", "--session-id", "newid"])
+                .validate_session_flags()
+                .is_ok()
+        );
         assert!(parse(&["--continue"]).validate_session_flags().is_ok());
     }
 
@@ -1014,13 +1165,27 @@ mod tests {
         assert!(assert_valid_session_id("bad-").is_err());
         assert!(assert_valid_session_id("bad/slash").is_err());
         // Threaded through the flag validator (a value clap accepts but the grammar rejects).
-        assert!(parse(&["--session-id", "bad."]).validate_session_flags().is_err());
-        assert!(parse(&["--session-id", "ok.id-1"]).validate_session_flags().is_ok());
+        assert!(
+            parse(&["--session-id", "bad."])
+                .validate_session_flags()
+                .is_err()
+        );
+        assert!(
+            parse(&["--session-id", "ok.id-1"])
+                .validate_session_flags()
+                .is_ok()
+        );
     }
 
     #[test]
     fn name_is_trimmed_and_empty_is_rejected() {
-        assert_eq!(parse(&["--name", "  hi  "]).validated_name().unwrap().as_deref(), Some("hi"));
+        assert_eq!(
+            parse(&["--name", "  hi  "])
+                .validated_name()
+                .unwrap()
+                .as_deref(),
+            Some("hi")
+        );
         assert!(parse(&["--name", "   "]).validated_name().is_err());
         assert_eq!(parse(&[]).validated_name().unwrap(), None);
     }
@@ -1030,7 +1195,11 @@ mod tests {
         let cwd = std::path::Path::new("/work");
         let out = resolve_cli_paths(
             cwd,
-            &[PathBuf::from("rel/x.ts"), PathBuf::from("/abs/y.ts"), PathBuf::from("npm:@a/b")],
+            &[
+                PathBuf::from("rel/x.ts"),
+                PathBuf::from("/abs/y.ts"),
+                PathBuf::from("npm:@a/b"),
+            ],
         );
         assert_eq!(out[0], PathBuf::from("/work/rel/x.ts"));
         assert_eq!(out[1], PathBuf::from("/abs/y.ts"));
@@ -1052,14 +1221,27 @@ mod tests {
         ]);
         assert_eq!(
             clean,
-            vec!["--model".to_string(), "openai/gpt-4o".to_string(), "hello".to_string()]
+            vec![
+                "--model".to_string(),
+                "openai/gpt-4o".to_string(),
+                "hello".to_string()
+            ]
         );
         assert_eq!(
             flags,
             vec![
-                ExtensionFlag { name: "plan".into(), value: ExtFlagValue::Bool(true) },
-                ExtensionFlag { name: "reviewer".into(), value: ExtFlagValue::Str("alice".into()) },
-                ExtensionFlag { name: "limit".into(), value: ExtFlagValue::Str("5".into()) },
+                ExtensionFlag {
+                    name: "plan".into(),
+                    value: ExtFlagValue::Bool(true)
+                },
+                ExtensionFlag {
+                    name: "reviewer".into(),
+                    value: ExtFlagValue::Str("alice".into())
+                },
+                ExtensionFlag {
+                    name: "limit".into(),
+                    value: ExtFlagValue::Str("5".into())
+                },
             ]
         );
         // The clean argv still parses under clap with the unknowns removed.
@@ -1074,12 +1256,23 @@ mod tests {
     fn stdout_takeover_decision_matches_pi() {
         // Plain metadata commands (help / list-models without --print/--mode) are NOT guarded.
         assert!(is_plain_runtime_metadata_command(&parse(&["--help"])));
-        assert!(is_plain_runtime_metadata_command(&parse(&["--list-models"])));
-        assert!(!is_plain_runtime_metadata_command(&parse(&["-p", "--list-models"])));
+        assert!(is_plain_runtime_metadata_command(&parse(&[
+            "--list-models"
+        ])));
+        assert!(!is_plain_runtime_metadata_command(&parse(&[
+            "-p",
+            "--list-models"
+        ])));
         // Print/JSON/RPC (non-interactive, non-metadata) ARE guarded; interactive never is.
-        assert!(should_take_over_stdout(&parse(&["-p", "hi"]), AppMode::Print));
+        assert!(should_take_over_stdout(
+            &parse(&["-p", "hi"]),
+            AppMode::Print
+        ));
         assert!(should_take_over_stdout(&parse(&["--json"]), AppMode::Json));
-        assert!(!should_take_over_stdout(&parse(&["--help"]), AppMode::Print));
+        assert!(!should_take_over_stdout(
+            &parse(&["--help"]),
+            AppMode::Print
+        ));
         assert!(!should_take_over_stdout(&parse(&[]), AppMode::Interactive));
     }
 
@@ -1106,13 +1299,19 @@ mod tests {
     fn config_mapping_carries_flags_and_persistence() {
         let d = dirs();
         let cli = parse(&[
-            "--model", "faux/faux-1",
-            "--system-prompt", "be terse",
-            "--append-system-prompt", "cite sources",
-            "--append-system-prompt", "stay calm",
-            "--thinking", "low",
+            "--model",
+            "faux/faux-1",
+            "--system-prompt",
+            "be terse",
+            "--append-system-prompt",
+            "cite sources",
+            "--append-system-prompt",
+            "stay calm",
+            "--thinking",
+            "low",
             "--no-tools",
-            "--exclude-tools", "bash",
+            "--exclude-tools",
+            "bash",
             "--no-context-files",
             "--no-skills",
             "--no-approve",
@@ -1122,7 +1321,10 @@ mod tests {
         assert_eq!(config.cwd, PathBuf::from("/work"));
         assert_eq!(config.model_pattern.as_deref(), Some("faux/faux-1"));
         assert_eq!(config.system_prompt.as_deref(), Some("be terse"));
-        assert_eq!(config.append_system_prompt.as_deref(), Some("cite sources\nstay calm"));
+        assert_eq!(
+            config.append_system_prompt.as_deref(),
+            Some("cite sources\nstay calm")
+        );
         assert_eq!(config.thinking_level, Some(ModelThinkingLevel::Low));
         assert_eq!(config.no_tools, Some(NoTools::All));
         assert_eq!(config.exclude_tools, vec!["bash".to_string()]);
@@ -1191,20 +1393,33 @@ mod tests {
             config.extension_flag_values,
             vec![
                 ("plan".to_string(), SvcExtensionFlagValue::Bool(true)),
-                ("reviewer".to_string(), SvcExtensionFlagValue::Str("alice".to_string())),
+                (
+                    "reviewer".to_string(),
+                    SvcExtensionFlagValue::Str("alice".to_string())
+                ),
             ]
         );
         // No unknown flags ⇒ an empty threaded set (the live path carries nothing extra).
-        assert!(parse(&["hi"]).to_session_config(&d, AppMode::Print).extension_flag_values.is_empty());
+        assert!(
+            parse(&["hi"])
+                .to_session_config(&d, AppMode::Print)
+                .extension_flag_values
+                .is_empty()
+        );
     }
 
     #[test]
     fn resource_flags_thread_into_config() {
         let d = dirs();
         let cli = parse(&[
-            "--skill", "s1", "--skill", "s2",
-            "--theme", "t1",
-            "--prompt-template", "p1",
+            "--skill",
+            "s1",
+            "--skill",
+            "s2",
+            "--theme",
+            "t1",
+            "--prompt-template",
+            "p1",
             "--no-themes",
             "--no-prompt-templates",
         ]);
@@ -1222,8 +1437,14 @@ mod tests {
 
     #[test]
     fn scoped_model_pattern_matching() {
-        assert_eq!(split_model_level("sonnet:high"), ("sonnet".to_string(), Some(ThinkingArg::High)));
-        assert_eq!(split_model_level("anthropic/claude"), ("anthropic/claude".to_string(), None));
+        assert_eq!(
+            split_model_level("sonnet:high"),
+            ("sonnet".to_string(), Some(ThinkingArg::High))
+        );
+        assert_eq!(
+            split_model_level("anthropic/claude"),
+            ("anthropic/claude".to_string(), None)
+        );
         // A non-level suffix is preserved.
         assert_eq!(split_model_level("a:b"), ("a:b".to_string(), None));
 
@@ -1236,7 +1457,7 @@ mod tests {
 
     #[test]
     fn lenient_args_feed_clap_without_a_hard_error() {
-        use crate::diagnostics::{apply_arg_leniency, DiagnosticLevel};
+        use crate::diagnostics::{DiagnosticLevel, apply_arg_leniency};
 
         // The full bin pipeline: normalize → leniency → partition → clap. A bad `--mode` and a bad
         // `--thinking` must NOT make clap exit-2; they are dropped/warned by the leniency layer.
@@ -1278,8 +1499,16 @@ mod tests {
     #[test]
     fn model_flag_is_parsed_regardless_of_position() {
         // A `--model` placed AFTER the bare prompt must still be parsed as the model flag.
-        let after = parse(&["-p", "Reply with pong", "--model", "together/moonshotai/Kimi-K2.6"]);
-        assert_eq!(after.model.as_deref(), Some("together/moonshotai/Kimi-K2.6"));
+        let after = parse(&[
+            "-p",
+            "Reply with pong",
+            "--model",
+            "together/moonshotai/Kimi-K2.6",
+        ]);
+        assert_eq!(
+            after.model.as_deref(),
+            Some("together/moonshotai/Kimi-K2.6")
+        );
         assert_eq!(after.positionals, vec!["Reply with pong".to_string()]);
     }
 }

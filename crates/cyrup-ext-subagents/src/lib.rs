@@ -30,6 +30,10 @@ pub mod error;
 pub mod exec;
 pub mod extension;
 pub mod fork_context;
+/// The shared, size-capped append-only JSONL primitive (R-SA-136/146) used by both
+/// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
+/// event log. See [`jsonl`] for the full contract.
+pub mod jsonl;
 pub mod registration;
 pub mod spawn;
 pub mod tui;

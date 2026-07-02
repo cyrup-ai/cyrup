@@ -30,18 +30,19 @@ pub fn is_official_distribution() -> bool {
 
 /// Port of `areExperimentalFeaturesEnabled` (experimental.ts): `*_EXPERIMENTAL=1`.
 pub fn are_experimental_features_enabled() -> bool {
-    std::env::var("CYRUP_EXPERIMENTAL").map(|v| v == "1").unwrap_or(false)
-        || std::env::var("PI_EXPERIMENTAL").map(|v| v == "1").unwrap_or(false)
+    std::env::var("CYRUP_EXPERIMENTAL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        || std::env::var("PI_EXPERIMENTAL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
 }
 
 /// Port of `shouldRunFirstTimeSetup` (startup-ui.ts:115): official distribution AND experimental
 /// features AND default agent dir AND no existing `settings.json`. `agent_dir_overridden` reflects
 /// whether `*_CODING_AGENT_DIR` was set (startup-ui.ts:128). For cyrup this returns `false` because
 /// [`is_official_distribution`] is false.
-pub fn should_run_first_time_setup(
-    settings_path: &Path,
-    agent_dir_overridden: bool,
-) -> bool {
+pub fn should_run_first_time_setup(settings_path: &Path, agent_dir_overridden: bool) -> bool {
     if !is_official_distribution() {
         return false;
     }
@@ -59,7 +60,10 @@ pub fn should_run_first_time_setup(
 /// `existsSync(settingsPath)` and `/settings` persistence both rely on this). Global writes go to
 /// `<agent_dir>/settings.json`; project writes to `<cwd>/.cyrup/settings.json`.
 pub fn file_settings_store(dirs: &ConfigDirs) -> Arc<dyn SettingsStore> {
-    Arc::new(FileSettingsStore::new(dirs.settings_path(), dirs.project_settings_path()))
+    Arc::new(FileSettingsStore::new(
+        dirs.settings_path(),
+        dirs.project_settings_path(),
+    ))
 }
 
 /// The global `settings.json` path for the resolved dirs (the wizard predicate reads this).

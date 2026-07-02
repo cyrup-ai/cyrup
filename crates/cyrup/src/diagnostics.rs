@@ -35,10 +35,16 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn warning(message: impl Into<String>) -> Self {
-        Self { level: DiagnosticLevel::Warning, message: message.into() }
+        Self {
+            level: DiagnosticLevel::Warning,
+            message: message.into(),
+        }
     }
     pub fn error(message: impl Into<String>) -> Self {
-        Self { level: DiagnosticLevel::Error, message: message.into() }
+        Self {
+            level: DiagnosticLevel::Error,
+            message: message.into(),
+        }
     }
 }
 
@@ -56,9 +62,23 @@ const KNOWN_SHORT_FLAGS: [&str; 9] = ["-p", "-c", "-r", "-a", "-n", "-t", "-e", 
 /// `--mode`/`--thinking` are handled specially (their value IS inspected for leniency) and so are
 /// excluded here.
 const VALUE_LONG_FLAGS: [&str; 17] = [
-    "--provider", "--api-key", "--models", "--system-prompt", "--append-system-prompt", "--tools",
-    "--exclude-tools", "--extension", "--skill", "--prompt-template", "--theme", "--session",
-    "--session-id", "--fork", "--session-dir", "--name", "--export",
+    "--provider",
+    "--api-key",
+    "--models",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--tools",
+    "--exclude-tools",
+    "--extension",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--name",
+    "--export",
 ];
 
 /// `--model` is value-taking but is intentionally NOT lumped with [`VALUE_LONG_FLAGS`] only because
@@ -147,7 +167,12 @@ pub fn format_no_models_available_message() -> String {
 pub const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"cyrup -ne\".";
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -174,7 +199,11 @@ mod tests {
         assert_eq!(clean, v(&["go"]));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].level, DiagnosticLevel::Warning);
-        assert!(diags[0].message.contains("Invalid thinking level \"ultra\""));
+        assert!(
+            diags[0]
+                .message
+                .contains("Invalid thinking level \"ultra\"")
+        );
         // A valid level passes through.
         let (clean, diags) = apply_arg_leniency(&v(&["--thinking", "high"]));
         assert_eq!(clean, v(&["--thinking", "high"]));

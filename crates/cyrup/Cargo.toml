@@ -26,6 +26,10 @@ cyrup-session-svc = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-modes = { workspace = true }
 cyrup-tui = { workspace = true }
+# The SubAgents extension (arch-SA): registered as a native built-in at all three session
+# construction sites below, plus this bin owns the internal `__subagent-runner --config <path>`
+# hop-2 subcommand (`subagent_runner_cmd.rs`) that calls straight into its `background::runner_main`.
+cyrup-ext-subagents = { workspace = true }
 # Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
 cyrup-resources = { workspace = true }
 # The provider seam — `faux` is the only runnable provider until real HTTP providers land, so the

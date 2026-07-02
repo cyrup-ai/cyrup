@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::bail;
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::{
-    default_models, Credential, CreateModelsOptions, InMemoryCredentialStore, Provider,
+    CreateModelsOptions, Credential, InMemoryCredentialStore, Provider, default_models,
 };
 use cyrup_sdk::core::ProviderId;
 
@@ -24,7 +24,10 @@ use cyrup_sdk::core::ProviderId;
 /// the session's selected provider. The offline scripted faux provider is intentionally excluded (it
 /// is a cyrup run-time default, not a catalog entry, and has no analog in Pi's production registry).
 pub fn all_available_models() -> Vec<cyrup_provider::Model> {
-    let models = default_models(CreateModelsOptions { credentials: None, auth_context: None });
+    let models = default_models(CreateModelsOptions {
+        credentials: None,
+        auth_context: None,
+    });
     models.get_models(None)
 }
 
@@ -48,8 +51,11 @@ pub fn default_launch_model(
     has_configured_auth: &dyn Fn(&cyrup_provider::Model) -> bool,
 ) -> Option<(String, String)> {
     let all = all_available_models();
-    let available: Vec<cyrup_provider::Model> =
-        all.iter().filter(|m| has_configured_auth(m)).cloned().collect();
+    let available: Vec<cyrup_provider::Model> = all
+        .iter()
+        .filter(|m| has_configured_auth(m))
+        .cloned()
+        .collect();
     // No `--provider`/`--model`, no `--models` scope, fresh (non-continuing) session: Pi's step-1/2
     // (CLI args / scoped) are inert, so this exercises steps 3-5 exactly.
     let result = cyrup_config::find_initial_model(
@@ -101,7 +107,9 @@ fn resolve_provider_id<'a>(
     provider_override: Option<&'a str>,
     model_pattern: Option<&'a str>,
 ) -> Option<&'a str> {
-    provider_override.filter(|s| !s.is_empty()).or_else(|| provider_prefix(model_pattern))
+    provider_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| provider_prefix(model_pattern))
 }
 
 /// Resolve a [`Provider`] for the requested `(provider, model, apiKey)` triple.
@@ -126,7 +134,10 @@ pub fn select_provider(
                     .with_credential(ProviderId::from(id), Credential::api_key(key));
                 Arc::new(store) as Arc<dyn cyrup_provider::CredentialStore>
             });
-            let models = default_models(CreateModelsOptions { credentials, auth_context: None });
+            let models = default_models(CreateModelsOptions {
+                credentials,
+                auth_context: None,
+            });
             match models.get_provider(id) {
                 Some(provider) => Ok(provider),
                 None => {
@@ -177,7 +188,10 @@ pub fn unknown_model_warning(
         Some(p) => {
             let canonical = known(p)?; // an unknown explicit provider is select_provider's error
             let prefix = format!("{canonical}/");
-            let rest = if pattern.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+            let rest = if pattern
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+            {
                 pattern[prefix.len()..].to_string()
             } else {
                 pattern.to_string()
@@ -201,12 +215,15 @@ pub fn unknown_model_warning(
         m.provider.as_str().eq_ignore_ascii_case(&provider)
             && (m.id.as_str().eq_ignore_ascii_case(&base)
                 || m.id.as_str().to_ascii_lowercase().contains(&base_lc)
-                || format!("{}/{}", m.provider.as_str(), m.id.as_str()).eq_ignore_ascii_case(pattern))
+                || format!("{}/{}", m.provider.as_str(), m.id.as_str())
+                    .eq_ignore_ascii_case(pattern))
     });
     if found {
         None
     } else {
-        Some(format!("Model \"{base}\" not found for provider \"{provider}\". Using custom model id."))
+        Some(format!(
+            "Model \"{base}\" not found for provider \"{provider}\". Using custom model id."
+        ))
     }
 }
 
@@ -223,7 +240,10 @@ mod tests {
         let providers: std::collections::BTreeSet<&str> =
             models.iter().map(|m| m.provider.as_str()).collect();
         // Several distinct built-in providers are represented (anthropic/openai/together at minimum).
-        assert!(providers.len() > 1, "expected multiple providers, got {providers:?}");
+        assert!(
+            providers.len() > 1,
+            "expected multiple providers, got {providers:?}"
+        );
         assert!(providers.contains("anthropic"));
         assert!(providers.contains("openai"));
         assert!(providers.contains("together"));
@@ -233,10 +253,31 @@ mod tests {
 
     #[test]
     fn defaults_and_faux_resolve_to_faux() {
-        assert_eq!(select_provider(None, None, None).unwrap().id().as_str(), "faux");
-        assert_eq!(select_provider(None, Some("faux-1"), None).unwrap().id().as_str(), "faux");
-        assert_eq!(select_provider(None, Some("faux/faux-1"), None).unwrap().id().as_str(), "faux");
-        assert_eq!(select_provider(Some("faux"), None, None).unwrap().id().as_str(), "faux");
+        assert_eq!(
+            select_provider(None, None, None).unwrap().id().as_str(),
+            "faux"
+        );
+        assert_eq!(
+            select_provider(None, Some("faux-1"), None)
+                .unwrap()
+                .id()
+                .as_str(),
+            "faux"
+        );
+        assert_eq!(
+            select_provider(None, Some("faux/faux-1"), None)
+                .unwrap()
+                .id()
+                .as_str(),
+            "faux"
+        );
+        assert_eq!(
+            select_provider(Some("faux"), None, None)
+                .unwrap()
+                .id()
+                .as_str(),
+            "faux"
+        );
     }
 
     #[test]
@@ -267,7 +308,12 @@ mod tests {
         let together = select_provider(None, Some("together/moonshotai/Kimi-K2.6"), None)
             .expect("together is built-in");
         assert_eq!(together.id().as_str(), "together");
-        assert!(together.models().iter().any(|m| m.id.as_str() == "moonshotai/Kimi-K2.6"));
+        assert!(
+            together
+                .models()
+                .iter()
+                .any(|m| m.id.as_str() == "moonshotai/Kimi-K2.6")
+        );
     }
 
     #[test]
@@ -327,9 +373,12 @@ mod tests {
         // configured-provider curated default (Pi `findInitialModel` step 3, model-resolver.ts:600-609).
         let together_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "together";
         // The saved default names together's curated model explicitly; still resolves to together.
-        let (provider, pattern) =
-            default_launch_model(Some("together"), Some("moonshotai/Kimi-K2.6"), &together_configured)
-                .expect("saved settings default resolves");
+        let (provider, pattern) = default_launch_model(
+            Some("together"),
+            Some("moonshotai/Kimi-K2.6"),
+            &together_configured,
+        )
+        .expect("saved settings default resolves");
         assert_eq!(provider, "together");
         assert_eq!(pattern, "together/moonshotai/Kimi-K2.6");
     }

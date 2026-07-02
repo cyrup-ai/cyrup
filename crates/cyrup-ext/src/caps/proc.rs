@@ -322,6 +322,24 @@ pub struct ProcCaps {
     /// ([`Self::with_write_stdin_timeout`]) so the timeout-firing path is exercisable without a
     /// real test waiting 30 real seconds.
     write_stdin_timeout: Duration,
+    /// Pids of children that were spawned at the OS level but LOST the race to be inserted into
+    /// `registry` (`Self::spawn`'s atomic re-check against [`MAX_SPAWNED_PROCESSES`] — a real process
+    /// was already forked before the cap could be re-checked, see the doc there). Never guest-visible
+    /// (that `spawn` call itself returns `Err`, so no handle for the pid was ever handed out).
+    /// `Self::spawn` already makes a best-effort immediate `kill_pid` for such a pid, but that single
+    /// attempt's error is unavoidably swallowed there — `kill(2)`'s own failure modes (`ESRCH`/
+    /// `EPERM`) are not meaningfully retryable in a tight loop, and this synchronous rejection path
+    /// has no bounded-confirmation-wait budget the way the `async` [`Self::kill`] does. Recording the
+    /// pid here — instead of dropping it on the floor entirely, with zero compensating cleanup for
+    /// the rest of the host process's lifetime — gives it the SAME safety net [`Drop for ProcCaps`]
+    /// already provides every successfully REGISTERED child (`446b858`): a second `kill_pid` attempt
+    /// at session end, bounding the worst case to "leaked for the rest of THIS session" instead of
+    /// "leaked for the rest of the host process". Naturally bounded (no separate cap needed): once
+    /// `registry.len()` reaches [`MAX_SPAWNED_PROCESSES`] the FAST up-front check in `Self::spawn`
+    /// rejects every later call before it ever forks a real process, so this narrow reject-after-fork
+    /// race can only ever be hit while the registry is crossing that threshold — a handful of times
+    /// per session at most, never on every subsequent `spawn` call the way the registry itself is.
+    orphaned_pids: Mutex<Vec<u32>>,
 }
 
 impl std::fmt::Debug for ProcCaps {
@@ -353,6 +371,12 @@ impl Drop for ProcCaps {
             if entry.exit_code.borrow().is_none() {
                 let _ = cyrup_tools::kill_pid(entry.pid);
             }
+        }
+        // Second-chance sweep for pids that lost `Self::spawn`'s atomic cap race ([`Self::orphaned_pids`]'s
+        // doc) — same best-effort swallow idiom as above; whatever pid this is has no OTHER
+        // compensating cleanup, since it was never accepted into `registry` in the first place.
+        for pid in self.orphaned_pids.lock().map(|g| std::mem::take(&mut *g)).unwrap_or_default() {
+            let _ = cyrup_tools::kill_pid(pid);
         }
     }
 }

@@ -22,24 +22,26 @@ pub mod session_resolve;
 pub mod signals;
 pub mod startup;
 pub mod startup_ui;
+pub mod subagent_config;
+pub mod subagent_runner_cmd;
 pub mod subcommands;
 pub mod timings;
 
 pub use cli::{
-    normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
-    should_take_over_stdout, Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg,
+    Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, normalize_short_aliases,
+    partition_extension_flags, render_help, resolve_app_mode, should_take_over_stdout,
 };
 pub use diagnostics::{
-    apply_arg_leniency, format_no_models_available_message, get_provider_login_help, Diagnostic,
-    DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT,
+    Diagnostic, DiagnosticLevel, EXTENSION_LOAD_FAILURE_HINT, apply_arg_leniency,
+    format_no_models_available_message, get_provider_login_help,
 };
-pub use input::{build_inputs, compose_inputs, split_positionals, Inputs};
+pub use input::{Inputs, build_inputs, compose_inputs, split_positionals};
 pub use provider::{select_provider, unknown_model_warning};
 pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
 pub use session_resolve::{
+    MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup, SessionRef,
     format_missing_session_cwd_prompt, match_session_arg, missing_session_cwd_error,
-    resolve_session_target, MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup,
-    SessionRef,
+    resolve_session_target,
 };
 pub use signals::spawn_abort_on_signal;
 pub use startup::{
@@ -47,8 +49,8 @@ pub use startup::{
     should_run_first_time_setup,
 };
 pub use startup_ui::{
-    has_trust_requiring_project_resources, run_missing_cwd_prompt, run_resume_picker,
-    run_trust_prompt, session_rows, trust_needs_prompt, MissingCwdChoice, ResumeChoice, TrustChoice,
+    MissingCwdChoice, ResumeChoice, TrustChoice, has_trust_requiring_project_resources,
+    run_missing_cwd_prompt, run_resume_picker, run_trust_prompt, session_rows, trust_needs_prompt,
 };
 
 // Re-export the runtime-mode enum the whole bin pivots on (arch-11 §6.1).

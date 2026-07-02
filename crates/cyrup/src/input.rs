@@ -12,7 +12,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use base64::Engine;
 use cyrup_sdk::core::Content;
 use tokio::io::AsyncReadExt;
@@ -74,7 +74,11 @@ fn resolve_read_path(spec: &str, cwd: &Path) -> PathBuf {
     } else {
         PathBuf::from(spec)
     };
-    let resolved = if expanded.is_absolute() { expanded } else { cwd.join(expanded) };
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
     if resolved.exists() {
         return resolved;
     }
@@ -176,7 +180,14 @@ struct ProcessedImage {
 /// `normalizeSupportedImageMimeType`, image-process.ts:33-46). `image/jpg` folds to `image/jpeg`.
 /// Anything else (e.g. `image/bmp`) returns `None`, signalling a PNG conversion.
 fn supported_inline_mime(mime: &str) -> Option<&'static str> {
-    match mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase().as_str() {
+    match mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "image/png" => Some("image/png"),
         "image/jpeg" | "image/jpg" => Some("image/jpeg"),
         "image/gif" => Some("image/gif"),
@@ -213,7 +224,14 @@ fn process_image(bytes: &[u8], detected_mime: &str) -> Option<ProcessedImage> {
                 (
                     "image/png".to_string(),
                     buf.into_inner(),
-                    Some(detected_mime.split(';').next().unwrap_or(detected_mime).trim().to_ascii_lowercase()),
+                    Some(
+                        detected_mime
+                            .split(';')
+                            .next()
+                            .unwrap_or(detected_mime)
+                            .trim()
+                            .to_ascii_lowercase(),
+                    ),
                 )
             }
         };
@@ -228,20 +246,34 @@ fn process_image(bytes: &[u8], detected_mime: &str) -> Option<ProcessedImage> {
     let decoded = image::load_from_memory(&norm_bytes).ok()?;
     let (ow, oh) = (decoded.width(), decoded.height());
     if ow > MAX_IMAGE_EDGE || oh > MAX_IMAGE_EDGE {
-        let resized = decoded.resize(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE, image::imageops::FilterType::Lanczos3);
+        let resized = decoded.resize(
+            MAX_IMAGE_EDGE,
+            MAX_IMAGE_EDGE,
+            image::imageops::FilterType::Lanczos3,
+        );
         let (rw, rh) = (resized.width(), resized.height());
         let mut buf = std::io::Cursor::new(Vec::new());
-        resized.write_to(&mut buf, mime_to_format(&norm_mime)).ok()?;
+        resized
+            .write_to(&mut buf, mime_to_format(&norm_mime))
+            .ok()?;
         let scale = ow as f64 / rw.max(1) as f64;
         hints.push(format!(
             "[Image: original {ow}x{oh}, displayed at {rw}x{rh}. Multiply coordinates by {scale:.2} to map to original image.]"
         ));
         let data = base64::engine::general_purpose::STANDARD.encode(buf.get_ref());
-        return Some(ProcessedImage { data, mime_type: norm_mime, hints });
+        return Some(ProcessedImage {
+            data,
+            mime_type: norm_mime,
+            hints,
+        });
     }
 
     let data = base64::engine::general_purpose::STANDARD.encode(&norm_bytes);
-    Some(ProcessedImage { data, mime_type: norm_mime, hints })
+    Some(ProcessedImage {
+        data,
+        mime_type: norm_mime,
+        hints,
+    })
 }
 
 /// Process the `@file` references into wrapped text + image attachments (Pi `processFileArguments`).
@@ -329,7 +361,10 @@ async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     let mut buf = String::new();
-    tokio::io::stdin().read_to_string(&mut buf).await.context("reading piped stdin")?;
+    tokio::io::stdin()
+        .read_to_string(&mut buf)
+        .await
+        .context("reading piped stdin")?;
     if buf.trim().is_empty() {
         Ok(None)
     } else {
@@ -342,13 +377,27 @@ async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
 pub async fn build_inputs(cli: &Cli, cwd: &Path) -> anyhow::Result<Inputs> {
     let (files, messages) = split_positionals(&cli.positionals);
     let processed = process_file_args(&files, cwd).await?;
-    let file_text = if processed.text.is_empty() { None } else { Some(processed.text) };
+    let file_text = if processed.text.is_empty() {
+        None
+    } else {
+        Some(processed.text)
+    };
     let piped = read_piped_stdin().await?;
-    Ok(compose_inputs(file_text, processed.images, &messages, piped))
+    Ok(compose_inputs(
+        file_text,
+        processed.images,
+        &messages,
+        piped,
+    ))
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -379,7 +428,10 @@ mod tests {
             &s(&["first", "second", "third"]),
             Some("PIPED\n".to_string()),
         );
-        assert_eq!(inputs.initial, "PIPED\n<file name=\"/a\">\nBODY\n</file>\nfirst");
+        assert_eq!(
+            inputs.initial,
+            "PIPED\n<file name=\"/a\">\nBODY\n</file>\nfirst"
+        );
         assert_eq!(inputs.follow_ups, s(&["second", "third"]));
     }
 
@@ -444,13 +496,22 @@ mod tests {
             }
             other => panic!("expected image content, got {other:?}"),
         }
-        assert_eq!(processed.text, format!("<file name=\"{}\"></file>\n", path.display()));
+        assert_eq!(
+            processed.text,
+            format!("<file name=\"{}\"></file>\n", path.display())
+        );
     }
 
     #[test]
     fn detect_mime_recognizes_signatures() {
-        assert_eq!(detect_image_mime(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]), Some("image/png"));
-        assert_eq!(detect_image_mime(&[0xff, 0xd8, 0xff, 0x00]), Some("image/jpeg"));
+        assert_eq!(
+            detect_image_mime(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            Some("image/png")
+        );
+        assert_eq!(
+            detect_image_mime(&[0xff, 0xd8, 0xff, 0x00]),
+            Some("image/jpeg")
+        );
         assert_eq!(detect_image_mime(b"GIF89a..."), Some("image/gif"));
         assert_eq!(detect_image_mime(b"plain text"), None);
     }

@@ -2,14 +2,19 @@
 //! scripted faux provider in a tempdir and exercise the PRINT and JSON dispatchers into `Vec<u8>`
 //! buffers — no TTY, no network. Asserts the final assistant text (PRINT) and the ordered JSONL
 //! event sequence (JSON), plus follow-up replay (R-11-009).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
 use cyrup::input::Inputs;
 use cyrup::run::{run_json_dispatch, run_print_dispatch};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_sdk::core::{AssistantMessage, StopReason};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, SessionTarget};
 use tempfile::TempDir;
@@ -41,12 +46,16 @@ fn text(initial: &str, follow_ups: &[&str]) -> Inputs {
 
 #[tokio::test]
 async fn print_dispatch_writes_final_assistant_text() {
-    let (session, _cwd, _agent) =
-        session_with(vec![faux_assistant_message(vec![faux_text("hello world")], StopReason::Stop)])
-            .await;
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("hello world")],
+        StopReason::Stop,
+    )])
+    .await;
 
     let mut out: Vec<u8> = Vec::new();
-    let code = run_print_dispatch(&session, &text("hi", &[]), &mut out).await.unwrap();
+    let code = run_print_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
 
     let printed = String::from_utf8(out).unwrap();
     assert_eq!(printed.trim(), "hello world");
@@ -62,22 +71,33 @@ async fn print_dispatch_replays_follow_ups_in_order() {
     .await;
 
     let mut out: Vec<u8> = Vec::new();
-    run_print_dispatch(&session, &text("q1", &["q2"]), &mut out).await.unwrap();
+    run_print_dispatch(&session, &text("q1", &["q2"]), &mut out)
+        .await
+        .unwrap();
 
     let printed = String::from_utf8(out).unwrap();
     let first = printed.find("first answer").expect("first answer printed");
-    let second = printed.find("second answer").expect("second answer printed");
-    assert!(first < second, "follow-up replayed after the initial run (R-11-009)");
+    let second = printed
+        .find("second answer")
+        .expect("second answer printed");
+    assert!(
+        first < second,
+        "follow-up replayed after the initial run (R-11-009)"
+    );
 }
 
 #[tokio::test]
 async fn json_dispatch_emits_ordered_event_stream() {
-    let (session, _cwd, _agent) =
-        session_with(vec![faux_assistant_message(vec![faux_text("hi there")], StopReason::Stop)])
-            .await;
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("hi there")],
+        StopReason::Stop,
+    )])
+    .await;
 
     let mut out: Vec<u8> = Vec::new();
-    let code = run_json_dispatch(&session, &text("hello", &[]), &mut out).await.unwrap();
+    let code = run_json_dispatch(&session, &text("hello", &[]), &mut out)
+        .await
+        .unwrap();
 
     let body = String::from_utf8(out).unwrap();
     let kinds: Vec<String> = body
@@ -94,8 +114,16 @@ async fn json_dispatch_emits_ordered_event_stream() {
         })
         .collect();
 
-    assert_eq!(kinds.first().map(String::as_str), Some("agent_start"), "stream opens with agent_start");
-    assert_eq!(kinds.last().map(String::as_str), Some("agent_end"), "stream closes with agent_end");
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("agent_start"),
+        "stream opens with agent_start"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("agent_end"),
+        "stream closes with agent_end"
+    );
     assert_eq!(code, 0);
 }
 
@@ -126,22 +154,46 @@ async fn fork_target_copies_history_into_a_new_id() {
 
     // 1. Build + run a persisted SOURCE session so a file with entries exists on disk.
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("source answer")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("source answer")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux;
     let mut src_cfg = SessionConfig::new(cwd.path(), agent_dir.path());
     src_cfg.persist = true;
-    let source = SessionBuilder::new(provider, src_cfg).build().await.unwrap();
+    let source = SessionBuilder::new(provider, src_cfg)
+        .build()
+        .await
+        .unwrap();
     let mut sink: Vec<u8> = Vec::new();
-    run_print_dispatch(&source, &text("seed", &[]), &mut sink).await.unwrap();
-    let source_file = source.session_file().await.expect("source session flushed to disk");
+    run_print_dispatch(&source, &text("seed", &[]), &mut sink)
+        .await
+        .unwrap();
+    let source_file = source
+        .session_file()
+        .await
+        .expect("source session flushed to disk");
 
     // 2. Fork that file into a fresh session that adopts the explicit id.
     let provider2: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let mut fork_cfg = SessionConfig::new(cwd.path(), agent_dir.path());
     fork_cfg.persist = true;
-    fork_cfg.target = SessionTarget::Fork { source: source_file, id: Some("forked-id".to_string()) };
-    let forked = SessionBuilder::new(provider2, fork_cfg).build().await.unwrap();
+    fork_cfg.target = SessionTarget::Fork {
+        source: source_file,
+        id: Some("forked-id".to_string()),
+    };
+    let forked = SessionBuilder::new(provider2, fork_cfg)
+        .build()
+        .await
+        .unwrap();
 
-    assert_eq!(forked.session_id().as_str(), "forked-id", "fork adopts --session-id");
-    assert!(!forked.entries_json().await.is_empty(), "fork copies the source history");
+    assert_eq!(
+        forked.session_id().as_str(),
+        "forked-id",
+        "fork adopts --session-id"
+    );
+    assert!(
+        !forked.entries_json().await.is_empty(),
+        "fork copies the source history"
+    );
 }

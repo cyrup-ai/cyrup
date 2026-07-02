@@ -26,6 +26,14 @@ cyrup-ext = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
+# `/subagents-models` and `/subagents-refresh-provider-models` (R-SA-129/130 gap closure): the
+# only genuine, already-built provider/model-catalog surface in the workspace today is this
+# crate's static, embedded seed catalog (`catalog::seed_catalog`/`load_catalog`) — full
+# models.dev live-probe generation/refresh is explicitly DEFERRED (func-SA §9 item 31, arch-SA
+# §12 item 11), so this dependency is used ONLY for that already-real static-catalog read, never
+# to invent the deferred live-probe algorithm. `cyrup-ext` (already a direct dependency above)
+# itself depends on `cyrup-provider`, so this adds no new layering cycle.
+cyrup-provider = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "signal", "macros", "rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,12 +41,24 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 nix = { workspace = true, features = ["signal", "process"] }
 notify = { workspace = true }
+# Parent-side JSON-Schema re-validation of a subagent child's structured-output value (R-SA-030,
+# `exec/structured.rs`) — see the workspace `Cargo.toml`'s own comment above this dependency's
+# entry for the full crate-choice rationale (`jsonschema` over `schemars`) and why default
+# features (remote/file `$ref` resolution) are disabled.
+jsonschema = { workspace = true }
 # `v4` added on top of the workspace-default `v7` feature: `background::RunId` (R-SA-072) needs
 # pure random entropy for an opaque, non-orderable run token, whereas `atomic.rs`'s temp-filename
 # nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
 uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
 tracing = "0.1.44"
+# `tui/render.rs`'s pure fold-to-aggregate rendering functions (R-SA-106..113) return
+# `ratatui::text::Line`/`Span` values so a live terminal owner (`cyrup-tui`, out of scope for
+# this crate — see arch-SA §1.1/§6.1's crate-boundary rule) can paint them without this crate
+# depending on `cyrup-tui` itself. Same pinned version `cyrup-tui`/`cyrup-test-support` use
+# directly (not workspace-aliased there either); no `crossterm`/backend features needed here since
+# this crate never owns a live terminal, only builds renderable line/span values.
+ratatui = "0.30.2"
 
 [[bin]]
 # The scripted-NDJSON test-double `cyrup`-shaped binary (arch-SA §11): emits scripted NDJSON
@@ -52,5 +72,30 @@ name = "cyrup-subagent-fixture"
 path = "src/bin/cyrup_subagent_fixture.rs"
 required-features = ["test-fixtures"]
 
+[[bin]]
+# A-SA-12's own tiny helper binary (func-SA §7): plays the role of "the orchestrator" as a real,
+# separate, killable OS process so an integration test can kill it mid-background-run and observe
+# that the detached runner it spawned survives independently (DI-SA-8/R-SA-070/071). See that
+# binary's own module doc for the full rationale/contract. Same never-shipped-in-real-`cyrup`
+# gating as `cyrup-subagent-fixture` above.
+name = "cyrup-subagent-orchestrator-sim"
+path = "src/bin/cyrup_subagent_orchestrator_sim.rs"
+required-features = ["test-fixtures"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tui::render`'s tests paint into a real `TestBackend` grid via `cyrup_test_support::tui::
+# TestTerminal` (mirroring `crates/cyrup-tui/tests/assembled_render.rs`'s whole-buffer text-grid
+# pattern) rather than asserting on `Line`/`Span` structure alone. Not aliased in
+# `[workspace.dependencies]` (no existing crate depends on it as a dev-dependency yet), so this is
+# a plain path dependency, matching how the crate itself is declared as a workspace member.
+cyrup-test-support = { path = "../cyrup-test-support" }
+# `tests/extension_end_to_end_smoke.rs` asserts on `AgentSessionEvent::{ToolExecutionStart,
+# ToolExecutionEnd}` observed on a REAL `cyrup-test-support`-built session (the only way to prove
+# `extension.rs`'s `NativeExtension`/`Tool` registration actually reaches a live session's tool
+# registry) — `cyrup-test-support`'s own `Harness` uses this type internally but does not
+# re-export it at its crate root, so this crate's dev-dependency closure needs it directly, dev-only
+# (never a production dependency: `cyrup-ext-subagents` itself has zero `cyrup-session-svc`
+# dependency in `[dependencies]` above, preserving this crate's own crate-boundary rule that it
+# never depends on the session-service facade in production code).
+cyrup-session-svc = { workspace = true }

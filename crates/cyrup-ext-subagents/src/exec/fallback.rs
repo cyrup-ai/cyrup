@@ -251,7 +251,13 @@ pub fn format_attempt_note(
 
 /// One row of the model-fallback ladder's attempt history (R-SA-040's `model_attempts`;
 /// arch-SA §3.4's `ModelAttempt`).
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Serialize`/`Deserialize` are derived (beyond the original `Debug, Clone`) because
+/// `background::ResultFile` (func-SA §4.5, R-SA-077/166) embeds this type transitively via
+/// `SingleResult.model_attempts` and must round-trip through `status.json`/the terminal result
+/// file exactly like every other field on that struct.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelAttempt {
     pub model: ModelId,
     pub success: bool,
@@ -333,6 +339,48 @@ pub struct AttemptSignal {
     /// nor does it retry) but is tracked as its own distinct flag rather than folded into
     /// `timed_out`, since downstream gate-bypass behavior distinguishes the two (R-SA-037 bypasses
     /// acceptance/completion-guard/truncation entirely; R-SA-036 does not).
+    ///
+    /// # Why this is always `false` today (not a bug)
+    ///
+    /// There is currently **no live trigger path anywhere in this crate** that can ever set this
+    /// `true`, and that is intentional, not an oversight:
+    ///
+    /// - The only production [`AttemptRunner`] impl, `exec::mod::SpawnedChildAttemptRunner`,
+    ///   hardcodes `detached: false` on every `AttemptSignal` it constructs (see that impl's own
+    ///   `run_attempt`, `exec/mod.rs`).
+    /// - The NDJSON wire union a child subprocess actually emits, [`crate::exec::ndjson::SubagentEvent`],
+    ///   has **no variant at all** carrying a "child is blocked on an intercom-style
+    ///   supervisor-clarify interaction" signal — so even a fully-faithful `AttemptRunner` reading
+    ///   every event on the wire today has nothing to observe that would justify setting this
+    ///   field.
+    /// - `crate::tui::intercom`'s `ClarifyRequest`/`AskLock`/`request_clarify` machinery (the
+    ///   actual R-SA-119/120 clarify/ask primitive) is a real, tested, in-memory single-slot lock,
+    ///   but it is explicitly documented (see that module's own `NOTE(clarify-deferred)`) as not
+    ///   wired to any live human-facing channel and not connected to this crate's spawn/exec path
+    ///   at all — it has no way to observe a real child subprocess's stdout, and nothing in
+    ///   `exec/` calls into it.
+    ///
+    /// This is the sanctioned, documented deferral tracked as architecture.md §12 open questions
+    /// item 6 (the `LiveHostServices`/`ui_sink` wiring is currently WASM-guest-only; reaching it
+    /// from this native extension requires adding a `cyrup-session-svc` dependency and threading a
+    /// constructor-time handle through `SubagentsExtension::new`, neither of which exists yet) and
+    /// func-SA §9 item 25 / architecture.md §12 item 7 (the `pi-intercom` companion transport's
+    /// Rust-port status is unconfirmed, so there is not even an external signal source to wire
+    /// from on the other end). **Do not fabricate a synthetic trigger for this field** (e.g. a
+    /// heuristic guess from output text, a fake NDJSON event, or a test-only backdoor reachable
+    /// from production code) — doing so would create a false "intercom detach" signal with no
+    /// real supervisor-clarify interaction behind it.
+    ///
+    /// A future phase that completes R-SA-119/120's live wiring should set this field from a real
+    /// blocking-detach signal by: (1) adding a `SubagentEvent` variant (or reusing an existing
+    /// clarify-shaped event once one exists on the wire) that a child emits when it blocks on a
+    /// supervisor-clarify interaction, (2) having `SpawnedChildAttemptRunner::run_attempt` observe
+    /// that event via `drive_attempt`'s NDJSON loop and route it through a constructed
+    /// `tui::intercom::AskLock` backed by a real `ClarifyChannel` (per `tui/intercom.rs`'s own
+    /// `NOTE(clarify-deferred)` seam), and (3) setting `AttemptSignal::detached = true` on that
+    /// attempt's outcome instead of the current unconditional `false` — with no change required to
+    /// `run_fallback_ladder`'s or `run_sync`'s own gate-bypass logic, both of which already
+    /// correctly branch on this flag.
     pub detached: bool,
 }
 

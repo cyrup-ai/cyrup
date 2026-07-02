@@ -7,7 +7,7 @@
 
 use std::io::Write;
 
-use cyrup_modes::{run_json, run_print, run_rpc, PrintOptions};
+use cyrup_modes::{PrintOptions, run_json, run_print, run_rpc};
 use cyrup_session_svc::{AgentSession, AgentSessionRuntime, InputSource, UserInput};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 

@@ -57,6 +57,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{ChildStderr, ChildStdout};
 
 use crate::error::SubagentError;
+use crate::jsonl::BoundedJsonlWriter;
 
 /// Threshold (characters) above which the task prompt MUST be written to a temp file and passed
 /// as an `@<tempfile>` argv reference instead of a literal argument, to stay well clear of OS
@@ -281,8 +282,11 @@ pub struct SpawnedChild {
     stdout_lines: Lines<BufReader<ChildStdout>>,
     stderr_lines: Lines<BufReader<ChildStderr>>,
     /// Raw NDJSON stdout lines, teed unmodified as they are read (R-SA-058), written lazily via
-    /// [`SpawnedChild::next_event`] rather than buffered and flushed at exit.
-    jsonl_writer: tokio::fs::File,
+    /// [`SpawnedChild::next_event`] rather than buffered and flushed at exit. Size-capped at
+    /// [`crate::jsonl::DEFAULT_JSONL_CAP_BYTES`] per file (R-SA-136/146): once the cap is reached,
+    /// further lines are silently dropped without erroring this run or corrupting the lines
+    /// already written — see [`BoundedJsonlWriter`] for the exact contract.
+    jsonl_writer: BoundedJsonlWriter,
     /// Temp files (long task text, system-prompt overrides) to remove once this child exits, on
     /// both the success and failure paths (R-SA-067) — see [`cleanup_temp_files`].
     temp_files: Vec<PathBuf>,
@@ -370,7 +374,7 @@ impl SpawnedChild {
             .take()
             .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("child stderr not piped")))?;
 
-        let jsonl_writer = tokio::fs::File::create(jsonl_path)
+        let jsonl_writer = BoundedJsonlWriter::create(jsonl_path)
             .await
             .map_err(SubagentError::Spawn)?;
 
@@ -414,7 +418,7 @@ impl SpawnedChild {
             Err(err) => return Some(Err(SubagentError::Spawn(err))),
         };
 
-        if let Err(err) = tee_line(&mut self.jsonl_writer, &line).await {
+        if let Err(err) = self.jsonl_writer.write_line(&line).await {
             return Some(Err(SubagentError::Spawn(err)));
         }
 
@@ -523,18 +527,6 @@ fn cleanup_temp_files(paths: &[PathBuf]) {
             );
         }
     }
-}
-
-/// Write `line` plus a trailing newline to `writer`, unmodified, and flush — the raw-stdout-tee
-/// half of R-SA-058. Flushing every line (rather than relying on buffered-writer batching) is
-/// deliberate: the artifact must reflect what has actually been read "live", not only once some
-/// internal buffer happens to fill, since an operator tailing the `.jsonl` file while a run is
-/// still in progress is exactly the scenario this artifact exists for.
-async fn tee_line(writer: &mut tokio::fs::File, line: &str) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await
 }
 
 #[cfg(test)]

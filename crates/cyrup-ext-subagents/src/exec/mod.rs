@@ -10,6 +10,8 @@
 //!   this module folds progress/usage state from (R-SA-026/057/058).
 //! - [`output`] — final-output extraction, file-only output-path handoff, UTF-8-safe truncation
 //!   (R-SA-024/025/029/031/042).
+//! - [`structured`] — structured-output extraction from the child's event stream + parent-side
+//!   JSON-Schema re-validation via the `jsonschema` crate (R-SA-030).
 //! - [`completion_guard`] — implementation-expecting classification + mutating-tool-call scan
 //!   (R-SA-034).
 //! - [`fallback`] — the model-fallback ladder-construction/retry-classification/usage-aggregation
@@ -50,6 +52,9 @@ pub mod ndjson;
 /// (R-SA-024/025/031), and UTF-8-safe output truncation (R-SA-042).
 pub mod output;
 
+/// Parent-side structured-output extraction and JSON-Schema re-validation (R-SA-030).
+pub mod structured;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -72,6 +77,7 @@ use crate::exec::output::{
     OutputCap, build_output_path_system_prompt_instruction, extract_final_output,
     resolve_output_handoff, snapshot_output_file, truncate_output, validate_file_only_requires_path,
 };
+use crate::exec::structured::{StructuredOutcome, resolve_structured_output};
 use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
 use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::{ChildSpawnSpec, SpawnCommand, SpawnedChild};
@@ -204,7 +210,14 @@ pub use crate::exec::fallback::ModelAttempt as RunModelAttempt;
 /// (`RunOptions.include_progress`-gated, §4.3) is a materially different, richer shape this crate
 /// does not construct in this module (that belongs to `tui/` once it exists); `SingleResult` is
 /// exclusively the terminal return value.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Serialize`/`Deserialize` are derived (beyond the original `Debug, Clone`) because
+/// `background::ResultFile` (func-SA §4.5, R-SA-077/166) embeds `Vec<SingleResult>` directly and
+/// must round-trip it through `status.json`/the terminal result file exactly like every other
+/// field on that struct — a bare `Debug, Clone` shape cannot satisfy `write_atomic_json`'s
+/// `T: Serialize` bound (R-SA-076).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SingleResult {
     pub agent: String,
     pub task: String,
@@ -217,7 +230,10 @@ pub struct SingleResult {
     pub structured_output: Option<serde_json::Value>,
     pub acceptance: Option<AcceptanceLedger>,
     /// R-SA-037: an intercom-style blocking detach signal was observed — bypasses acceptance,
-    /// completion-guard, and output truncation entirely.
+    /// completion-guard, and output truncation entirely. Always `false` in every build of this
+    /// crate today: see [`crate::exec::fallback::AttemptSignal::detached`]'s doc comment for the
+    /// full, current explanation of why no live trigger for this exists yet and exactly what
+    /// future work (the R-SA-119/120 intercom wiring) would set it.
     pub detached: bool,
     /// A soft interrupt was observed (`RunOptions.interrupt` fired) — like a timeout, this
     /// terminates the fallback ladder outright without advancing, but is recorded under its own
@@ -270,9 +286,10 @@ pub struct AgentProgress {
     /// list [`SingleResult`] carries (R-SA-043).
     pub tool_end_events: Vec<SubagentEvent>,
     /// The full parsed transcript of every recognized event this attempt observed, in
-    /// chronological order — retained for callers (a later phase's structured-output validation,
-    /// R-SA-030) that need more than the two narrower vectors above; `run_sync` itself only reads
-    /// `message_end_events`/`tool_end_events` for its own R-SA-029/034 wiring.
+    /// chronological order — feeds [`structured::resolve_structured_output`] (R-SA-030), which
+    /// needs more than the two narrower vectors above; `run_sync` also reads this directly for
+    /// that R-SA-030 wiring, alongside `message_end_events`/`tool_end_events` for its own
+    /// R-SA-029/034 wiring.
     pub all_events: Vec<SubagentEvent>,
 }
 
@@ -591,8 +608,9 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 error,
                 usage: progress.usage.clone(),
                 timed_out,
-                detached: false, // R-SA-037: intercom detach is out of this phase's scope; see
-                                 // module doc — no path in this crate currently sets this true.
+                detached: false, // R-SA-037: no live trigger exists yet in this crate — see
+                                 // `AttemptSignal::detached`'s doc comment (exec/fallback.rs) for
+                                 // the full explanation and exactly what future work sets this.
             },
             AttemptRecord {
                 progress,
@@ -712,6 +730,17 @@ async fn drive_attempt(
 ///
 /// # Pipeline (strict order, per R-SA-033's own ordering restated at the top level)
 ///
+/// 0. R-SA-055 (SAFETY-CRITICAL): the recursion-depth guard ([`crate::spawn::depth::is_blocked`]
+///    against `agent.depth`) runs FIRST, before anything else in this function — including
+///    R-SA-025's own output-mode validation immediately below. `run_sync` is the sole real spawn
+///    chokepoint in this crate (every production caller — the foreground tool dispatch, the
+///    background runner's step loop, and every chain/parallel/dynamic fan-out child reached via
+///    `chain_graph::walk_chain`/`spawn::parallel::run_bounded`'s `SingleStepExecutor` seam —
+///    funnels through this one function before ever touching `SpawnedChild::spawn`), so gating
+///    here is what makes the depth ceiling actually bind at runtime rather than merely existing as
+///    a unit-tested-in-isolation predicate. A blocked attempt returns
+///    [`SubagentError::DepthExceeded`]'s message as `SingleResult::error` with `exit_code: 1` and
+///    spawns nothing.
 /// 1. R-SA-025: file-only output mode requires an output path — fail fast, before any subprocess
 ///    is spawned, if violated.
 /// 2. Resolve the effective acceptance contract (explicit `opts.acceptance`, or
@@ -722,13 +751,16 @@ async fn drive_attempt(
 ///    (detach) both terminate the ladder outright without advancing, exactly as
 ///    `run_fallback_ladder` itself already enforces (this module supplies the signal, not the
 ///    ladder-control logic, which stays [`fallback`]'s sole responsibility).
-/// 5. R-SA-030: structured-output validation (schema presence/validity) — deferred: this phase
-///    (R-SA-027/028/036/043) does not implement full JSON-Schema re-validation; see
-///    [`SingleResult::structured_output`]'s doc note and architecture.md §12 item 13 (JSON-Schema
-///    validation crate choice is an open question upstream of this phase). Structured output, if
-///    the child emitted one recognizably, is currently passed through unvalidated; a later phase
-///    (owning `exec/output.rs`'s own follow-up or a dedicated `exec/structured.rs`) is expected to
-///    add real schema validation here without changing this function's own call shape.
+/// 5. R-SA-030: structured-output extraction + parent-side JSON-Schema re-validation, via
+///    [`structured::resolve_structured_output`] (arch-SA §12 item 13's resolved crate choice,
+///    `jsonschema`). Only evaluated when the run is otherwise clean (exit 0, not detached/
+///    interrupted/timed-out) — mirrors R-SA-032/033's own "don't re-diagnose an already-failed
+///    attempt" gate. If `opts.structured_output_schema` is `None`, this step is a no-op
+///    (`SingleResult::structured_output` stays `None`). If a schema IS declared: an extracted value
+///    that validates populates `SingleResult::structured_output`; an extracted value that fails
+///    validation, or no value at all when no plain-text fallback was produced either, forces
+///    `exit_code = 1` with a validation-error `error` message — never silently downgraded, per
+///    R-SA-030's "MUST also fail the run" text.
 /// 6. R-SA-034: completion-mutation guard, via [`completion_guard::evaluate_completion_mutation_guard`].
 /// 7. R-SA-032: acceptance-gate evaluation, gated on `exit_code == 0 && !detached && !interrupted
 ///    && !timed_out` (R-SA-033's own gate condition), via [`acceptance::evaluate_acceptance`].
@@ -739,13 +771,51 @@ async fn drive_attempt(
 ///     summarized tool-name list.
 ///
 /// R-SA-037 (intercom detach bypasses acceptance/completion-guard/truncation entirely) has no
-/// live trigger path in this phase — [`SpawnedChildAttemptRunner`] never sets
+/// live trigger path anywhere in this crate today — [`SpawnedChildAttemptRunner`] never sets
 /// `AttemptSignal::detached`, so the `detached` branch below is dead code on every currently
 /// reachable path but is retained (not `unreachable!()`'d — this crate forbids `panic!`/
 /// `unreachable!` outside tests) so a later phase wiring intercom detach through
 /// [`SpawnedChildAttemptRunner`] only needs to flip that one signal, not touch this function's own
-/// gating logic at all.
+/// gating logic at all. See [`crate::exec::fallback::AttemptSignal::detached`]'s doc comment for
+/// the full explanation of why this is currently always `false` (no `SubagentEvent` on the wire
+/// carries a clarify-block signal, and `tui::intercom`'s `AskLock` is not wired to this crate's
+/// spawn/exec path) and exactly what the R-SA-119/120 follow-up work would need to do to set it.
 pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> SingleResult {
+    // Step 0 (R-SA-055, SAFETY-CRITICAL): the recursion-depth guard MUST run before any spawn,
+    // discovery, or worktree setup — this is `run_sync`'s very first action, ahead of even
+    // R-SA-025's output-mode validation below, because `run_sync` is the sole chokepoint every
+    // production spawn path in this crate funnels through (the foreground single-run tool
+    // dispatch, the background hop-2 runner's per-step loop, and — via `chain_graph::walk_chain`/
+    // `spawn::parallel::run_bounded`'s `SingleStepExecutor` seam — every chain step, parallel
+    // fan-out child, and dynamic fan-out child as well). A blocked check returns an error result
+    // telling the caller to complete the task directly, per R-SA-055's own text, and — because
+    // this check precedes every other line of this function — zero subprocesses are ever spawned
+    // for a blocked attempt.
+    if crate::spawn::depth::is_blocked(&agent.depth) {
+        let err = SubagentError::DepthExceeded {
+            current: agent.depth.current_depth,
+            max: agent.depth.max_depth,
+        };
+        return SingleResult {
+            agent: agent.name.clone(),
+            task: task.to_string(),
+            exit_code: 1,
+            usage: Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: None,
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            error: Some(err.to_string()),
+            tool_calls: Vec::new(),
+            output_truncated: false,
+        };
+    }
+
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
     if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
@@ -894,6 +964,60 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     let progress = last_attempt.map(|record| record.progress).unwrap_or_default();
 
+    // Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation.
+    // Only evaluated on an otherwise-clean run (mirrors the completion-guard/acceptance gate's own
+    // "don't re-diagnose an already-failed attempt" discipline just below) — a run that already
+    // failed for another reason (non-zero exit, timeout, detach, interrupt) must not additionally
+    // be re-labeled by a structured-output check that never had a fair chance to run against a
+    // clean transcript.
+    let structured_output = if (CleanCompletionGate {
+        exit_code,
+        detached,
+        interrupted,
+        timed_out,
+    })
+    .is_clean()
+    {
+        match resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
+        {
+            StructuredOutcome::NotRequested => None,
+            StructuredOutcome::Valid(value) => Some(value),
+            StructuredOutcome::Missing => {
+                // R-SA-030: absence is a hard failure UNLESS plain text was also produced as a
+                // fallback.
+                if final_output.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+                    None
+                } else {
+                    exit_code = 1;
+                    error = Some(match error {
+                        Some(existing) if !existing.trim().is_empty() => format!(
+                            "{existing}; structured output missing: task declared a \
+                             structured-output schema but the child produced neither a \
+                             schema-valid structured output nor any plain-text fallback"
+                        ),
+                        _ => "structured output missing: task declared a structured-output \
+                              schema but the child produced neither a schema-valid structured \
+                              output nor any plain-text fallback"
+                            .to_string(),
+                    });
+                    None
+                }
+            }
+            StructuredOutcome::Invalid(message) => {
+                exit_code = 1;
+                error = Some(match error {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{existing}; {message}")
+                    }
+                    _ => message,
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Step 6 (R-SA-034): completion-mutation guard — needs a real AgentDefinition-shaped view;
     // `evaluate_completion_mutation_guard` only reads `local_name`/`tools`/`completion_guard`, so
     // a minimal projection is built here rather than requiring `AgentConfig` to carry every other
@@ -980,7 +1104,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         attempted_models: outcome.attempted_models,
         model_attempts: outcome.model_attempts,
         final_output,
-        structured_output: None, // R-SA-030: deferred, see this fn's own doc note above.
+        structured_output,
         acceptance: acceptance_ledger,
         detached,
         interrupted,
@@ -1309,6 +1433,94 @@ mod tests {
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
             Some(&"4".to_string())
+        );
+    }
+
+    // ---- run_sync: depth guard runs first, before anything else (R-SA-055, SAFETY-CRITICAL) ----
+
+    #[tokio::test]
+    async fn run_sync_rejects_a_blocked_depth_envelope_before_any_spawn_setup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        // current_depth == max_depth: is_blocked() must be true (R-SA-055's own `>=` semantics,
+        // not merely `>`).
+        agent.depth = DepthEnvelope {
+            current_depth: 3,
+            max_depth: 3,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let result = run_sync(&agent, "do something", &opts).await;
+
+        assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("depth limit exceeded"),
+            "expected a DepthExceeded-shaped error message, got: {:?}",
+            result.error
+        );
+        assert!(result.attempted_models.is_empty(), "no model attempt may ever be made");
+        assert!(result.model_attempts.is_empty());
+        assert_eq!(result.usage, Usage::default(), "no usage can have accrued");
+        // The load-bearing proof that this rejection happens BEFORE any spawn setup: `run_sync`'s
+        // scratch-directory creation (the very first filesystem side effect any subsequent spawn
+        // attempt would need) must never have run at all.
+        assert!(
+            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            "the depth guard must reject before the spawn-scratch directory is ever created"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sync_rejects_when_depth_has_defensively_exceeded_the_ceiling() {
+        // current_depth > max_depth (should never occur given each hop only increments by one past
+        // a checked gate, but the guard must still be a safe `>=`, matching
+        // `spawn::depth::is_blocked`'s own defense-in-depth comparison).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.depth = DepthEnvelope {
+            current_depth: 9,
+            max_depth: 2,
+        };
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let result = run_sync(&agent, "do something", &opts).await;
+
+        assert_eq!(result.exit_code, 1);
+        assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
+    }
+
+    #[tokio::test]
+    async fn run_sync_proceeds_normally_when_strictly_below_the_depth_ceiling() {
+        // The negative case: a non-blocked envelope must NOT be rejected by the depth guard —
+        // proven by observing this attempt fails for the ordinary, UNRELATED "no candidate model"
+        // reason (this test supplies no available models), never a DepthExceeded message, so the
+        // depth guard is proven to be neither a false-positive gate nor accidentally bypassed by a
+        // change to this function's own step ordering.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.model = None;
+        agent.depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let opts = base_opts(dir.path(), &[]); // no available models: ladder is empty downstream
+
+        let result = run_sync(&agent, "do something", &opts).await;
+
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no candidate model"),
+            "a non-blocked depth must fall through to the NEXT gate (empty ladder), not be \
+             rejected by the depth guard itself, got: {:?}",
+            result.error
         );
     }
 

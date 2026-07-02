@@ -72,6 +72,7 @@ cyrup-tui          = { path = "crates/cyrup-tui",          version = "0.0.0" }
 cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.0.0" }
 cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.0.0" }
 cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
+cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---
@@ -105,6 +106,21 @@ tempfile             = { version = "3.27.0" }
 # cyrup-ext-subagents (arch-SA). New to the workspace.
 nix                  = { version = "0.31.3" }
 notify               = { version = "8.2.0" }
+
+# arch-SA §5.2/§12 item 13 (R-SA-030) — parent-side JSON-Schema re-validation of a subagent
+# child's structured-output value, first used by cyrup-ext-subagents (arch-SA §6.3.3). `jsonschema`
+# (not `schemars`) is the correct crate for this: `schemars` only *generates* a JSON Schema from a
+# Rust type, it has no validator for an arbitrary runtime `serde_json::Value` against an
+# arbitrary, externally-declared schema, which is exactly what R-SA-030 needs. `cyrup-ext`'s own
+# tool-parameter validation (`registry.rs::ToolDescriptor::validate`) does only a minimal
+# "is-object" shape check today and depends on neither crate, so there is no existing dependency
+# to match here (arch-SA §12 item 13's own open question, resolved this way for this crate).
+# `default-features = false`: the default `resolve-http`/`resolve-file` features pull in
+# `reqwest`/`rustls` to fetch remote/on-disk `$ref` targets — this crate validates a child's
+# already-inline structured-output value against an already-inline declared schema, never fetching
+# a `$ref` over the network or filesystem, so those features (and their heavyweight deps) are
+# never needed here.
+jsonschema           = { version = "0.46.9", default-features = false }
 
 # arch-00 §7 — first used by cyrup-session (arch-04).
 time                 = { version = "0.3", features = ["formatting", "parsing"] }
@@ -153,7 +169,7 @@ ratatui-image        = { version = "11.0.6", default-features = false, features 
 
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
-#   schemars, jsonschema, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
+#   schemars, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
 #   ratatui, crossterm, ratatui-image, unicode-width, unicode-segmentation, tui-textarea,
 #   wasmtime(component-model,async,epoch,pooling-allocator), wasmtime-wasi, wit-bindgen,
 #   ignore, globset, grep/grep-searcher/grep-regex, clap, tracing, tracing-subscriber,

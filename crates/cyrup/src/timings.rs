@@ -19,7 +19,10 @@ fn timing_enabled() -> bool {
 /// `PI_STARTUP_BENCHMARK`, truthy `1`/`true`/`yes`).
 pub fn startup_benchmark_enabled() -> bool {
     fn truthy(v: Option<String>) -> bool {
-        matches!(v.as_deref().map(str::to_ascii_lowercase).as_deref(), Some("1" | "true" | "yes"))
+        matches!(
+            v.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("1" | "true" | "yes")
+        )
     }
     truthy(std::env::var("CYRUP_STARTUP_BENCHMARK").ok())
         || truthy(std::env::var("PI_STARTUP_BENCHMARK").ok())
@@ -42,7 +45,11 @@ impl Default for Timings {
 impl Timings {
     /// Start a timing run (Pi `resetTimings`). Inert unless `CYRUP_TIMING=1`.
     pub fn new() -> Self {
-        Self { enabled: timing_enabled(), last: Instant::now(), entries: Vec::new() }
+        Self {
+            enabled: timing_enabled(),
+            last: Instant::now(),
+            entries: Vec::new(),
+        }
     }
 
     /// Record the interval since the previous mark under `label` (Pi `time`).
@@ -81,7 +88,11 @@ mod tests {
     #[test]
     fn marks_accumulate_when_enabled() {
         // Force-enable via the struct field (env-independent) so the test is deterministic.
-        let mut t = Timings { enabled: true, last: Instant::now(), entries: Vec::new() };
+        let mut t = Timings {
+            enabled: true,
+            last: Instant::now(),
+            entries: Vec::new(),
+        };
         t.mark("parseArgs");
         t.mark("createSession");
         assert_eq!(t.entries.len(), 2);
@@ -92,7 +103,11 @@ mod tests {
 
     #[test]
     fn disabled_timings_record_nothing() {
-        let mut t = Timings { enabled: false, last: Instant::now(), entries: Vec::new() };
+        let mut t = Timings {
+            enabled: false,
+            last: Instant::now(),
+            entries: Vec::new(),
+        };
         t.mark("x");
         assert!(t.entries.is_empty());
     }

@@ -11,7 +11,7 @@
 //! root with a real `cyrup.toml`, and settings-override application runs against a real,
 //! populated `SubagentSettings`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 
@@ -555,4 +555,120 @@ fn empty_config_discovers_nothing_without_erroring() {
 #[test]
 fn path_buf_import_is_reachable() {
     let _ = PathBuf::from("/tmp");
+}
+
+// -------------------------------------------------------------------------------------------
+// R-SA-132/134: the 8 bundled builtin personas (scout, delegate, context-builder, planner,
+// researcher, reviewer, worker, oracle) are real, discoverable resources — not hardcoded Rust
+// strings — under this crate's own `resources/agents/` directory (the exact path
+// `extension.rs::builtin_agents_dir()` resolves at runtime via `CARGO_MANIFEST_DIR`, mirrored
+// here so this test exercises the SAME on-disk resource root the real extension uses, not a
+// synthetic fixture standing in for it). Resolved through the real `AgentDiscoveryConfig::
+// builtin_agents_dir` -> `scan_builtin_agents` -> `cyrup_resources::resolve_manifest` auto-
+// discovery pipeline (R-SA-020), end to end via `discover_agents_all`.
+// -------------------------------------------------------------------------------------------
+
+/// The 8 bundled builtin persona runtime names this crate ships, mirroring `pi-subagents/agents/
+/// {context-builder,delegate,oracle,planner,researcher,reviewer,scout,worker}.md` (func-SA
+/// §5.1 R-SA-132's exact target list). Each `.md` file's frontmatter `name:` is unqualified (no
+/// `package:` field), so per R-SA-008 the runtime name is exactly the local name.
+const BUILTIN_PERSONA_NAMES: &[&str] = &[
+    "context-builder",
+    "delegate",
+    "oracle",
+    "planner",
+    "researcher",
+    "reviewer",
+    "scout",
+    "worker",
+];
+
+/// Resolve this crate's bundled `resources/` directory the exact same way
+/// `extension.rs::builtin_agents_dir()` does in production: `CARGO_MANIFEST_DIR`-relative,
+/// baked in at compile time. Kept as its own tiny helper (rather than importing a private
+/// `extension.rs` function into this black-box integration test) so this test proves the
+/// resource files are genuinely present and parseable at the conventional path independent of
+/// `extension.rs`'s own internal wiring.
+fn bundled_resources_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+}
+
+#[test]
+fn all_eight_bundled_builtin_personas_are_discovered_with_builtin_source() {
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+
+    let result = discover_agents_all(&cfg).expect("builtin-only discovery succeeds");
+
+    for expected_name in BUILTIN_PERSONA_NAMES {
+        let found = result
+            .agents
+            .iter()
+            .find(|a| a.name == *expected_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected bundled builtin persona '{expected_name}' to be discovered; \
+                     discovered names were: {:?}",
+                    result.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            found.source,
+            AgentSource::Builtin,
+            "bundled persona '{expected_name}' must be discovered at AgentSource::Builtin precedence"
+        );
+        assert_eq!(
+            found.local_name, *expected_name,
+            "bundled persona '{expected_name}' must be unqualified (no package prefix)"
+        );
+    }
+
+    assert_eq!(
+        result.agents.len(),
+        BUILTIN_PERSONA_NAMES.len(),
+        "exactly the 8 bundled personas should be discovered from the builtin resource root, \
+         found: {:?}",
+        result.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn bundled_builtin_personas_are_visible_through_the_delegation_view_too() {
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+
+    let result = discover_agents(&cfg, None).expect("builtin-only delegation discovery succeeds");
+    for expected_name in BUILTIN_PERSONA_NAMES {
+        assert!(
+            result.agents.iter().any(|a| a.name == *expected_name),
+            "delegation view must include bundled builtin persona '{expected_name}'"
+        );
+    }
+}
+
+#[test]
+fn delegate_persona_keeps_its_name_sensitive_defaults_when_loaded_from_the_bundled_resource_root() {
+    // R-SA-018: `delegate`'s `systemPromptMode`/`inheritProjectContext` name-sensitive defaults
+    // must still apply when parsed from the real bundled file (not just a synthetic fixture) —
+    // the frontmatter itself declares them explicitly (systemPromptMode: append), so this also
+    // pins that the real file's frontmatter was ported byte-for-byte rather than paraphrased.
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let result = discover_agents_all(&cfg).expect("discovery succeeds");
+    let delegate = result
+        .agents
+        .iter()
+        .find(|a| a.name == "delegate")
+        .expect("bundled delegate.md must be discovered");
+    assert_eq!(
+        delegate.system_prompt_mode,
+        cyrup_ext_subagents::discovery::types::SystemPromptMode::Append
+    );
+    assert!(delegate.inherit_project_context);
 }
