@@ -212,7 +212,23 @@ impl HttpCaps {
     /// (`tower_http::compression_utils::AcceptEncoding::to_header_value`'s `(true,true,true,true)`
     /// arm: `"zstd,gzip,deflate,br"`), since [`Self::new`] disables that automatic behavior to keep
     /// the ORIGINAL response headers intact (see [`Self::new`]'s doc comment).
-    fn build_request(&self, req: &HttpRequest) -> Result<reqwest::RequestBuilder, String> {
+    ///
+    /// `apply_reqwest_timeout` gates whether `req.timeout_ms` (when given and non-zero) is ALSO set as
+    /// `reqwest`'s own request-level `RequestBuilder::timeout()` — [`Self::request`] wants this (it
+    /// wants the WHOLE round trip, including body-drain, bounded, and the outer `tokio::time::timeout`
+    /// wrapper it also applies makes this redundant-but-harmless). [`Self::request_stream`] must pass
+    /// `false`: verified against `reqwest` 0.13.4's source
+    /// (`~/.cargo/registry/.../reqwest-0.13.4/src/async_impl/{client,body}.rs`) that
+    /// `RequestBuilder::timeout()` becomes a TOTAL-request `Sleep` threaded into the returned
+    /// `Response` (`client.rs`'s `Response::new(..., self.total_timeout.take(), ...)`) and wraps its
+    /// body in a `TotalTimeoutBody` (`body.rs`) whose timer is NEVER reset on read progress — so it
+    /// keeps running through `resp.bytes_stream()` long after the connect+headers phase this function
+    /// is meant to bound has completed, silently killing an otherwise-healthy long-lived body stream
+    /// at exactly `timeout_ms`, contradicting [`Self::request_stream`]'s own documented "only
+    /// connect+headers is bounded" contract. `request_stream`'s outer `tokio::time::timeout` around
+    /// `.send()` already bounds connect+headers on its own; the body stream is separately bounded
+    /// per-poll by [`HTTP_POLL_IDLE_TIMEOUT`] in [`Self::poll_stream_chunk`], never by this timeout.
+    fn build_request(&self, req: &HttpRequest, apply_reqwest_timeout: bool) -> Result<reqwest::RequestBuilder, String> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("invalid HTTP method `{}`: {e}", req.method))?;
         let mut builder = self.client.request(method, req.url.as_str());
@@ -233,7 +249,7 @@ impl HttpCaps {
         // literal 0ms `reqwest` per-request timeout fires on (essentially) the very next poll, so
         // `Some(0)` was silently indistinguishable from "fail immediately" instead of falling through to
         // [`Self::request`]/[`Self::request_stream`]'s own [`DEFAULT_REQUEST_TIMEOUT`] fallback below.
-        if let Some(ms) = req.timeout_ms.filter(|ms| *ms > 0) {
+        if apply_reqwest_timeout && let Some(ms) = req.timeout_ms.filter(|ms| *ms > 0) {
             builder = builder.timeout(std::time::Duration::from_millis(u64::from(ms)));
         }
         Ok(builder)
@@ -262,7 +278,11 @@ impl HttpCaps {
             .map(|ms| Duration::from_millis(u64::from(ms)))
             .unwrap_or(self.request_timeout);
         tokio::time::timeout(effective_timeout, async {
-            let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+            // `true`: `request` wants the WHOLE round trip (connect through body-drain) bounded, so
+            // reqwest's own request-level timeout doubling up with the outer `tokio::time::timeout`
+            // above is intentional, redundant-but-harmless belt-and-suspenders — see
+            // [`Self::build_request`]'s doc for why [`Self::request_stream`] below must NOT do this.
+            let resp = self.build_request(req, true)?.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
             let headers = collect_headers(resp.headers());
             let encoding = content_encoding_of(resp.headers());
@@ -306,7 +326,12 @@ impl HttpCaps {
             .filter(|ms| *ms > 0)
             .map(|ms| Duration::from_millis(u64::from(ms)))
             .unwrap_or(self.request_timeout);
-        let resp = tokio::time::timeout(effective_timeout, self.build_request(req)?.send())
+        // `false`: unlike `request`, the guest's `timeout_ms` must bound ONLY this connect+headers
+        // `.send()` (via the outer `tokio::time::timeout` below) — NOT become reqwest's own
+        // request-level timeout, which would keep running as a TOTAL-request timer and silently kill
+        // the long-lived body stream this function hands back, contradicting this function's own
+        // documented contract (see [`Self::build_request`]'s doc for the full `reqwest` internals).
+        let resp = tokio::time::timeout(effective_timeout, self.build_request(req, false)?.send())
             .await
             .map_err(|_| {
                 format!("request_stream: timed out after {effective_timeout:?} waiting for the initial response")
@@ -777,6 +802,61 @@ mod tests {
 
         // EOF is sticky: polling again still returns `Ok(None)`, never re-erroring.
         assert_eq!(caps.poll_stream_chunk(handle).await.expect("poll after EOF"), None);
+    }
+
+    /// THE HIGH finding this closes: `request_stream`'s explicit non-zero `timeout_ms` used to ALSO
+    /// become `reqwest`'s own request-level (TOTAL, not just connect+headers) timeout via
+    /// `build_request`, silently killing the body stream mid-read even though the doc comment (and,
+    /// via the OUTER `tokio::time::timeout` around `.send()`, the actual intent) promises only the
+    /// initial connect+headers phase is bounded by it. A real TCP server declares `Content-Length: 10`,
+    /// writes the first 5 bytes immediately, then the remaining 5 bytes after a 400ms delay — well
+    /// past the 200ms `timeout_ms` under test, but well within the stream's own (separate, much
+    /// longer) per-poll idle ceiling. Pre-fix: the second `poll_stream_chunk` errors (`reqwest`'s
+    /// `TotalTimeoutBody` firing mid-read). Post-fix: the full 10 bytes drain successfully.
+    #[tokio::test]
+    async fn request_stream_survives_a_slow_body_past_an_explicit_non_zero_timeout_ms() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head =
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(b"AAAAA").await;
+                let _ = sock.flush().await;
+                // Well past the 200ms `timeout_ms` under test.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = sock.write_all(b"BBBBB").await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/probe"),
+            timeout_ms: Some(200),
+            ..Default::default()
+        };
+        let opened = caps
+            .request_stream(&req)
+            .await
+            .expect("the connect+headers phase completes well within the 200ms timeout_ms");
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("the still-healthy body stream must survive past the connect-phase timeout_ms")
+        {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, b"AAAAABBBBB",
+            "the full body, including the slow tail written after timeout_ms elapsed, must drain intact"
+        );
     }
 
     /// Closes L4 §2.3: the initiating response's status+headers must be readable off
