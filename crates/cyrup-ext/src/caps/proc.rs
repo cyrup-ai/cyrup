@@ -77,13 +77,17 @@ const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SPAWNED_PROCESSES: usize = 256;
 
 /// A spawn request for the `proc` capability (mirrors the WIT `proc.spawn` params 1:1). `env` is
-/// OVERLAID onto the host's own inherited environment (Pi `resolveEnv`, `server-manager.ts:422` —
-/// copies `process.env` then applies overrides), never a full replacement. `capture_stderr` mirrors
-/// Pi's debug-mode "inherit" vs "ignore" (`server-manager.ts:111`): `true` pipes + buffers stderr
-/// for `read-stderr`; `false` routes it to the null device — NOT the host's own terminal (unlike
-/// Node's literal `"inherit"`, mixing an arbitrary guest-spawned child's stderr into the host
-/// process's own stdio would be an unrelated-output leak; routing to null instead achieves the same
-/// "don't surface it on the MCP protocol stream" effect while keeping host/guest output separate).
+/// OVERLAID onto the host's own inherited environment (Pi `resolveEnv`, `server-manager.ts:422-435` —
+/// copies `process.env`, then applies each override VALUE through `interpolateEnvRecord`/
+/// `interpolateEnvVars`, `utils.ts:62-76`), never a full replacement; `cwd` is likewise resolved
+/// through Pi's `resolveConfigPath` (`server-manager.ts:110`, `utils.ts:78-87`): interpolate, then
+/// tilde-expand a leading `~`. [`ProcCaps::spawn`] applies both — see [`interpolate_env_vars`]/
+/// [`resolve_config_path`]. `capture_stderr` mirrors Pi's debug-mode "inherit" vs "ignore"
+/// (`server-manager.ts:111`): `true` pipes + buffers stderr for `read-stderr`; `false` routes it to
+/// the null device — NOT the host's own terminal (unlike Node's literal `"inherit"`, mixing an
+/// arbitrary guest-spawned child's stderr into the host process's own stdio would be an
+/// unrelated-output leak; routing to null instead achieves the same "don't surface it on the MCP
+/// protocol stream" effect while keeping host/guest output separate).
 #[derive(Clone, Debug, Default)]
 pub struct ProcSpawnSpec {
     pub cmd: String,
@@ -91,6 +95,116 @@ pub struct ProcSpawnSpec {
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
     pub capture_stderr: bool,
+}
+
+/// Interpolate `${VAR}`/`$env:VAR` placeholders in `value` against the HOST's own environment — a
+/// direct Rust port of Pi's `interpolateEnvVars` (`pi-mcp-adapter/utils.ts:62-66`), including its
+/// exact two-pass order (every `${VAR}` is resolved FIRST, against a `\w+` = `[A-Za-z0-9_]+` name;
+/// THEN every `$env:VAR` is resolved against the resulting string) and its "missing variable resolves
+/// to the empty string" fallback (`process.env[name] ?? ""`). An unrecognized/malformed placeholder
+/// (unterminated `${`, an empty or non-word name) is left byte-for-byte untouched, matching the JS
+/// regex simply not matching such input.
+pub(crate) fn interpolate_env_vars(value: &str) -> String {
+    interpolate_env_vars_with(value, |name| std::env::var(name).ok())
+}
+
+/// [`interpolate_env_vars`] against an injected `lookup` rather than the REAL process environment —
+/// the real entry point above is a thin wrapper around this with `std::env::var`. Exists so the
+/// substitution logic itself is unit-testable hermetically: `cyrup-ext` is `#![forbid(unsafe_code)]`
+/// (`src/lib.rs:20`) crate-wide, and edition 2024 makes `std::env::set_var`/`remove_var` `unsafe fn`
+/// — tests cannot mutate the real process environment at all, so they inject a fixed lookup instead.
+fn interpolate_env_vars_with(value: &str, lookup: impl Fn(&str) -> Option<String> + Copy) -> String {
+    interpolate_dollar_env(&interpolate_braces(value, lookup), lookup)
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The `\$\{(\w+)\}` half of [`interpolate_env_vars_with`].
+fn interpolate_braces(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if let Some(after_open) = value[i..].strip_prefix("${")
+            && let Some(close_rel) = after_open.find('}')
+            && let Some(name) = after_open.get(..close_rel)
+            && !name.is_empty()
+            && name.bytes().all(is_word_byte)
+        {
+            out.push_str(&lookup(name).unwrap_or_default());
+            i += 2 + close_rel + 1;
+            continue;
+        }
+        let ch = value[i..].chars().next().unwrap_or('\u{0}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The `\$env:(\w+)` half of [`interpolate_env_vars_with`] (the PowerShell-style form Pi also
+/// supports).
+fn interpolate_dollar_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    const PREFIX: &str = "$env:";
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if value[i..].starts_with(PREFIX) {
+            let rest = &value[i + PREFIX.len()..];
+            let name_len = rest.bytes().take_while(|b| is_word_byte(*b)).count();
+            if name_len > 0 {
+                let name = &rest[..name_len];
+                out.push_str(&lookup(name).unwrap_or_default());
+                i += PREFIX.len() + name_len;
+                continue;
+            }
+        }
+        let ch = value[i..].chars().next().unwrap_or('\u{0}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The host's home directory, matching Node's real `os.homedir()` resolution closely enough to
+/// satisfy the REAL consumer's actual need here (`HOME` on unix, `USERPROFILE` on Windows — the SAME
+/// env-var-first source Node's libuv `uv_os_homedir` consults before falling back to a passwd-database
+/// lookup, a fallback this does not replicate since no realistic MCP-server-launching environment
+/// leaves `HOME` unset).
+fn host_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Interpolate + tilde-expand a config-supplied path — a direct Rust port of Pi's
+/// `resolveConfigPath` (`pi-mcp-adapter/utils.ts:78-87`): interpolate env vars first (same
+/// [`interpolate_env_vars`] pass `resolveEnv`'s overrides get), then expand a LEADING `~` (exactly
+/// `"~"`, or a `~/`/`~\` prefix) against [`host_home_dir`]. A path with no leading `~` (the common
+/// case) round-trips through interpolation unchanged, same as Pi's own early-return shape.
+pub(crate) fn resolve_config_path(value: &str) -> PathBuf {
+    resolve_config_path_with(value, |name| std::env::var(name).ok(), host_home_dir)
+}
+
+/// [`resolve_config_path`] against injected `lookup`/`home` — see [`interpolate_env_vars_with`]'s doc
+/// for why tests need this rather than mutating the real process environment/home directory.
+fn resolve_config_path_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String> + Copy,
+    home: impl Fn() -> Option<PathBuf>,
+) -> PathBuf {
+    let resolved = interpolate_env_vars_with(value, lookup);
+    if resolved == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(resolved));
+    }
+    if let Some(rest) = resolved.strip_prefix("~/").or_else(|| resolved.strip_prefix("~\\"))
+        && let Some(home) = home()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(resolved)
 }
 
 /// Per-pipe cap on buffered-but-unread bytes. `proc` is request/poll-shaped (a guest drains via
@@ -292,10 +406,14 @@ impl ProcCaps {
         let mut cmd = tokio::process::Command::new(&spec.cmd);
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
+            // Pi `resolveConfigPath` (server-manager.ts:110, utils.ts:78-87): interpolate `${VAR}`/
+            // `$env:VAR`, then tilde-expand a leading `~`.
+            cmd.current_dir(resolve_config_path(&cwd.to_string_lossy()));
         }
         for (k, v) in &spec.env {
-            cmd.env(k, v);
+            // Pi `resolveEnv`/`interpolateEnvRecord` (server-manager.ts:422-435, utils.ts:68-76):
+            // interpolate `${VAR}`/`$env:VAR` in each VALUE — keys are never interpolated.
+            cmd.env(k, interpolate_env_vars(v));
         }
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -602,6 +720,78 @@ mod tests {
         }
     }
 
+    /// A fixed, hermetic lookup (never touches the real process environment — `cyrup-ext` is
+    /// `#![forbid(unsafe_code)]`, and edition 2024 makes `std::env::set_var` `unsafe fn`, so tests
+    /// cannot mutate real env vars at all).
+    fn fixed_lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + Copy {
+        move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
+    }
+
+    /// THE MEDIUM finding this closes: `interpolate_env_vars` must handle BOTH placeholder forms Pi's
+    /// `interpolateEnvVars` supports (`${VAR}` and `$env:VAR`), resolve an unset variable to the empty
+    /// string (never an error/panic), leave malformed placeholders untouched, and apply the two forms
+    /// in Pi's exact SEQUENTIAL order (`${VAR}` fully resolved first, `$env:VAR` resolved second,
+    /// against the ALREADY-`${}`-resolved string) — proven by a value whose `${...}` substitution
+    /// itself yields a literal `$env:...` that must then ALSO be resolved.
+    #[test]
+    fn interpolate_env_vars_resolves_both_placeholder_forms_in_pis_exact_order() {
+        let lookup = fixed_lookup(&[("FOO", "foo-value"), ("BAR", "$env:BAZ"), ("BAZ", "baz-value")]);
+
+        assert_eq!(interpolate_env_vars_with("${FOO}", lookup), "foo-value");
+        assert_eq!(interpolate_env_vars_with("$env:FOO", lookup), "foo-value");
+        assert_eq!(
+            interpolate_env_vars_with("prefix-${FOO}-mid-$env:BAZ-suffix", lookup),
+            "prefix-foo-value-mid-baz-value-suffix"
+        );
+        // Unset variable ⇒ empty string, never an error.
+        assert_eq!(interpolate_env_vars_with("${MISSING}", lookup), "");
+        assert_eq!(interpolate_env_vars_with("$env:MISSING", lookup), "");
+        // Malformed placeholders are left byte-for-byte untouched (no matching `}`, empty name).
+        assert_eq!(interpolate_env_vars_with("${FOO", lookup), "${FOO");
+        assert_eq!(interpolate_env_vars_with("${}", lookup), "${}");
+        assert_eq!(interpolate_env_vars_with("plain text, no placeholders", lookup), "plain text, no placeholders");
+        // Two-pass order: `${BAR}` resolves to the LITERAL string `$env:BAZ` in pass one, which pass
+        // two then ALSO resolves — proving the passes are sequential over the whole string, not a
+        // single combined scan (mirrors Pi's chained `.replace(...).replace(...)`).
+        assert_eq!(
+            interpolate_env_vars_with("${BAR}", lookup),
+            "baz-value",
+            "a value produced by the ${{}} pass must still be resolved by the subsequent $env: pass"
+        );
+    }
+
+    /// THE MEDIUM finding this closes, the `cwd` half: `resolve_config_path` must interpolate THEN
+    /// tilde-expand — a bare `~`, a `~/rest` prefix, and a `~\rest` prefix (Windows-style) all resolve
+    /// against the injected home directory; a path with no leading `~` only gets interpolated.
+    #[test]
+    fn resolve_config_path_interpolates_then_tilde_expands() {
+        let lookup = fixed_lookup(&[("PROJECT", "my-project")]);
+        let home = || Some(PathBuf::from("/home/testuser"));
+
+        assert_eq!(resolve_config_path_with("~", lookup, home), PathBuf::from("/home/testuser"));
+        assert_eq!(
+            resolve_config_path_with("~/${PROJECT}/servers", lookup, home),
+            PathBuf::from("/home/testuser/my-project/servers")
+        );
+        assert_eq!(
+            resolve_config_path_with("~\\${PROJECT}\\servers", lookup, home),
+            PathBuf::from("/home/testuser/my-project\\servers"),
+            "a Windows-style ~\\ prefix is also expanded"
+        );
+        // No leading `~` at all ⇒ interpolated but otherwise untouched (no tilde expansion applied).
+        assert_eq!(
+            resolve_config_path_with("/abs/${PROJECT}/path", lookup, home),
+            PathBuf::from("/abs/my-project/path")
+        );
+        // No home available ⇒ the (interpolated) `~`-prefixed string passes through verbatim rather
+        // than panicking or silently dropping the `~`.
+        assert_eq!(
+            resolve_config_path_with("~/x", lookup, || None),
+            PathBuf::from("~/x"),
+            "no home available must degrade gracefully, not panic"
+        );
+    }
+
     /// A real `cat` is a genuine duplex pipe: write a line, poll stdout across MULTIPLE calls until
     /// the real echoed bytes show up (proving a live pipe, not a one-shot capture), then again for a
     /// second line — proving the SAME handle stays open and keeps echoing.
@@ -638,6 +828,57 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    /// End-to-end live proof (not just the unit-level `interpolate_env_vars_with` above): `spawn`'s
+    /// `env` values are interpolated against the REAL host environment before reaching the real
+    /// child. `HOME` is a variable this test can read but never needs to SET (`cyrup-ext` cannot
+    /// mutate real env vars — see `fixed_lookup`'s doc) — a genuinely ambient one is guaranteed
+    /// present on any host capable of running an MCP server child at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_interpolates_env_values_against_the_real_host_environment() {
+        let real_home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let caps = ProcCaps::new();
+        let mut s = spec("sh", &["-c", "printenv MY_GREETING"]);
+        s.env = vec![("MY_GREETING".to_string(), "hello-${HOME}-and-$env:HOME-again".to_string())];
+        let handle = caps.spawn(&s).expect("sh spawns");
+
+        // Wait for the real natural exit, then drain the real stdout it printed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while caps.poll_exit(handle).is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let out = caps.read_stdout(handle, 4096).expect("read_stdout after exit");
+        let printed = String::from_utf8_lossy(&out);
+        let expected = format!("hello-{real_home}-and-{real_home}-again\n");
+        assert_eq!(
+            printed, expected,
+            "the REAL child must see the REAL host $HOME substituted into both placeholder forms"
+        );
+    }
+
+    /// End-to-end live proof for the `cwd` half: `spawn`'s `cwd` is tilde-expanded against the REAL
+    /// host home directory before reaching the real child — a bare `~` resolves to the actual `$HOME`
+    /// a `pwd` run inside the spawned child then confirms.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_tilde_expands_cwd_against_the_real_host_home_directory() {
+        let real_home = std::fs::canonicalize(std::env::var("HOME").expect("HOME is set"))
+            .expect("HOME resolves to a real, canonical directory");
+        let caps = ProcCaps::new();
+        let mut s = spec("pwd", &[]);
+        s.cwd = Some(PathBuf::from("~"));
+        let handle = caps.spawn(&s).expect("pwd spawns with a bare ~ cwd");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while caps.poll_exit(handle).is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let out = caps.read_stdout(handle, 4096).expect("read_stdout after exit");
+        let printed = std::fs::canonicalize(String::from_utf8_lossy(&out).trim_end())
+            .expect("pwd's real stdout is a real, canonical directory");
+        assert_eq!(printed, real_home, "a bare `~` cwd must resolve to the REAL host home directory");
     }
 
     /// `poll_exit` is `None` while genuinely running and `Some(code)` with the REAL exit code once
