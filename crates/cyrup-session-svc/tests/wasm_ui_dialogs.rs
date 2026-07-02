@@ -235,3 +235,59 @@ async fn wasm_guest_extension_stays_usable_after_a_dialog_round_trip() {
         ext.guest().notifications()
     );
 }
+
+/// Closes the CRITICAL, still-open finding that the WASM epoch budget
+/// (`ExtensionHost::WASM_EPOCH_BUDGET_TICKS`, `crates/cyrup-ext/src/facade.rs`, ~5s) used to bound
+/// the ENTIRE `ui.*` dialog wait: a human (here, a scripted sink standing in for one) taking longer
+/// than the budget to answer left the deadline already expired by the time the guest resumed wasm
+/// execution right after the blocking host call returned — tripping an epoch trap that permanently
+/// wedges the instance (component-model reentrance bookkeeping never sees a clean completion).
+/// Reproduces the audit's OWN exact repro methodology: a REAL ~6s-delayed reply (well past the ~5s
+/// budget), driven through the actual `SessionBuilder`/`ExtensionHost::load_wasm` production path
+/// (the real `WASM_EPOCH_BUDGET_TICKS`, not a test-shortened one) — `confirmdemo` uses
+/// `DialogOptions::default()` (no `timeout_ms`), so `LiveHostServices::ui_roundtrip`'s OWN
+/// independent host-side timeout race (the separate, already-covered Finding 2) never fires either,
+/// isolating this test to the epoch mechanism alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_guest_dialog_delayed_past_the_epoch_budget_does_not_wedge_the_extension() {
+    let (session, ext) = build_session().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+    session.services().host_services.set_ui_sink(tx);
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            // A REAL delay past the ~5s `WASM_EPOCH_BUDGET_TICKS` budget — matches the audit's own
+            // repro ("a 6s-delayed reply").
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let reply = match req.kind {
+                UiKind::Confirm => UiReply::Confirm(true),
+                _ => UiReply::Text(None),
+            };
+            let _ = req.reply.send(reply);
+        }
+    });
+
+    let _ = session.prompt("/confirmdemo").await.unwrap();
+    session.wait_for_idle().await;
+
+    // The delayed reply still resolved to the REAL answer, not a timeout/trap-induced default —
+    // `confirmdemo` (`cyrup-ext-sdk/src/example.rs`) notifies `"confirmed: {ok}"` right after the
+    // FIRST (delayed) dialog returns, before ever opening its second, nested confirm.
+    let notifications = ext.guest().notifications();
+    assert!(
+        notifications.iter().any(|n| n == "confirmed: true"),
+        "the delayed dialog resolved to the real scripted answer, not a default: {notifications:?}"
+    );
+
+    // THE headline proof: a later, unrelated, dialog-free command against the SAME instance still
+    // genuinely runs. Before this fix, the epoch trap right after the delayed reply permanently
+    // wedged the instance and this silently no-op'd.
+    let before = ext.guest().notifications().len();
+    let _ = session.prompt("/execdemo").await.unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        ext.guest().notifications()[before..].iter().any(|n| n.starts_with("exec stdout:")),
+        "the extension survives a dialog delayed past the epoch budget — a later command still \
+         genuinely runs, not a silent no-op: {:?}",
+        ext.guest().notifications()
+    );
+}

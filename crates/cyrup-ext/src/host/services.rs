@@ -692,6 +692,21 @@ pub struct GuestState {
     /// `withSessionCallbackId`; the host invokes the `with-session` export for each after the command
     /// body returns (Pi `finishSessionReplacement`, agent-session-runtime.ts:184; sdk gap #3).
     pending_with_session: Mutex<Vec<String>>,
+    /// Epoch ticks to forgive at the NEXT epoch-deadline check, accumulated by a `ui.{confirm,select,
+    /// input}` call that blocked on a human answer (`live.rs`'s `ui::Host` impl records the REAL
+    /// wall-clock duration of each `guest.services.{confirm,input,select}` call here). Closes the
+    /// still-open finding that the WASM epoch budget (`ExtensionHost::WASM_EPOCH_BUDGET_TICKS`,
+    /// facade.rs, ~5s) bounds the ENTIRE dialog wait: a human taking longer than the budget used to
+    /// leave the deadline already expired by the time the guest resumed wasm execution right after
+    /// the host call returned, tripping an epoch trap that (component-model reentrance bookkeeping
+    /// never seeing a clean completion) permanently wedges the instance for the rest of the session —
+    /// reproduced empirically (a 6s-delayed reply still resolved the call `Ok`, but every subsequent
+    /// call against the same instance silently no-op'd). The `epoch_deadline_callback` registered at
+    /// Store-construction time (`live.rs`) reads + resets this via [`Self::take_dialog_extra_ticks`]
+    /// and extends the deadline by EXACTLY that much (never a blanket/unlimited grant) instead of
+    /// trapping — so legitimate human-paced dialog time is fully exempted from the budget while a
+    /// GENUINE runaway loop (which never touches this field) still traps at its original budget.
+    dialog_extra_ticks: std::sync::atomic::AtomicU64,
 }
 
 /// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
@@ -748,6 +763,7 @@ impl GuestState {
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
+            dialog_extra_ticks: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1019,6 +1035,24 @@ impl GuestState {
     /// Whether a dialog opened with `opts` is already dismissed by a programmatic signal (sdk gap #2).
     pub fn dialog_dismissed(&self, opts: &DialogOptions) -> bool {
         opts.signal_id.as_deref().is_some_and(|id| self.is_signal_aborted(id))
+    }
+
+    /// Record that a `ui.{confirm,select,input}` call just blocked for `elapsed` real wall-clock time
+    /// waiting on a human — converts it to the epoch driver's own tick granularity
+    /// ([`crate::host::epoch::DEFAULT_TICK`], 5ms) and accumulates it to forgive at the next epoch
+    /// deadline check (see [`Self::dialog_extra_ticks`]'s doc for the full rationale). Rounds UP so a
+    /// sub-tick remainder is never under-credited (a spurious trap is the failure mode being closed;
+    /// over-crediting by at most one 5ms tick is harmless).
+    pub fn note_dialog_wait(&self, elapsed: std::time::Duration) {
+        let ticks = elapsed.as_millis().div_ceil(crate::host::epoch::DEFAULT_TICK.as_millis()).max(1);
+        let ticks = u64::try_from(ticks).unwrap_or(u64::MAX);
+        self.dialog_extra_ticks.fetch_add(ticks, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Atomically take (reset to zero) the epoch ticks accumulated by [`Self::note_dialog_wait`] —
+    /// the `epoch_deadline_callback` (`live.rs`) calls this exactly once per deadline-reached event.
+    pub fn take_dialog_extra_ticks(&self) -> u64 {
+        self.dialog_extra_ticks.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bind the currently-executing tool's `CancelToken` for the `is-cancelled` poll (sdk gap #1).

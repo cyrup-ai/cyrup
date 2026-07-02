@@ -172,7 +172,15 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         if guest.dialog_dismissed(&opts) {
             return false;
         }
-        guest.services.confirm(&prompt, &message, &opts)
+        // Closes the still-open epoch-budget finding (`GuestState::dialog_extra_ticks`'s doc): the
+        // wall-clock duration this blocks waiting on a human is recorded so the
+        // `epoch_deadline_callback` (registered on this store, [`LiveExtension::load`]) can forgive
+        // EXACTLY that much instead of letting the deadline trap the instant the guest resumes wasm
+        // execution right after this call returns.
+        let started = std::time::Instant::now();
+        let result = guest.services.confirm(&prompt, &message, &opts);
+        guest.note_dialog_wait(started.elapsed());
+        result
     }
     async fn input(&mut self, prompt: String, placeholder: Option<String>, opts_json: String) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
@@ -180,7 +188,10 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         if guest.dialog_dismissed(&opts) {
             return None;
         }
-        guest.services.input(&prompt, placeholder.as_deref(), &opts)
+        let started = std::time::Instant::now();
+        let result = guest.services.input(&prompt, placeholder.as_deref(), &opts);
+        guest.note_dialog_wait(started.elapsed());
+        result
     }
     async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
         let guest = guest_of(self).ok()?;
@@ -189,10 +200,19 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         if guest.dialog_dismissed(&opts) {
             return None;
         }
-        guest.services.select(&prompt, &options, &opts)
+        let started = std::time::Instant::now();
+        let result = guest.services.select(&prompt, &options, &opts);
+        guest.note_dialog_wait(started.elapsed());
+        result
     }
     async fn editor(&mut self, initial: String) -> Option<String> {
-        guest_of(self).ok().and_then(|g| g.services.editor(&initial))
+        let guest = guest_of(self).ok()?;
+        // `ui.editor` blocks the same way (tears the TUI down and waits for `$EDITOR` to exit, an
+        // equally human-paced wait) — the SAME epoch-budget exemption applies.
+        let started = std::time::Instant::now();
+        let result = guest.services.editor(&initial);
+        guest.note_dialog_wait(started.elapsed());
+        result
     }
     async fn set_widget(&mut self, widget_json: String) {
         if let Ok(guest) = guest_of(self) {
@@ -688,6 +708,29 @@ impl LiveExtension {
         let mut store = Store::new(engine, HostState::with_guest(limits, guest.clone()));
         store.limiter(|s| &mut s.limits);
         store.set_epoch_deadline(epoch_ticks);
+        // Closes the still-open finding that the epoch budget bounds the ENTIRE `ui.*` dialog wait: by
+        // default a deadline reached mid-execution traps immediately (`epoch_deadline_trap`, wasmtime's
+        // default) — but the epoch check only fires at a WASM checkpoint, which for a call like
+        // `ui.confirm` is the instant the guest resumes wasm execution right after the (possibly
+        // long, human-paced) blocking host call returns; a real trap there wedges the whole instance
+        // for the rest of the session (component-model reentrance bookkeeping never sees a clean
+        // completion — reproduced empirically: a 6s-delayed reply still resolved `Ok`, but every
+        // later call against the same instance silently no-op'd). Replace the default trap with a
+        // callback that forgives EXACTLY the ticks `GuestState::note_dialog_wait` recorded for a
+        // legitimate dialog wait (`take_dialog_extra_ticks`'s doc) and extends the deadline by that
+        // much instead of trapping; a deadline reached with NO recorded dialog wait (a genuine
+        // runaway/looping guest) still traps exactly as before — `UpdateDeadline::Interrupt` is
+        // wasmtime's own explicit "halt and trap" variant, so this is not a weaker budget, only a
+        // correctly-scoped one.
+        store.epoch_deadline_callback(|ctx| {
+            let owed =
+                ctx.data().guest.as_ref().map(|g| g.take_dialog_extra_ticks()).unwrap_or(0);
+            if owed > 0 {
+                Ok(wasmtime::UpdateDeadline::Continue(owed))
+            } else {
+                Ok(wasmtime::UpdateDeadline::Interrupt)
+            }
+        });
 
         // init runs at command tier (load time): control ops would be legal here (R-08-008).
         guest.set_tier(CtxTier::Command);
