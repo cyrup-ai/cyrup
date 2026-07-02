@@ -88,14 +88,26 @@ impl PipeBufState {
         Arc::new(Self { data: Mutex::new(VecDeque::new()), space_freed: tokio::sync::Notify::new() })
     }
 
-    /// Park until buffered bytes drop below the cap (immediately if already under it).
-    async fn wait_for_room(&self) {
+    /// Park until buffered bytes drop below the cap (immediately if already under it) OR the child
+    /// process has exited — whichever happens first. Racing `exited` here closes a distinct task
+    /// leak from the OS-process leak `446b858` fixed: without it, a guest that never drains a
+    /// buffer that reached the cap (e.g. it kills the process, or the process's own bursty output
+    /// fills the cap, and the guest simply never calls `read-stdout`/`read-stderr` again) leaves
+    /// [`spawn_pump`]'s task parked HERE forever — nothing but a `drain()` ever calls `notify_one`
+    /// on `space_freed`, and a dead process can never be drained into by a guest that already gave
+    /// up on it. Waking on exit lets the pump proceed to its next `read()`, which — since the
+    /// child's own process-exit already closed the write end of the pipe — returns `Ok(0)`/`Err`
+    /// immediately, letting the pump's own loop end cleanly instead of parking forever.
+    async fn wait_for_room(&self, exited: &mut watch::Receiver<Option<i32>>) {
         loop {
             let len = self.data.lock().map(|g| g.len()).unwrap_or(0);
-            if len < MAX_PIPE_BUFFER_BYTES {
+            if len < MAX_PIPE_BUFFER_BYTES || exited.borrow().is_some() {
                 return;
             }
-            self.space_freed.notified().await;
+            tokio::select! {
+                () = self.space_freed.notified() => {}
+                _ = exited.changed() => {}
+            }
         }
     }
 }
@@ -242,17 +254,21 @@ impl ProcCaps {
         let stdout_buf: PipeBuf = PipeBufState::new();
         let stderr_buf: PipeBuf = PipeBufState::new();
 
+        // Created BEFORE the pumps spawn so each gets its own clone of the SAME watch to race
+        // against in `wait_for_room` (see `spawn_pump`'s doc) — `poll_exit`/`kill` read the ORIGINAL
+        // `exit_rx` via the `watch` receiver stored on the entry below, never blocking on the
+        // process (or the child's own stdio) themselves.
+        let (exit_tx, exit_rx) = watch::channel(None);
+
         if let Some(out) = stdout {
-            spawn_pump(out, stdout_buf.clone());
+            spawn_pump(out, stdout_buf.clone(), exit_rx.clone());
         }
         if let Some(err) = stderr {
-            spawn_pump(err, stderr_buf.clone());
+            spawn_pump(err, stderr_buf.clone(), exit_rx.clone());
         }
 
         // Reap the child + publish its REAL exit code the instant it terminates (natural exit, or a
-        // signal `kill` sent) — `poll_exit`/`kill` read this via the `watch` receiver, never
-        // blocking on the process (or the child's own stdio) themselves.
-        let (exit_tx, exit_rx) = watch::channel(None);
+        // signal `kill` sent).
         tokio::spawn(async move {
             let code = match child.wait().await {
                 Ok(status) => status.code().unwrap_or(0),
@@ -406,8 +422,18 @@ impl ProcCaps {
 }
 
 /// Continuously pump a real pipe (`AsyncRead`) into `buf` until EOF/error — the background task
-/// that keeps `read-stdout`/`read-stderr` non-lossy between polls.
-fn spawn_pump<R>(mut reader: R, buf: PipeBuf)
+/// that keeps `read-stdout`/`read-stderr` non-lossy between polls. `exited` is a clone of the SAME
+/// watch the process waiter task publishes to — passed through to [`PipeBufState::wait_for_room`]
+/// so a buffer parked at the cap wakes up (and this task ends) once the process is gone, instead of
+/// staying parked forever waiting for a `drain()` a guest that gave up on this handle will never
+/// call again (see `wait_for_room`'s doc). Returns the task's `JoinHandle` (unused by the production
+/// caller, which is deliberately fire-and-forget — the SAME reason `Self::spawn`'s process-waiter
+/// task isn't joined either — but lets tests observe the task genuinely completing).
+fn spawn_pump<R>(
+    mut reader: R,
+    buf: PipeBuf,
+    mut exited: watch::Receiver<Option<i32>>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -419,7 +445,7 @@ where
             // the kernel pipe buffer fills and the CHILD's own `write()` blocks, exactly the
             // pressure a real Node `Readable` stream's `highWaterMark` applies (see
             // [`MAX_PIPE_BUFFER_BYTES`]'s doc).
-            buf.wait_for_room().await;
+            buf.wait_for_room(&mut exited).await;
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -429,7 +455,7 @@ where
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -736,6 +762,68 @@ mod tests {
         );
 
         caps.kill(handle).await.expect("kill terminates the real yes");
+    }
+
+    /// A fake `AsyncRead` mirroring a bursty child's live pipe: always offers more bytes while
+    /// `exited` is unset, then returns a genuine EOF (0 bytes) once it's set — exactly how a REAL
+    /// pipe behaves once the child process exits and the kernel closes the write end. Avoids having
+    /// to actually push [`MAX_PIPE_BUFFER_BYTES`] (16 MiB) through a real OS pipe just to reach the
+    /// cap in a test.
+    struct BurstyUntilExited {
+        exited: watch::Receiver<Option<i32>>,
+    }
+    impl tokio::io::AsyncRead for BurstyUntilExited {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.exited.borrow().is_some() {
+                return std::task::Poll::Ready(Ok(())); // 0 bytes filled == EOF
+            }
+            let n = buf.remaining();
+            buf.initialize_unfilled_to(n).fill(b'x');
+            buf.advance(n);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Closes the pump-task leak (distinct from the OS-process leak `446b858` fixed): a pump parked
+    /// at [`PipeBufState::wait_for_room`]'s cap, whose buffer NOBODY ever drains again (the guest
+    /// killed the process and stopped polling, or simply abandoned the handle), must still let its
+    /// task actually END once the process exits — not stay parked forever, since nothing but a
+    /// `drain()` used to ever wake it. Drives [`spawn_pump`]/[`PipeBufState`] directly (bypassing
+    /// `ProcCaps::spawn`, which doesn't expose the pump's `JoinHandle`) to OBSERVE the task
+    /// genuinely completing via a bounded `tokio::time::timeout`, not just infer it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_task_ends_once_the_process_exits_even_with_a_full_undrained_buffer() {
+        let buf = PipeBufState::new();
+        // Mirrors `ProcCaps::spawn`'s own wiring exactly: ONE `watch` channel, cloned once for the
+        // (fake) pipe reader's own EOF-on-exit behavior and once for `wait_for_room`'s race.
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let pump = spawn_pump(BurstyUntilExited { exited: exit_rx.clone() }, buf.clone(), exit_rx);
+
+        // Let the pump run until the buffer fills to the cap and it parks — nobody ever drains it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let len = buf.data.lock().expect("lock").len();
+                if len >= MAX_PIPE_BUFFER_BYTES {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pump must fill the buffer to the cap");
+
+        // Simulate the process exiting — nobody ever drains the buffer afterward.
+        let _ = exit_tx.send(Some(0));
+
+        // THE fix: the pump task must actually END once notified of the exit, not park forever.
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the pump task must end once the process exits, not park forever")
+            .expect("the pump task must not panic");
     }
 
     /// `capture_stderr: false` routes stderr to the null device: `read_stderr` legitimately stays
