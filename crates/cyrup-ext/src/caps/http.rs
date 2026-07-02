@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use tokio::io::AsyncReadExt;
 
 /// A single outbound HTTP request (mirrors the WIT `http-request` record 1:1, world.wit).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,8 +45,10 @@ pub struct HttpStreamResponse {
     pub headers: Vec<(String, String)>,
 }
 
-/// A live streaming response body, boxed for storage in the registry.
-type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+/// A live streaming response body, boxed for storage in the registry. The error type is
+/// `std::io::Error` (not `reqwest::Error`) because a Content-Encoded stream is re-wrapped through
+/// an `async-compression` decoder — see [`decode_stream`].
+type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 /// Bounds how much of a single [`HttpCaps::request`] response body gets buffered in memory before
 /// the request is rejected outright. `HttpCaps` is ONE shared engine behind a single `Arc` on
@@ -105,8 +108,17 @@ impl HttpCaps {
     /// Build a real client (rustls, arch-01 §7.1's convention — no native-tls). A builder failure
     /// (never observed with the default rustls config actually used in this workspace) degrades to
     /// `reqwest::Client::new()` rather than panicking (no-panic policy, arch-00 §8).
+    ///
+    /// Disables `reqwest`'s own built-in auto-decompression (`no_gzip`/`no_brotli`/`no_deflate`/
+    /// `no_zstd` — available regardless of cargo features, so this compiles either way): that
+    /// machinery unconditionally strips `Content-Encoding`/`Content-Length` the instant it
+    /// decompresses a body, diverging from the real consumer's `fetch()` (which preserves both —
+    /// verified live against Node's real `fetch()`). [`request`]/[`request_stream`] instead
+    /// advertise the SAME `Accept-Encoding` reqwest's own toggles would have (`build_request`) and
+    /// decompress manually via [`decode_buffered`]/[`decode_stream`], so the caller sees the
+    /// decompressed body AND the untouched original headers.
     pub fn new() -> Self {
-        let client = reqwest::Client::builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
         Self::with_client(client)
     }
 
@@ -129,18 +141,27 @@ impl HttpCaps {
     /// flake this test must not be sensitive to.
     #[cfg(test)]
     fn with_max_open_streams(max_open_streams: usize) -> Self {
-        let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(0)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client =
+            client_builder().pool_max_idle_per_host(0).build().unwrap_or_else(|_| reqwest::Client::new());
         Self { max_open_streams, ..Self::with_client(client) }
     }
 
     /// Shared request-building: method parse + headers + optional body + optional timeout.
+    ///
+    /// Sets `Accept-Encoding` when the caller didn't already supply one — the SAME value reqwest's
+    /// own `gzip`+`brotli`+`deflate`+`zstd` toggles would have set automatically
+    /// (`tower_http::compression_utils::AcceptEncoding::to_header_value`'s `(true,true,true,true)`
+    /// arm: `"zstd,gzip,deflate,br"`), since [`Self::new`] disables that automatic behavior to keep
+    /// the ORIGINAL response headers intact (see [`Self::new`]'s doc comment).
     fn build_request(&self, req: &HttpRequest) -> Result<reqwest::RequestBuilder, String> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("invalid HTTP method `{}`: {e}", req.method))?;
         let mut builder = self.client.request(method, req.url.as_str());
+        let has_accept_encoding =
+            req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
+        if !has_accept_encoding {
+            builder = builder.header(reqwest::header::ACCEPT_ENCODING, "zstd,gzip,deflate,br");
+        }
         for (name, value) in &req.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -156,11 +177,20 @@ impl HttpCaps {
     /// A bounded request/response round trip (the WIT `request`): the whole body is buffered and
     /// returned. A non-2xx status is NOT itself an `Err` (fetch/Pi semantics — only a transport
     /// failure is); the caller inspects `status` itself.
+    ///
+    /// `headers` are the REAL wire headers (including `Content-Encoding`/`Content-Length` when the
+    /// server compressed the body) — `body` is still the DECOMPRESSED bytes, matching real `fetch()`
+    /// exactly (verified live against Node's real `fetch()`, not just the spec). `read_bounded_body`
+    /// bounds the WIRE (possibly compressed) transfer; [`decode_buffered`] separately bounds the
+    /// DECOMPRESSED output at the same cap, so a small compressed body cannot expand into an
+    /// unbounded in-memory allocation (a decompression bomb) now that decoding happens manually.
     pub async fn request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
         let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
-        let body = read_bounded_body(resp).await?;
+        let encoding = content_encoding_of(resp.headers());
+        let raw = read_bounded_body(resp).await?;
+        let body = decode_buffered(encoding.as_deref(), raw).await?;
         Ok(HttpResponse { status, headers, body })
     }
 
@@ -169,6 +199,10 @@ impl HttpCaps {
     /// stores the decoded byte stream keyed by a fresh handle for [`Self::poll_stream_chunk`] to
     /// drain. Like [`Self::request`], a non-2xx status is not itself an error (fetch semantics) — the
     /// caller inspects [`HttpStreamResponse::status`] itself; the body is stored regardless of status.
+    ///
+    /// `headers` are the real wire headers (see [`Self::request`]'s doc comment); the drained chunks
+    /// are the DECOMPRESSED bytes ([`decode_stream`] wraps the raw byte stream through the matching
+    /// `async-compression` decoder before it ever reaches the registry).
     pub async fn request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
         // Reject BEFORE spending a real network round-trip if already at the cap (checked again,
         // atomically with the insert, below — this is a fast up-front rejection, not the only gate).
@@ -185,7 +219,8 @@ impl HttpCaps {
         let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
-        let stream: ChunkStream = Box::pin(resp.bytes_stream());
+        let encoding = content_encoding_of(resp.headers());
+        let stream: ChunkStream = decode_stream(encoding.as_deref(), resp.bytes_stream());
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut g =
             self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
@@ -311,9 +346,111 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
         .collect()
 }
 
+/// A `reqwest::ClientBuilder` with the built-in `gzip`/`brotli`/`deflate`/`zstd` auto-decompression
+/// disabled (`no_gzip`/`no_brotli`/`no_deflate`/`no_zstd` — real methods regardless of which of
+/// those cargo features are compiled in), so the response headers this crate hands back stay the
+/// REAL wire headers (matching Pi's real `fetch()`, which preserves `Content-Encoding`/
+/// `Content-Length` even while transparently decompressing — see [`HttpCaps::new`]'s doc comment).
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_gzip().no_brotli().no_deflate().no_zstd()
+}
+
+/// The response's `Content-Encoding` value, if any (lowercased is NOT applied — matches
+/// `tower_http`'s own byte-exact, case-SENSITIVE match against `gzip`/`deflate`/`br`/`zstd`; an
+/// unrecognized casing/value is treated as `identity`, exactly like the real decompression layer
+/// this replaces).
+fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers.get(reqwest::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+/// Decompress a fully-buffered body per `encoding` (the real consumer's `fetch()` semantics — an
+/// unrecognized/absent encoding passes the bytes through unchanged, matching `identity`). Bounds the
+/// DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`], the SAME cap [`read_bounded_body`] already
+/// applies to the wire (possibly-compressed) transfer — now that decompression happens manually
+/// here rather than inside `reqwest`, a small compressed body must not be able to expand into an
+/// unbounded allocation (a decompression bomb).
+async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
+    let Some(encoding) = encoding else { return Ok(raw) };
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(raw));
+    match encoding {
+        "gzip" => read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await,
+        "br" => read_capped(async_compression::tokio::bufread::BrotliDecoder::new(reader)).await,
+        "deflate" => {
+            read_capped(async_compression::tokio::bufread::DeflateDecoder::new(reader)).await
+        }
+        "zstd" => read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await,
+        // Unrecognized Content-Encoding ⇒ identity, matching the real decompression layer this
+        // replaces (`tower_http`'s `_ => identity` fallback). `reader` (holding `raw`) is simply
+        // dropped here; recover the original bytes from its inner cursor.
+        _ => Ok(reader.into_inner().into_inner()),
+    }
+}
+
+/// Read `r` to EOF, capped at [`MAX_RESPONSE_BODY_BYTES`] of DECOMPRESSED output — rejects rather
+/// than growing past the cap, mirroring [`read_bounded_body`]'s running-total check.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = r.read(&mut buf).await.map_err(|e| format!("decompression failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let Some(chunk) = buf.get(..n) else { break };
+        if out.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(format!(
+                "decompressed response body exceeds the {MAX_RESPONSE_BODY_BYTES}-byte cap"
+            ));
+        }
+        out.extend_from_slice(chunk);
+    }
+    Ok(out)
+}
+
+/// Wrap a raw response byte stream through the `async-compression` decoder matching `encoding` (the
+/// real consumer's `fetch()` semantics — an unrecognized/absent encoding passes chunks through
+/// unchanged, matching `identity`), used by [`HttpCaps::request_stream`]. Unlike the buffered path,
+/// there is no additional cap here: the host never accumulates a streaming body (the guest drains it
+/// one already-network-bounded chunk at a time via [`HttpCaps::poll_stream_chunk`] — the same
+/// reasoning [`MAX_RESPONSE_BODY_BYTES`]'s doc comment already gives for why streaming doesn't need
+/// it), and a decoder that never learns the true end of a bomb-sized declared stream is nothing new:
+/// an identity stream of the same declared size is already unbounded in the exact same way.
+fn decode_stream(
+    encoding: Option<&str>,
+    raw: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+) -> ChunkStream {
+    // `reqwest::Error` doesn't satisfy `StreamReader`'s `Into<std::io::Error>` bound directly —
+    // map it explicitly once, up front, so every decoder branch below shares one `io::Error`-typed
+    // stream.
+    let raw = raw.map(|r| r.map_err(std::io::Error::other));
+    match encoding {
+        Some("gzip") => {
+            let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
+            let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
+            Box::pin(tokio_util::io::ReaderStream::new(decoder))
+        }
+        Some("br") => {
+            let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
+            let decoder = async_compression::tokio::bufread::BrotliDecoder::new(reader);
+            Box::pin(tokio_util::io::ReaderStream::new(decoder))
+        }
+        Some("deflate") => {
+            let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
+            let decoder = async_compression::tokio::bufread::DeflateDecoder::new(reader);
+            Box::pin(tokio_util::io::ReaderStream::new(decoder))
+        }
+        Some("zstd") => {
+            let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
+            let decoder = async_compression::tokio::bufread::ZstdDecoder::new(reader);
+            Box::pin(tokio_util::io::ReaderStream::new(decoder))
+        }
+        _ => Box::pin(raw),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -356,43 +493,50 @@ mod tests {
         assert_eq!(resp.body, body);
     }
 
+    /// Pipe `input` through a real system compressor binary (`gzip -c` / `zstd -c`), no canned
+    /// bytes.
+    fn compress_with(binary: &str, args: &[&str], input: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut child = std::process::Command::new(binary)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn the system `{binary}` binary: {e}"));
+        child
+            .stdin
+            .take()
+            .expect("child stdin")
+            .write_all(input)
+            .expect("write plaintext to the compressor");
+        let out = child.wait_with_output().expect("compressor runs");
+        assert!(out.status.success(), "`{binary}` must succeed");
+        out.stdout
+    }
+
     /// The real consumer's `fetch()` (`streamableHttp.js:89,306,443`, `@modelcontextprotocol/sdk
     /// @1.26.0`) auto-decodes a standard `Content-Encoding` per the Fetch spec with zero caller-
-    /// visible opt-in — closes the finding that the workspace's `reqwest` feature set (`gzip`/
-    /// `brotli`/`deflate`/`zstd`, `Cargo.toml`) omitted the very feature flags that make it do the
-    /// same. Serves a REAL gzip-compressed body (via the system `gzip` binary, no canned bytes) with
-    /// a genuine `Content-Encoding: gzip` header and asserts `HttpCaps::request` hands back the
-    /// DECOMPRESSED plaintext, not the raw compressed wire bytes.
+    /// visible opt-in, AND (verified live against Node's real `fetch()`, not just the spec)
+    /// preserves the original wire `Content-Encoding`/`Content-Length` in `Response.headers` even
+    /// though the body it hands back is decompressed. Serves a REAL gzip-compressed body (via the
+    /// system `gzip` binary, no canned bytes) with a genuine `Content-Encoding: gzip` header and
+    /// asserts BOTH halves: `HttpCaps::request` hands back the DECOMPRESSED plaintext body, AND the
+    /// returned headers still carry the real `Content-Encoding: gzip` + the ORIGINAL (compressed)
+    /// `Content-Length` — the exact divergence the L4 review found (`reqwest`'s own built-in
+    /// decompression strips both).
     #[tokio::test]
     async fn request_transparently_decodes_a_real_gzip_content_encoding() {
         let plaintext = b"hello decompression world, repeated for a real ratio: \
             hello decompression world, hello decompression world"
             .to_vec();
-        let gzipped = {
-            use std::io::Write;
-            let mut child = std::process::Command::new("gzip")
-                .arg("-c")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn the system gzip binary");
-            child
-                .stdin
-                .take()
-                .expect("gzip stdin")
-                .write_all(&plaintext)
-                .expect("write plaintext to gzip");
-            let out = child.wait_with_output().expect("gzip runs");
-            assert!(out.status.success(), "gzip must succeed");
-            out.stdout
-        };
+        let gzipped = compress_with("gzip", &["-c"], &plaintext);
         assert_ne!(gzipped, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
 
         let headers = format!(
             "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n",
             gzipped.len()
         );
-        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
         let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
@@ -401,6 +545,96 @@ mod tests {
         assert_eq!(
             resp.body, plaintext,
             "the body must come back as the DECOMPRESSED plaintext, matching a real fetch() client"
+        );
+        let get = |name: &str| {
+            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("content-encoding"),
+            Some("gzip"),
+            "Content-Encoding must survive decompression, matching real fetch(): {:?}",
+            resp.headers
+        );
+        assert_eq!(
+            get("content-length"),
+            Some(gzipped.len().to_string().as_str()),
+            "Content-Length must still report the ORIGINAL (compressed, wire) size, matching real \
+             fetch(), not the decompressed body's length: {:?}",
+            resp.headers
+        );
+    }
+
+    /// Same finding, the streaming path (`request_stream`/`poll_stream_chunk`): a REAL zstd-
+    /// compressed body (via the system `zstd` binary) must decompress the DRAINED chunks while the
+    /// initiating response's headers (captured before any chunk is polled) still carry the real
+    /// `Content-Encoding: zstd` + original compressed `Content-Length`.
+    #[tokio::test]
+    async fn request_stream_transparently_decodes_a_real_zstd_content_encoding() {
+        let plaintext = b"streaming zstd decompression world, repeated for a real ratio: \
+            streaming zstd decompression world, streaming zstd decompression world"
+            .to_vec();
+        let compressed = compress_with("zstd", &["-c"], &plaintext);
+        assert_ne!(compressed, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n",
+            compressed.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![compressed.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        assert_eq!(opened.status, 200);
+        let get = |name: &str| {
+            opened.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-encoding"), Some("zstd"), "headers: {:?}", opened.headers);
+        assert_eq!(
+            get("content-length"),
+            Some(compressed.len().to_string().as_str()),
+            "the ORIGINAL compressed length, not the decompressed one: {:?}",
+            opened.headers
+        );
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, plaintext,
+            "drained chunks concatenate back to the DECOMPRESSED plaintext, matching real fetch()"
+        );
+    }
+
+    /// A small compressed body that decompresses to something far larger than
+    /// [`MAX_RESPONSE_BODY_BYTES`] (a decompression bomb) must still be rejected — now that
+    /// decompression happens manually (`decode_buffered`), this cap is no longer `reqwest`'s
+    /// responsibility, so it must be reasserted independently of the wire-size cap
+    /// (`request_rejects_a_declared_content_length_over_the_cap` already covers the wire side).
+    #[tokio::test]
+    async fn request_rejects_a_decompression_bomb_over_the_cap() {
+        // Highly compressible: one repeated byte, decompressed size deliberately over the cap.
+        let huge = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
+        let gzipped = compress_with("gzip", &["-9", "-c"], &huge);
+        assert!(
+            gzipped.len() < MAX_RESPONSE_BODY_BYTES / 4,
+            "sanity: the compressed wire form must be small (a real bomb), got {} bytes",
+            gzipped.len()
+        );
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = caps.request(&req).await.expect_err("a decompression bomb must be rejected");
+        assert!(
+            err.contains("cap"),
+            "the error must explain the decompressed-size cap was hit: {err}"
         );
     }
 

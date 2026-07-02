@@ -124,6 +124,22 @@ eventsource-stream   = { version = "0.2.3" }
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
 
+# arch-00 §7.1 ratified — first used by cyrup-ext (arch-08 §3.2 draft): the real consumer's
+# `fetch()` (same `streamableHttp.js` citation as `reqwest` above) preserves the WIRE
+# `Content-Encoding`/`Content-Length` in `Response.headers` even while transparently decompressing
+# the body (verified live against Node's real `fetch()`, not just the spec) — but `reqwest`'s
+# built-in decompression (`tower-http`'s `DecompressionLayer`, wired in via the `gzip`/`brotli`/
+# `deflate`/`zstd` features above) unconditionally STRIPS both headers the instant it decompresses
+# (`tower_http::decompression::future::ResponseFuture::poll`, `entry.remove()` +
+# `parts.headers.remove(CONTENT_LENGTH)` — confirmed by reading that source directly), with no
+# opt-out other than disabling the whole per-`Client` runtime toggle (`ClientBuilder::no_gzip()`
+# etc., which exist regardless of these cargo features). `cyrup-ext::caps::http` disables that
+# runtime toggle and decompresses manually with `async-compression`'s already-resolved codecs (the
+# SAME crates `tower-http`'s decompression layer already pulls in transitively — this promotes an
+# existing dependency-graph member to a direct one, not a new codec implementation) so it can return
+# the decompressed body AND the untouched original headers, matching real `fetch()` exactly.
+async-compression    = { version = "0.4.33", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
+
 # arch-10 §7 / §8 — rich-rendering stack, first used by cyrup-tui (arch-10, spec/tui/06).
 # User-ratified for the L6 round (markdown + syntax + inline images). `syntect` uses the pure-Rust
 # `fancy-regex` engine (`default-fancy`) — NO oniguruma C dep — so the workspace stays all-Rust and

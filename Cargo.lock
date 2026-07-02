@@ -1070,6 +1070,7 @@ dependencies = [
 name = "cyrup-ext"
 version = "0.0.0"
 dependencies = [
+ "async-compression",
  "async-trait",
  "blake3",
  "bytes",
@@ -1085,6 +1086,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
