@@ -278,6 +278,54 @@ mod tests {
         assert_eq!(resp.body, body);
     }
 
+    /// The real consumer's `fetch()` (`streamableHttp.js:89,306,443`, `@modelcontextprotocol/sdk
+    /// @1.26.0`) auto-decodes a standard `Content-Encoding` per the Fetch spec with zero caller-
+    /// visible opt-in — closes the finding that the workspace's `reqwest` feature set (`gzip`/
+    /// `brotli`/`deflate`/`zstd`, `Cargo.toml`) omitted the very feature flags that make it do the
+    /// same. Serves a REAL gzip-compressed body (via the system `gzip` binary, no canned bytes) with
+    /// a genuine `Content-Encoding: gzip` header and asserts `HttpCaps::request` hands back the
+    /// DECOMPRESSED plaintext, not the raw compressed wire bytes.
+    #[tokio::test]
+    async fn request_transparently_decodes_a_real_gzip_content_encoding() {
+        let plaintext = b"hello decompression world, repeated for a real ratio: \
+            hello decompression world, hello decompression world"
+            .to_vec();
+        let gzipped = {
+            use std::io::Write;
+            let mut child = std::process::Command::new("gzip")
+                .arg("-c")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the system gzip binary");
+            child
+                .stdin
+                .take()
+                .expect("gzip stdin")
+                .write_all(&plaintext)
+                .expect("write plaintext to gzip");
+            let out = child.wait_with_output().expect("gzip runs");
+            assert!(out.status.success(), "gzip must succeed");
+            out.stdout
+        };
+        assert_ne!(gzipped, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
+
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, plaintext,
+            "the body must come back as the DECOMPRESSED plaintext, matching a real fetch() client"
+        );
+    }
+
     #[tokio::test]
     async fn request_stream_yields_real_chunks_in_order_then_eof() {
         let parts: Vec<Vec<u8>> =

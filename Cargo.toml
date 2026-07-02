@@ -103,7 +103,15 @@ time                 = { version = "0.3", features = ["formatting", "parsing"] }
 uuid                 = { version = "1", features = ["v7"] }
 
 # arch-00 §7 / §7.1 — direct-wire HTTP + SSE stack, first used by cyrup-provider (arch-01).
-reqwest              = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2"] }
+# `gzip`/`brotli`/`deflate`/`zstd` (each gated via `tower-http`'s decompression layer, reqwest's own
+# Cargo.toml) make reqwest transparently decode a `Content-Encoding` response body — matching the
+# REAL consumer's behavior 1:1: the MCP SDK's `streamableHttp.js` uses the platform `fetch()`
+# (dist/esm/client/streamableHttp.js:89,306,443, @modelcontextprotocol/sdk@1.26.0), and Node's
+# `fetch()` auto-decodes standard `Content-Encoding` per the Fetch spec with zero caller-visible
+# opt-in. Without these, `cyrup-ext`'s `http-client` capability (caps/http.rs) — the wasm guest's
+# ONLY way to make an outbound request — would hand back raw compressed bytes for any server that
+# compresses (the common case), silently diverging from what a real `fetch()`-based client sees.
+reqwest              = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2", "gzip", "brotli", "deflate", "zstd"] }
 eventsource-stream   = { version = "0.2.3" }
 bytes                = { version = "1" }
 base64               = { version = "0.22" }
