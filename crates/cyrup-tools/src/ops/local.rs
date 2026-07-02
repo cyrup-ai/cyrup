@@ -323,24 +323,30 @@ fn send_sigkill_tree(child: &mut tokio::process::Child) {
 /// which targets the whole `setsid` group a shell-spawned tree needs, R-03-027). This is the graceful
 /// half of a two-step escalation for a caller that owns exactly one non-group-leader child directly
 /// (e.g. cyrup-ext's long-lived `proc` capability, arch-08 §5.2/pi-mcp-adapter-port.md §3.1, which
-/// spawns a plain — not `setsid`'d — child, mirroring Pi's own non-detached `StdioClientTransport`
+/// spawns a plain — not `setsid`'d — child, mirroring the real `StdioClientTransport`'s non-detached
 /// spawn 1:1). A best-effort no-op on non-unix (no portable single-pid graceful-signal primitive
 /// there without holding the `Child` itself, which this pid-only API deliberately doesn't require);
 /// [`kill_pid`] is the forceful escalation that DOES work everywhere.
+///
+/// Returns whether a REAL graceful signal was actually sent: `Ok(true)` on unix (the `kill(2)` call
+/// succeeded); `Ok(false)` on non-unix, where nothing was sent at all. Callers MUST skip any
+/// post-call grace-period wait when this returns `Ok(false)` — waiting for a reaction to a signal
+/// that was never sent only pays a needless delay before the (always-effective) forceful escalation,
+/// with zero chance of the child ever reacting.
 #[allow(unsafe_code)]
-pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
+pub fn terminate_pid(pid: u32) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         // SAFETY: `kill(2)` only reads its two integer args (pid, signal); it touches no memory. A
         // non-zero return is an `errno` (e.g. `ESRCH` if the pid is already gone), surfaced as an
         // `io::Error`, never a panic.
         let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        if rc == 0 { Ok(true) } else { Err(std::io::Error::last_os_error()) }
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -655,5 +661,31 @@ mod tests {
             "the grace period was genuinely waited out before escalating to SIGKILL, got {:?}",
             started.elapsed()
         );
+    }
+
+    /// `terminate_pid`'s `bool` return is the signal callers (`cyrup_ext::caps::proc::ProcCaps::kill`)
+    /// rely on to decide whether to wait out a grace period at all — `Ok(true)` on unix means a REAL
+    /// `SIGTERM` was sent (so waiting for a reaction is meaningful), verified here by actually
+    /// terminating a real spawned child and confirming it dies within the standard grace window.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_pid_reports_true_and_the_real_process_dies() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id().expect("spawned child has a pid");
+
+        let sent = terminate_pid(pid).expect("SIGTERM send succeeds");
+        assert!(sent, "unix terminate_pid must report a real signal was sent");
+
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("the SIGTERM-obeying child dies within the grace window")
+            .expect("wait succeeds");
+        assert!(!status.success(), "a SIGTERM-terminated child does not exit successfully");
     }
 }

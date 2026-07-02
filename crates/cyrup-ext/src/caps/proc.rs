@@ -317,10 +317,13 @@ impl ProcCaps {
             return Ok(()); // exited on stdin EOF alone — no signal needed (stdio.js:159-160).
         }
 
-        // Phase 2 — SIGTERM (stdio.js:162), same 2000ms-real grace (stdio.js:167).
-        cyrup_tools::terminate_pid(entry.pid)
+        // Phase 2 — SIGTERM (stdio.js:162), same 2000ms-real grace (stdio.js:167). On non-unix,
+        // `terminate_pid` is a best-effort no-op (no portable single-pid graceful-signal primitive
+        // there) and reports `Ok(false)` — skip the grace-period wait entirely rather than paying
+        // a needless ~2s delay for a signal that was genuinely never sent.
+        let sigterm_sent = cyrup_tools::terminate_pid(entry.pid)
             .map_err(|e| format!("SIGTERM pid {}: {e}", entry.pid))?;
-        if Self::wait_exited(&entry, self.kill_grace).await {
+        if sigterm_sent && Self::wait_exited(&entry, self.kill_grace).await {
             return Ok(()); // SIGTERM worked within the grace period — no further escalation needed.
         }
 
