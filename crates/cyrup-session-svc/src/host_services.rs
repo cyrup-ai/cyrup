@@ -489,7 +489,25 @@ impl HostServices for LiveHostServices {
     // `block_in_place` + `block_on` bridge `exec`/`http_request` use.
 
     fn proc_spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
-        self.proc_caps.spawn(spec)
+        // Default an omitted `cwd` to the session's own project directory — the SAME fallback
+        // `exec` applies (`opts.cwd ?? self.cwd` above), for the SAME reason: the real consumer's
+        // own default (`server-manager.ts:110`'s `resolveConfigPath(definition.cwd)`, which is
+        // `undefined` when `definition.cwd` is `undefined`, `utils.ts:78-80`) relies on ITS
+        // coordinating process's OWN ambient `process.cwd()` reliably already BEING the project
+        // directory, since pi-mcp-adapter runs as part of the per-invocation coding-agent process
+        // rooted there. `cyrup-session-svc` is architected as a long-lived MULTI-session service
+        // with an explicit per-session `cwd` field precisely because the ambient host-process cwd
+        // is NOT a reliable stand-in for a given session's project directory here — so, unlike Pi,
+        // omitting `cwd` must not silently fall through to `tokio::process::Command`'s own default
+        // (inheriting the HOST's ambient cwd, not the calling session's), or a guest-authored
+        // MCP-client extension that (correctly, matching Pi) omits `cwd` could spawn the server in
+        // the wrong directory under concurrent multi-session deployment.
+        let spec = if spec.cwd.is_none() {
+            ProcSpawnSpec { cwd: Some(self.cwd.clone()), ..spec.clone() }
+        } else {
+            spec.clone()
+        };
+        self.proc_caps.spawn(&spec)
     }
 
     fn proc_write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
@@ -663,6 +681,71 @@ mod tests {
             .exec("sleep", &["30".to_string()], &json!({}), cancelled)
             .expect("a pre-cancelled exec resolves");
         assert!(out.killed, "a pre-aborted signal kills the exec");
+    }
+
+    /// The `proc` grant's `spawn` defaults an OMITTED `cwd` to the session's own project directory —
+    /// the SAME fallback `exec` applies (test 3 above, `opts.cwd ?? self.cwd`) — rather than
+    /// silently inheriting the HOST PROCESS's own ambient cwd (`tokio::process::Command`'s default
+    /// when no `.current_dir()` call is made at all). Verified by actually running `pwd` inside the
+    /// spawned child and reading its REAL stdout, not asserting on `ProcSpawnSpec` construction.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proc_spawn_defaults_omitted_cwd_to_the_session_cwd() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        let session_cwd = std::env::temp_dir();
+
+        // No `cwd` in the spec at all — must run in the SESSION's cwd, not the host's ambient one
+        // (this test binary's own cwd is the crate root, which must NOT be what `pwd` prints).
+        let spec = ProcSpawnSpec {
+            cmd: "pwd".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            capture_stderr: false,
+        };
+        let handle = svc.proc_spawn(&spec).expect("pwd spawns with no cwd override");
+        let stdout = wait_for_exit_and_read_stdout(&svc, handle).await;
+        let printed = std::fs::canonicalize(stdout.trim_end()).unwrap_or_default();
+        assert_eq!(
+            printed,
+            std::fs::canonicalize(&session_cwd).unwrap_or(session_cwd),
+            "an omitted cwd must default to the SESSION's cwd, not the host process's ambient one"
+        );
+
+        // An EXPLICIT `cwd` in the spec is still honored verbatim (the fallback only fires when
+        // `cwd` is `None`, never overriding a guest-supplied value).
+        let explicit = std::env::current_dir().expect("host has a cwd");
+        let spec = ProcSpawnSpec {
+            cmd: "pwd".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: Some(explicit.clone()),
+            capture_stderr: false,
+        };
+        let handle = svc.proc_spawn(&spec).expect("pwd spawns with an explicit cwd");
+        let stdout = wait_for_exit_and_read_stdout(&svc, handle).await;
+        let printed = std::fs::canonicalize(stdout.trim_end()).unwrap_or_default();
+        assert_eq!(
+            printed,
+            std::fs::canonicalize(&explicit).unwrap_or(explicit),
+            "an explicit cwd is honored verbatim, not overridden by the session-cwd fallback"
+        );
+    }
+
+    /// Poll `proc_poll_exit` until the child reaps, then drain its real stdout — used by tests that
+    /// need a spawned child's actual captured output rather than just an `Ok` handle.
+    #[cfg(unix)]
+    async fn wait_for_exit_and_read_stdout(svc: &LiveHostServices, handle: u32) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if svc.proc_poll_exit(handle).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let bytes = svc.proc_read_stdout(handle, 65536).expect("read_stdout on a live handle");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// With NO ui sink attached (headless print/json: `set_ui_sink` is never called), the ui grant
