@@ -130,6 +130,15 @@ ratatui-image        = { version = "11.0.6", default-features = false, features 
 #   toml, serde_yml, gix, notify, slotmap, pulldown-cmark, syntect, camino, bytes, memchr,
 #   landlock, seccompiler.
 
+# Dev-profile footprint control (ADR-0003 / arch-13 §6.2). Full DWARF (`debug=2`,
+# the dev default) dominates target/debug/deps; line-tables-only keeps file:line in
+# backtraces at a fraction of the size, and dependency crates carry no debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false          # deps: no DWARF (we don't step into them) — R-ARCH-BLD-002/008
+
 # Single static binary, lean + fast (arch-00 Appendix B / func-00 R-00-008).
 [profile.release]
 lto = "fat"
