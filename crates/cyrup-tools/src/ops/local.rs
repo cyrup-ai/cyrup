@@ -284,24 +284,32 @@ fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
 /// which signals a single non-group-leader pid for the unrelated `proc` capability). A `setsid`'d
 /// tree that traps `SIGTERM` gets real time — up to [`LocalProc::kill_grace`] — to flush state /
 /// clean up children before [`send_sigkill_tree`] forces it (R-03-024/027).
+///
+/// Returns whether a REAL graceful signal was actually sent: `true` on unix when `killpg(2)`
+/// succeeds; `false` on non-unix (no portable single-call graceful-signal-a-tree primitive there)
+/// AND on unix if the group is already gone (`killpg` fails, e.g. `ESRCH`). Callers must use this
+/// to skip the grace-period wait when nothing was sent — exactly the sibling `proc` capability's
+/// `ProcCaps::kill`/`cyrup_tools::terminate_pid` fix for the identical bug class (commit `0790ace`:
+/// "skip the pointless SIGTERM grace wait on non-unix").
 #[allow(unsafe_code)]
-fn send_sigterm_tree(child: &tokio::process::Child) {
+fn send_sigterm_tree(child: &tokio::process::Child) -> bool {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
+        match child.id() {
             // SAFETY: send SIGTERM to the child's process group (created via `setsid`). A negative
-            // pid / killpg targets the group; harmless if the group is already gone (ESRCH).
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGTERM);
-            }
+            // pid / killpg targets the group; a nonzero return (e.g. `ESRCH`, group already gone)
+            // means nothing was actually signaled.
+            Some(pid) => unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) == 0 },
+            None => false,
         }
     }
     #[cfg(not(unix))]
     {
         // No portable graceful-signal primitive on non-unix without a real `Child` + platform API
-        // beyond what this crate depends on; the grace period still elapses (matching Pi's timer
-        // structure), then [`send_sigkill_tree`]'s `taskkill /F /T` forces the tree exactly once.
+        // beyond what this crate depends on — genuinely nothing is sent here; [`send_sigkill_tree`]'s
+        // `taskkill /F /T` is the only real termination path on this platform.
         let _ = child;
+        false
     }
 }
 
@@ -473,18 +481,25 @@ impl ProcOps for LocalProc {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled(), if pending.is_none() => {
-                    send_sigterm_tree(&child);
+                    // Skip the grace-period wait entirely when nothing was actually sent (non-unix,
+                    // or the group is already gone) — waiting it out has zero chance of a graceful
+                    // exit landing, mirroring `ProcCaps::kill`'s identical fix for this bug class
+                    // (`cyrup-ext/src/caps/proc.rs:347-355`, commit `0790ace`).
+                    let sigterm_sent = send_sigterm_tree(&child);
                     pending = Some(ExitStatus::Killed);
-                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
+                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut timeout_fut, if pending.is_none() => {
-                    send_sigterm_tree(&child);
+                    let sigterm_sent = send_sigterm_tree(&child);
                     pending = Some(ExitStatus::TimedOut);
-                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
+                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut grace, if pending.is_some() => {
-                    // Grace period elapsed and the tree is still alive (a natural exit would already
-                    // have hit the `child.wait()` arm below and broken the loop) — force it.
+                    // Grace period elapsed (or was skipped outright, above) and the tree is still
+                    // alive (a natural exit would already have hit the `child.wait()` arm below and
+                    // broken the loop) — force it.
                     send_sigkill_tree(&mut child);
                     let _ = child.wait().await;
                     break pending.unwrap_or(ExitStatus::TimedOut);
@@ -595,17 +610,24 @@ impl ProcOps for LocalProc {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled(), if pending.is_none() => {
-                    send_sigterm_tree(&child);
+                    // Skip the grace-period wait entirely when nothing was actually sent (non-unix,
+                    // or the group is already gone) — waiting it out has zero chance of a graceful
+                    // exit landing, mirroring `ProcCaps::kill`'s identical fix for this bug class
+                    // (`cyrup-ext/src/caps/proc.rs:347-355`, commit `0790ace`).
+                    let sigterm_sent = send_sigterm_tree(&child);
                     pending = Some(ExitStatus::Killed);
-                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
+                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut timeout_fut, if pending.is_none() => {
-                    send_sigterm_tree(&child);
+                    let sigterm_sent = send_sigterm_tree(&child);
                     pending = Some(ExitStatus::TimedOut);
-                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                    let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
+                    grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut grace, if pending.is_some() => {
-                    // Grace elapsed with NO natural exit yet (a graceful mid-grace exit already
+                    // Grace elapsed (or was skipped outright, above) with NO natural exit yet (a
+                    // graceful mid-grace exit already
                     // broke the loop via the `child.wait()`/drain arms below, which keep the REAL
                     // code). Force it, but still capture whatever real status `wait()` reports
                     // (Pi: SIGKILL ⇒ `exit(null)` ⇒ `code ?? 0`, matched by `exit_from`'s
@@ -834,6 +856,28 @@ mod tests {
             .expect("the SIGTERM-obeying child dies within the grace window")
             .expect("wait succeeds");
         assert!(!status.success(), "a SIGTERM-terminated child does not exit successfully");
+    }
+
+    /// `send_sigterm_tree`'s `bool` return is what `exec`/`exec_argv`'s select loops now use to skip
+    /// the grace-period wait when nothing was actually sent — the SAME bug class as `terminate_pid`
+    /// (`0790ace`), just for the whole-process-GROUP kill this file's `exec`/`exec_argv` use. Verified
+    /// directly against a REAL `setsid`'d process group: `true` while it's alive, `false` (`ESRCH`)
+    /// once it's already reaped — not just documented.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_sigterm_tree_reports_true_while_alive_false_once_reaped() {
+        let std_cmd = build_argv_command(&argv("sleep", &["30"]));
+        let mut child = tokio::process::Command::from(std_cmd).spawn().expect("sleep spawns");
+
+        assert!(send_sigterm_tree(&child), "a live setsid'd group is genuinely signaled");
+        // `sleep` doesn't trap SIGTERM — the signal just sent is enough to reap it.
+        child.wait().await.expect("the SIGTERM-obeying child dies");
+
+        assert!(
+            !send_sigterm_tree(&child),
+            "signaling an already-reaped process group must report false (ESRCH), not silently \
+             claim success"
+        );
     }
 
     /// Reproduces the exact hang class Pi's `EXIT_STDIO_GRACE_MS` idle timer exists to close
