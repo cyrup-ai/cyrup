@@ -47,6 +47,18 @@ pub struct HttpStreamResponse {
 /// A live streaming response body, boxed for storage in the registry.
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
+/// Bounds how much of a single [`HttpCaps::request`] response body gets buffered in memory before
+/// the request is rejected outright. `HttpCaps` is ONE shared engine behind a single `Arc` on
+/// `LiveHostServices` (`host_services.rs`), used by EVERY extension loaded into a session — an
+/// unbounded `resp.bytes().await` lets any one malicious/misbehaving extension exhaust the whole
+/// host process's memory just by pointing `request` at an endpoint that serves an arbitrarily
+/// large (or unbounded chunked) body. Mirrors the exact bound `cyrup_ext::caps::proc`'s
+/// `MAX_PIPE_BUFFER_BYTES` (`proc.rs`) already established for this identical class of
+/// shared-host-resource exhaustion, ported here to close the one capability that skipped it.
+/// [`Self::request_stream`]/[`Self::poll_stream_chunk`] don't need this: the host never
+/// accumulates their body — the guest drains it one already-bounded network chunk at a time.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// The real HTTP capability engine: one shared `reqwest::Client` plus a registry of open streaming
 /// bodies keyed by an opaque `u32` handle (`request-stream` / `poll-stream-chunk` / `close-stream`).
 /// A registry entry of `None` means the underlying stream already reached natural EOF (or errored)
@@ -109,7 +121,7 @@ impl HttpCaps {
         let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
-        let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+        let body = read_bounded_body(resp).await?;
         Ok(HttpResponse { status, headers, body })
     }
 
@@ -182,6 +194,37 @@ impl HttpCaps {
             g.remove(&handle);
         }
     }
+}
+
+/// Drain `resp`'s body into memory, capped at [`MAX_RESPONSE_BODY_BYTES`]. Reads chunk-by-chunk
+/// (rather than the single-shot `resp.bytes()`, which buffers the WHOLE body internally before
+/// this call even gets a chance to look at its length) so a body that exceeds the cap is rejected
+/// — dropping the in-flight `stream` cancels the remaining download — without ever holding more
+/// than the cap in memory, even transiently. A declared `Content-Length` over the cap is rejected
+/// immediately, before reading a single byte; an absent/understated one (chunked transfer) is still
+/// caught by the running-total check on every chunk.
+async fn read_bounded_body(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length()
+        && len > MAX_RESPONSE_BODY_BYTES as u64
+    {
+        return Err(format!(
+            "response body ({len} bytes, Content-Length) exceeds the \
+             {MAX_RESPONSE_BODY_BYTES}-byte cap"
+        ));
+    }
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(format!(
+                "response body exceeds the {MAX_RESPONSE_BODY_BYTES}-byte cap (Content-Length \
+                 absent or understated)"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -315,6 +358,37 @@ mod tests {
         caps.close_stream(opened.handle);
         let err = caps.poll_stream_chunk(opened.handle).await.expect_err("closed handle is unknown");
         assert!(err.contains("no open http stream"), "got: {err}");
+    }
+
+    /// Closes the shared-host-memory-exhaustion finding: a response that DECLARES (via
+    /// `Content-Length`) a body bigger than [`MAX_RESPONSE_BODY_BYTES`] is rejected up front, before
+    /// a single byte is read — the mock server never actually has to produce that many bytes for
+    /// this to be observed, proving the cap is enforced off the header alone.
+    #[tokio::test]
+    async fn request_rejects_a_declared_content_length_over_the_cap() {
+        let headers = format!("Content-Length: {}\r\n", MAX_RESPONSE_BODY_BYTES as u64 + 1);
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"short".to_vec()]).await;
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = caps.request(&req).await.expect_err("oversized Content-Length is rejected");
+        assert!(err.contains("exceeds"), "got: {err}");
+        assert!(err.contains("Content-Length"), "the early, header-only path reports why: {err}");
+    }
+
+    /// Same finding, the harder path: NO `Content-Length` header at all (real chunked/streamed
+    /// responses often omit it), so the cap must still be enforced off the RUNNING total as chunks
+    /// arrive — a real, over-the-cap body is actually streamed from the mock server here.
+    #[tokio::test]
+    async fn request_rejects_a_body_that_exceeds_the_cap_with_no_content_length_header() {
+        let oversized = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
+        let url = spawn_mock("HTTP/1.1 200 OK", String::new(), vec![oversized]).await;
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("an over-cap body with no Content-Length is still rejected");
+        assert!(err.contains("exceeds"), "got: {err}");
     }
 
     #[tokio::test]
