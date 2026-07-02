@@ -367,18 +367,35 @@ fn map_ui_response(pending: &PendingUi, body: &Value) -> UiReply {
     }
 }
 
-/// Force-resolve every dialog the current turn's extension(s) have open to its per-kind default and
-/// drop it from `pending` (closes L4 review §2.5). RPC serves one turn at a time (`in_flight`), so
-/// every entry still in `pending` at the moment of `abort`/`abort_retry` belongs to the turn being
-/// aborted — matching Pi's usual pattern of binding a dialog's `ExtensionUIDialogOptions.signal` to
-/// the current run's `AbortSignal` (`ctx.signal`, types.ts:320-321), which Pi's `createDialogPromise`
-/// live abort listener resolves immediately (`rpc-mode.ts:108-112`). Sending on `p.reply` here is
-/// exactly what a genuine `extension_ui_response` does — it resumes [`LiveHostServices::ui_roundtrip`]
-/// (`host_services.rs`) the SAME way, no separate cancellation channel required.
+/// Force-resolve every `select`/`confirm`/`input` dialog the current turn's extension(s) have open to
+/// its per-kind default and drop it from `pending` (closes L4 review §2.5). RPC serves one turn at a
+/// time (`in_flight`), so every non-`Editor` entry still in `pending` at the moment of
+/// `abort`/`abort_retry` belongs to the turn being aborted — matching Pi's usual pattern of binding a
+/// dialog's `ExtensionUIDialogOptions.signal` to the current run's `AbortSignal` (`ctx.signal`,
+/// types.ts:320-321), which Pi's `createDialogPromise` live abort listener resolves immediately
+/// (`rpc-mode.ts:108-112`). Sending on `p.reply` here is exactly what a genuine `extension_ui_response`
+/// does — it resumes [`LiveHostServices::ui_roundtrip`] (`host_services.rs`) the SAME way, no separate
+/// cancellation channel required.
+///
+/// `Editor` dialogs are deliberately left untouched: Pi's `editor(title, prefill)` is a bare
+/// hand-rolled `Promise` with NO `opts`/signal/timeout parameter at all (`rpc-mode.ts:253-270`) — it
+/// resolves ONLY via a matching `pendingExtensionRequests.get(id).resolve(...)`, i.e. a genuine
+/// `extension_ui_response`. `select`/`confirm`/`input` (`rpc-mode.ts:136-149`) are the only three
+/// methods that go through `createDialogPromise` (`rpc-mode.ts:90-130`), the sole place an
+/// `AbortSignal` can dismiss a dialog early. Force-resolving an open editor here would spuriously
+/// cancel it on every `abort`/`abort_retry`, diverging from Pi, which leaves it hanging for a real
+/// response (or the client's own timeout).
 fn force_resolve_pending(pending: &mut HashMap<String, PendingUi>) {
-    for (_, p) in pending.drain() {
-        let reply = default_ui_reply(p.kind);
-        let _ = p.reply.send(reply);
+    let ids: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| p.kind != UiKind::Editor)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        if let Some(p) = pending.remove(&id) {
+            let reply = default_ui_reply(p.kind);
+            let _ = p.reply.send(reply);
+        }
     }
 }
 
@@ -1048,5 +1065,38 @@ mod tests {
         assert_eq!(wire["title"], "edit the changelog", "the real guest title must reach the wire");
         assert_ne!(wire["title"], "", "title must never be the pre-fix hardcoded empty string");
         assert_eq!(wire["prefill"], "## seed content", "prefill carries the seed text, not the title");
+    }
+
+    /// L4 round-12 finding #1: `abort`/`abort_retry` must NOT force-dismiss an open `ui.editor`
+    /// dialog. Pi's `editor(title, prefill)` is a bare hand-rolled `Promise` with no
+    /// `opts`/signal/timeout parameter at all (`rpc-mode.ts:253-270`) — it resolves ONLY via a
+    /// genuine `extension_ui_response`. `select`/`confirm`/`input` (`rpc-mode.ts:136-149`) are the
+    /// only three methods that go through `createDialogPromise` (`rpc-mode.ts:90-130`), the sole
+    /// place an `AbortSignal` can dismiss a dialog early. So `force_resolve_pending` must resolve a
+    /// pending `Confirm` (removing it) but leave a pending `Editor` entry untouched in `pending`.
+    #[test]
+    fn force_resolve_pending_leaves_editor_dialogs_open_but_resolves_the_rest() {
+        let (confirm_reply, mut confirm_rx) = oneshot::channel();
+        let (editor_reply, mut editor_rx) = oneshot::channel();
+        let mut pending: HashMap<String, PendingUi> = HashMap::new();
+        pending.insert("confirm-1".to_string(), PendingUi { kind: UiKind::Confirm, reply: confirm_reply });
+        pending.insert("editor-1".to_string(), PendingUi { kind: UiKind::Editor, reply: editor_reply });
+
+        force_resolve_pending(&mut pending);
+
+        // The confirm dialog is force-resolved to its per-kind default and dropped from `pending`.
+        assert_eq!(
+            confirm_rx.try_recv().expect("confirm dialog must be force-resolved on abort"),
+            UiReply::Confirm(false)
+        );
+        assert!(!pending.contains_key("confirm-1"), "resolved confirm dialog must be removed");
+
+        // The editor dialog is left genuinely pending: no reply sent, still in the map, awaiting a
+        // real `extension_ui_response`.
+        assert!(
+            editor_rx.try_recv().is_err(),
+            "abort must not force-resolve an open ui.editor dialog (no Pi equivalent)"
+        );
+        assert!(pending.contains_key("editor-1"), "editor dialog must remain pending after abort");
     }
 }
