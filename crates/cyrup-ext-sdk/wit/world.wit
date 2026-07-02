@@ -309,6 +309,40 @@ interface exec {
   run: func(cmd: string, args: list<string>, opts-json: string) -> result<exec-result, string>;
 }
 
+// Outbound HTTP only (no raw TCP-connect; no ambient authority) — the L4 `http-client` capability
+// (pi-mcp-adapter-port.md §3.2, the locked drafted shape). Gated by the SAME load-time trust check
+// `exec`/`ui` use (`is_trusted = origin.is_pre_trust() || project_trusted`, loader.rs:57-60); an
+// untrusted extension gets `DenyServices` and this interface is unreachable, exactly like `exec`.
+// `request` is a bounded round trip. `request-stream`/`poll-stream-chunk`/`close-stream` back a
+// long-lived streaming body (SSE / StreamableHTTP chunked responses): the HOST owns the live byte
+// stream and the guest polls it (a guest cannot hold a live Rust stream across the wasm boundary —
+// the request/poll bridge, arch-08 §5.2), keyed by an opaque `handle`.
+interface http-client {
+  record http-request {
+    method: string,                       // "GET" | "POST" | ...
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+    timeout-ms: option<u32>,
+  }
+  record http-response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  // A single request/response call. A non-2xx status is NOT itself a WIT error (fetch semantics) —
+  // only a transport failure (DNS, connect refused, TLS, timeout) is; the guest inspects `status`.
+  request: func(req: http-request) -> result<http-response, string>;
+
+  // Streaming variant for SSE / StreamableHTTP's chunked responses. Returns a stream handle; the
+  // guest polls for the next chunk (request/poll bridge, arch-08 §5.2) rather than the host blocking
+  // the guest's Store on an unbounded-duration long poll.
+  request-stream: func(req: http-request) -> result<u32, string>;   // u32 = stream-handle
+  poll-stream-chunk: func(handle: u32) -> result<option<list<u8>>, string>;  // none-of-none = EOF
+  close-stream: func(handle: u32);
+}
+
 interface ext-fs {
   // capability-scoped; preopened dirs via WASI p2 (no ambient authority).
   read-file:  func(path: string) -> result<list<u8>, string>;
@@ -382,6 +416,7 @@ world extension {
   import session;
   import models;
   import exec;
+  import http-client;
   import ext-fs;
   import bus;
   import host-tool;

@@ -8,8 +8,9 @@
 
 use crate::{
     AutocompleteItem, AutocompleteSuggestions, CommandDescriptor, DialogOptions, ExecOptions,
-    ExtensionApi, MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider, Outcome,
-    ProviderConfig, ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor, ToolOutput,
+    ExtensionApi, HttpRequest, MessageRenderer, NewSessionOptions, NotifyKind, OAuthProvider,
+    Outcome, ProviderConfig, ProviderHandlers, ReplacedSessionContext, ToolCall, ToolDescriptor,
+    ToolOutput,
 };
 use serde_json::{json, Value};
 
@@ -206,6 +207,70 @@ pub fn build() -> ExtensionApi {
                 ctx.ui().notify(&format!("exec denied: {e}"));
                 Ok(Some(format!("exec denied: {e}")))
             }
+        },
+    );
+
+    // A command exercising the capability-scoped http-client grant (arch-08 §3.2 draft;
+    // pi-mcp-adapter-port.md §3.2): GET `args` (the target URL) and surface the REAL captured status
+    // + body. When the host has NOT granted http-client (untrusted ⇒ `DenyServices`) the call errors
+    // and we notify the denial reason instead — the same seam gates both ways (mirrors `execdemo`).
+    api.register_command(
+        "httpdemo",
+        CommandDescriptor::new(
+            "GET a URL via the http-client capability and report status+body (demo).",
+        ),
+        |args: &str, ctx: &crate::CommandCtx| match ctx
+            .ctx()
+            .http_request(&HttpRequest::get(args.trim()))
+        {
+            Ok(r) => {
+                let body = String::from_utf8_lossy(&r.body).into_owned();
+                ctx.ui().notify(&format!("http status: {} body: {}", r.status, body));
+                Ok(Some(format!("http status {} body {}", r.status, body)))
+            }
+            Err(e) => {
+                ctx.ui().notify(&format!("http denied: {e}"));
+                Ok(Some(format!("http denied: {e}")))
+            }
+        },
+    );
+
+    // A command exercising the streaming half of the http-client grant (`request-stream` /
+    // `poll-stream-chunk`): open a stream to `args`, poll every chunk to EOF, and surface the real
+    // chunk count + concatenated body — proving the host-owned stream registry (arch-08 §5.2's
+    // request/poll bridge) delivers real bytes across the wasm boundary, in order.
+    api.register_command(
+        "httpstreamdemo",
+        CommandDescriptor::new(
+            "Stream a URL via the http-client capability and report chunks+body (demo).",
+        ),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let handle = match ctx.ctx().http_request_stream(&HttpRequest::get(args.trim())) {
+                Ok(h) => h,
+                Err(e) => {
+                    ctx.ui().notify(&format!("http stream denied: {e}"));
+                    return Ok(Some(format!("http stream denied: {e}")));
+                }
+            };
+            let mut body = Vec::new();
+            let mut chunks = 0u32;
+            loop {
+                match ctx.ctx().http_poll_stream_chunk(handle) {
+                    Ok(Some(chunk)) => {
+                        chunks += 1;
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        ctx.ui().notify(&format!("http stream poll error: {e}"));
+                        break;
+                    }
+                }
+            }
+            ctx.ctx().http_close_stream(handle);
+            let body = String::from_utf8_lossy(&body).into_owned();
+            ctx.ui().notify(&format!("http stream chunks: {chunks} body: {body}"));
+            Ok(Some(format!("http stream chunks {chunks} body {body}")))
         },
     );
 

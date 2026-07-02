@@ -36,6 +36,8 @@ pub mod registry;
 pub mod subscriber;
 
 #[cfg(feature = "wasm-host")]
+pub mod caps;
+#[cfg(feature = "wasm-host")]
 pub mod host;
 #[cfg(feature = "wasm-host")]
 pub mod host_runtime;
@@ -73,8 +75,8 @@ pub use subscriber::ExtSubscriber;
 #[cfg(feature = "wasm-host")]
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
-    GuestState, HostServices, InstancePool, LiveExtension, NotifyKind, OAuthEvent,
-    RecordingServices, StoreLimits, UiChrome, WasmExtension, WasmTool,
+    GuestState, HostServices, HttpRequest, HttpResponse, InstancePool, LiveExtension, NotifyKind,
+    OAuthEvent, RecordingServices, StoreLimits, UiChrome, WasmExtension, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

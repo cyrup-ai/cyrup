@@ -1,0 +1,273 @@
+//! Outbound HTTP capability grant (arch-08 §3.2 draft; `pi-mcp-adapter-port.md` §3.2 — the locked
+//! WIT shape this backs verbatim). A real `reqwest`-backed engine for the `http-client` WIT
+//! interface: [`HttpCaps::request`] is a bounded round trip; [`HttpCaps::request_stream`] /
+//! [`HttpCaps::poll_stream_chunk`] / [`HttpCaps::close_stream`] back a long-lived streaming body the
+//! HOST owns (a guest cannot hold a live Rust `Stream` across the wasm boundary — the request/poll
+//! bridge, arch-08 §5.2), keyed by an opaque `u32` handle the guest polls.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+
+/// A single outbound HTTP request (mirrors the WIT `http-request` record 1:1, world.wit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub timeout_ms: Option<u32>,
+}
+
+/// The response to a [`HttpRequest`] (mirrors the WIT `http-response` record 1:1, world.wit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// A live streaming response body, boxed for storage in the registry.
+type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+/// The real HTTP capability engine: one shared `reqwest::Client` plus a registry of open streaming
+/// bodies keyed by an opaque `u32` handle (`request-stream` / `poll-stream-chunk` / `close-stream`).
+/// A registry entry of `None` means the underlying stream already reached natural EOF (or errored)
+/// but the handle stays registered — repeat polls keep returning `Ok(None)` until the guest calls
+/// `close-stream`, matching Pi's SSE/StreamableHTTP "done" semantics for the eventual MCP transport
+/// consumer.
+pub struct HttpCaps {
+    client: reqwest::Client,
+    streams: Mutex<HashMap<u32, Option<ChunkStream>>>,
+    next_handle: AtomicU32,
+}
+
+impl std::fmt::Debug for HttpCaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCaps").finish_non_exhaustive()
+    }
+}
+
+impl Default for HttpCaps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpCaps {
+    /// Build a real client (rustls, arch-01 §7.1's convention — no native-tls). A builder failure
+    /// (never observed with the default rustls config actually used in this workspace) degrades to
+    /// `reqwest::Client::new()` rather than panicking (no-panic policy, arch-00 §8).
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_client(client)
+    }
+
+    /// Build around a caller-supplied client (tests, or a client the host already built).
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client, streams: Mutex::new(HashMap::new()), next_handle: AtomicU32::new(1) }
+    }
+
+    /// Shared request-building: method parse + headers + optional body + optional timeout.
+    fn build_request(&self, req: &HttpRequest) -> Result<reqwest::RequestBuilder, String> {
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())
+            .map_err(|e| format!("invalid HTTP method `{}`: {e}", req.method))?;
+        let mut builder = self.client.request(method, req.url.as_str());
+        for (name, value) in &req.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = &req.body {
+            builder = builder.body(body.clone());
+        }
+        if let Some(ms) = req.timeout_ms {
+            builder = builder.timeout(std::time::Duration::from_millis(u64::from(ms)));
+        }
+        Ok(builder)
+    }
+
+    /// A bounded request/response round trip (the WIT `request`): the whole body is buffered and
+    /// returned. A non-2xx status is NOT itself an `Err` (fetch/Pi semantics — only a transport
+    /// failure is); the caller inspects `status` itself.
+    pub async fn request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let headers = collect_headers(resp.headers());
+        let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+        Ok(HttpResponse { status, headers, body })
+    }
+
+    /// Start a streaming request (the WIT `request-stream`): opens the connection, then stores the
+    /// decoded byte stream keyed by a fresh handle for [`Self::poll_stream_chunk`] to drain. Like
+    /// [`Self::request`], a non-2xx status is not itself an error — the locked WIT shape gives the
+    /// guest no way to observe a streamed response's status/headers (`pi-mcp-adapter-port.md` §3.2),
+    /// so this stores whatever body the server sent regardless of status.
+    pub async fn request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+        let resp = self.build_request(req)?.send().await.map_err(|e| e.to_string())?;
+        let stream: ChunkStream = Box::pin(resp.bytes_stream());
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let mut g =
+            self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
+        g.insert(handle, Some(stream));
+        Ok(handle)
+    }
+
+    /// Drain the next chunk of an open stream (the WIT `poll-stream-chunk`); `Ok(None)` = EOF. A
+    /// stream that already hit EOF (or errored) keeps returning `Ok(None)` on repeat polls; only an
+    /// unknown/already-closed handle is an `Err`.
+    pub async fn poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
+        // Take the live stream out of the registry while we `.await` it (a `MutexGuard` cannot be
+        // held across an await point — the compiler enforces this since the guard isn't `Send`).
+        let slot = {
+            let mut g = self
+                .streams
+                .lock()
+                .map_err(|_| "http stream registry lock poisoned".to_string())?;
+            match g.get_mut(&handle) {
+                Some(slot) => slot.take(),
+                None => return Err(format!("no open http stream for handle {handle}")),
+            }
+        };
+        let Some(mut stream) = slot else {
+            // Already EOF'd/errored on a prior poll; the handle stays open (only `close-stream`
+            // removes it) but every further poll degrades to EOF, never a re-raised error.
+            return Ok(None);
+        };
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                if let Ok(mut g) = self.streams.lock() {
+                    g.insert(handle, Some(stream));
+                }
+                Ok(Some(bytes.to_vec()))
+            }
+            Some(Err(e)) => {
+                if let Ok(mut g) = self.streams.lock() {
+                    g.insert(handle, None); // terminal: subsequent polls degrade to EOF
+                }
+                Err(e.to_string())
+            }
+            None => {
+                if let Ok(mut g) = self.streams.lock() {
+                    g.insert(handle, None); // natural EOF
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Close (drop/cancel) a stream (the WIT `close-stream`). Dropping the underlying
+    /// `reqwest::Response` body cancels the in-flight download. Unconditionally removes the handle
+    /// (never an error — mirrors the WIT signature's `()` return); closing an unknown handle is a
+    /// silent no-op.
+    pub fn close_stream(&self, handle: u32) {
+        if let Ok(mut g) = self.streams.lock() {
+            g.remove(&handle);
+        }
+    }
+}
+
+fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a raw-TCP mock HTTP/1.1 server: accepts one connection, drains the request, then writes
+    /// each of `parts` as a separate flushed write with a small delay between them (so a real client
+    /// observes them as distinct reads, proving genuine incremental delivery — no external network
+    /// dependency). Returns the server's `http://127.0.0.1:<port>/path` URL.
+    async fn spawn_mock(status_line: &'static str, headers: String, parts: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("{status_line}\r\n{headers}\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+                for part in parts {
+                    let _ = sock.write_all(&part).await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+            }
+        });
+        format!("http://{addr}/probe")
+    }
+
+    #[tokio::test]
+    async fn request_returns_the_real_status_and_body() {
+        let body = b"hello from the mock server".to_vec();
+        let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![body.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, body);
+    }
+
+    #[tokio::test]
+    async fn request_stream_yields_real_chunks_in_order_then_eof() {
+        let parts: Vec<Vec<u8>> =
+            vec![b"chunk-one-".to_vec(), b"chunk-two-".to_vec(), b"chunk-three".to_vec()];
+        let total: usize = parts.iter().map(Vec::len).sum();
+        let headers = format!("Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n");
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, parts.clone()).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let handle = caps.request_stream(&req).await.expect("stream opens");
+
+        let mut collected = Vec::new();
+        let mut chunk_count = 0usize;
+        while let Some(chunk) = caps.poll_stream_chunk(handle).await.expect("poll succeeds") {
+            chunk_count += 1;
+            collected.extend_from_slice(&chunk);
+        }
+        let expected: Vec<u8> = parts.concat();
+        assert_eq!(collected, expected, "chunks concatenate back to the real body, in order");
+        assert!(chunk_count >= 2, "the delayed writes arrived as multiple distinct chunks: {chunk_count}");
+
+        // EOF is sticky: polling again still returns `Ok(None)`, never re-erroring.
+        assert_eq!(caps.poll_stream_chunk(handle).await.expect("poll after EOF"), None);
+    }
+
+    #[tokio::test]
+    async fn close_stream_invalidates_the_handle() {
+        let url = spawn_mock("HTTP/1.1 200 OK", "Content-Length: 0\r\n".into(), vec![]).await;
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let handle = caps.request_stream(&req).await.expect("stream opens");
+        caps.close_stream(handle);
+        let err = caps.poll_stream_chunk(handle).await.expect_err("closed handle is unknown");
+        assert!(err.contains("no open http stream"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_is_an_err_not_a_panic() {
+        // Bind then immediately drop to get a refused-connection address (no server listening).
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let caps = HttpCaps::new();
+        let req =
+            HttpRequest { method: "GET".into(), url: format!("http://{addr}/nope"), ..Default::default() };
+        let err = caps.request(&req).await.expect_err("connection refused surfaces as Err");
+        assert!(!err.is_empty());
+    }
+}

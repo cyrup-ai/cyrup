@@ -355,6 +355,51 @@ impl bindings::cyrup::ext::exec::Host for HostState {
     }
 }
 
+impl bindings::cyrup::ext::http_client::Host for HostState {
+    async fn request(
+        &mut self,
+        req: bindings::cyrup::ext::http_client::HttpRequest,
+    ) -> Result<bindings::cyrup::ext::http_client::HttpResponse, String> {
+        let guest = guest_of(self)?;
+        let request = crate::caps::http::HttpRequest {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: req.body,
+            timeout_ms: req.timeout_ms,
+        };
+        let resp = guest.services.http_request(&request)?;
+        Ok(bindings::cyrup::ext::http_client::HttpResponse {
+            status: resp.status,
+            headers: resp.headers,
+            body: resp.body,
+        })
+    }
+    async fn request_stream(
+        &mut self,
+        req: bindings::cyrup::ext::http_client::HttpRequest,
+    ) -> Result<u32, String> {
+        let guest = guest_of(self)?;
+        let request = crate::caps::http::HttpRequest {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: req.body,
+            timeout_ms: req.timeout_ms,
+        };
+        guest.services.http_request_stream(&request)
+    }
+    async fn poll_stream_chunk(&mut self, handle: u32) -> Result<Option<Vec<u8>>, String> {
+        let guest = guest_of(self)?;
+        guest.services.http_poll_stream_chunk(handle)
+    }
+    async fn close_stream(&mut self, handle: u32) {
+        if let Ok(guest) = guest_of(self) {
+            guest.services.http_close_stream(handle);
+        }
+    }
+}
+
 impl bindings::cyrup::ext::ext_fs::Host for HostState {
     async fn read_file(&mut self, path: String) -> Result<Vec<u8>, String> {
         let guest = guest_of(self)?;

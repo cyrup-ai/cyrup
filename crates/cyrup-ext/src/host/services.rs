@@ -13,6 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+// Re-exported for downstream backends (e.g. `cyrup-session-svc::LiveHostServices`), which reach
+// these DTOs the same way it reaches `ExecOutput`/`DialogOptions` (`cyrup_ext::host::{..}`).
+pub use crate::caps::http::{HttpRequest, HttpResponse};
+
 /// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
 /// exec.ts:23-28). `killed` is true when the host SIGTERM/SIGKILLed the process on a timeout/abort.
 #[derive(Clone, Debug, Default)]
@@ -158,6 +162,30 @@ pub trait HostServices: Send + Sync {
         Err("exec capability not granted".into())
     }
 
+    // --- http-client capability (arch-08 §3.2 draft; pi-mcp-adapter-port.md §3.2); gated by the
+    // SAME load-time trust check `exec`/`ui` use (no new bool, no per-host allowlist) — denied by
+    // default (no ambient network authority, R-ARCH-EXT-011) ---
+
+    /// A bounded HTTP request/response round trip (the WIT `http-client.request`). Denied by default.
+    fn http_request(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
+        Err("http-client capability not granted".into())
+    }
+    /// Start a streaming HTTP request (the WIT `http-client.request-stream`); returns an opaque
+    /// stream handle the guest drains via [`Self::http_poll_stream_chunk`] — the host owns the live
+    /// Rust stream (a guest cannot hold one across the wasm boundary, arch-08 §5.2). Denied by
+    /// default.
+    fn http_request_stream(&self, _req: &HttpRequest) -> Result<u32, String> {
+        Err("http-client capability not granted".into())
+    }
+    /// Drain the next chunk of a stream opened via [`Self::http_request_stream`] (the WIT
+    /// `http-client.poll-stream-chunk`); `Ok(None)` = EOF. Denied by default.
+    fn http_poll_stream_chunk(&self, _handle: u32) -> Result<Option<Vec<u8>>, String> {
+        Err("http-client capability not granted".into())
+    }
+    /// Close (drop/cancel) a stream opened via [`Self::http_request_stream`] (the WIT
+    /// `http-client.close-stream`). No-op by default.
+    fn http_close_stream(&self, _handle: u32) {}
+
     // --- command-tier control (arch-08 §6.3); the deadlock guard is applied BEFORE this is called ---
     fn control(&self, _op: ControlOp) -> Result<(), String> {
         Err("control capability not available".into())
@@ -209,6 +237,10 @@ pub struct CannedResponses {
     pub editor: Option<String>,
     pub custom: Option<String>,
     pub exec: ExecOutput,
+    /// The canned answer to `http_request` (default: a bare `200` with an empty body).
+    pub http_response: HttpResponse,
+    /// The canned chunks a `http_request_stream` grant yields in order, then EOF (`Ok(None)`).
+    pub http_stream_chunks: Vec<Vec<u8>>,
     pub current_model: Option<String>,
     pub models: Value,
     pub theme: Option<String>,
@@ -229,6 +261,8 @@ impl Default for CannedResponses {
             editor: Some(String::new()),
             custom: None,
             exec: ExecOutput::default(),
+            http_response: HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+            http_stream_chunks: Vec::new(),
             current_model: None,
             models: json!([]),
             theme: None,
@@ -254,6 +288,11 @@ pub struct RecordingServices {
 struct RecordingState {
     control_ops: Vec<ControlOp>,
     exec_calls: Vec<(String, Vec<String>)>,
+    /// Requests recorded via `http_request`/`http_request_stream`.
+    http_requests: Vec<HttpRequest>,
+    /// Open streaming grants: handle -> cursor into `responses.http_stream_chunks`.
+    http_streams: HashMap<u32, usize>,
+    next_http_stream_handle: u32,
     entries: Vec<(String, Value)>,
     next_entry: u64,
     /// The last session name set via `set_session_name` (Pi `setSessionName`).
@@ -275,6 +314,11 @@ impl RecordingServices {
     /// The `(cmd, args)` of each capability-scoped `exec.run`.
     pub fn exec_calls(&self) -> Vec<(String, Vec<String>)> {
         self.state.lock().map(|g| g.exec_calls.clone()).unwrap_or_default()
+    }
+
+    /// The requests recorded via `http_request`/`http_request_stream`.
+    pub fn http_requests(&self) -> Vec<HttpRequest> {
+        self.state.lock().map(|g| g.http_requests.clone()).unwrap_or_default()
     }
 
     /// The persisted custom entries (R-08-026).
@@ -344,6 +388,40 @@ impl HostServices for RecordingServices {
             g.exec_calls.push((cmd.to_string(), args.to_vec()));
         }
         Ok(self.responses.exec.clone())
+    }
+    fn http_request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        if let Ok(mut g) = self.state.lock() {
+            g.http_requests.push(req.clone());
+        }
+        Ok(self.responses.http_response.clone())
+    }
+    fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        g.http_requests.push(req.clone());
+        let handle = g.next_http_stream_handle;
+        g.next_http_stream_handle += 1;
+        g.http_streams.insert(handle, 0);
+        Ok(handle)
+    }
+    fn http_poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
+        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let cursor = g
+            .http_streams
+            .get_mut(&handle)
+            .ok_or_else(|| format!("no open http stream for handle {handle}"))?;
+        match self.responses.http_stream_chunks.get(*cursor) {
+            Some(chunk) => {
+                let chunk = chunk.clone();
+                *cursor += 1;
+                Ok(Some(chunk))
+            }
+            None => Ok(None),
+        }
+    }
+    fn http_close_stream(&self, handle: u32) {
+        if let Ok(mut g) = self.state.lock() {
+            g.http_streams.remove(&handle);
+        }
     }
     fn control(&self, op: ControlOp) -> Result<(), String> {
         if let Ok(mut g) = self.state.lock() {

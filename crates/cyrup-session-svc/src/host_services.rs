@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{CancelToken, EntryId, ModelRef};
-use cyrup_ext::host::{ControlOp, DialogOptions, ExecOutput, HostServices};
+use cyrup_ext::caps::http::HttpCaps;
+use cyrup_ext::host::{ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse};
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
@@ -93,6 +94,10 @@ pub struct LiveHostServices {
     /// The session cwd — the default working directory for an `exec` with no `cwd` option (Pi's
     /// `execCommand(..., opts?.cwd ?? cwd)` where `cwd` is the extension's cwd, loader.ts:317-320).
     cwd: PathBuf,
+    /// The `http-client` capability grant's real `reqwest`-backed engine (arch-08 §3.2 draft;
+    /// pi-mcp-adapter-port.md §3.2). Gated by the SAME load-time trust check as `exec` (reaching this
+    /// backend at all means the guest already passed the trust gate) — no per-call check here either.
+    http: HttpCaps,
     snapshot: Mutex<LiveSnapshot>,
     control: Mutex<Option<ControlSink>>,
     /// The active mode's dialog renderer (interactive TUI / RPC), attached post-build via
@@ -127,6 +132,7 @@ impl LiveHostServices {
             provider,
             proc,
             cwd,
+            http: HttpCaps::new(),
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
@@ -385,6 +391,37 @@ impl HostServices for LiveHostServices {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             killed,
         })
+    }
+
+    // --- http-client GRANT (arch-08 §3.2 draft; pi-mcp-adapter-port.md §3.2) ---
+    // Reaching here means the load-time trust gate already said yes (the SAME gate `exec` uses,
+    // `is_trusted = origin.is_pre_trust() || project_trusted`, loader.rs:57-60) — an untrusted
+    // extension gets `DenyServices` and never lands here. So, like `exec`, this adds NO extra
+    // trust/tier check or per-host allowlist; it just runs the request through the real `HttpCaps`
+    // engine. The `HostServices` trait is sync (the guest is wasm-suspended across the call); drive
+    // the async `reqwest` calls to completion on the current multi-threaded runtime worker — the SAME
+    // `block_in_place` + `block_on` bridge the `exec` grant uses.
+
+    fn http_request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.http.request(req))
+        })
+    }
+
+    fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.http.request_stream(req))
+        })
+    }
+
+    fn http_poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.http.poll_stream_chunk(handle))
+        })
+    }
+
+    fn http_close_stream(&self, handle: u32) {
+        self.http.close_stream(handle);
     }
 
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {

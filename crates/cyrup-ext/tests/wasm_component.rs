@@ -197,6 +197,36 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
         ext.guest().notifications()
     );
 
+    // 8) the http-client capability is likewise DENIED for this DenyServices-backed guest (the
+    //    untrusted analog, arch-08 §3.2 draft / pi-mcp-adapter-port.md §3.2): the guest's `/httpdemo`
+    //    calls `ctx.http_request(...)` across the WIT boundary, the host router routes it to
+    //    `DenyServices::http_request` which returns "http-client capability not granted", and the
+    //    guest surfaces that denial — the SAME trust gate as `exec`, no separate allowlist.
+    let out = ext.execute_command("httpdemo", "http://127.0.0.1:1/unused", &cancel).await.expect("httpdemo runs");
+    assert_eq!(
+        out.as_deref(),
+        Some("http denied: http-client capability not granted"),
+        "the deny-all backend refuses the guest's http_request"
+    );
+    assert!(
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("http denied: http-client capability not granted")),
+        "the guest observed the http-client denial across the boundary: {:?}",
+        ext.guest().notifications()
+    );
+
+    // The streaming half is denied the same way (denial happens at `request-stream`, before any
+    // poll — never a hang/panic on the ungranted path).
+    let out =
+        ext.execute_command("httpstreamdemo", "http://127.0.0.1:1/unused", &cancel).await.expect("httpstreamdemo runs");
+    assert_eq!(
+        out.as_deref(),
+        Some("http stream denied: http-client capability not granted"),
+        "the deny-all backend refuses the guest's http_request_stream"
+    );
+
     // an unknown command surfaces an error (never a host crash).
     let err = ext.execute_command("nope", "", &cancel).await.unwrap_err();
     assert!(err.to_string().contains("no such command"), "unknown command surfaced: {err}");

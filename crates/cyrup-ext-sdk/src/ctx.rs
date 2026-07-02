@@ -144,6 +144,64 @@ impl Ctx {
             Err("exec unavailable on host target".into())
         }
     }
+
+    /// A bounded outbound HTTP request/response round trip (the `http-client.request` capability
+    /// grant; arch-08 §3.2 draft, pi-mcp-adapter-port.md §3.2). Gated by the SAME trust check as
+    /// [`Ctx::exec`] — denied unless the host granted the http-client capability. A non-2xx status is
+    /// NOT itself an `Err` (fetch semantics); inspect [`HttpResponse::status`].
+    pub fn http_request(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let wit = req.to_wit();
+            return crate::guest::bindings::cyrup::ext::http_client::request(&wit)
+                .map(HttpResponse::from_wit);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = req;
+            Err("http-client unavailable on host target".into())
+        }
+    }
+
+    /// Start a streaming outbound HTTP request (the `http-client.request-stream` capability grant);
+    /// returns an opaque stream handle the guest drains via [`Ctx::http_poll_stream_chunk`] — the
+    /// HOST owns the live Rust stream (a guest cannot hold one across the wasm boundary, arch-08
+    /// §5.2's request/poll bridge). Gated the same way as [`Ctx::http_request`].
+    pub fn http_request_stream(&self, req: &HttpRequest) -> Result<u32, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let wit = req.to_wit();
+            return crate::guest::bindings::cyrup::ext::http_client::request_stream(&wit);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = req;
+            Err("http-client unavailable on host target".into())
+        }
+    }
+
+    /// Drain the next chunk of a stream opened via [`Ctx::http_request_stream`] (the
+    /// `http-client.poll-stream-chunk` import); `Ok(None)` = EOF.
+    pub fn http_poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::http_client::poll_stream_chunk(handle);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = handle;
+            Err("http-client unavailable on host target".into())
+        }
+    }
+
+    /// Close (drop/cancel) a stream opened via [`Ctx::http_request_stream`] (the
+    /// `http-client.close-stream` import).
+    pub fn http_close_stream(&self, handle: u32) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::http_client::close_stream(handle);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = handle;
+    }
 }
 
 /// Result of [`Ctx::exec`] (Pi `ExecResult`, exec.ts:23-28). `killed` is true when the host
@@ -154,6 +212,69 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub killed: bool,
+}
+
+/// An outbound HTTP request (`Ctx::http_request`/`http_request_stream`; mirrors the WIT
+/// `http-request` record 1:1, arch-08 §3.2 draft, pi-mcp-adapter-port.md §3.2).
+#[derive(Clone, Debug, Default)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub timeout_ms: Option<u32>,
+}
+
+impl HttpRequest {
+    /// A bare `GET` to `url`.
+    pub fn get(url: impl Into<String>) -> Self {
+        Self { method: "GET".into(), url: url.into(), ..Default::default() }
+    }
+    /// A `method` request to `url`.
+    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
+        Self { method: method.into(), url: url.into(), ..Default::default() }
+    }
+    /// Append a request header (builder-style).
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+    /// Set the request body (builder-style).
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+    /// Set a request timeout in milliseconds (builder-style).
+    pub fn timeout_ms(mut self, ms: u32) -> Self {
+        self.timeout_ms = Some(ms);
+        self
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn to_wit(&self) -> crate::guest::bindings::cyrup::ext::http_client::HttpRequest {
+        crate::guest::bindings::cyrup::ext::http_client::HttpRequest {
+            method: self.method.clone(),
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+/// The response to an [`HttpRequest`] (mirrors the WIT `http-response` record 1:1).
+#[derive(Clone, Debug, Default)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    #[cfg(target_arch = "wasm32")]
+    fn from_wit(wit: crate::guest::bindings::cyrup::ext::http_client::HttpResponse) -> Self {
+        Self { status: wit.status, headers: wit.headers, body: wit.body }
+    }
 }
 
 /// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
