@@ -375,7 +375,7 @@ impl Drop for ProcCaps {
         // Second-chance sweep for pids that lost `Self::spawn`'s atomic cap race ([`Self::orphaned_pids`]'s
         // doc) — same best-effort swallow idiom as above; whatever pid this is has no OTHER
         // compensating cleanup, since it was never accepted into `registry` in the first place.
-        for pid in self.orphaned_pids.lock().map(|g| std::mem::take(&mut *g)).unwrap_or_default() {
+        for pid in self.orphaned_pids.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default() {
             let _ = cyrup_tools::kill_pid(pid);
         }
     }
@@ -400,6 +400,7 @@ impl ProcCaps {
             next_handle: AtomicU32::new(1),
             kill_grace,
             write_stdin_timeout: WRITE_STDIN_TIMEOUT,
+            orphaned_pids: Mutex::new(Vec::new()),
         }
     }
 
@@ -411,6 +412,7 @@ impl ProcCaps {
             next_handle: AtomicU32::new(1),
             kill_grace: DEFAULT_KILL_GRACE,
             write_stdin_timeout,
+            orphaned_pids: Mutex::new(Vec::new()),
         }
     }
 
@@ -528,6 +530,14 @@ impl ProcCaps {
             if reg.len() >= MAX_SPAWNED_PROCESSES {
                 drop(reg);
                 let _ = cyrup_tools::kill_pid(pid);
+                // A failed kill above has NO other compensating cleanup — this pid never made it
+                // into `registry`, so `Drop for ProcCaps` (which only sweeps registered entries)
+                // would otherwise never see it. Record it regardless of whether the immediate
+                // attempt reported success (a harmless no-op re-kill of an already-dead pid if it
+                // did) so `Drop` gets a second chance at session end ([`Self::orphaned_pids`]'s doc).
+                if let Ok(mut g) = self.orphaned_pids.lock() {
+                    g.push(pid);
+                }
                 return Err(format!(
                     "too many processes spawned via this capability ({MAX_SPAWNED_PROCESSES} \
                      already in the registry, killed or not) — this grant does not evict entries"
@@ -1379,6 +1389,60 @@ mod tests {
             MAX_SPAWNED_PROCESSES,
             "the registry must never overshoot the cap even under a concurrent race"
         );
+        // SOME of the 49 losers necessarily forked a real process before losing the atomic re-check
+        // (not all 49 — many instead lose the CHEAPER fast up-front check once the winner has already
+        // inserted, and are rejected before ever forking at all; which path each loser takes depends
+        // on real OS task scheduling, not something this test can pin down exactly) — every one that
+        // DID fork must be recorded for `Drop`'s second-chance sweep, not merely killed once and
+        // forgotten. See `orphaned_pid_from_a_lost_spawn_race_is_reaped_on_drop` for the end-to-end
+        // proof this recording actually matters.
+        let orphaned = caps.orphaned_pids.lock().expect("lock").len();
+        assert!(
+            orphaned > 0 && orphaned <= 49,
+            "at least one (and at most all 49) race losers that forked a real process before losing \
+             the atomic re-check must be recorded in orphaned_pids, got {orphaned}"
+        );
+    }
+
+    /// THE regression this closes: a pid that lost `Self::spawn`'s atomic cap race (a real process
+    /// was forked, then rejected at the atomic re-check) had its cleanup depend ENTIRELY on a single
+    /// immediate `kill_pid` attempt whose error was silently swallowed with no other compensating
+    /// cleanup — since the pid was never inserted into `registry`, `Drop for ProcCaps`'s sweep (which
+    /// only iterated `registry`) could never see it either, leaking it as a live OS process for the
+    /// rest of the HOST process's lifetime if that one attempt ever failed. Verifies the fix directly
+    /// (independent of actually forcing the race, which can't deterministically make the immediate
+    /// `kill_pid` fail): a pid recorded in `orphaned_pids` — the exact bookkeeping
+    /// `Self::spawn`'s rejection branch performs — is confirmed dead once `ProcCaps` drops, restoring
+    /// the SAME safety net every successfully-registered child already gets from `Drop`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphaned_pid_from_a_lost_spawn_race_is_reaped_on_drop() {
+        let caps = ProcCaps::new();
+        // A real, independently-spawned, long-running process `ProcCaps` never registered at all —
+        // exactly what `Self::spawn`'s atomic-recheck rejection branch hands to `orphaned_pids` (a
+        // real forked pid with no registry entry), without depending on timing to force the race.
+        let mut orphan = std::process::Command::new("sleep").arg("30").spawn().expect("sleep spawns");
+        let pid = orphan.id();
+        caps.orphaned_pids.lock().expect("lock").push(pid);
+
+        let alive_before = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(alive_before.map(|s| s.success()).unwrap_or(false), "the orphan must be alive before drop");
+
+        drop(caps);
+        // SIGKILL is not interceptable, but the OS still needs a scheduler tick to actually reap it.
+        for _ in 0..50 {
+            if orphan.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let alive_after = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        assert!(
+            alive_after.map(|s| !s.success()).unwrap_or(true),
+            "an orphaned pid recorded via the lost-spawn-race path must be confirmed dead once \
+             ProcCaps drops — Drop's sweep must cover orphaned_pids, not just registry"
+        );
     }
 
     /// Closes the confirmed audit finding: a still-running child that the guest never explicitly
@@ -1513,6 +1577,7 @@ mod tests {
             next_handle: AtomicU32::new(1),
             kill_grace: Duration::from_millis(150),
             write_stdin_timeout: Duration::from_secs(30),
+            orphaned_pids: Mutex::new(Vec::new()),
         });
         let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
         // Far larger than any realistic OS pipe buffer so `write_all` is genuinely still blocked,
