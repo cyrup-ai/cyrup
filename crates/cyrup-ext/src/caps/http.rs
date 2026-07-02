@@ -360,7 +360,7 @@ impl HttpCaps {
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
         let encoding = content_encoding_of(resp.headers());
-        let stream: ChunkStream = decode_stream(encoding.as_deref(), resp.bytes_stream());
+        let stream: ChunkStream = decode_stream(encoding.as_deref(), resp.bytes_stream())?;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut g =
             self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
@@ -549,12 +549,25 @@ fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers.get(reqwest::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }
 
+/// Real consumer citation: `undici/lib/web/fetch/index.js:2269-2275` (the exact `fetch()` engine
+/// backing `@modelcontextprotocol/sdk`'s pinned version, verified against the copy vendored under
+/// `pi/node_modules/undici`) rejects the WHOLE response outright once `Content-Encoding` lists more
+/// than this many chained codings, rather than let one crafted response header make the host build
+/// an arbitrarily long decoder chain — its own comment: "Limit the number of content-encodings to
+/// prevent resource exhaustion. CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl
+/// (CVE-2022-32206)." [`decode_buffered`]/[`decode_stream`] port that SAME cap, verbatim value
+/// (`index.js:2271`'s `const maxContentEncodings = 5`).
+const MAX_CONTENT_ENCODINGS: usize = 5;
+
 /// Decompress a fully-buffered body per `encoding` (the real consumer's `fetch()` semantics — an
 /// unrecognized/absent encoding passes the bytes through unchanged, matching `identity`). Bounds the
 /// DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`] on EVERY chained stage (see below), the SAME cap
 /// [`read_bounded_body`] already applies to the wire (possibly-compressed) transfer — now that
 /// decompression happens manually here rather than inside `reqwest`, a small compressed body must not
-/// be able to expand into an unbounded allocation (a decompression bomb).
+/// be able to expand into an unbounded allocation (a decompression bomb). Separately, the NUMBER of
+/// chained stages itself is capped at [`MAX_CONTENT_ENCODINGS`] — see that constant's doc — matching
+/// `undici/lib/web/fetch/index.js:2272-2275`'s `reject(...)` (this whole call fails, no partial body
+/// is produced) rather than silently building/running an unbounded decoder chain.
 ///
 /// `Content-Encoding` may list MULTIPLE codings, e.g. `"gzip, br"` (RFC 9110 §8.4.1: "the codings are
 /// listed in the order in which they were applied" — `gzip` first, `br` second, on top). Decoding must
@@ -567,8 +580,15 @@ fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
 /// KNOWN codings around it.
 async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let Some(encoding) = encoding else { return Ok(raw) };
+    let tokens: Vec<&str> = encoding.split(',').collect();
+    if tokens.len() > MAX_CONTENT_ENCODINGS {
+        return Err(format!(
+            "too many content-encodings in response: {}, maximum allowed is {MAX_CONTENT_ENCODINGS}",
+            tokens.len()
+        ));
+    }
     let mut body = raw;
-    for token in encoding.split(',').map(str::trim).rev() {
+    for token in tokens.into_iter().map(str::trim).rev() {
         body = decode_buffered_one(token, body).await?;
     }
     Ok(body)
@@ -625,20 +645,30 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Result<Vec<u8
 /// RFC 9110 §8.4.1 rationale and the live Node `fetch()` verification. Decoded here the same way:
 /// wrap the stream with one decoder per token, applied in REVERSE of the listed order (the
 /// LAST-listed coding is the outermost layer, unwrapped first). An unrecognized token degrades to
-/// identity for just that one stage.
+/// identity for just that one stage. Also matches [`decode_buffered`]'s [`MAX_CONTENT_ENCODINGS`]
+/// chain-depth cap — `Err` here means [`HttpCaps::request_stream`] fails the WHOLE call before ever
+/// registering a stream handle, matching undici's `reject(...)` (`index.js:2272-2275`), not a
+/// stream that silently opens and then errors on first poll.
 fn decode_stream(
     encoding: Option<&str>,
     raw: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-) -> ChunkStream {
+) -> Result<ChunkStream, String> {
     // `reqwest::Error` doesn't satisfy `StreamReader`'s `Into<std::io::Error>` bound directly —
     // map it explicitly once, up front, so every decoder stage below shares one `io::Error`-typed
     // stream.
     let mut stream: ChunkStream = Box::pin(raw.map(|r| r.map_err(std::io::Error::other)));
-    let Some(encoding) = encoding else { return stream };
-    for token in encoding.split(',').map(str::trim).rev() {
+    let Some(encoding) = encoding else { return Ok(stream) };
+    let tokens: Vec<&str> = encoding.split(',').collect();
+    if tokens.len() > MAX_CONTENT_ENCODINGS {
+        return Err(format!(
+            "too many content-encodings in response: {}, maximum allowed is {MAX_CONTENT_ENCODINGS}",
+            tokens.len()
+        ));
+    }
+    for token in tokens.into_iter().map(str::trim).rev() {
         stream = decode_stream_one(token, stream);
     }
-    stream
+    Ok(stream)
 }
 
 /// Wrap `raw` through the decoder for a SINGLE `Content-Encoding` token (one stage of
@@ -866,6 +896,55 @@ mod tests {
         assert_eq!(
             collected, plaintext,
             "drained chunks concatenate back to the plaintext with BOTH chained layers undone"
+        );
+    }
+
+    /// THE finding this closes (buffered path): a `Content-Encoding` chaining MORE than
+    /// [`MAX_CONTENT_ENCODINGS`] tokens must be rejected OUTRIGHT — matching
+    /// `undici/lib/web/fetch/index.js:2272-2275`'s `reject(...)` — rather than the host building
+    /// and running an arbitrarily long decoder chain per request. Six tokens (one over the cap of
+    /// five); the body content is irrelevant since the cap must fire BEFORE any decompression stage
+    /// ever runs.
+    #[tokio::test]
+    async fn request_rejects_a_content_encoding_chain_over_the_max_depth() {
+        let headers = "Content-Type: application/octet-stream\r\n\
+            Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n\
+            Content-Length: 3\r\n"
+            .to_string();
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"abc".to_vec()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("a 6-deep content-encoding chain must be rejected, over the 5-deep cap");
+        assert!(
+            err.contains("too many content-encodings") && err.contains('6') && err.contains('5'),
+            "the error must name both the actual depth and the cap, matching undici's own message: {err}"
+        );
+    }
+
+    /// Same finding, the streaming path: `request_stream` itself must fail (no stream handle ever
+    /// registered) rather than opening a stream that only errors on first poll — matching undici's
+    /// `reject(...)` happening before the response promise ever resolves.
+    #[tokio::test]
+    async fn request_stream_rejects_a_content_encoding_chain_over_the_max_depth() {
+        let headers = "Content-Type: application/octet-stream\r\n\
+            Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n\
+            Content-Length: 3\r\n"
+            .to_string();
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"abc".to_vec()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = caps
+            .request_stream(&req)
+            .await
+            .expect_err("a 6-deep content-encoding chain must be rejected, over the 5-deep cap");
+        assert!(
+            err.contains("too many content-encodings") && err.contains('6') && err.contains('5'),
+            "the error must name both the actual depth and the cap, matching undici's own message: {err}"
         );
     }
 
