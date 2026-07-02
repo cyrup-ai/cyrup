@@ -83,6 +83,25 @@ async fn spawn_mock_with_status(status_line: &'static str, headers: String, part
     format!("http://{addr}/probe")
 }
 
+/// As [`spawn_mock`], but waits `delay` AFTER accepting the connection and draining the request
+/// BEFORE writing anything back — simulates a genuinely slow (but real) server, not a mocked clock.
+async fn spawn_mock_with_delay(headers: String, body: Vec<u8>, delay: std::time::Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            tokio::time::sleep(delay).await;
+            let head = format!("HTTP/1.1 200 OK\r\n{headers}\r\n");
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.flush().await;
+        }
+    });
+    format!("http://{addr}/probe")
+}
+
 /// Build a TRUSTED session (`trust_override = Some(true)`) with a fresh project/agent dir, exactly
 /// as `tests/wasm_exec.rs` does — the guest's `http-client` grant is live via the load-time trust
 /// gate, the SAME one `exec`/`ui` already use.
@@ -244,4 +263,54 @@ async fn wasm_guest_http_stream_surfaces_real_non_2xx_status_and_headers_before_
     let rest = streamed.strip_prefix("http stream chunks: ").expect("prefix");
     let (_count_str, streamed_body) = rest.split_once(" body: ").expect("split");
     assert_eq!(streamed_body, String::from_utf8_lossy(&body), "the real body still drains after 401");
+}
+
+/// Closes the CRITICAL finding that `http_client::Host` (`crates/cyrup-ext/src/host/live.rs`) never
+/// called `guest.note_dialog_wait(...)` anywhere — unlike `ui.*` dialogs (`845f707`), a slow-but-real
+/// HTTP response left the WASM epoch deadline already expired by the time the guest resumed wasm
+/// execution right after the blocking `http-client.request` host call returned, tripping the SAME
+/// permanent-instance-wedging epoch trap `845f707` closed for dialogs. Reproduces that fix's own
+/// methodology 1:1: a REAL ~6s-delayed response (past the ~5s `WASM_EPOCH_BUDGET_TICKS` production
+/// budget, via a REAL `tokio::time::sleep` on a real local TCP server, not a mocked clock), then a
+/// later, unrelated command against the SAME instance. `httpdemo` uses `HttpRequest::get` (no
+/// `timeout_ms`, and `HttpCaps`'s `reqwest::Client` has no default timeout either — confirmed by
+/// direct inspection of `HttpCaps::new`/`build_request`), so no independent host-side timeout races
+/// with the epoch mechanism, isolating this test to it alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_guest_http_request_delayed_past_the_epoch_budget_does_not_wedge_the_extension() {
+    let bytes = std::fs::read(fixture_component()).expect("read fixture component bytes");
+    let session = trusted_session().await;
+
+    let ext = session
+        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .await
+        .expect("load + init the live wasm extension");
+
+    let body = b"slow but real response".to_vec();
+    let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
+    let url = spawn_mock_with_delay(headers, body.clone(), std::time::Duration::from_secs(6)).await;
+
+    let _ = session.prompt(format!("/httpdemo {url}")).await.unwrap();
+    session.wait_for_idle().await;
+
+    // The delayed response still resolved to the REAL status+body, not a timeout/trap-induced default.
+    let expect_msg = format!("http status: 200 body: {}", String::from_utf8_lossy(&body));
+    assert!(
+        ext.guest().notifications().iter().any(|n| n == &expect_msg),
+        "the delayed request resolved to the real scripted response, not a default: {:?}",
+        ext.guest().notifications()
+    );
+
+    // THE headline proof: a later, unrelated, http-free command against the SAME instance still
+    // genuinely runs. Before this fix, the epoch trap right after the delayed response permanently
+    // wedged the instance and this would silently no-op.
+    let before = ext.guest().notifications().len();
+    let _ = session.prompt("/execdemo").await.unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        ext.guest().notifications()[before..].iter().any(|n| n.starts_with("exec stdout:")),
+        "the extension survives an http request delayed past the epoch budget — a later command \
+         still genuinely runs, not a silent no-op: {:?}",
+        ext.guest().notifications()
+    );
 }

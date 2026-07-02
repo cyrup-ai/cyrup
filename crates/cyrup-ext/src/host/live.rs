@@ -439,7 +439,19 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
             body: req.body,
             timeout_ms: req.timeout_ms,
         };
-        let resp = guest.services.http_request(&request)?;
+        // Closes the SAME class of CRITICAL finding `845f707`/the epoch-forgiveness fix closed for
+        // `ui.*` dialogs: `guest.services.http_request` blocks synchronously in host Rust code
+        // (`LiveHostServices::http_request`, `block_in_place`+`block_on` over a real `reqwest` call)
+        // for up to the guest-settable `timeoutMs` (WIT `timeout-ms`, `world.wit`) — potentially far
+        // longer than the WASM epoch budget (`WASM_EPOCH_BUDGET_TICKS`, `facade.rs`, ~5s). With NO
+        // `note_dialog_wait` call, a slow request left the epoch deadline already expired by the time
+        // the guest resumed wasm execution right after this call returns, tripping the SAME permanent
+        // instance-wedging trap `ui.*` dialogs used to. Record the wait exactly like `ui::Host`'s
+        // `confirm`/`input`/`select`/`editor` do.
+        let started = std::time::Instant::now();
+        let result = guest.services.http_request(&request);
+        guest.note_dialog_wait(started);
+        let resp = result?;
         Ok(bindings::cyrup::ext::http_client::HttpResponse {
             status: resp.status,
             headers: resp.headers,
@@ -458,7 +470,12 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
             body: req.body,
             timeout_ms: req.timeout_ms,
         };
-        let opened = guest.services.http_request_stream(&request)?;
+        // Same rationale as `request` above — opening a streaming connection blocks on the initiating
+        // response the same way a non-streaming request does.
+        let started = std::time::Instant::now();
+        let result = guest.services.http_request_stream(&request);
+        guest.note_dialog_wait(started);
+        let opened = result?;
         Ok(bindings::cyrup::ext::http_client::HttpStreamResponse {
             handle: opened.handle,
             status: opened.status,
@@ -467,7 +484,13 @@ impl bindings::cyrup::ext::http_client::Host for HostState {
     }
     async fn poll_stream_chunk(&mut self, handle: u32) -> Result<Option<Vec<u8>>, String> {
         let guest = guest_of(self)?;
-        guest.services.http_poll_stream_chunk(handle)
+        // Same rationale — `HttpCaps::poll_stream_chunk` `.await`s the underlying stream's `next()`,
+        // which can legitimately block for a while on a slow/sparse server-sent stream (the real MCP
+        // SSE-over-HTTP transport shape `pi-mcp-adapter` targets).
+        let started = std::time::Instant::now();
+        let result = guest.services.http_poll_stream_chunk(handle);
+        guest.note_dialog_wait(started);
+        result
     }
     async fn close_stream(&mut self, handle: u32) {
         if let Ok(guest) = guest_of(self) {
