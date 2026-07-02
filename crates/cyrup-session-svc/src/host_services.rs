@@ -29,6 +29,28 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
 
+/// Fallback ceiling for the `exec` grant's full round trip (spawn through exit) when the guest
+/// supplied NO `opts.timeoutMs` (or gave `0`, which — like `http-client`'s `timeout_ms` — means "no
+/// explicit timeout", not an instant one; see [`LiveHostServices::exec`]'s `.filter(|ms| *ms > 0)`
+/// guard). Pi's own `execCommand` (exec.ts:74-79) is ALSO genuinely unbounded absent a `timeout`, so
+/// this is not a Pi-parity gap — but Pi's caller can still interrupt an untimed call live via
+/// `options.signal.addEventListener("abort", killProcess, {once: true})` (exec.ts:65-72), a listener
+/// that stays LIVE in Node's event loop for the whole call. Cyrup's equivalent (`opts.signalId`) can
+/// only pre-cancel an ALREADY-aborted signal at call entry (`host/live.rs`'s `exec` import): the guest
+/// is wasm-suspended for the entire synchronous `block_in_place`+`block_on` bridge below, so nothing
+/// can observe or act on a signal that aborts mid-run. That asymmetry means an untimed `exec` here has
+/// NO live escape hatch at all — unlike Pi, and unlike this file's own sibling `http-client` grant
+/// (`cyrup_ext::caps::http::DEFAULT_REQUEST_TIMEOUT`, added for the identical "unbounded blocking-pool
+/// thread" concern). Mirrors that constant's rationale and magnitude exactly: deliberately generous
+/// (comfortably above any realistic legitimate command runtime) while still guaranteeing the call can
+/// never hang literally forever. An EXPLICIT non-zero `opts.timeoutMs` from the guest always wins;
+/// this only fills the gap when none was given. Fed straight into `ProcOps::exec_argv`'s existing
+/// `timeout: Option<Duration>` (rather than wrapped in an outer `tokio::time::timeout`) so a fallback
+/// firing still goes through the SAME SIGTERM-then-grace-then-SIGKILL escalation
+/// (`cyrup-tools/src/ops/local.rs`) as an explicit guest timeout — not an ungraceful `kill_on_drop`
+/// SIGKILL from abandoning the future outright.
+const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A command-tier control sink: a loaded extension's `control` import (new/switch/fork/…) is routed
 /// here so the runtime can act on it (Pi `createCommandContext`, agent-session.ts:1158). Set by the
 /// runtime once it owns the session; until then control ops are reported as unavailable.
@@ -135,6 +157,10 @@ pub struct LiveHostServices {
     /// and fanned out by [`crate::AgentSession::apply_pending_control`] after the guest call settles —
     /// the same sync→async bridge point the control queue uses.
     pending_events: Mutex<Vec<AgentSessionEvent>>,
+    /// [`DEFAULT_EXEC_TIMEOUT`] in production; overridable ONLY for tests
+    /// ([`Self::with_exec_timeout`]) so the fallback-timeout path is exercisable without a real test
+    /// waiting the full production duration.
+    exec_timeout: Duration,
 }
 
 impl LiveHostServices {
@@ -154,7 +180,15 @@ impl LiveHostServices {
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
+            exec_timeout: DEFAULT_EXEC_TIMEOUT,
         }
+    }
+
+    /// Build with a caller-supplied fallback exec timeout (tests only; production always gets the
+    /// real [`DEFAULT_EXEC_TIMEOUT`] via [`Self::new`]) — L4 review.
+    #[cfg(test)]
+    fn with_exec_timeout(provider: Arc<dyn Provider>, proc: Arc<dyn ProcOps>, cwd: PathBuf, exec_timeout: Duration) -> Self {
+        Self { exec_timeout, ..Self::new(provider, proc, cwd) }
     }
 
     fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -420,11 +454,15 @@ impl HostServices for LiveHostServices {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone());
+        // L4 review: falls back to [`DEFAULT_EXEC_TIMEOUT`] (`self.exec_timeout`) when the guest gave
+        // no `timeoutMs` (or gave `0`) — see that constant's doc for why an unbounded `exec` here,
+        // unlike Pi's own unbounded `execCommand`, has no live abort escape hatch to fall back on.
         let timeout = opts
             .get("timeoutMs")
             .and_then(Value::as_u64)
             .filter(|ms| *ms > 0)
-            .map(Duration::from_millis);
+            .map(Duration::from_millis)
+            .or(Some(self.exec_timeout));
         let spec =
             ArgvSpec { program: cmd.to_string(), args: args.to_vec(), cwd, env: Vec::new() };
         let proc = self.proc.clone();
@@ -714,6 +752,42 @@ mod tests {
             .expect("the SIGTERM-trapping child runs then exits itself");
         assert_eq!(out.code, 7, "the child's own real exit code survives a host-initiated kill");
         assert!(out.killed, "a timeout-initiated kill is still `killed`, independent of `code`");
+    }
+
+    /// L4 review: `exec` must never be truly UNBOUNDED when the guest gives no `timeoutMs` (or `0`) —
+    /// unlike Pi's own `execCommand` (exec.ts:74-79), which is also unbounded absent a `timeout` but
+    /// can still be interrupted live via a real `AbortSignal` listener (exec.ts:65-72), cyrup's `exec`
+    /// grant blocks the guest wasm-suspended for the ENTIRE synchronous host call — a `signalId` can
+    /// only pre-cancel an ALREADY-aborted signal at call entry, never mid-run — so an untimed call has
+    /// no live escape hatch at all without [`DEFAULT_EXEC_TIMEOUT`]. Proven with a REAL never-exiting
+    /// child (`sleep 3600`) and NO `timeoutMs` in `opts` at all, against a tiny overridden fallback
+    /// (`with_exec_timeout`) so the test doesn't wait the full 120s production ceiling: the exec call
+    /// must still return promptly, `killed`, via the SAME SIGTERM-then-grace-then-SIGKILL escalation
+    /// an explicit guest timeout gets (proving the fallback is fed into `exec_argv`'s real `timeout`
+    /// parameter, not merely abandoning/leaking the child via an outer future-drop).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_with_no_timeout_ms_still_gets_killed_by_the_fallback_ceiling() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = LiveHostServices::with_exec_timeout(
+            provider,
+            cyrup_tools::Backend::default().proc,
+            std::env::temp_dir(),
+            Duration::from_millis(100),
+        );
+
+        let started = std::time::Instant::now();
+        let out = svc
+            .exec("sleep", &["3600".to_string()], &json!({}), CancelToken::new())
+            .expect("exec resolves even though the guest gave no timeoutMs at all");
+        let elapsed = started.elapsed();
+
+        assert!(out.killed, "the fallback ceiling must kill an untimed exec — a 3600s sleep can never exit on its own");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must be bounded by the (overridden, 100ms) fallback ceiling, not the real 3600s sleep — \
+             took {elapsed:?}"
+        );
     }
 
     /// The `proc` grant's `spawn` defaults an OMITTED `cwd` to the session's own project directory —
