@@ -37,6 +37,21 @@ pub use crate::caps::proc::ProcSpawnSpec;
 /// already tracked stays tracked (this is a bound on DISTINCT ids, not a re-insert budget).
 const MAX_ABORTED_SIGNALS: usize = 4096;
 
+/// How stale [`GuestState::last_wait_touch`] is allowed to be, at the moment
+/// [`GuestState::take_dialog_extra_ticks`] runs, before the recorded wait anchor is distrusted as
+/// belonging to an already-finished dialog rather than the trap that is actually firing right now.
+/// A genuinely live wait chain (the blocking `ui.*`/`exec`/`proc` call that is CAUSING this exact
+/// trap, or a back-to-back batch of several such calls with no intervening checkpoint) always has
+/// [`GuestState::note_dialog_wait`] run within microseconds of the trap firing — wasmtime's epoch
+/// checkpoint fires at the very next instrumented point once the guest resumes wasm execution, and
+/// nothing but host code (which just ran `note_dialog_wait`) executes in between. Anything wider than
+/// a couple of ticks' worth of pure scheduling/host-call overhead means real, untracked guest cpu
+/// execution happened after the last recorded wait ended — exactly the same-dispatch stale-anchor
+/// class [`GuestState::last_wait_touch`]'s doc describes. Not a Pi-derived value (Pi has no analogous
+/// host-side epoch budget at all): deliberately generous relative to `epoch::DEFAULT_TICK` (5ms) to
+/// absorb scheduler jitter without ever mistaking a real wait for a stale one.
+const STALE_WAIT_TOUCH_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Result of a capability-scoped `exec.run` (mirrors the WIT `exec-result`; 1:1 with Pi `ExecResult`,
 /// exec.ts:23-28). `killed` is true when the host SIGTERM/SIGKILLed the process on a timeout/abort.
 #[derive(Clone, Debug, Default)]
@@ -742,6 +757,20 @@ pub struct GuestState {
     /// tripping `epoch_deadline_callback`, so `take_dialog_extra_ticks` never ran) can't leave a stale
     /// anchor that a LATER, unrelated dispatch's genuine runaway would exploit for outsized forgiveness.
     first_wait_started: Mutex<Option<std::time::Instant>>,
+    /// Wall-clock instant [`Self::note_dialog_wait`] most recently confirmed a dialog call had JUST
+    /// returned (`None` between batches). This closes the SAME-dispatch sibling of the stale-anchor
+    /// bug `first_wait_started`'s doc describes for the CROSS-dispatch case: a dialog that resolves
+    /// comfortably inside its OWN budget leaves `first_wait_started` set (no dispatch boundary and no
+    /// `epoch_deadline_callback` have run yet to clear it) — if the guest then burns cpu on wholly
+    /// UNRELATED work for the rest of the SAME dispatch with no further host call at all, the eventual
+    /// trap would read that ancient timestamp as "still owed" and grant forgiveness computed from a
+    /// wait that already finished, potentially re-granting close to a full fresh budget for zero
+    /// actual waiting. A genuinely live back-to-back dialog batch (several `ui.*` calls chained with
+    /// no intervening checkpoint — [`Self::first_wait_started`]'s doc) keeps this touched on every
+    /// call, so the gap [`Self::take_dialog_extra_ticks`] observes between the last touch and "now"
+    /// stays near-zero (just scheduler/checkpoint latency); only an anchor left stale by real,
+    /// untracked cpu execution opens up a gap wider than [`STALE_WAIT_TOUCH_GAP`].
+    last_wait_touch: Mutex<Option<std::time::Instant>>,
 }
 
 /// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
@@ -800,6 +829,7 @@ impl GuestState {
             pending_with_session: Mutex::new(Vec::new()),
             deadline_estimate: Mutex::new(None),
             first_wait_started: Mutex::new(None),
+            last_wait_touch: Mutex::new(None),
         }
     }
 
@@ -1105,16 +1135,25 @@ impl GuestState {
         if let Ok(mut g) = self.first_wait_started.lock() {
             *g = None;
         }
+        if let Ok(mut g) = self.last_wait_touch.lock() {
+            *g = None;
+        }
     }
 
     /// Record that a `ui.{confirm,select,input,editor}` call is about to block on a human answer,
     /// starting at `started` (real wall-clock `Instant`). Only the FIRST call of a back-to-back batch
-    /// (no intervening successful checkpoint) is kept — see [`Self::first_wait_started`]'s doc.
+    /// (no intervening successful checkpoint) is kept — see [`Self::first_wait_started`]'s doc. ALSO
+    /// touches [`Self::last_wait_touch`] on EVERY call (not just the first) — [`Self::take_dialog_extra_ticks`]
+    /// uses that to tell a still-live batch apart from a stale anchor left by an already-finished wait
+    /// (see [`Self::last_wait_touch`]'s doc for the same-dispatch bug class this closes).
     pub fn note_dialog_wait(&self, started: std::time::Instant) {
         if let Ok(mut g) = self.first_wait_started.lock()
             && g.is_none()
         {
             *g = Some(started);
+        }
+        if let Ok(mut g) = self.last_wait_touch.lock() {
+            *g = Some(std::time::Instant::now());
         }
     }
 
@@ -1136,13 +1175,35 @@ impl GuestState {
     /// originally granted), so it cannot be exploited by chaining many quick dialogs to accumulate
     /// unbounded compute time the way a flat "always grant a fresh full budget" policy could.
     ///
-    /// A recorded wait NEVER produces zero forgiveness (floor of 1 tick): the whole point of this
-    /// mechanism (`845f707`) is that a genuine dialog wait must never trap — a trap here permanently
-    /// wedges the instance (component-model reentrance bookkeeping never sees a clean completion).
+    /// A recorded wait that is still LIVE (see [`Self::last_wait_touch`]) NEVER produces zero
+    /// forgiveness (floor of 1 tick): the whole point of this mechanism (`845f707`) is that a genuine
+    /// dialog wait must never trap — a trap here permanently wedges the instance (component-model
+    /// reentrance bookkeeping never sees a clean completion). A recorded wait that has gone STALE
+    /// (already finished, with real untracked guest execution since) is treated as no wait at all —
+    /// zero forgiveness, a real trap — which is exactly correct: nothing is actually being waited on.
     pub fn take_dialog_extra_ticks(&self) -> u64 {
         let Some(first_started) = self.first_wait_started.lock().ok().and_then(|mut g| g.take()) else {
             return 0;
         };
+        // Same-dispatch stale-anchor guard (see [`Self::last_wait_touch`]'s doc): `first_started` only
+        // proves SOME wait began at that instant, not that it is the wait actually causing THIS trap —
+        // a wait that resolved well inside its own budget leaves `first_started` sitting there, and
+        // without this check a later, wholly UNRELATED cpu-bound stretch of the same dispatch (no
+        // further host call at all) would be handed forgiveness computed from that ancient, irrelevant
+        // timestamp. A genuinely live wait (this one, or the tail of a back-to-back batch) always has
+        // `note_dialog_wait` touch `last_wait_touch` within microseconds of this callback running, so
+        // require that gap to be small; anything wider means real, untracked guest execution happened
+        // in between, and this is treated exactly like "no recorded wait" (0 forgiveness ⇒ a real
+        // trap, matching a genuine runaway/looping guest).
+        let touch_is_fresh = self
+            .last_wait_touch
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .is_some_and(|touched| std::time::Instant::now().saturating_duration_since(touched) <= STALE_WAIT_TOUCH_GAP);
+        if !touch_is_fresh {
+            return 0;
+        }
         let deadline = self.deadline_estimate.lock().ok().and_then(|g| *g);
         let remaining_ticks = deadline
             .map(|d| {
@@ -1258,11 +1319,14 @@ mod tests {
         // (leaving ~60ms / ~12 ticks of budget unused at wait-start).
         std::thread::sleep(std::time::Duration::from_millis(40));
         let wait_started = std::time::Instant::now();
-        s.note_dialog_wait(wait_started);
         // The "human" takes 500ms to answer — 5x the ENTIRE original budget, and the exact class of
         // scenario (`845f707`'s own live repro used 6s against a ~5s budget) that trips the epoch
-        // deadline and invokes this forgiveness path.
+        // deadline and invokes this forgiveness path. `note_dialog_wait` is called AFTER the block
+        // resolves, mirroring `live.rs`'s `let started = Instant::now(); let result = guest.services
+        // .confirm(...); guest.note_dialog_wait(started);` — the callback then runs immediately after,
+        // exactly like the real `epoch_deadline_callback` firing the instant wasm resumes.
         std::thread::sleep(std::time::Duration::from_millis(500));
+        s.note_dialog_wait(wait_started);
 
         let forgiven = s.take_dialog_extra_ticks();
         // The bug: `owed` (wait duration in ticks) would be ~100 ticks (500ms / 5ms) here — the
@@ -1291,9 +1355,9 @@ mod tests {
     fn take_dialog_extra_ticks_floors_at_one_tick_even_with_no_remaining_budget() {
         let s = state();
         s.arm_epoch_deadline_estimate(0); // deadline is effectively "now" already
+        let wait_started = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        s.note_dialog_wait(std::time::Instant::now());
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.note_dialog_wait(wait_started); // called right after the (simulated) block, like live.rs
         assert_eq!(s.take_dialog_extra_ticks(), 1, "a recorded wait floors at 1 tick, never 0");
     }
 
@@ -1315,16 +1379,52 @@ mod tests {
         s.arm_epoch_deadline_estimate(20);
         std::thread::sleep(std::time::Duration::from_millis(10));
         let first = std::time::Instant::now();
+        // First dialog in the batch blocks ~15ms, then `note_dialog_wait` runs right after it
+        // resolves — mirroring live.rs's `let started = Instant::now(); <blocking call>;
+        // guest.note_dialog_wait(started);` pattern for each of `ui.confirm`/`input`/`select`/`editor`.
+        std::thread::sleep(std::time::Duration::from_millis(15));
         s.note_dialog_wait(first); // first dialog in the batch
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        s.note_dialog_wait(std::time::Instant::now()); // second dialog — should NOT move the anchor
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Second dialog immediately follows with NO intervening checkpoint (no cpu burn between the
+        // two calls) and itself blocks ~15ms — should NOT move the anchor off `first`.
+        let second = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.note_dialog_wait(second); // second dialog — should NOT move the anchor
 
         let forgiven = s.take_dialog_extra_ticks();
         // Remaining budget computed from `first` (~90ms / 18 ticks) must be used, not from the
         // second call's later start (~70ms / 14 ticks) — i.e. `forgiven` skews toward the larger,
         // first-anchored value.
         assert!(forgiven >= 15, "must anchor to the FIRST wait in the batch, got {forgiven} ticks");
+    }
+
+    /// THE same-dispatch stale-anchor fix this closes (the sibling of the CROSS-dispatch case below):
+    /// a dialog that resolves comfortably inside its OWN dispatch's budget must NOT leave a stale
+    /// anchor that a LATER, wholly unrelated stretch of cpu-bound work in the SAME dispatch (no
+    /// further host call of any kind — no dialog, no `exec`, no `proc`) can exploit for a near-full
+    /// re-grant of the original budget. Pre-fix, `take_dialog_extra_ticks` computed `remaining` from
+    /// the fast call's ancient `first_wait_started` regardless of what happened since, handing the
+    /// guest close to a full fresh budget for a wait that had already finished.
+    #[test]
+    fn take_dialog_extra_ticks_does_not_reward_a_fast_dialog_followed_by_an_unrelated_cpu_runaway() {
+        let s = state();
+        // A 20-tick (100ms) per-dispatch budget.
+        s.arm_epoch_deadline_estimate(20);
+
+        // A dialog resolves almost instantly, well inside budget.
+        let wait_started = std::time::Instant::now();
+        s.note_dialog_wait(wait_started);
+
+        // The guest then runs long on wholly UNRELATED work for the rest of the dispatch — no further
+        // host call of any kind, so no further `note_dialog_wait`. This alone crosses the 100ms budget.
+        std::thread::sleep(std::time::Duration::from_millis(90));
+
+        let forgiven = s.take_dialog_extra_ticks();
+        assert_eq!(
+            forgiven, 0,
+            "an unrelated cpu-bound stretch with no further host call must trap (0 forgiveness) — \
+             got {forgiven}, meaning a fast, already-finished dialog left a stale anchor that let a \
+             genuine SAME-dispatch runaway be handed a near-full re-grant of the original budget"
+        );
     }
 
     /// THE CRITICAL cross-dispatch fix this closes: a dialog wait that resolves comfortably inside its
