@@ -78,10 +78,11 @@ struct ProcEntry {
 /// (`server-manager.ts:105-112`) is a plain, non-detached `child_process.spawn`, never a process-
 /// group leader. [`ProcCaps::kill`] mirrors that 1:1: it signals the single child pid directly
 /// (`cyrup_tools::terminate_pid`/`kill_pid`), NOT a `setsid`/`killpg` process-GROUP kill. Reusing
-/// `cyrup-tools`' `kill_tree` (the `exec`/`bash` seam's group-kill machinery, R-03-027) here would
-/// diverge from what Pi actually does for stdio MCP transport — that machinery exists because a
-/// SHELL-spawned command tree needs group cleanup; a directly-`spawn`ed single MCP server process
-/// does not, and killing a wider group than Pi itself would is an unjustified behavior change, not a
+/// `cyrup-tools`' `send_sigterm_tree`/`send_sigkill_tree` (the `exec`/`bash` seam's group-kill
+/// escalation, R-03-027) here would diverge from what Pi actually does for stdio MCP transport —
+/// that machinery exists because a SHELL-spawned command tree needs group cleanup; a directly-
+/// `spawn`ed single MCP server process does not, and killing a wider group than Pi itself would
+/// is an unjustified behavior change, not a
 /// strictly-more-correct one. Accordingly `spawn` does NOT `setsid` the child either (contrast
 /// `cyrup-tools::ops::local::build_argv_command`), keeping the child a plain, non-group-leader
 /// process exactly like Node's `spawn(..., {shell:false})` with no `detached` option.

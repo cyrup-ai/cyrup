@@ -2,8 +2,11 @@
 //!
 //! `LocalFs` is an indirection over the real filesystem; `LocalProc` runs commands through the
 //! detected shell, streams combined stdout+stderr, and kills the whole process tree on
-//! cancel/timeout (R-03-024/027). The only `unsafe` in the crate lives here, isolated to the unix
-//! process-group calls (`setsid`/`killpg`) with safety comments.
+//! cancel/timeout (R-03-024/027) via Pi's own SIGTERM-then-5s-grace-then-SIGKILL escalation
+//! (`killProcess`, `exec.ts:52-63`) — the group-scoped analog of `cyrup-ext`'s `proc.rs::kill`
+//! (single-pid escalation for the non-`setsid`'d `proc` capability). The only `unsafe` in the
+//! crate lives here, isolated to the unix process-group calls (`setsid`/`killpg`) with safety
+//! comments.
 
 use super::{
     Access, ArgvOutput, ArgvSpec, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig,
@@ -171,14 +174,28 @@ impl FsOps for LocalFs {
     }
 }
 
+/// How long [`LocalProc::exec`]/[`LocalProc::exec_argv`] wait after `SIGTERM` before escalating to
+/// `SIGKILL` — Pi's exact `killProcess` timing (`exec.ts:56-61`: `setTimeout(..., 5000)`). Mirrors
+/// `cyrup-ext::caps::proc::DEFAULT_KILL_GRACE`.
+const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
+
 /// Local process operations.
 pub struct LocalProc {
     shell: ShellConfig,
+    /// SIGTERM→SIGKILL grace period; overridable ONLY for tests ([`Self::with_kill_grace`]) so the
+    /// escalation path is exercisable without a real test waiting 5+ real seconds — production
+    /// always gets Pi's real 5s via [`Self::new`].
+    kill_grace: Duration,
 }
 
 impl LocalProc {
     pub fn new(shell: ShellConfig) -> Self {
-        Self { shell }
+        Self::with_kill_grace(shell, DEFAULT_KILL_GRACE)
+    }
+
+    /// Build with a caller-supplied SIGTERM→SIGKILL grace period (tests only).
+    pub fn with_kill_grace(shell: ShellConfig, kill_grace: Duration) -> Self {
+        Self { shell, kill_grace }
     }
 }
 
@@ -251,9 +268,36 @@ fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     std_cmd
 }
 
-/// Kill the child's whole process tree (R-03-024/027).
+/// Send the GRACEFUL first step of the kill-tree escalation (Pi `killProcess`'s `proc.kill
+/// ("SIGTERM")`, `exec.ts:55`) to the child's whole process GROUP (contrast [`terminate_pid`],
+/// which signals a single non-group-leader pid for the unrelated `proc` capability). A `setsid`'d
+/// tree that traps `SIGTERM` gets real time — up to [`LocalProc::kill_grace`] — to flush state /
+/// clean up children before [`send_sigkill_tree`] forces it (R-03-024/027).
 #[allow(unsafe_code)]
-fn kill_tree(child: &mut tokio::process::Child) {
+fn send_sigterm_tree(child: &tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: send SIGTERM to the child's process group (created via `setsid`). A negative
+            // pid / killpg targets the group; harmless if the group is already gone (ESRCH).
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable graceful-signal primitive on non-unix without a real `Child` + platform API
+        // beyond what this crate depends on; the grace period still elapses (matching Pi's timer
+        // structure), then [`send_sigkill_tree`]'s `taskkill /F /T` forces the tree exactly once.
+        let _ = child;
+    }
+}
+
+/// Force-kill the child's whole process tree (Pi `killProcess`'s escalation, `exec.ts:57-61`: `if
+/// (!proc.killed) proc.kill("SIGKILL")` after the grace period) — R-03-024/027.
+#[allow(unsafe_code)]
+fn send_sigkill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
@@ -275,8 +319,8 @@ fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
-/// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`kill_tree`], which
-/// targets the whole `setsid` group a shell-spawned tree needs, R-03-027). This is the graceful
+/// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`send_sigterm_tree`],
+/// which targets the whole `setsid` group a shell-spawned tree needs, R-03-027). This is the graceful
 /// half of a two-step escalation for a caller that owns exactly one non-group-leader child directly
 /// (e.g. cyrup-ext's long-lived `proc` capability, arch-08 §5.2/pi-mcp-adapter-port.md §3.1, which
 /// spawns a plain — not `setsid`'d — child, mirroring Pi's own non-detached `StdioClientTransport`
@@ -301,8 +345,8 @@ pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
 }
 
 /// Force-kill a SINGLE process by pid (SIGKILL / non-unix `taskkill /F /PID`, no `/T` — this
-/// targets exactly the one pid, never a subtree; contrast [`kill_tree`]). The escalation half of
-/// [`terminate_pid`]; works everywhere (unlike the graceful half).
+/// targets exactly the one pid, never a subtree; contrast [`send_sigkill_tree`]). The escalation
+/// half of [`terminate_pid`]; works everywhere (unlike the graceful half).
 #[allow(unsafe_code)]
 pub fn kill_pid(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -388,18 +432,36 @@ impl ProcOps for LocalProc {
         };
         tokio::pin!(timeout_fut);
 
+        // SIGTERM-then-grace-then-SIGKILL escalation (Pi `killProcess`, `exec.ts:52-63`): `pending`
+        // records which trigger (cancel vs timeout) asked for termination — so the eventual
+        // `ExitStatus` reports the right reason even if the tree exits gracefully mid-grace — and
+        // gates the one-shot SIGTERM send; `grace` is (re)armed the instant SIGTERM goes out and
+        // forces SIGKILL if the tree is still alive once it elapses. Draining continues throughout
+        // the grace window (Pi's `data` handlers stay attached across `killProcess` too), so output
+        // a well-behaved SIGTERM handler flushes while cleaning up is not lost.
+        let mut pending: Option<ExitStatus> = None;
+        let grace = tokio::time::sleep(self.kill_grace);
+        tokio::pin!(grace);
+
         let status = loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    kill_tree(&mut child);
-                    let _ = child.wait().await;
-                    break ExitStatus::Killed;
+                _ = cancel.cancelled(), if pending.is_none() => {
+                    send_sigterm_tree(&child);
+                    pending = Some(ExitStatus::Killed);
+                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
                 }
-                _ = &mut timeout_fut => {
-                    kill_tree(&mut child);
+                _ = &mut timeout_fut, if pending.is_none() => {
+                    send_sigterm_tree(&child);
+                    pending = Some(ExitStatus::TimedOut);
+                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                }
+                _ = &mut grace, if pending.is_some() => {
+                    // Grace period elapsed and the tree is still alive (a natural exit would already
+                    // have hit the `child.wait()` arm below and broken the loop) — force it.
+                    send_sigkill_tree(&mut child);
                     let _ = child.wait().await;
-                    break ExitStatus::TimedOut;
+                    break pending.unwrap_or(ExitStatus::TimedOut);
                 }
                 chunk = read_chunk(&mut stdout) => {
                     match chunk {
@@ -414,9 +476,12 @@ impl ProcOps for LocalProc {
                     }
                 }
                 s = child.wait(), if stdout.is_none() && stderr.is_none() => {
-                    break match s {
-                        Ok(st) => exit_from(st),
-                        Err(_) => ExitStatus::Exited(-1),
+                    break match pending {
+                        Some(reason) => reason,
+                        None => match s {
+                            Ok(st) => exit_from(st),
+                            Err(_) => ExitStatus::Exited(-1),
+                        },
                     };
                 }
             }
@@ -453,18 +518,29 @@ impl ProcOps for LocalProc {
         };
         tokio::pin!(timeout_fut);
 
+        // SIGTERM-then-grace-then-SIGKILL escalation (Pi `killProcess`, `exec.ts:52-63`) — see
+        // `LocalProc::exec`'s identical loop above for the full rationale.
+        let mut pending: Option<ExitStatus> = None;
+        let grace = tokio::time::sleep(self.kill_grace);
+        tokio::pin!(grace);
+
         let status = loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    kill_tree(&mut child);
-                    let _ = child.wait().await;
-                    break ExitStatus::Killed;
+                _ = cancel.cancelled(), if pending.is_none() => {
+                    send_sigterm_tree(&child);
+                    pending = Some(ExitStatus::Killed);
+                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
                 }
-                _ = &mut timeout_fut => {
-                    kill_tree(&mut child);
+                _ = &mut timeout_fut, if pending.is_none() => {
+                    send_sigterm_tree(&child);
+                    pending = Some(ExitStatus::TimedOut);
+                    grace.as_mut().reset(tokio::time::Instant::now() + self.kill_grace);
+                }
+                _ = &mut grace, if pending.is_some() => {
+                    send_sigkill_tree(&mut child);
                     let _ = child.wait().await;
-                    break ExitStatus::TimedOut;
+                    break pending.unwrap_or(ExitStatus::TimedOut);
                 }
                 chunk = read_chunk(&mut stdout) => {
                     match chunk {
@@ -479,13 +555,105 @@ impl ProcOps for LocalProc {
                     }
                 }
                 s = child.wait(), if stdout.is_none() && stderr.is_none() => {
-                    break match s {
-                        Ok(st) => exit_from(st),
-                        Err(_) => ExitStatus::Exited(-1),
+                    break match pending {
+                        Some(reason) => reason,
+                        None => match s {
+                            Ok(st) => exit_from(st),
+                            Err(_) => ExitStatus::Exited(-1),
+                        },
                     };
                 }
             }
         };
         Ok(ArgvOutput { status, stdout: out_buf, stderr: err_buf })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use crate::ops::ArgvSpec;
+
+    fn argv(program: &str, args: &[&str]) -> ArgvSpec {
+        ArgvSpec {
+            program: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        }
+    }
+
+    /// A normal (SIGTERM-obeying) child dies well within the grace period on timeout — no SIGKILL
+    /// escalation needed. Guards against a regression that makes EVERY timeout/cancel wait out the
+    /// full grace period regardless of whether the tree already died (mirrors
+    /// `cyrup_ext::caps::proc::kill_terminates_a_real_running_child_and_the_os_process_is_gone`).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_timeout_kills_a_normal_child_well_within_grace() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+        let started = tokio::time::Instant::now();
+        let out = proc
+            .exec_argv(argv("sleep", &["30"]), CancelToken::new(), Some(Duration::from_millis(200)))
+            .await
+            .expect("exec_argv runs");
+        assert_eq!(out.status, ExitStatus::TimedOut, "timeout still reports TimedOut");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a SIGTERM-obeying child (`sleep`) must die well within the 5s grace period, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The FORCED SIGKILL escalation, exercised deterministically (mirrors
+    /// `cyrup_ext::caps::proc::kill_escalates_to_sigkill_when_the_child_ignores_sigterm`): a
+    /// process-group leader that traps SIGTERM and loops forever ignores the graceful signal
+    /// outright, so `exec_argv`'s timeout branch MUST wait out the (test-shortened) grace period
+    /// and then SIGKILL the whole group — which cannot be ignored — to actually terminate it.
+    /// Proves the escalation is real, not just documented (closes L4 §2.4).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_timeout_escalates_to_sigkill_when_the_child_ignores_sigterm() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+        let started = tokio::time::Instant::now();
+        let out = proc
+            .exec_argv(
+                argv("sh", &["-c", "trap '' TERM; while true; do sleep 1; done"]),
+                CancelToken::new(),
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .expect("exec_argv runs");
+        assert_eq!(out.status, ExitStatus::TimedOut, "timeout still reports TimedOut");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the 100ms timeout + 150ms grace period was genuinely waited out before escalating to \
+             SIGKILL, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The same escalation on the `cancel` path (not just `timeout`): an abort mid-run SIGTERMs
+    /// first, and only SIGKILLs the SIGTERM-ignoring group after the grace period elapses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_argv_cancel_escalates_to_sigkill_when_the_child_ignores_sigterm() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+        let cancel = CancelToken::new();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            let spec = argv("sh", &["-c", "trap '' TERM; while true; do sleep 1; done"]);
+            async move { proc.exec_argv(spec, cancel, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let out = task.await.expect("task joins").expect("exec_argv runs");
+        assert_eq!(out.status, ExitStatus::Killed, "cancel still reports Killed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the grace period was genuinely waited out before escalating to SIGKILL, got {:?}",
+            started.elapsed()
+        );
     }
 }

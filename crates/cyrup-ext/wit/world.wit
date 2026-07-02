@@ -40,8 +40,9 @@ interface types {
   }
 
   // Result of a capability-scoped exec (arch-08 caps/exec.rs). 1:1 with Pi's `ExecResult`
-  // (exec.ts:23-28): `killed` is true when the host SIGTERM/SIGKILLed the process on a
-  // timeout/abort (Pi `execCommand` `killed`), false for a natural exit or an external signal.
+  // (exec.ts:23-28): `killed` is true when the host SIGTERMed, then (after a 5s grace period if
+  // still alive) SIGKILLed, the process on a timeout/abort — Pi's exact `killProcess` escalation
+  // (exec.ts:52-63) — false for a natural exit or an external signal.
   record exec-result {
     code: s32,
     stdout: string,
