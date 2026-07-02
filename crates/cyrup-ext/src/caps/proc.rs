@@ -22,6 +22,8 @@ use tokio::process::ChildStdin;
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
+mod npx_resolver;
+
 /// The REAL `proc` teardown escalation's exact timing — the actual majority-case MCP-stdio
 /// consumer, `StdioClientTransport.close()` (`@modelcontextprotocol/sdk@1.25.1`
 /// `dist/cjs/client/stdio.js:144-179`): close stdin (EOF), wait 2000ms; if still alive, SIGTERM,
@@ -404,6 +406,28 @@ impl Default for ProcCaps {
     }
 }
 
+/// Pure mapping from an [`npx_resolver::resolve_npx_binary`] result onto the `(cmd, args)`
+/// [`ProcCaps::spawn`] actually launches — split out from `spawn` itself so it's unit-testable
+/// without any real process/filesystem I/O. Mirrors `server-manager.ts:100-101` exactly:
+/// `command = resolved.isJs ? "node" : resolved.binPath; args = resolved.isJs ? [resolved.binPath,
+/// ...resolved.extraArgs] : resolved.extraArgs;` — and, for `resolved === null` (here, `None`),
+/// `:97-104`'s `if (resolved) { ... }` simply never reassigns `command`/`args`, i.e. the ORIGINAL
+/// guest-supplied `spec.cmd`/`spec.args` pass through verbatim.
+fn apply_npx_resolution(
+    resolved: Option<npx_resolver::NpxResolution>,
+    spec: &ProcSpawnSpec,
+) -> (String, Vec<String>) {
+    match resolved {
+        Some(r) if r.is_js => {
+            let mut args = vec![r.bin_path];
+            args.extend(r.extra_args);
+            ("node".to_string(), args)
+        }
+        Some(r) => (r.bin_path, r.extra_args),
+        None => (spec.cmd.clone(), spec.args.clone()),
+    }
+}
+
 impl ProcCaps {
     pub fn new() -> Self {
         Self::with_kill_grace(DEFAULT_KILL_GRACE)
@@ -444,9 +468,11 @@ impl ProcCaps {
     /// Spawn a REAL long-lived child (the WIT `proc.spawn`): pipes stdin/stdout always, stderr iff
     /// `spec.capture_stderr`. Background tasks immediately start pumping the real stdout/stderr
     /// pipes into per-handle buffers, and a background waiter reaps the child + records its real
-    /// exit code the instant it terminates. Synchronous (no `.await` needed — `Command::spawn` is
-    /// itself sync; only `tokio::spawn`, which needs a runtime context, not an async fn, to start
-    /// the pump/waiter tasks).
+    /// exit code the instant it terminates. Mostly synchronous (`Command::spawn` is itself sync;
+    /// only `tokio::spawn`, which needs a runtime context, not an async fn, to start the
+    /// pump/waiter tasks) — EXCEPT for the `npx`/`npm` resolution step immediately below, which can
+    /// block briefly (or, on a cold cache, up to `npx_resolver`'s 30s force-cache-population
+    /// ceiling); that step runs inside `tokio::task::block_in_place` for exactly that reason.
     pub fn spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
         // Reject BEFORE spending a real process spawn if already at the cap (checked again,
         // atomically with the insert, below — this is a fast up-front rejection, not the only
@@ -458,8 +484,21 @@ impl ProcCaps {
                  in the registry, killed or not) — this grant does not evict entries"
             ));
         }
-        let mut cmd = tokio::process::Command::new(&spec.cmd);
-        cmd.args(&spec.args);
+        // Mirrors `server-manager.ts:97-104`: an `npx`/`npm`-shaped invocation is resolved down to
+        // the REAL underlying binary BEFORE the real child is ever spawned, so the pid this
+        // registry tracks (and `kill`, below, can actually signal) is the real MCP server, not a
+        // transient `npm`/`npx` launcher whose own real child can otherwise survive `kill` as an
+        // orphan (see `npx_resolver`'s module doc for the full citation). Gated on the exact
+        // command name so the overwhelmingly common non-npx case never pays for the
+        // `block_in_place` + resolution-module call at all.
+        let resolved = if spec.cmd == "npx" || spec.cmd == "npm" {
+            tokio::task::block_in_place(|| npx_resolver::resolve_npx_binary(&spec.cmd, &spec.args))
+        } else {
+            None
+        };
+        let (resolved_cmd, resolved_args) = apply_npx_resolution(resolved, spec);
+        let mut cmd = tokio::process::Command::new(&resolved_cmd);
+        cmd.args(&resolved_args);
         if let Some(cwd) = &spec.cwd {
             // `cwd` is used VERBATIM — NO interpolation/tilde-expansion here. It must already be
             // fully resolved by the caller: see [`ProcSpawnSpec`]'s doc for why (a host-injected
@@ -484,8 +523,8 @@ impl ProcCaps {
         // entry (and this `ProcCaps`) is dropped without one — e.g. the guest unloads.
         cmd.kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", spec.cmd))?;
-        let pid = child.id().ok_or_else(|| format!("spawn {}: no pid assigned", spec.cmd))?;
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {resolved_cmd}: {e}"))?;
+        let pid = child.id().ok_or_else(|| format!("spawn {resolved_cmd}: no pid assigned"))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -886,6 +925,75 @@ mod tests {
             PathBuf::from("~/x"),
             "no home available must degrade gracefully, not panic"
         );
+    }
+
+    /// `apply_npx_resolution`'s three arms, matching `server-manager.ts:100-101` 1:1 — the finding-1
+    /// fix (`proc.rs:461` before this fix: `spec.cmd` used verbatim with no npx/npm interception).
+    #[test]
+    fn apply_npx_resolution_matches_pi_exactly() {
+        let original = spec("npx", &["-y", "@foo/bar"]);
+
+        // resolved.isJs ⇒ command becomes "node", args become [binPath, ...extraArgs].
+        let js_resolution = npx_resolver::NpxResolution {
+            bin_path: "/cache/_npx/abc/node_modules/@foo/bar/cli.js".to_string(),
+            extra_args: vec!["--flag".to_string()],
+            is_js: true,
+        };
+        assert_eq!(
+            apply_npx_resolution(Some(js_resolution), &original),
+            (
+                "node".to_string(),
+                vec!["/cache/_npx/abc/node_modules/@foo/bar/cli.js".to_string(), "--flag".to_string()]
+            )
+        );
+
+        // !resolved.isJs (a native/shebang-less binary, or a non-`node` shebang) ⇒ command becomes
+        // the resolved binPath directly, args become extraArgs verbatim (no `node` prepended).
+        let native_resolution = npx_resolver::NpxResolution {
+            bin_path: "/cache/_npx/abc/node_modules/.bin/foo-bar".to_string(),
+            extra_args: vec!["--flag".to_string()],
+            is_js: false,
+        };
+        assert_eq!(
+            apply_npx_resolution(Some(native_resolution), &original),
+            ("/cache/_npx/abc/node_modules/.bin/foo-bar".to_string(), vec!["--flag".to_string()])
+        );
+
+        // resolved === null (here, None) ⇒ `command`/`args` pass through UNCHANGED — the original
+        // guest-supplied `spec.cmd`/`spec.args`, not touched at all.
+        assert_eq!(
+            apply_npx_resolution(None, &original),
+            ("npx".to_string(), vec!["-y".to_string(), "@foo/bar".to_string()])
+        );
+    }
+
+    /// Live end-to-end proof that [`ProcCaps::spawn`] actually RUNS `npx`/`npm` resolution (not
+    /// just that the pure mapping above is correct in isolation): `npx --version` is a real,
+    /// network-free, near-instant invocation whose args (`["--version"]`) `parse_npx_args` rejects
+    /// (`--version` isn't `-y`/`--yes`/`-p`/`--package`/`--package=` and starts with `-`,
+    /// `npx-resolver.ts:103-105`) — so `resolve_npx_binary` returns `None` immediately with ZERO
+    /// filesystem/subprocess work, and `spawn` must fall through to launching the REAL `npx` off
+    /// `PATH` with the ORIGINAL args verbatim, exactly like it did before this fix existed. Proves
+    /// the new gate+`block_in_place`+resolution wiring in `spawn` doesn't corrupt the ordinary
+    /// pass-through case. Skips (not fails) on a host with no `npx` on `PATH`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_falls_through_to_real_npx_when_resolution_declines() {
+        let caps = ProcCaps::new();
+        let Ok(handle) = caps.spawn(&spec("npx", &["--version"])) else {
+            eprintln!("skipping: no `npx` on PATH in this environment");
+            return;
+        };
+        let code = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(code) = caps.poll_exit(handle) {
+                    return code;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("npx --version exits promptly, no network/install involved");
+        assert_eq!(code, 0, "a real `npx --version` must exit 0");
     }
 
     /// A real `cat` is a genuine duplex pipe: write a line, poll stdout across MULTIPLE calls until
