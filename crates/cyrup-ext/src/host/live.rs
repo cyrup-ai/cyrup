@@ -1626,12 +1626,14 @@ mod tests {
         let cwds = rec.proc_spawn_cwds();
         assert_eq!(cwds.len(), 2);
         assert_eq!(
-            cwds[0], None,
+            cwds.first().cloned().flatten(),
+            None,
             "a literal empty guest cwd must fold to None, letting proc_spawn's own omitted-cwd \
              fallback fire — not reach it as Some(\"\")"
         );
         assert_eq!(
-            cwds[1], None,
+            cwds.get(1).cloned().flatten(),
+            None,
             "a cwd that INTERPOLATES to empty (an undefined ${{VAR}}) must fold to None the same way"
         );
     }
