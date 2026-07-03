@@ -453,7 +453,25 @@ impl bindings::cyrup::ext::proc::Host for HostState {
                 .filter(|p| !p.as_os_str().is_empty()),
             capture_stderr,
         };
-        guest.services.proc_spawn(&spec)
+        // Closes the SAME class of CRITICAL finding `845f707`/`9ffec1a` closed for `ui.*`/
+        // `http-client`, and this file's own `write_stdin`/`kill` already close for their siblings:
+        // an `npx`/`npm`-shaped `spec.cmd` sends `guest.services.proc_spawn` through
+        // `ProcCaps::spawn`'s `block_in_place`-wrapped `npx_resolver::resolve_npx_binary` call,
+        // which on a cold cache runs a REAL blocking subprocess-spawn-and-wait up to
+        // `npx_resolver::FORCE_CACHE_TIMEOUT` (30s — `caps/proc/npx_resolver.rs`) — six times the
+        // WASM epoch budget (`facade.rs`'s `WASM_EPOCH_BUDGET_TICKS` * `epoch::DEFAULT_TICK` ≈ 5s).
+        // With no `note_dialog_wait` call, that 30s worst case left the epoch deadline already
+        // expired by the time the guest resumed wasm execution right after this call returns,
+        // tripping the SAME permanent instance-wedging trap `ui.*`/`http-client`/`exec`/
+        // `write_stdin`/`kill` used to. Record the wait exactly like those do — including the
+        // ordinary (non-npx, non-blocking) spawn path, which costs nothing extra here (an
+        // `Instant::now()`/`note_dialog_wait` pair on an already-fast call is negligible, and gating
+        // it on `cmd == "npx" || cmd == "npm"` would duplicate `ProcCaps::spawn`'s own gate rather
+        // than reuse it).
+        let started = std::time::Instant::now();
+        let result = guest.services.proc_spawn(&spec);
+        guest.note_dialog_wait(started);
+        result
     }
     async fn write_stdin(&mut self, handle: u32, data: Vec<u8>) -> Result<u32, String> {
         let guest = guest_of(self)?;
@@ -1652,6 +1670,38 @@ mod tests {
             cwds.get(1).cloned().flatten(),
             None,
             "a cwd that INTERPOLATES to empty (an undefined ${{VAR}}) must fold to None the same way"
+        );
+    }
+
+    /// The `proc::Host::spawn` WIT handler must record `note_dialog_wait` around
+    /// `HostServices::proc_spawn` — the SAME epoch-forgiveness bookkeeping `write_stdin`/`kill`
+    /// (this file) already carry for their own occasionally-slow calls. `proc_spawn` can run
+    /// `ProcCaps::spawn`'s `block_in_place`-wrapped `npx_resolver::resolve_npx_binary`, which on a
+    /// cold cache blocks up to `npx_resolver::FORCE_CACHE_TIMEOUT` (30s) — six times the ~5s WASM
+    /// epoch budget — with no way for the guest to observe or interrupt it. Proven by arming a short
+    /// epoch budget, calling the REAL production `proc::Host::spawn` once, and observing
+    /// `take_dialog_extra_ticks()` return NONZERO (floor-1) forgiveness, which only happens when a
+    /// wait was actually recorded: `take_dialog_extra_ticks_is_zero_with_no_recorded_wait`
+    /// (`host/services.rs`) proves the converse — no recorded wait means exactly `0`. Before this
+    /// fix, `spawn` never called `note_dialog_wait` at all, so this assertion would have failed.
+    #[tokio::test]
+    async fn spawn_records_a_dialog_wait_for_epoch_forgiveness() {
+        use bindings::cyrup::ext::proc::Host as ProcHost;
+
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec);
+        let guest = guest_of(&state).expect("guest state present").clone();
+        guest.arm_epoch_deadline_estimate(20); // a 20-tick (100ms) per-dispatch budget, as elsewhere
+
+        ProcHost::spawn(&mut state, "true".into(), vec![], "{}".into(), None, false)
+            .await
+            .expect("spawn succeeds");
+
+        assert!(
+            guest.take_dialog_extra_ticks() > 0,
+            "proc.spawn must record a dialog wait so the epoch trap forgives the call's real \
+             wall-clock duration — without it, a slow npx/npm cold-cache resolution would trap the \
+             instance the instant the guest resumes execution right after this call returns"
         );
     }
 }
