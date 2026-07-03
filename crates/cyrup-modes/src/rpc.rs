@@ -23,12 +23,14 @@
 //! `prompt_with` performs this preflight (the `input` ext event + steer/follow-up routing).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
     ForkPosition, InputSource, ModelThinkingLevel, NotifyKind, PromptAccepted, PromptOptions,
     QueueMode, StreamingBehavior, UiEffect, UiKind, UiReply, UiRequest, UserInput,
 };
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -267,6 +269,12 @@ pub enum RpcOut {
     /// `createExtensionUIContext` → `output({type:"extension_ui_request", …})`, rpc-mode.ts:128-160,
     /// 253-268). Carries the pre-shaped Pi wire object so field names/order match byte-for-byte.
     ExtensionUiRequest(Value),
+    /// A contained extension fault surfaced to the client (Pi `bindExtensions({onError})`,
+    /// rpc-mode.ts:347-349: `output({type:"extension_error", extensionPath, event, error})`). Carries
+    /// the pre-shaped `{type:"extension_error", extensionPath, event, error}` wire object; emitted on
+    /// stdout each time the dispatcher contains + skips a guest handler fault (R-08-036). Untagged, so
+    /// the embedded `"type":"extension_error"` is the discriminant a client dispatches on.
+    ExtensionError(Value),
 }
 
 /// A pending extension dialog awaiting its `extension_ui_response` (mirrors Pi's
@@ -462,9 +470,19 @@ struct Dispatched {
 /// Reads strict-LF JSONL requests, drives the active session, and streams every
 /// [`AgentSessionEvent`] (agent + session-level) back as it occurs. A session-replacing command
 /// rebinds: the active session + its event subscription are re-acquired from the runtime (Pi
-/// `rebindSession`). Returns once the reader reaches EOF *and* no run is in flight. A dedicated
-/// reader task keeps line parsing cancel-safe against the concurrent event stream; the writer is
-/// owned by the loop so its writes never interleave.
+/// `rebindSession`). Returns once the reader reaches EOF *and* no run is in flight *and* no
+/// concurrently-dispatched command is still running. A dedicated reader task keeps line parsing
+/// cancel-safe against the concurrent event stream; the writer is owned by the loop so its writes
+/// never interleave.
+///
+/// ## Command concurrency (Pi `void handleInputLine`, rpc-mode.ts:782; G1)
+/// Blocking commands (`bash`/`compact`/`export_html`) and session-replacing ones
+/// (`new_session`/`switch_session`/`fork`/`clone`) are dispatched CONCURRENTLY (a per-command future
+/// in a `FuturesUnordered`), so a subsequent `abort`/`abort_bash` line is read + serviced WHILE the
+/// blocking command runs and can actually interrupt it — mirroring Node interleaving Pi's fire-and-
+/// forget `handleInputLine` promise chains. Fast run-control commands (`prompt`/`steer`/`follow_up`)
+/// stay inline (they own `in_flight`). Contained extension faults surface as `extension_error` lines
+/// (Pi `onError`, rpc-mode.ts:347-349; G2).
 pub async fn run_rpc<R, W>(
     runtime: &AgentSessionRuntime,
     reader: R,
@@ -495,6 +513,15 @@ where
     let (ui_effect_tx, mut ui_effect_rx) = mpsc::unbounded_channel::<UiEffect>();
     session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
 
+    // The contained-extension-fault sink (Pi `bindExtensions({ onError })`, rpc-mode.ts:347-349):
+    // every guest handler fault the dispatcher contains + skips (R-08-036) is surfaced to the client
+    // as one `extension_error` line on stdout. The listener bridges the dispatcher's synchronous
+    // `onError` fan-out (which may fire on any worker thread mid-run) into this loop via a channel;
+    // (re)installed on the active session's extension host here and again on every rebind, exactly as
+    // Pi re-binds `onError` inside `rebindSession()`.
+    let (error_tx, mut error_rx) = mpsc::unbounded_channel::<Value>();
+    session.services().ext_host.add_error_listener(error_listener(error_tx.clone()));
+
     // Dedicated reader task → mpsc of raw JSONL lines (strict LF framing; cancel-safe vs. events).
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
     let reader_task = tokio::spawn(read_lines(reader, cmd_tx));
@@ -502,6 +529,17 @@ where
     let mut reader_open = true;
     // True from the moment a run is accepted until its `agent_end` is observed.
     let mut in_flight = false;
+
+    // In-flight dispatches of the potentially-BLOCKING and session-replacing commands, driven
+    // CONCURRENTLY with continued input reading so an `abort`/`abort_bash` line arriving mid-command
+    // is read + serviced WHILE that command is still running — Pi's fire-and-forget `void
+    // handleInputLine(line)` (rpc-mode.ts:782) interleaves the two promise chains; without this the
+    // command that exists to interrupt a hung `bash` structurally cannot be delivered (G1). The fast
+    // run-control commands (`prompt`/`steer`/`follow_up`, which only preflight/enqueue then return
+    // while the agent streams via `events`) stay INLINE: they own the `in_flight` flag, and running
+    // them inline keeps that flag set before the event stream is next polled (no set-true / observe-
+    // `agent_end` reordering race that a drain-time set would introduce).
+    let mut dispatches = FuturesUnordered::new();
 
     loop {
         tokio::select! {
@@ -519,22 +557,48 @@ where
                             }
                             continue;
                         }
-                        let dispatched = dispatch(runtime, &session, &line, &mut in_flight).await;
-                        write_out(writer, &RpcOut::Response(dispatched.response)).await?;
-                        if dispatched.rebind {
-                            // Pi `rebindSession`: the active session was replaced — re-acquire it
-                            // and re-subscribe (the prior subscription was terminated, R-11-021).
-                            session = runtime.session().await;
-                            events = session.subscribe();
-                            // The replacement brought a fresh `LiveHostServices`; re-install the ui
-                            // sink so a post-swap guest dialog still reaches this loop.
-                            session.services().host_services.set_ui_sink(ui_tx.clone());
-                            session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
-                            in_flight = false;
+                        if is_inline_command(&line) {
+                            // Run-control commands are fast (preflight/enqueue) and own `in_flight`;
+                            // dispatch inline so the flag is set before `events` is next polled. They
+                            // never replace the active session, so no rebind handling is needed here.
+                            let dispatched =
+                                dispatch(runtime, &session, &line, &mut in_flight).await;
+                            write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                        } else {
+                            // Everything else — including the blocking `bash`/`compact`/`export_html`
+                            // and the session-replacing `new_session`/`switch_session`/`fork`/`clone`
+                            // — dispatches concurrently so a following `abort`/`abort_bash` is not
+                            // queued behind it. The response (and any rebind) is handled when the
+                            // future completes, in the `select_next_some` arm below.
+                            dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
                         }
                     }
                     None => reader_open = false,
                 }
+            }
+            Some(dispatched) = dispatches.next(), if !dispatches.is_empty() => {
+                // A concurrent command finished: emit its correlated response, then rebind if it
+                // replaced the active session (Pi `rebindSession`, rpc-mode.ts:312-360). Responses are
+                // written only here + the inline arm, both on this single loop task, so the writer is
+                // never shared across the concurrent dispatch futures (they only compute a response).
+                write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                if dispatched.rebind {
+                    // The active session was replaced — re-acquire it and re-subscribe (the prior
+                    // subscription was terminated, R-11-021).
+                    session = runtime.session().await;
+                    events = session.subscribe();
+                    // The replacement brought a fresh `LiveHostServices` + extension host; re-install
+                    // the ui sinks and the fault listener so a post-swap guest still reaches this loop.
+                    session.services().host_services.set_ui_sink(ui_tx.clone());
+                    session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
+                    session.services().ext_host.add_error_listener(error_listener(error_tx.clone()));
+                    in_flight = false;
+                }
+            }
+            Some(wire) = error_rx.recv() => {
+                // A dispatcher-contained extension fault: surface it as an `extension_error` line
+                // (Pi `onError` → `output({type:"extension_error", …})`, rpc-mode.ts:347-349).
+                write_out(writer, &RpcOut::ExtensionError(wire)).await?;
             }
             Some(req) = ui_rx.recv() => {
                 // A guest opened a dialog: allocate a correlation id, emit the Pi `extension_ui_request`
@@ -572,12 +636,18 @@ where
             }
         }
 
-        if !reader_open && !in_flight {
-            // Flush any events already buffered on the channel, then shut down cleanly.
+        if !reader_open && !in_flight && dispatches.is_empty() {
+            // The reader is at EOF, no agent run is in flight, and every concurrently-dispatched
+            // command has completed (a still-running `bash` at EOF is awaited here, not cut off).
+            // Flush any events already buffered on the channel + any extension_error queued during
+            // shutdown, then shut down cleanly.
             while let Some(Some(ev)) = events.next().now_or_never() {
                 if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
                     write_out(writer, &RpcOut::Event(Box::new(ev))).await?;
                 }
+            }
+            while let Ok(wire) = error_rx.try_recv() {
+                write_out(writer, &RpcOut::ExtensionError(wire)).await?;
             }
             break;
         }
@@ -586,6 +656,51 @@ where
     // The reader task ends on its own at EOF; this just reaps it.
     reader_task.abort();
     Ok(())
+}
+
+/// Whether `line` is a fast run-control command (`prompt`/`steer`/`follow_up`) that must be
+/// dispatched INLINE. These own the `in_flight` flag and return quickly (after preflight/enqueue),
+/// so running them inline keeps `in_flight` set before the event stream is next polled — avoiding a
+/// set-true / observe-`agent_end` reordering race that a concurrent, drain-time set would introduce.
+/// Every other command (including the blocking `bash`/`compact`/`export_html` and the session-
+/// replacing ones) is dispatched concurrently so `abort`/`abort_bash` can interrupt it (G1). A line
+/// that is not parseable / has no `type` is treated as non-inline: its exact parse/unknown error
+/// response is still produced by [`dispatch`] on the concurrent path.
+fn is_inline_command(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| matches!(t, "prompt" | "steer" | "follow_up"))
+}
+
+/// Owned-capture wrapper around [`dispatch`] for the concurrent path: holds its own `Arc` clone of
+/// the active session (so the loop may reassign/rebind `session` without invalidating in-flight
+/// dispatches) and the raw line. Concurrent commands are never the run-control kind, so their
+/// `in_flight` mutation is inert — a throwaway flag is threaded through.
+async fn dispatch_owned(
+    runtime: &AgentSessionRuntime,
+    session: Arc<AgentSession>,
+    line: String,
+) -> Dispatched {
+    let mut ignored = false;
+    dispatch(runtime, &session, &line, &mut ignored).await
+}
+
+/// Build the `onError` bridge (Pi `bindExtensions({ onError })`, rpc-mode.ts:347-349): a dispatcher
+/// [`cyrup_ext::ErrorListener`] that shapes each contained [`cyrup_ext::ExtensionError`] into the Pi
+/// `extension_error` wire object (`{type, extensionPath, event, error}`) and forwards it to the run
+/// loop over `tx`. `Send + Sync` so the dispatcher can invoke it from any worker thread mid-run.
+fn error_listener(tx: mpsc::UnboundedSender<Value>) -> cyrup_ext::ErrorListener {
+    Arc::new(move |err: &cyrup_ext::ExtensionError| {
+        let _ = tx.send(json!({
+            "type": "extension_error",
+            "extensionPath": err.extension.as_str(),
+            "event": err.event,
+            "error": err.error,
+        }));
+    })
 }
 
 /// Decode one request line and apply it, in the same **staged** order Pi's `handleInputLine` +

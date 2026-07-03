@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 cyrup-core = { workspace = true }
+cyrup-ext = { workspace = true }
 cyrup-session-svc = { workspace = true }
 futures.workspace = true
 serde.workspace = true
@@ -24,5 +25,4 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
-cyrup-ext = { workspace = true }
 tempfile.workspace = true
