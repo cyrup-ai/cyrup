@@ -175,9 +175,9 @@ impl HttpCaps {
     /// machinery unconditionally strips `Content-Encoding`/`Content-Length` the instant it
     /// decompresses a body, diverging from the real consumer's `fetch()` (which preserves both —
     /// verified live against Node's real `fetch()`). [`request`]/[`request_stream`] instead
-    /// advertise the SAME `Accept-Encoding` reqwest's own toggles would have (`build_request`) and
-    /// decompress manually via [`decode_buffered`]/[`decode_stream`], so the caller sees the
-    /// decompressed body AND the untouched original headers.
+    /// advertise `fetch()`'s own real `Accept-Encoding` default (`build_request`) and decompress
+    /// manually via [`decode_buffered`]/[`decode_stream`], so the caller sees the decompressed body
+    /// AND the untouched original headers.
     pub fn new() -> Self {
         let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
         Self::with_client(client)
@@ -227,11 +227,18 @@ impl HttpCaps {
 
     /// Shared request-building: method parse + headers + optional body + optional timeout.
     ///
-    /// Sets `Accept-Encoding` when the caller didn't already supply one — the SAME value reqwest's
-    /// own `gzip`+`brotli`+`deflate`+`zstd` toggles would have set automatically
-    /// (`tower_http::compression_utils::AcceptEncoding::to_header_value`'s `(true,true,true,true)`
-    /// arm: `"zstd,gzip,deflate,br"`), since [`Self::new`] disables that automatic behavior to keep
-    /// the ORIGINAL response headers intact (see [`Self::new`]'s doc comment).
+    /// Sets `Accept-Encoding` when the caller didn't already supply one, mirroring the real
+    /// consumer's own `fetch()` default EXACTLY — undici `dispatch`'s request-header step
+    /// (`index.js:1552-1566`), not `reqwest`'s (or `tower_http`'s) own auto-decompression toggle
+    /// set, which this crate disables ([`Self::new`]'s doc) precisely because it diverges from
+    /// `fetch()`. In order of precedence: a `Range` header present ⇒ `"identity"` (step 18,
+    /// `index.js:1552-1555` — a compressed byte-range response can't be meaningfully resumed/sliced,
+    /// so real `fetch()` refuses to negotiate compression at all for a ranged request); otherwise
+    /// scheme-conditional (step 19, `index.js:1561-1565`): `"br, gzip, deflate"` for `https:`,
+    /// `"gzip, deflate"` for everything else. Never `zstd` in EITHER arm — undici's own outbound
+    /// default doesn't advertise it, even though its decoder still accepts a `zstd`-encoded response
+    /// sent unprompted (`index.js:2296-2299`; mirrored by [`decode_buffered_one`]/[`decode_stream_one`]
+    /// below, which likewise keep `zstd` decoder support without ever asking for it by default).
     ///
     /// `apply_reqwest_timeout` gates whether `req.timeout_ms` (when given and non-zero) is ALSO set as
     /// `reqwest`'s own request-level `RequestBuilder::timeout()` — [`Self::request`] wants this (it
@@ -255,7 +262,24 @@ impl HttpCaps {
         let has_accept_encoding =
             req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
         if !has_accept_encoding {
-            builder = builder.header(reqwest::header::ACCEPT_ENCODING, "zstd,gzip,deflate,br");
+            let has_range = req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("range"));
+            let default_accept_encoding = if has_range {
+                // Real `fetch()` step 18 (index.js:1552-1555): a `Range` request always gets
+                // `Accept-Encoding: identity` — a compressed byte-range response cannot be resumed/
+                // sliced meaningfully, so the real consumer refuses to negotiate compression at all
+                // for this request, regardless of scheme.
+                "identity"
+            } else if req.url.parse::<reqwest::Url>().map(|u| u.scheme() == "https").unwrap_or(false) {
+                // Real `fetch()` step 19, HTTPS arm (index.js:1561-1563): `"br, gzip, deflate"` — no
+                // `zstd` (undici's own outbound default never advertises it, even though its decoder
+                // still handles a server that sends it unprompted, index.js:2296-2299 — mirrored by
+                // this crate's own decoder support below).
+                "br, gzip, deflate"
+            } else {
+                // Real `fetch()` step 19, non-HTTPS arm (index.js:1564-1565): `"gzip, deflate"`.
+                "gzip, deflate"
+            };
+            builder = builder.header(reqwest::header::ACCEPT_ENCODING, default_accept_encoding);
         }
         for (name, value) in &req.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -562,33 +586,62 @@ fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
 /// (`index.js:2271`'s `const maxContentEncodings = 5`).
 const MAX_CONTENT_ENCODINGS: usize = 5;
 
-/// Decompress a fully-buffered body per `encoding` (the real consumer's `fetch()` semantics — an
-/// unrecognized/absent encoding passes the bytes through unchanged, matching `identity`). Bounds the
-/// DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`] on EVERY chained stage (see below), the SAME cap
-/// [`read_bounded_body`] already applies to the wire (possibly-compressed) transfer — now that
-/// decompression happens manually here rather than inside `reqwest`, a small compressed body must not
-/// be able to expand into an unbounded allocation (a decompression bomb). Separately, the NUMBER of
-/// chained stages itself is capped at [`MAX_CONTENT_ENCODINGS`] — see that constant's doc — matching
-/// `undici/lib/web/fetch/index.js:2272-2275`'s `reject(...)` (this whole call fails, no partial body
-/// is produced) rather than silently building/running an unbounded decoder chain.
+/// One recognized `Content-Encoding` coding (RFC 9110 §8.4.1's registered set this crate supports).
+/// Built by [`resolve_codings`], which owns ALL "is this token known" logic — [`decode_buffered_one`]/
+/// [`decode_stream_one`] below never see an unrecognized token at all, so neither has (or needs) an
+/// identity fallback arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coding {
+    Gzip,
+    Br,
+    Deflate,
+    Zstd,
+}
+
+impl Coding {
+    /// `"x-gzip"` is `"gzip"`'s RFC 9112 §7.2 legacy alias — real consumer:
+    /// `undici/lib/web/fetch/index.js:2280`'s `coding === 'x-gzip' || coding === 'gzip'`. `token` must
+    /// already be lowercased + trimmed (`resolve_codings` does both before calling this).
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "gzip" | "x-gzip" => Some(Coding::Gzip),
+            "br" => Some(Coding::Br),
+            "deflate" => Some(Coding::Deflate),
+            "zstd" => Some(Coding::Zstd),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve a `Content-Encoding` header into the ordered list of [`Coding`] stages to actually apply,
+/// ALREADY reversed into application order (index 0 = outermost/last-listed coding, applied first) —
+/// the exact real-consumer semantics of `undici/lib/web/fetch/index.js:2275-2303`, not merely "known
+/// codings decode, unknown ones pass through": that loop walks tokens from the LAST-listed (outermost)
+/// down to the FIRST-listed (innermost), pushing a decoder for each recognized one — but the MOMENT it
+/// hits an unrecognized token, it runs `decoders.length = 0; break` (`index.js:2301-2302`), discarding
+/// EVERY decoder identified so far (not just failing that one stage) and stopping immediately. A
+/// single bad/unknown token ANYWHERE in the chain means the ENTIRE response body is later used
+/// UNTOUCHED (`decoders.length ? pipeline(...) : this.body`, `index.js:2312-2313`) — not "every OTHER,
+/// recognized stage still decodes normally," which is what an identity-per-unknown-stage fallback
+/// (this crate's OLD behavior) would produce instead. Concretely, for `Content-Encoding: "bogus,
+/// gzip"` (bogus applied first/innermost, gzip second/outermost): the loop visits `gzip` first (i=1,
+/// recognized, pushed), then `bogus` (i=0, unrecognized) — which WIPES the just-pushed gzip decoder
+/// and breaks, so the real consumer returns the FULLY RAW bytes, not gzip-decompressed-with-bogus-
+/// left-as-is. Mirrored exactly here: `decoders.clear()` (not `continue`/skip) on the first
+/// unrecognized token, then `break`.
 ///
-/// `Content-Encoding` may list MULTIPLE codings, e.g. `"gzip, br"` (RFC 9110 §8.4.1: "the codings are
-/// listed in the order in which they were applied" — `gzip` first, `br` second, on top). Decoding must
-/// undo them in REVERSE: the LAST-listed coding is the OUTERMOST layer, so it comes off first. Verified
-/// live against real Node `fetch()` (`zlib.gzipSync` then `brotliCompressSync`, header `gzip, br`):
-/// Node decodes both layers back to the original plaintext while still exposing the untouched
-/// `content-encoding: gzip, br` header — this loop reproduces that. A token this decoder doesn't
-/// recognize degrades to identity for JUST that stage (matching the existing single-token fallback),
-/// not the whole chain, so a trailing/leading unknown token never silently defeats decoding of the
-/// KNOWN codings around it.
+/// `Err` only for the chain-DEPTH cap ([`MAX_CONTENT_ENCODINGS`]) — matching `undici`'s own
+/// `reject(...)` (`index.js:2272-2275`): that failure aborts the WHOLE response before any decoder
+/// resolution is even attempted, unlike an unrecognized-token discard (which is a normal `Ok(vec![])`,
+/// i.e. "decode nothing," exactly like an absent `Content-Encoding` header).
 ///
 /// Matching is case-INSENSITIVE, on a lowercased COPY of `encoding` — RFC 9110 §8.4.1 / RFC 7231
 /// §3.1.2.1: "All content-coding values are case-insensitive"; real consumer:
 /// `undici/lib/web/fetch/index.js:2267`'s `contentEncoding.toLowerCase().split(',')`, run BEFORE
 /// the split, exactly mirrored here. The ORIGINAL `encoding` (and the untouched header this crate
 /// hands back to the guest, [`content_encoding_of`]) is never itself modified.
-async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
-    let Some(encoding) = encoding else { return Ok(raw) };
+fn resolve_codings(encoding: Option<&str>) -> Result<Vec<Coding>, String> {
+    let Some(encoding) = encoding else { return Ok(Vec::new()) };
     let lower = encoding.to_lowercase();
     let tokens: Vec<&str> = lower.split(',').collect();
     if tokens.len() > MAX_CONTENT_ENCODINGS {
@@ -597,31 +650,55 @@ async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>
             tokens.len()
         ));
     }
-    let mut body = raw;
+    let mut decoders = Vec::new();
     for token in tokens.into_iter().map(str::trim).rev() {
-        body = decode_buffered_one(token, body).await?;
+        match Coding::parse(token) {
+            Some(coding) => decoders.push(coding),
+            None => {
+                decoders.clear();
+                break;
+            }
+        }
+    }
+    Ok(decoders)
+}
+
+/// Decompress a fully-buffered body per `encoding` (the real consumer's `fetch()` semantics — see
+/// [`resolve_codings`] for the exact "unknown token discards the whole chain" behavior this ports).
+/// Bounds the DECOMPRESSED output at [`MAX_RESPONSE_BODY_BYTES`] on EVERY chained stage (see below),
+/// the SAME cap [`read_bounded_body`] already applies to the wire (possibly-compressed) transfer —
+/// now that decompression happens manually here rather than inside `reqwest`, a small compressed body
+/// must not be able to expand into an unbounded allocation (a decompression bomb).
+///
+/// `Content-Encoding` may list MULTIPLE codings, e.g. `"gzip, br"` (RFC 9110 §8.4.1: "the codings are
+/// listed in the order in which they were applied" — `gzip` first, `br` second, on top). Decoding must
+/// undo them in REVERSE: the LAST-listed coding is the OUTERMOST layer, so it comes off first. Verified
+/// live against real Node `fetch()` (`zlib.gzipSync` then `brotliCompressSync`, header `gzip, br`):
+/// Node decodes both layers back to the original plaintext while still exposing the untouched
+/// `content-encoding: gzip, br` header — this loop reproduces that (for an all-recognized chain).
+async fn decode_buffered(encoding: Option<&str>, raw: Vec<u8>) -> Result<Vec<u8>, String> {
+    let codings = resolve_codings(encoding)?;
+    let mut body = raw;
+    for coding in codings {
+        body = decode_buffered_one(coding, body).await?;
     }
     Ok(body)
 }
 
-/// Decompress `raw` per a SINGLE, already-lowercased `Content-Encoding` token (one stage of
-/// [`decode_buffered`]'s chain). `"x-gzip"` is `"gzip"`'s RFC 9112 §7.2 legacy alias — real
-/// consumer: `undici/lib/web/fetch/index.js:2280`'s `coding === 'x-gzip' || coding === 'gzip'`.
-async fn decode_buffered_one(encoding: &str, raw: Vec<u8>) -> Result<Vec<u8>, String> {
+/// Decompress `raw` per a SINGLE [`Coding`] (one stage of [`decode_buffered`]'s chain, already
+/// resolved by [`resolve_codings`] — every variant here is by construction a recognized coding, so
+/// there is no identity/fallback arm to reach).
+async fn decode_buffered_one(coding: Coding, raw: Vec<u8>) -> Result<Vec<u8>, String> {
     let reader = tokio::io::BufReader::new(std::io::Cursor::new(raw));
-    match encoding {
-        "gzip" | "x-gzip" => {
+    match coding {
+        Coding::Gzip => {
             read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await
         }
-        "br" => read_capped(async_compression::tokio::bufread::BrotliDecoder::new(reader)).await,
-        "deflate" => {
+        Coding::Br => read_capped(async_compression::tokio::bufread::BrotliDecoder::new(reader)).await,
+        Coding::Deflate => {
             read_capped(async_compression::tokio::bufread::DeflateDecoder::new(reader)).await
         }
-        "zstd" => read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await,
-        // Unrecognized Content-Encoding token ⇒ identity for this stage, matching the real
-        // decompression layer this replaces (`tower_http`'s `_ => identity` fallback). `reader`
-        // (holding `raw`) is simply dropped here; recover the original bytes from its inner cursor.
-        _ => Ok(reader.into_inner().into_inner()),
+        Coding::Zstd => read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await,
     }
 }
 
@@ -647,24 +724,22 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Result<Vec<u8
 }
 
 /// Wrap a raw response byte stream through the `async-compression` decoder chain matching `encoding`
-/// (the real consumer's `fetch()` semantics — an unrecognized/absent encoding passes chunks through
-/// unchanged, matching `identity`), used by [`HttpCaps::request_stream`]. Unlike the buffered path,
-/// there is no additional cap here: the host never accumulates a streaming body (the guest drains it
-/// one already-network-bounded chunk at a time via [`HttpCaps::poll_stream_chunk`] — the same
-/// reasoning [`MAX_RESPONSE_BODY_BYTES`]'s doc comment already gives for why streaming doesn't need
-/// it), and a decoder that never learns the true end of a bomb-sized declared stream is nothing new:
-/// an identity stream of the same declared size is already unbounded in the exact same way.
+/// (the real consumer's `fetch()` semantics — see [`resolve_codings`] for the exact "unknown token
+/// discards the whole chain" behavior this ports), used by [`HttpCaps::request_stream`]. Unlike the
+/// buffered path, there is no additional cap here: the host never accumulates a streaming body (the
+/// guest drains it one already-network-bounded chunk at a time via [`HttpCaps::poll_stream_chunk`] —
+/// the same reasoning [`MAX_RESPONSE_BODY_BYTES`]'s doc comment already gives for why streaming
+/// doesn't need it), and a decoder that never learns the true end of a bomb-sized declared stream is
+/// nothing new: an identity stream of the same declared size is already unbounded in the exact same
+/// way.
 ///
 /// `Content-Encoding` may list MULTIPLE codings — see [`decode_buffered`]'s doc for the full
 /// RFC 9110 §8.4.1 rationale and the live Node `fetch()` verification. Decoded here the same way:
-/// wrap the stream with one decoder per token, applied in REVERSE of the listed order (the
-/// LAST-listed coding is the outermost layer, unwrapped first). An unrecognized token degrades to
-/// identity for just that one stage. Also matches [`decode_buffered`]'s [`MAX_CONTENT_ENCODINGS`]
-/// chain-depth cap — `Err` here means [`HttpCaps::request_stream`] fails the WHOLE call before ever
-/// registering a stream handle, matching undici's `reject(...)` (`index.js:2272-2275`), not a
-/// stream that silently opens and then errors on first poll. Matching is case-INSENSITIVE, on a
-/// lowercased COPY of `encoding` — see [`decode_buffered`]'s doc for the same RFC citation; the
-/// original header this crate hands back to the guest is never touched.
+/// wrap the stream with one decoder per resolved [`Coding`], applied in REVERSE of the listed order
+/// (the LAST-listed coding is the outermost layer, unwrapped first). `Err` here means
+/// [`HttpCaps::request_stream`] fails the WHOLE call before ever registering a stream handle, matching
+/// undici's `reject(...)` (`index.js:2272-2275`) for the [`MAX_CONTENT_ENCODINGS`] depth cap — not a
+/// stream that silently opens and then errors on first poll.
 fn decode_stream(
     encoding: Option<&str>,
     raw: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -673,47 +748,38 @@ fn decode_stream(
     // map it explicitly once, up front, so every decoder stage below shares one `io::Error`-typed
     // stream.
     let mut stream: ChunkStream = Box::pin(raw.map(|r| r.map_err(std::io::Error::other)));
-    let Some(encoding) = encoding else { return Ok(stream) };
-    let lower = encoding.to_lowercase();
-    let tokens: Vec<&str> = lower.split(',').collect();
-    if tokens.len() > MAX_CONTENT_ENCODINGS {
-        return Err(format!(
-            "too many content-encodings in response: {}, maximum allowed is {MAX_CONTENT_ENCODINGS}",
-            tokens.len()
-        ));
-    }
-    for token in tokens.into_iter().map(str::trim).rev() {
-        stream = decode_stream_one(token, stream);
+    let codings = resolve_codings(encoding)?;
+    for coding in codings {
+        stream = decode_stream_one(coding, stream);
     }
     Ok(stream)
 }
 
-/// Wrap `raw` through the decoder for a SINGLE, already-lowercased `Content-Encoding` token (one
-/// stage of [`decode_stream`]'s chain). `"x-gzip"` is `"gzip"`'s RFC 9112 §7.2 legacy alias — see
-/// [`decode_buffered_one`]'s doc for the same citation.
-fn decode_stream_one(encoding: &str, raw: ChunkStream) -> ChunkStream {
-    match encoding {
-        "gzip" | "x-gzip" => {
+/// Wrap `raw` through the decoder for a SINGLE [`Coding`] (one stage of [`decode_stream`]'s chain,
+/// already resolved by [`resolve_codings`] — every variant here is by construction a recognized
+/// coding, so there is no identity/fallback arm to reach).
+fn decode_stream_one(coding: Coding, raw: ChunkStream) -> ChunkStream {
+    match coding {
+        Coding::Gzip => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        "br" => {
+        Coding::Br => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::BrotliDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        "deflate" => {
+        Coding::Deflate => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::DeflateDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        "zstd" => {
+        Coding::Zstd => {
             let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(raw));
             let decoder = async_compression::tokio::bufread::ZstdDecoder::new(reader);
             Box::pin(tokio_util::io::ReaderStream::new(decoder))
         }
-        _ => raw,
     }
 }
 
@@ -1005,6 +1071,154 @@ mod tests {
         assert_eq!(
             collected, plaintext,
             "drained chunks concatenate back to the plaintext with BOTH chained layers undone"
+        );
+    }
+
+    /// THE finding this closes (buffered path): an UNRECOGNIZED `Content-Encoding` token anywhere in
+    /// the chain must discard EVERY decoder identified so far, not just fall back to identity for
+    /// that one stage — matching real `fetch()`'s `decoders.length = 0; break`
+    /// (`undici/lib/web/fetch/index.js:2301-2302`). `"bogus, gzip"`: real gzip-compressed bytes on
+    /// the wire, but the header lists an unrecognized `bogus` coding BEFORE `gzip` — since decoding
+    /// walks the header in REVERSE (last-listed = outermost, decoded first), the loop visits `gzip`
+    /// first (recognized, would decode) then `bogus` (unrecognized), which wipes the just-identified
+    /// gzip decoder. The response body must therefore come back FULLY RAW (still gzip-compressed),
+    /// proving this is a real end-to-end behavior over a real mock server + real gzip binary, not
+    /// merely a unit check of the resolver function.
+    #[tokio::test]
+    async fn request_with_an_unrecognized_content_encoding_token_discards_the_whole_chain_not_just_that_stage() {
+        let plaintext = b"this must NOT be gzip-decoded when an unknown token poisons the chain";
+        let gzipped = compress_with("gzip", &["-c"], plaintext);
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: bogus, gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds (an unknown token is not itself an error)");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body, gzipped,
+            "an unrecognized token anywhere in the chain must discard the WHOLE decoder chain — the \
+             body must come back still gzip-compressed, not gzip-decoded with the bad token merely \
+             skipped: {:?}",
+            resp.body
+        );
+    }
+
+    /// The order-reversed sibling: `"gzip, bogus"` — `bogus` is now the OUTERMOST (last-listed)
+    /// coding, so the reverse-order walk hits it FIRST, before `gzip` is ever even inspected. Same
+    /// real-server, real-gzip proof; same expected fully-raw result.
+    #[tokio::test]
+    async fn request_with_a_trailing_unrecognized_content_encoding_token_also_discards_the_whole_chain() {
+        let plaintext = b"an outermost unknown coding must poison the chain before gzip is even seen";
+        let gzipped = compress_with("gzip", &["-c"], plaintext);
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: gzip, bogus\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps.request(&req).await.expect("request succeeds");
+        assert_eq!(
+            resp.body, gzipped,
+            "an outermost unrecognized token must ALSO discard the whole chain, including the \
+             recognized gzip stage underneath it: {:?}",
+            resp.body
+        );
+    }
+
+    /// Same finding, the streaming path (`request_stream`/`poll_stream_chunk`): drained chunks must
+    /// concatenate back to the still-gzip-compressed bytes, not the plaintext.
+    #[tokio::test]
+    async fn request_stream_with_an_unrecognized_content_encoding_token_discards_the_whole_chain() {
+        let plaintext = b"streaming: this must NOT be gzip-decoded when an unknown token is present";
+        let gzipped = compress_with("gzip", &["-c"], plaintext);
+
+        let headers = format!(
+            "Content-Type: application/octet-stream\r\nContent-Encoding: bogus, gzip\r\nContent-Length: {}\r\n",
+            gzipped.len()
+        );
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps.request_stream(&req).await.expect("stream opens");
+        assert_eq!(opened.status, 200);
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, gzipped,
+            "the drained stream must reconstruct the fully raw (still gzip-compressed) bytes, not the \
+             gzip-decoded plaintext"
+        );
+    }
+
+    /// `Accept-Encoding` defaults must match real `fetch()`'s request-header algorithm exactly
+    /// (`undici/lib/web/fetch/index.js:1552-1566`), not `reqwest`'s own auto-decompression toggle set
+    /// — scheme-conditional (`https:` → `"br, gzip, deflate"`, anything else → `"gzip, deflate"`,
+    /// NEVER `zstd` in either arm), a `Range` header present → `"identity"` regardless of scheme, and
+    /// a caller-supplied `Accept-Encoding` always left untouched. `build_request` only materializes a
+    /// `reqwest::Request` (`.build()`) — no network I/O, so both the `https://` and `http://` arms are
+    /// exercised directly without needing a live TLS listener.
+    #[test]
+    fn build_request_defaults_accept_encoding_scheme_conditionally_and_identity_for_range() {
+        let caps = HttpCaps::new();
+        let get_accept_encoding = |req: &HttpRequest| {
+            caps.build_request(req, true)
+                .expect("builds")
+                .build()
+                .expect("materializes without connecting")
+                .headers()
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let req = HttpRequest { method: "GET".into(), url: "https://example.invalid/x".into(), ..Default::default() };
+        assert_eq!(
+            get_accept_encoding(&req).as_deref(),
+            Some("br, gzip, deflate"),
+            "https:// must default to br,gzip,deflate — never zstd"
+        );
+
+        let req = HttpRequest { method: "GET".into(), url: "http://example.invalid/x".into(), ..Default::default() };
+        assert_eq!(
+            get_accept_encoding(&req).as_deref(),
+            Some("gzip, deflate"),
+            "non-https must default to gzip,deflate only"
+        );
+
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: "https://example.invalid/x".into(),
+            headers: vec![("Range".to_string(), "bytes=0-99".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(
+            get_accept_encoding(&req).as_deref(),
+            Some("identity"),
+            "a Range request must get identity, even on https:// which would otherwise get br,gzip,deflate"
+        );
+
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: "https://example.invalid/x".into(),
+            headers: vec![("Accept-Encoding".to_string(), "gzip".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(
+            get_accept_encoding(&req).as_deref(),
+            Some("gzip"),
+            "an explicit caller-supplied Accept-Encoding must never be overridden"
         );
     }
 
