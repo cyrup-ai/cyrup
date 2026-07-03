@@ -457,9 +457,12 @@ pub enum Message {
     User {
         /// Pi `UserMessage.content: string | (TextContent | ImageContent)[]` (types.ts:379). On
         /// READ, a bare JSON string is accepted and promoted to a single text block, and the array
-        /// form is validated to `Text|Image` only (gap 5/9 / R-00-013). On WRITE, a single
-        /// signature-less text block is serialized back to the bare-string shorthand for byte
-        /// parity with Pi (gap 16); anything else serializes as the content array.
+        /// form is validated to `Text|Image` only (gap 5/9 / R-00-013). On WRITE, the content array
+        /// is ALWAYS emitted — every real Pi entry point that builds a `UserMessage` constructs the
+        /// array form `[{type:"text",text}]` (`agent.ts:389`, `agent-harness.ts:38`,
+        /// `agent-session.ts:1117`) and Pi's session write path (`session-manager.ts:940,952,959`)
+        /// is a pure `JSON.stringify(entry)` with no shape transform, so Pi never collapses a
+        /// single-text user turn to the bare-string shorthand on write. cyrup matches those bytes.
         #[serde(deserialize_with = "de_user_content")]
         content: Vec<Content>,
         timestamp: i64,
@@ -495,14 +498,11 @@ impl serde::Serialize for Message {
             Message::User { content, timestamp } => {
                 let mut st = serializer.serialize_struct("Message", 3)?;
                 st.serialize_field("role", "user")?;
-                // Pi bare-string shorthand for a single signature-less text block (gap 16);
-                // otherwise the content array. Round-trips through `de_user_content`.
-                match content.as_slice() {
-                    [Content::Text { text, text_signature: None }] => {
-                        st.serialize_field("content", text)?
-                    }
-                    _ => st.serialize_field("content", content)?,
-                }
+                // Always the content array — Pi's real entry points build `[{type:"text",text}]`
+                // for every user turn and its write path (`JSON.stringify`, no transform) never
+                // collapses a single-text turn to the bare-string shorthand. The bare-string form
+                // is READ-tolerated (`de_user_content`) for legacy/foreign JSONL, not written.
+                st.serialize_field("content", content)?;
                 st.serialize_field("timestamp", timestamp)?;
                 st.end()
             }
@@ -672,13 +672,22 @@ mod tests {
     }
 
     #[test]
-    fn user_content_serializes_single_text_as_bare_string() {
-        // gap 16: a single signature-less text block round-trips to Pi's bare-string shorthand.
+    fn user_content_serializes_single_text_as_array_like_pi() {
+        // Every real Pi entry point builds the ARRAY form `[{type:"text",text}]` for a single-text
+        // user turn (agent.ts:389, agent-harness.ts:38, agent-session.ts:1117) and Pi's write path
+        // (session-manager.ts:940,952,959 — pure JSON.stringify) never collapses it to a bare
+        // string. cyrup must emit the same bytes, even for a single signature-less text block.
         let m = Message::User { content: vec![Content::text("hi")], timestamp: 7 };
         let v = serde_json::to_value(&m).expect("serialize");
-        assert_eq!(v["content"], serde_json::json!("hi"));
+        assert_eq!(v["content"], serde_json::json!([{ "type": "text", "text": "hi" }]));
         let back: Message = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, m);
+        // The bare-string shorthand is still READ-tolerated for legacy/foreign JSONL, promoting to
+        // a single text block (Pi's `content: string | Content[]` union accepts it on load).
+        let legacy: Message =
+            serde_json::from_value(serde_json::json!({ "role": "user", "content": "hi", "timestamp": 7 }))
+                .expect("deserialize bare-string legacy shorthand");
+        assert_eq!(legacy, m);
         // A text block carrying a signature stays the array form (the signature must survive).
         let m2 = Message::User {
             content: vec![Content::text_with_signature("hi", "sig")],
