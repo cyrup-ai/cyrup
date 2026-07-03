@@ -3151,6 +3151,14 @@ impl AgentSession {
     /// agent-session.ts:2588). Streams combined output to `on_chunk`; the result is recorded into the
     /// transcript (or deferred while a run streams).
     ///
+    /// Fires NO extension event of its own — Pi's `executeBash` (agent-session.ts:2582-2684) has zero
+    /// `emitUserBash` emission; the ONLY `emitUserBash` call site in Pi is `interactive-mode.ts:5663-
+    /// 5669`'s `handleBashCommand`, the interactive `!`/`!!`-prefix handler, which emits the event
+    /// itself and then calls into execution — see [`Self::execute_bash_interactive`] for that wrapped
+    /// path. The JSON-RPC `bash` command (`rpc-mode.ts:550-554`'s `case "bash"`) calls
+    /// `session.executeBash(...)` directly with no emission, matching this bare method — that is what
+    /// `crates/cyrup-modes/src/rpc.rs`'s `SessionCommand::Bash` arm calls.
+    ///
     /// A genuine backend failure is returned as `Err` and NEVER recorded into history — Pi's
     /// `executeBash` only calls `recordBashResult` on the success path inside its `try` block
     /// (`agent-session.ts:2628-2643`); a rejection from `executeBashWithOperations` propagates
@@ -3162,16 +3170,6 @@ impl AgentSession {
         options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
     ) -> Result<BashResult, SessionServiceError> {
-        // `user_bash` extension event (Pi `extensionRunner.emitUserBash`,
-        // interactive-mode.ts:5616 / rpc-mode.ts:551). Fired from this submission pipeline BEFORE
-        // execution with the LIVE `{command, excludeFromContext, cwd}`. A handler that returns a full
-        // `result` override short-circuits execution (Pi handleBashCommand:5624-5651); otherwise we
-        // run normally. (Pi's `operations` remote-exec override is not honored here: cyrup has no
-        // per-call bash-backend override seam — `self.proc` is the fixed backend.)
-        if let Some(result) = self.emit_user_bash_event(command, options.exclude_from_context).await {
-            self.record_bash_result(command, &result, options).await;
-            return Ok(result);
-        }
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.bash_cancel) = Some(cancel.clone());
         let cwd = self.services.cwd.clone();
@@ -3216,6 +3214,28 @@ impl AgentSession {
         let result = outcome?;
         self.record_bash_result(command, &result, options).await;
         Ok(result)
+    }
+
+    /// Execute a bash command from the interactive `!`/`!!`-prefix front-end (Pi
+    /// `handleBashCommand`, `interactive-mode.ts:5663-5669`). Unlike the bare [`Self::execute_bash`]
+    /// (which the JSON-RPC `bash` command calls directly with zero extension involvement), this
+    /// wrapper fires the `user_bash` extension event FIRST with the live `{command,
+    /// excludeFromContext, cwd}` — a handler that returns a full `result` override
+    /// (`UserBashEventResult.result`, types.ts:1043-1048) short-circuits local execution entirely
+    /// (Pi `handleBashCommand:5624-5651`); otherwise this falls through to [`Self::execute_bash`]
+    /// for normal execution. (Pi's `operations` remote-exec override is not honored here: cyrup has
+    /// no per-call bash-backend override seam — `self.proc` is the fixed backend.)
+    pub async fn execute_bash_interactive(
+        &self,
+        command: &str,
+        options: BashOptions,
+        on_chunk: crate::bash::BashChunkSink,
+    ) -> Result<BashResult, SessionServiceError> {
+        if let Some(result) = self.emit_user_bash_event(command, options.exclude_from_context).await {
+            self.record_bash_result(command, &result, options).await;
+            return Ok(result);
+        }
+        self.execute_bash(command, options, on_chunk).await
     }
 
     /// Emit the `user_bash` extension event and, if a handler fully serviced the command (Pi

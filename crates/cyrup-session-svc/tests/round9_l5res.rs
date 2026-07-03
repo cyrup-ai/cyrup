@@ -6,7 +6,8 @@
 //!   * A.8  `steer`/`follow_up` expand skill/template AND reject extension commands (`_throwIfExtensionCommand`).
 //!   * A.4  the queue-drain → `queue_update` branch fires from a real run (mirror emptied on delivery).
 //!   * check_compaction Case-2 (threshold, direct-usage) fires from a real run.
-//!   * B/user_bash the `user_bash` ext event fires with the LIVE `{command, excludeFromContext, cwd}`.
+//!   * B/user_bash the `user_bash` ext event fires with the LIVE `{command, excludeFromContext, cwd}`
+//!     from `execute_bash_interactive` only — never from the RPC-reachable bare `execute_bash`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
@@ -399,11 +400,42 @@ impl NativeExtension for UserBashProbe {
     }
 }
 
-/// B/user_bash: `execute_bash` fires the `user_bash` extension event from the submission pipeline with
-/// the LIVE `{command, excludeFromContext (the !!-prefix flag), cwd (agent cwd)}` (Pi
-/// `extensionRunner.emitUserBash`, interactive-mode.ts:5616 / types.ts:782-790).
+/// B/user_bash: `execute_bash_interactive` (the interactive `!`/`!!`-prefix entry point) fires the
+/// `user_bash` extension event from the submission pipeline with the LIVE `{command,
+/// excludeFromContext (the !!-prefix flag), cwd (agent cwd)}` (Pi `extensionRunner.emitUserBash`,
+/// `interactive-mode.ts:5663-5669`'s `handleBashCommand` / `types.ts:782-790`). The bare
+/// `execute_bash` (which the JSON-RPC `bash` command calls directly, `rpc-mode.ts:550-554`) fires no
+/// such event — see `execute_bash_never_emits_user_bash` below.
 #[tokio::test]
-async fn execute_bash_emits_user_bash_with_live_values() {
+async fn execute_bash_interactive_emits_user_bash_with_live_values() {
+    let fx = fixture();
+    let probe: BashProbe = Arc::new(Mutex::new(Vec::new()));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(Arc::new(UserBashProbe(probe.clone())))
+        .build()
+        .await
+        .expect("build");
+
+    let _ = session
+        .execute_bash_interactive("echo hello", BashOptions { exclude_from_context: true }, None)
+        .await;
+
+    let seen = probe.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the user_bash handler fired exactly once");
+    assert_eq!(seen[0].0, "echo hello", "the live command is delivered");
+    assert!(seen[0].1, "the !!-prefix excludeFromContext flag is delivered");
+    assert_eq!(seen[0].2, fx.cwd.display().to_string(), "the agent cwd is delivered");
+}
+
+/// B/user_bash (RPC path): the bare `execute_bash` — the exact method
+/// `crates/cyrup-modes/src/rpc.rs`'s `SessionCommand::Bash` arm calls for the JSON-RPC `bash`
+/// command — fires NO `user_bash` extension event. Pi's `executeBash` (`agent-session.ts:2582-
+/// 2684`) has zero `emitUserBash` emission, and `rpc-mode.ts:550-554`'s `case "bash"` calls
+/// `session.executeBash(...)` directly; only the interactive `!`/`!!`-prefix handler
+/// (`interactive-mode.ts:5663-5669`) emits the event, proven by
+/// `execute_bash_interactive_emits_user_bash_with_live_values` above.
+#[tokio::test]
+async fn execute_bash_never_emits_user_bash() {
     let fx = fixture();
     let probe: BashProbe = Arc::new(Mutex::new(Vec::new()));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
@@ -417,10 +449,7 @@ async fn execute_bash_emits_user_bash_with_live_values() {
         .await;
 
     let seen = probe.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1, "the user_bash handler fired exactly once");
-    assert_eq!(seen[0].0, "echo hello", "the live command is delivered");
-    assert!(seen[0].1, "the !!-prefix excludeFromContext flag is delivered");
-    assert_eq!(seen[0].2, fx.cwd.display().to_string(), "the agent cwd is delivered");
+    assert!(seen.is_empty(), "the RPC-reachable execute_bash must never fire user_bash: {seen:?}");
 }
 
 // ============================================ L4 gap #5: session_before_compact typed override ====
