@@ -54,6 +54,24 @@ fn unknown_slash_is_a_prompt_not_an_error() {
 }
 
 #[test]
+fn theme_think_show_images_route_to_the_agent_like_pi() {
+    // Pi has NO `/theme`, `/think`, or `/show-images` builtin (`BUILTIN_SLASH_COMMANDS`,
+    // slash-commands.ts:18-90) — each is an unknown `/command` that Pi routes to the AGENT as
+    // literal text (interactive-mode.ts onSubmit fallthrough; `isExtensionCommand` returns false).
+    // Theme is reached via `/settings` → Theme submenu (settings-selector.ts:603-610); thinking
+    // level via Shift+Tab (`app.thinking.cycle`, keybindings.ts). These must therefore dispatch as
+    // prompts, never as in-crate commands (regression guard against the reverted 9a703f1 divergence).
+    let reg = CommandRegistry::new();
+    assert_eq!(reg.dispatch("/theme"), Dispatch::Prompt("/theme".to_string()));
+    assert_eq!(reg.dispatch("/think"), Dispatch::Prompt("/think".to_string()));
+    assert_eq!(reg.dispatch("/show-images"), Dispatch::Prompt("/show-images".to_string()));
+    // ...and none of the three appear in the autocomplete surface.
+    for name in ["theme", "think", "show-images"] {
+        assert!(reg.commands().iter().all(|c| c.name != name), "/{name} leaked into autocomplete");
+    }
+}
+
+#[test]
 fn hidden_commands_dispatch_but_are_not_in_autocomplete() {
     let reg = CommandRegistry::new();
     assert_eq!(

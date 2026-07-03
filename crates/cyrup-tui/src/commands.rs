@@ -69,16 +69,6 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
 /// (`interactive-mode.ts:2657-2671`): `/debug` + the two easter eggs.
 pub const HIDDEN_COMMANDS: &[&str] = &["debug", "arminsayshi", "dementedelves"];
 
-/// cyrup dispatch-only affordances that open a dependency-free in-crate selector but are NOT part of
-/// Pi's visible or hidden command surface. Pi reaches these three the same way cyrup ALSO now does —
-/// theme via the `/settings` "Theme" row (`settings-selector.ts:603-610`), thinking level via Shift+Tab
-/// (`app.thinking.cycle`, `keybindings.ts:72`), and show-images via the `/settings` "Show images" row —
-/// so registering them here is a strict SUPERSET of reachability that leaves Pi's own paths intact. They
-/// are dispatch-recognized (so `/theme` opens the theme picker instead of leaking to the agent as chat
-/// text) but deliberately kept OUT of [`BUILTIN_SLASH_COMMANDS`] so the `/`-autocomplete surface stays
-/// byte-for-byte 1:1 with Pi. Each name has a matching arm in `App::run_command`.
-pub const DISPATCH_ONLY_COMMANDS: &[&str] = &["theme", "think", "show-images"];
-
 const fn cmd(
     name: &'static str,
     description: &'static str,
@@ -143,7 +133,6 @@ impl CommandRegistry {
         let mut dispatch_names: Vec<&'static str> =
             BUILTIN_SLASH_COMMANDS.iter().map(|c| c.name).collect();
         dispatch_names.extend_from_slice(HIDDEN_COMMANDS);
-        dispatch_names.extend_from_slice(DISPATCH_ONLY_COMMANDS);
         CommandRegistry { commands: BUILTIN_SLASH_COMMANDS.to_vec(), dispatch_names }
     }
 

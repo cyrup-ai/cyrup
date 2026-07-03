@@ -15,7 +15,7 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{CancelToken, EventStream};
+use cyrup_core::{CancelToken, EventStream, ModelThinkingLevel};
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, InputSource, UserInput};
@@ -119,9 +119,9 @@ pub enum CycleDirection {
     Backward,
 }
 
-/// A slash command whose execution the run loop performs against the session/resources layer (the
-/// in-crate effects — `/hotkeys`, `/debug`, `/changelog`, `/quit`, the 3 dependency-free selectors —
-/// are applied directly in [`App::dispatch_submission`] and never become an `AppCommand`).
+/// A slash command / keybinding whose execution the run loop performs against the session/resources
+/// layer (the in-crate effects — `/hotkeys`, `/debug`, `/changelog`, `/quit` — are applied directly in
+/// [`App::dispatch_submission`] and never become an `AppCommand`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     /// Open a data-bound selector; the run loop sources its rows from session-svc / resources.
@@ -131,6 +131,12 @@ pub enum AppCommand {
     /// the current model, and calls [`AgentSession::set_model`] (Pi `cycleModel`,
     /// interactive-mode.ts:3617-3632).
     CycleModel(CycleDirection),
+    /// Cycle the reasoning level one step (`app.thinking.cycle`, Shift+Tab): the run loop calls
+    /// [`AgentSession::cycle_thinking_level`], which is GATED on model support — a non-reasoning model
+    /// returns `None` (nothing changes) and cycling otherwise walks the model's OWN supported levels
+    /// (incl. `xhigh` where mapped), exactly like Pi's `cycleThinkingLevel` (agent-session.ts:1599 →
+    /// interactive-mode.ts:3606-3614). Rides an `AppCommand` because the gate needs the live model.
+    CycleThinking,
     /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
     /// branch, login/logout, etc.
     ConfirmSelection { kind: SelectorKind, value: String },
@@ -819,26 +825,16 @@ impl<B: Backend> App<B> {
     }
 
     /// Route a recognized slash command (`setupEditorSubmitHandler`, interactive-mode.ts:2554-2734).
-    /// In-crate effects (the 3 dependency-free selectors, info blocks, quit) are applied here directly
-    /// and return [`AppAction::Redraw`]; session/data-bound effects return [`AppAction::Command`] for
-    /// the run loop to execute against the [`AgentSession`].
+    /// In-crate effects (info blocks, quit, easter eggs) are applied here directly and return
+    /// [`AppAction::Redraw`]; session/data-bound effects return [`AppAction::Command`] for the run
+    /// loop to execute against the [`AgentSession`]. Note `/theme`, `/think`, `/show-images` are NOT
+    /// commands — Pi has no such builtins, so they fall through [`CommandRegistry::dispatch`] to
+    /// [`Dispatch::Prompt`] and reach the agent as literal text (theme is reached via `/settings` →
+    /// Theme, thinking via Shift+Tab; see [`Action::ThinkingCycle`]).
     fn run_command(&mut self, name: &str, arg: Option<String>) -> AppAction {
         use AppCommand as C;
         let cmd = |c| AppAction::Command(c);
         match name {
-            // --- in-crate selectors (dependency-free) ---
-            "think" => {
-                self.open_selector(SelectorKind::Thinking);
-                AppAction::Redraw
-            }
-            "theme" => {
-                self.open_selector(SelectorKind::Theme);
-                AppAction::Redraw
-            }
-            "show-images" => {
-                self.open_selector(SelectorKind::ShowImages);
-                AppAction::Redraw
-            }
             // --- data-bound selectors (run loop sources rows) ---
             "model" => cmd(C::OpenSelector(SelectorKind::Model)),
             "settings" => cmd(C::OpenSelector(SelectorKind::Settings)),
@@ -985,14 +981,13 @@ impl<B: Backend> App<B> {
                 self.state.transcript.page_down(PAGE_SCROLL_LINES);
                 AppAction::Redraw
             }
-            // `app.thinking.cycle` (Shift+Tab): advance the reasoning level in place — no picker — and
-            // re-color the editor rule + footer, exactly like Pi's `cycleThinkingLevel`
-            // (interactive-mode.ts:3606-3614). The level is the TUI-owned state the thinking selector's
-            // confirm path also drives, so a Shift+Tab cycle and a `/think`-selector pick stay in sync.
-            Action::ThinkingCycle => {
-                self.cycle_thinking_level();
-                AppAction::Redraw
-            }
+            // `app.thinking.cycle` (Shift+Tab): advance the reasoning level in place — no picker. The
+            // cycle is GATED on the live model supporting thinking and walks the model's OWN supported
+            // levels, so it rides an `AppCommand` the run loop resolves against the session (Pi
+            // `cycleThinkingLevel` calls `session.cycleThinkingLevel()`, interactive-mode.ts:3606-3614;
+            // agent-session.ts:1599). The footer + editor rule re-color off the emitted
+            // `ThinkingLevelChanged` event, exactly as in Pi's event handler (interactive-mode.ts:2804).
+            Action::ThinkingCycle => AppAction::Command(AppCommand::CycleThinking),
             // `app.model.cycleForward` / `cycleBackward` (Ctrl+P / Shift+Ctrl+P): the model swap needs
             // the live catalog + `set_model` at the session layer, so it rides an `AppCommand` the run
             // loop applies (Pi `cycleModel`, interactive-mode.ts:3617-3632).
@@ -1015,23 +1010,6 @@ impl<B: Backend> App<B> {
                 }
             }
         }
-    }
-
-    /// Advance the reasoning level one step through Pi's canonical cycle (`THINKING_LEVELS`,
-    /// agent-session.ts:262: `off→minimal→low→medium→high`, wrapping), updating the footer band and the
-    /// editor's always-visible rule color (spec/tui/03 §3.3) — the in-place body of `app.thinking.cycle`
-    /// (`cycleThinkingLevel`, interactive-mode.ts:3606-3614). A current level outside the cycle set
-    /// (e.g. `xhigh`, reachable only via the `/think` selector) restarts at `off`, matching Pi's
-    /// `indexOf(...)` = -1 → `(-1 + 1) % len` = 0 wrap.
-    fn cycle_thinking_level(&mut self) {
-        const THINKING_LEVELS: [&str; 5] = ["off", "minimal", "low", "medium", "high"];
-        let pos = THINKING_LEVELS.iter().position(|l| *l == self.state.thinking_level);
-        let next = pos.map_or(0, |i| (i + 1) % THINKING_LEVELS.len());
-        let level = THINKING_LEVELS.get(next).copied().unwrap_or("off");
-        self.state.thinking_level = level.to_string();
-        self.state.status.set_thinking_level(level);
-        self.state.editor.set_thinking_level(level);
-        self.state.transcript.push_status(format!("Thinking level: {level}"));
     }
 
     /// Route one key to the topmost floating overlay (spec/tui/05 §2 step 2). `Close` pops it; any
@@ -1774,6 +1752,33 @@ impl<B: Backend> App<B> {
                     }
                 }
             }
+            C::CycleThinking => {
+                // Pi `cycleThinkingLevel` (interactive-mode.ts:3606-3614): call the session's cycle,
+                // which is gated on `supportsThinking()` (agent-session.ts:1599-1608) and walks the
+                // model's OWN supported levels (`getSupportedThinkingLevels`, incl. `xhigh` where
+                // mapped). `Ok(None)` ⇒ the model does not reason: show the exact Pi status and change
+                // NOTHING. `Ok(Some(level))` ⇒ `set_thinking_level` already emitted
+                // `ThinkingLevelChanged`, so the footer + editor rule re-color off that event
+                // (mirroring Pi's `footer.invalidate()` + `updateEditorBorderColor()`); here we only
+                // surface Pi's `Thinking level: {level}` status line.
+                match session.cycle_thinking_level().await {
+                    Ok(None) => {
+                        self.state.transcript.push_status("Current model does not support thinking");
+                    }
+                    Ok(Some(level)) => {
+                        let label = match level {
+                            ModelThinkingLevel::Off => "off",
+                            ModelThinkingLevel::Minimal => "minimal",
+                            ModelThinkingLevel::Low => "low",
+                            ModelThinkingLevel::Medium => "medium",
+                            ModelThinkingLevel::High => "high",
+                            ModelThinkingLevel::Xhigh => "xhigh",
+                        };
+                        self.state.transcript.push_status(format!("Thinking level: {label}"));
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("thinking error: {e}")),
+                }
+            }
             C::ConfirmSelection { kind: SelectorKind::ScopedModels, value } => {
                 // The checkbox selector confirms with the ordered enabled ids (`\n`-joined), or the
                 // `SCOPED_MODELS_ALL` sentinel for "all enabled". Rebuild the scoped set from the
@@ -2218,11 +2223,15 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("model → {label}"));
             }
             AgentSessionEvent::ThinkingLevelChanged { level } => {
-                // Mirror the level into the footer right cluster (`• {level}`, footer.ts:186-188)
-                // and the editor's rule color (spec/tui/03 §3.3).
+                // Pi's `thinking_level_changed` handler (interactive-mode.ts:2804-2807) only
+                // `footer.invalidate()` + `updateEditorBorderColor()` — NO status line (the acting
+                // command, e.g. Shift+Tab's `C::CycleThinking`, owns the status). Mirror the level into
+                // the footer right cluster (`• {level}`, footer.ts:186-188), the editor's rule color
+                // (spec/tui/03 §3.3), and the TUI's cached level so `/debug` reflects the authoritative
+                // session state.
+                self.state.thinking_level = level.clone();
                 self.state.status.set_thinking_level(level.clone());
-                self.state.editor.set_thinking_level(level.clone());
-                self.state.transcript.push_status(format!("thinking → {level}"));
+                self.state.editor.set_thinking_level(level);
             }
             AgentSessionEvent::SessionInfoChanged { name } => {
                 // Pi `interactive-mode.ts:2784` mirrors the renamed session into the header/status.
