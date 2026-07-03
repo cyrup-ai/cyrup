@@ -88,6 +88,11 @@ fn push_registrations(api: &ExtensionApi) {
     for _ in 0..api.autocomplete_provider_count() {
         registration::add_autocomplete_provider();
     }
+    // Declare each inter-extension bus topic this guest listens on (Pi `pi.events.on`,
+    // event-bus.ts:18) so the host fans a matching `bus.emit` out to our `bus-deliver` export.
+    for topic in api.bus_topics() {
+        bindings::cyrup::ext::bus::subscribe(&topic);
+    }
 }
 
 /// Run the registered handler for `kind` with ordered string args; returns the lowered outcome.
@@ -254,6 +259,19 @@ pub fn provider_stream_simple(
 /// calls this after re-binding the session that a `control.*` op replaced.
 pub fn with_session(callback_id: String) -> Result<(), String> {
     crate::ctx::run_with_session(&callback_id)
+}
+
+/// `bus-deliver` export body (Pi EventEmitter listener invocation, event-bus.ts:18-27): run every
+/// subscription handler this guest registered for `topic` against the emitted payload. Notify-style
+/// (return ignored); an unmatched topic is a no-op.
+pub fn bus_deliver(topic: String, payload_json: String) {
+    let payload = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+    let ctx = crate::ctx::Ctx::new();
+    API.with(|c| {
+        if let Some(api) = c.borrow().as_ref() {
+            api.dispatch_bus(&topic, payload, &ctx);
+        }
+    });
 }
 
 /// `autocomplete-suggest` export body (Pi the `AutocompleteProviderFactory` chain): fold the stacked

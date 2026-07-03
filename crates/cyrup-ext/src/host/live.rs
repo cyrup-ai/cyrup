@@ -614,6 +614,14 @@ impl bindings::cyrup::ext::bus::Host for HostState {
             guest.bus_emit(topic, v);
         }
     }
+    async fn subscribe(&mut self, topic: String) {
+        // Declare this guest as a listener on `topic` in the SHARED bus (Pi `pi.events.on`,
+        // event-bus.ts:18). The host later fans a matching `emit` from any guest out to this guest's
+        // `bus-deliver` export (gap-08 §5.3).
+        if let Ok(guest) = guest_of(self) {
+            guest.bus_subscribe(topic);
+        }
+    }
 }
 
 impl bindings::cyrup::ext::host_tool::Host for HostState {
@@ -1017,6 +1025,33 @@ impl LiveExtension {
             }
         }
         Ok(out)
+    }
+
+    /// Deliver an inter-extension bus event to this guest's `bus-deliver` export (Pi EventEmitter
+    /// listener invocation, event-bus.ts:18-27; gap-08 §5.3). A FRESH top-level notify-style call —
+    /// the host invokes it after the emitting guest call unwinds, so it is never re-entrant. Runs at
+    /// EVENT tier (a bus listener is not a command-tier session-control handler; Pi hands it only the
+    /// data). A guest fault is contained as a typed `ExtError` (the caller reports + skips it).
+    pub async fn bus_deliver(
+        &self,
+        topic: &str,
+        payload: &Value,
+        cancel: &CancelToken,
+    ) -> Result<(), ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let payload_s = payload.to_string();
+        let api = inner.instance.cyrup_ext_events();
+        let call = api.call_bus_deliver(&mut inner.store, topic, &payload_s);
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ExtError::Cancelled),
+            r = call => r,
+        };
+        res.map_err(|e| map_wasm_error(&e))
     }
 
     /// Execute a guest-registered keyboard shortcut (R-08-017; Pi `registerShortcut` handler,

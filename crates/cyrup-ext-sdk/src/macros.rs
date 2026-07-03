@@ -311,6 +311,14 @@ macro_rules! export_extension {
                 fn on_session_tree(tree_json: ::std::string::String) {
                     $crate::guest::notify(29, &[&tree_json]);
                 }
+
+                // --- inter-extension event bus delivery (gap-08 §5.3) ---
+                fn bus_deliver(
+                    topic: ::std::string::String,
+                    payload_json: ::std::string::String,
+                ) {
+                    $crate::guest::bus_deliver(topic, payload_json)
+                }
             }
 
             bindings::export!(__CyrupExtComponent with_types_in bindings);

@@ -216,6 +216,12 @@ interface events {
   // summary/customInstructions/label override via `mutate` (Pi SessionBeforeTreeResult).
   on-session-before-tree:    func(preparation-json: string) -> hook-outcome;
   on-session-tree:           func(tree-json: string);
+
+  // --- inter-extension event bus delivery (Pi `pi.events.on` listener, event-bus.ts:18-27) ---
+  // The host invokes this on a guest that declared a `bus.subscribe(topic)` when ANY loaded guest
+  // (this one included) `bus.emit`s that topic. `payload-json` is the emitted payload. Notify-style
+  // (return ignored) — the receiving half of the bus that closes gap-08 §5.3.
+  bus-deliver:               func(topic: string, payload-json: string);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,8 +415,15 @@ interface ext-fs {
 }
 
 interface bus {
-  // inter-extension event bus (R-08-029): emit a topic the host fans out to subscribers.
-  emit: func(topic: string, payload-json: string);
+  // inter-extension event bus (R-08-029; Pi `createEventBus()`, event-bus.ts:12-32). A guest
+  // `emit`s a topic; the host fans it out to every guest that `subscribe`d that topic (its
+  // `events.bus-deliver` export is invoked with the payload — the receive side that makes this a
+  // real pub/sub, not an emit-into-a-void). `emit` enqueues; the host drains + delivers after the
+  // emitting guest call unwinds (Pi's EventEmitter `emit` likewise returns without awaiting its
+  // async listeners; wasm single-instance reentrancy forbids re-entering the emitter synchronously).
+  emit:      func(topic: string, payload-json: string);
+  // Declare that this guest listens on `topic` (Pi `pi.events.on(channel, handler)`, event-bus.ts:18).
+  subscribe: func(topic: string);
 }
 
 // streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:467).

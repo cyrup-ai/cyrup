@@ -24,6 +24,6 @@ pub use live::{LiveExtension, WasmTool};
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
     HostServices, HttpRequest, HttpResponse, HttpStreamResponse, NotifyKind, OAuthEvent,
-    ProcSpawnSpec, RecordingServices, UiChrome,
+    ProcSpawnSpec, RecordingServices, SharedBus, UiChrome,
 };
 pub use store_state::HostState;

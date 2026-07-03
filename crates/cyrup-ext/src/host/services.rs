@@ -9,7 +9,7 @@ use crate::native::CtxTier;
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -764,6 +764,69 @@ impl FsCaps {
     }
 }
 
+/// The host-owned inter-extension event bus (Pi `createEventBus()`, event-bus.ts:12-32): ONE shared
+/// instance per [`crate::ExtensionHost`], threaded into EVERY loaded guest's [`GuestState`] — NOT a
+/// per-guest object (the exact defect gap-08 §5.3 named: `bus.emit` used to land in a private
+/// per-guest `Vec` no other guest could read). A guest `bus.subscribe(topic)` records `(owner,
+/// topic)` here; a guest `bus.emit(topic, payload)` enqueues into `pending`. The host drains
+/// `pending` after the emitting guest call unwinds and invokes each subscribed guest's `bus-deliver`
+/// export ([`crate::ExtensionHost::deliver_bus_events`]). Deferred delivery mirrors Pi's EventEmitter
+/// (`emit` returns without awaiting its async listeners) and is REQUIRED: wasm single-instance
+/// reentrancy forbids re-entering the emitting guest synchronously inside its own `bus.emit` import.
+#[derive(Default)]
+pub struct SharedBus {
+    /// `(owner, topic)` subscriptions in registration/load order (Pi's per-channel listener list).
+    subs: Mutex<Vec<(ExtensionId, String)>>,
+    /// Emitted `(topic, payload)` awaiting fan-out, FIFO (Pi emits in call order).
+    pending: Mutex<VecDeque<(String, Value)>>,
+}
+
+impl SharedBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `owner` listens on `topic` (Pi `pi.events.on`, event-bus.ts:18). Idempotent per
+    /// `(owner, topic)` pair so a re-declared subscription does not duplicate delivery.
+    pub fn subscribe(&self, owner: ExtensionId, topic: String) {
+        if let Ok(mut g) = self.subs.lock()
+            && !g.iter().any(|(o, t)| *o == owner && *t == topic)
+        {
+            g.push((owner, topic));
+        }
+    }
+
+    /// Enqueue an emitted event for deferred fan-out (Pi `emitter.emit`, event-bus.ts:15).
+    pub fn emit(&self, topic: String, payload: Value) {
+        if let Ok(mut g) = self.pending.lock() {
+            g.push_back((topic, payload));
+        }
+    }
+
+    /// Drain every queued event (the host delivers them, then re-checks for cascaded emits).
+    pub fn take_pending(&self) -> Vec<(String, Value)> {
+        self.pending.lock().map(|mut g| g.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// The extension ids subscribed to `topic`, in subscription order (Pi listener order).
+    pub fn subscribers_for(&self, topic: &str) -> Vec<ExtensionId> {
+        self.subs
+            .lock()
+            .map(|g| g.iter().filter(|(_, t)| t == topic).map(|(o, _)| o.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop all subscriptions + queued events (hot-reload, R-08-005): the fresh load re-declares them.
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.subs.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pending.lock() {
+            g.clear();
+        }
+    }
+}
+
 /// Host-side state backing one loaded WASM extension's imports (arch-08 §3.5/§3.6). Shared (via
 /// `Arc`) between the extension's `Store<HostState>` (so the import Host impls reach it) and the
 /// [`crate::host::WasmExtension`] handle (so the loader reads back what `init` registered).
@@ -794,8 +857,16 @@ pub struct GuestState {
     widgets: Mutex<Vec<Value>>,
     /// Extended UI chrome effects (header/footer/title/editor/theme/working/tools-expanded).
     chrome: Mutex<UiChrome>,
-    /// `bus.emit` topics + payloads (R-08-029).
+    /// `bus.emit` topics + payloads this guest emitted (R-08-029). A per-guest observability log kept
+    /// for tests/diagnostics; the ACTUAL cross-extension fan-out goes through the shared [`Self::bus`]
+    /// (gap-08 §5.3) — this log is no longer the delivery mechanism, only a record of what THIS guest
+    /// sent.
     bus_emits: Mutex<Vec<(String, Value)>>,
+    /// The host-owned inter-extension event bus (Pi's single `createEventBus()` instance,
+    /// event-bus.ts:12-32). Shared across every loaded guest by [`crate::ExtensionHost`]; a standalone
+    /// [`GuestState`] (unit tests) gets a fresh isolated bus. `bus.subscribe`/`bus.emit` route here so
+    /// a published event reaches OTHER guests' subscribed handlers (gap-08 §5.3).
+    bus: Arc<SharedBus>,
     /// `host-tool.emit-update` chunks emitted during a guest tool's `execute` (call_id, chunk).
     /// Drained to the runtime `ToolUpdateSink` after the execute call settles (Pi `onUpdate`).
     tool_updates: Mutex<Vec<(String, Value)>>,
@@ -899,6 +970,7 @@ impl GuestState {
             widgets: Mutex::new(Vec::new()),
             chrome: Mutex::new(UiChrome::default()),
             bus_emits: Mutex::new(Vec::new()),
+            bus: Arc::new(SharedBus::new()),
             tool_updates: Mutex::new(Vec::new()),
             autocomplete_providers: Mutex::new(0),
             oauth_events: Mutex::new(Vec::new()),
@@ -916,6 +988,24 @@ impl GuestState {
     pub fn with_fs(mut self, root: PathBuf) -> Self {
         self.fs = FsCaps { root: Some(root) };
         self
+    }
+
+    /// Wire this guest onto the host-owned shared bus (Pi's single `createEventBus()` threaded to
+    /// every extension, loader.ts:492,499). Called by [`crate::ExtensionHost::load_wasm`] before
+    /// `init` so the guest's `bus.subscribe` declarations land in the SHARED bus (gap-08 §5.3).
+    pub fn with_bus(mut self, bus: Arc<SharedBus>) -> Self {
+        self.bus = bus;
+        self
+    }
+
+    /// The shared bus this guest is wired to (host uses it to find subscribers + drain emits).
+    pub fn bus(&self) -> &Arc<SharedBus> {
+        &self.bus
+    }
+
+    /// Record a `bus.subscribe(topic)` declaration into the shared bus (Pi `pi.events.on`).
+    pub fn bus_subscribe(&self, topic: String) {
+        self.bus.subscribe(self.owner.clone(), topic);
     }
 
     /// Set the dispatch tier (the loader sets `Event` before dispatching an event handler, keeps
@@ -973,7 +1063,20 @@ impl GuestState {
     /// only gets an entry when `options.default !== undefined`, loader.ts:259).
     pub fn get_flag(&self, name: &str) -> Option<String> {
         let g = self.flags.lock().ok()?;
+        // Pi's gate (`getFlag`, loader.ts:282): return `undefined` unless THIS extension registered
+        // the flag. The per-guest `flags` map IS that `extension.flags.has(name)` check.
         let spec = g.get(name)?;
+        // Pi `runtime.flagValues.get(name)` (loader.ts:283): a CLI-supplied override (applied by
+        // `applyExtensionFlagValues` into the SHARED store) wins over the registered default — this
+        // is the step that was missing, so `getFlag` used to only ever see the static default
+        // (gap-08 §5.6). `flag_values` is keyed by flag name and shared across guests, matching Pi's
+        // single `runtime.flagValues` map.
+        if let Ok(Some(override_value)) = self.registry.flag_value(name) {
+            if override_value.is_null() {
+                return None;
+            }
+            return Some(override_value.to_string());
+        }
         // A bare (non-object) stored value is itself the resolved value (defensive).
         let value = match spec.as_object() {
             Some(_) => spec.get("default")?,
@@ -1087,9 +1190,14 @@ impl GuestState {
     }
 
     pub fn bus_emit(&self, topic: String, payload: Value) {
+        // Per-guest observability log (tests/diagnostics) — a record of what THIS guest sent.
         if let Ok(mut g) = self.bus_emits.lock() {
-            g.push((topic, payload));
+            g.push((topic.clone(), payload.clone()));
         }
+        // The real cross-extension fan-out: enqueue on the SHARED bus so the host can deliver this to
+        // every OTHER guest that subscribed the topic (gap-08 §5.3). Previously this method ONLY wrote
+        // the private log above, so a published event reached nothing — the dead-but-advertised defect.
+        self.bus.emit(topic, payload);
     }
 
     pub fn bus_emits(&self) -> Vec<(String, Value)> {

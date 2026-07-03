@@ -107,6 +107,12 @@ struct RegistryInner {
     command_order: Vec<(ExtensionId, String, CommandDescriptor)>,
     shortcuts: HashMap<String, ExtensionId>,
     flags: HashMap<String, Value>,
+    /// CLI-supplied flag VALUE overrides (Pi `runtime.flagValues` entries set by
+    /// `applyExtensionFlagValues`, agent-session-services.ts:102-114). ONE shared map keyed by flag
+    /// name (Pi's single `runtime.flagValues`), consulted by `GuestState::get_flag` AHEAD of the
+    /// registered default so a `--flag=value` the CLI captured is what a guest's `getFlag` reads
+    /// (gap-08 §5.6). Empty until [`crate::ExtensionHost::apply_extension_flag_values`] runs.
+    flag_values: HashMap<String, Value>,
     /// Custom-provider registrations: typed, api-key-resolved, deferred→bind→flush (A-08-7).
     provider_hub: ProviderHub,
     /// Which extension owns each provider id (for diagnostics / unload).
@@ -354,6 +360,21 @@ impl ExtensionRegistry {
 
     pub fn get_flag(&self, name: &str) -> Result<Option<Value>, ExtError> {
         Ok(self.lock_read()?.flags.get(name).cloned())
+    }
+
+    /// Record a CLI-supplied flag override value (Pi `runtime.flagValues.set(name, value)`,
+    /// runner.ts:454-456 / agent-session-services.ts:109,113). Shared across guests; read back by
+    /// [`crate::host::GuestState::get_flag`] ahead of the registered default (gap-08 §5.6).
+    pub fn set_flag_value(&self, name: impl Into<String>, value: Value) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.flag_values.insert(name.into(), value);
+        Ok(())
+    }
+
+    /// The CLI override value for `name`, if one was applied (Pi `runtime.flagValues.get(name)` for a
+    /// CLI-set entry). `None` = no override; the guest's registered default applies instead.
+    pub fn flag_value(&self, name: &str) -> Result<Option<Value>, ExtError> {
+        Ok(self.lock_read()?.flag_values.get(name).cloned())
     }
 
     /// All extension tools in registration order (overrides resolved).

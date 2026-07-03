@@ -52,8 +52,8 @@ pub use error::ExtError;
 pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
 pub use facade::{
-    BeforeAgentStartReduction, CompactionReduction, ExtensionHost, HostConfig, InputReduction,
-    TreeReduction, UserBashReduction,
+    BeforeAgentStartReduction, CompactionReduction, ExtensionFlagOverride, ExtensionHost,
+    HostConfig, InputReduction, TreeReduction, UserBashReduction,
 };
 pub use build::build_component;
 pub use hooks::ExtHooks;
@@ -76,8 +76,8 @@ pub use subscriber::ExtSubscriber;
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, InstancePool,
-    LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome,
-    WasmExtension, WasmTool,
+    LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec, RecordingServices, SharedBus, StoreLimits,
+    UiChrome, WasmExtension, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

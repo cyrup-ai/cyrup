@@ -297,7 +297,17 @@ pub struct ExtensionApi {
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
     pub(crate) autocomplete_providers: Vec<Box<dyn AutocompleteProvider>>,
+    /// Inter-extension event-bus subscriptions (Pi `pi.events.on(channel, handler)`,
+    /// event-bus.ts:18; gap-08 §5.3). Each is a `(topic, handler)`; the topic is declared to the
+    /// host via the `bus.subscribe` import so a matching `bus.emit` from ANY extension is fanned out
+    /// to this guest's `bus-deliver` export, which routes to [`Self::dispatch_bus`].
+    pub(crate) bus_subscriptions: Vec<(String, BusHandler)>,
 }
+
+/// A bus subscription handler: receives the emitted topic + its JSON payload + a [`Ctx`] (Pi
+/// `handler(data)`, event-bus.ts:18). The topic is passed too so one handler can serve several
+/// closely-related channels if the author registers it under each.
+type BusHandler = Box<dyn Fn(&str, Value, &Ctx) + 'static>;
 
 /// Read an ordered arg without panicking on a short slice (clippy no-indexing).
 fn arg<'a>(args: &'a [&'a str], i: usize) -> &'a str {
@@ -467,6 +477,15 @@ impl ExtensionApi {
     /// ("current") provider's suggestions and may augment or replace them.
     pub fn add_autocomplete_provider(&mut self, provider: impl AutocompleteProvider) {
         self.autocomplete_providers.push(Box::new(provider));
+    }
+
+    /// Subscribe to an inter-extension event-bus topic (Pi `pi.events.on(channel, handler)`,
+    /// event-bus.ts:18; gap-08 §5.3). The `handler` runs whenever ANY loaded extension — this one
+    /// included, matching Pi's EventEmitter — emits `topic` via [`Ctx::emit`]; it receives the topic
+    /// and the emitted JSON payload. The topic is declared to the host (the `bus.subscribe` import)
+    /// so the host knows to fan a matching emit out to this guest's `bus-deliver` export.
+    pub fn on_bus(&mut self, topic: impl Into<String>, handler: impl Fn(&str, Value, &Ctx) + 'static) {
+        self.bus_subscriptions.push((topic.into(), Box::new(handler)));
     }
 
     // --- the 30 event subscriptions (Pi `pi.on`, types.ts:1133-1171) ---
@@ -807,6 +826,29 @@ impl ExtensionApi {
         let mut v: Vec<u8> = self.handlers.keys().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// The DISTINCT inter-extension bus topics this extension subscribed to, for the host
+    /// `bus.subscribe` import (gap-08 §5.3). Order-preserving, deduplicated.
+    pub fn bus_topics(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for (t, _) in &self.bus_subscriptions {
+            if !v.iter().any(|x| x == t) {
+                v.push(t.clone());
+            }
+        }
+        v
+    }
+
+    /// Deliver a bus event to every matching subscription handler (Pi EventEmitter fan-out to all
+    /// listeners registered on the channel, event-bus.ts). Called by the `bus-deliver` export when
+    /// the host routes an emit from any extension to this guest.
+    pub fn dispatch_bus(&self, topic: &str, payload: Value, ctx: &Ctx) {
+        for (t, h) in &self.bus_subscriptions {
+            if t == topic {
+                h(topic, payload.clone(), ctx);
+            }
+        }
     }
 
     pub fn tools(&self) -> &[RegisteredTool] {

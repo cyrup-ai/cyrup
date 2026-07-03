@@ -83,6 +83,16 @@ pub enum TreeReduction {
     Override(Value),
 }
 
+/// A captured CLI extension-flag value (Pi `unknownFlags` map entry, args.ts:52-53). `Bool(true)` is
+/// a bare `--flag`; `Str` is `--flag=value`. Mirrors the bin/session-svc `ExtensionFlagValue` so
+/// [`ExtensionHost::apply_extension_flag_values`] can apply Pi's `applyExtensionFlagValues` type
+/// rules (agent-session-services.ts:102-114) without depending on the downstream crates' own type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionFlagOverride {
+    Bool(bool),
+    Str(String),
+}
+
 /// Configuration for the host (mode + cwd + UI availability drive the dispatch `HostCtx`).
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -116,6 +126,11 @@ pub struct ExtensionHost {
     /// Loaded live wasm instances keyed by id — the slash-command/reload routing table (R-08-016/005).
     #[cfg(feature = "wasm-host")]
     live: RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>,
+    /// The single host-owned inter-extension event bus (Pi's one `createEventBus()` threaded to every
+    /// extension, event-bus.ts:12-32 / loader.ts:492,499). Shared into every loaded guest so a
+    /// `bus.emit` from one reaches another's subscribed `bus-deliver` handler (gap-08 §5.3).
+    #[cfg(feature = "wasm-host")]
+    bus: Arc<crate::host::SharedBus>,
 }
 
 impl Default for ExtensionHost {
@@ -138,6 +153,8 @@ impl ExtensionHost {
             wasm: None,
             #[cfg(feature = "wasm-host")]
             live: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm-host")]
+            bus: Arc::new(crate::host::SharedBus::new()),
         }
     }
 
@@ -453,6 +470,76 @@ impl ExtensionHost {
         &self.dispatcher
     }
 
+    /// Apply CLI-captured extension-flag overrides (Pi `applyExtensionFlagValues`,
+    /// agent-session-services.ts:84-113). Called AFTER extensions load (so their `registerFlag`
+    /// specs are known). For each captured `(name, value)`:
+    /// - no loaded extension registered `name` ⇒ ignored (Pi records an "Unknown option" diagnostic
+    ///   and skips — cyrup drops it silently, the same no-effect outcome);
+    /// - the registered flag's `type` is `boolean` ⇒ the stored value is `true` regardless of the
+    ///   token's value (Pi agent-session-services.ts:109);
+    /// - the registered flag's `type` is `string` and the token carried a value ⇒ that string (Pi
+    ///   :113); a bare `--flag` on a string flag is skipped (Pi's "requires a value" diagnostic).
+    ///
+    /// The resolved value lands in the shared flag store so a guest's `getFlag(name)` reads the CLI
+    /// value AHEAD of its registered default (gap-08 §5.6 — the step that was missing, so the
+    /// 1:1-ported CLI capture used to be dropped one call short of `getFlag`).
+    pub fn apply_extension_flag_values(
+        &self,
+        flags: &[(String, ExtensionFlagOverride)],
+    ) -> Result<(), ExtError> {
+        for (name, value) in flags {
+            let spec = match self.registry.get_flag(name)? {
+                Some(s) => s,
+                // Unregistered flag: no extension owns it — ignored (Pi unknownFlags diagnostic).
+                None => continue,
+            };
+            let is_boolean = spec.get("type").and_then(|t| t.as_str()) == Some("boolean");
+            let resolved = match (is_boolean, value) {
+                (true, _) => Value::Bool(true),
+                (false, ExtensionFlagOverride::Str(s)) => Value::String(s.clone()),
+                // A string-typed flag passed with no value: Pi emits "requires a value" and does not
+                // set it — skip so the registered default stands.
+                (false, ExtensionFlagOverride::Bool(_)) => continue,
+            };
+            self.registry.set_flag_value(name.clone(), resolved)?;
+        }
+        Ok(())
+    }
+
+    /// Fan out every queued inter-extension bus event to its subscribers (gap-08 §5.3). Drains the
+    /// shared bus (Pi's `createEventBus()` fan-out) and invokes each subscribed guest's `bus-deliver`
+    /// export. Loops so a handler that emits during delivery is itself delivered (bounded to guard a
+    /// pathological emit cycle — never hangs). A faulting delivery is contained + skipped (R-08-036),
+    /// never crashing the host. Called at the tail of a guest call that may have emitted (e.g.
+    /// [`Self::run_command`]); also public so other guest-call seams can drain after their dispatch.
+    #[cfg(feature = "wasm-host")]
+    pub async fn deliver_bus_events(&self, cancel: &CancelToken) {
+        // Bound on delivery rounds: each round drains the whole queue, then re-checks for events a
+        // just-delivered handler emitted. A cycle (A→B→A→…) stops after the bound rather than hanging.
+        const MAX_ROUNDS: usize = 64;
+        for _ in 0..MAX_ROUNDS {
+            let batch = self.bus.take_pending();
+            if batch.is_empty() {
+                return;
+            }
+            for (topic, payload) in batch {
+                for id in self.bus.subscribers_for(&topic) {
+                    let ext = self.live.read().ok().and_then(|g| g.get(&id).cloned());
+                    // Contained (R-08-036): a faulting listener is logged + skipped; the rest of the
+                    // fan-out proceeds and the host never crashes.
+                    if let Some(ext) = ext
+                        && let Err(e) = ext.bus_deliver(&topic, &payload, cancel).await
+                    {
+                        tracing::warn!(
+                            extension = %id, topic = %topic, error = %e,
+                            "inter-extension bus delivery contained (skipped)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Register a listener for contained extension faults (Pi `onError`, R-08-036). The listener
     /// receives a typed [`crate::ExtensionError`] (`{extension, event, error}`) each time a guest
     /// handler fault is contained and skipped.
@@ -494,11 +581,13 @@ impl ExtensionHost {
     ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
         let wasm = self.wasm.as_ref().ok_or(ExtError::WasmHostDisabled)?;
         self.reserve_id(&id)?;
-        let guest = Arc::new(crate::host::GuestState::with_services(
-            id.clone(),
-            self.registry.clone(),
-            services,
-        ));
+        let guest = Arc::new(
+            crate::host::GuestState::with_services(id.clone(), self.registry.clone(), services)
+                // Wire the guest onto the HOST-OWNED shared bus (not a fresh per-guest one) so its
+                // `bus.subscribe`/`bus.emit` reach other guests (Pi's single shared EventBus,
+                // gap-08 §5.3).
+                .with_bus(self.bus.clone()),
+        );
         let ext = crate::host::LiveExtension::load(
             wasm.engine(),
             id.clone(),
@@ -581,7 +670,13 @@ impl ExtensionHost {
         cancel: &CancelToken,
     ) -> Result<Option<String>, ExtError> {
         let ext = self.live_for_command(name)?;
-        ext.execute_command(name, args, cancel).await
+        let out = ext.execute_command(name, args, cancel).await;
+        // Fan out any inter-extension bus events this command emitted (Pi's EventEmitter dispatch
+        // runs the listeners after the emit call, event-bus.ts; gap-08 §5.3) — deferred to here
+        // because wasm reentrancy forbids delivering inside the guest's `bus.emit` import. Delivery
+        // runs even if the command errored (an emit before the error still fires, Pi-faithfully).
+        self.deliver_bus_events(cancel).await;
+        out
     }
 
     /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions`).
@@ -632,7 +727,10 @@ impl ExtensionHost {
             .ok()
             .and_then(|g| g.get(&owner).cloned())
             .ok_or_else(|| ExtError::Component(format!("shortcut `{key}` has no live owner")))?;
-        ext.execute_shortcut(key, cancel).await
+        let out = ext.execute_shortcut(key, cancel).await;
+        // Fan out any inter-extension bus events the shortcut handler emitted (gap-08 §5.3).
+        self.deliver_bus_events(cancel).await;
+        out
     }
 
     /// Native-host fallback for [`ExtensionHost::run_shortcut`] (no `wasm-host` feature): no live
@@ -662,6 +760,9 @@ impl ExtensionHost {
         // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
         self.dispatcher.clear()?;
         self.registry.clear()?;
+        // Drop stale bus subscriptions + any undelivered queued events; the fresh load re-declares
+        // its subscriptions during `init` (gap-08 §5.3).
+        self.bus.clear();
         if let Ok(mut g) = self.native.write() {
             g.clear();
         }
