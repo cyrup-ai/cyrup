@@ -252,7 +252,14 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     async fn custom(&mut self, spec_json: String) -> Option<String> {
         let guest = guest_of(self).ok()?;
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
-        guest.services.custom(&spec)
+        // Same epoch-budget forgiveness its siblings (`confirm`/`input`/`select`/`editor` above)
+        // carry: a custom overlay is just as human-paced a wait once a real `HostServices` backend
+        // wires it to a live UI (Pi `custom()`), so the wall-clock block must be recorded here too,
+        // not only for the four dialog kinds that happened to land first.
+        let started = std::time::Instant::now();
+        let result = guest.services.custom(&spec);
+        guest.note_dialog_wait(started);
+        result
     }
     async fn get_editor_text(&mut self) -> String {
         guest_of(self).map(|g| g.services.editor_text()).unwrap_or_default()
@@ -1702,6 +1709,31 @@ mod tests {
             "proc.spawn must record a dialog wait so the epoch trap forgives the call's real \
              wall-clock duration — without it, a slow npx/npm cold-cache resolution would trap the \
              instance the instant the guest resumes execution right after this call returns"
+        );
+    }
+
+    /// The `ui::Host::custom` WIT handler must record `note_dialog_wait` around
+    /// `HostServices::custom` — the SAME epoch-forgiveness bookkeeping its siblings `confirm`/
+    /// `input`/`select`/`editor` (this file, `ui::Host` impl above) already carry. A custom overlay
+    /// is exactly as human-paced a wait once a real backend answers it (Pi `custom()`); before this
+    /// fix `custom` never called `note_dialog_wait` at all, so this assertion would have failed —
+    /// same proof shape as `spawn_records_a_dialog_wait_for_epoch_forgiveness` above.
+    #[tokio::test]
+    async fn custom_records_a_dialog_wait_for_epoch_forgiveness() {
+        use bindings::cyrup::ext::ui::Host as UiHost;
+
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec);
+        let guest = guest_of(&state).expect("guest state present").clone();
+        guest.arm_epoch_deadline_estimate(20); // a 20-tick (100ms) per-dispatch budget, as elsewhere
+
+        UiHost::custom(&mut state, "{}".into()).await;
+
+        assert!(
+            guest.take_dialog_extra_ticks() > 0,
+            "ui.custom must record a dialog wait so the epoch trap forgives the call's real \
+             wall-clock duration — without it, a slow custom-overlay answer would trap the instance \
+             the instant the guest resumes execution right after this call returns"
         );
     }
 }
