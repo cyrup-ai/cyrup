@@ -1136,6 +1136,34 @@ async fn bash_missing_shell_path_still_emits_initial_empty_update_first() {
     assert!(seen[0].details.is_none());
 }
 
+// L4 round-17 finding #2a: Pi's abort check (`if (signal?.aborted) throw new Error("aborted")`,
+// bash.ts:86-88) sits strictly BETWEEN `resolveTimeoutMs` and `getShellConfig` (bash.ts:85,89), so
+// an ALREADY-cancelled run must surface "Command aborted" even when the configured `shellPath` is
+// also invalid — `getShellConfig` (and its `Custom shell path not found` error) is never reached at
+// all once the abort check has already thrown. This is the inverse of
+// `bash_missing_shell_path_errors` above (same invalid `shellPath`, but a live, non-cancelled
+// token) — proving the abort check genuinely runs BEFORE shell resolution, not after.
+#[tokio::test]
+async fn bash_pre_cancelled_reports_aborted_even_with_an_invalid_shell_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(
+        dir.path().to_path_buf(),
+        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+    );
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = bash
+        .execute(cid(), serde_json::json!({ "command": "echo hi" }), cancel, noop_sink())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("aborted"), "got: {msg}");
+    assert!(
+        !msg.contains("Custom shell path not found"),
+        "the abort check must short-circuit before shellPath is ever resolved, got: {msg}"
+    );
+}
+
 // gap #13 — read offset bound is `allLines.length` (the trailing-newline phantom line counts),
 // and the out-of-bounds error reads `(N lines total)` (read.ts:268-275).
 #[tokio::test]

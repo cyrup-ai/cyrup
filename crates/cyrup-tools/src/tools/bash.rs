@@ -120,11 +120,27 @@ impl Tool for BashTool {
         // (bash.ts:417) with no status appended — mirror that by returning the raw error here.
         let timeout = resolve_timeout_ms(input.timeout)?;
 
+        // Pi's abort check (`if (signal?.aborted) throw new Error("aborted")`, bash.ts:86-88) sits
+        // HERE — strictly between `resolveTimeoutMs` and `getShellConfig` (bash.ts:85,89) — so an
+        // already-cancelled run always surfaces "Command aborted" and NEVER reaches `getShellConfig`
+        // at all. `ShellConfig::resolve` below can itself throw (`Custom shell path not found`); that
+        // error must not preempt an already-cancelled run's "Command aborted", exactly like Pi (the
+        // outer catch's `err.message === "aborted"` branch, bash.ts:410-411, wins over its verbatim
+        // `throw err` fallback, bash.ts:417, only because the abort check runs first and short-
+        // circuits before `getShellConfig` is ever reached). `LocalProc::exec` (ops/local.rs) still
+        // re-checks this defensively before spawning — for OTHER `ProcOps` backends that may not
+        // check cancellation themselves — but by the time control reaches it here, no output has
+        // been accumulated yet, so this early return produces the identical bare "Command aborted"
+        // (no leading text) the `ExitStatus::Killed` arm below produces for a mid-run cancel.
+        if cancel.is_cancelled() {
+            return Err(error::invalid(append_status("", "Command aborted")));
+        }
+
         // Resolve the shell per-exec, honoring an explicit settings `shellPath` (Pi's
         // `createLocalBashOperations` calls `getShellConfig(shellPath)` inside `exec`, AFTER
         // `resolveTimeoutMs` and the abort check, bash.ts:85-89); a missing custom path surfaces
-        // as the `Custom shell path not found` error only after the initial empty update and the
-        // timeout validation have already happened, exactly like Pi.
+        // as the `Custom shell path not found` error only after the initial empty update, the
+        // timeout validation, AND the abort check have already happened, exactly like Pi.
         let shell = match self.opts.shell_path.as_deref() {
             Some(p) => ShellConfig::resolve(Some(p))?,
             None => self.shell.clone(),
