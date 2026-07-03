@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_modes::{run_json, run_print, run_rpc, PrintOptions, SessionCommand};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
+use cyrup_provider::faux::{
+    faux_assistant_message, faux_assistant_message_with, faux_text, faux_tool_call,
+    FauxMessageOptions, FauxProvider,
+};
 use cyrup_provider::Provider;
 use cyrup_session_svc::{
     AgentSessionRuntime, InputSource, SessionBuilder, SessionConfig, SessionFactory, UserInput,
@@ -90,10 +93,12 @@ async fn print_mode_emits_final_assistant_text() {
     let session = build_session(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
     run_print(
         &session,
-        UserInput::text("what is the answer?", InputSource::Cli),
+        [UserInput::text("what is the answer?", InputSource::Cli)],
         &mut out,
+        &mut err,
         PrintOptions::default(),
     )
     .await
@@ -101,6 +106,110 @@ async fn print_mode_emits_final_assistant_text() {
 
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("the final answer"), "final assistant text missing:\n{text}");
+    assert!(String::from_utf8(err).unwrap().is_empty(), "a clean turn writes nothing to stderr");
+}
+
+/// G3 — PRINT mode prints ONLY the final assistant message of a multi-message turn, exactly once,
+/// never one line per intermediate message. Pi's send loop produces no output and the terminal
+/// output block reads `state.messages[state.messages.length - 1]` outside the loop
+/// (print-mode.ts:121-146). Pre-fix cyrup wrote the accumulated text on every call, so a two-message
+/// turn produced BOTH `"first answer"` and `"second answer"`.
+#[tokio::test]
+async fn print_mode_prints_only_the_final_message_of_a_turn() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+    ]);
+    let session = build_session(&fx, faux).await;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    run_print(
+        &session,
+        [
+            UserInput::text("q1", InputSource::Cli),
+            UserInput::text("q2", InputSource::Cli),
+        ],
+        &mut out,
+        &mut err,
+        PrintOptions::default(),
+    )
+    .await
+    .expect("print mode runs");
+
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text, "second answer\n", "only the FINAL message prints, exactly once (G3): {text:?}");
+    assert!(!text.contains("first answer"), "an intermediate message must NOT print (G3): {text:?}");
+    assert!(String::from_utf8(err).unwrap().is_empty(), "a clean turn writes nothing to stderr");
+}
+
+/// G4 — a failed final turn: Pi writes `errorMessage` to stderr and suppresses the assistant stdout
+/// (print-mode.ts:133-137). Pre-fix cyrup wrote the failed turn's partial text to stdout and never
+/// touched stderr.
+#[tokio::test]
+async fn print_mode_routes_a_failed_turn_to_stderr_and_suppresses_stdout() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message_with(
+        vec![faux_text("partial garbled output")],
+        StopReason::Error,
+        FauxMessageOptions {
+            error_message: Some("the model exploded".into()),
+            ..Default::default()
+        },
+    )]);
+    let session = build_session(&fx, faux).await;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    run_print(
+        &session,
+        [UserInput::text("q", InputSource::Cli)],
+        &mut out,
+        &mut err,
+        PrintOptions::default(),
+    )
+    .await
+    .expect("print mode runs");
+
+    let stdout = String::from_utf8(out).unwrap();
+    let stderr = String::from_utf8(err).unwrap();
+    assert!(stdout.is_empty(), "a failed turn suppresses assistant stdout (G4): {stdout:?}");
+    assert_eq!(stderr, "the model exploded\n", "the error message goes to stderr (G4): {stderr:?}");
+}
+
+/// G4 — an aborted final turn with NO `error_message` falls back to Pi's `Request ${stopReason}`
+/// string on stderr, still suppressing stdout (print-mode.ts:136, the `|| ` branch).
+#[tokio::test]
+async fn print_mode_aborted_turn_without_message_uses_the_request_reason_fallback() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("half-written")],
+        StopReason::Aborted,
+    )]);
+    let session = build_session(&fx, faux).await;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    run_print(
+        &session,
+        [UserInput::text("q", InputSource::Cli)],
+        &mut out,
+        &mut err,
+        PrintOptions::default(),
+    )
+    .await
+    .expect("print mode runs");
+
+    assert!(String::from_utf8(out).unwrap().is_empty(), "aborted turn suppresses stdout (G4)");
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Request aborted\n",
+        "an aborted turn without an error_message falls back to `Request aborted` (G4)"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
