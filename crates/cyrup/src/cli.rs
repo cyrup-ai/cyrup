@@ -376,6 +376,18 @@ impl Cli {
         // like Pi's `getHomeDir()` (`process.env.HOME || homedir()`, package-manager.ts:217) and
         // trust-manager.ts:185. `SessionConfig::new` defaults `home` to the agent dir; override it here.
         config.home = dirs.home.clone();
+        // Thread the resolved package dir (CLI `--package-dir` > `CYRUP_PACKAGE_DIR`/`PI_PACKAGE_DIR`
+        // env > `<agent_dir>/packages` default; env.rs:156-160) so the session builder reads installed
+        // packages from the SAME root the `install` subcommand writes to
+        // (`PackageStore::new(dirs.package_dir, Some(dirs.cwd))`, subcommands.rs:396). Pi resolves ONE
+        // `agentDir` (main.ts:481 `getAgentDir()`) and threads it into BOTH the package manager and the
+        // resource loader (resource-loader.ts:222-224 constructs `new DefaultPackageManager({ agentDir })`
+        // from the same value used for resource discovery), so an install into a custom dir is always
+        // visible to the assembled session. cyrup splits `package_dir` into its own knob, so it must be
+        // threaded here too; `SessionConfig::new` otherwise leaves it at the `<agent_dir>/packages`
+        // default and a non-default `--package-dir`/`CYRUP_PACKAGE_DIR` install never loads (gap-13 C1
+        // residual — the default case landed in f5eee19).
+        config.package_dir = dirs.package_dir.clone();
         // Preserve Pi's optional `sessionDir` distinction: `Some` ONLY when `--session-dir`/env was
         // explicitly supplied (used literally), `None` ⇒ the builder applies the cwd-encoded default
         // (gap-analysis 05, Finding 3). Collapsing this to `Some(resolved)` unconditionally would
