@@ -41,6 +41,7 @@ mod bash;
 mod chrome;
 mod commands;
 mod component;
+mod config_selector;
 mod diff;
 mod editor;
 mod error;
@@ -100,6 +101,7 @@ pub use keymap::{
 pub use markdown::{render as render_markdown, trim_partial_closing_fence};
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
+pub use config_selector::{ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle};
 pub use selector::{
     search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
     SCOPED_MODELS_ALL,

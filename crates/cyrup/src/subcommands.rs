@@ -11,10 +11,20 @@
 //! with `(filtered)` tags + dim installed paths, and the saved-trust-store lookup + project-write
 //! guard. The interactive trust prompt + the binary self-update are the gated tails (residual ledger).
 
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
 use anyhow::Result;
-use cyrup_config::{ConfigDirs, TrustStore};
-use cyrup_resources::{InstallScope, PackageManager, PackageSource, PackageStore, UpdateTarget};
+use cyrup_config::{ConfigDirs, Settings, SettingsManager, SettingsScope, TrustStore};
+use cyrup_resources::{
+    discover, DiscoveryConfig, InstallScope, PackageManager, PackageSource, PackageStore,
+    ResourceOrigin, ResourceOverrides, ResourceScope, UpdateTarget,
+};
 use cyrup_sdk::core::{CancelToken, PackageId};
+use cyrup_tui::{
+    run_startup_selector, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle,
+    SelectKeymap, UiTheme,
+};
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
 /// `config`). `config` is dispatched specially (Pi `handleConfigCommand`).
@@ -332,7 +342,13 @@ pub async fn dispatch(
 ) -> Result<Option<i32>> {
     // `config` is handled specially (Pi `handleConfigCommand`).
     if argv.first().map(String::as_str) == Some("config") {
-        return Ok(Some(run_config(dirs).await?));
+        // Resolve trust the same way the other verbs do (Pi `createCommandSettingsManager`): the
+        // `--approve`/`-a` override, else the saved decision for this folder. Project-scope toggles
+        // require trust to persist (R-07-004).
+        let trusted = trust_override(argv)
+            .or(cli_trust_override)
+            .unwrap_or_else(|| saved_trusted(dirs));
+        return Ok(Some(run_config(dirs, trusted).await?));
     }
 
     let Some(opts) = parse_package_command(argv) else {
@@ -547,17 +563,253 @@ async fn run_update(
     Ok(code)
 }
 
-/// `config`: Pi opens the interactive resource-config TUI (`selectConfig`) — the ext-UI dialog host,
-/// a gated outer layer (residual ledger). The CLI surfaces a read-only summary of installs.
-async fn run_config(dirs: &ConfigDirs) -> Result<i32> {
-    let store = PackageStore::new(dirs.package_dir.clone(), Some(dirs.cwd.clone()));
-    let manager = PackageManager::new(store);
-    let packages = manager.list();
-    println!("Installed packages ({}):", packages.len());
-    for pkg in packages {
-        println!("  {}  [{:?}]", pkg.id, pkg.scope);
+/// `config`: open the interactive resource-config TUI (Pi `handleConfigCommand` → `selectConfig`,
+/// package-manager-cli.ts:543-572). Resolves the settings + trust, discovers every top-level
+/// auto-discovered skill/prompt/theme with its current enabled state, mounts the [`ConfigSelector`],
+/// and persists each space/enter toggle as a `+pattern`/`-pattern` override entry into the matching
+/// `skills`/`prompts`/`themes` settings array (Pi `toggleTopLevelResource`, config-selector.ts:457-503)
+/// — the SAME arrays discovery's `global_overrides`/`project_overrides` already read back. Esc closes.
+///
+/// Package-tier resource toggling (Pi `togglePackageResource`) is out of this bin's crate scope — it
+/// needs the installed-package → live-session wiring (`DiscoveryConfig.installed`, gap-07 §1) and
+/// `PackageManager::set_enabled`, both in `cyrup-resources`/`cyrup-session-svc`.
+async fn run_config(dirs: &ConfigDirs, trusted: bool) -> Result<i32> {
+    let settings = SettingsManager::load(crate::file_settings_store(dirs), Settings::new(), trusted);
+    let rows = resolve_config_rows(dirs, &settings, trusted).await?;
+
+    if rows.is_empty() {
+        println!("No configurable skills, prompts, or themes found.");
+        return Ok(0);
+    }
+
+    // Seed the per-(scope,kind) settings arrays from disk; each toggle read-modify-writes its own
+    // scope's array (Pi's `getGlobalSettings()`/`getProjectSettings()` array reads, config-selector.ts).
+    let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
+    for kind in [ConfigKind::Skills, ConfigKind::Prompts, ConfigKind::Themes] {
+        arrays.insert((ConfigScope::User, kind), settings_array(settings.global(), kind));
+        arrays.insert((ConfigScope::Project, kind), settings_array(settings.project(), kind));
+    }
+
+    let theme = UiTheme::default();
+    let keymap = SelectKeymap::default();
+    let mut selector = ConfigSelector::new(rows);
+    let mut persist_err: Option<String> = None;
+    run_startup_selector(&theme, &keymap, &mut selector, |payload| {
+        let Some(toggle) = ConfigToggle::from_payload(payload) else {
+            return;
+        };
+        let settings_scope = match toggle.scope {
+            ConfigScope::User => SettingsScope::Global,
+            ConfigScope::Project => SettingsScope::Project,
+        };
+        let entry = arrays.entry((toggle.scope, toggle.kind)).or_default();
+        // Drop any prior +/-/! entry for this exact pattern, then push the new decision (Pi
+        // `toggleTopLevelResource`, config-selector.ts:471-480): enabling writes `+pattern`, disabling
+        // `-pattern`.
+        entry.retain(|p| strip_override_marker(p) != toggle.pattern);
+        entry.push(format!("{}{}", if toggle.enabled { '+' } else { '-' }, toggle.pattern));
+        let value = serde_json::Value::Array(
+            entry.iter().cloned().map(serde_json::Value::String).collect(),
+        );
+        if let Err(e) = settings.persist_nested(settings_scope, &[toggle.kind.key()], value) {
+            persist_err = Some(e.to_string());
+        }
+    })?;
+
+    if let Some(e) = persist_err {
+        // A project toggle in an untrusted folder is the usual cause (Pi requires trust to write
+        // project settings). Surface it after teardown rather than silently swallowing.
+        eprintln!("Some changes could not be saved: {e}");
+        eprintln!("(use --approve to modify project settings in an untrusted folder)");
+        return Ok(1);
     }
     Ok(0)
+}
+
+/// The current `skills`/`prompts`/`themes` override array of a settings layer.
+fn settings_array(layer: &Settings, kind: ConfigKind) -> Vec<String> {
+    match kind {
+        ConfigKind::Skills => layer.skill_paths(),
+        ConfigKind::Prompts => layer.prompt_template_paths(),
+        ConfigKind::Themes => layer.theme_paths(),
+    }
+}
+
+/// Strip one leading `!`/`+`/`-` override marker (Pi's `p.slice(1)` for a marked pattern,
+/// config-selector.ts:472).
+fn strip_override_marker(p: &str) -> &str {
+    match p.as_bytes().first() {
+        Some(b'!' | b'+' | b'-') => p.get(1..).unwrap_or(p),
+        _ => p,
+    }
+}
+
+/// Resolve every top-level auto-discovered skill/prompt/theme with its **current** enabled state, for
+/// the config editor. Runs discovery twice against the SAME dirs: once with the live settings override
+/// patterns (the enabled set) and once with empty overrides (the full universe of files). A resource
+/// is enabled iff it survived the override-filtered pass — reusing cyrup-resources' own enable/disable
+/// logic without depending on its `pub(crate)` matcher. Mirrors Pi's `packageManager.resolve()`
+/// returning every resource tagged with its `enabled` flag (package-manager.ts:881-897).
+async fn resolve_config_rows(
+    dirs: &ConfigDirs,
+    settings: &SettingsManager,
+    trusted: bool,
+) -> Result<Vec<ConfigRow>> {
+    let base = |overrides_global: ResourceOverrides, overrides_project: ResourceOverrides| {
+        let mut disc = DiscoveryConfig::new(dirs.cwd.clone(), dirs.agent_dir.clone());
+        disc.user_agents_dir = Some(dirs.home.join(".agents"));
+        disc.trusted_project = trusted;
+        disc.project_root = Some(dirs.cwd.clone());
+        disc.package_global_dir = dirs.package_dir.clone();
+        // `installed` is left empty: this editor manages only the top-level (loose) resources; the
+        // package tier is the gated cross-crate piece (gap-07 §1/§3 piece 2).
+        disc.global_overrides = overrides_global;
+        disc.project_overrides = overrides_project;
+        disc
+    };
+    let enabled_disc = base(
+        ResourceOverrides {
+            skills: settings.global().skill_paths(),
+            prompts: settings.global().prompt_template_paths(),
+            themes: settings.global().theme_paths(),
+        },
+        ResourceOverrides {
+            skills: settings.project().skill_paths(),
+            prompts: settings.project().prompt_template_paths(),
+            themes: settings.project().theme_paths(),
+        },
+    );
+    let universe_disc = base(ResourceOverrides::default(), ResourceOverrides::default());
+
+    let enabled = discover(&enabled_disc, CancelToken::new()).await?;
+    let universe = discover(&universe_disc, CancelToken::new()).await?;
+
+    let enabled_skills: HashSet<_> =
+        enabled.registry.skills.all().iter().map(|s| s.skill_md.clone()).collect();
+    let enabled_prompts: HashSet<_> =
+        enabled.registry.prompts.all().iter().map(|p| p.path.clone()).collect();
+    let enabled_themes: HashSet<_> =
+        enabled.registry.themes.all().iter().filter_map(|t| t.origin_path.clone()).collect();
+
+    let mut rows = Vec::new();
+    let mut seen: HashSet<(ConfigKind, std::path::PathBuf)> = HashSet::new();
+
+    for skill in universe.registry.skills.all() {
+        let ResourceOrigin::LooseFile { scope, root } = &skill.origin else { continue };
+        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &skill.skill_md, dirs) else {
+            continue;
+        };
+        if !seen.insert((ConfigKind::Skills, skill.skill_md.clone())) {
+            continue;
+        }
+        rows.push(ConfigRow {
+            scope: cscope,
+            kind: ConfigKind::Skills,
+            display_name: skill_display_name(&skill.skill_md),
+            pattern,
+            base_dir,
+            enabled: enabled_skills.contains(&skill.skill_md),
+        });
+    }
+    for prompt in universe.registry.prompts.all() {
+        let ResourceOrigin::LooseFile { scope, root } = &prompt.origin else { continue };
+        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &prompt.path, dirs) else {
+            continue;
+        };
+        if !seen.insert((ConfigKind::Prompts, prompt.path.clone())) {
+            continue;
+        }
+        rows.push(ConfigRow {
+            scope: cscope,
+            kind: ConfigKind::Prompts,
+            display_name: file_display_name(&prompt.path),
+            pattern,
+            base_dir,
+            enabled: enabled_prompts.contains(&prompt.path),
+        });
+    }
+    for theme in universe.registry.themes.all() {
+        let ResourceOrigin::LooseFile { scope, root } = &theme.origin else { continue };
+        let Some(path) = theme.origin_path.clone() else { continue };
+        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &path, dirs) else {
+            continue;
+        };
+        if !seen.insert((ConfigKind::Themes, path.clone())) {
+            continue;
+        }
+        rows.push(ConfigRow {
+            scope: cscope,
+            kind: ConfigKind::Themes,
+            display_name: file_display_name(&path),
+            pattern,
+            base_dir,
+            enabled: enabled_themes.contains(&path),
+        });
+    }
+    Ok(rows)
+}
+
+/// Map a loose-file resource's `(scope, root, path)` to its config-editor `(scope, pattern, base dir)`.
+/// The pattern is the resource path relative to the resource root's PARENT (`root.parent()`), matching
+/// exactly the base cyrup-resources' `is_enabled_by_overrides` uses (discovery.rs `override_enabled`
+/// = `root.parent()`), so a written `+`/`-pattern` round-trips through the next discovery. Only the
+/// auto-discovered `Global`/`Project` tiers are editable here (settings-listed positive entries and
+/// packages are skipped).
+fn loose_pattern(
+    scope: ResourceScope,
+    root: &Path,
+    path: &Path,
+    dirs: &ConfigDirs,
+) -> Option<(ConfigScope, String, String)> {
+    let cscope = match scope {
+        ResourceScope::Global => ConfigScope::User,
+        ResourceScope::Project => ConfigScope::Project,
+        _ => return None,
+    };
+    let base = root.parent()?;
+    let pattern = to_posix(path.strip_prefix(base).ok()?);
+    Some((cscope, pattern, display_base_dir(base, &dirs.home)))
+}
+
+/// Posix-normalize a path for a settings pattern (Pi `toPosixPath`, package-manager.ts:212-214).
+fn to_posix(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// A home-relative display of a base dir (Pi `formatBaseDir`, config-selector.ts:59-74): `~`-prefixed
+/// when under the home dir, with a trailing slash.
+fn display_base_dir(base: &Path, home: &Path) -> String {
+    let shown = if base == home {
+        "~".to_string()
+    } else if let Ok(rest) = base.strip_prefix(home) {
+        format!("~/{}", to_posix(rest))
+    } else {
+        to_posix(base)
+    };
+    if shown.ends_with('/') {
+        shown
+    } else {
+        format!("{shown}/")
+    }
+}
+
+/// A skill's display name (Pi config-selector.ts:129-133): the parent directory for a `SKILL.md`,
+/// else the file name.
+fn skill_display_name(path: &Path) -> String {
+    let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if file == "SKILL.md" {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(file)
+    } else {
+        file
+    }
+}
+
+/// A prompt/theme display name: the file name (Pi config-selector.ts:132).
+fn file_display_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
 #[cfg(test)]

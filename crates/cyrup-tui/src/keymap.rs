@@ -73,6 +73,12 @@ pub enum Action {
     /// `app.message.followUp` (`handleFollowUp`, interactive-mode.ts:3554-3585;
     /// `core/keybindings.ts:98-101`). Acts as a plain submit when the session is idle.
     FollowUp,
+    /// Restore all queued (steering + follow-up) messages back into the editor (Alt+Up) —
+    /// `app.message.dequeue` (`handleDequeue` → `restoreQueuedMessagesToEditor`,
+    /// interactive-mode.ts:3587-3594,3852-3871; `core/keybindings.ts:102-105`). Clears both queues and
+    /// prepends their text (joined by blank lines) to the current editor buffer; shows a
+    /// `No queued messages to restore` status when nothing is queued.
+    Dequeue,
 }
 
 impl Action {
@@ -92,6 +98,7 @@ impl Action {
             "app.model.cycleForward" => Some(Action::ModelCycleForward),
             "app.model.cycleBackward" => Some(Action::ModelCycleBackward),
             "app.message.followUp" => Some(Action::FollowUp),
+            "app.message.dequeue" => Some(Action::Dequeue),
             _ => None,
         }
     }
@@ -371,6 +378,8 @@ impl Default for Keymap {
                 ),
                 // `app.message.followUp` (`core/keybindings.ts:98-101`, default `alt+enter`).
                 (Key { code: KeyCode::Enter, mods: KeyModifiers::ALT }, Action::FollowUp),
+                // `app.message.dequeue` (`core/keybindings.ts:102-105`, default `alt+up`).
+                (Key { code: KeyCode::Up, mods: KeyModifiers::ALT }, Action::Dequeue),
             ],
         }
     }

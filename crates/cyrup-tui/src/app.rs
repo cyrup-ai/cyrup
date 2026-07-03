@@ -75,6 +75,12 @@ pub enum AppAction {
     /// loop delivers it via [`AgentSession::follow_up`] when a turn is streaming, or as a plain submit
     /// when idle (Pi `handleFollowUp`, interactive-mode.ts:3554-3585). Carries the trimmed text.
     FollowUp(String),
+    /// The user asked to restore queued messages back into the editor (Alt+Up, `app.message.dequeue`):
+    /// the run loop reads the session's steering + follow-up queues, clears them, and prepends their
+    /// text to the current editor buffer (Pi `handleDequeue` → `restoreQueuedMessagesToEditor`,
+    /// interactive-mode.ts:3587-3594,3852-3871). Needs the live session (async queue read/clear), so
+    /// like [`Self::FollowUp`] it rides an `AppAction` the run loop resolves.
+    Dequeue,
     /// The user requested an abort/interrupt of the in-flight run (Esc).
     Interrupt,
     /// The user requested to quit the session.
@@ -1009,6 +1015,10 @@ impl<B: Backend> App<B> {
                     AppAction::FollowUp(text)
                 }
             }
+            // `app.message.dequeue` (Alt+Up): restore queued messages to the editor. The queue read +
+            // clear are on the live session, so it rides an `AppAction` the run loop resolves (Pi
+            // `handleDequeue`, interactive-mode.ts:3587-3594).
+            Action::Dequeue => AppAction::Dequeue,
         }
     }
 
@@ -1090,6 +1100,7 @@ impl<B: Backend> App<B> {
                 "Cycle model forward / backward",
             ),
             entry(g(Action::FollowUp), "Queue message as a follow-up"),
+            entry(g(Action::Dequeue), "Restore queued messages to editor"),
             entry("/".to_string(), "Slash commands"),
             entry("!".to_string(), "Run bash command"),
             entry("!!".to_string(), "Run bash command (excluded from context)"),
@@ -3115,6 +3126,35 @@ impl App<CrosstermBackend<Stdout>> {
                                     let _ = session.prompt_accepted(ui).await;
                                 }
                             });
+                        }
+                        AppAction::Dequeue => {
+                            // Pi `handleDequeue` → `restoreQueuedMessagesToEditor`
+                            // (interactive-mode.ts:3587-3594,3852-3871): drain BOTH the steering and
+                            // follow-up queues (steering first, then follow-up — Pi's
+                            // `[...steering, ...followUp]` order), join their text by blank lines, and
+                            // prepend it to the current editor buffer. When nothing is queued, show
+                            // Pi's exact `No queued messages to restore` status and leave the editor
+                            // untouched.
+                            let mut queued = session.steering_messages();
+                            queued.extend(session.follow_up_messages());
+                            if queued.is_empty() {
+                                self.state.transcript.push_status("No queued messages to restore");
+                            } else {
+                                let n = queued.len();
+                                session.clear_queue().await;
+                                let queued_text = queued.join("\n\n");
+                                let current = self.state.editor.text();
+                                let combined = [queued_text, current]
+                                    .into_iter()
+                                    .filter(|t| !t.trim().is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                self.state.editor.set_text(&combined);
+                                self.state.transcript.push_status(format!(
+                                    "Restored {n} queued message{} to editor",
+                                    if n > 1 { "s" } else { "" }
+                                ));
+                            }
                         }
                         AppAction::Command(cmd) => {
                             self.execute_command(cmd, &session, runtime.as_ref()).await
