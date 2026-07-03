@@ -990,7 +990,7 @@ fn resolve_model(
                     // "Using custom model id." warning). The provider is "known" when `--provider` was
                     // explicit OR the pattern carries a `provider/` prefix naming the resolved
                     // provider; a bare unresolvable id with neither stays a hard `ModelNotFound`.
-                    None => match fallback_model(&resolver, provider, cfg, pat) {
+                    None => match fallback_model(provider, cfg, pat) {
                         Some((m, level)) => (Some(m), level),
                         None => return Err(SessionServiceError::ModelNotFound(pat.clone())),
                     },
@@ -1069,14 +1069,13 @@ fn resolve_model(
 
 /// Pi `resolveCliModel` custom-fallback (model-resolver.ts:475-501 + `buildFallbackModel`
 /// 163-177): when a strict `--model` pattern does not resolve but the provider is *known*, clone the
-/// provider's default (alias-preferred, else first) model and override `id`/`name` with the
-/// requested model id, so an unknown-but-intended model id proceeds as a custom model. The provider
-/// is "known" when `--provider` was explicit (`cli_provider_explicit`) or the pattern carries a
-/// `provider/` prefix naming the resolved provider. Returns `(model, thinking_level)` or `None` (⇒
-/// the caller keeps Pi's hard `ModelNotFound`). A trailing `:level` is honored only when `--thinking`
-/// was not given (Pi `fallbackThinking`, model-resolver.ts:481-490).
+/// provider's *curated* default (Pi `defaultModelPerProvider`, else its first model) and override
+/// `id`/`name` with the requested model id, so an unknown-but-intended model id proceeds as a custom
+/// model. The provider is "known" when `--provider` was explicit (`cli_provider_explicit`) or the
+/// pattern carries a `provider/` prefix naming the resolved provider. Returns `(model,
+/// thinking_level)` or `None` (⇒ the caller keeps Pi's hard `ModelNotFound`). A trailing `:level` is
+/// honored only when `--thinking` was not given (Pi `fallbackThinking`, model-resolver.ts:481-490).
 fn fallback_model(
-    resolver: &ModelResolver,
     provider: &dyn Provider,
     cfg: &SessionConfig,
     pattern: &str,
@@ -1106,14 +1105,13 @@ fn fallback_model(
     if base_id.is_empty() {
         return None;
     }
-    // Clone the provider default (alias-preferred) or the first model, overriding id + name.
-    let base = resolver
-        .provider_default(provider_id)
-        .cloned()
-        .or_else(|| provider.models().first().cloned())?;
-    let mut model = base;
-    model.id = cyrup_core::ModelId::from(base_id);
-    model.name = base_id.to_string();
+    // Clone the provider's *curated* default (Pi `defaultModelPerProvider` — e.g. anthropic ->
+    // `claude-opus-4-8`), else its first model, overriding id + name (Pi `buildFallbackModel`,
+    // model-resolver.ts:163-177). `cyrup_config::build_fallback_model` (model.rs:1033) is the shared
+    // helper that mirrors that curated pick exactly. NOTE: `ModelResolver::provider_default` is the
+    // WRONG base here — it is alias-preferred + raw-byte-descending (anthropic -> `claude-sonnet-5`),
+    // which diverges the cloned model's cost (~2.5x) and compat flags from Pi.
+    let model = cyrup_config::build_fallback_model(provider_id.as_str(), base_id, provider.models())?;
     Some((model, level))
 }
 
@@ -1212,5 +1210,48 @@ mod tests {
         assert!(http_proxy_overlay(Some("   ")).is_none());
         assert!(http_proxy_overlay(Some("")).is_none());
         assert!(http_proxy_overlay(None).is_none());
+    }
+
+    // Pi `buildFallbackModel` (model-resolver.ts:163-177): a `--model <custom-id>` on a *known*
+    // provider clones that provider's **curated** default (`defaultModelPerProvider` — anthropic ->
+    // `claude-opus-4-8`), then overrides id/name. The buggy path cloned the alias-preferred,
+    // raw-byte-descending pick (`resolver.provider_default` -> `claude-sonnet-5`), diverging cost
+    // (~2.5x) and dropping the base's compat flags. This drives the real `fallback_model` site over
+    // an assembled two-model anthropic catalog (opus cost 15/75 vs sonnet 6/30).
+    #[test]
+    fn fallback_model_clones_curated_default_not_alias_preferred_base() {
+        use super::{fallback_model, SessionConfig};
+        use cyrup_provider::faux::{FauxConfig, FauxModelDefinition, FauxProvider};
+        use cyrup_provider::ModelCost;
+
+        let mk = |id: &str, input: f64, output: f64| {
+            let mut d = FauxModelDefinition::new(id);
+            d.cost = ModelCost { input, output, cache_read: 0.0, cache_write: 0.0 };
+            d
+        };
+        // Order the alias-preferred pick FIRST (byte-descending `s` > `o` -> sonnet), so the naive
+        // `providerModels[0]` fallback is ALSO sonnet — only the curated-default lookup rescues opus.
+        let provider = FauxProvider::with_config(FauxConfig {
+            provider: "anthropic".into(),
+            api: "anthropic".into(),
+            models: vec![mk("claude-sonnet-5", 6.0, 30.0), mk("claude-opus-4-8", 15.0, 75.0)],
+            ..Default::default()
+        });
+        let mut cfg = SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.cli_provider_explicit = true; // provider is "known" -> custom fallback is allowed
+
+        let (model, _lvl) = fallback_model(&provider, &cfg, "my-custom-model")
+            .expect("known provider yields a custom fallback model");
+
+        // The requested custom id/name is applied on top of the base.
+        assert_eq!(model.id.as_str(), "my-custom-model");
+        assert_eq!(model.name, "my-custom-model");
+        // The BASE must be the curated default (claude-opus-4-8), so cost matches opus, NOT the
+        // alias-preferred claude-sonnet-5. On the buggy code this reads 6.0/30.0 and FAILS.
+        assert_eq!(
+            model.cost.input, 15.0,
+            "fallback must clone curated default claude-opus-4-8, not alias-preferred claude-sonnet-5"
+        );
+        assert_eq!(model.cost.output, 75.0);
     }
 }
