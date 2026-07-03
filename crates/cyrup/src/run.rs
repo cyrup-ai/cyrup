@@ -13,17 +13,19 @@ use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::input::Inputs;
 
-/// PRINT dispatch: run the initial prompt then each follow-up, writing final assistant text to `out`.
-/// Returns the process exit code derived from the terminal stop reason (R-11-005, arch-11 §6.6).
+/// PRINT dispatch: prompt the initial submission then each follow-up in order as ONE ordered turn,
+/// writing only the *final* transcript message to `out` (Pi print-mode.ts:129-146); a failed/aborted
+/// final turn routes its error to stderr with no assistant stdout. Returns the process exit code
+/// derived from the terminal stop reason (R-11-005, arch-11 §6.6).
 pub async fn run_print_dispatch<W: Write>(
     session: &AgentSession,
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    run_print(session, initial_input(inputs), out, PrintOptions::default()).await?;
-    for follow_up in &inputs.follow_ups {
-        run_print(session, cli_input(follow_up), out, PrintOptions::default()).await?;
-    }
+    let messages =
+        std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    let mut err = std::io::stderr();
+    run_print(session, messages, out, &mut err, PrintOptions::default()).await?;
     Ok(exit_code(session).await)
 }
 

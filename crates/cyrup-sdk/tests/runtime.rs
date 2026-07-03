@@ -119,10 +119,12 @@ async fn sdk_run_print_over_the_active_session() {
     let session = runtime.session().await;
 
     let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
     run_print(
         &session,
-        cyrup_sdk::UserInput::text("hi", cyrup_sdk::InputSource::Cli),
+        std::iter::once(cyrup_sdk::UserInput::text("hi", cyrup_sdk::InputSource::Cli)),
         &mut out,
+        &mut err,
         PrintOptions::default(),
     )
     .await
