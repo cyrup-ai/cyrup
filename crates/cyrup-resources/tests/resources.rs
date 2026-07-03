@@ -682,6 +682,63 @@ async fn a09_4_installed_package_resources_surface_in_discovery() {
     );
 }
 
+#[tokio::test]
+async fn installed_global_git_package_resolves_via_package_global_dir() {
+    // A Global-scope git-source package's working tree lives at `<package_global_dir>/packages/<id>`
+    // — the bin passes `dirs.package_dir` (default `<agent_dir>/packages`) as the store root
+    // (subcommands.rs:396), so the tree is one level deeper than a naive `<global_dir>/packages/<id>`
+    // guess. Discovery must resolve it via `package_global_dir`, NOT `global_dir` (the loose-resource
+    // agent root), else an installed Global git/oci package's resources never surface — the base half
+    // of C1 (gap-07 #1 / gap-13 C1). Path installs bypass this (they carry an absolute source path),
+    // so only git/oci sources exercise the base; here we replicate the on-disk state without a real
+    // clone (discovery only READS the tree, exactly like a09_5_update_skips_pinned seeds git records).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let global = root.join("global");
+    let package_dir = global.join("packages"); // the bin's default `dirs.package_dir`.
+    fs::create_dir_all(&global).unwrap();
+
+    let source = PackageSource::Git { url: "file:///fake/pkg".into(), reff: PinRef::Default };
+    let id = source.package_id();
+    let store = PackageStore::new(package_dir.clone(), None);
+    let pkg_tree = store.package_dir(InstallScope::Global, &id).unwrap();
+    make_package_tree(&pkg_tree, true, false);
+
+    // `DiscoveryConfig::new(root, &global)` defaults `package_global_dir` to `global/packages`
+    // (== the store root above), so a Global package resolves out of the box.
+    let mut c = DiscoveryConfig::new(root, &global);
+    c.installed = InstalledPackages {
+        packages: vec![InstalledPackage {
+            id,
+            source,
+            scope: InstallScope::Global,
+            resolved_commit: Some("deadbeef".into()),
+            installed_at: "0".to_string(),
+            disabled: Default::default(),
+        }],
+    };
+    let report = run_discover(&c).await;
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "Global git package skill resolves via package_global_dir"
+    );
+    assert!(report.registry.themes.contains("midnight"), "Global git package theme resolves");
+    assert!(
+        report.registry.ext_crate_paths.iter().any(|p| p.ends_with("deploy")),
+        "Global git package extension dir collected"
+    );
+
+    // Negative control: pointing the base at the loose-resource `global_dir` (agent root) resolves
+    // `<global_dir>/packages/<id>` — the WRONG, one-level-too-shallow path — so nothing is found.
+    // Proves the resolution genuinely keys off `package_global_dir`, not `global_dir`.
+    let mut wrong = c.clone();
+    wrong.package_global_dir = global.clone();
+    assert!(
+        !run_discover(&wrong).await.registry.skills.contains("alpha"),
+        "resolving a Global package via global_dir misses its tree — the package_global_dir base matters"
+    );
+}
+
 // ===========================================================================
 // A-09-5 — install / remove / list / update / pin (local path + git fixture)
 // ===========================================================================

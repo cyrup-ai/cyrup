@@ -140,6 +140,17 @@ pub struct DiscoveryConfig {
     pub cwd: PathBuf,
     pub global_dir: PathBuf,
     pub global_agents_dir: PathBuf,
+    /// The `PackageStore` global root — the value the `install` subcommand passes as the store's
+    /// `global_dir` when it records an install (`PackageStore::new(dirs.package_dir, …)`, cyrup
+    /// subcommands.rs:396; Pi `dirs.package_dir`, env.rs:156-160). Used to resolve installed
+    /// **Global**-scope package working trees, i.e. `<package_global_dir>/packages/<id>`. Kept
+    /// DISTINCT from `global_dir` (which roots the loose global resources at `<global_dir>/skills`,
+    /// `/prompts`, `/themes`) because the bin passes its `package_dir` — not `agent_dir` — as the
+    /// store root, so a Global package's tree lives one level deeper than a naive
+    /// `<global_dir>/packages/<id>` guess. Defaults to `<global_dir>/packages` (the bin's own default
+    /// for `package_dir`), so callers that don't set a custom `--package-dir`/`CYRUP_PACKAGE_DIR`
+    /// resolve installed Global packages correctly with no extra wiring.
+    pub package_global_dir: PathBuf,
     /// The user-tier cross-tool `.agents` base dir (Pi `getHomeDir()/.agents`,
     /// package-manager.ts:2286,217). When `Some`, `<user_agents_dir>/skills` is loaded as a
     /// USER/global-scope skill source AND excluded from the project `.agents/skills` ancestor walk so
@@ -172,10 +183,16 @@ impl DiscoveryConfig {
     pub fn new(cwd: impl Into<PathBuf>, global_dir: impl Into<PathBuf>) -> Self {
         let global_dir = global_dir.into();
         let global_agents_dir = global_dir.join("agents");
+        // The bin's default `dirs.package_dir` is `<agent_dir>/packages` (env.rs:156-160); with
+        // `global_dir == agent_dir` (the session-svc builder's `DiscoveryConfig::new` call) this
+        // default matches the store root the `install` subcommand writes to, so a Global package
+        // installed with no custom `--package-dir` resolves correctly out of the box.
+        let package_global_dir = global_dir.join("packages");
         Self {
             cwd: cwd.into(),
             global_dir,
             global_agents_dir,
+            package_global_dir,
             user_agents_dir: None,
             project_root: None,
             trusted_project: false,
@@ -446,7 +463,9 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             &pkg.source,
             pkg.scope,
             &pkg.id,
-            &cfg.global_dir,
+            // The package-store global root the bin wrote to (`dirs.package_dir`), NOT `global_dir`
+            // (the loose-resource agent root) — see the `package_global_dir` field docs.
+            &cfg.package_global_dir,
             cfg.project_root.as_deref(),
         ) else {
             continue;

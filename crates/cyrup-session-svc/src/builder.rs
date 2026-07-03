@@ -6,7 +6,7 @@
 //! extension host with native built-ins and attaches BOTH ext seams to the agent (cyrup-ext), and
 //! resolves the provider into the agent loop (cyrup-provider).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cyrup_agent::Agent;
@@ -17,7 +17,10 @@ use cyrup_config::{
 };
 use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
 use cyrup_provider::{Model, Provider};
-use cyrup_resources::{discover, DiscoveryConfig, ResourceOverrides, SkillPointer};
+use cyrup_resources::{
+    discover, DiscoveryConfig, InstallScope, InstalledPackages, PackageStore, ResourceOverrides,
+    SkillPointer,
+};
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
 use cyrup_session::prompt::{
     ContextFileLoader, DocsPointers, PromptInputs, ResolvedOverride, SystemPromptBuilder,
@@ -77,6 +80,15 @@ pub struct SessionConfig {
     pub home: PathBuf,
     /// Sessions root directory (defaults to `agent_dir/sessions`).
     pub session_dir: Option<PathBuf>,
+    /// Packages root — the value the bin passes as the `PackageStore` global root when it writes
+    /// `install` records (`PackageStore::new(dirs.package_dir, …)`, subcommands.rs:396; Pi
+    /// `dirs.package_dir`, env.rs:156-160, default `<agent_dir>/packages`). The builder reads the
+    /// SAME registry back into `DiscoveryConfig.installed`/`package_global_dir` so an installed
+    /// package's resources load into the assembled session (gap-07 #1 / gap-13 C1). Defaults to
+    /// `<agent_dir>/packages` — the bin's own default. NOTE: the bin's `to_session_config` currently
+    /// leaves this at the default, so a non-default `--package-dir`/`CYRUP_PACKAGE_DIR` is not yet
+    /// threaded here (closing that residual is a one-line bin edit, outside this crate's scope).
+    pub package_dir: PathBuf,
     /// Runtime mode (drives non-prompting trust + the extension `ctx.mode`/`ctx.hasUI`).
     pub app_mode: AppMode,
     /// Model selection pattern (`provider/id[:level]`); `None` ⇒ settings default ⇒ first catalog.
@@ -164,6 +176,7 @@ impl SessionConfig {
             cwd: cwd.into(),
             cwd_override: None,
             home: agent_dir.clone(),
+            package_dir: agent_dir.join("packages"),
             agent_dir,
             session_dir: None,
             app_mode: AppMode::Print,
@@ -534,41 +547,32 @@ impl SessionBuilder {
         }
         let ext_host = Arc::new(host);
 
-        // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
-        // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664). The roots
-        // are computed here (so `-ne` disables project+global discovery and `-e` paths are configured,
-        // pre-trust); the live wasm *instantiation* of each discovered extension runs only under the
-        // `wasm-host` feature (the Wasmtime engine + the `wasm32-wasip2` guest toolchain — the gated
-        // arch-08b live-wasm tail, residual ledger §09 #13). Native built-ins are already loaded above.
-        let ext_roots = extension_discovery_roots(&cfg);
-        #[cfg(feature = "wasm-host")]
-        {
-            // Inject the session's OWN `host_services` (built at 4a) so a disk-discovered guest's
-            // `control` capability reaches the same queue `apply_pending_control` drains.
-            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
-            // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
-            // diagnostics, main.ts:679-682) surface to the caller once the diagnostics channel reaches
-            // the bin; today they are recorded on the result.
-            let _load_result =
-                ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
-        }
-        #[cfg(not(feature = "wasm-host"))]
-        let _ = &ext_roots;
-
-        // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
-        // + disk extensions loaded (Pi `runner.bindCore` pending-flush, runner.ts:345-362). The SAME
-        // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
-        // view (its catalog is UNIONed into the model registry, and its provider installed on select).
-        let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
-        ext_host.registry().bind_model_registry(guest_providers.clone())?;
-
-        // ---- 5. resources discovery (cyrup-resources) -----------------------------------------
+        // ---- 5. resources discovery (cyrup-resources) — RUN FIRST (before disk-extension load) so
+        // the package-declared extension dirs discovery collects (`registry.ext_crate_paths`) can be
+        // folded into the extension discovery roots below, matching Pi's `resolve()` producing
+        // `resolvedPaths.extensions` (the package tier) which is then merged into the loaded
+        // extension set (resource-loader.ts:379,403-407). Discovery is a pure fs pass with no
+        // dependency on the not-yet-loaded disk extensions; the extension-*contributed* resources are
+        // folded in AFTER the load via `aggregate_resources` (unchanged, below).
         let mut disc = DiscoveryConfig::new(cwd.clone(), cfg.agent_dir.clone());
         // R6: plumb the user-tier cross-tool `~/.agents` base (Pi `getHomeDir()/.agents`,
         // package-manager.ts:2286,217) so cyrup-resources loads `~/.agents/skills` (user scope) and
         // dedups the project `.agents/skills` ancestor walk against it.
         disc.user_agents_dir = Some(cfg.home.join(".agents"));
         disc.trusted_project = trusted;
+        // C1 (gap-07 #1 / gap-13 C1): read the on-disk install registry back into discovery so an
+        // installed package's skills/prompts/themes actually load into the assembled session. Pi's
+        // `PackageManager.resolve()` re-reads `projectSettings.packages`/`globalSettings.packages`
+        // from the settings store on EVERY call (package-manager.ts:880-897), so an installed package
+        // is structurally impossible to forget; cyrup persists installs to a SEPARATE file-backed
+        // `packages.json` store, so the builder must take the explicit read step the bin's `install`
+        // write mirrors (`PackageStore::new(dirs.package_dir, Some(dirs.cwd))`, subcommands.rs:396).
+        // `project_root` + `package_global_dir` are the SAME store roots `install` writes to, so
+        // `installed_dir` resolves each record's working tree at the exact on-disk path `install`
+        // created (Global at `<package_dir>/packages/<id>`, Project at `<cwd>/.cyrup/packages/<id>`).
+        disc.project_root = Some(cwd.clone());
+        disc.package_global_dir = cfg.package_dir.clone();
+        disc.installed = load_installed_packages(&cfg.package_dir, &cwd);
         disc.enable_skills = !cfg.no_skills;
         disc.enable_prompts = !cfg.no_prompt_templates;
         disc.enable_themes = !cfg.no_themes;
@@ -590,6 +594,40 @@ impl SessionBuilder {
             themes: settings.project().theme_paths(),
         };
         let report = discover(&disc, cancel.token()).await?;
+
+        // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
+        // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664), then
+        // fold in the package-declared extension dirs discovery just collected (gap-07 #2: Pi merges
+        // the package tier's `resolvedPaths.extensions` into the loaded set, resource-loader.ts:
+        // 379,403-407 `mergePaths(cliEnabledExtensions, enabledExtensions)`). `configured` is the
+        // pre-trust configured-extension tier — the same shape package extension dirs enter — so
+        // appending them here makes an installed package's extension load alongside the
+        // project/global/CLI roots. The live wasm *instantiation* of each discovered extension runs
+        // only under the `wasm-host` feature (the Wasmtime engine + the `wasm32-wasip2` guest
+        // toolchain — the gated arch-08b live-wasm tail, residual ledger §09 #13). Native built-ins
+        // are already loaded above.
+        let mut ext_roots = extension_discovery_roots(&cfg);
+        ext_roots.configured.extend(report.registry.ext_crate_paths.iter().cloned());
+        #[cfg(feature = "wasm-host")]
+        {
+            // Inject the session's OWN `host_services` (built at 4a) so a disk-discovered guest's
+            // `control` capability reaches the same queue `apply_pending_control` drains.
+            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
+            // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
+            // diagnostics, main.ts:679-682) surface to the caller once the diagnostics channel reaches
+            // the bin; today they are recorded on the result.
+            let _load_result =
+                ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        let _ = &ext_roots;
+
+        // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
+        // + disk extensions loaded (Pi `runner.bindCore` pending-flush, runner.ts:345-362). The SAME
+        // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
+        // view (its catalog is UNIONed into the model registry, and its provider installed on select).
+        let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
+        ext_host.registry().bind_model_registry(guest_providers.clone())?;
         // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
         // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
         // BEFORE the skill pointers + system prompt are derived. An empty aggregate (no handlers, or
@@ -1114,6 +1152,33 @@ pub fn extension_discovery_roots(cfg: &SessionConfig) -> cyrup_ext::DiscoveryRoo
             configured: cfg.extra_extension_paths.clone(),
         }
     }
+}
+
+/// Load the on-disk installed-package registries the `install` subcommand writes — Global under
+/// `<package_dir>/packages.json`, Project under `<cwd>/.cyrup/packages.json` (the exact paths
+/// [`PackageStore::registry_path`] resolves for `PackageStore::new(package_dir, Some(cwd))`, the SAME
+/// construction the bin's `install` uses at subcommands.rs:396) — and concatenate them in the fixed
+/// project-then-global order discovery re-sorts into anyway (discovery.rs:435-439). This is the READ
+/// half of C1 (gap-07 #1 / gap-13 C1): the write half already works (the bin persists correctly);
+/// this threads the persisted registry into a live session, the missing wiring that made
+/// `cyrup install` a runtime no-op for skill/prompt/theme/extension resources.
+///
+/// A missing registry file is an empty registry (the common "nothing installed" case) and a
+/// malformed one is treated as "no packages from that scope" rather than aborting the whole session
+/// build — mirroring the working `cyrup-ext-subagents::enumerate_installed_packages` precedent
+/// (extension.rs:1269-1289) and `lock::load`'s own missing-file contract.
+fn load_installed_packages(package_dir: &Path, cwd: &Path) -> InstalledPackages {
+    let store = PackageStore::new(package_dir.to_path_buf(), Some(cwd.to_path_buf()));
+    let mut installed = InstalledPackages::default();
+    for scope in [InstallScope::Project, InstallScope::Global] {
+        let Some(registry_path) = store.registry_path(scope) else {
+            continue;
+        };
+        if let Ok(registry) = cyrup_resources::package::lock::load(&registry_path) {
+            installed.packages.extend(registry.packages);
+        }
+    }
+    installed
 }
 
 /// Map the runtime mode to the extension `(ExtMode, has_ui)` (R-11-002).
