@@ -42,7 +42,16 @@ pub fn build() -> ExtensionApi {
     });
 
     // Notify hook: announce activation when a run starts.
-    api.on_agent_start(|ctx| ctx.ui().notify("demo extension active"));
+    api.on_agent_start(|ctx| {
+        ctx.ui().notify("demo extension active");
+        // parity gap #12: set_thinking_level from an EVENT handler. Pi allows this from any handler
+        // (runner.ts:330); cyrup routes it through the command-tier `control` path (deadlock rule),
+        // so from an event handler it must surface an OBSERVABLE error — never a silent no-op.
+        match ctx.models().set_thinking_level("minimal") {
+            Ok(()) => ctx.ui().notify("thinking level set from agent_start"),
+            Err(e) => ctx.ui().notify(&format!("thinking level rejected: {e}")),
+        }
+    });
 
     // --- the previously-dead mutating seams, now driven by the assembled host (gap-08 #1-#5) ---
 
@@ -438,6 +447,27 @@ pub fn build() -> ExtensionApi {
             match kill_result {
                 Ok(()) => Ok(Some(format!("proc killed code:{code:?}"))),
                 Err(e) => Ok(Some(format!("proc kill denied: {e}"))),
+            }
+        },
+    );
+
+    // A COMMAND-tier counterpart to the event-tier set_thinking_level call above (parity gap #12):
+    // at command tier the deadlock rule permits it, so the host APPLIES it (recorded as a
+    // `SetThinkingLevel` control op) and the guest observes `Ok(())`.
+    api.register_command(
+        "thinkdemo",
+        CommandDescriptor::new("Set the thinking level from a command (demo, parity gap #12)."),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let level = if args.trim().is_empty() { "high" } else { args.trim() };
+            match ctx.models().set_thinking_level(level) {
+                Ok(()) => {
+                    ctx.ui().notify(&format!("thinking level set: {level}"));
+                    Ok(Some(format!("thinking level set: {level}")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("thinking level rejected: {e}"));
+                    Ok(Some(format!("thinking level rejected: {e}")))
+                }
             }
         },
     );

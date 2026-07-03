@@ -808,14 +808,26 @@ impl Models {
         None
     }
 
-    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25). COMMAND-only
-    /// host-side (silently dropped from an event handler). Wraps the existing WIT
-    /// `models.set-thinking-level` import.
-    pub fn set_thinking_level(&self, level: &str) {
+    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25 / parity
+    /// gap #12).
+    ///
+    /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `runner.ts:330`, no tier
+    /// gate). cyrup routes it through the command-tier `control` path (the deadlock rule, arch-08
+    /// §6.3: Pi's `setThinkingLevel` re-emits `thinking_level_select`, `agent-session.ts:1588` — a
+    /// re-entrant dispatch a single-instance wasm store cannot legally make from a suspended event
+    /// handler). The restriction is therefore surfaced as an OBSERVABLE `Err` when called from an
+    /// event handler — matching every `control.*` op — instead of the former silent no-op. Returns
+    /// `Ok(())` when it takes effect (command tier), `Err(reason)` when rejected (event tier).
+    pub fn set_thinking_level(&self, level: &str) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::models::set_thinking_level(level);
+        {
+            return crate::guest::bindings::cyrup::ext::models::set_thinking_level(level);
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = level;
+        {
+            let _ = level;
+            Ok(())
+        }
     }
 }
 

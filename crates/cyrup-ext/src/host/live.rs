@@ -365,12 +365,17 @@ impl bindings::cyrup::ext::models::Host for HostState {
     async fn thinking_level(&mut self) -> Option<String> {
         guest_of(self).ok().and_then(|g| g.services.thinking_level())
     }
-    async fn set_thinking_level(&mut self, level: String) {
-        let Ok(guest) = guest_of(self) else { return };
-        if guest.require_command_tier().is_err() {
-            return;
-        }
-        let _ = guest.services.control(ControlOp::SetThinkingLevel(level));
+    async fn set_thinking_level(&mut self, level: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        // COMMAND-only (deadlock rule, R-08-008): reject an event-tier call with an OBSERVABLE
+        // error the guest can surface — matching every `control.*` op — instead of the former bare
+        // early return that silently dropped it (parity gap #12). Pi allows setThinkingLevel from
+        // any handler (runner.ts:330), but cyrup's `setThinkingLevel` routes through the
+        // command-tier `control` path (Pi's own re-emits `thinking_level_select`,
+        // agent-session.ts:1588 — a re-entrant dispatch a single-instance wasm store cannot make
+        // from a suspended event handler), so the restriction is real; here it is at least honest.
+        guest.require_command_tier()?;
+        guest.services.control(ControlOp::SetThinkingLevel(level))
     }
 }
 

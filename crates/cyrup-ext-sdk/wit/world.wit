@@ -308,7 +308,10 @@ interface models {
   set-model:          func(model-json: string);  // COMMAND-only at the host
   context-usage:      func() -> string;
   thinking-level:     func() -> option<string>;
-  set-thinking-level: func(level: string);       // COMMAND-only at the host
+  // COMMAND-only at the host (deadlock rule): Pi allows setThinkingLevel from any handler
+  // (runner.ts:330), but cyrup routes it through the command-tier `control` path, so an event-tier
+  // call is REJECTED with an observable error (like every `control.*` op) — never a silent no-op.
+  set-thinking-level: func(level: string) -> result<_, string>;
 }
 
 interface exec {
