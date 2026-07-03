@@ -1,18 +1,24 @@
 //! The default local backend over `tokio::fs` / `tokio::process` (arch-03 §3.3, §6.5).
 //!
 //! `LocalFs` is an indirection over the real filesystem; `LocalProc` runs commands through the
-//! detected shell, streams combined stdout+stderr, and kills the whole process tree on
-//! cancel/timeout (R-03-024/027). The two `ProcOps` methods intentionally use DIFFERENT
-//! escalations, 1:1 with their DIFFERENT real Pi consumers: [`LocalProc::exec`] backs both the
-//! `bash` tool (`bash.ts:82-148`'s `createLocalBashOperations`) and the immediate-bash RPC seam
+//! detected shell, streams combined stdout+stderr, and kills on cancel/timeout. The two `ProcOps`
+//! methods intentionally use DIFFERENT escalations, 1:1 with their DIFFERENT real Pi consumers:
+//! [`LocalProc::exec`] backs both the `bash` tool (`bash.ts:97-99`'s `createLocalBashOperations`,
+//! which spawns with `detached: process.platform !== "win32"`) and the immediate-bash RPC seam
 //! (`bash-executor.ts:108`'s `executeBashWithOperations`, which calls the SAME `BashOperations`),
 //! and both paths' abort/timeout handlers call `killProcessTree` (`shell.ts:200-225`) — an
-//! IMMEDIATE `killpg(SIGKILL)`, no `SIGTERM`, no grace period, ever. [`LocalProc::exec_argv`] backs
-//! the WASM `exec` capability grant instead, whose real consumer is `exec.ts:34-63`'s
-//! `execCommand`/`killProcess` — a `SIGTERM`-then-grace-then-`SIGKILL` escalation (the group-scoped
-//! analog of `cyrup-ext`'s `proc.rs::kill`, single-pid escalation for the non-`setsid`'d `proc`
-//! capability). The only `unsafe` in the crate lives here, isolated to the unix process-group calls
-//! (`setsid`/`killpg`) with safety comments.
+//! IMMEDIATE `killpg(SIGKILL)` (negated pid, whole process GROUP), no `SIGTERM`, no grace period,
+//! ever. [`LocalProc::exec_argv`] backs the WASM `exec` capability grant instead, whose real
+//! consumer is `exec.ts:34-63`'s `execCommand`/`killProcess` — spawned with `shell: false` and NO
+//! `detached` option, and killed via a bare `proc.kill("SIGTERM")`/`proc.kill("SIGKILL")` (Node's
+//! `ChildProcess.kill()` always signals only `this.pid`, never a negated/group pid, regardless of
+//! `detached`). So `exec_argv`'s escalation is a `SIGTERM`-then-grace-then-`SIGKILL`
+//! **single-pid** signal — the SAME single-pid mechanism `cyrup-ext`'s `proc.rs::kill` already uses
+//! for the unrelated long-lived `proc` capability ([`terminate_pid`]/[`kill_pid`], reused directly
+//! here) — NOT a process-group kill. The only `unsafe` in the crate lives here, isolated to the
+//! unix process-group calls (`setsid`/`killpg`, [`build_command`]/[`send_sigkill_tree`], used ONLY
+//! by [`LocalProc::exec`]) and the single-pid `kill(2)` calls ([`terminate_pid`]/[`kill_pid`]) with
+//! safety comments.
 
 use super::{
     Access, ArgvOutput, ArgvSpec, DirEntry, ExecSpec, ExitStatus, FsOps, Meta, ProcOps, ShellConfig,
@@ -256,9 +262,11 @@ fn build_command(spec: &ExecSpec) -> std::process::Command {
 
 /// Build the OS command for an [`ArgvSpec`] — a DIRECT argv (shell:false) exec (Pi `execCommand`
 /// spawn with `shell:false`, exec.ts:41-45): the program IS `spec.program`, its args are the literal
-/// `spec.args` (no shell, no word-splitting), with the same unix process-group setup as the shell path
-/// so the whole tree can be reaped on timeout/cancel.
-#[allow(unsafe_code)]
+/// `spec.args` (no shell, no word-splitting). Unlike [`build_command`] (the `bash`-tool/shell path,
+/// whose real consumer `bash.ts:97-99` passes `detached: true`), this deliberately does NOT
+/// `setsid` the child — Pi's real `execCommand` (`exec.ts:41-45`) never sets `detached` either, so
+/// the spawned process stays in the caller's own process group and [`LocalProc::exec_argv`]'s
+/// escalation targets it by single pid only ([`terminate_pid`]/[`kill_pid`]), never `killpg`.
 fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     let mut std_cmd = std::process::Command::new(&spec.program);
     std_cmd.args(&spec.args);
@@ -282,59 +290,19 @@ fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     std_cmd.stdin(std::process::Stdio::null());
     std_cmd.stdout(std::process::Stdio::piped());
     std_cmd.stderr(std::process::Stdio::piped());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` only detaches the child into its own session/process group before exec;
-        // it touches no parent memory and is async-signal-safe. This makes the child the group leader
-        // (pgid == pid) so the whole tree can be killed via `killpg` on timeout/cancel (R-03-027).
-        unsafe {
-            std_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    // Deliberately NO `setsid`/process-group setup here — Pi's real `execCommand` spawn
+    // (`exec.ts:41-45`) never sets `detached`, so the child stays in the caller's own process
+    // group and must be signaled by single pid only, never `killpg` (see the doc comment above and
+    // the module doc comment).
     std_cmd
 }
 
-/// Send the GRACEFUL first step of the kill-tree escalation (Pi `killProcess`'s `proc.kill
-/// ("SIGTERM")`, `exec.ts:55`) to the child's whole process GROUP (contrast [`terminate_pid`],
-/// which signals a single non-group-leader pid for the unrelated `proc` capability). A `setsid`'d
-/// tree that traps `SIGTERM` gets real time — up to [`LocalProc::kill_grace`] — to flush state /
-/// clean up children before [`send_sigkill_tree`] forces it (R-03-024/027).
-///
-/// Returns whether a REAL graceful signal was actually sent: `true` on unix when `killpg(2)`
-/// succeeds; `false` on non-unix (no portable single-call graceful-signal-a-tree primitive there)
-/// AND on unix if the group is already gone (`killpg` fails, e.g. `ESRCH`). Callers must use this
-/// to skip the grace-period wait when nothing was sent — exactly the sibling `proc` capability's
-/// `ProcCaps::kill`/`cyrup_tools::terminate_pid` fix for the identical bug class (commit `0790ace`:
-/// "skip the pointless SIGTERM grace wait on non-unix").
-#[allow(unsafe_code)]
-fn send_sigterm_tree(child: &tokio::process::Child) -> bool {
-    #[cfg(unix)]
-    {
-        match child.id() {
-            // SAFETY: send SIGTERM to the child's process group (created via `setsid`). A negative
-            // pid / killpg targets the group; a nonzero return (e.g. `ESRCH`, group already gone)
-            // means nothing was actually signaled.
-            Some(pid) => unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) == 0 },
-            None => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No portable graceful-signal primitive on non-unix without a real `Child` + platform API
-        // beyond what this crate depends on — genuinely nothing is sent here; [`send_sigkill_tree`]'s
-        // `taskkill /F /T` is the only real termination path on this platform.
-        let _ = child;
-        false
-    }
-}
-
-/// Force-kill the child's whole process tree (Pi `killProcess`'s escalation, `exec.ts:57-61`: `if
-/// (!proc.killed) proc.kill("SIGKILL")` after the grace period) — R-03-024/027.
+/// Force-kill [`LocalProc::exec`]'s (the `bash`-tool/shell path's) child's whole process tree —
+/// Pi's real `killProcessTree` (`shell.ts:200-225`: `process.kill(-pid, "SIGKILL")`), the ONLY step
+/// of that escalation (no `SIGTERM`, no grace period, ever — see the module doc comment) —
+/// R-03-024/027. NOT used by [`LocalProc::exec_argv`], which is single-pid
+/// ([`terminate_pid`]/[`kill_pid`]) and DOES have a graceful `SIGTERM`-then-grace leg first; see the
+/// module doc comment for why the two methods diverge.
 #[allow(unsafe_code)]
 fn send_sigkill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
@@ -358,14 +326,17 @@ fn send_sigkill_tree(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
-/// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`send_sigterm_tree`],
-/// which targets the whole `setsid` group a shell-spawned tree needs, R-03-027). This is the graceful
-/// half of a two-step escalation for a caller that owns exactly one non-group-leader child directly
-/// (e.g. cyrup-ext's long-lived `proc` capability, arch-08 §5.2/pi-mcp-adapter-port.md §3.1, which
-/// spawns a plain — not `setsid`'d — child, mirroring the real `StdioClientTransport`'s non-detached
-/// spawn 1:1). A best-effort no-op on non-unix (no portable single-pid graceful-signal primitive
-/// there without holding the `Child` itself, which this pid-only API deliberately doesn't require);
-/// [`kill_pid`] is the forceful escalation that DOES work everywhere.
+/// Send SIGTERM to a SINGLE process by pid — NOT a process group (contrast [`send_sigkill_tree`],
+/// which targets the whole `setsid` group [`LocalProc::exec`]'s shell-spawned tree needs,
+/// R-03-027). This is the graceful half of a two-step escalation for a caller that owns exactly one
+/// non-group-leader child directly: TWO real consumers share this exact mechanism — cyrup-ext's
+/// long-lived `proc` capability (arch-08 §5.2/pi-mcp-adapter-port.md §3.1, which spawns a plain —
+/// not `setsid`'d — child, mirroring the real `StdioClientTransport`'s non-detached spawn 1:1), and
+/// [`LocalProc::exec_argv`] (the WASM `exec` capability grant, whose real consumer `exec.ts:34-63`'s
+/// `execCommand`/`killProcess` never sets `detached` and signals via a bare, un-negated
+/// `proc.kill("SIGTERM")`). A best-effort no-op on non-unix (no portable single-pid graceful-signal
+/// primitive there without holding the `Child` itself, which this pid-only API deliberately doesn't
+/// require); [`kill_pid`] is the forceful escalation that DOES work everywhere.
 ///
 /// Returns whether a REAL graceful signal was actually sent: `Ok(true)` on unix (the `kill(2)` call
 /// succeeded); `Ok(false)` on non-unix, where nothing was sent at all. Callers MUST skip any
@@ -391,7 +362,8 @@ pub fn terminate_pid(pid: u32) -> std::io::Result<bool> {
 
 /// Force-kill a SINGLE process by pid (SIGKILL / non-unix `taskkill /F /PID`, no `/T` — this
 /// targets exactly the one pid, never a subtree; contrast [`send_sigkill_tree`]). The escalation
-/// half of [`terminate_pid`]; works everywhere (unlike the graceful half).
+/// half of [`terminate_pid`]; works everywhere (unlike the graceful half). Shared by cyrup-ext's
+/// `proc` capability and [`LocalProc::exec_argv`] — see [`terminate_pid`]'s doc comment.
 #[allow(unsafe_code)]
 pub fn kill_pid(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -630,17 +602,21 @@ impl ProcOps for LocalProc {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled(), if pending.is_none() => {
+                    // SINGLE-PID SIGTERM (Pi's bare `proc.kill("SIGTERM")`, `exec.ts:55` — NEVER a
+                    // negated/group pid; `exec.ts`'s spawn never sets `detached`, so there IS no
+                    // group to target here, unlike `LocalProc::exec`'s group `send_sigkill_tree`).
                     // Skip the grace-period wait entirely when nothing was actually sent (non-unix,
-                    // or the group is already gone) — waiting it out has zero chance of a graceful
+                    // or the pid is already gone) — waiting it out has zero chance of a graceful
                     // exit landing, mirroring `ProcCaps::kill`'s identical fix for this bug class
-                    // (`cyrup-ext/src/caps/proc.rs:347-355`, commit `0790ace`).
-                    let sigterm_sent = send_sigterm_tree(&child);
+                    // (`cyrup-ext/src/caps/proc.rs:748-751`, commit `0790ace`) — indeed the SAME
+                    // `terminate_pid` call, reused directly rather than merely mirrored.
+                    let sigterm_sent = child.id().is_some_and(|pid| terminate_pid(pid).unwrap_or(false));
                     pending = Some(ExitStatus::Killed);
                     let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
                     grace.as_mut().reset(tokio::time::Instant::now() + wait);
                 }
                 _ = &mut timeout_fut, if pending.is_none() => {
-                    let sigterm_sent = send_sigterm_tree(&child);
+                    let sigterm_sent = child.id().is_some_and(|pid| terminate_pid(pid).unwrap_or(false));
                     pending = Some(ExitStatus::TimedOut);
                     let wait = if sigterm_sent { self.kill_grace } else { Duration::ZERO };
                     grace.as_mut().reset(tokio::time::Instant::now() + wait);
@@ -658,8 +634,12 @@ impl ProcOps for LocalProc {
                     // instant of SIGKILL are still readable via the still-open read end even after
                     // the writer is gone, but only if something keeps calling `read_chunk` — mirrors
                     // `LocalProc::exec`'s cancel/timeout arms above, which never `break` either.
+                    // SINGLE-PID SIGKILL (Pi's bare `proc.kill("SIGKILL")`, `exec.ts:59` — same
+                    // never-a-group-pid rationale as the SIGTERM arms above).
                     sigkill_sent = true;
-                    send_sigkill_tree(&mut child);
+                    if let Some(pid) = child.id() {
+                        let _ = kill_pid(pid);
+                    }
                 }
                 _ = &mut idle_grace, if idle_armed => {
                     // `idle_armed` is only set after `child.wait()` already captured the real
@@ -1083,25 +1063,57 @@ mod tests {
         assert!(!status.success(), "a SIGTERM-terminated child does not exit successfully");
     }
 
-    /// `send_sigterm_tree`'s `bool` return is what `exec`/`exec_argv`'s select loops now use to skip
-    /// the grace-period wait when nothing was actually sent — the SAME bug class as `terminate_pid`
-    /// (`0790ace`), just for the whole-process-GROUP kill this file's `exec`/`exec_argv` use. Verified
-    /// directly against a REAL `setsid`'d process group: `true` while it's alive, `false` (`ESRCH`)
-    /// once it's already reaped — not just documented.
+    /// L4 round-17 finding #1: `exec_argv`'s kill escalation MUST signal only the single spawned
+    /// pid — Pi's real `execCommand`/`killProcess` (`exec.ts:34-63`) spawns with no `detached`
+    /// option and kills via a bare, un-negated `proc.kill("SIGTERM"/"SIGKILL")`, which Node always
+    /// delivers to `this.pid` alone, never a process group. Proven by actually spawning a SIBLING
+    /// process in the exact same process group as the `exec_argv`-spawned command (both inherit
+    /// THIS TEST's own group, since [`build_argv_command`] deliberately does not `setsid`), letting
+    /// `exec_argv`'s timeout escalate all the way to `SIGKILL`, and confirming the sibling survived.
+    /// The regression this guards against (`killpg` targeting the whole group) would have killed
+    /// this sibling as collateral damage — and, worse, in production would signal the WASM guest
+    /// engine's own ambient process group, since a real `exec_argv` caller is never `setsid`'d either.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn send_sigterm_tree_reports_true_while_alive_false_once_reaped() {
-        let std_cmd = build_argv_command(&argv("sleep", &["30"]));
-        let mut child = tokio::process::Command::from(std_cmd).spawn().expect("sleep spawns");
+    async fn exec_argv_kill_signals_only_the_single_pid_never_the_process_group() {
+        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+        let marker = std::env::temp_dir()
+            .join(format!("cyrup-exec-argv-singlepid-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // The outer `sh` is what `exec_argv` directly spawns and kills; it backgrounds a SIBLING
+        // `sleep 30` (via `&`, no `setsid`) that inherits the SAME process group and writes its own
+        // pid to `marker` before the outer shell blocks on `wait`.
+        let script = format!("sleep 30 & echo $! > {}; wait", marker.display());
+        let out = proc
+            .exec_argv(argv("sh", &["-c", &script]), CancelToken::new(), Some(Duration::from_millis(100)))
+            .await
+            .expect("exec_argv runs");
+        assert!(out.killed, "the timeout must have initiated a kill");
 
-        assert!(send_sigterm_tree(&child), "a live setsid'd group is genuinely signaled");
-        // `sleep` doesn't trap SIGTERM — the signal just sent is enough to reap it.
-        child.wait().await.expect("the SIGTERM-obeying child dies");
+        let sibling_pid: u32 = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(s) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = s.trim().parse()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background sibling must have written its pid before the outer shell died");
+        let _ = std::fs::remove_file(&marker);
 
+        // `terminate_pid` doubles as the liveness probe AND cleanup here: `Ok(true)` means the
+        // sibling was genuinely still alive (proving `exec_argv`'s kill never reached it) and also
+        // terminates it so the test doesn't leak a real `sleep 30` process; `Err` (`ESRCH`) would
+        // mean it was already dead — exactly what the group-kill regression would cause.
+        let sibling_was_alive = terminate_pid(sibling_pid).unwrap_or(false);
         assert!(
-            !send_sigterm_tree(&child),
-            "signaling an already-reaped process group must report false (ESRCH), not silently \
-             claim success"
+            sibling_was_alive,
+            "a same-process-group sibling of the exec_argv-spawned command must survive its \
+             SIGTERM/SIGKILL escalation — exec_argv's kill must target only the single spawned \
+             pid, mirroring Pi's real execCommand/killProcess (exec.ts:34-63), never `killpg`"
         );
     }
 

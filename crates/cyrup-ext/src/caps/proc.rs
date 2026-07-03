@@ -32,9 +32,10 @@ mod npx_resolver;
 /// reuses this ONE value for both of its own two waits for the same reason.
 ///
 /// NOT Pi's `packages/coding-agent/src/core/exec.ts:52-63` `killProcess` (that escalation is the
-/// separate, bounded one-shot `exec`/`bash`-tool-run kill path — a genuinely different code path
-/// from a long-lived duplex-pipe MCP transport child; see `cyrup-tools::ops::local::send_sigterm_tree`
-/// for where that 5000ms timing is actually ported, `cyrup-session-svc`'s `exec` grant).
+/// separate, bounded one-shot WASM `exec` capability grant's kill path — a genuinely different code
+/// path from a long-lived duplex-pipe MCP transport child; see
+/// `cyrup-tools::ops::local::LocalProc::exec_argv`, which reuses these SAME `terminate_pid`/
+/// `kill_pid` single-pid primitives, for where that 5000ms timing is actually ported).
 const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
 /// Bounded confirmation wait AFTER sending SIGKILL. The real `StdioClientTransport.close()` fires
 /// SIGKILL and returns immediately (fire-and-forget, stdio.js:169-176, no further wait) — but
@@ -320,14 +321,16 @@ struct ProcEntry {
 /// non-detached `child_process.spawn` (via `cross-spawn`), never a process-group leader.
 /// [`ProcCaps::kill`] mirrors that 1:1: it signals the single child pid directly
 /// (`cyrup_tools::terminate_pid`/`kill_pid`), NOT a `setsid`/`killpg` process-GROUP kill. Reusing
-/// `cyrup-tools`' `send_sigterm_tree`/`send_sigkill_tree` (the `exec`/`bash` seam's group-kill
-/// escalation, R-03-027) here would diverge from what the real consumer does for stdio MCP
-/// transport — that machinery exists because a SHELL-spawned command tree needs group cleanup; a
-/// directly-`spawn`ed single MCP server process does not, and killing a wider group than the real
-/// transport itself would is an unjustified behavior change, not a strictly-more-correct one.
-/// Accordingly `spawn` does NOT `setsid` the child either (contrast
-/// `cyrup-tools::ops::local::build_argv_command`), keeping the child a plain, non-group-leader
-/// process exactly like `cross-spawn`'s `spawn(..., {shell:false})` with no `detached` option.
+/// `cyrup-tools`' `send_sigkill_tree` (the `exec`/`bash` seam's group-kill escalation, R-03-027)
+/// here would diverge from what the real consumer does for stdio MCP transport — that machinery
+/// exists because a SHELL-spawned command tree needs group cleanup; a directly-`spawn`ed single MCP
+/// server process does not, and killing a wider group than the real transport itself would is an
+/// unjustified behavior change, not a strictly-more-correct one.
+/// Accordingly `spawn` does NOT `setsid` the child either — same choice, same reasoning, as
+/// `cyrup-tools::ops::local::build_argv_command` (the WASM `exec` grant's spawn, whose real
+/// consumer `exec.ts:41-45` likewise never sets `detached`) — keeping the child a plain,
+/// non-group-leader process exactly like `cross-spawn`'s `spawn(..., {shell:false})` with no
+/// `detached` option.
 pub struct ProcCaps {
     registry: Mutex<HashMap<u32, Arc<ProcEntry>>>,
     next_handle: AtomicU32,
