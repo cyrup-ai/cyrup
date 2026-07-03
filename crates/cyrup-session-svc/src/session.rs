@@ -233,6 +233,11 @@ pub(crate) struct SessionExtras {
     pub retry_base_delay_ms: u64,
     pub proc: Arc<dyn ProcOps>,
     pub shell: ShellConfig,
+    /// `shellPath` setting (Pi `getShellPath`, settings-manager.ts:864-865); resolved fresh on
+    /// every immediate-bash call (see [`AgentSession::execute_bash`]), never baked in at build time.
+    pub shell_path: Option<String>,
+    /// `shellCommandPrefix` setting (Pi `getShellCommandPrefix`, settings-manager.ts:895-896).
+    pub shell_command_prefix: Option<String>,
     pub dynamic_tools: DynamicToolState,
     /// The shared self-handle the builder also handed to the persist+fan-out subscriber.
     pub handle: Arc<SessionHandle>,
@@ -324,6 +329,8 @@ pub struct AgentSession {
     // ---- immediate-bash seam (Pi agent-session.ts:2582-2684) ----
     proc: Arc<dyn ProcOps>,
     shell: ShellConfig,
+    shell_path: Option<String>,
+    shell_command_prefix: Option<String>,
     /// Cancel handle for an in-flight `execute_bash` (Pi `_bashAbortController`).
     bash_cancel: Mutex<Option<CancelToken>>,
     /// Bash messages deferred while a run streams, flushed after the turn (Pi `_pendingBashMessages`).
@@ -408,6 +415,8 @@ impl AgentSession {
             overflow_recovery_attempted: Mutex::new(false),
             proc: extras.proc,
             shell: extras.shell,
+            shell_path: extras.shell_path,
+            shell_command_prefix: extras.shell_command_prefix,
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
             dynamic_tools: Mutex::new(extras.dynamic_tools),
@@ -3169,11 +3178,35 @@ impl AgentSession {
         // Managed bin dir (Pi `getBinDir()`, `config.ts:549`: `join(getAgentDir(), "bin")`), matching
         // `cyrup_config::ConfigDirs::bin_dir()`'s layout — see `run_bash`'s doc comment.
         let bin_dir = self.services.agent_dir.join("bin");
+        // Apply the `shellCommandPrefix` setting (Pi `executeBash`, agent-session.ts:2624-2627):
+        // prepend it before the command, joined by a newline — the same prefix application the
+        // agent-loop `bash` tool already performs (`cyrup-tools/src/tools/bash.rs:99-102`). The
+        // ORIGINAL `command` (not this resolved one) is still what gets recorded into history below,
+        // matching Pi's `recordBashResult(command, result, options)` (agent-session.ts:2628).
+        let resolved_command = match &self.shell_command_prefix {
+            Some(prefix) => format!("{prefix}\n{command}"),
+            None => command.to_string(),
+        };
+        // Resolve the shell fresh on THIS call, honoring a custom `shellPath` setting (Pi's
+        // `createLocalBashOperations({ shellPath })` resolves `getShellConfig(shellPath)` inside
+        // `exec` on every `executeBash` invocation — bash.ts:69/89 — never baked in once at session
+        // build time); a missing custom path surfaces the same `Custom shell path not found` error
+        // as the agent-loop `bash` tool (`cyrup-tools/src/tools/bash.rs:108-111`).
+        let shell = match self.shell_path.as_deref() {
+            Some(p) => match ShellConfig::resolve(Some(p)) {
+                Ok(shell) => shell,
+                Err(e) => {
+                    *Self::lock(&self.bash_cancel) = None;
+                    return Err(e.into());
+                }
+            },
+            None => self.shell.clone(),
+        };
         let outcome = run_bash(
             &self.proc,
-            &self.shell,
+            &shell,
             cwd,
-            command.to_string(),
+            resolved_command,
             Some(bin_dir.as_path()),
             cancel,
             on_chunk,

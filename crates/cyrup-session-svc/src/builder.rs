@@ -25,8 +25,8 @@ use cyrup_session::prompt::{
 };
 use cyrup_session::SessionLayout;
 use cyrup_tools::{
-    Availability, Backend, PermissionPolicy, ProtectedFs, ShellConfig, ToolRegistry, ToolsOptions,
-    TraversalFs,
+    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ShellConfig, ToolRegistry,
+    ToolsOptions, TraversalFs,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -432,6 +432,14 @@ impl SessionBuilder {
             resolve_model(&*self.provider, &cfg, &settings, &existing, has_existing_session, has_thinking_entry)?;
 
         // ---- 4. tools + isolation + policy (cyrup-tools) --------------------------------------
+        // `shellPath`/`shellCommandPrefix` settings (Pi `getShellPath`/`getShellCommandPrefix`,
+        // settings-manager.ts:864-865,895-896), read once here and threaded into BOTH bash seams:
+        // the agent-loop `bash` tool (via `ToolsOptions.bash` below, matching Pi's `_buildRuntime`
+        // passing `{commandPrefix, shellPath}` into `createAllToolDefinitions`, agent-session.ts:
+        // 2436-2448) and the immediate-bash RPC seam (via `SessionExtras` below, matching Pi's
+        // `executeBash` re-reading the same two settings, agent-session.ts:2624-2632).
+        let shell_path_setting = settings.effective().shell_path();
+        let shell_command_prefix_setting = settings.effective().shell_command_prefix();
         let shell = ShellConfig::detect();
         let base = Backend::local(shell.clone());
         // The process backend the immediate-bash seam (#8) runs against (kept past `base`'s move).
@@ -444,7 +452,18 @@ impl SessionBuilder {
             fs = Arc::new(ProtectedFs::with_defaults(fs));
         }
         let backend = Backend { fs, proc: base.proc.clone() };
-        let registry = ToolRegistry::with_builtins(cwd.clone(), backend, ToolsOptions::default());
+        let registry = ToolRegistry::with_builtins(
+            cwd.clone(),
+            backend,
+            ToolsOptions {
+                bash: BashOpts {
+                    command_prefix: shell_command_prefix_setting.clone(),
+                    shell_path: shell_path_setting.clone(),
+                    ..BashOpts::default()
+                },
+                ..ToolsOptions::default()
+            },
+        );
         let visible = registry.visible(&cfg.tool_availability);
         // Tool-set selection (Pi sdk.ts:244-251): an explicit `tools` allowlist, or `noTools`
         // ("all" ⇒ none; "builtin" ⇒ drop the default built-ins), then minus the `excludeTools`
@@ -816,6 +835,8 @@ impl SessionBuilder {
             retry_base_delay_ms: u64::try_from(eff.retry_base_delay_ms().max(0)).unwrap_or(0),
             proc: bash_proc,
             shell,
+            shell_path: shell_path_setting,
+            shell_command_prefix: shell_command_prefix_setting,
             dynamic_tools,
             handle,
         };

@@ -11,7 +11,7 @@ use cyrup_core::{
     AssistantMessage, Content, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxConfig, FauxModelDefinition, FauxProvider,
+    faux_assistant_message, faux_text, faux_tool_call, FauxConfig, FauxModelDefinition, FauxProvider,
 };
 use cyrup_provider::Provider;
 use cyrup_session_svc::{
@@ -246,6 +246,118 @@ async fn execute_bash_sanitizes_real_ansi_and_cr_from_a_live_child() {
         })
         .expect("a bashExecution message was recorded");
     assert_eq!(bash_msg["output"], "redtext\n");
+}
+
+/// `shellCommandPrefix` (Pi `getShellCommandPrefix`, settings-manager.ts:895-896) must be prepended
+/// before the command on the immediate-bash (`!!`/RPC) seam, exactly like Pi's `executeBash`
+/// (agent-session.ts:2624-2627: `prefix ? \`${prefix}\n${command}\` : command`).
+#[tokio::test]
+async fn execute_bash_applies_shell_command_prefix_setting() {
+    let fx = fixture();
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field("shellCommandPrefix", serde_json::json!("export L4_PREFIX_TEST=from-prefix"))
+        .unwrap();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+
+    let result = session
+        .execute_bash("echo $L4_PREFIX_TEST", BashOptions::default(), None)
+        .await
+        .expect("the prefixed command runs");
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        result.output.contains("from-prefix"),
+        "shellCommandPrefix must be prepended before the command: {:?}",
+        result.output
+    );
+
+    // The prefix is applied to the RESOLVED command only — the ORIGINAL command (unprefixed) is
+    // what gets recorded into history (Pi `recordBashResult(command, ...)`, agent-session.ts:2628).
+    let msgs = session.agent_messages().await;
+    let bash_msg = msgs
+        .iter()
+        .find_map(|m| match m {
+            cyrup_agent::AgentMessage::Custom { kind, payload, .. } if kind == "bashExecution" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .expect("a bashExecution message was recorded");
+    assert_eq!(bash_msg["command"], "echo $L4_PREFIX_TEST");
+}
+
+/// `shellPath` (Pi `getShellPath`, settings-manager.ts:864-865) must be honored on the immediate-bash
+/// seam, resolved fresh on each call (Pi `createLocalBashOperations({ shellPath })` → `getShellConfig`
+/// inside `exec`, bash.ts:69/89); a missing custom path surfaces the exact `Custom shell path not
+/// found` error `getShellConfig` throws (shell.ts:73), matching the agent-loop `bash` tool
+/// (`cyrup-tools/src/ops/shell.rs::ShellConfig::resolve`).
+#[tokio::test]
+async fn execute_bash_missing_custom_shell_path_setting_errors() {
+    let fx = fixture();
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field("shellPath", serde_json::json!("/no/such/shell/l4-round13-finding1-test"))
+        .unwrap();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+
+    let err = session
+        .execute_bash("echo hi", BashOptions::default(), None)
+        .await
+        .expect_err("a nonexistent custom shellPath must surface as a real error, not a fabricated success");
+    assert!(
+        err.to_string().contains("Custom shell path not found"),
+        "expected Pi's exact error text, got: {err}"
+    );
+    // The abort-controller-equivalent bash slot is cleared even on this error path (Pi's `finally`,
+    // agent-session.ts:2643).
+    assert!(!session.is_bash_running());
+}
+
+/// `shellCommandPrefix` must ALSO reach the agent-loop `bash` TOOL (not just the immediate-bash
+/// seam) — Pi's `_buildRuntime` passes the SAME `{commandPrefix, shellPath}` into
+/// `createAllToolDefinitions` (agent-session.ts:2436-2448), so a real LLM-issued `bash` tool call
+/// gets the identical prefix as the `!!`/RPC path. Drives a REAL scripted tool_use through the agent
+/// loop end-to-end (not a direct `BashTool::execute` unit call) to observe the wiring live.
+#[tokio::test]
+async fn agent_loop_bash_tool_applies_shell_command_prefix_setting() {
+    let fx = fixture();
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field("shellCommandPrefix", serde_json::json!("export L4_TOOL_PREFIX_TEST=from-tool-prefix"))
+        .unwrap();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(
+            vec![faux_tool_call("bash", serde_json::json!({"command": "echo $L4_TOOL_PREFIX_TEST"}))],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx)).cli_settings(cli).build().await.unwrap();
+
+    let _ = session.prompt("run the bash tool").await.unwrap();
+    session.wait_for_idle().await;
+
+    let msgs = session.agent_messages().await;
+    let tool_output: String = msgs
+        .iter()
+        .filter_map(|m| match m {
+            cyrup_agent::AgentMessage::ToolResult(tr) if tr.tool_name == "bash" => Some(
+                tr.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tool_output.contains("from-tool-prefix"),
+        "the agent-loop bash tool must honor the shellCommandPrefix setting: {tool_output:?}"
+    );
 }
 
 /// Output exceeding `DEFAULT_MAX_BYTES` (50KB) from a REAL child process is tail-truncated in the
