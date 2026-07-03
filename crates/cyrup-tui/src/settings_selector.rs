@@ -40,6 +40,10 @@ pub struct SettingRow {
     pub cycle: Vec<String>,
     /// Optional secondary description (unused in the compact grid; kept for parity).
     pub description: Option<String>,
+    /// When `Some(id)`, activating the row opens a nested picker instead of cycling in place (Pi's
+    /// `SettingItem.submenu`, `settings-selector.ts:603-610`). The chrome maps `id` to the picker
+    /// (e.g. `"theme"` → the theme selector). A submenu row never cycles and never persists a value.
+    pub submenu: Option<String>,
 }
 
 impl SettingRow {
@@ -51,6 +55,7 @@ impl SettingRow {
             value: value.to_string(),
             cycle: vec!["true".to_string(), "false".to_string()],
             description: None,
+            submenu: None,
         }
     }
 
@@ -67,6 +72,7 @@ impl SettingRow {
             value: value.into(),
             cycle: choices,
             description: None,
+            submenu: None,
         }
     }
 
@@ -78,6 +84,26 @@ impl SettingRow {
             value: value.into(),
             cycle: Vec::new(),
             description: None,
+            submenu: None,
+        }
+    }
+
+    /// A row that opens a nested picker on activation instead of cycling (Pi `SettingItem.submenu`,
+    /// `settings-selector.ts:603-610`; the "Theme" row). `value` is the current display value (e.g. the
+    /// active theme name); `submenu_id` is the picker key the chrome maps (`"theme"`).
+    pub fn submenu(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        value: impl Into<String>,
+        submenu_id: impl Into<String>,
+    ) -> Self {
+        SettingRow {
+            id: id.into(),
+            label: label.into(),
+            value: value.into(),
+            cycle: Vec::new(),
+            description: None,
+            submenu: Some(submenu_id.into()),
         }
     }
 }
@@ -192,12 +218,18 @@ impl Selector for SettingsSelector {
                 self.list.select_down();
                 SelectorOutcome::Redraw
             }
-            // Enter cycles the value in place and applies it live (Pi `cycleValue` → `onChange`); the
-            // slot stays open.
-            Some(SelectAction::Confirm) => match self.cycle_current() {
-                Some(payload) => SelectorOutcome::Apply(payload),
-                None => SelectorOutcome::Redraw,
-            },
+            // Enter on a submenu row opens the nested picker (Pi `SettingItem.submenu`); otherwise it
+            // cycles the value in place and applies it live (Pi `cycleValue` → `onChange`), the slot
+            // staying open.
+            Some(SelectAction::Confirm) => {
+                if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
+                    return SelectorOutcome::OpenSubmenu(id);
+                }
+                match self.cycle_current() {
+                    Some(payload) => SelectorOutcome::Apply(payload),
+                    None => SelectorOutcome::Redraw,
+                }
+            }
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => SelectorOutcome::Ignored,
         }

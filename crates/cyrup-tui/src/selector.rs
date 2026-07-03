@@ -181,6 +181,10 @@ pub enum SelectorOutcome {
     Apply(String),
     /// The selector was dismissed (`tui.select.cancel` — `Esc`/`Ctrl+C`).
     Cancel,
+    /// A `/settings` row that opens a nested picker was activated (Pi's `SettingItem.submenu`,
+    /// `settings-selector.ts:603-610` — the "Theme" row opens `ThemeSubmenu`). Carries the submenu id
+    /// (`"theme"`); the chrome replaces the settings selector with the matching picker (spec/tui/05 §6).
+    OpenSubmenu(String),
     /// `Ctrl+G` (`app.editor.external`) pressed inside [`crate::extension_editor::
     /// ExtensionEditorSelector`] (Pi `ExtensionEditorComponent.openExternalEditor`,
     /// `extension-editor.ts:119-157`): the chrome tears the terminal down for `$VISUAL`/`$EDITOR`,

@@ -71,6 +71,10 @@ const PAGE_SCROLL_LINES: usize = 10;
 pub enum AppAction {
     /// The user submitted a prompt (already optimistically shown in the transcript).
     Submit(String),
+    /// The user queued the editor text as a follow-up (Alt+Enter, `app.message.followUp`): the run
+    /// loop delivers it via [`AgentSession::follow_up`] when a turn is streaming, or as a plain submit
+    /// when idle (Pi `handleFollowUp`, interactive-mode.ts:3554-3585). Carries the trimmed text.
+    FollowUp(String),
     /// The user requested an abort/interrupt of the in-flight run (Esc).
     Interrupt,
     /// The user requested to quit the session.
@@ -105,6 +109,16 @@ pub enum AppAction {
     None,
 }
 
+/// The direction the model-cycle keybindings move through the cycle set (`app.model.cycleForward` vs
+/// `cycleBackward`, `core/keybindings.ts:76-83`; Pi `cycleModel(direction)`, interactive-mode.ts:3617).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CycleDirection {
+    /// Next model (Ctrl+P).
+    Forward,
+    /// Previous model (Shift+Ctrl+P).
+    Backward,
+}
+
 /// A slash command whose execution the run loop performs against the session/resources layer (the
 /// in-crate effects — `/hotkeys`, `/debug`, `/changelog`, `/quit`, the 3 dependency-free selectors —
 /// are applied directly in [`App::dispatch_submission`] and never become an `AppCommand`).
@@ -112,6 +126,11 @@ pub enum AppAction {
 pub enum AppCommand {
     /// Open a data-bound selector; the run loop sources its rows from session-svc / resources.
     OpenSelector(SelectorKind),
+    /// Cycle to the next/previous model in place (`app.model.cycleForward`/`cycleBackward`): the run
+    /// loop reads the cycle set (the scoped models if any, else the available catalog), advances from
+    /// the current model, and calls [`AgentSession::set_model`] (Pi `cycleModel`,
+    /// interactive-mode.ts:3617-3632).
+    CycleModel(CycleDirection),
     /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
     /// branch, login/logout, etc.
     ConfirmSelection { kind: SelectorKind, value: String },
@@ -966,7 +985,53 @@ impl<B: Backend> App<B> {
                 self.state.transcript.page_down(PAGE_SCROLL_LINES);
                 AppAction::Redraw
             }
+            // `app.thinking.cycle` (Shift+Tab): advance the reasoning level in place — no picker — and
+            // re-color the editor rule + footer, exactly like Pi's `cycleThinkingLevel`
+            // (interactive-mode.ts:3606-3614). The level is the TUI-owned state the thinking selector's
+            // confirm path also drives, so a Shift+Tab cycle and a `/think`-selector pick stay in sync.
+            Action::ThinkingCycle => {
+                self.cycle_thinking_level();
+                AppAction::Redraw
+            }
+            // `app.model.cycleForward` / `cycleBackward` (Ctrl+P / Shift+Ctrl+P): the model swap needs
+            // the live catalog + `set_model` at the session layer, so it rides an `AppCommand` the run
+            // loop applies (Pi `cycleModel`, interactive-mode.ts:3617-3632).
+            Action::ModelCycleForward => {
+                AppAction::Command(AppCommand::CycleModel(CycleDirection::Forward))
+            }
+            Action::ModelCycleBackward => {
+                AppAction::Command(AppCommand::CycleModel(CycleDirection::Backward))
+            }
+            // `app.message.followUp` (Alt+Enter): queue the editor text as a follow-up delivered after
+            // the turn goes idle (Pi `handleFollowUp`, interactive-mode.ts:3554-3585). Empty input is a
+            // no-op (Pi's `if (!text) return`); the streaming-vs-idle decision + delivery is async, so
+            // it rides an `AppAction` the run loop resolves against the live session.
+            Action::FollowUp => {
+                let text = self.state.editor.text();
+                if text.trim().is_empty() {
+                    AppAction::Redraw
+                } else {
+                    AppAction::FollowUp(text)
+                }
+            }
         }
+    }
+
+    /// Advance the reasoning level one step through Pi's canonical cycle (`THINKING_LEVELS`,
+    /// agent-session.ts:262: `off→minimal→low→medium→high`, wrapping), updating the footer band and the
+    /// editor's always-visible rule color (spec/tui/03 §3.3) — the in-place body of `app.thinking.cycle`
+    /// (`cycleThinkingLevel`, interactive-mode.ts:3606-3614). A current level outside the cycle set
+    /// (e.g. `xhigh`, reachable only via the `/think` selector) restarts at `off`, matching Pi's
+    /// `indexOf(...)` = -1 → `(-1 + 1) % len` = 0 wrap.
+    fn cycle_thinking_level(&mut self) {
+        const THINKING_LEVELS: [&str; 5] = ["off", "minimal", "low", "medium", "high"];
+        let pos = THINKING_LEVELS.iter().position(|l| *l == self.state.thinking_level);
+        let next = pos.map_or(0, |i| (i + 1) % THINKING_LEVELS.len());
+        let level = THINKING_LEVELS.get(next).copied().unwrap_or("off");
+        self.state.thinking_level = level.to_string();
+        self.state.status.set_thinking_level(level);
+        self.state.editor.set_thinking_level(level);
+        self.state.transcript.push_status(format!("Thinking level: {level}"));
     }
 
     /// Route one key to the topmost floating overlay (spec/tui/05 §2 step 2). `Close` pops it; any
@@ -1041,6 +1106,12 @@ impl<B: Backend> App<B> {
             entry(g(Action::Suspend), "Suspend to background"),
             entry(g(Action::ToolsExpand), "Toggle tool output expansion"),
             entry(g(Action::ExternalEditor), "Open buffer in external editor"),
+            entry(g(Action::ThinkingCycle), "Cycle thinking level"),
+            entry(
+                format!("{}/{}", g(Action::ModelCycleForward), g(Action::ModelCycleBackward)),
+                "Cycle model forward / backward",
+            ),
+            entry(g(Action::FollowUp), "Queue message as a follow-up"),
             entry("/".to_string(), "Slash commands"),
             entry("!".to_string(), "Run bash command"),
             entry("!!".to_string(), "Run bash command (excluded from context)"),
@@ -1329,6 +1400,15 @@ impl<B: Backend> App<B> {
                 self.close_selector(true);
                 AppAction::Redraw
             }
+            // A `/settings` submenu row (Pi `SettingItem.submenu`, settings-selector.ts:603-610):
+            // replace the settings selector with the nested picker. Only `"theme"` exists today — the
+            // theme picker with live preview (`ThemeSubmenu`); an unknown id is a defensive no-op.
+            SelectorOutcome::OpenSubmenu(id) => {
+                if id == "theme" {
+                    self.open_selector(SelectorKind::Theme);
+                }
+                AppAction::Redraw
+            }
             // `Ctrl+G` inside the extension `ui.editor` dialog (L4 review §3) — the actual
             // teardown+spawn+restore needs `&mut self: &mut App` (terminal access), which
             // `Selector::handle` doesn't have; bubble it up as an `AppAction` the run loop's
@@ -1545,7 +1625,7 @@ impl<B: Backend> App<B> {
                 // `/settings` (settings-selector.ts): the curated toggle/choice grid sourced from the
                 // live effective settings. Each row cycles in place on `Enter` and persists via
                 // `ApplySetting` (Pi's settings selector applies on `onChange`).
-                let rows = settings_rows(session.services().settings.effective());
+                let rows = settings_rows(session.services().settings.effective(), &self.state.theme.name);
                 let inner: Box<dyn Selector> = Box::new(SettingsSelector::new("Settings", rows));
                 self.open_boxed_selector(SelectorKind::Settings, inner);
             }
@@ -1649,6 +1729,49 @@ impl<B: Backend> App<B> {
                 match session.set_model(&value).await {
                     Ok(_) => self.state.transcript.push_status(format!("model → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+                }
+            }
+            C::CycleModel(direction) => {
+                // The cycle set is the scoped models when a scope is active, else the full available
+                // catalog (Pi `cycleModel`: `scopedModels.length > 0 ? scoped : available`). Cycling by
+                // model id mirrors the `/model` confirm path (`set_model(&value)` above); the footer
+                // re-reads the new model off the `ModelChanged` event this triggers.
+                let scoped = session.scoped_models();
+                let scoped_active = !scoped.is_empty();
+                let cycle: Vec<(String, String, String)> = if scoped_active {
+                    scoped
+                        .iter()
+                        .map(|sm| {
+                            (sm.model.id.to_string(), sm.model.provider.to_string(), sm.model.name.clone())
+                        })
+                        .collect()
+                } else {
+                    session
+                        .available_model_catalog()
+                        .iter()
+                        .map(|m| (m.id.to_string(), m.provider.to_string(), m.name.clone()))
+                        .collect()
+                };
+                if cycle.len() <= 1 {
+                    let msg =
+                        if scoped_active { "Only one model in scope" } else { "Only one model available" };
+                    self.state.transcript.push_status(msg);
+                } else {
+                    let current = session.model();
+                    let n = cycle.len();
+                    let cur = cycle.iter().position(|(id, prov, _)| {
+                        id == current.model.as_str() && prov == current.provider.as_str()
+                    });
+                    let next = match direction {
+                        CycleDirection::Forward => cur.map_or(0, |i| (i + 1) % n),
+                        CycleDirection::Backward => cur.map_or(0, |i| (i + n - 1) % n),
+                    };
+                    if let Some((id, _prov, name)) = cycle.get(next) {
+                        match session.set_model(id).await {
+                            Ok(_) => self.state.transcript.push_status(format!("Switched to {name}")),
+                            Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+                        }
+                    }
                 }
             }
             C::ConfirmSelection { kind: SelectorKind::ScopedModels, value } => {
@@ -2320,9 +2443,12 @@ fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
 /// `SettingsConfig` → `SettingItem`s, :479-712). Each row's `id` is the dotted settings key persisted
 /// on cycle; toggles cycle `true`/`false`, choices cycle their fixed sets. Read straight off
 /// [`cyrup_session_svc::EffectiveSettings`] so the displayed value matches the merged config.
-fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings) -> Vec<SettingRow> {
+fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str) -> Vec<SettingRow> {
     let choices = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     vec![
+        // The "Theme" row opens the theme picker (Pi `SettingItem.submenu` → `ThemeSubmenu`,
+        // settings-selector.ts:603-610) — the one in-app path Pi reaches theme switching through.
+        SettingRow::submenu("theme", "Theme", current_theme.to_string(), "theme"),
         SettingRow::toggle("compaction.enabled", "Auto-compact", eff.compaction_enabled()),
         SettingRow::toggle("terminal.showImages", "Show images", eff.show_images()),
         SettingRow::choice(
@@ -2952,6 +3078,30 @@ impl App<CrosstermBackend<Stdout>> {
                                 let ui = UserInput::text(text, InputSource::Tui);
                                 if session.is_streaming().await {
                                     let _ = session.steer(ui).await;
+                                } else {
+                                    let _ = session.prompt_accepted(ui).await;
+                                }
+                            });
+                        }
+                        AppAction::FollowUp(text) => {
+                            // Pi `handleFollowUp` (interactive-mode.ts:3554-3585): while a turn is
+                            // streaming, queue the text as a follow-up (delivered once the agent goes
+                            // idle — a SEPARATE queue from `steer`); when idle, Alt+Enter behaves like a
+                            // plain Enter submit. The editor is cleared here (Pi's `setText("")` in both
+                            // branches) since `apply_action` deferred the mutation until this async
+                            // streaming check. Spawned, not awaited, for the same guest-reentrancy reason
+                            // as `Submit`.
+                            self.state.editor.clear();
+                            let streaming = session.is_streaming().await;
+                            if !streaming {
+                                // Idle → behaves like a normal prompt: echo optimistically before send.
+                                self.state.transcript.push_user(text.clone());
+                            }
+                            let session = session.clone();
+                            tokio::spawn(async move {
+                                let ui = UserInput::text(text, InputSource::Tui);
+                                if streaming {
+                                    let _ = session.follow_up(ui).await;
                                 } else {
                                     let _ = session.prompt_accepted(ui).await;
                                 }

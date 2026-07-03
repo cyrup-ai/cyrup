@@ -59,6 +59,20 @@ pub enum Action {
     /// Open the editor buffer in `$VISUAL`/`$EDITOR` (Ctrl+G) — `app.editor.external`
     /// (`openExternalEditor`, interactive-mode.ts:3611).
     ExternalEditor,
+    /// Cycle the reasoning level in place (Shift+Tab) — `app.thinking.cycle`
+    /// (`cycleThinkingLevel`, interactive-mode.ts:3606-3614; `core/keybindings.ts:72-75`). Advances
+    /// `off→minimal→low→medium→high` (wrapping) and re-colors the editor rule to the new level.
+    ThinkingCycle,
+    /// Switch to the next model in the cycle set (Ctrl+P) — `app.model.cycleForward`
+    /// (`cycleModel("forward")`, interactive-mode.ts:3617-3632; `core/keybindings.ts:76-79`).
+    ModelCycleForward,
+    /// Switch to the previous model in the cycle set (Shift+Ctrl+P) — `app.model.cycleBackward`
+    /// (`cycleModel("backward")`, interactive-mode.ts:3617-3632; `core/keybindings.ts:80-83`).
+    ModelCycleBackward,
+    /// Queue the editor text as a follow-up delivered after the turn goes idle (Alt+Enter) —
+    /// `app.message.followUp` (`handleFollowUp`, interactive-mode.ts:3554-3585;
+    /// `core/keybindings.ts:98-101`). Acts as a plain submit when the session is idle.
+    FollowUp,
 }
 
 impl Action {
@@ -74,6 +88,10 @@ impl Action {
             "app.pageDown" => Some(Action::PageDown),
             "app.tools.expand" => Some(Action::ToolsExpand),
             "app.editor.external" => Some(Action::ExternalEditor),
+            "app.thinking.cycle" => Some(Action::ThinkingCycle),
+            "app.model.cycleForward" => Some(Action::ModelCycleForward),
+            "app.model.cycleBackward" => Some(Action::ModelCycleBackward),
+            "app.message.followUp" => Some(Action::FollowUp),
             _ => None,
         }
     }
@@ -231,6 +249,7 @@ impl Key {
                 "super" | "cmd" | "command" => mods |= KeyModifiers::SUPER,
                 "enter" | "return" => code = Some(KeyCode::Enter),
                 "tab" => code = Some(KeyCode::Tab),
+                "backtab" => code = Some(KeyCode::BackTab),
                 "esc" | "escape" => code = Some(KeyCode::Esc),
                 "space" => code = Some(KeyCode::Char(' ')),
                 "up" => code = Some(KeyCode::Up),
@@ -298,6 +317,7 @@ impl Key {
             KeyCode::Char(c) => c.to_string(),
             KeyCode::Enter => "enter".to_string(),
             KeyCode::Tab => "tab".to_string(),
+            KeyCode::BackTab => "shift+tab".to_string(),
             KeyCode::Esc => "esc".to_string(),
             KeyCode::Up => "up".to_string(),
             KeyCode::Down => "down".to_string(),
@@ -336,6 +356,21 @@ impl Default for Keymap {
                 (Key::ctrl('g'), Action::ExternalEditor),
                 (Key::plain(KeyCode::PageUp), Action::PageUp),
                 (Key::plain(KeyCode::PageDown), Action::PageDown),
+                // `app.thinking.cycle` (`core/keybindings.ts:72-75`, default `shift+tab`). A terminal
+                // reports Shift+Tab three ways depending on the keyboard protocol: the legacy `CSI Z`
+                // `BackTab` (with or without a SHIFT flag) and — under this TUI's Kitty
+                // DISAMBIGUATE mode — `Tab`+SHIFT. Bind all three so the cycle fires regardless.
+                (Key::plain(KeyCode::BackTab), Action::ThinkingCycle),
+                (Key { code: KeyCode::BackTab, mods: KeyModifiers::SHIFT }, Action::ThinkingCycle),
+                (Key { code: KeyCode::Tab, mods: KeyModifiers::SHIFT }, Action::ThinkingCycle),
+                // `app.model.cycleForward` / `cycleBackward` (`core/keybindings.ts:76-83`).
+                (Key::ctrl('p'), Action::ModelCycleForward),
+                (
+                    Key { code: KeyCode::Char('p'), mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT },
+                    Action::ModelCycleBackward,
+                ),
+                // `app.message.followUp` (`core/keybindings.ts:98-101`, default `alt+enter`).
+                (Key { code: KeyCode::Enter, mods: KeyModifiers::ALT }, Action::FollowUp),
             ],
         }
     }
