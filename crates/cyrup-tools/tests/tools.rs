@@ -1108,6 +1108,34 @@ async fn bash_missing_shell_path_errors() {
     assert!(err.to_string().contains("Custom shell path not found"), "got: {err}");
 }
 
+// Pi always emits its initial empty `onUpdate({content:[],details:undefined})` (bash.ts:355-357)
+// strictly BEFORE `ops.exec` runs `resolveTimeoutMs`/the abort check/`getShellConfig`
+// (bash.ts:85-89), so even a hard-failing shell resolution must be preceded by that update.
+#[tokio::test]
+async fn bash_missing_shell_path_still_emits_initial_empty_update_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let updates: Arc<std::sync::Mutex<Vec<ToolUpdate>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink: ToolUpdateSink = {
+        let updates = updates.clone();
+        Box::new(move |u| {
+            updates.lock().unwrap().push(u);
+        })
+    };
+    let bash = bash_tool(
+        dir.path().to_path_buf(),
+        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+    );
+    let err = bash
+        .execute(cid(), serde_json::json!({ "command": "echo hi" }), CancelToken::new(), sink)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Custom shell path not found"), "got: {err}");
+    let seen = updates.lock().unwrap();
+    assert_eq!(seen.len(), 1, "expected exactly one (the initial empty) update, got {seen:?}");
+    assert!(seen[0].content.is_empty());
+    assert!(seen[0].details.is_none());
+}
+
 // gap #13 — read offset bound is `allLines.length` (the trailing-newline phantom line counts),
 // and the out-of-bounds error reads `(N lines total)` (read.ts:268-275).
 #[tokio::test]

@@ -102,32 +102,35 @@ impl Tool for BashTool {
             None => ctx,
         };
 
-        // Resolve the shell per-exec, honoring an explicit settings `shellPath` (Pi's
-        // `createLocalBashOperations` calls `getShellConfig(shellPath)` inside `exec`,
-        // bash.ts:69); a missing custom path surfaces as the `Custom shell path not found` error.
-        let shell = match self.opts.shell_path.as_deref() {
-            Some(p) => ShellConfig::resolve(Some(p))?,
-            None => self.shell.clone(),
-        };
-
-        let spec = ExecSpec { command: ctx.command, cwd: ctx.cwd, env: ctx.env, shell };
-
         let max_lines = self.opts.max_lines;
         let max_bytes = self.opts.max_bytes;
 
         let mut acc = OutputAccumulator::new("cyrup-bash", max_lines, max_bytes);
         let mut sink = on_update;
 
-        // Pi emits an initial empty update before streaming (bash.ts:355-357). This happens BEFORE
-        // `ops.exec` runs `resolveTimeoutMs` (bash.ts:400,85), so an invalid timeout surfaces AFTER
-        // this empty update — emit it first, then validate.
+        // Pi emits an initial empty update before streaming (bash.ts:355-357), strictly BEFORE
+        // `ops.exec` is ever called — everything `ops.exec` does internally (`resolveTimeoutMs`
+        // at bash.ts:85, the abort check, and `getShellConfig` at bash.ts:69) happens AFTER this
+        // update. Emit it first, then run those checks in the same order.
         sink(ToolUpdate { content: vec![], details: None, terminate: None });
 
-        // Pi's `resolveTimeoutMs` (bash.ts:85): validate the seconds and convert to a `Duration`.
-        // An invalid value reaches Pi's catch as a plain `Error` that matches neither `"aborted"`
-        // nor `"timeout:"`, so it is re-thrown verbatim via `throw err` (bash.ts:417) with no status
-        // appended — mirror that by returning the raw error here.
+        // Pi's `resolveTimeoutMs` (bash.ts:85), called at the top of `ops.exec` right after the
+        // initial `onUpdate`. An invalid value reaches Pi's catch as a plain `Error` that matches
+        // neither `"aborted"` nor `"timeout:"`, so it is re-thrown verbatim via `throw err`
+        // (bash.ts:417) with no status appended — mirror that by returning the raw error here.
         let timeout = resolve_timeout_ms(input.timeout)?;
+
+        // Resolve the shell per-exec, honoring an explicit settings `shellPath` (Pi's
+        // `createLocalBashOperations` calls `getShellConfig(shellPath)` inside `exec`, AFTER
+        // `resolveTimeoutMs` and the abort check, bash.ts:85-89); a missing custom path surfaces
+        // as the `Custom shell path not found` error only after the initial empty update and the
+        // timeout validation have already happened, exactly like Pi.
+        let shell = match self.opts.shell_path.as_deref() {
+            Some(p) => ShellConfig::resolve(Some(p))?,
+            None => self.shell.clone(),
+        };
+
+        let spec = ExecSpec { command: ctx.command, cwd: ctx.cwd, env: ctx.env, shell };
 
         // Pi debounces mid-stream output updates with a 100ms throttle that has BOTH a leading edge
         // AND a scheduled TRAILING-edge `setTimeout` flush (`scheduleOutputUpdate`, bash.ts:158,
