@@ -363,9 +363,19 @@ impl SessionBuilder {
         // ---- 2b. session tree (cyrup-session arch-04) — created BEFORE model resolution so the
         // model/thinking restore can read the resumed branch (Pi sdk.ts:178,187: the SessionManager
         // is constructed, then `buildSessionContext()` feeds `existingSession.model`/`thinkingLevel`).
-        let sessions_root =
-            cfg.session_dir.clone().unwrap_or_else(|| cfg.agent_dir.join("sessions"));
-        let layout = SessionLayout::new(sessions_root, cwd.clone());
+        // Pi chooses the session directory per call: an explicit `sessionDir` (`--session-dir`) is
+        // used LITERALLY, otherwise the cwd-encoded default `getDefaultSessionDir(cwd)` applies
+        // (`sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd)`,
+        // session-manager.ts:1430,1457,1496). `cfg.session_dir` is `Some` only when `--session-dir`
+        // (or its env) was explicitly supplied (the "was it explicit" signal ConfigDirs collapses one
+        // layer too early is preserved as this `Option`); `None` ⇒ the encoded default. Using the
+        // encoded [`SessionLayout::new`] on an explicit dir would nest one level too deep
+        // (gap-analysis 05, Finding 3).
+        let default_root = cfg.agent_dir.join("sessions");
+        let layout = match &cfg.session_dir {
+            Some(dir) => SessionLayout::literal(dir.clone(), cwd.clone()),
+            None => SessionLayout::new(default_root.clone(), cwd.clone()),
+        };
         let mut manager = match self.prebuilt_manager {
             Some(m) => m,
             None => match &cfg.target {
@@ -389,7 +399,21 @@ impl SessionBuilder {
                 SessionTarget::Resume(path) => {
                     SessionManager::open_with_cwd(path, cfg.cwd_override.as_deref())?
                 }
-                SessionTarget::Continue => SessionManager::continue_recent(&cwd, &layout)?,
+                // Pi `continueRecent` applies a cross-project cwd filter exactly when a custom
+                // `sessionDir` is in play and it is not the cwd-default
+                // (`filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd)`,
+                // session-manager.ts:1458), so a shared `--session-dir` holding several projects'
+                // sessions only resumes the current project's. The default (encoded) root already
+                // isolates by cwd, so it never filters.
+                SessionTarget::Continue => {
+                    let filter_cwd = match &cfg.session_dir {
+                        Some(dir) => {
+                            *dir != SessionLayout::new(default_root.clone(), cwd.clone()).dir()
+                        }
+                        None => false,
+                    };
+                    SessionManager::continue_recent_filtered(&cwd, &layout, filter_cwd)?
+                }
                 // Fork the resolved source file into a fresh session at the build cwd (Pi
                 // `forkSessionOrExit`/`SessionManager.forkFrom`, main.ts:251-258). The `--session-id`
                 // (when given) becomes the forked session's id; otherwise one is minted.

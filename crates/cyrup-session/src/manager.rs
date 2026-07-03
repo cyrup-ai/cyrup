@@ -86,9 +86,18 @@ impl SessionManager {
     /// leaves `fileEntries`' header untouched (the override lives on the `this.cwd` field only).
     pub fn open_with_cwd(path: &Path, cwd_override: Option<&Path>) -> Result<Self, SessionError> {
         let meta = std::fs::metadata(path);
-        if matches!(&meta, Ok(m) if m.len() == 0) {
-            // Empty file → fresh session anchored here. The override (when given) seeds both the
-            // header and the manager cwd, since there is no persisted header to preserve.
+        // Pi treats a NONEXISTENT `--session <path>` and an EXISTING zero-length file identically:
+        // both anchor a brand-new session at that exact path. `loadEntriesFromFile` returns `[]` for a
+        // missing file (session-manager.ts:489-491), so `static open` reaches `setSessionFile`'s
+        // `!existsSync` branch, which runs `newSession()` and preserves the explicit path
+        // (session-manager.ts:843-847); an existing empty file takes the sibling `size === 0` branch
+        // (session-manager.ts:822-831). Only a non-empty, unparseable file is an error. cyrup
+        // previously special-cased only the zero-length case, so a missing path fell through to
+        // `load()` → `File::open` → `NotFound` → a CLI hard-error (gap-analysis 05, Finding 2).
+        let missing = matches!(&meta, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if missing || matches!(&meta, Ok(m) if m.len() == 0) {
+            // Missing/empty file → fresh session anchored here. The override (when given) seeds both
+            // the header and the manager cwd, since there is no persisted header to preserve.
             let id = gen_session_id();
             let cwd = cwd_override.map(Path::to_path_buf).unwrap_or_default();
             let header = SessionHeader::new(id, cwd.to_string_lossy(), now_ts());

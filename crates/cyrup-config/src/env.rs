@@ -116,6 +116,12 @@ pub struct CliConfigOverrides {
 pub struct ConfigDirs {
     pub agent_dir: PathBuf,
     pub session_dir: PathBuf,
+    /// Whether `session_dir` came from an explicit `--session-dir` flag or `$CYRUP_SESSION_DIR`
+    /// (as opposed to the `agent_dir/sessions` default). Pi keeps this distinction as the optional
+    /// `sessionDir?` argument threaded through every session op; `ConfigDirs::resolve` otherwise
+    /// collapses it, so it is preserved here for the layout to use the explicit dir LITERALLY vs.
+    /// cwd-encoding the default (gap-analysis 05, Finding 3; Pi `sessionDir ? … : getDefaultSessionDir`).
+    pub session_dir_explicit: bool,
     pub package_dir: PathBuf,
     pub cwd: PathBuf,
     /// The real user home directory (`process.env.HOME || homedir()`; Pi `getHomeDir()`,
@@ -142,11 +148,10 @@ impl ConfigDirs {
             .or_else(|| env.agent_dir.clone())
             .unwrap_or_else(|| home.join(".cyrup").join("agent"));
 
-        let session_dir = cli
-            .session_dir
-            .clone()
-            .or_else(|| env.session_dir.clone())
-            .unwrap_or_else(|| agent_dir.join("sessions"));
+        let session_dir_override = cli.session_dir.clone().or_else(|| env.session_dir.clone());
+        let session_dir_explicit = session_dir_override.is_some();
+        let session_dir =
+            session_dir_override.unwrap_or_else(|| agent_dir.join("sessions"));
 
         let package_dir = cli
             .package_dir
@@ -165,6 +170,7 @@ impl ConfigDirs {
         Ok(Self {
             agent_dir,
             session_dir,
+            session_dir_explicit,
             package_dir,
             cwd,
             home,

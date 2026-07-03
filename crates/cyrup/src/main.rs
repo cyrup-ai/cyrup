@@ -650,12 +650,26 @@ fn default_project_trust(dirs: &ConfigDirs) -> DefaultProjectTrust {
     mgr.effective().default_project_trust()
 }
 
+/// The [`SessionLayout`] the `--resume` listing scans, mirroring Pi's per-call directory choice: an
+/// explicit `--session-dir` is used LITERALLY, otherwise the cwd-encoded default applies
+/// (`sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd)`, session-manager.ts:1538).
+/// This must agree with the write-side layout in `SessionServiceBuilder::build`, or a session written
+/// under an explicit `--session-dir` would be listed at a different (doubly-nested) path
+/// (gap-analysis 05, Finding 3).
+fn session_list_layout(dirs: &ConfigDirs) -> SessionLayout {
+    if dirs.session_dir_explicit {
+        SessionLayout::literal(dirs.session_dir.clone(), dirs.cwd.clone())
+    } else {
+        SessionLayout::new(dirs.session_dir.clone(), dirs.cwd.clone())
+    }
+}
+
 /// Scan the cwd's local session listing and the global cross-project listing into a merged
 /// [`SessionInfo`] vector (locals first, globals de-duplicated by path) for the `--resume` picker (Pi
 /// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25).
 fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
     let root = dirs.session_dir.clone();
-    let layout = SessionLayout::new(root.clone(), dirs.cwd.clone());
+    let layout = session_list_layout(dirs);
     let mut sessions = list_in_dir(&layout.dir(), None, None);
     for global in list_all(&SessionsRoot(root)) {
         if !sessions.iter().any(|s| s.path == global.path) {
@@ -669,7 +683,7 @@ fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
 /// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:169,179).
 fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) {
     let root = dirs.session_dir.clone();
-    let layout = SessionLayout::new(root.clone(), dirs.cwd.clone());
+    let layout = session_list_layout(dirs);
     let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), None, None)
         .iter()
         .map(SessionRef::from)

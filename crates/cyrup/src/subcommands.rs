@@ -575,6 +575,7 @@ mod tests {
         ConfigDirs {
             agent_dir: root.join("agent"),
             session_dir: root.join("agent/sessions"),
+            session_dir_explicit: false,
             package_dir: root.join("agent/packages"),
             cwd: root.join("work"),
             home: root.to_path_buf(),

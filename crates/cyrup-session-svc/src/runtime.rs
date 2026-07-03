@@ -296,9 +296,14 @@ impl AgentSessionRuntime {
                     crate::session::fork_anchor(&mgr, &entry, position)?;
                 match target_leaf {
                     Some(leaf) => {
+                        // Reuse the current session file's OWN directory literally (Pi
+                        // `createBranchedSession`'s `this.sessionDir` reuse, session-manager.ts:1343)
+                        // — it is already fully resolved, so re-encoding it would nest the branch one
+                        // level too deep (gap-analysis 05, Finding 1). Falls back to the cwd itself
+                        // only if the file somehow has no parent.
                         let root =
                             file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
-                        let layout = cyrup_session::SessionLayout::new(root, cwd);
+                        let layout = cyrup_session::SessionLayout::literal(root, cwd);
                         mgr.create_branched_session(&leaf, &layout)?;
                         (self.factory.build_from_manager(mgr).await?.into_shared(), selected_text)
                     }

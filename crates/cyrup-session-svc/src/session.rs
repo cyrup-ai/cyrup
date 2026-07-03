@@ -1603,11 +1603,7 @@ impl AgentSession {
     pub async fn fork(&self) -> Result<SessionId, SessionServiceError> {
         // A fork clones the active path through the current leaf into a new file.
         let mut guard = self.manager.lock().await;
-        let root = guard.session_file().and_then(Path::parent).map(Path::to_path_buf);
-        let layout = match root {
-            Some(dir) => cyrup_session::SessionLayout::new(dir, guard.cwd().to_path_buf()),
-            None => cyrup_session::SessionLayout::for_cwd(guard.cwd().to_path_buf()),
-        };
+        let layout = branch_layout(&guard);
         // Pi forks at an explicit leaf and mutates the manager in place
         // (`createBranchedSession(leafId)`, session-manager.ts:1292-1392). Fork-at-current-position
         // passes the current leaf; an empty session has nothing to fork.
@@ -1641,11 +1637,7 @@ impl AgentSession {
                 )
             })?,
         };
-        let root = guard.session_file().and_then(Path::parent).map(Path::to_path_buf);
-        let layout = match root {
-            Some(dir) => cyrup_session::SessionLayout::new(dir, guard.cwd().to_path_buf()),
-            None => cyrup_session::SessionLayout::for_cwd(guard.cwd().to_path_buf()),
-        };
+        let layout = branch_layout(&guard);
         guard.create_branched_session(&leaf, &layout)?;
         Ok(guard.session_id().clone())
     }
@@ -1666,11 +1658,7 @@ impl AgentSession {
 
         match target_leaf {
             Some(leaf) => {
-                let root = guard.session_file().and_then(Path::parent).map(Path::to_path_buf);
-                let layout = match root {
-                    Some(dir) => cyrup_session::SessionLayout::new(dir, guard.cwd().to_path_buf()),
-                    None => cyrup_session::SessionLayout::for_cwd(guard.cwd().to_path_buf()),
-                };
+                let layout = branch_layout(&guard);
                 guard.create_branched_session(&leaf, &layout)?;
                 let id = guard.session_id().clone();
                 Ok(ForkOutcome { session_id: Some(id), selected_text })
@@ -3624,6 +3612,22 @@ fn branch_summary_entry_of(
 /// For a `position:"before"` fork: require a user-message anchor and return `(parent_id, text)`.
 fn user_message_anchor(e: &cyrup_session::Entry) -> Option<(Option<EntryId>, String)> {
     user_message_text(e).map(|text| (e.parent_id(), text))
+}
+
+/// The [`SessionLayout`] a fork/clone writes its new file into. Mirrors Pi
+/// `createBranchedSession`'s reuse of `this.getSessionDir()` (session-manager.ts:918-920,1343): the
+/// directory fixed once at manager construction, never re-derived or re-encoded on branch. cyrup's
+/// equivalent of `this.sessionDir` is the currently-open session file's own parent directory, which
+/// is ALREADY fully resolved (`<root>/--<encoded-cwd>--` for a default session, or a literal
+/// `--session-dir`), so it must be used LITERALLY. Feeding it back through the *encoded*
+/// [`SessionLayout::new`] would append `--<encoded-cwd>--` a second time and land the branch one
+/// directory too deep — orphaning it from every listing/resume path (gap-analysis 05, Finding 1). An
+/// in-memory session (no file) never persists a branch, so the default-root fallback is inert.
+pub(crate) fn branch_layout(mgr: &SessionManager) -> cyrup_session::SessionLayout {
+    match mgr.session_file().and_then(Path::parent) {
+        Some(dir) => cyrup_session::SessionLayout::literal(dir.to_path_buf(), mgr.cwd().to_path_buf()),
+        None => cyrup_session::SessionLayout::for_cwd(mgr.cwd().to_path_buf()),
+    }
 }
 
 /// Resolve the branch leaf + optional selected-text for an entry-anchored fork (Pi

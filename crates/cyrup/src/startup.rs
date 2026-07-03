@@ -98,6 +98,7 @@ mod tests {
         let dirs = ConfigDirs {
             agent_dir: dir.path().join("agent"),
             session_dir: dir.path().join("agent/sessions"),
+            session_dir_explicit: false,
             package_dir: dir.path().join("agent/packages"),
             cwd: dir.path().join("work"),
             home: dir.path().to_path_buf(),

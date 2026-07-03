@@ -376,7 +376,12 @@ impl Cli {
         // like Pi's `getHomeDir()` (`process.env.HOME || homedir()`, package-manager.ts:217) and
         // trust-manager.ts:185. `SessionConfig::new` defaults `home` to the agent dir; override it here.
         config.home = dirs.home.clone();
-        config.session_dir = Some(dirs.session_dir.clone());
+        // Preserve Pi's optional `sessionDir` distinction: `Some` ONLY when `--session-dir`/env was
+        // explicitly supplied (used literally), `None` ⇒ the builder applies the cwd-encoded default
+        // (gap-analysis 05, Finding 3). Collapsing this to `Some(resolved)` unconditionally would
+        // make the builder treat the default root as an explicit dir and skip cwd-encoding.
+        config.session_dir =
+            dirs.session_dir_explicit.then(|| dirs.session_dir.clone());
         config.app_mode = mode;
         config.model_pattern = self.model.clone();
         // An explicit `--provider` lets the builder's custom-fallback fire for a bare unresolvable
@@ -950,6 +955,7 @@ mod tests {
         ConfigDirs {
             agent_dir: "/agent".into(),
             session_dir: "/agent/sessions".into(),
+            session_dir_explicit: false,
             package_dir: "/agent/packages".into(),
             cwd: "/work".into(),
             home: "/home/user".into(),

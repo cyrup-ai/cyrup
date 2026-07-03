@@ -993,3 +993,84 @@ fn g2_create_branched_session_explicit_leaf_in_place() {
     let reopened = SessionManager::open(&old_file).unwrap();
     assert_eq!(reopened.entries().len(), old_count);
 }
+
+// ---- gap-analysis 05: SessionLayout literal mode + open-nonexistent (Findings 1/2/3) -------------
+
+#[test]
+fn f3_session_layout_literal_is_used_verbatim() {
+    // Finding 3. Pi uses an explicit `--session-dir` LITERALLY (`sessionDir ? normalizePath(sessionDir)
+    // : getDefaultSessionDir(cwd)`, session-manager.ts:1430,1447,1457). `literal` must NOT re-encode.
+    let cwd = PathBuf::from("/work/proj");
+    let root = PathBuf::from("/tmp/custom-sessions");
+    assert_eq!(
+        SessionLayout::literal(root.clone(), cwd.clone()).dir(),
+        root,
+        "an explicit --session-dir must be used verbatim, with no --<cwd>-- suffix",
+    );
+    // The default constructor still encodes (the default root case is unchanged).
+    assert_eq!(
+        SessionLayout::new(root.clone(), cwd.clone()).dir(),
+        root.join(cyrup_session::encode_cwd(&cwd)),
+        "the default (non-explicit) root is still cwd-encoded",
+    );
+}
+
+#[test]
+fn f1_branch_reuses_the_open_dir_without_re_encoding() {
+    // Finding 1. Pi's `createBranchedSession` reuses `this.getSessionDir()` — the dir fixed once at
+    // construction, never re-encoded on branch (session-manager.ts:918-920,1343). A branch caller that
+    // takes the currently-open session file's OWN directory (already `<root>/--<cwd>--`) must feed it
+    // through the LITERAL layout, or the branch nests one level too deep and is orphaned from listing.
+    let cwd = PathBuf::from("/work/proj");
+    let open_dir = PathBuf::from("/tmp/root").join(cyrup_session::encode_cwd(&cwd));
+    assert_eq!(
+        SessionLayout::literal(open_dir.clone(), cwd.clone()).dir(),
+        open_dir,
+        "a fork must land in the SAME directory as the session it branched from",
+    );
+}
+
+#[test]
+fn f1_forked_file_stays_in_the_listing_dir_end_to_end() {
+    // Finding 1, end to end over the real manager: a persisted branch lands in the SAME directory the
+    // listing scans, so `newest_session`/`list` still see it (they re-derive a fresh single-level
+    // layout from the sessions root). Mirrors AgentSession::fork/clone_at's `branch_layout` reuse.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f1");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("q0")).unwrap();
+    m.append_message(asst()).unwrap();
+    let original = m.session_file().unwrap().to_path_buf();
+    let list_dir = original.parent().unwrap().to_path_buf(); // <root>/--<cwd>--
+
+    // Branch the way the service callers do: reuse the open file's OWN parent dir, LITERALLY.
+    let branch_layout = SessionLayout::literal(list_dir.clone(), cwd.clone());
+    let leaf = m.leaf_id().cloned().unwrap();
+    let branched = m.create_branched_session(&leaf, &branch_layout).unwrap().unwrap();
+
+    assert_eq!(
+        branched.parent().unwrap(),
+        list_dir,
+        "the branch must live in the same dir the listing scans, not one level deeper",
+    );
+    let listed = cyrup_session::listing::list(&lay);
+    let paths: Vec<PathBuf> = listed.iter().map(|s| s.path.clone()).collect();
+    assert!(paths.contains(&original), "original session is listed");
+    assert!(paths.contains(&branched), "Finding 1: the branched session must be visible to listing");
+}
+
+#[test]
+fn f2_open_nonexistent_path_creates_a_fresh_session() {
+    // Finding 2. Pi treats a not-yet-existing `--session <path>` as a NEW session anchored there
+    // (`loadEntriesFromFile` returns [] for a missing file → `setSessionFile`'s !existsSync branch →
+    // newSession + preserve the explicit path, session-manager.ts:489-491,843-847). It must NOT error.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("brand-new-notes.jsonl");
+    assert!(!path.exists());
+    let m = SessionManager::open(&path).expect("opening a nonexistent --session path creates a fresh session");
+    assert_eq!(m.session_file(), Some(path.as_path()), "the explicit path is preserved verbatim");
+    assert!(m.entries().is_empty(), "a fresh session starts empty");
+    // Fresh + no assistant yet ⇒ deferred flush, exactly like `newSession` (no file written yet).
+    assert!(!path.exists(), "the file is deferred until the first assistant message (Pi parity)");
+}
