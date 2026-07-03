@@ -650,7 +650,15 @@ impl bindings::cyrup::ext::oauth::Host for HostState {
     ) -> Result<String, String> {
         let guest = guest_of(self)?;
         guest.record_oauth_event(OAuthEvent::Prompt { message: message.clone() });
-        guest.services.oauth_prompt(&message, placeholder.as_deref(), allow_empty)
+        // Same epoch-budget forgiveness its `ui::Host` siblings (`confirm`/`input`/`select`/
+        // `editor`/`custom`, above) already carry: an OAuth prompt is exactly as human-paced a wait
+        // once a real `HostServices` backend wires it to a live UI (Pi `onPrompt`), so the
+        // wall-clock block must be recorded here too, not only for the `ui.*` dialog kinds that
+        // happened to land first.
+        let started = std::time::Instant::now();
+        let result = guest.services.oauth_prompt(&message, placeholder.as_deref(), allow_empty);
+        guest.note_dialog_wait(started);
+        result
     }
     async fn on_progress(&mut self, message: String) {
         if let Ok(guest) = guest_of(self) {
@@ -661,7 +669,12 @@ impl bindings::cyrup::ext::oauth::Host for HostState {
         let guest = guest_of(self).ok()?;
         guest.record_oauth_event(OAuthEvent::Select { message: message.clone() });
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
-        guest.services.oauth_select(&message, &options)
+        // Same epoch-budget forgiveness as `on_prompt` just above (Pi `onSelect` is the identical
+        // human-paced OAuth wait).
+        let started = std::time::Instant::now();
+        let result = guest.services.oauth_select(&message, &options);
+        guest.note_dialog_wait(started);
+        result
     }
 }
 
@@ -1734,6 +1747,56 @@ mod tests {
             "ui.custom must record a dialog wait so the epoch trap forgives the call's real \
              wall-clock duration — without it, a slow custom-overlay answer would trap the instance \
              the instant the guest resumes execution right after this call returns"
+        );
+    }
+
+    /// L4 round-17 finding #3: the `oauth::Host::on_prompt` WIT handler must record
+    /// `note_dialog_wait` around `HostServices::oauth_prompt` — the SAME epoch-forgiveness
+    /// bookkeeping every OTHER dialog kind (`ui::Host::confirm`/`input`/`select`/`editor`/`custom`,
+    /// this file, above) already carries. An OAuth prompt is exactly as human-paced a wait once a
+    /// real backend answers it (Pi `onPrompt`); before this fix `on_prompt` never called
+    /// `note_dialog_wait` at all, so this assertion would have failed — same proof shape as
+    /// `custom_records_a_dialog_wait_for_epoch_forgiveness` above.
+    #[tokio::test]
+    async fn oauth_on_prompt_records_a_dialog_wait_for_epoch_forgiveness() {
+        use bindings::cyrup::ext::oauth::Host as OauthHost;
+
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec);
+        let guest = guest_of(&state).expect("guest state present").clone();
+        guest.arm_epoch_deadline_estimate(20); // a 20-tick (100ms) per-dispatch budget, as elsewhere
+
+        OauthHost::on_prompt(&mut state, "enter code".into(), None, false)
+            .await
+            .expect("canned oauth prompt answers Ok");
+
+        assert!(
+            guest.take_dialog_extra_ticks() > 0,
+            "oauth.on-prompt must record a dialog wait so the epoch trap forgives the call's real \
+             wall-clock duration — without it, a slow real OAuth prompt answer would trap the \
+             instance the instant the guest resumes execution right after this call returns"
+        );
+    }
+
+    /// Same finding as `oauth_on_prompt_records_a_dialog_wait_for_epoch_forgiveness` above, for the
+    /// sibling `oauth::Host::on_select` WIT handler (Pi `onSelect`) — before this fix, `on_select`
+    /// ALSO never called `note_dialog_wait`.
+    #[tokio::test]
+    async fn oauth_on_select_records_a_dialog_wait_for_epoch_forgiveness() {
+        use bindings::cyrup::ext::oauth::Host as OauthHost;
+
+        let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
+        let mut state = state_with(rec);
+        let guest = guest_of(&state).expect("guest state present").clone();
+        guest.arm_epoch_deadline_estimate(20); // a 20-tick (100ms) per-dispatch budget, as elsewhere
+
+        let _ = OauthHost::on_select(&mut state, "pick an account".into(), "[]".into()).await;
+
+        assert!(
+            guest.take_dialog_extra_ticks() > 0,
+            "oauth.on-select must record a dialog wait so the epoch trap forgives the call's real \
+             wall-clock duration — without it, a slow real OAuth selection answer would trap the \
+             instance the instant the guest resumes execution right after this call returns"
         );
     }
 }
