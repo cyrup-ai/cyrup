@@ -921,11 +921,16 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
     rpc.await.unwrap();
 }
 
-/// L4 review §2.5 (MAJOR): aborting the in-flight turn immediately dismisses any dialog that turn's
-/// extension currently has open, rather than only pre-empting a dialog before it opens. The client
-/// deliberately never sends an `extension_ui_response` for the open dialog — only `abort` unblocks it.
+/// `abort`/`abort_retry` must NOT force-dismiss an open `confirm`/`input`/`select` dialog. Pi's
+/// `session.abort()` (`agent-session.ts`) only cancels the run; `rpc-mode.ts`'s `case "abort"`
+/// (~line 424) and `case "abort_retry"` (~line 541) never touch `pendingExtensionRequests` — a
+/// dialog is dismissed early ONLY through the extension's own opt-in `signal` binding
+/// (`ExtensionUIDialogOptions.signal`, types.ts:320-321), which nothing in Pi's first-party code
+/// wires to "the turn got aborted" by default. The client here deliberately never sends an
+/// `extension_ui_response` while aborting — the still-open dialog must remain genuinely pending
+/// through the abort, and only settle once a real response finally arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_abort_force_resolves_a_pending_dialog() {
+async fn rpc_abort_does_not_force_resolve_a_pending_dialog() {
     use cyrup_ext::host::{DialogOptions, HostServices};
     use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -950,14 +955,15 @@ async fn rpc_abort_force_resolves_a_pending_dialog() {
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
-    // Open a `select` dialog with NO timeout at all — only a live abort can ever unblock it.
+    // Open a `select` dialog with NO timeout at all — nothing but a genuine response can unblock it.
     let hs = host_services.clone();
-    let guest_select =
+    let mut guest_select =
         tokio::spawn(async move {
             hs.select("Pick one", &serde_json::json!(["a", "b"]), &DialogOptions::default())
         });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "select");
+    let dialog_id = req["id"].as_str().unwrap().to_string();
 
     // The client never answers the dialog — it aborts the turn instead.
     client_tx.write_all(b"{\"type\":\"abort\",\"id\":\"stop\"}\n").await.unwrap();
@@ -965,18 +971,28 @@ async fn rpc_abort_force_resolves_a_pending_dialog() {
     assert_eq!(abort_resp["command"], "abort");
     assert_eq!(abort_resp["success"], true);
 
-    // The guest's still-open dialog must resolve immediately, bounded well under what a "never
-    // answered, no timeout" dialog would otherwise do (hang forever).
-    let resolved = tokio::time::timeout(Duration::from_secs(2), guest_select)
-        .await
-        .expect("abort must force-resolve the pending dialog, not leave it hanging")
-        .expect("select task");
-    assert_eq!(resolved, None, "an aborted select settles to Pi's `undefined` default");
+    // The guest's dialog must NOT resolve from the abort alone — it stays genuinely pending.
+    let still_pending = tokio::time::timeout(Duration::from_millis(300), &mut guest_select).await;
+    assert!(
+        still_pending.is_err(),
+        "abort must not force-resolve an open dialog: {still_pending:?}"
+    );
 
-    // The loop is still alive afterward.
+    // The loop is still alive, and the dialog is STILL answerable by a real `extension_ui_response`
+    // after the abort — proving it was left genuinely pending, not silently dropped.
     client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(after["command"], "get_state");
+
+    client_tx
+        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{dialog_id}\",\"value\":\"a\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    let resolved = tokio::time::timeout(Duration::from_secs(2), guest_select)
+        .await
+        .expect("the dialog must still be answerable after an unrelated abort")
+        .expect("select task");
+    assert_eq!(resolved.as_deref(), Some("a"), "a real response after abort still resumes the guest");
 
     drop(client_tx);
     rpc.await.unwrap();
