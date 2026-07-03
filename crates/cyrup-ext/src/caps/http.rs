@@ -330,7 +330,6 @@ impl HttpCaps {
             let status = resp.status().as_u16();
             let headers = collect_headers(resp.headers());
             let encoding = content_encoding_of(resp.headers());
-            let raw = read_bounded_body(resp).await?;
             // Skip decompression entirely for a response that must never carry a coded body (a
             // null-body status, or a HEAD/CONNECT request) — see [`body_may_carry_content_coding`].
             let coding_encoding = if body_may_carry_content_coding(&req.method, status) {
@@ -338,6 +337,16 @@ impl HttpCaps {
             } else {
                 None
             };
+            // Undici's `onResponseStart` rejects a response whose `Content-Encoding` chain exceeds
+            // `maxContentEncodings` synchronously off HEADERS ALONE, before any body byte is read
+            // (`undici/lib/web/fetch/index.js:2262-2275`) — mirror that ordering here by resolving
+            // (and possibly failing on) the chain-depth cap BEFORE spending the bounded-but-possibly-
+            // large `read_bounded_body` download, not after. [`Self::request_stream`] already got
+            // this right via [`decode_stream`]; this brings the buffered path's ordering in line
+            // with it (the actual decode below still re-resolves — cheap string work — to keep
+            // [`decode_buffered`]'s self-contained signature).
+            resolve_codings(coding_encoding)?;
+            let raw = read_bounded_body(resp).await?;
             let body = decode_buffered(coding_encoding, raw).await?;
             Ok(HttpResponse { status, headers, body })
         })
@@ -1361,6 +1370,48 @@ mod tests {
         let err = caps
             .request(&req)
             .await
+            .expect_err("a 6-deep content-encoding chain must be rejected, over the 5-deep cap");
+        assert!(
+            err.contains("too many content-encodings") && err.contains('6') && err.contains('5'),
+            "the error must name both the actual depth and the cap, matching undici's own message: {err}"
+        );
+    }
+
+    /// Undici's `onResponseStart` rejects an over-depth `Content-Encoding` chain synchronously off
+    /// HEADERS ALONE, before any body byte is read (`undici/lib/web/fetch/index.js:2262-2275`). Prove
+    /// `HttpCaps::request` matches that ordering (not just the eventual error) by holding a mock
+    /// server's connection open with headers sent but NO body bytes ever written, for far longer than
+    /// this test's own bound: a pre-fix implementation that downloads the (unbounded-wait) body before
+    /// checking the depth cap would hang past that bound; the fixed ordering rejects immediately.
+    #[tokio::test]
+    async fn request_rejects_the_content_encoding_depth_cap_before_downloading_the_body() {
+        let headers = "Content-Type: application/octet-stream\r\n\
+            Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n"
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\n{headers}\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Hold the connection open with no body bytes, well past the 2s bound below — a
+                // pre-fix implementation would block here inside `read_bounded_body`.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+        let url = format!("http://{addr}/probe");
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), caps.request(&req))
+            .await
+            .expect(
+                "request must reject the chain-depth cap immediately off headers, \
+                 never waiting on the (never-arriving) body",
+            )
             .expect_err("a 6-deep content-encoding chain must be rejected, over the 5-deep cap");
         assert!(
             err.contains("too many content-encodings") && err.contains('6') && err.contains('5'),
