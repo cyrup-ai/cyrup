@@ -148,8 +148,12 @@ fn parse_npx_args(args: &[String]) -> Option<ParsedInvocation> {
             continue;
         }
         if arg == "-p" || arg == "--package" {
+            // `npx-resolver.ts:88`: `if (!value || value.startsWith("-")) return null;` — JS's
+            // `!value` rejects BOTH the out-of-bounds case (`before[i+1]` is `undefined`) AND an
+            // empty string. `before.get(i + 1)?` already covers out-of-bounds; the `is_empty()`
+            // check below is what closes the empty-string half.
             let value = before.get(i + 1)?;
-            if value.starts_with('-') {
+            if value.is_empty() || value.starts_with('-') {
                 return None;
             }
             if package_spec.is_none() {
@@ -211,8 +215,10 @@ fn parse_npm_exec_args(args: &[String]) -> Option<ParsedInvocation> {
             continue;
         }
         if arg == "--package" {
+            // `npx-resolver.ts:132`: `if (!value || value.startsWith("-")) return null;` — same
+            // empty-string gap as `parse_npx_args` above; see that comment for the JS semantics.
             let value = before.get(i + 1)?;
-            if value.starts_with('-') {
+            if value.is_empty() || value.starts_with('-') {
                 return None;
             }
             if package_spec.is_none() {
@@ -633,6 +639,20 @@ mod tests {
         assert!(parse_npx_args(&args(&["--unknown", "@foo/bar"])).is_none());
     }
 
+    // npx-resolver.ts:88: `if (!value || value.startsWith("-")) return null;` — JS's `!value`
+    // rejects an empty string just as much as a missing/dash-prefixed one. An empty `-p`/`--package`
+    // value must not slip through and reach `force_npx_cache("")`.
+    #[test]
+    fn parse_npx_args_rejects_empty_package_flag_value() {
+        assert!(parse_npx_args(&args(&["-p", "", "mybin"])).is_none());
+        assert!(parse_npx_args(&args(&["--package", "", "mybin"])).is_none());
+    }
+
+    #[test]
+    fn parse_npx_args_rejects_empty_inline_package_value() {
+        assert!(parse_npx_args(&args(&["--package=", "mybin"])).is_none());
+    }
+
     #[test]
     fn parse_npx_args_empty_is_none() {
         assert!(parse_npx_args(&args(&[])).is_none());
@@ -655,6 +675,13 @@ mod tests {
     #[test]
     fn parse_npm_exec_args_requires_exec_first() {
         assert!(parse_npm_exec_args(&args(&["install", "@foo/bar"])).is_none());
+    }
+
+    // npx-resolver.ts:132: same `!value` empty-string gap as `parseNpxArgs`, ported to the
+    // `npm exec --package` form.
+    #[test]
+    fn parse_npm_exec_args_rejects_empty_package_flag_value() {
+        assert!(parse_npm_exec_args(&args(&["exec", "--package", "", "--", "mybin"])).is_none());
     }
 
     #[test]
