@@ -23,8 +23,8 @@ use cyrup_resources::{
 };
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
 use cyrup_session::prompt::{
-    ContextFileLoader, DocsPointers, PromptInputs, ResolvedOverride, SystemPromptBuilder,
-    ToolPromptContribution,
+    ContextFile, ContextFileLoader, ContextSnapshot, DocsPointers, PromptInputs, ResolvedOverride,
+    SystemPromptBuilder, ToolPromptContribution,
 };
 use cyrup_session::SessionLayout;
 use cyrup_tools::{
@@ -264,6 +264,12 @@ fn select_active_tools(
         .collect()
 }
 
+/// A synthetic-skill override closure (Pi `DefaultResourceLoader.skillsOverride`): transforms the
+/// discovered [`SkillPointer`] set before it feeds the system prompt.
+type SkillsOverrideFn = Box<dyn FnOnce(Vec<SkillPointer>) -> Vec<SkillPointer> + Send>;
+/// A synthetic context-file override closure (Pi `DefaultResourceLoader.agentsFilesOverride`).
+type ContextFilesOverrideFn = Box<dyn FnOnce(Vec<ContextFile>) -> Vec<ContextFile> + Send>;
+
 /// Assembles an [`AgentSession`] from a [`SessionConfig`] + injected provider/services (arch-11).
 pub struct SessionBuilder {
     provider: Arc<dyn Provider>,
@@ -280,6 +286,25 @@ pub struct SessionBuilder {
     /// Provider resolver seam (the bin's `select_provider`) enabling live cross-provider `/model`
     /// swaps. `None` ⇒ only same-provider model changes are possible (tests / offline builds).
     provider_resolver: Option<Arc<dyn ProviderResolver>>,
+    /// Custom transport override (Pi `AgentOptions.streamFn`, sdk.ts:301-331; the proxy-closure
+    /// example, proxy.ts:92-98). When `Some`, the agent loop streams through THIS `StreamFn` (e.g. a
+    /// [`cyrup_agent::ProxyStreamFn`] routing through an auth-managing proxy backend, R-11-022)
+    /// instead of the default provider-backed [`ProviderSwap`] — the embedder brings its own
+    /// transport. `None` ⇒ the provider-backed default (the live-swappable path).
+    stream_fn: Option<Arc<dyn cyrup_agent::StreamFn>>,
+    /// Dynamic per-request API-key resolution (Pi per-request key resolution). Threaded onto the
+    /// agent's `key_resolver` slot (`AgentBuilder::key_resolver`, agent.rs:1585); consulted on every
+    /// turn and its result takes precedence over any static key. `None` ⇒ no dynamic override.
+    key_resolver: Option<Arc<dyn cyrup_agent::ApiKeyResolver>>,
+    /// Synthetic-skill injection closure (Pi `DefaultResourceLoader.skillsOverride`,
+    /// resource-loader.ts:143,630). Runs over the discovered [`SkillPointer`]s before they feed the
+    /// system prompt / context snapshot, so an embedder can inject in-memory skills not backed by
+    /// files on disk. `None` ⇒ the discovered set passes through unchanged.
+    skills_override: Option<SkillsOverrideFn>,
+    /// Synthetic context-file (`AGENTS.md`/`CLAUDE.md`) injection closure (Pi
+    /// `DefaultResourceLoader.agentsFilesOverride`, resource-loader.ts:155,474). Runs over the loaded
+    /// [`ContextFile`]s before the system prompt reads them. `None` ⇒ the loaded set is used verbatim.
+    context_files_override: Option<ContextFilesOverrideFn>,
 }
 
 impl SessionBuilder {
@@ -294,6 +319,10 @@ impl SessionBuilder {
             cli_settings: Settings::new(),
             prebuilt_manager: None,
             provider_resolver: None,
+            stream_fn: None,
+            key_resolver: None,
+            skills_override: None,
+            context_files_override: None,
         }
     }
 
@@ -302,6 +331,49 @@ impl SessionBuilder {
     #[must_use]
     pub fn provider_resolver(mut self, resolver: Arc<dyn ProviderResolver>) -> Self {
         self.provider_resolver = Some(resolver);
+        self
+    }
+
+    /// Inject a custom transport (Pi `AgentOptions.streamFn`, sdk.ts:301; the `ProxyStreamFn`
+    /// proxy-closure example, proxy.ts:92-98). The agent loop streams through `stream_fn` — e.g. a
+    /// [`cyrup_agent::ProxyStreamFn`] — instead of the provider-backed default. The injected
+    /// `provider` still resolves the model catalog / model-ref; only the wire transport is replaced.
+    #[must_use]
+    pub fn stream_fn(mut self, stream_fn: Arc<dyn cyrup_agent::StreamFn>) -> Self {
+        self.stream_fn = Some(stream_fn);
+        self
+    }
+
+    /// Inject a dynamic API-key resolver (Pi per-request key resolution). Consulted on every turn
+    /// (agent.rs:599); its result overrides any static configured key.
+    #[must_use]
+    pub fn key_resolver(mut self, resolver: Arc<dyn cyrup_agent::ApiKeyResolver>) -> Self {
+        self.key_resolver = Some(resolver);
+        self
+    }
+
+    /// Inject/transform synthetic skills (Pi `DefaultResourceLoader.skillsOverride`,
+    /// resource-loader.ts:143,630). The closure receives the discovered [`SkillPointer`]s and returns
+    /// the set that feeds the system prompt (add in-memory skills, drop discovered ones, or replace
+    /// the whole set). Skills still render only when the `read` tool is available (R-06-010).
+    #[must_use]
+    pub fn skills_override(
+        mut self,
+        f: impl FnOnce(Vec<SkillPointer>) -> Vec<SkillPointer> + Send + 'static,
+    ) -> Self {
+        self.skills_override = Some(Box::new(f));
+        self
+    }
+
+    /// Inject/transform synthetic context (`AGENTS.md`/`CLAUDE.md`) files (Pi
+    /// `DefaultResourceLoader.agentsFilesOverride`, resource-loader.ts:155,474). The closure receives
+    /// the discovered [`ContextFile`]s and returns the set the system prompt reads.
+    #[must_use]
+    pub fn context_files_override(
+        mut self,
+        f: impl FnOnce(Vec<ContextFile>) -> Vec<ContextFile> + Send + 'static,
+    ) -> Self {
+        self.context_files_override = Some(Box::new(f));
         self
     }
 
@@ -345,6 +417,11 @@ impl SessionBuilder {
     /// extension `init` run here.
     pub async fn build(self) -> Result<AgentSession, SessionServiceError> {
         let cfg = self.config;
+        // Embedder-supplied seams pulled out before the rest of `self` is consumed piecewise below.
+        let custom_stream_fn = self.stream_fn;
+        let custom_key_resolver = self.key_resolver;
+        let skills_override = self.skills_override;
+        let context_files_override = self.context_files_override;
         let cwd = cfg.cwd.clone();
         let cancel = RunCancel::new();
 
@@ -622,6 +699,30 @@ impl SessionBuilder {
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
 
+        // Apply the CLI-captured extension flag overrides now that every loaded extension's
+        // `registerFlag` has run (Pi runs `applyExtensionFlagValues` inside
+        // `createAgentSessionServices`, agent-session-services.ts:167 — AFTER the extensions load).
+        // Without this step the 1:1-ported CLI capture (`cfg.extension_flag_values`, from the bin's
+        // `partition_extension_flags` / Pi `unknownFlags`) is dropped one call short of the
+        // guest-visible `getFlag` (gap-08 §5.6). The ext-host resolves each value against the
+        // registered flag's declared type and stores it in the shared flag store `getFlag` consults.
+        if !cfg.extension_flag_values.is_empty() {
+            let overrides: Vec<(String, cyrup_ext::ExtensionFlagOverride)> = cfg
+                .extension_flag_values
+                .iter()
+                .map(|(name, v)| {
+                    let ov = match v {
+                        ExtensionFlagValue::Bool(b) => cyrup_ext::ExtensionFlagOverride::Bool(*b),
+                        ExtensionFlagValue::Str(s) => {
+                            cyrup_ext::ExtensionFlagOverride::Str(s.clone())
+                        }
+                    };
+                    (name.clone(), ov)
+                })
+                .collect();
+            ext_host.apply_extension_flag_values(&overrides)?;
+        }
+
         // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
         // + disk extensions loaded (Pi `runner.bindCore` pending-flush, runner.ts:345-362). The SAME
         // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
@@ -660,11 +761,18 @@ impl SessionBuilder {
         };
         let resources = Arc::new(resources);
         // Read-gated skill pointers (R-06-010): only when the `read` tool is available.
-        let skills: Vec<SkillPointer> = if read_available && !cfg.no_skills {
+        let mut skills: Vec<SkillPointer> = if read_available && !cfg.no_skills {
             resources.skills.winners().map(|s| s.pointer()).collect()
         } else {
             Vec::new()
         };
+        // Synthetic-skill injection (Pi `skillsOverride`, resource-loader.ts:630): transform the
+        // discovered pointer set before it feeds the context snapshot + system prompt. Applied to the
+        // (possibly-empty) base so an embedder can inject skills discovery found none of; the emit is
+        // still `read`-gated downstream (skills_inject.rs), matching Pi.
+        if let Some(f) = skills_override {
+            skills = f(skills);
+        }
 
         // ---- 6. context store + system prompt (cyrup-session arch-06) -------------------------
         let loader = ContextFileLoader::new(
@@ -677,6 +785,18 @@ impl SessionBuilder {
         context_store
             .reload(&cancel, loader, Arc::from(skills), ResolvedOverride::default())
             .await?;
+        // Synthetic context-file injection (Pi `agentsFilesOverride`, resource-loader.ts:474):
+        // transform the loaded `AGENTS.md`/`CLAUDE.md` set before the system prompt reads it.
+        if let Some(f) = context_files_override {
+            let snap = context_store.snapshot();
+            let files = f(snap.context_files.to_vec());
+            context_store.store(ContextSnapshot {
+                context_files: Arc::from(files),
+                skills: snap.skills.clone(),
+                override_source: snap.override_source.clone(),
+                diagnostics: snap.diagnostics.clone(),
+            });
+        }
         let snapshot = context_store.snapshot();
 
         let selected_tools: Vec<Arc<str>> =
@@ -760,7 +880,14 @@ impl SessionBuilder {
         // `Arc` is handed to the agent (as its `StreamFn`) and to the session (to mutate on select).
         let provider_swap =
             Arc::new(ProviderSwap::new(self.provider.clone(), self.provider_resolver.clone()));
-        let mut agent_builder = Agent::builder(model_ref.clone(), provider_swap.clone())
+        // Transport selection (Pi `AgentOptions.streamFn`, sdk.ts:301): an embedder-supplied custom
+        // `StreamFn` (e.g. `ProxyStreamFn`) becomes THE transport the agent loop streams through;
+        // absent one, the provider-backed `ProviderSwap` is used (the default live-swappable path).
+        let agent_stream_fn: Arc<dyn cyrup_agent::StreamFn> = match custom_stream_fn {
+            Some(f) => f,
+            None => provider_swap.clone(),
+        };
+        let mut agent_builder = Agent::builder(model_ref.clone(), agent_stream_fn)
         .system_prompt(system_prompt.clone())
         .thinking_level(thinking)
         .tools(active_tools)
@@ -837,6 +964,12 @@ impl SessionBuilder {
                         .await;
                 })
             }));
+        }
+
+        // Dynamic per-request key resolution (Pi key resolver): consulted on every turn, overriding
+        // any static key. Threaded whether or not a custom transport is installed.
+        if let Some(kr) = custom_key_resolver {
+            agent_builder = agent_builder.key_resolver(kr);
         }
 
         let agent = agent_builder.build();

@@ -11,11 +11,47 @@
 
 use std::sync::Arc;
 
-use cyrup_provider::Provider;
-use cyrup_session_svc::{SessionBuilder, SessionConfig};
+use cyrup_agent::{ApiKeyResolver, StreamFn};
+use cyrup_provider::{CreateModelsOptions, Provider};
+use cyrup_session_svc::{ContextFile, SessionBuilder, SessionConfig, SkillPointer};
 
-use crate::error::SdkResult;
+use crate::error::{SdkError, SdkResult};
 use crate::handle::Session;
+
+/// Zero-config provider construction — the packaged convenience Pi's `createAgentSession()` provides
+/// via `ModelRegistry.create(authStorage)` + `findInitialModel` (sdk.ts:174-221).
+///
+/// Builds the full built-in provider catalog with **env-based auth** ([`cyrup_provider::default_models`]
+/// over the default [`CreateModelsOptions`], whose `EnvAuthContext` reads real process-env credentials)
+/// and returns the provider that owns `model_pattern` — a `provider/model` pattern selects that
+/// provider; a bare provider id selects it directly. No credentials are wired by hand: an embedder can
+/// go from a model string to a [`build_session`](CyrupBuilder::build_session)-ready provider without
+/// constructing providers or an auth store itself.
+///
+/// # Examples
+/// ```no_run
+/// # fn demo() -> cyrup_sdk::SdkResult<()> {
+/// let provider = cyrup_sdk::zero_config_provider("anthropic/claude-opus-4-8")?;
+/// # let _ = provider;
+/// # Ok(()) }
+/// ```
+///
+/// # Errors
+/// [`SdkError::Provider`] when `model_pattern`'s provider segment names no built-in provider.
+pub fn zero_config_provider(model_pattern: &str) -> SdkResult<Arc<dyn Provider>> {
+    let provider_id = model_pattern.split('/').next().unwrap_or(model_pattern);
+    let models = cyrup_provider::default_models(CreateModelsOptions::default());
+    models.get_provider(provider_id).ok_or_else(|| {
+        let mut available: Vec<String> =
+            models.get_providers().iter().map(|p| p.id().as_str().to_string()).collect();
+        available.sort();
+        SdkError::Provider(format!(
+            "no built-in provider '{provider_id}' (from model pattern '{model_pattern}'); \
+             available: {}",
+            available.join(", ")
+        ))
+    })
+}
 
 /// A customization applied to the underlying [`SessionBuilder`] before `build`.
 type Customizer = Box<dyn FnOnce(SessionBuilder) -> SessionBuilder + Send>;
@@ -100,6 +136,66 @@ impl CyrupBuilder {
         self
     }
 
+    /// Inject a custom transport (Pi `AgentOptions.streamFn`, sdk.ts:301; the `ProxyStreamFn`
+    /// proxy-closure example, proxy.ts:92-98). The agent streams through `stream_fn` instead of the
+    /// provider-backed default — bring your own proxy / HTTP transport. Pass a
+    /// [`crate::ProxyStreamFn`] to route every call through an auth-managing proxy server.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// use cyrup_sdk::{Cyrup, ProxyStreamFn, StreamFn};
+    /// let proxy: Arc<dyn StreamFn> =
+    ///     Arc::new(ProxyStreamFn::new("https://genai.example.com", "auth-token"));
+    /// let _builder = Cyrup::builder().stream_fn(proxy);
+    /// ```
+    #[must_use]
+    pub fn stream_fn(self, stream_fn: Arc<dyn StreamFn>) -> Self {
+        self.customize(move |b| b.stream_fn(stream_fn))
+    }
+
+    /// Inject a dynamic API-key resolver (Pi per-request key resolution). Consulted on every turn;
+    /// its result overrides any static configured key.
+    #[must_use]
+    pub fn key_resolver(self, resolver: Arc<dyn ApiKeyResolver>) -> Self {
+        self.customize(move |b| b.key_resolver(resolver))
+    }
+
+    /// Inject/transform synthetic skills (Pi `DefaultResourceLoader.skillsOverride`,
+    /// resource-loader.ts:143). The closure transforms the discovered [`SkillPointer`] set that feeds
+    /// the system prompt, letting an embedder add in-memory skills not backed by files on disk.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use cyrup_sdk::{Cyrup, SkillPointer};
+    /// let _builder = Cyrup::builder().skills_override(|mut skills: Vec<SkillPointer>| {
+    ///     skills.push(SkillPointer {
+    ///         name: "deploy".into(),
+    ///         description: Some("How to ship a release".into()),
+    ///         path: "/virtual/deploy/SKILL.md".into(),
+    ///     });
+    ///     skills
+    /// });
+    /// ```
+    #[must_use]
+    pub fn skills_override(
+        self,
+        f: impl FnOnce(Vec<SkillPointer>) -> Vec<SkillPointer> + Send + 'static,
+    ) -> Self {
+        self.customize(move |b| b.skills_override(f))
+    }
+
+    /// Inject/transform synthetic context (`AGENTS.md`/`CLAUDE.md`) files (Pi
+    /// `DefaultResourceLoader.agentsFilesOverride`, resource-loader.ts:155). The closure transforms
+    /// the discovered [`ContextFile`] set the system prompt reads.
+    #[must_use]
+    pub fn context_files_override(
+        self,
+        f: impl FnOnce(Vec<ContextFile>) -> Vec<ContextFile> + Send + 'static,
+    ) -> Self {
+        self.customize(move |b| b.context_files_override(f))
+    }
+
     /// Assemble a wired [`Session`] over the given `provider` and `config`.
     ///
     /// Resolves settings + trust + auth + model, discovers resources, builds tools, opens/creates
@@ -131,5 +227,36 @@ impl CyrupBuilder {
             builder = customize(builder);
         }
         Ok(Session::new(builder.build().await?))
+    }
+
+    /// Assemble a session, constructing the provider automatically from `config.model_pattern` via
+    /// [`zero_config_provider`] (env-based auth, zero credential wiring) — the packaged zero-config
+    /// path Pi's `createAgentSession()` provides via `ModelRegistry.create` + `findInitialModel`
+    /// (sdk.ts:166-221). `config.model_pattern` also selects the model within that provider.
+    ///
+    /// # Errors
+    /// [`SdkError::Provider`] when `config.model_pattern` is `None` or names no built-in provider;
+    /// otherwise the underlying facade build error (unknown model id, empty catalog, extension init).
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn demo() -> cyrup_sdk::SdkResult<()> {
+    /// use cyrup_sdk::{Cyrup, SessionConfig};
+    /// let mut config = SessionConfig::new(".", "/home/me/.cyrup/agent");
+    /// config.model_pattern = Some("anthropic/claude-opus-4-8".into());
+    /// let session = Cyrup::builder().build_session_auto(config).await?;
+    /// # let _ = session;
+    /// # Ok(()) }
+    /// ```
+    pub async fn build_session_auto(self, config: SessionConfig) -> SdkResult<Session> {
+        let pattern = config.model_pattern.clone().ok_or_else(|| {
+            SdkError::Provider(
+                "build_session_auto requires config.model_pattern to name a provider \
+                 (e.g. \"anthropic/claude-opus-4-8\")"
+                    .to_string(),
+            )
+        })?;
+        let provider = zero_config_provider(&pattern)?;
+        self.build_session(provider, config).await
     }
 }

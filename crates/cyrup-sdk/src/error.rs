@@ -24,6 +24,10 @@ pub enum SdkError {
     /// An error from the wrapped [`cyrup_session_svc::AgentSession`] facade.
     #[error(transparent)]
     Session(#[from] cyrup_session_svc::SessionServiceError),
+    /// Zero-config provider construction failed — the model pattern named no built-in provider
+    /// ([`crate::zero_config_provider`]/[`crate::CyrupBuilder::build_session_auto`]).
+    #[error("provider construction failed: {0}")]
+    Provider(String),
 }
 
 /// A convenience result alias for SDK operations.

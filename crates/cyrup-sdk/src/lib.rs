@@ -60,9 +60,17 @@ mod handle;
 pub mod prelude;
 
 // ---- the embedding surface ----
-pub use client::{Cyrup, CyrupBuilder};
+pub use client::{zero_config_provider, Cyrup, CyrupBuilder};
 pub use error::{SdkError, SdkResult};
 pub use handle::Session;
+
+// ---- embedder-seam types: custom transport injection (Pi `AgentOptions.streamFn`, sdk.ts:301) +
+// resource-override closures (Pi `DefaultResourceLoader` override closures, resource-loader.ts:125).
+// `StreamFn` is the transport an embedder injects (bring-your-own proxy/HTTP client); `ProxyStreamFn`
+// is the built-in proxy transport; `ApiKeyResolver` is dynamic per-request key resolution. The
+// override closures transform the discovered [`SkillPointer`]/[`ContextFile`] sets. ----
+pub use cyrup_agent::{stream_proxy, ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
+pub use cyrup_session_svc::{ContextFile, ContextScope, SkillPointer};
 
 // ---- load-bearing seam types, re-exported so embedders depend only on this crate ----
 pub use cyrup_session_svc::{

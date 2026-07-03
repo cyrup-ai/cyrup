@@ -95,6 +95,15 @@ pub use cyrup_tools::{Availability, PermissionPolicy};
 /// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
 /// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.
 pub use cyrup_agent::QueueMode;
+/// Re-exported so an embedder can name the custom-transport seam types
+/// ([`SessionBuilder::stream_fn`]/[`SessionBuilder::key_resolver`], Pi `AgentOptions.streamFn`) and
+/// the built-in proxy transport ([`ProxyStreamFn`]) without a direct `cyrup-agent` dependency.
+pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
+/// Re-exported so an embedder can name the synthetic-resource override closures' element types
+/// ([`SessionBuilder::skills_override`]/[`SessionBuilder::context_files_override`]) without a direct
+/// `cyrup-resources`/`cyrup-session` dependency.
+pub use cyrup_resources::SkillPointer;
+pub use cyrup_session::prompt::{ContextFile, ContextScope};
 /// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
 /// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
 pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};
