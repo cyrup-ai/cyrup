@@ -461,44 +461,6 @@ pub fn split_model_level(pattern: &str) -> (String, Option<ThinkingArg>) {
     (pattern.to_string(), None)
 }
 
-/// Does a `provider/id`-qualified model name match a base `--models` pattern? Supports `*` globs
-/// (`anthropic/*`, `*sonnet*`) and a case-insensitive substring fallback (Pi's fuzzy scope match).
-pub fn qualified_matches(qualified: &str, base_pattern: &str) -> bool {
-    let q = qualified.to_ascii_lowercase();
-    let p = base_pattern.to_ascii_lowercase();
-    if p.contains('*') {
-        glob_match(&q, &p)
-    } else {
-        q == p || q.contains(&p)
-    }
-}
-
-/// A minimal `*`-glob matcher (each `*` matches any run, including empty); no `?`/char-classes.
-fn glob_match(text: &str, pattern: &str) -> bool {
-    let segments: Vec<&str> = pattern.split('*').collect();
-    let mut pos = 0usize;
-    for (i, seg) in segments.iter().enumerate() {
-        if seg.is_empty() {
-            continue;
-        }
-        match text[pos..].find(seg) {
-            Some(found) => {
-                // The first non-empty segment must anchor at the start unless the pattern began `*`.
-                if i == 0 && found != 0 {
-                    return false;
-                }
-                pos += found + seg.len();
-            }
-            None => return false,
-        }
-    }
-    // A trailing non-`*` segment must reach the end of the text.
-    match pattern.rsplit('*').next() {
-        Some(last) if !last.is_empty() => text.ends_with(last),
-        _ => true,
-    }
-}
-
 /// Rewrite Pi's multi-character short flags (`-nt`/`-nbt`/`-xt`/`-ne`/`-ns`/`-np`/`-nc`/`-na`) to
 /// their long forms before clap parsing — clap's native shorts are single-character only, so these
 /// Pi aliases (args.ts:116-183) are normalized here so `cyrup -nt` is accepted exactly as Pi accepts
@@ -1442,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_model_pattern_matching() {
+    fn split_model_level_peels_a_trailing_thinking_suffix() {
         assert_eq!(
             split_model_level("sonnet:high"),
             ("sonnet".to_string(), Some(ThinkingArg::High))
@@ -1453,12 +1415,6 @@ mod tests {
         );
         // A non-level suffix is preserved.
         assert_eq!(split_model_level("a:b"), ("a:b".to_string(), None));
-
-        assert!(qualified_matches("anthropic/claude-sonnet", "anthropic/*"));
-        assert!(qualified_matches("anthropic/claude-sonnet", "*sonnet*"));
-        assert!(qualified_matches("openai/gpt-4o", "gpt-4o"));
-        assert!(!qualified_matches("openai/gpt-4o", "anthropic/*"));
-        assert!(!qualified_matches("openai/gpt-4o", "claude"));
     }
 
     #[test]

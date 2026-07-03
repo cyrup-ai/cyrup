@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use cyrup::cli::{qualified_matches, split_model_level};
 use cyrup::session_resolve::{Outcome, SessionFlags, SessionRef, resolve_session_target};
 use cyrup::{
     AppMode, Cli, Diagnostic, DiagnosticLevel, Inputs, apply_arg_leniency, build_inputs,
@@ -424,6 +423,11 @@ async fn run() -> anyhow::Result<i32> {
 /// `--name` display name (Pi `appendSessionInfo`, main.ts:586) and the `--models` Ctrl+P scope (Pi
 /// `resolveModelScope`/`scopedModels`, main.ts:685).
 ///
+/// The scope patterns follow Pi's precedence `parsed.models ?? settingsManager.getEnabledModels()`
+/// (main.ts:685): an explicit `--models` wins, otherwise the persisted `enabledModels` setting is the
+/// fallback scope source. Matching itself is delegated to `cyrup-config`'s `minimatch`-faithful
+/// resolver (see [`resolve_scoped_models`]), not a bespoke matcher.
+///
 /// `fresh` is whether this is a brand-new session (Pi `!hasExistingSession`, main.ts:394): a resumed
 /// session keeps its own restored model, so the saved-default-in-scope active-model pick only fires
 /// for a fresh session.
@@ -431,8 +435,15 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
     if let Some(name) = name {
         let _ = session.set_session_name(name).await;
     }
-    if !cli.models.is_empty() {
-        let scoped = resolve_scoped_models(&session.model_catalog(), &cli.models);
+    // Pi `modelPatterns = parsed.models ?? settingsManager.getEnabledModels()` (main.ts:685): an
+    // explicit `--models` wins; otherwise fall back to the persisted `enabledModels` setting.
+    let patterns: Vec<String> = if cli.models.is_empty() {
+        session.services().settings.effective().enabled_models().unwrap_or_default()
+    } else {
+        cli.models.clone()
+    };
+    if !patterns.is_empty() {
+        let scoped = resolve_scoped_models(&session.model_catalog(), &patterns);
         if !scoped.is_empty() {
             // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
             // when `--models` scopes the set and `--model` is omitted, the active model is the saved
@@ -489,31 +500,31 @@ fn pick_scoped_active_model<'a>(
     saved.or_else(|| scoped.first())
 }
 
-/// Resolve the `--models` patterns to a [`ScopedModel`] set against the live catalog (Pi
-/// `resolveModelScope`): each pattern (optionally `:level`-suffixed) selects the catalog models whose
-/// `provider/id` matches it; duplicates are de-duplicated in first-seen order.
+/// Resolve the `--models`/`enabledModels` patterns to a [`ScopedModel`] set against the live catalog
+/// (Pi `resolveModelScope`, model-resolver.ts:269-339): each pattern (optionally `:level`-suffixed)
+/// selects the catalog models whose `provider/id` (or bare `id`) matches it; duplicates are
+/// de-duplicated in first-seen order.
+///
+/// The matching is delegated to `cyrup-config`'s `ModelResolver::resolve_scope`, a byte-for-byte
+/// `minimatch({ nocase: true })` port (13,877-case verified): a pattern containing `*`/`?`/`[` is
+/// matched with real path-segment-aware globbing (`*` never crosses `/`, full `?`/`[...]`/`{a,b}`/
+/// extglob support), and a non-glob pattern resolves to Pi's single best (alias-preferred,
+/// `localeCompare`-tie-broken) model — exactly as `resolveModelScopeWithDiagnostics` does. This
+/// replaces the prior bespoke `*`-only, non-path-segment-aware substring matcher in `cli.rs`, which
+/// diverged from Pi (e.g. `anthropic*` wrongly matched every anthropic model; `[...]` classes were
+/// unsupported). The resolver's `ScopedModel` is mapped onto the session-svc `ScopedModel` here.
 fn resolve_scoped_models(
     catalog: &[cyrup_provider::Model],
     patterns: &[String],
 ) -> Vec<ScopedModel> {
-    let mut out: Vec<ScopedModel> = Vec::new();
-    for pattern in patterns {
-        let (base, level) = split_model_level(pattern);
-        for model in catalog {
-            let qualified = format!("{}/{}", model.provider.as_str(), model.id.as_str());
-            if qualified_matches(&qualified, &base)
-                && !out
-                    .iter()
-                    .any(|s| s.model.provider == model.provider && s.model.id == model.id)
-            {
-                out.push(ScopedModel {
-                    model: model.clone(),
-                    thinking_level: level.map(|l| l.to_level()),
-                });
-            }
-        }
-    }
-    out
+    cyrup_config::ModelResolver::new(catalog)
+        .resolve_scope(patterns)
+        .into_iter()
+        .map(|sm| ScopedModel {
+            model: sm.model,
+            thinking_level: sm.thinking_level,
+        })
+        .collect()
 }
 
 /// Resolve the session target with Pi's full non-interactive depth (Pi `createSessionManager`,
@@ -1182,8 +1193,59 @@ fn init_tracing(verbose: bool) {
 mod tests {
     use super::{
         ScopedModel, SessionTarget, format_token_count, fuzzy_match, is_fresh_target,
-        pick_scoped_active_model,
+        pick_scoped_active_model, resolve_scoped_models,
     };
+
+    /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s
+    /// `minimatch`-faithful `ModelResolver::resolve_scope`, NOT the removed bespoke `*`-only matcher
+    /// (gap-analysis 06 Gap #1; Pi `resolveModelScope`, model-resolver.ts:269-339). These are the
+    /// exact divergences the crude matcher got wrong, verified against a real bundled catalog.
+    #[test]
+    fn resolve_scoped_models_uses_minimatch_semantics_like_pi() {
+        let catalog = cyrup::provider::all_available_models();
+
+        // Path-segment awareness: a 1-segment pattern (`anthropic*`, no `**`) can NEVER match the
+        // 2-segment `anthropic/<id>` under minimatch, and `anthropic*` also does not match any bare
+        // `id` (none begin "anthropic"). Pi → 0 matches. The old crude matcher wrongly matched EVERY
+        // anthropic model (its single segment anchored via plain substring across the `/`).
+        let scoped = resolve_scoped_models(&catalog, &["anthropic*".to_string()]);
+        assert!(
+            scoped.is_empty(),
+            "`anthropic*` must scope 0 models (path-segment-aware, like Pi), got {}",
+            scoped.len()
+        );
+
+        // Character classes (`[08]`) are real minimatch syntax the crude matcher could not express
+        // (it fell through to a literal-substring miss). Pi matches exactly the -0 and -8 opus ids.
+        let scoped = resolve_scoped_models(&catalog, &["anthropic/claude-opus-4-[08]".to_string()]);
+        let ids: Vec<&str> = scoped.iter().map(|s| s.model.id.as_str()).collect();
+        assert!(
+            ids.contains(&"claude-opus-4-0") && ids.contains(&"claude-opus-4-8"),
+            "`anthropic/claude-opus-4-[08]` char-class must scope both opus ids, got {ids:?}"
+        );
+        assert!(
+            scoped.iter().all(|s| s.model.provider.as_str() == "anthropic"),
+            "char-class stays path-segment-scoped to the anthropic provider"
+        );
+
+        // A bare `provider/*` glob is path-segment-aware: its first segment matches the whole
+        // provider segment. Pi matches `minimatch(fullId) || minimatch(id)`, so every scoped model
+        // is either an anthropic-provider model (fullId `anthropic/<id>`) or a model whose bare id
+        // itself begins `anthropic/` (e.g. openrouter's `anthropic/claude-…`) — never an unrelated
+        // provider like `anthropicX/…` (segment boundary, not a substring).
+        let scoped = resolve_scoped_models(&catalog, &["anthropic/*".to_string()]);
+        assert!(!scoped.is_empty(), "`anthropic/*` scopes a non-empty set");
+        assert!(
+            scoped.iter().any(|s| s.model.provider.as_str() == "anthropic"),
+            "`anthropic/*` includes the anthropic provider's own models"
+        );
+        assert!(
+            scoped.iter().all(|s| s.model.provider.as_str() == "anthropic"
+                || s.model.id.as_str().starts_with("anthropic/")),
+            "every `anthropic/*` match is anthropic-provider or an `anthropic/`-prefixed id (Pi's \
+             `minimatch(fullId) || minimatch(id)`)"
+        );
+    }
 
     fn scoped(provider: &str, id: &str) -> ScopedModel {
         // Build a `ScopedModel` from a real catalog entry so the pick exercises real `Model` fields.
