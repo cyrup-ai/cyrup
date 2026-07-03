@@ -305,6 +305,24 @@ pub trait HostServices: Send + Sync {
     /// Set (or replace) an entry's label (Pi `setLabel`, agent-session.ts:2276-2279). No-op by
     /// default; the session service routes this to the live tree's `append_label`.
     fn set_label(&self, _entry_id: &str, _label: &str) {}
+
+    /// The live session's currently-active tool names (Pi `getActiveToolNames`,
+    /// agent-session.ts:813, which the guest's `getActiveTools` binds DIRECTLY to,
+    /// agent-session.ts:2281). `None` when no live session backend is attached (the default host has
+    /// no agent) — the guest-facing binding then falls back to the guest's own active-tool
+    /// bookkeeping. The session service returns `Some(active_tool_names())` so a guest's
+    /// `getActiveTools` reflects the REAL agent tool set.
+    fn active_tools(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Restrict the live session's active tool set by name (Pi `setActiveToolsByName`,
+    /// agent-session.ts:840-855, which the guest's `setActiveTools` binds DIRECTLY to,
+    /// agent-session.ts:2283). Unknown names are ignored; the change takes effect on the next agent
+    /// turn. No-op by default (the default host grants no tool-restriction authority); the session
+    /// service routes this to the live agent's tool set + system-prompt rebuild — the SAME method the
+    /// host/CLI tool-toggle path uses, so a guest's call has full, real effect.
+    fn set_active_tools(&self, _names: &[String]) {}
 }
 
 /// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, types.ts:124-275). These

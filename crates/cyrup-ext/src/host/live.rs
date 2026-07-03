@@ -695,10 +695,15 @@ impl bindings::cyrup::ext::provider_stream::Host for HostState {
 impl bindings::cyrup::ext::ext_tools::Host for HostState {
     async fn get_active_tools(&mut self) -> String {
         let Ok(guest) = guest_of(self) else { return "[]".into() };
-        // Honour the guest's restriction if set; else surface every registered extension/guest tool.
-        let names: Vec<String> = match guest.active_tools_restriction() {
-            Some(r) => r,
-            None => guest.registry.all_registered_tool_names().unwrap_or_default(),
+        // Prefer the LIVE session's real active tool set (Pi `getActiveTools` = `getActiveToolNames`,
+        // agent-session.ts:2281,813 — the SAME source the host/CLI tool-toggle reads). Fall back to
+        // the guest's own restriction / registry when no session backend is attached (default host).
+        let names: Vec<String> = match guest.services.active_tools() {
+            Some(live) => live,
+            None => match guest.active_tools_restriction() {
+                Some(r) => r,
+                None => guest.registry.all_registered_tool_names().unwrap_or_default(),
+            },
         };
         serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
     }
@@ -710,6 +715,10 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
     async fn set_active_tools(&mut self, names_json: String) {
         if let Ok(guest) = guest_of(self) {
             let names: Vec<String> = serde_json::from_str(&names_json).unwrap_or_default();
+            // Route to the pluggable backend so a live session genuinely restricts the agent's tool
+            // set (Pi `setActiveTools` = `setActiveToolsByName`, agent-session.ts:2283,840-855). ALSO
+            // keep the local mirror for hosts with no session backend (mirrors `set_tools_expanded`).
+            guest.services.set_active_tools(&names);
             guest.set_active_tools_restriction(names);
         }
     }

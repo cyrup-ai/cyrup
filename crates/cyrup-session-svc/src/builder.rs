@@ -711,11 +711,15 @@ impl SessionBuilder {
         let mut rebuild_base = prompt_inputs.clone();
         rebuild_base.selected_tools = Vec::new();
         rebuild_base.tool_contributions = Vec::new();
-        let dynamic_tools = crate::tools::DynamicToolState::new(
+        // Shared with `host_services` so a loaded guest's `setActiveTools`/`getActiveTools`
+        // capability read+mutates the SAME authoritative active-tool view the host/CLI toggle uses
+        // (Pi binds both to `agent.state.tools`, agent-session.ts:2281,2283).
+        let dynamic_tools = Arc::new(std::sync::Mutex::new(crate::tools::DynamicToolState::new(
             registry_tools,
             base_tools.clone(),
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
-        );
+        )));
+        host_services.attach_dynamic_tools(dynamic_tools.clone());
 
         // ---- 7. seed the agent transcript from the resumed branch (R-04-011). The manager was
         // created at step 2b; `existing` already holds its context.

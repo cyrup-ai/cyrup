@@ -238,7 +238,11 @@ pub(crate) struct SessionExtras {
     pub shell_path: Option<String>,
     /// `shellCommandPrefix` setting (Pi `getShellCommandPrefix`, settings-manager.ts:895-896).
     pub shell_command_prefix: Option<String>,
-    pub dynamic_tools: DynamicToolState,
+    /// Shared with the session's [`crate::host_services::LiveHostServices`] backend so a loaded
+    /// guest's `setActiveTools`/`getActiveTools` capability operates on the ONE authoritative
+    /// active-tool view (Pi `getActiveTools`/`setActiveTools` bind to the same `agent.state.tools`,
+    /// agent-session.ts:2281,2283).
+    pub dynamic_tools: Arc<Mutex<DynamicToolState>>,
     /// The shared self-handle the builder also handed to the persist+fan-out subscriber.
     pub handle: Arc<SessionHandle>,
 }
@@ -336,7 +340,9 @@ pub struct AgentSession {
     /// Bash messages deferred while a run streams, flushed after the turn (Pi `_pendingBashMessages`).
     pending_bash: Mutex<Vec<AgentMessage>>,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
-    dynamic_tools: Mutex<DynamicToolState>,
+    /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
+    /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
+    dynamic_tools: Arc<Mutex<DynamicToolState>>,
     // ---- post-run execution loop (Pi `_runAgentPrompt`/`_handlePostAgentRun`,
     //      agent-session.ts:973-1022; the assembled-run driver) ----
     /// Weak self-reference, bound by [`Self::into_shared`]; shared with the persist+fan-out
@@ -419,7 +425,7 @@ impl AgentSession {
             shell_command_prefix: extras.shell_command_prefix,
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
-            dynamic_tools: Mutex::new(extras.dynamic_tools),
+            dynamic_tools: extras.dynamic_tools,
             handle: extras.handle,
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
@@ -2089,6 +2095,14 @@ impl AgentSession {
         for ev in self.services.host_services.take_pending_events() {
             self.fanout_emit(ev).await;
         }
+        // Push the tool set a guest `setActiveTools` restricted the session to onto the live agent
+        // (Pi `setActiveTools` = `setActiveToolsByName`, agent-session.ts:2283,850-854). The guest
+        // updated the authoritative dynamic-tool view synchronously across the wasm-suspended call
+        // (so `getActiveTools` already reflects it); the ASYNC agent push lands here — the same
+        // command-tier-safe bridge point control ops / pending events drain at — before the next turn.
+        if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
+            self.push_active_tools(tools, prompt).await;
+        }
         let ops = self.services.host_services.take_pending_control();
         let mut deferred = Vec::new();
         for op in ops {
@@ -3333,13 +3347,21 @@ impl AgentSession {
         Self::lock(&self.dynamic_tools).get(name)
     }
 
+    /// Push a rebuilt `(tools, system_prompt)` onto the agent for the next turn (Pi
+    /// `setActiveToolsByName` tail, agent-session.ts:850-854). Shared by the host/CLI
+    /// [`Self::set_active_tools_by_name`] path and the guest-driven drain in
+    /// [`Self::apply_pending_control`] so both reach the live agent identically.
+    async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
+        self.agent.set_tools(tools).await;
+        self.agent.set_system_prompt(prompt).await;
+    }
+
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
     pub async fn set_active_tools_by_name(&self, names: &[String]) {
         let (tools, prompt) = { Self::lock(&self.dynamic_tools).set_active(names) };
-        self.agent.set_tools(tools).await;
-        self.agent.set_system_prompt(prompt).await;
+        self.push_active_tools(tools, prompt).await;
     }
 
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71,384).

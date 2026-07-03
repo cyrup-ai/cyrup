@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_core::{CancelToken, EntryId, ModelRef};
+use cyrup_core::{CancelToken, EntryId, ModelRef, Tool};
 use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
@@ -28,6 +28,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
+use crate::tools::DynamicToolState;
 
 /// Fallback ceiling for the `exec` grant's full round trip (spawn through exit) when the guest
 /// supplied NO `opts.timeoutMs` (or gave `0`, which — like `http-client`'s `timeout_ms` — means "no
@@ -55,6 +56,11 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// here so the runtime can act on it (Pi `createCommandContext`, agent-session.ts:1158). Set by the
 /// runtime once it owns the session; until then control ops are reported as unavailable.
 pub type ControlSink = Arc<dyn Fn(ControlOp) -> Result<(), String> + Send + Sync>;
+
+/// A rebuilt active-tool push: the new tool array + the rebuilt system prompt a guest `setActiveTools`
+/// produced (Pi `setActiveToolsByName` output, agent-session.ts:850-854), queued for the async agent
+/// push in [`crate::AgentSession::apply_pending_control`].
+type ActiveToolsPush = (Vec<Arc<dyn Tool>>, String);
 
 /// Which dialog family a [`UiRequest`] carries (Pi `ExtensionUIContext.{confirm,input,select,editor}`,
 /// types.ts:127-133,216).
@@ -212,6 +218,17 @@ pub struct LiveHostServices {
     /// and fanned out by [`crate::AgentSession::apply_pending_control`] after the guest call settles —
     /// the same sync→async bridge point the control queue uses.
     pending_events: Mutex<Vec<AgentSessionEvent>>,
+    /// The session's ONE authoritative dynamic-tool view (Pi `agent.state.tools`), shared with the
+    /// facade so a guest's `setActiveTools`/`getActiveTools` capability read+mutates the SAME state
+    /// the host/CLI tool-toggle does (Pi binds both to `setActiveToolsByName`/`getActiveToolNames`,
+    /// agent-session.ts:2281,2283). Attached post-build via [`Self::attach_dynamic_tools`]; `None`
+    /// until then (default host: `active_tools` returns `None` ⇒ the binding uses its own bookkeeping).
+    dynamic_tools: Mutex<Option<Arc<Mutex<DynamicToolState>>>>,
+    /// The rebuilt `(tools, system_prompt)` a guest `setActiveTools` produced, queued for the ASYNC
+    /// agent push [`crate::AgentSession::apply_pending_control`] applies before the next turn (the
+    /// guest is wasm-suspended across the SYNC `set_active_tools` call — the same sync→async bridge
+    /// `pending_events`/the control queue use). Last write wins (Pi: the last `setActiveTools` wins).
+    pending_active_tools: Mutex<Option<ActiveToolsPush>>,
     /// [`DEFAULT_EXEC_TIMEOUT`] in production; overridable ONLY for tests
     /// ([`Self::with_exec_timeout`]) so the fallback-timeout path is exercisable without a real test
     /// waiting the full production duration.
@@ -236,6 +253,8 @@ impl LiveHostServices {
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
+            dynamic_tools: Mutex::new(None),
+            pending_active_tools: Mutex::new(None),
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
         }
     }
@@ -387,6 +406,21 @@ impl LiveHostServices {
     /// The builder calls this once the `Arc<AsyncMutex<SessionManager>>` exists (step 10).
     pub fn attach_session(&self, manager: Arc<AsyncMutex<SessionManager>>) {
         *Self::lock(&self.manager) = Some(manager);
+    }
+
+    /// Share the session's authoritative dynamic-tool view so a guest's `setActiveTools`/
+    /// `getActiveTools` capability read+mutates the SAME state the host/CLI tool-toggle does (Pi
+    /// `getActiveTools`/`setActiveTools`, agent-session.ts:2281,2283). The builder calls this once the
+    /// shared `Arc<Mutex<DynamicToolState>>` exists (step 6), before any guest can be loaded.
+    pub(crate) fn attach_dynamic_tools(&self, dynamic_tools: Arc<Mutex<DynamicToolState>>) {
+        *Self::lock(&self.dynamic_tools) = Some(dynamic_tools);
+    }
+
+    /// Drain the `(tools, system_prompt)` push a guest `setActiveTools` queued;
+    /// [`crate::AgentSession::apply_pending_control`] applies it to the live agent before the next
+    /// turn (the guest ran the restriction synchronously across the wasm-suspended call).
+    pub fn take_pending_active_tools(&self) -> Option<ActiveToolsPush> {
+        Self::lock(&self.pending_active_tools).take()
     }
 
     /// Drain the facade events queued by guest state mutations (entry_appended/session_info_changed);
@@ -734,6 +768,26 @@ impl HostServices for LiveHostServices {
             mgr.append_label(&EntryId::from(entry_id), Some(label)).map_err(|e| e.to_string())?;
             Ok(())
         });
+    }
+
+    fn active_tools(&self) -> Option<Vec<String>> {
+        // The live session's REAL active tool set (Pi `getActiveTools` = `getActiveToolNames`,
+        // agent-session.ts:2281,813). `None` until the shared view is attached (default host).
+        let dt = Self::lock(&self.dynamic_tools).clone()?;
+        Some(Self::lock(&dt).active_names())
+    }
+
+    fn set_active_tools(&self, names: &[String]) {
+        // Restrict the live agent's tool set (Pi `setActiveTools` = `setActiveToolsByName`,
+        // agent-session.ts:2283,840-855). Update the authoritative dynamic-tool view SYNCHRONOUSLY —
+        // Pi mutates `this.agent.state.tools` immediately, so the paired `getActiveTools` read
+        // reflects it at once — and queue the rebuilt `(tools, prompt)` for the ASYNC agent push
+        // `AgentSession::apply_pending_control` applies before the next turn (the guest is
+        // wasm-suspended across this SYNC call, the same sync→async bridge control ops use). No-op
+        // when no shared view is attached (default host: no live agent to restrict).
+        let Some(dt) = Self::lock(&self.dynamic_tools).clone() else { return };
+        let (tools, prompt) = { Self::lock(&dt).set_active(names) };
+        *Self::lock(&self.pending_active_tools) = Some((tools, prompt));
     }
 }
 
