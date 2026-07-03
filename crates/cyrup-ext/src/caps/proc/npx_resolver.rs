@@ -555,7 +555,13 @@ fn npx_cache_path() -> PathBuf {
 
 /// `npx-resolver.ts:373-385` `loadCache`.
 fn load_cache() -> Option<NpxCache> {
-    let raw = fs::read_to_string(npx_cache_path()).ok()?;
+    load_cache_at(&npx_cache_path())
+}
+
+/// Thin wrapper split out (same reasoning as [`resolve_from_npm_cache`]/[`resolve_from_npm_cache_at`]
+/// just above) so tests can point it at a hermetic fixture path instead of the real `npx_cache_path()`.
+fn load_cache_at(path: &Path) -> Option<NpxCache> {
+    let raw = fs::read_to_string(path).ok()?;
     let cache: NpxCache = serde_json::from_str(&raw).ok()?;
     if cache.version != CACHE_VERSION {
         return None;
@@ -563,18 +569,47 @@ fn load_cache() -> Option<NpxCache> {
     Some(cache)
 }
 
+/// Serializes [`save_cache_entry`]'s read-merge-write-rename cycle across concurrent
+/// [`resolve_npx_binary`] calls within this process.
+///
+/// Pi's `saveCacheEntry` (`npx-resolver.ts:387-408`) is fully synchronous
+/// (`readFileSync`/`writeFileSync`/`renameSync`, no `await`), so Node's single-threaded event loop
+/// already guarantees no other JS — including a concurrent `saveCacheEntry` call from a different
+/// in-flight `Promise` (e.g. two MCP servers connecting around the same time,
+/// `server-manager.ts:73`) — can interleave mid-function, even though every call builds the SAME
+/// `${cachePath}.${process.pid}.tmp` tmp-file name (`npx-resolver.ts:405`, same `process.pid`
+/// every time). [`resolve_npx_binary`] runs on separate OS threads via
+/// `tokio::task::block_in_place` (see this module's top-level doc comment), and [`super::ProcCaps::
+/// spawn`] takes `&self` (not `&mut self`), so — without an explicit lock — two genuinely
+/// concurrent cold-cache resolutions racing on the identical tmp path could interleave a
+/// write/rename (a guest managing multiple npx-backed subprocesses concurrently is a realistic
+/// trigger). A process-wide `Mutex` restores Node's single-writer-at-a-time guarantee.
+static SAVE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `npx-resolver.ts:387-408` `saveCacheEntry` — same read-merge-atomic-rename shape (a fresh read
 /// immediately before the merge, rather than the loaded `cache` from [`resolve_npx_binary`]'s own
 /// earlier call, exactly like the TS re-reading `cachePath` here rather than reusing its own
 /// earlier `loadCache()` result).
 fn save_cache_entry(key: &str, entry: &NpxCacheEntry) {
-    let path = npx_cache_path();
+    save_cache_entry_at(&npx_cache_path(), key, entry);
+}
+
+/// Thin wrapper split out (same reasoning as [`resolve_from_npm_cache`]/[`resolve_from_npm_cache_at`]
+/// above) so tests can drive the real read-merge-write-rename-under-lock cycle against a hermetic
+/// fixture path, including concurrently from multiple threads, instead of the real `npx_cache_path()`.
+fn save_cache_entry_at(path: &Path, key: &str, entry: &NpxCacheEntry) {
+    // A poisoned lock (only reachable if a prior holder panicked mid-cycle, which nothing in this
+    // body does) degrades to skipping this save — the SAME graceful "just don't persist" fallback
+    // already used for every I/O failure below, never a panic of our own.
+    let Ok(_guard) = SAVE_CACHE_LOCK.lock() else { return };
+
     let Some(dir) = path.parent() else { return };
     if fs::create_dir_all(dir).is_err() {
         return;
     }
 
-    let mut merged = load_cache().unwrap_or_else(|| NpxCache { version: CACHE_VERSION, entries: HashMap::new() });
+    let mut merged =
+        load_cache_at(path).unwrap_or_else(|| NpxCache { version: CACHE_VERSION, entries: HashMap::new() });
     merged.entries.insert(key.to_string(), entry.clone());
 
     let Ok(serialized) = serde_json::to_string_pretty(&merged) else { return };
@@ -582,7 +617,7 @@ fn save_cache_entry(key: &str, entry: &NpxCacheEntry) {
     if fs::write(&tmp_path, serialized).is_err() {
         return;
     }
-    let _ = fs::rename(&tmp_path, &path);
+    let _ = fs::rename(&tmp_path, path);
 }
 
 fn cache_key(command: &str, args: &[String]) -> String {
@@ -797,6 +832,61 @@ mod tests {
             .join(format!("cyrup-npx-detect-sh-{}-{}", std::process::id(), now_ms()));
         fs::write(&tmp, "#!/bin/sh\necho hi\n").expect("write");
         assert!(!detect_js_binary(&tmp));
+        let _ = fs::remove_file(&tmp);
+    }
+
+    /// [`resolve_npx_binary`] runs on separate real OS threads via `tokio::task::block_in_place`
+    /// (`&self` `ProcCaps::spawn`, this module's top-level doc comment), so [`save_cache_entry`]'s
+    /// tmp-path race is reachable with genuine concurrency, not just in theory. Drive many real
+    /// `std::thread`s at [`save_cache_entry_at`] against the SAME fixture cache file concurrently,
+    /// each inserting a distinct key — matching Pi's `saveCacheEntry` guarantee (synchronous, so
+    /// Node's single-threaded event loop never interleaves two calls, npx-resolver.ts:387-408): if
+    /// [`SAVE_CACHE_LOCK`] genuinely serializes the read-merge-write-rename cycle, every thread's
+    /// insert survives (each sees the prior thread's write before its own read) and the final file
+    /// is always valid, un-corrupted JSON. Before the fix (no lock) this test was flaky — some runs
+    /// lost entries (classic read-old/merge/last-writer-wins TOCTOU) and some produced a tmp file
+    /// whose content was a byte-interleaved mix of two threads' `serde_json::to_string_pretty`
+    /// output that failed to parse at all.
+    #[test]
+    fn save_cache_entry_survives_concurrent_writers_from_real_threads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cyrup-npx-save-cache-concurrent-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        const N: usize = 16;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let path = tmp.clone();
+                std::thread::spawn(move || {
+                    let entry = NpxCacheEntry {
+                        resolved_bin: format!("/fake/bin/{i}"),
+                        resolved_at: now_ms(),
+                        package_version: None,
+                        is_js: true,
+                    };
+                    save_cache_entry_at(&path, &format!("key-{i}"), &entry);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread must not panic");
+        }
+
+        let raw = fs::read_to_string(&tmp).expect("final cache file must exist and be readable");
+        let cache: NpxCache =
+            serde_json::from_str(&raw).expect("final cache file must be valid, un-corrupted JSON");
+        assert_eq!(
+            cache.entries.len(),
+            N,
+            "every concurrent writer's distinct key must survive the serialized read-merge-write \
+             cycle, got: {:?}",
+            cache.entries.keys().collect::<Vec<_>>()
+        );
+        for i in 0..N {
+            assert!(cache.entries.contains_key(&format!("key-{i}")), "missing key-{i}");
+        }
+
         let _ = fs::remove_file(&tmp);
     }
 }
