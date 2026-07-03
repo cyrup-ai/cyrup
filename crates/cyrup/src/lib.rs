@@ -16,6 +16,7 @@ pub mod cli;
 pub mod diagnostics;
 pub mod input;
 pub mod migrations;
+pub mod output_guard;
 pub mod provider;
 pub mod run;
 pub mod session_resolve;
@@ -36,6 +37,9 @@ pub use diagnostics::{
     format_no_models_available_message, get_provider_login_help,
 };
 pub use input::{Inputs, build_inputs, compose_inputs, split_positionals};
+pub use output_guard::{
+    emit_stray, emit_stray_line, is_stdout_taken_over, restore_stdout, take_over_stdout,
+};
 pub use provider::{select_provider, unknown_model_warning};
 pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
 pub use session_resolve::{

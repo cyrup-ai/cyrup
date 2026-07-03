@@ -128,9 +128,15 @@ async fn run() -> anyhow::Result<i32> {
     let stdout_tty = io::stdout().is_terminal();
     let mode = resolve_app_mode(&cli, stdin_tty, stdout_tty);
 
-    // Stdout-takeover decision (Pi main.ts:535). The streams the bin owns are already disciplined
-    // (tracing → stderr), so the takeover itself is inert; the Pi-faithful decision is computed.
-    let _guard_stdout = should_take_over_stdout(&cli, mode);
+    // Stdout takeover (Pi main.ts:535-537): for a non-interactive run that is not a plain-metadata
+    // command, install the guard so every *incidental* stdout write between here and the protocol
+    // stream — a `runMigrations` notice, `createSessionManager`'s cross-project "Session found in
+    // different project" hint — is rerouted to stderr (via `emit_stray_line`) instead of corrupting
+    // the PRINT/JSON/RPC stream on stdout. The protocol writers keep writing to real stdout (their
+    // injected `io::stdout()` sink is the analog of Pi's `writeRawStdout`).
+    if should_take_over_stdout(&cli, mode) {
+        cyrup::output_guard::take_over_stdout();
+    }
 
     // `@file` is unsupported in RPC mode (Pi main.ts:540-543).
     if mode == AppMode::Rpc && !split_file_args(&cli).is_empty() {
@@ -368,6 +374,8 @@ async fn run() -> anyhow::Result<i32> {
             let reader = tokio::io::BufReader::new(tokio::io::stdin());
             let mut writer = tokio::io::stdout();
             run_rpc_dispatch(&runtime, reader, &mut writer).await?;
+            // Restore stdout at teardown (Pi `finally { restoreStdout() }`, main.ts:848).
+            cyrup::output_guard::restore_stdout();
             Ok(0)
         }
         AppMode::Print | AppMode::Json => {
@@ -399,11 +407,14 @@ async fn run() -> anyhow::Result<i32> {
             let inputs = build_inputs(&cli, &dirs.cwd).await?;
             ensure_prompt(&inputs)?;
             let mut out = io::stdout();
-            if let AppMode::Json = mode {
+            let dispatch = if let AppMode::Json = mode {
                 run_json_dispatch(&session, &inputs, &mut out).await
             } else {
                 run_print_dispatch(&session, &inputs, &mut out).await
-            }
+            };
+            // Restore stdout at teardown (Pi `finally { restoreStdout() }`, main.ts:848).
+            cyrup::output_guard::restore_stdout();
+            dispatch
         }
         AppMode::Interactive => unreachable!("interactive mode is handled before this match"),
     }
@@ -535,9 +546,12 @@ fn resolve_session(
         &mut confirm,
     );
     // Pi prints these via `console.log` (stdout) / `console.error` (stderr) verbatim — no `Error:`
-    // prefix (the messages are pre-composed, e.g. `No session found matching '<arg>'`).
+    // prefix (the messages are pre-composed, e.g. `No session found matching '<arg>'`). The
+    // `console.log` lines route through the stdout guard: under a non-interactive takeover (Pi's
+    // swapped `process.stdout.write`) they land on stderr so they cannot corrupt the JSON/RPC stream,
+    // e.g. the cross-project "Session found in different project" hint (Pi main.ts:317).
     for line in &resolution.stdout {
-        println!("{line}");
+        cyrup::output_guard::emit_stray_line(line);
     }
     for line in &resolution.stderr {
         eprintln!("{line}");
@@ -697,10 +711,13 @@ fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) 
 
 /// The plain-stdin fork-into-cwd confirmation (Pi `promptConfirm`, main.ts:191-203): a cooked-mode
 /// `[y/N]` readline (NOT the TUI dialog host), run before any terminal takeover. Defaults to `no`.
+///
+/// The prompt itself routes through the stdout guard: Pi's `promptConfirm` writes it via readline to
+/// `process.stdout`, which the stdout takeover redirects to stderr, so under a non-interactive
+/// `--mode json`/`--mode rpc` run the `[y/N]` prompt lands on stderr and cannot corrupt the protocol
+/// stream on stdout (the answer is still read from stdin).
 fn prompt_fork_confirm() -> bool {
-    use std::io::Write;
-    print!("Fork this session into current directory? [y/N] ");
-    let _ = io::stdout().flush();
+    cyrup::output_guard::emit_stray("Fork this session into current directory? [y/N] ");
     let mut line = String::new();
     if io::stdin().read_line(&mut line).is_err() {
         return false;

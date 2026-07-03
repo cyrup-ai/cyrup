@@ -208,11 +208,16 @@ fn migrate_commands_to_prompts(base_dir: &Path, label: &str) -> bool {
     if commands_dir.exists() && !prompts_dir.exists() {
         match std::fs::rename(&commands_dir, &prompts_dir) {
             Ok(()) => {
-                println!("Migrated {label} commands/ → prompts/");
+                // Routed through the stdout guard (Pi `console.log` under `takeOverStdout`): during a
+                // non-interactive PRINT/JSON/RPC run this notice is rerouted to stderr so it can never
+                // corrupt the machine-readable stream on stdout (Pi migrations.ts:144, main.ts:537).
+                crate::output_guard::emit_stray_line(&format!("Migrated {label} commands/ → prompts/"));
                 return true;
             }
             Err(err) => {
-                println!("Warning: Could not migrate {label} commands/ to prompts/: {err}");
+                crate::output_guard::emit_stray_line(&format!(
+                    "Warning: Could not migrate {label} commands/ to prompts/: {err}"
+                ));
             }
         }
     }
