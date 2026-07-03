@@ -157,6 +157,31 @@ pub trait HostServices: Send + Sync {
         false
     }
 
+    // --- fire-and-forget ui effects (Pi `ExtensionUIContext` mutators, types.ts:130-275) ---
+    // Unlike confirm/input/select/editor above, the guest does NOT block on a reply for any of
+    // these — Pi's own signatures return `void` (types.ts:136,142,164,177,184,187,210,275) and its
+    // RPC-mode wire handlers explicitly say "Fire and forget - no response needed"
+    // (`rpc-mode.ts:149,163,196`). No-op by default (no ambient delivery authority); the session
+    // service routes these to the active mode's live renderer.
+    /// A notification toast (Pi `notify(message, type)`, types.ts:136).
+    fn notify(&self, _message: &str, _kind: NotifyKind) {}
+    /// A keyed status-bar segment (Pi `setStatus(key, text?)`, types.ts:141-142); `None` clears the
+    /// key.
+    fn set_status(&self, _key: &str, _text: Option<&str>) {}
+    /// A custom status-line widget payload (Pi `setWidget`, types.ts:164-173).
+    fn set_widget(&self, _widget: &Value) {}
+    /// Custom header content (Pi `setHeader`, types.ts:184).
+    fn set_header(&self, _content: &str) {}
+    /// Custom footer content (Pi `setFooter`, types.ts:174-177).
+    fn set_footer(&self, _content: &str) {}
+    /// The terminal/window title (Pi `setTitle`, types.ts:187).
+    fn set_title(&self, _title: &str) {}
+    /// Replace (`is_paste=false`, Pi `setEditorText`, types.ts:210) or paste-insert
+    /// (`is_paste=true`, Pi `pasteEditorText`, types.ts:230) into the editor buffer.
+    fn set_editor_text(&self, _text: &str, _is_paste: bool) {}
+    /// Expand/collapse tool rows (Pi `setToolsExpanded`, types.ts:275).
+    fn set_tools_expanded(&self, _expanded: bool) {}
+
     // --- session read-only view (R-08-027) ---
     fn entries(&self) -> Value {
         json!([])
@@ -389,6 +414,12 @@ struct RecordingState {
     /// actually produced a pre-cancelled token (Pi `options.signal.aborted`, `exec.ts:66-68`), not
     /// just that the id was recorded somewhere.
     exec_call_pre_cancelled: Vec<bool>,
+    /// The `(message, kind)` of each fire-and-forget `notify` call, in call order — proves the WIT
+    /// `ui.notify` import reaches `HostServices::notify`, not just `GuestState`'s own bookkeeping.
+    notify_calls: Vec<(String, NotifyKind)>,
+    /// The `(key, text)` of each fire-and-forget `set_status` call, in call order — the same live
+    /// proof as `notify_calls`, for the WIT `ui.set-status` import.
+    set_status_calls: Vec<(String, Option<String>)>,
     /// The `message` body of each `confirm` call (L4 review §2.6), in call order.
     confirm_messages: Vec<String>,
     /// The `placeholder` of each `input` call (L4 review §2.7), in call order.
@@ -474,6 +505,18 @@ impl RecordingServices {
         self.state.lock().map(|g| g.labels.clone()).unwrap_or_default()
     }
 
+    /// The `(message, kind)` of each fire-and-forget `notify` call the `HostServices` boundary
+    /// itself observed, in call order.
+    pub fn notify_calls(&self) -> Vec<(String, NotifyKind)> {
+        self.state.lock().map(|g| g.notify_calls.clone()).unwrap_or_default()
+    }
+
+    /// The `(key, text)` of each fire-and-forget `set_status` call the `HostServices` boundary
+    /// itself observed, in call order.
+    pub fn set_status_calls(&self) -> Vec<(String, Option<String>)> {
+        self.state.lock().map(|g| g.set_status_calls.clone()).unwrap_or_default()
+    }
+
     /// The `message` body of each `confirm` call, in call order (L4 review §2.6 live proof: a guest
     /// `confirm_with(title, message, ..)` call's `message` reaches the host distinct from `title`).
     pub fn confirm_messages(&self) -> Vec<String> {
@@ -488,6 +531,16 @@ impl RecordingServices {
 }
 
 impl HostServices for RecordingServices {
+    fn notify(&self, message: &str, kind: NotifyKind) {
+        if let Ok(mut g) = self.state.lock() {
+            g.notify_calls.push((message.to_string(), kind));
+        }
+    }
+    fn set_status(&self, key: &str, text: Option<&str>) {
+        if let Ok(mut g) = self.state.lock() {
+            g.set_status_calls.push((key.to_string(), text.map(str::to_string)));
+        }
+    }
     fn confirm(&self, _prompt: &str, message: &str, _opts: &DialogOptions) -> bool {
         if let Ok(mut g) = self.state.lock() {
             g.confirm_messages.push(message.to_string());

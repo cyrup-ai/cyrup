@@ -18,7 +18,7 @@ use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
     ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse,
-    HttpStreamResponse, ProcSpawnSpec,
+    HttpStreamResponse, NotifyKind, ProcSpawnSpec,
 };
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
@@ -107,6 +107,54 @@ pub struct UiRequest {
 /// fall back to the deny defaults (== Pi `noOpUIContext`, runner.ts:230-261).
 pub type UiSink = UnboundedSender<UiRequest>;
 
+/// A fire-and-forget `ui.*` effect a loaded extension pushed via `notify`/`set-status`/`set-widget`/
+/// `set-header`/`set-footer`/`set-title`/`set-editor-text`/`paste-editor-text`/`set-tools-expanded`
+/// (Pi `ExtensionUIContext` mutators, types.ts:130-275) — the ONE-WAY counterpart to [`UiRequest`]:
+/// the guest never blocks on a reply (Pi's own signatures return `void`), so there is no `reply`
+/// channel here at all, unlike `UiRequest`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiEffect {
+    /// Pi `notify(message, type)`, types.ts:136; RPC wire `method:"notify"` (rpc-mode.ts:149-157).
+    Notify { message: String, kind: NotifyKind },
+    /// Pi `setStatus(key, text?)`, types.ts:141-142; RPC wire `method:"setStatus"`
+    /// (rpc-mode.ts:163-172). `text: None` clears the key.
+    SetStatus { key: String, text: Option<String> },
+    /// Pi `setWidget(key, content, options?)`, types.ts:164-173; RPC wire `method:"setWidget"`
+    /// (rpc-mode.ts:190-206). Cyrup's WIT `set-widget(widget-json)` collapsed Pi's 3-argument
+    /// `{key, content, options}` shape into ONE opaque JSON payload (`cyrup-ext-sdk::Ctx::set_widget`
+    /// takes `impl Serialize` verbatim) — `widget` carries that payload as-is, not re-split into
+    /// Pi's `widgetKey`/`widgetLines`/`widgetPlacement` fields (there is no cyrup-side convention to
+    /// re-derive them from).
+    SetWidget { widget: Value },
+    /// Pi `setHeader(factory)`, types.ts:184. Pi's RPC mode never delivers this over the wire at all
+    /// ("Custom header not supported in RPC mode - requires TUI access", rpc-mode.ts:209-211) because
+    /// Pi's version takes a TUI component FACTORY; cyrup's WIT `set-header(content: string)` is
+    /// plain data (world.wit:272), so it is still delivered on this in-process channel for a future
+    /// TUI-mode consumer even though the RPC mode does not forward it onward (see `rpc.rs`).
+    SetHeader { content: String },
+    /// Pi `setFooter(factory)`, types.ts:174-177; same RPC non-forwarding rationale as `SetHeader`
+    /// (rpc-mode.ts:213-215).
+    SetFooter { content: String },
+    /// Pi `setTitle(title)`, types.ts:187; RPC wire `method:"setTitle"` (rpc-mode.ts:216-223).
+    SetTitle { title: String },
+    /// Pi `setEditorText(text)`/`pasteEditorText(text)`, types.ts:200-230; RPC wire
+    /// `method:"set_editor_text"` (rpc-mode.ts:234-241; `pasteToEditor` falls back to the same
+    /// handler, rpc-mode.ts:230-232) — note the wire method name is snake_case, unlike its siblings.
+    SetEditorText { text: String, is_paste: bool },
+    /// Pi `setToolsExpanded(expanded)`, types.ts:275. Pi's RPC mode never forwards this either
+    /// ("Tool expansion not supported in RPC mode - no TUI", rpc-mode.ts:296-298); delivered here for
+    /// the same future-TUI-consumer reason `SetHeader`/`SetFooter` are.
+    SetToolsExpanded { expanded: bool },
+}
+
+/// A fire-and-forget effect sink: the mode's renderer (currently RPC; see `cyrup_modes::rpc::run_rpc`)
+/// drains [`UiEffect`]s as they arrive and relays the ones Pi's own RPC mode relays (notify/setStatus/
+/// setWidget/setTitle/setEditorText — rpc-mode.ts:149-241) onward to the client. Set by the mode entry
+/// point via [`LiveHostServices::set_ui_effect_sink`]; absent (`None`) in headless (print/json), where
+/// the effect methods below silently drop (== Pi `noOpUIContext`'s `notify`/`setStatus`/… no-ops,
+/// runner.ts:234-244).
+pub type UiEffectSink = UnboundedSender<UiEffect>;
+
 /// The sync snapshot the session keeps current for the (sync) host-services reads.
 #[derive(Clone, Debug, Default)]
 struct LiveSnapshot {
@@ -142,6 +190,13 @@ pub struct LiveHostServices {
     /// [`UiRequest`] here and BLOCKS on the one-shot reply. `None` in headless (print/json): the
     /// overrides then fall through to the trait deny defaults (== Pi `noOpUIContext`) and never block.
     ui_sink: Mutex<Option<UiSink>>,
+    /// The active mode's fire-and-forget effect drain (interactive TUI / RPC), attached post-build
+    /// via [`Self::set_ui_effect_sink`]. A guest's `ui.{notify,set-status,set-widget,set-header,
+    /// set-footer,set-title,set-editor-text,paste-editor-text,set-tools-expanded}` capability reaches
+    /// the SYNC [`HostServices`] method, which forwards a [`UiEffect`] here and returns immediately —
+    /// no reply is awaited, unlike [`Self::ui_sink`]. `None` in headless (print/json): the overrides
+    /// then silently drop (== Pi `noOpUIContext`, runner.ts:230-261).
+    ui_effect_sink: Mutex<Option<UiEffectSink>>,
     /// Receiver half of the command-tier control channel (see [`Self::wire_control_channel`]). A
     /// guest's `control` capability call reaches the SYNC [`HostServices::control`] method (the
     /// guest is wasm-suspended and cannot await), which forwards the [`ControlOp`] here; the session
@@ -177,6 +232,7 @@ impl LiveHostServices {
             snapshot: Mutex::new(LiveSnapshot::default()),
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
+            ui_effect_sink: Mutex::new(None),
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
@@ -221,6 +277,20 @@ impl LiveHostServices {
     /// absence of a sink IS the headless policy, mirroring Pi's absence of a `uiContext`.
     pub fn set_ui_sink(&self, sink: UiSink) {
         *Self::lock(&self.ui_sink) = Some(sink);
+    }
+
+    /// Attach the mode's fire-and-forget effect drain (see [`UiEffectSink`]/[`Self::ui_effect_sink`]).
+    /// Only interactive/rpc call this; headless (print/json) leaves it `None`.
+    pub fn set_ui_effect_sink(&self, sink: UiEffectSink) {
+        *Self::lock(&self.ui_effect_sink) = Some(sink);
+    }
+
+    /// Send one fire-and-forget effect to the attached drain, if any (no-op — matching Pi's
+    /// `noOpUIContext` — when unattached). Never blocks: an `UnboundedSender::send` never awaits.
+    fn emit_ui_effect(&self, effect: UiEffect) {
+        if let Some(sink) = Self::lock(&self.ui_effect_sink).clone() {
+            let _ = sink.send(effect);
+        }
     }
 
     /// Route one dialog request to the attached renderer and BLOCK (the guest is wasm-suspended) on the
@@ -386,6 +456,43 @@ impl HostServices for LiveHostServices {
             Some(UiReply::Text(t)) => t,
             _ => None,
         }
+    }
+
+    // --- fire-and-forget ui effects (see [`UiEffect`]'s doc for the Pi citation per variant) ---
+    // Unlike `confirm`/`input`/`select`/`editor` above, these never block: [`Self::emit_ui_effect`]
+    // sends on an unbounded channel and returns immediately, matching Pi's own `void`-returning
+    // `ExtensionUIContext` mutators.
+
+    fn notify(&self, message: &str, kind: NotifyKind) {
+        self.emit_ui_effect(UiEffect::Notify { message: message.to_string(), kind });
+    }
+
+    fn set_status(&self, key: &str, text: Option<&str>) {
+        self.emit_ui_effect(UiEffect::SetStatus { key: key.to_string(), text: text.map(str::to_string) });
+    }
+
+    fn set_widget(&self, widget: &Value) {
+        self.emit_ui_effect(UiEffect::SetWidget { widget: widget.clone() });
+    }
+
+    fn set_header(&self, content: &str) {
+        self.emit_ui_effect(UiEffect::SetHeader { content: content.to_string() });
+    }
+
+    fn set_footer(&self, content: &str) {
+        self.emit_ui_effect(UiEffect::SetFooter { content: content.to_string() });
+    }
+
+    fn set_title(&self, title: &str) {
+        self.emit_ui_effect(UiEffect::SetTitle { title: title.to_string() });
+    }
+
+    fn set_editor_text(&self, text: &str, is_paste: bool) {
+        self.emit_ui_effect(UiEffect::SetEditorText { text: text.to_string(), is_paste });
+    }
+
+    fn set_tools_expanded(&self, expanded: bool) {
+        self.emit_ui_effect(UiEffect::SetToolsExpanded { expanded });
     }
 
     fn models(&self) -> Value {

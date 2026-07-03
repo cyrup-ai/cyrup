@@ -26,8 +26,8 @@ use std::collections::HashMap;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
-    ForkPosition, InputSource, ModelThinkingLevel, PromptAccepted, PromptOptions, QueueMode,
-    StreamingBehavior, UiKind, UiReply, UiRequest, UserInput,
+    ForkPosition, InputSource, ModelThinkingLevel, NotifyKind, PromptAccepted, PromptOptions,
+    QueueMode, StreamingBehavior, UiEffect, UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
@@ -337,6 +337,83 @@ fn extension_ui_request_json(id: &str, req: &UiRequest) -> Value {
     }
 }
 
+/// Render a [`NotifyKind`] as Pi's exact wire string (`notify`'s `type` param, types.ts:135).
+fn notify_kind_str(kind: NotifyKind) -> &'static str {
+    match kind {
+        NotifyKind::Info => "info",
+        NotifyKind::Warning => "warning",
+        NotifyKind::Error => "error",
+    }
+}
+
+/// Shape a fire-and-forget [`UiEffect`] into the Pi `extension_ui_request` wire object, mirroring
+/// `createExtensionUIContext`'s `notify`/`setStatus`/`setWidget`/`setTitle`/`setEditorText` handlers
+/// (`rpc-mode.ts:149-241`), each of which emits the SAME envelope `confirm`/`input`/`select`/`editor`
+/// use — `{type:"extension_ui_request", id, method, ...}` — but never registers the fresh `id` in
+/// `pendingExtensionRequests`, since no response is ever awaited (Pi's own comment: "Fire and forget -
+/// no response needed"). Returns `None` for `SetHeader`/`SetFooter`/`SetToolsExpanded` — Pi's real RPC
+/// mode never forwards THOSE three over the wire either ("not supported in RPC mode - requires TUI
+/// access" / "no TUI", rpc-mode.ts:209-215,296-298); [`run_rpc`]'s effect-drain arm below only writes
+/// out when this returns `Some`.
+fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
+    Some(match effect {
+        // Pi `notify(message, type)` → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157).
+        UiEffect::Notify { message, kind } => json!({
+            "type": "extension_ui_request",
+            "id": new_request_id(),
+            "method": "notify",
+            "message": message,
+            "notifyType": notify_kind_str(*kind),
+        }),
+        // Pi `setStatus(key, text?)` → `{method:"setStatus", statusKey, statusText}`
+        // (rpc-mode.ts:163-172); `statusText` is OMITTED (not `null`) when `text` is `None`, matching
+        // Pi's `JSON.stringify` dropping an `undefined` property.
+        UiEffect::SetStatus { key, text } => {
+            let mut v = json!({
+                "type": "extension_ui_request",
+                "id": new_request_id(),
+                "method": "setStatus",
+                "statusKey": key,
+            });
+            if let (Some(text), Some(obj)) = (text, v.as_object_mut()) {
+                obj.insert("statusText".to_string(), json!(text));
+            }
+            v
+        }
+        // Pi `setWidget(key, content, options?)` → `{method:"setWidget", widgetKey, widgetLines,
+        // widgetPlacement}` (rpc-mode.ts:190-206); cyrup's WIT collapsed that 3-argument shape into
+        // ONE opaque JSON payload (see [`UiEffect::SetWidget`]'s doc), so `widget` carries it verbatim
+        // rather than a fabricated re-split into Pi's field names.
+        UiEffect::SetWidget { widget } => json!({
+            "type": "extension_ui_request",
+            "id": new_request_id(),
+            "method": "setWidget",
+            "widget": widget,
+        }),
+        // Pi `setTitle(title)` → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
+        UiEffect::SetTitle { title } => json!({
+            "type": "extension_ui_request",
+            "id": new_request_id(),
+            "method": "setTitle",
+            "title": title,
+        }),
+        // Pi `setEditorText(text)`/`pasteEditorText(text)` (the latter falling back to the former,
+        // rpc-mode.ts:230-232) → `{method:"set_editor_text", text}` (rpc-mode.ts:234-241) — note the
+        // snake_case wire method name, unlike this function's other camelCase methods; `is_paste`
+        // itself does not ride the wire (Pi's own `pasteToEditor` collapses onto the same handler).
+        UiEffect::SetEditorText { text, .. } => json!({
+            "type": "extension_ui_request",
+            "id": new_request_id(),
+            "method": "set_editor_text",
+            "text": text,
+        }),
+        // Intentionally no wire shape — see this function's doc.
+        UiEffect::SetHeader { .. } | UiEffect::SetFooter { .. } | UiEffect::SetToolsExpanded { .. } => {
+            return None;
+        }
+    })
+}
+
 /// The per-kind deny default a dialog resolves to when it is never genuinely answered — Pi's
 /// `createDialogPromise` `defaultValue` argument (`select`/`input` → `undefined`, `confirm` → `false`,
 /// rpc-mode.ts:136-149): `{cancelled:true}`, an unresponded timeout (§2.2), and a force-resolved
@@ -441,6 +518,14 @@ where
     session.services().host_services.set_ui_sink(ui_tx.clone());
     let mut pending: HashMap<String, PendingUi> = HashMap::new();
 
+    // The fire-and-forget extension-effect drain: a loaded guest's `ui.{notify,set-status,set-widget,
+    // set-header,set-footer,set-title,set-editor-text,paste-editor-text,set-tools-expanded}`
+    // capability lands here with NO reply expected (Pi `createExtensionUIContext`'s `notify`/
+    // `setStatus`/`setWidget`/`setTitle`/`setEditorText` handlers, rpc-mode.ts:149-241). Installed +
+    // re-installed on rebind exactly like `ui_tx` above.
+    let (ui_effect_tx, mut ui_effect_rx) = mpsc::unbounded_channel::<UiEffect>();
+    session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
+
     // Dedicated reader task → mpsc of raw JSONL lines (strict LF framing; cancel-safe vs. events).
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
     let reader_task = tokio::spawn(read_lines(reader, cmd_tx));
@@ -475,6 +560,7 @@ where
                             // The replacement brought a fresh `LiveHostServices`; re-install the ui
                             // sink so a post-swap guest dialog still reaches this loop.
                             session.services().host_services.set_ui_sink(ui_tx.clone());
+                            session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
                             in_flight = false;
                         }
                     }
@@ -493,6 +579,16 @@ where
                 let wire = extension_ui_request_json(&id, &req);
                 pending.insert(id, PendingUi { kind: req.kind, reply: req.reply });
                 write_out(writer, &RpcOut::ExtensionUiRequest(wire)).await?;
+            }
+            Some(effect) = ui_effect_rx.recv() => {
+                // A guest pushed a fire-and-forget ui effect: emit it immediately (no correlation
+                // bookkeeping — nothing ever replies) — Pi's `notify`/`setStatus`/`setWidget`/
+                // `setTitle`/`setEditorText` RPC handlers each just call `output(...)` inline
+                // (rpc-mode.ts:149-241). `setHeader`/`setFooter`/`setToolsExpanded` are dropped here
+                // (Pi doesn't forward them over RPC either — see `extension_ui_effect_json`'s doc).
+                if let Some(wire) = extension_ui_effect_json(&effect) {
+                    write_out(writer, &RpcOut::ExtensionUiRequest(wire)).await?;
+                }
             }
             maybe_ev = events.next() => {
                 if let Some(ev) = maybe_ev {

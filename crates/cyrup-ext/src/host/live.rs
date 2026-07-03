@@ -150,13 +150,23 @@ impl bindings::cyrup::ext::registration::Host for HostState {
 }
 
 impl bindings::cyrup::ext::ui::Host for HostState {
+    // `notify`/`set_status`/`set_widget`/`set_header`/`set_footer`/`set_title`/`set_editor_text`/
+    // `paste_editor_text`/`set_tools_expanded` below ALSO forward to `guest.services` (the pluggable
+    // [`HostServices`] backend the running session injects), not just `GuestState`'s own bookkeeping
+    // (kept for tests/diagnostics — see [`crate::host::services::UiChrome`]'s doc). Without the
+    // `guest.services.*` call, these fire-and-forget `ui.*` effects never reach a live consumer at
+    // all (they are Pi's `ExtensionUIContext` mutators, types.ts:130-275) — mirrors how `confirm`/
+    // `input`/`select`/`editor` below already route through `guest.services`.
     async fn notify(&mut self, message: String, kind: bindings::cyrup::ext::ui::NotifyKind) {
         if let Ok(guest) = guest_of(self) {
-            guest.notify(message, notify_kind_from_wit(kind));
+            let kind = notify_kind_from_wit(kind);
+            guest.services.notify(&message, kind);
+            guest.notify(message, kind);
         }
     }
     async fn set_status(&mut self, key: String, text: Option<String>) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_status(&key, text.as_deref());
             guest.set_status(key, text);
         }
     }
@@ -217,21 +227,25 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     async fn set_widget(&mut self, widget_json: String) {
         if let Ok(guest) = guest_of(self) {
             let v: Value = serde_json::from_str(&widget_json).unwrap_or(Value::Null);
+            guest.services.set_widget(&v);
             guest.set_widget(v);
         }
     }
     async fn set_header(&mut self, content: String) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_header(&content);
             guest.set_header(content);
         }
     }
     async fn set_footer(&mut self, content: String) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_footer(&content);
             guest.set_footer(content);
         }
     }
     async fn set_title(&mut self, title: String) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_title(&title);
             guest.set_title(title);
         }
     }
@@ -245,11 +259,13 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn set_editor_text(&mut self, text: String) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_editor_text(&text, false);
             guest.editor_write(text, false);
         }
     }
     async fn paste_editor_text(&mut self, text: String) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_editor_text(&text, true);
             guest.editor_write(text, true);
         }
     }
@@ -280,6 +296,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn set_tools_expanded(&mut self, expanded: bool) {
         if let Ok(guest) = guest_of(self) {
+            guest.services.set_tools_expanded(expanded);
             guest.set_tools_expanded(expanded);
         }
     }

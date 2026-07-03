@@ -250,3 +250,54 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
     let err = ext.execute_command("nope", "", &cancel).await.unwrap_err();
     assert!(err.to_string().contains("no such command"), "unknown command surfaced: {err}");
 }
+
+/// The fire-and-forget `ui.notify`/`ui.set-status` imports must ALSO reach the injected
+/// [`HostServices`] backend, not just `GuestState`'s own bookkeeping (`ext.guest().notifications()`/
+/// `.statuses()`, already proven above) — closing the "reaches no consumer at all" gap for the WIT
+/// `ui::Host` impl. Loads the SAME demo component as the test above, but with a [`RecordingServices`]
+/// backend instead of [`DenyServices`], and drives it through the SAME `greet` command (which the
+/// demo's `on_greet` handler — `cyrup-ext-sdk/src/example.rs:157,160` — calls `ctx.ui().notify(...)`
+/// and `ctx.ui().set_status(...)` from), then asserts the RECORDING backend itself observed both
+/// calls, proving the real Wasmtime component boundary carries them all the way to `HostServices`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_guest_component_fire_and_forget_ui_effects_reach_host_services() {
+    use cyrup_ext::host::{CannedResponses, RecordingServices};
+
+    let bytes = std::fs::read(fixture_component()).expect("read fixture component bytes");
+
+    let recording = Arc::new(RecordingServices::new(CannedResponses::default()));
+    let host = ExtensionHost::with_wasm(cfg()).expect("host with wasm runtime");
+    let ext = host
+        .load_wasm("demo".into(), &bytes, recording.clone())
+        .await
+        .expect("load + init the live wasm extension");
+
+    let cancel = CancelToken::new();
+    let out = ext.execute_command("greet", "world", &cancel).await.expect("guest command runs");
+    assert_eq!(out.as_deref(), Some("hello, world!"));
+
+    // `ctx.ui().notify("greet command ran")` (example.rs:157) reached `HostServices::notify` — the
+    // WIT `ui.notify` import now forwards to `guest.services` in ADDITION to `GuestState`'s own log.
+    assert!(
+        recording.notify_calls().iter().any(|(m, _)| m.contains("greet command ran")),
+        "the injected HostServices backend observed the guest's notify call: {:?}",
+        recording.notify_calls()
+    );
+
+    // `ctx.ui().set_status("greet", Some("greeting…"))` (example.rs:160) reached
+    // `HostServices::set_status` the same way.
+    assert!(
+        recording
+            .set_status_calls()
+            .iter()
+            .any(|(k, t)| k == "greet" && t.as_deref() == Some("greeting…")),
+        "the injected HostServices backend observed the guest's set_status call: {:?}",
+        recording.set_status_calls()
+    );
+    // ...and its later clear (`set_status("greet", None)`, example.rs:163 area) too.
+    assert!(
+        recording.set_status_calls().iter().any(|(k, t)| k == "greet" && t.is_none()),
+        "the injected HostServices backend observed the guest's set_status CLEAR call: {:?}",
+        recording.set_status_calls()
+    );
+}

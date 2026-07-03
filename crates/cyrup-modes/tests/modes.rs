@@ -707,6 +707,153 @@ async fn rpc_extension_ui_request_response_round_trips() {
     rpc.await.unwrap();
 }
 
+/// The fire-and-forget half of the `ui` capability (`notify`/`set-status`/`set-widget`/`set-title`/
+/// `set-editor-text`/`paste-editor-text`) must ALSO reach the RPC client, exactly like Pi's own
+/// `notify`/`setStatus`/`setWidget`/`setTitle`/`setEditorText` RPC handlers, each of which just calls
+/// `output({type:"extension_ui_request", id, method, ...})` inline with no correlated response
+/// expected (`rpc-mode.ts:149-241`) — unlike `confirm`/`input`/`select`/`editor` above, none of these
+/// calls block on a reply, so no `extension_ui_response` is ever sent back for them in this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
+    use cyrup_ext::host::{HostServices, NotifyKind};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let session = runtime.session().await;
+    let host_services = session.services().host_services.clone();
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    // A get_state first proves the loop (and its effect sink) is up before any effect fires.
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    let boot = read_json_line(&mut client_reader).await;
+    assert_eq!(boot["command"], "get_state");
+
+    // notify → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157). None of these calls
+    // block: `HostServices::notify` is a plain sync fire-and-forget send, called directly (no
+    // `spawn_blocking` needed, unlike `confirm`/`input`/`select`/`editor` above).
+    host_services.notify("careful now", NotifyKind::Warning);
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["type"], "extension_ui_request");
+    assert_eq!(req["method"], "notify");
+    assert_eq!(req["message"], "careful now");
+    assert_eq!(req["notifyType"], "warning");
+
+    // set_status(key, Some(text)) → `{method:"setStatus", statusKey, statusText}` (rpc-mode.ts:163-172).
+    host_services.set_status("git", Some("main"));
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "setStatus");
+    assert_eq!(req["statusKey"], "git");
+    assert_eq!(req["statusText"], "main");
+
+    // set_status(key, None) clears the key → `statusText` is OMITTED entirely (not `null`), matching
+    // Pi's `JSON.stringify` dropping an `undefined` property.
+    host_services.set_status("git", None);
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "setStatus");
+    assert_eq!(req["statusKey"], "git");
+    assert!(req.get("statusText").is_none(), "a cleared status must omit statusText: {req:?}");
+
+    // set_widget → `{method:"setWidget", widget}`: cyrup's WIT collapsed Pi's 3-arg `setWidget(key,
+    // content, options)` into ONE opaque JSON payload, forwarded verbatim (see `UiEffect::SetWidget`).
+    host_services.set_widget(&serde_json::json!({"widget": "text", "text": "hi"}));
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "setWidget");
+    assert_eq!(req["widget"], serde_json::json!({"widget": "text", "text": "hi"}));
+
+    // set_title → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
+    host_services.set_title("My Session");
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "setTitle");
+    assert_eq!(req["title"], "My Session");
+
+    // set_editor_text(text, is_paste=false) → `{method:"set_editor_text", text}` — snake_case method
+    // name (rpc-mode.ts:234-241), unlike this test's other camelCase methods.
+    host_services.set_editor_text("typed text", false);
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "set_editor_text");
+    assert_eq!(req["text"], "typed text");
+
+    // paste_editor_text (is_paste=true) collapses onto the SAME wire method as set_editor_text — Pi's
+    // own `pasteToEditor(text) { this.setEditorText(text); }` (rpc-mode.ts:230-232).
+    host_services.set_editor_text("pasted text", true);
+    let req = read_json_line(&mut client_reader).await;
+    assert_eq!(req["method"], "set_editor_text");
+    assert_eq!(req["text"], "pasted text");
+
+    // The loop is still alive and responsive after all six effects (proves the drain arm never
+    // blocked the select! loop or consumed a client-facing response slot).
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    let after = read_json_line(&mut client_reader).await;
+    assert_eq!(after["command"], "get_state");
+
+    drop(client_tx);
+    rpc.await.unwrap();
+}
+
+/// `set-header`/`set-footer`/`set-tools-expanded` are delivered to the in-process [`UiEffect`] sink
+/// (closing the "reaches no consumer at all" gap) but deliberately NEVER forwarded onto the RPC wire —
+/// Pi's own RPC mode does not deliver them either ("Custom header/footer not supported in RPC mode -
+/// requires TUI access", "Tool expansion not supported in RPC mode - no TUI", rpc-mode.ts:209-215,
+/// 296-298). Proven by calling all three back-to-back and observing the very next wire line is still
+/// the `get_state` response sent immediately after — no `extension_ui_request` slipped out ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_header_footer_and_tools_expanded_effects_never_reach_the_wire() {
+    use cyrup_ext::host::HostServices;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let session = runtime.session().await;
+    let host_services = session.services().host_services.clone();
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    let boot = read_json_line(&mut client_reader).await;
+    assert_eq!(boot["command"], "get_state");
+
+    host_services.set_header("custom header");
+    host_services.set_footer("custom footer");
+    host_services.set_tools_expanded(true);
+
+    // Give the (silent-by-design) drain arm a moment to actually run before checking nothing landed.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    let after = read_json_line(&mut client_reader).await;
+    assert_eq!(
+        after["command"], "get_state",
+        "the very next wire line must be the get_state response, not a stray extension_ui_request \
+         for set_header/set_footer/set_tools_expanded: {after:?}"
+    );
+    assert_eq!(after["id"], "after");
+
+    drop(client_tx);
+    rpc.await.unwrap();
+}
+
 /// L4 review §2.2 (CRITICAL): a `timeout_ms`-bearing dialog whose RPC client NEVER answers must still
 /// resolve within that window — Pi's `createDialogPromise` host-armed `setTimeout`
 /// (`rpc-mode.ts:114-119`) ALWAYS settles the Promise regardless of client behavior. Proves the fix
