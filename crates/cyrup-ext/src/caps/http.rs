@@ -331,7 +331,14 @@ impl HttpCaps {
             let headers = collect_headers(resp.headers());
             let encoding = content_encoding_of(resp.headers());
             let raw = read_bounded_body(resp).await?;
-            let body = decode_buffered(encoding.as_deref(), raw).await?;
+            // Skip decompression entirely for a response that must never carry a coded body (a
+            // null-body status, or a HEAD/CONNECT request) — see [`body_may_carry_content_coding`].
+            let coding_encoding = if body_may_carry_content_coding(&req.method, status) {
+                encoding.as_deref()
+            } else {
+                None
+            };
+            let body = decode_buffered(coding_encoding, raw).await?;
             Ok(HttpResponse { status, headers, body })
         })
         .await
@@ -384,7 +391,14 @@ impl HttpCaps {
         let status = resp.status().as_u16();
         let headers = collect_headers(resp.headers());
         let encoding = content_encoding_of(resp.headers());
-        let stream: ChunkStream = decode_stream(encoding.as_deref(), resp.bytes_stream())?;
+        // Skip decompression entirely for a response that must never carry a coded body (a
+        // null-body status, or a HEAD/CONNECT request) — see [`body_may_carry_content_coding`].
+        let coding_encoding = if body_may_carry_content_coding(&req.method, status) {
+            encoding.as_deref()
+        } else {
+            None
+        };
+        let stream: ChunkStream = decode_stream(coding_encoding, resp.bytes_stream())?;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut g =
             self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
@@ -574,6 +588,38 @@ fn client_builder() -> reqwest::ClientBuilder {
 /// [`decode_buffered`]/[`decode_stream`], never here.
 fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers.get(reqwest::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+/// The status codes that NEVER carry a body (real consumer:
+/// `undici/lib/web/fetch/constants.js:6`, `nullBodyStatus = [101, 204, 205, 304]`, the exact vendored
+/// copy `@modelcontextprotocol/sdk`'s `fetch()` sits on top of).
+const NULL_BODY_STATUS: [u16; 4] = [101, 204, 205, 304];
+
+/// Whether a response may legitimately carry a `Content-Encoding`-coded body worth decoding — real
+/// consumer citation: `undici/lib/web/fetch/index.js:2262`'s `onResponseStart`, the exact guard
+/// gating decoder-chain construction: `if (request.method !== 'HEAD' && request.method !== 'CONNECT'
+/// && !nullBodyStatus.includes(status) && !willFollow)`. `willFollow` (a pending redirect) has no
+/// cyrup equivalent to replicate: `reqwest`'s client already follows redirects itself (default
+/// policy, unchanged by [`client_builder`]) before this code ever sees a response, so `status` here
+/// is always the FINAL response's status, never an intermediate 3xx.
+///
+/// A `false` result means: attempt NO decompression at all, regardless of what a
+/// (spec-nonconforming, since none of these responses should carry one) `Content-Encoding` header
+/// claims — matching undici leaving `decoders` empty and handing the raw body straight through
+/// (`index.js:2312-2313`), rather than this crate's OLD behavior of decoding unconditionally, which
+/// broke on e.g. a `304 Not Modified` carrying a stale `Content-Encoding: gzip` from the original
+/// 200 response with a genuinely empty body (real reproduction: `decode_buffered` on `[]` bytes with
+/// a `gzip` decoder returns `Err("decompression failed: unexpected end of file")` instead of the
+/// empty body straight through).
+///
+/// Method comparison is case-insensitive: Pi's own `Request` constructor normalizes well-known
+/// methods to uppercase before `fetch()` ever sees them (WHATWG Fetch §"method states"), so an
+/// extension author passing a lowercase `"head"`/`"connect"` here must not silently fall through
+/// undici's exact (case-sensitive) string check and attempt decompression on a body-less response.
+fn body_may_carry_content_coding(method: &str, status: u16) -> bool {
+    !method.eq_ignore_ascii_case("HEAD")
+        && !method.eq_ignore_ascii_case("CONNECT")
+        && !NULL_BODY_STATUS.contains(&status)
 }
 
 /// Real consumer citation: `undici/lib/web/fetch/index.js:2269-2275` (the exact `fetch()` engine
@@ -988,6 +1034,80 @@ mod tests {
             collected, plaintext,
             "`x-gzip` must decompress exactly like `gzip` over the streaming path too"
         );
+    }
+
+    /// THE finding this fix closes (buffered path): a null-body status (real consumer:
+    /// `undici/lib/web/fetch/constants.js:6`'s `nullBodyStatus = [101, 204, 205, 304]`) must never
+    /// have decompression attempted against it, even when it carries a STALE `Content-Encoding`
+    /// header — a real, observed pattern: a `304 Not Modified` reply to a conditional GET echoes the
+    /// ORIGINAL cached response's `Content-Encoding` header while sending a genuinely empty body.
+    /// Reproduced live against a real mock server: before this fix, `decode_buffered` ran a gzip
+    /// decoder over the empty body and failed with `"decompression failed: unexpected end of file"`
+    /// instead of returning the (correctly) empty body straight through, matching real `fetch()`
+    /// (`index.js:2262`'s `onResponseStart` guard, which skips decoder-chain construction entirely
+    /// for a `nullBodyStatus` response).
+    #[tokio::test]
+    async fn request_with_a_304_and_a_stale_content_encoding_returns_the_empty_body_undecoded() {
+        let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n".to_string();
+        let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let resp = caps
+            .request(&req)
+            .await
+            .expect("a 304 with a stale Content-Encoding must not fail decompression");
+        assert_eq!(resp.status, 304);
+        assert_eq!(
+            resp.body,
+            Vec::<u8>::new(),
+            "a null-body status must return the empty body untouched, not attempt to decode it"
+        );
+        let get = |name: &str| {
+            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("content-encoding"),
+            Some("gzip"),
+            "the stale header must still round-trip verbatim, exactly like real fetch(): {:?}",
+            resp.headers
+        );
+    }
+
+    /// Same finding, the streaming path (`request_stream`): a `304` must open (not error) and drain
+    /// to immediate EOF with no decode attempted, matching the buffered path above.
+    #[tokio::test]
+    async fn request_stream_with_a_304_and_a_stale_content_encoding_opens_and_drains_to_eof() {
+        let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n".to_string();
+        let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let opened = caps
+            .request_stream(&req)
+            .await
+            .expect("a 304 with a stale Content-Encoding must not fail to open the stream");
+        assert_eq!(opened.status, 304);
+        let chunk = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds");
+        assert_eq!(chunk, None, "a null-body status drains straight to EOF with no decode attempted");
+    }
+
+    /// Same finding, the HEAD case: real servers echo the `Content-Encoding` a matching `GET` would
+    /// have produced on a `HEAD` response too (RFC 9110 §9.3.2 — a `HEAD` response's header fields
+    /// are "identical" to what `GET` would have sent), but a `HEAD` response body is ALWAYS empty
+    /// (undici's exact guard: `request.method !== 'HEAD'`) — decoding it must never be attempted.
+    #[tokio::test]
+    async fn request_head_with_a_content_encoding_header_returns_the_empty_body_undecoded() {
+        let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 12345\r\n"
+            .to_string();
+        let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![]).await;
+
+        let caps = HttpCaps::new();
+        let req = HttpRequest { method: "HEAD".into(), url, ..Default::default() };
+        let resp =
+            caps.request(&req).await.expect("a HEAD response must not fail decompression either");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, Vec::<u8>::new(), "a HEAD response body must come back empty, undecoded");
     }
 
     /// L4 round-12 finding #2b: `Content-Encoding` may CHAIN multiple codings (RFC 9110 §8.4.1 — "the
