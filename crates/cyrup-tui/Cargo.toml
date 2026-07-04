@@ -35,6 +35,13 @@ syntect = { workspace = true }
 # under the `show_images` toggle. `image` decodes/resizes the source bytes (already in-workspace).
 ratatui-image = { workspace = true }
 image = { workspace = true }
+# Clipboard IMAGE paste (gap-12 F5; Ctrl+V — `handleClipboardImagePaste`, interactive-mode.ts:2537-2557
+# + `utils/clipboard-image.ts`/`clipboard-native.ts`). `arboard` reads a native-clipboard image
+# (NSPasteboard on macOS, X11/Wayland on Linux) — the faithful Rust analog of Pi's native clipboard
+# module, not a substituted design. The RGBA raster is re-encoded to a PNG temp file via the `image`
+# crate above; `uuid` names it `cyrup-clipboard-<uuid>.png` (Pi's `pi-clipboard-<randomUUID>.<ext>`).
+arboard = { workspace = true }
+uuid = { workspace = true }
 # Grapheme-cluster cursor motion (spec/tui/03 §4; editor-component.ts grapheme stepping) — user-approved.
 unicode-segmentation = { workspace = true }
 # JSON keybindings loader (spec/tui/07 §3.9; core/keybindings.ts:14-262) + theme-data hot-reload.

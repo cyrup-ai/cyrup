@@ -79,6 +79,13 @@ pub enum Action {
     /// prepends their text (joined by blank lines) to the current editor buffer; shows a
     /// `No queued messages to restore` status when nothing is queued.
     Dequeue,
+    /// Paste a system-clipboard image, attaching it to the next prompt (Ctrl+V; Windows: Alt+V) —
+    /// `app.clipboard.pasteImage` (`handleClipboardImagePaste`, interactive-mode.ts:2537-2557;
+    /// `core/keybindings.ts:106-109`). Reads the clipboard image via `arboard`, writes it to a
+    /// `cyrup-clipboard-<uuid>.png` temp file, and attaches it through the `@`-mention image path. Gated
+    /// on an image actually being present (Pi `clipboard.hasImage()`); a bare Ctrl+V with no clipboard
+    /// image falls through to the editor so normal text behavior is preserved.
+    ClipboardPasteImage,
 }
 
 impl Action {
@@ -99,6 +106,7 @@ impl Action {
             "app.model.cycleBackward" => Some(Action::ModelCycleBackward),
             "app.message.followUp" => Some(Action::FollowUp),
             "app.message.dequeue" => Some(Action::Dequeue),
+            "app.clipboard.pasteImage" => Some(Action::ClipboardPasteImage),
             _ => None,
         }
     }
@@ -380,6 +388,12 @@ impl Default for Keymap {
                 (Key { code: KeyCode::Enter, mods: KeyModifiers::ALT }, Action::FollowUp),
                 // `app.message.dequeue` (`core/keybindings.ts:102-105`, default `alt+up`).
                 (Key { code: KeyCode::Up, mods: KeyModifiers::ALT }, Action::Dequeue),
+                // `app.clipboard.pasteImage` (`core/keybindings.ts:106-109`): `ctrl+v` everywhere,
+                // `alt+v` on Windows. Bind both so muscle memory works on either platform (the read is
+                // gated on an image actually being present, so a bare Ctrl+V still falls through to the
+                // editor as before).
+                (Key::ctrl('v'), Action::ClipboardPasteImage),
+                (Key { code: KeyCode::Char('v'), mods: KeyModifiers::ALT }, Action::ClipboardPasteImage),
             ],
         }
     }

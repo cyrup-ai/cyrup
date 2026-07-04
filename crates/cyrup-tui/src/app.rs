@@ -575,6 +575,19 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Read a system-clipboard image and attach it to the next prompt (Ctrl+V; Pi
+    /// `handleClipboardImagePaste`, interactive-mode.ts:2537-2557), reusing the `@`-mention image
+    /// attach path ([`attach_image_path`](Self::attach_image_path)). Returns `true` when a clipboard
+    /// image was found, materialized to a `cyrup-clipboard-<uuid>.png` temp file, and attached; `false`
+    /// when the clipboard holds no image (Pi `clipboard.hasImage()` gate) or on any clipboard/encode/IO
+    /// error — so the caller lets the key fall through to the editor, preserving normal Ctrl+V behavior.
+    fn try_attach_clipboard_image(&mut self) -> bool {
+        match read_clipboard_image_to_temp() {
+            Some(path) => self.attach_image_path(&path),
+            None => false,
+        }
+    }
+
     /// Clear all attached images (after the prompt is sent, or on `Esc`).
     pub fn clear_images(&mut self) {
         self.state.pending_images.clear();
@@ -753,13 +766,25 @@ impl<B: Backend> App<B> {
                 //   • Ctrl+D on a non-empty buffer is forward-delete; it only exits on empty
                 //     (spec/tui/03 §6, spec/tui/07 §3.3).
                 if let Some(action) = self.state.keymap.action_for(key) {
-                    let defer_to_editor = match action {
-                        Action::Interrupt => self.state.editor.autocomplete_open(),
-                        Action::Quit => !self.state.editor.is_empty(),
-                        _ => false,
-                    };
-                    if !defer_to_editor {
-                        return self.apply_action(action);
+                    // `app.clipboard.pasteImage` (Ctrl+V): read a system-clipboard image and attach it
+                    // (Pi `handleClipboardImagePaste`, interactive-mode.ts:2537-2557). Gated on an image
+                    // actually being present (Pi `clipboard.hasImage()`): when the clipboard holds no
+                    // image the key is NOT swallowed — it falls through to the editor below so normal
+                    // Ctrl+V behavior is preserved (do not break text paste).
+                    if action == Action::ClipboardPasteImage {
+                        if self.try_attach_clipboard_image() {
+                            return AppAction::Redraw;
+                        }
+                        // No image on the clipboard: fall through to the editor (text) handling below.
+                    } else {
+                        let defer_to_editor = match action {
+                            Action::Interrupt => self.state.editor.autocomplete_open(),
+                            Action::Quit => !self.state.editor.is_empty(),
+                            _ => false,
+                        };
+                        if !defer_to_editor {
+                            return self.apply_action(action);
+                        }
                     }
                 }
                 // An extension-registered keyboard shortcut (R-08-017; Pi `registerShortcut`) fires at
@@ -1019,6 +1044,14 @@ impl<B: Backend> App<B> {
             // clear are on the live session, so it rides an `AppAction` the run loop resolves (Pi
             // `handleDequeue`, interactive-mode.ts:3587-3594).
             Action::Dequeue => AppAction::Dequeue,
+            // `app.clipboard.pasteImage` (Ctrl+V) is resolved earlier in `handle_input` — it must be
+            // able to fall through to the editor when the clipboard holds no image, which this arm
+            // cannot do — so this arm is normally unreachable. It exists only to keep the match
+            // exhaustive; it attaches best-effort and redraws (no panic, per the no-panic policy).
+            Action::ClipboardPasteImage => {
+                self.try_attach_clipboard_image();
+                AppAction::Redraw
+            }
         }
     }
 
@@ -1101,6 +1134,7 @@ impl<B: Backend> App<B> {
             ),
             entry(g(Action::FollowUp), "Queue message as a follow-up"),
             entry(g(Action::Dequeue), "Restore queued messages to editor"),
+            entry(g(Action::ClipboardPasteImage), "Paste image from clipboard"),
             entry("/".to_string(), "Slash commands"),
             entry("!".to_string(), "Run bash command"),
             entry("!!".to_string(), "Run bash command (excluded from context)"),
@@ -2389,6 +2423,32 @@ fn copy_to_clipboard(text: &str) {
 /// No-op clipboard write on non-unix targets (the platform CLI tools are unix-only here).
 #[cfg(not(unix))]
 fn copy_to_clipboard(_text: &str) {}
+
+/// Read a system-clipboard image and materialize it as a PNG temp file, returning its path (Pi
+/// `readClipboardImage` + the temp-file write of `handleClipboardImagePaste`,
+/// interactive-mode.ts:2544-2549 / `utils/clipboard-image.ts`). `arboard` is the faithful Rust analog
+/// of Pi's native clipboard module (`utils/clipboard-native.ts`): NSPasteboard on macOS, X11/Wayland on
+/// Linux. `get_image` hands back an RGBA8 raster (`arboard::ImageData`), which is re-encoded to PNG with
+/// the in-tree `image` crate and written to `cyrup-clipboard-<uuid>.png` in the OS temp dir (Pi's
+/// `pi-clipboard-<randomUUID>.<ext>`, always PNG here since the raster is already decoded).
+///
+/// Returns `None` when the clipboard holds no image (Pi's `clipboard.hasImage()` gate) or on ANY
+/// clipboard/decode/encode/IO error — mirroring Pi's `catch {}` silent-ignore (no clipboard access, a
+/// headless/permission-denied session, a zero-area raster, …) — so a bare Ctrl+V never disrupts the
+/// editor and simply falls through to normal text handling.
+fn read_clipboard_image_to_temp() -> Option<std::path::PathBuf> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let width = u32::try_from(img.width).ok()?;
+    let height = u32::try_from(img.height).ok()?;
+    // `arboard::ImageData::bytes` is an RGBA8 raster; `from_raw` returns `None` if the buffer length
+    // does not match `width * height * 4`, guarding a malformed clipboard payload without panicking.
+    let raster = image::RgbaImage::from_raw(width, height, img.bytes.into_owned())?;
+    let path =
+        std::env::temp_dir().join(format!("cyrup-clipboard-{}.png", uuid::Uuid::now_v7()));
+    raster.save_with_format(&path, image::ImageFormat::Png).ok()?;
+    Some(path)
+}
 
 /// Truncate a one-line summary to a sane length (avoid overrunning the marker line).
 /// Detect a `Custom`-role [`cyrup_agent::AgentMessage`] from its serde projection and return its

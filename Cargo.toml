@@ -98,6 +98,13 @@ unicode-segmentation = { version = "1.13.3" }
 unicode-normalization = { version = "0.1.24" }   # tools NFKC/NFD normalization (arch-03)
 feruca               = { version = "0.12.0" }    # pure-Rust UCA collation for `ls` localeCompare parity (arch-03, ls.ts:150)
 image                = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# Clipboard IMAGE *read* for the Ctrl+V paste keybinding (gap-12 F5; first used by cyrup-tui). `arboard`
+# is the faithful Rust analog of Pi's native clipboard module (`utils/clipboard-native.ts` →
+# `@mariozechner/clipboard`: NSPasteboard on macOS, X11/Wayland on Linux) — a ported mechanism, NOT a
+# substituted design. Default features carry the per-platform backend (`core-graphics` on macOS, x11rb
+# on Linux); `image-data` exposes `get_image()` → an RGBA raster, which cyrup re-encodes to a PNG temp
+# file with the in-tree `image` crate above (arboard depends on the same `image` ^0.25, so it unifies).
+arboard              = { version = "3.6.1", features = ["image-data"] }
 libc                 = { version = "0.2.186" }
 tempfile             = { version = "3.27.0" }
 
