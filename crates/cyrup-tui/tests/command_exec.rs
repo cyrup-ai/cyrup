@@ -26,9 +26,16 @@ fn new_app() -> App<TestBackend> {
 #[test]
 fn data_bound_commands_route_to_open_selector() {
     let mut app = new_app();
+    // `/model` (no arg) routes to the model command with no search term (F6: exact-match/pre-filter is
+    // resolved by the run loop against the live catalog; a bare `/model` opens the unfiltered picker).
     assert_eq!(
         submit(&mut app, "/model"),
-        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Model))
+        AppAction::Command(AppCommand::ModelCommand(None))
+    );
+    // `/model <text>` threads the argument (exact match → set directly; partial → pre-filtered picker).
+    assert_eq!(
+        submit(&mut app, "/model qwen"),
+        AppAction::Command(AppCommand::ModelCommand(Some("qwen".to_string())))
     );
     assert_eq!(
         submit(&mut app, "/settings"),

@@ -706,6 +706,17 @@ impl EffectiveSettings {
         self.merged.get_nested_i64(&["editorPaddingX"]).unwrap_or(0)
     }
 
+    /// `outputPad` — horizontal padding for user/assistant/thinking chat output, `0` or `1`, default
+    /// `1` (Pi `getOutputPad`, settings-manager.ts:1186-1188: `outputPad === 0 ? 0 : 1`). Any value
+    /// other than an explicit `0` (unset, `1`, or a stray value) resolves to `1`.
+    pub fn output_pad(&self) -> i64 {
+        if self.merged.get_nested_i64(&["outputPad"]) == Some(0) {
+            0
+        } else {
+            1
+        }
+    }
+
     /// `autocompleteMaxVisible` (default 5; :1185-1187).
     pub fn autocomplete_max_visible(&self) -> i64 {
         self.merged
@@ -1586,6 +1597,20 @@ mod tests {
         assert_eq!(s.tree_filter_mode(), "default");
         assert_eq!(s.autocomplete_max_visible(), 5);
         assert_eq!(s.code_block_indent(), "  ");
+        // `outputPad` defaults to 1 (Pi `getOutputPad`: only an explicit 0 yields 0).
+        assert_eq!(s.output_pad(), 1);
+    }
+
+    #[test]
+    fn output_pad_only_explicit_zero_disables() {
+        // Pi `getOutputPad`: `outputPad === 0 ? 0 : 1` — only an explicit 0 turns padding off.
+        let zero = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 0 }"#).unwrap());
+        assert_eq!(zero.output_pad(), 0);
+        let one = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 1 }"#).unwrap());
+        assert_eq!(one.output_pad(), 1);
+        // A stray/unexpected value (or unset) resolves to the default 1, not 0.
+        let stray = EffectiveSettings::from_settings(Settings::parse(r#"{ "outputPad": 5 }"#).unwrap());
+        assert_eq!(stray.output_pad(), 1);
     }
 
     #[test]

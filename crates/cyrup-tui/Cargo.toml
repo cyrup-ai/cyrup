@@ -15,6 +15,11 @@ workspace = true
 cyrup-core = { workspace = true }
 cyrup-session-svc = { workspace = true }
 cyrup-resources = { workspace = true }
+# Already a transitive dep (via cyrup-session-svc) and a dev-dep below; promoted to a direct dependency
+# so the `HostServices` trait (`cyrup_ext::host`) is in scope to call `LiveHostServices::set_label` —
+# the live label-append the `/tree` `e` rename persists through (the SAME seam a guest's `setLabel`
+# uses, host_services.rs:866). `LiveHostServices` exposes the append only via that trait impl.
+cyrup-ext = { workspace = true }
 # Already a transitive dep (via cyrup-session-svc) and a dev-dep below; promoted to a direct
 # dependency so the streaming-delta variants of `StreamEvent` (`TextDelta { delta, partial }`,
 # stream.rs:306) can be matched in `App::ingest_event` (gap 1 — live token-by-token render).
@@ -52,8 +57,7 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 # Dev-only: lets the streaming-delta render test build the `AgentMessage` carried by
 # `AgentSessionEvent::MessageUpdate` (the runtime payload the TUI ignores but the variant requires).
 cyrup-agent = { workspace = true }
-# Dev-only: `DialogOptions` (the type of `UiRequest::opts`, cyrup-session-svc's own public API) lives
-# in cyrup-ext and isn't re-exported by cyrup-session-svc; the extension-dialog-countdown test needs
-# it to build a synthetic `UiRequest`. Already a transitive dep via cyrup-session-svc.
-cyrup-ext = { workspace = true }
+# `DialogOptions` (the type of `UiRequest::opts`) lives in cyrup-ext (now a direct dependency above,
+# where the `HostServices` trait for the `/tree` label-append is pulled in) and the
+# extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true

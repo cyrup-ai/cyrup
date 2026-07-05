@@ -10,7 +10,7 @@
 //! events but no flat-tree *getter* yet — tracked in the residual ledger); the **rendering + fold +
 //! filter + connector** engine that is the bulk of the 47KB is built and tested here.
 
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{Selector, SelectorOutcome};
+use crate::selector::{search_input_spans, Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
 /// The entry-type glyph key (`tree-selector.ts` switch ~`:638`, render `:691-727`; spec/tui/05 §5.1).
@@ -136,6 +136,20 @@ impl TreeNode {
     }
 }
 
+/// The inline label-edit sub-state (`LabelInput`, `tree-selector.ts:1231-1283`): active only while the
+/// user is renaming the selected entry (`e`, `app.tree.editLabel`). Mirrors Pi's `LabelInput` embedded
+/// `Input` — a live text buffer + caret offset over the entry whose label is being set. When `Some`, the
+/// tree list captures **all** keys into this buffer (Pi's `if (this.labelInput) …` route,
+/// `tree-selector.ts:1373-1379`), so `e`/`z`/digits type literally instead of firing tree actions.
+struct LabelEdit {
+    /// The entry id being (re)labeled — carried into the persist payload on save.
+    entry_id: String,
+    /// The label text buffer (empty ⇒ "remove label", Pi `value || undefined`, `:1277`).
+    query: String,
+    /// Caret byte offset within `query`.
+    cursor: usize,
+}
+
 /// The session-tree navigator selector (the bespoke `/tree` layout). Holds the full flattened node
 /// list plus selection/filter/timestamp UI state; renders only the *visible* rows (filter + folds).
 pub struct TreeSelector {
@@ -146,12 +160,21 @@ pub struct TreeSelector {
     /// Whether the time column is shown (`app.tree.toggleLabelTimestamp`).
     show_time: bool,
     keymap: TreeKeymap,
+    /// The inline label editor, present only while renaming (`e`); see [`LabelEdit`].
+    label_edit: Option<LabelEdit>,
 }
 
 impl TreeSelector {
     /// Build from a flattened node list (already in DAG pre-order).
     pub fn new(nodes: Vec<TreeNode>) -> Self {
-        TreeSelector { nodes, selected: 0, filter: FilterMode::Default, show_time: true, keymap: TreeKeymap::default() }
+        TreeSelector {
+            nodes,
+            selected: 0,
+            filter: FilterMode::Default,
+            show_time: true,
+            keymap: TreeKeymap::default(),
+            label_edit: None,
+        }
     }
 
     /// Override the tree bindings (JSON-configured `app.tree.*`).
@@ -272,6 +295,81 @@ impl TreeSelector {
     /// Toggle the relative-time column.
     fn toggle_time(&mut self) {
         self.show_time = !self.show_time;
+    }
+
+    /// Begin inline label editing on the highlighted entry (`app.tree.editLabel` → `onLabelEdit` →
+    /// `showLabelInput`, `tree-selector.ts:1046-1049,1327,1351`). A no-op when no row is selected. The
+    /// buffer starts empty: cyrup's flattened DAG (`SessionDagNode`) carries only `has_label`, not the
+    /// label text, so unlike Pi (which seeds `selected.node.label`) there is no existing string to
+    /// pre-fill — the user types the new label from scratch.
+    fn begin_label_edit(&mut self) {
+        if let Some(entry_id) = self.selected_id() {
+            self.label_edit = Some(LabelEdit { entry_id, query: String::new(), cursor: 0 });
+        }
+    }
+
+    /// Set/clear the `has_label` star on the node whose entry id is `entry_id`, mirroring Pi's
+    /// `TreeList.updateNodeLabel` (`:626-633`) local refresh so the tree reflects the rename the instant
+    /// the label input closes (the persist to the session DAG is the chrome's job). An empty label
+    /// clears the star (Pi stores `undefined`, `apply_label` drops empty labels).
+    fn update_node_label(&mut self, entry_id: &str, has_label: bool) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == entry_id) {
+            node.has_label = has_label;
+        }
+    }
+
+    /// Route one key into the active [`LabelEdit`] buffer (Pi `LabelInput.handleInput`, `:1272-1282`):
+    /// `confirm` trims + submits (empty ⇒ remove), `cancel` discards, everything printable types into
+    /// the buffer. On submit it updates the local star and emits an [`SelectorOutcome::Apply`] carrying
+    /// `"{entry_id}\u{1f}{label}"` — the chrome persists it via the session's `set_label` path and the
+    /// selector stays open (Pi hides the input and returns to the tree, `:1353-1372`).
+    fn handle_label_edit(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
+        match keymap.action_for(key) {
+            Some(SelectAction::Confirm) => {
+                let Some(edit) = self.label_edit.take() else { return SelectorOutcome::Redraw };
+                let label = edit.query.trim().to_string();
+                self.update_node_label(&edit.entry_id, !label.is_empty());
+                SelectorOutcome::Apply(format!("{}{}{}", edit.entry_id, crate::FIELD_SEP, label))
+            }
+            Some(SelectAction::Cancel) => {
+                self.label_edit = None;
+                SelectorOutcome::Redraw
+            }
+            _ => {
+                let Some(edit) = self.label_edit.as_mut() else { return SelectorOutcome::Redraw };
+                match key.code {
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        edit.query.insert(edit.cursor, c);
+                        edit.cursor += c.len_utf8();
+                        SelectorOutcome::Redraw
+                    }
+                    KeyCode::Backspace => {
+                        if edit.cursor > 0
+                            && let Some(ch) = edit.query[..edit.cursor].chars().next_back()
+                        {
+                            let start = edit.cursor - ch.len_utf8();
+                            edit.query.replace_range(start..edit.cursor, "");
+                            edit.cursor = start;
+                        }
+                        SelectorOutcome::Redraw
+                    }
+                    _ => SelectorOutcome::Ignored,
+                }
+            }
+        }
+    }
+
+    /// The label-input body lines (`LabelInput.render`, `tree-selector.ts:1256-1270`): a muted prompt,
+    /// the live buffer with a visible caret, and the save/cancel hint — shown in the tree body while a
+    /// rename is in progress.
+    fn label_edit_lines(&self, edit: &LabelEdit, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut input = vec![Span::raw("  ")];
+        input.extend(search_input_spans(&edit.query, edit.cursor, theme));
+        vec![
+            Line::from(Span::styled("  Label (empty to remove):", theme.muted_style())),
+            Line::from(input),
+            Line::from(Span::styled("  enter save   esc cancel", theme.dim_style())),
+        ]
     }
 
     /// Build the connector prefix for `node` at `nodes` index `idx` (depth-0 has none). Uses the
@@ -405,8 +503,13 @@ impl TreeSelector {
 
 impl Selector for TreeSelector {
     fn desired_height(&self, _width: u16) -> u16 {
-        // top rule + header + body + two hint lines + bottom rule.
-        let body = self.visible_indices().len().min(u16::MAX as usize) as u16;
+        // top rule + header + body + hint line + bottom rule (+ one slack row, unchanged).
+        let body = if self.label_edit.is_some() {
+            // The label editor occupies the body (prompt + input + hint): at least 3 rows.
+            3
+        } else {
+            self.visible_indices().len().min(u16::MAX as usize) as u16
+        };
         body.saturating_add(5)
     }
 
@@ -421,27 +524,48 @@ impl Selector for TreeSelector {
         .areas(area);
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(Paragraph::new(self.header(theme)), header);
-        frame.render_widget(
-            Paragraph::new(self.rows(body.width, theme)).style(theme.base_style()),
-            body,
-        );
-        let hint_line = Line::from(Span::styled(
-            " ↑/↓ move   ←/→ page   z/x branch   e label   t label time".to_string(),
-            theme.dim_style(),
-        ));
+        // While renaming, the body shows the inline label editor (Pi swaps `treeContainer` for the
+        // `labelInputContainer`, `tree-selector.ts:1363-1372`); otherwise the filtered tree rows.
+        if let Some(edit) = &self.label_edit {
+            frame.render_widget(
+                Paragraph::new(self.label_edit_lines(edit, theme)).style(theme.base_style()),
+                body,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(self.rows(body.width, theme)).style(theme.base_style()),
+                body,
+            );
+        }
+        let hint_line = if self.label_edit.is_some() {
+            Line::from(Span::styled(
+                " editing label — enter save   esc cancel".to_string(),
+                theme.dim_style(),
+            ))
+        } else {
+            Line::from(Span::styled(
+                " ↑/↓ move   ←/→ page   z/x branch   e label   t label time".to_string(),
+                theme.dim_style(),
+            ))
+        };
         frame.render_widget(Paragraph::new(hint_line), hint);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
+        // While the inline label editor is open it captures ALL keys (Pi `if (this.labelInput)`,
+        // `tree-selector.ts:1373-1379`) so `e`/`z`/digits type literally instead of firing tree actions.
+        if self.label_edit.is_some() {
+            return self.handle_label_edit(key, keymap);
+        }
         // Bespoke tree bindings take precedence over the shared select map.
         if let Some(action) = self.keymap.action_for(key) {
             match action {
                 TreeAction::FoldOrUp => self.fold_or_up(),
                 TreeAction::UnfoldOrDown => self.unfold_or_down(),
                 TreeAction::ToggleLabelTimestamp => self.toggle_time(),
-                // Inline label edit needs the embedded `LabelInput` sub-state (residual); no-op here.
-                TreeAction::EditLabel => {}
+                // Open the inline label editor on the selected entry (`onLabelEdit` → `showLabelInput`).
+                TreeAction::EditLabel => self.begin_label_edit(),
             }
             return SelectorOutcome::Redraw;
         }

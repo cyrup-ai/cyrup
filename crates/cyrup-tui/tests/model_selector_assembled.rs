@@ -68,7 +68,7 @@ fn assembled_model_selector_open_shows_search_check_and_provider_badges() {
     // Seed a model footer as the binary does, then open `/model` the way the run loop does
     // (`App::open_model_selector`) — the selector swaps into the editor slot over the live app.
     app.status_mut().set_model("anthropic/claude-opus-4-6");
-    app.open_model_selector(catalog());
+    app.open_model_selector(catalog(), None);
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Model));
     app.draw().unwrap();
 
@@ -91,7 +91,7 @@ fn assembled_model_selector_open_shows_search_check_and_provider_badges() {
 #[test]
 fn assembled_model_selector_typing_filters_the_live_render() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
-    app.open_model_selector(catalog());
+    app.open_model_selector(catalog(), None);
     // Type `gpt` into the embedded search box; the assembled render must narrow to the openai row.
     for c in "gpt".chars() {
         app.handle_input(&key(KeyCode::Char(c)));

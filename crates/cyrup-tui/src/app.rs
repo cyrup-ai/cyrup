@@ -16,6 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::{CancelToken, EventStream, ModelThinkingLevel};
+// The extension-facing session backend trait: brings `LiveHostServices::set_label` (the live
+// label-append the `/tree` `e` rename persists through — the SAME path a guest's `setLabel` uses,
+// host_services.rs:866) into scope.
+use cyrup_ext::host::HostServices;
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, InputSource, UserInput};
@@ -132,6 +136,15 @@ pub enum CycleDirection {
 pub enum AppCommand {
     /// Open a data-bound selector; the run loop sources its rows from session-svc / resources.
     OpenSelector(SelectorKind),
+    /// `/model [text]` (`handleModelCommand`, interactive-mode.ts:4175-4196): bare (`None`) opens the
+    /// unfiltered picker; a `Some(text)` that EXACTLY matches a model sets it directly (no picker),
+    /// otherwise opens the picker pre-filtered to `text`. The run loop resolves the exact-match against
+    /// the live catalog (`findExactModelReferenceMatch`), so the search term rides the command.
+    ModelCommand(Option<String>),
+    /// Persist an entry's `/tree` label (Pi `onLabelChange` → `sessionManager.appendLabelChange`,
+    /// interactive-mode.ts:4589-4591): set/replace when `label` is non-empty, remove when empty
+    /// (`apply_label` drops empty labels). The run loop applies it via the session's `set_label` path.
+    SetEntryLabel { entry_id: String, label: String },
     /// Cycle to the next/previous model in place (`app.model.cycleForward`/`cycleBackward`): the run
     /// loop reads the cycle set (the scoped models if any, else the available catalog), advances from
     /// the current model, and calls [`AgentSession::set_model`] (Pi `cycleModel`,
@@ -766,9 +779,10 @@ impl<B: Backend> App<B> {
         }
         // Content width for markdown wrapping: the live terminal width (R-ARCH-TUI-005), fallback 80.
         let width = self.terminal.backend().size().map(|s| s.width as usize).unwrap_or(80);
+        let output_pad = self.state.transcript.output_pad();
         let lines: Vec<Line<'static>> = committed
             .iter()
-            .flat_map(|e| entry_lines(e, &self.state.theme, width))
+            .flat_map(|e| entry_lines(e, &self.state.theme, width, output_pad))
             .collect();
         self.state.scrollback.extend(lines.iter().cloned());
         let style = self.state.theme.base_style();
@@ -917,7 +931,9 @@ impl<B: Backend> App<B> {
         let cmd = |c| AppAction::Command(c);
         match name {
             // --- data-bound selectors (run loop sources rows) ---
-            "model" => cmd(C::OpenSelector(SelectorKind::Model)),
+            // `/model [text]` threads its argument (`handleModelCommand(searchTerm?)`,
+            // interactive-mode.ts:4175): exact match → set directly; partial → pre-filtered picker.
+            "model" => cmd(C::ModelCommand(arg)),
             "settings" => cmd(C::OpenSelector(SelectorKind::Settings)),
             "scoped-models" => cmd(C::OpenSelector(SelectorKind::ScopedModels)),
             "tree" => cmd(C::OpenSelector(SelectorKind::Tree)),
@@ -1266,16 +1282,49 @@ impl<B: Backend> App<B> {
     /// Open the `/model` selector (feature #1): the full [`ModelSelector`] with fuzzy search, the
     /// `all | scoped` scope toggle, `[provider]` badges, and a `✓` on the active model — over the live
     /// model catalog `(id, name, provider, current, scoped)`. Replaces the bare titled list the audit
-    /// flagged. Snapshots the editor like every editor-swap selector.
-    pub fn open_model_selector(&mut self, models: Vec<ModelEntry>) {
+    /// flagged. Snapshots the editor like every editor-swap selector. When `search` is `Some`, the
+    /// picker opens **pre-filtered** to it (Pi `showModelSelector(initialSearchInput)`,
+    /// interactive-mode.ts:4307,4333).
+    pub fn open_model_selector(&mut self, models: Vec<ModelEntry>, search: Option<String>) {
         let saved_editor = self.state.editor.text();
-        let inner: Box<dyn Selector> = Box::new(ModelSelector::new(models));
+        let mut selector = ModelSelector::new(models);
+        if let Some(term) = search {
+            selector.set_search(term);
+        }
+        let inner: Box<dyn Selector> = Box::new(selector);
         self.state.selector = Some(ActiveSelector {
             kind: SelectorKind::Model,
             inner,
             saved_editor,
             restore_theme: None,
         });
+    }
+
+    /// Handle `/model [text]` (Pi `handleModelCommand`, interactive-mode.ts:4175-4196): with no term the
+    /// unfiltered picker opens; with a term, an EXACT catalog match sets the model directly (no picker,
+    /// `findExactModelReferenceMatch` → `session.setModel`), while a partial opens the picker
+    /// pre-filtered to it. The catalog is the live available multi-provider catalog the picker itself
+    /// sources (`model_entries`).
+    async fn handle_model_command(&mut self, session: &Arc<AgentSession>, search: Option<String>) {
+        let models = model_entries(session);
+        if models.is_empty() {
+            self.state.transcript.push_status("no models available (configure providers)");
+            return;
+        }
+        if let Some(term) = search.as_deref()
+            && let Some(model) = crate::model_selector::find_exact_model_reference_match(&models, term)
+        {
+            // Exact match → set the fully-qualified `provider/id` directly (mirrors the confirm path),
+            // no picker (`handleModelCommand` early-returns after `setModel`).
+            let id = format!("{}/{}", model.provider, model.id);
+            match session.set_model(&id).await {
+                Ok(_) => self.state.transcript.push_status(format!("model → {id}")),
+                Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+            }
+            return;
+        }
+        // No term, or a partial with no exact match → the picker, pre-filtered to the term if any.
+        self.open_model_selector(models, search);
     }
 
     /// Open an arbitrary boxed [`Selector`] in the input slot under `kind` (the seam for the bespoke
@@ -1450,6 +1499,19 @@ impl<B: Backend> App<B> {
                 }
             }
             SelectorOutcome::Apply(payload) => {
+                // A `/tree` label save (`e` → `LabelInput` submit, tree_selector.rs) rides an
+                // `"{entry_id}\u{1f}{label}"` `Apply` payload; the entry id is a UUID (never contains
+                // the separator) so the split is unambiguous. Persist it via the session `set_label`
+                // path and keep the slot open (the tree already refreshed its own `has_label` star).
+                if kind == SelectorKind::Tree {
+                    return match payload.split_once(crate::FIELD_SEP) {
+                        Some((entry_id, label)) => AppAction::Command(AppCommand::SetEntryLabel {
+                            entry_id: entry_id.to_string(),
+                            label: label.to_string(),
+                        }),
+                        None => AppAction::Redraw,
+                    };
+                }
                 // A `/resume` in-list delete/rename rides a unit-separator-*tagged* `Apply` payload
                 // (`session_selector.rs`); decode it first so it never mis-routes to the settings
                 // handler. The slot stays open (the selector already mutated its own row list).
@@ -1579,35 +1641,9 @@ impl<B: Backend> App<B> {
         use AppCommand as C;
         match cmd {
             C::OpenSelector(SelectorKind::Model) => {
-                // `/model` (feature #1): the full catalog, each row tagged with its provider, whether it
-                // is the active model, and whether it is in the scoped set (drives the `⇥` scope filter).
-                let current = session.model();
-                let scoped: std::collections::HashSet<String> = session
-                    .scoped_models()
-                    .into_iter()
-                    .map(|sm| sm.model.id.to_string())
-                    .collect();
-                // Enumerate the FULL multi-provider registry filtered to CONFIGURED providers (Pi
-                // `modelRegistry.getAvailable()`, model-selector.ts:152 + model-registry.ts:644) —
-                // NOT just the single injected provider. `together` appears once `TOGETHER_API_KEY`
-                // is set; the offline faux default stays selectable.
-                let models: Vec<ModelEntry> = session
-                    .available_model_catalog()
-                    .iter()
-                    .map(|m| ModelEntry {
-                        id: m.id.to_string(),
-                        name: m.name.clone(),
-                        provider: m.provider.to_string(),
-                        current: m.id.as_str() == current.model.as_str()
-                            && m.provider.as_str() == current.provider.as_str(),
-                        scoped: scoped.contains(m.id.as_str()),
-                    })
-                    .collect();
-                if models.is_empty() {
-                    self.state.transcript.push_status("no models available (configure providers)");
-                } else {
-                    self.open_model_selector(models);
-                }
+                // The bare `app.model.select` entry point (no search term) — same as `/model` with no
+                // argument: the unfiltered picker.
+                self.handle_model_command(session, None).await;
             }
             C::OpenSelector(SelectorKind::ScopedModels) => {
                 // The scoped-models picker is the bespoke checkbox+reorder selector over the FULL
@@ -1817,6 +1853,24 @@ impl<B: Backend> App<B> {
                     Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
                 }
             }
+            C::SetEntryLabel { entry_id, label } => {
+                // Persist the `/tree` label edit via the SAME live `set_label` path a loaded
+                // extension's `setLabel` uses (`LiveHostServices::set_label` → `manager.append_label`,
+                // host_services.rs:866). An empty label removes it (`apply_label` drops empty labels),
+                // matching Pi's `value || undefined`. Silently degrades (unknown id / busy), like Pi.
+                session.services().host_services.set_label(&entry_id, &label);
+                let msg = if label.is_empty() {
+                    "label removed".to_string()
+                } else {
+                    format!("label → {label}")
+                };
+                self.state.transcript.push_status(msg);
+            }
+            C::ModelCommand(search) => {
+                // `/model [text]` (`handleModelCommand`, interactive-mode.ts:4175-4196): exact match
+                // sets directly; a partial (or bare) opens the picker pre-filtered to `search`.
+                self.handle_model_command(session, search).await;
+            }
             C::CycleModel(direction) => {
                 // The cycle set is the scoped models when a scope is active, else the full available
                 // catalog (Pi `cycleModel`: `scopedModels.length > 0 ? scoped : available`). Cycling by
@@ -2019,6 +2073,14 @@ impl<B: Backend> App<B> {
                 // Persist a `/settings` toggle/choice live (Global scope; Pi's settings selector
                 // writes the global layer). The `/reload` re-reads the effective view.
                 let json = parse_setting_value(&value);
+                // `outputPad` also takes effect ON SCREEN immediately (Pi `onOutputPadChange` →
+                // `this.outputPad = padding` + re-render, interactive-mode.ts:4127-4136), unlike the
+                // settings that only rebind on `/reload`: push the new pad into the live transcript so
+                // the chat horizontal padding changes the moment the row is cycled.
+                if id == "outputPad" {
+                    let pad = if value == "0" { 0 } else { 1 };
+                    self.state.transcript.set_output_pad(pad);
+                }
                 match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
@@ -2531,6 +2593,65 @@ fn truncate_summary(s: &str) -> String {
 /// Project a flattened [`SessionDagNode`] (feature #2) into the tree selector's [`TreeNode`]: map the
 /// UI-agnostic [`SessionDagKind`] to the render [`TreeKind`] glyph, carry depth/label/fold/leaf/label,
 /// and use the leaf marker (`◀`) as the time label so the active branch tip is visible in the row.
+/// Build the `/model` picker rows from the live session (feature #1): the FULL multi-provider registry
+/// filtered to CONFIGURED providers (Pi `modelRegistry.getAvailable()`, model-selector.ts:152 +
+/// model-registry.ts:644), each row tagged with its provider, whether it is the active model, and
+/// whether it is in the scoped set (drives the `⇥` scope filter). `together` appears once
+/// `TOGETHER_API_KEY` is set; the offline faux default stays selectable. Shared by the bare picker and
+/// the `/model <text>` exact-match/pre-filter path so both see the identical catalog.
+fn model_entries(session: &AgentSession) -> Vec<ModelEntry> {
+    let current = session.model();
+    let scoped: std::collections::HashSet<String> =
+        session.scoped_models().into_iter().map(|sm| sm.model.id.to_string()).collect();
+    session
+        .available_model_catalog()
+        .iter()
+        .map(|m| ModelEntry {
+            id: m.id.to_string(),
+            name: m.name.clone(),
+            provider: m.provider.to_string(),
+            current: m.id.as_str() == current.model.as_str()
+                && m.provider.as_str() == current.provider.as_str(),
+            scoped: scoped.contains(m.id.as_str()),
+        })
+        .collect()
+}
+
+/// Resolve the external-editor command for the live session honoring Pi's precedence — settings
+/// `externalEditor` → `$VISUAL` → `$EDITOR` → platform default (F14; Pi `getExternalEditorCommand`,
+/// settings-manager.ts:846-848, consulted by `openExternalEditor` extension-editor.ts:117). Delegates
+/// to the settings-tested [`cyrup_config::EffectiveSettings::external_editor`] (re-exported as
+/// [`cyrup_session_svc::EffectiveSettings`]) so a configured editor is honored over the environment,
+/// instead of the old inline `$VISUAL`/`$EDITOR`-only chain that ignored it.
+fn resolve_external_editor(session: &AgentSession) -> String {
+    session
+        .services()
+        .settings
+        .effective()
+        .external_editor(&cyrup_session_svc::EnvVars::from_process())
+}
+
+/// Spawn `editor_cmd path` (inheriting stdio) and, on a clean exit, return the file's contents with a
+/// single trailing newline stripped (Pi's "reload the edited text"); `None` on a non-zero exit / spawn
+/// failure (Pi's "no change"). `editor_cmd` is split on whitespace so `code --wait`-style commands work,
+/// with `path` appended as the final argument. Pure (no terminal teardown, no `self`) so the resolved
+/// command that actually runs can be exercised directly by a test — the terminal suspend/restore is the
+/// caller's ([`App::edit_in_external_editor`]) responsibility.
+fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> Option<String> {
+    let mut parts = editor_cmd.split_whitespace();
+    let status = parts
+        .next()
+        .map(|bin| std::process::Command::new(bin).args(parts).arg(path).status());
+    if let Some(Ok(s)) = status
+        && s.success()
+        && let Ok(new_text) = std::fs::read_to_string(path)
+    {
+        let trimmed = new_text.strip_suffix('\n').unwrap_or(&new_text);
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
     let kind = match n.kind {
         SessionDagKind::Message | SessionDagKind::Other => TreeKind::Message,
@@ -2589,6 +2710,14 @@ fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str
             "Editor padding",
             eff.editor_padding_x().to_string(),
             choices(&["0", "1", "2", "3"]),
+        ),
+        // Inserted right after editor-padding, matching Pi (`settings-selector.ts:681-689` splices the
+        // "Output padding" row after "editor-padding"). Cycles 0|1; honored live by the transcript.
+        SettingRow::choice(
+            "outputPad",
+            "Output padding",
+            eff.output_pad().to_string(),
+            choices(&["0", "1"]),
         ),
         SettingRow::choice(
             "autocompleteMaxVisible",
@@ -2974,14 +3103,14 @@ impl App<CrosstermBackend<Stdout>> {
     }
 
     /// Open the editor buffer in an external editor (Ctrl+G / `app.editor.external`,
-    /// `openExternalEditor` interactive-mode.ts:3611): resolve `$VISUAL`/`$EDITOR` (falling back to
-    /// `nano` on unix, `notepad` on Windows), write the buffer to a temp `*.pi.md`, tear the TUI down
-    /// to release the terminal, run the editor (inheriting stdio), and — on a clean exit — reload the
-    /// edited text (trailing newline stripped). The terminal is always restored, even on error. No
-    /// `unsafe`, no new dependency (`std::process` + `std::fs`).
-    pub fn open_external_editor(&mut self) -> Result<(), TuiError> {
+    /// `openExternalEditor` interactive-mode.ts:3611): run the caller-resolved `editor_cmd` (the
+    /// settings `externalEditor` → `$VISUAL` → `$EDITOR` → default chain, see [`App::run`]), write the
+    /// buffer to a temp `*.pi.md`, tear the TUI down to release the terminal, run the editor (inheriting
+    /// stdio), and — on a clean exit — reload the edited text (trailing newline stripped). The terminal
+    /// is always restored, even on error. No `unsafe`, no new dependency (`std::process` + `std::fs`).
+    pub fn open_external_editor(&mut self, editor_cmd: &str) -> Result<(), TuiError> {
         let current = self.state.editor.text();
-        if let Some(new_text) = self.edit_in_external_editor(&current)? {
+        if let Some(new_text) = self.edit_in_external_editor(&current, editor_cmd)? {
             self.state.editor.set_text(&new_text);
         }
         self.draw_synchronized()
@@ -2994,12 +3123,12 @@ impl App<CrosstermBackend<Stdout>> {
     /// [`Selector::apply_external_edit`] — the dialog stays open (Pi never resolves it from this
     /// path, `extension-editor.ts:119-157`); only `Enter`/`Esc` close it. A no-op if no selector is
     /// open or the open one doesn't support external editing (`external_edit_text` returns `None`).
-    fn open_external_editor_for_selector(&mut self) -> Result<(), TuiError> {
+    fn open_external_editor_for_selector(&mut self, editor_cmd: &str) -> Result<(), TuiError> {
         let Some(current) = self.state.selector.as_ref().and_then(|a| a.inner.external_edit_text())
         else {
             return Ok(());
         };
-        if let Some(new_text) = self.edit_in_external_editor(&current)?
+        if let Some(new_text) = self.edit_in_external_editor(&current, editor_cmd)?
             && let Some(active) = self.state.selector.as_mut()
         {
             active.inner.apply_external_edit(&new_text);
@@ -3007,10 +3136,17 @@ impl App<CrosstermBackend<Stdout>> {
         self.draw_synchronized()
     }
 
-    /// Run `$VISUAL`/`$EDITOR` (falling back to `nano`/`notepad`) over `initial` text and return the
-    /// edited result on a clean exit (`Ok(None)` on a non-zero exit / spawn failure / unwritable temp
-    /// file — Pi's "no change"). Tears the TUI down for the duration and always restores it before
-    /// returning, even on failure — the caller is left with a usable terminal either way.
+    /// Run the resolved `editor_cmd` over `initial` text and return the edited result on a clean exit
+    /// (`Ok(None)` on a non-zero exit / spawn failure / unwritable temp file — Pi's "no change"). Tears
+    /// the TUI down for the duration and always restores it before returning, even on failure — the
+    /// caller is left with a usable terminal either way.
+    ///
+    /// `editor_cmd` is resolved by the caller (`App::run`) through the SAME precedence Pi uses —
+    /// settings `externalEditor` → `$VISUAL` → `$EDITOR` → platform default
+    /// ([`cyrup_config::EffectiveSettings::external_editor`], settings-manager.ts:846,
+    /// extension-editor.ts:117) — rather than the old inline `$VISUAL`/`$EDITOR`-only chain that
+    /// silently ignored a configured `externalEditor` (F14). This method just SPAWNS the resolved
+    /// command via [`run_editor_over_file`].
     ///
     /// The synchronous, TUI-suspending core both [`Self::open_external_editor`] (Ctrl+G on the live
     /// input buffer) and [`Self::open_external_editor_for_selector`] (Ctrl+G inside the extension
@@ -3020,13 +3156,11 @@ impl App<CrosstermBackend<Stdout>> {
     /// `App::run`'s `select!` loop is safe (nothing here can deadlock against a concurrently-blocked
     /// guest, unlike the `execute_command`/`run_shortcut` paths, which must never await guest-reentrant
     /// work inline for exactly that reason; see `App::run`'s `AppAction::ExtensionShortcut` arm).
-    fn edit_in_external_editor(&mut self, initial: &str) -> Result<Option<String>, TuiError> {
-        let editor_cmd = std::env::var("VISUAL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| if cfg!(windows) { "notepad".to_string() } else { "nano".to_string() });
-
+    fn edit_in_external_editor(
+        &mut self,
+        initial: &str,
+        editor_cmd: &str,
+    ) -> Result<Option<String>, TuiError> {
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("cyrup-editor-{}.pi.md", std::process::id()));
         if std::fs::write(&tmp, initial).is_err() {
@@ -3036,24 +3170,7 @@ impl App<CrosstermBackend<Stdout>> {
 
         // Release the terminal (cooked mode, no inline viewport) so the editor owns the screen.
         self.restore()?;
-        // `editor arg1 arg2 … tmp` — split on spaces to support `code --wait`-style commands.
-        let mut parts = editor_cmd.split_whitespace();
-        let status = parts.next().map(|bin| {
-            std::process::Command::new(bin)
-                .args(parts)
-                .arg(&tmp)
-                .status()
-        });
-
-        // A clean exit reloads the edited text; a non-zero exit yields `None` (Pi: no change).
-        let mut result = None;
-        if let Some(Ok(s)) = status
-            && s.success()
-            && let Ok(new_text) = std::fs::read_to_string(&tmp)
-        {
-            let trimmed = new_text.strip_suffix('\n').unwrap_or(&new_text);
-            result = Some(trimmed.to_string());
-        }
+        let result = run_editor_over_file(editor_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
 
         // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws.
@@ -3095,6 +3212,12 @@ impl App<CrosstermBackend<Stdout>> {
         // session swap below, since a replacement session brings a fresh `LiveHostServices`.
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
         session.services().host_services.set_ui_sink(ui_tx.clone());
+        // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
+        // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
+        // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
+        self.state
+            .transcript
+            .set_output_pad(session.services().settings.effective().output_pad().max(0) as usize);
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -3153,9 +3276,13 @@ impl App<CrosstermBackend<Stdout>> {
                     match self.handle_input(&ev) {
                         AppAction::Quit => break,
                         AppAction::Suspend => self.suspend()?,
-                        AppAction::OpenExternalEditor => self.open_external_editor()?,
+                        AppAction::OpenExternalEditor => {
+                            let editor_cmd = resolve_external_editor(&session);
+                            self.open_external_editor(&editor_cmd)?;
+                        }
                         AppAction::OpenExternalEditorForSelector => {
-                            self.open_external_editor_for_selector()?;
+                            let editor_cmd = resolve_external_editor(&session);
+                            self.open_external_editor_for_selector(&editor_cmd)?;
                         }
                         AppAction::Interrupt => {
                             session.abort();
@@ -3351,6 +3478,11 @@ impl App<CrosstermBackend<Stdout>> {
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from
                         // `crates/cyrup-modes/src/rpc.rs`'s `run_rpc`).
                         session.services().host_services.set_ui_sink(ui_tx.clone());
+                        // `rebind_session` reset the transcript to Pi's default pad; re-read the
+                        // swapped-in session's `outputPad` so a configured value survives the swap.
+                        self.state.transcript.set_output_pad(
+                            session.services().settings.effective().output_pad().max(0) as usize,
+                        );
                         // The swapped-in session owns a fresh extension host; re-source its
                         // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
                         let shortcuts = session.services().ext_host.shortcut_keys();
@@ -3636,5 +3768,61 @@ mod live_floor_tests {
             idle,
             "idle viewport must collapse back to the compact region after the turn"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod external_editor_tests {
+    use super::*;
+
+    /// F14: the RESOLVED editor command is exactly what runs over the temp file — proving
+    /// `edit_in_external_editor` spawns the command it is handed (which `App::run` resolves via
+    /// `resolve_external_editor` → `EffectiveSettings::external_editor`, honoring settings
+    /// `externalEditor` over `$VISUAL`/`$EDITOR`) rather than an inline env-only chain. A no-arg
+    /// executable script (so `split_whitespace` yields just the script path + the appended file arg)
+    /// rewrites the file; the reloaded text is the script's output.
+    #[test]
+    #[cfg(unix)]
+    fn resolved_editor_command_is_the_one_that_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-editor.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'REWRITTEN BY EDITOR' > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let file = dir.path().join("buffer.md");
+        std::fs::write(&file, "original text").unwrap();
+
+        let out = run_editor_over_file(script.to_str().unwrap(), &file);
+        assert_eq!(
+            out.as_deref(),
+            Some("REWRITTEN BY EDITOR"),
+            "the resolved editor's edit is reloaded"
+        );
+    }
+
+    /// A non-zero editor exit yields `None` — Pi's "no change" (`false` exits 1 without editing).
+    #[test]
+    #[cfg(unix)]
+    fn nonzero_editor_exit_is_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("buffer.md");
+        std::fs::write(&file, "keep me").unwrap();
+        assert_eq!(run_editor_over_file("false", &file), None);
+    }
+
+    /// A trailing newline the editor leaves is stripped once (Pi's `.replace(/\n$/, "")`).
+    #[test]
+    #[cfg(unix)]
+    fn trailing_newline_is_stripped_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("nl-editor.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'line one\\n' > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.path().join("buffer.md");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(run_editor_over_file(script.to_str().unwrap(), &file).as_deref(), Some("line one"));
     }
 }

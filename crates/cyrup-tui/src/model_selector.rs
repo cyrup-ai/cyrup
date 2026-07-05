@@ -144,6 +144,16 @@ impl ModelSelector {
         self.selected = self.filtered().iter().position(|m| m.current).unwrap_or(0);
     }
 
+    /// Pre-fill the search box (Pi `showModelSelector(initialSearchInput)` → `ModelSelectorComponent`'s
+    /// `initialSearchInput`, interactive-mode.ts:4307,4333): seed the fuzzy query from `/model <text>`
+    /// when no exact match set the model directly, so the picker opens already narrowed to `<text>`. The
+    /// caret lands at the end of the seeded text and the highlight resets to the top of the filtered set.
+    pub fn set_search(&mut self, term: String) {
+        self.cursor = term.len();
+        self.query = term;
+        self.selected = 0;
+    }
+
     /// Insert a printable char into the search query, resetting the highlight (Pi feeds everything else
     /// to `searchInput`, `:322-325`).
     fn insert_char(&mut self, c: char) {
@@ -232,6 +242,55 @@ impl ModelSelector {
             )));
         }
         lines
+    }
+}
+
+/// Find an EXACT model reference match (Pi `findExactModelReferenceMatch`, core/model-resolver.ts:76):
+/// a canonical `provider/id`, a `provider/id` split, or a bare `id`, matched case-insensitively.
+/// Ambiguous matches (a bare id shared across providers, or a duplicate canonical) are REJECTED
+/// (`None`), exactly like Pi. Used by `/model <text>` to set the model directly instead of opening the
+/// picker when the argument names a single model unambiguously.
+pub fn find_exact_model_reference_match<'a>(
+    models: &'a [ModelEntry],
+    reference: &str,
+) -> Option<&'a ModelEntry> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_lowercase();
+
+    // 1. Canonical `provider/id` (exactly one wins; >1 is ambiguous → reject).
+    let mut canonical =
+        models.iter().filter(|m| format!("{}/{}", m.provider, m.id).to_lowercase() == normalized);
+    match (canonical.next(), canonical.next()) {
+        (Some(m), None) => return Some(m),
+        (Some(_), Some(_)) => return None,
+        _ => {}
+    }
+
+    // 2. Split `provider/id` (exactly one wins; >1 is ambiguous → reject).
+    if let Some((provider, model_id)) = trimmed.split_once('/') {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if !provider.is_empty() && !model_id.is_empty() {
+            let mut matches = models.iter().filter(|m| {
+                m.provider.to_lowercase() == provider.to_lowercase()
+                    && m.id.to_lowercase() == model_id.to_lowercase()
+            });
+            match (matches.next(), matches.next()) {
+                (Some(m), None) => return Some(m),
+                (Some(_), Some(_)) => return None,
+                _ => {}
+            }
+        }
+    }
+
+    // 3. Bare `id` (exactly one wins; a cross-provider duplicate is ambiguous → reject).
+    let mut id_matches = models.iter().filter(|m| m.id.to_lowercase() == normalized);
+    match (id_matches.next(), id_matches.next()) {
+        (Some(m), None) => Some(m),
+        _ => None,
     }
 }
 
@@ -407,5 +466,81 @@ mod tests {
         assert!(text.contains("[anthropic]"));
         assert!(text.contains("[openai]"));
         assert!(text.contains("✓"));
+    }
+
+    // ---- F6: `/model <text>` exact match + pre-filter --------------------------------------------
+
+    fn unscoped() -> Vec<ModelEntry> {
+        vec![
+            entry("claude-opus-4-6", "anthropic", true, false),
+            entry("gpt-5.1", "openai", false, false),
+            entry("gemini-3-pro", "google", false, false),
+        ]
+    }
+
+    #[test]
+    fn exact_match_by_canonical_reference() {
+        let cat = catalog();
+        let m = find_exact_model_reference_match(&cat, "openai/gpt-5.1").unwrap();
+        assert_eq!(m.id, "gpt-5.1");
+        assert_eq!(m.provider, "openai");
+    }
+
+    #[test]
+    fn exact_match_by_canonical_is_case_insensitive() {
+        let cat = catalog();
+        let m = find_exact_model_reference_match(&cat, "OpenAI/GPT-5.1").unwrap();
+        assert_eq!(m.id, "gpt-5.1");
+    }
+
+    #[test]
+    fn exact_match_by_bare_unique_id() {
+        let cat = catalog();
+        let m = find_exact_model_reference_match(&cat, "gpt-5.1").unwrap();
+        assert_eq!(m.provider, "openai");
+        // A `provider/id` split also resolves.
+        let m2 = find_exact_model_reference_match(&cat, "anthropic/claude-opus-4-6").unwrap();
+        assert_eq!(m2.id, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn ambiguous_bare_id_across_providers_is_rejected() {
+        // Same bare id under two providers → no unambiguous match (Pi rejects cross-provider dupes).
+        let models = vec![
+            entry("shared-id", "anthropic", false, false),
+            entry("shared-id", "openai", false, false),
+        ];
+        assert!(find_exact_model_reference_match(&models, "shared-id").is_none());
+        // …but the canonical `provider/id` still disambiguates.
+        let m = find_exact_model_reference_match(&models, "openai/shared-id").unwrap();
+        assert_eq!(m.provider, "openai");
+    }
+
+    #[test]
+    fn partial_reference_has_no_exact_match() {
+        let cat = catalog();
+        // `qwen` names no model → the caller opens the picker pre-filtered instead of setting directly.
+        assert!(find_exact_model_reference_match(&cat, "qwen").is_none());
+        // A partial that is a substring of one id is still NOT an exact match.
+        assert!(find_exact_model_reference_match(&cat, "gpt").is_none());
+        // Empty / whitespace never matches.
+        assert!(find_exact_model_reference_match(&cat, "   ").is_none());
+    }
+
+    #[test]
+    fn set_search_prefilters_the_picker() {
+        // Pre-fill mirrors `/model gpt` opening the picker already narrowed. Use an unscoped catalog so
+        // the default scope is `all` and the query filters across every provider.
+        let mut sel = ModelSelector::new(unscoped());
+        sel.set_search("gpt".to_string());
+        assert_eq!(sel.visible_len(), 1, "picker opens pre-filtered to the seeded term");
+        assert_eq!(sel.current().unwrap().id, "gpt-5.1");
+        // The seeded query renders in the search box.
+        let theme = UiTheme::default();
+        let mut term = Terminal::new(TestBackend::new(72, 16)).unwrap();
+        term.draw(|f| sel.render(f, f.area(), &theme)).unwrap();
+        let text: String =
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("gpt"), "seeded search term shown in the box: {text}");
     }
 }

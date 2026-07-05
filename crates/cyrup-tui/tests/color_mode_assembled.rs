@@ -46,7 +46,7 @@ fn assembled_256color_render_emits_indexed_never_truecolor() {
     app.status_mut().set_reasoning(true);
     app.status_mut().set_thinking_level("high");
     app.transcript_mut().push_assistant_delta("indexing the workspace");
-    app.open_model_selector(model());
+    app.open_model_selector(model(), None);
     app.draw().unwrap();
 
     let buf = app.terminal().backend().buffer();
@@ -76,7 +76,7 @@ fn assembled_truecolor_render_keeps_rgb_for_contrast() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     assert_eq!(app.color_mode(), ColorMode::TrueColor);
     app.status_mut().set_model("anthropic/claude-opus-4-6");
-    app.open_model_selector(model());
+    app.open_model_selector(model(), None);
     app.draw().unwrap();
     let has_rgb = app
         .terminal()

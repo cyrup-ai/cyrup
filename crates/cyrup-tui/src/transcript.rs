@@ -125,12 +125,34 @@ pub struct TranscriptView {
     /// default auto-scroll); paging up reveals earlier streamed/tool/bash output before it commits to
     /// native scrollback. Reset to `0` whenever new content lands so live streaming stays visible.
     scroll_offset: usize,
+    /// Horizontal padding (columns) applied to user/assistant/thinking output (Pi `outputPad`, `0`|`1`,
+    /// default `1` — settings-manager.ts:1186; `Markdown(content, outputPad, 0)` /
+    /// `Box(outputPad, 1)`, assistant-message.ts:103, user-message.ts:31). Toggled live from
+    /// `/settings` → "Output padding" (F12). Left-indents each message line; `0` renders flush-left.
+    output_pad: usize,
 }
 
 impl TranscriptView {
     /// An empty transcript.
     pub fn new() -> Self {
-        TranscriptView::default()
+        // Pi's `outputPad` defaults to 1 (settings-manager.ts:1186), unlike the `0` a derived
+        // `Default` would give — seed it explicitly so fresh transcripts match Pi's default padding.
+        TranscriptView { output_pad: 1, ..TranscriptView::default() }
+    }
+
+    /// The horizontal output padding (`outputPad`, columns) applied to user/assistant messages — read
+    /// by the shell to pass into [`entry_lines`] when flushing committed entries to scrollback.
+    pub fn output_pad(&self) -> usize {
+        self.output_pad
+    }
+
+    /// Set the horizontal output padding live (Pi `onOutputPadChange` → `this.outputPad = padding`,
+    /// interactive-mode.ts:4127-4136). The `/settings` "Output padding" row drives this; the live region
+    /// re-renders with the new indent on the next draw, and subsequently-committed messages flush with
+    /// it (already-scrolled-off native scrollback is immutable, an accepted consequence of the
+    /// content-sized-viewport architecture).
+    pub fn set_output_pad(&mut self, pad: usize) {
+        self.output_pad = pad;
     }
 
     /// Committed entries not yet flushed to scrollback (test/inspection access).
@@ -439,7 +461,8 @@ impl TranscriptView {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(partial) = &self.streaming {
             let body = crate::markdown::trim_partial_closing_fence(partial);
-            let mut md = crate::markdown::render(&body, width.saturating_sub(11).max(1), theme);
+            let mut md =
+                crate::markdown::render(&body, width.saturating_sub(11 + self.output_pad).max(1), theme);
             if md.is_empty() {
                 md.push(Line::default());
             }
@@ -449,6 +472,7 @@ impl TranscriptView {
             if let Some(last) = md.last_mut() {
                 last.spans.push(Span::styled("▌", theme.dim_style()));
             }
+            pad_lines(&mut md, self.output_pad);
             lines.extend(md);
         }
         // Live tool executions render below the streaming partial, honoring the expand flag so
@@ -1105,7 +1129,24 @@ pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
 /// Assistant bodies render as **markdown** (spec/tui/06 §2) — multiple lines — with an `assistant: `
 /// accent label prefixed onto the first line so the conversation stays grep-legible. User/tool/status
 /// entries stay one line each.
-pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<Line<'static>> {
+/// Left-indent every line by `pad` columns — the horizontal half of Pi's `outputPad` message padding
+/// (`Markdown(content, outputPad, 0)` / `Box(outputPad, 1)`). A no-op at `pad == 0` (flush-left).
+fn pad_lines(lines: &mut [Line<'static>], pad: usize) {
+    if pad == 0 {
+        return;
+    }
+    let indent = " ".repeat(pad);
+    for line in lines.iter_mut() {
+        line.spans.insert(0, Span::raw(indent.clone()));
+    }
+}
+
+pub(crate) fn entry_lines(
+    entry: &Entry,
+    theme: &UiTheme,
+    width: usize,
+    output_pad: usize,
+) -> Vec<Line<'static>> {
     match entry {
         Entry::User(text) => {
             // The rich user-message render (`user-message.ts`): the submitted text is rendered as
@@ -1115,13 +1156,16 @@ pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<L
             // box background and the OSC-133 shell-zone markers wrapping the block are terminal
             // shell-integration escapes that the ratatui cell grid / `insert_before` scrollback model
             // cannot carry; the markdown body + user accent is the in-crate fidelity.)
-            let mut md = crate::markdown::render(text, width.saturating_sub(5).max(1), theme);
+            let mut md =
+                crate::markdown::render(text, width.saturating_sub(5 + output_pad).max(1), theme);
             if md.is_empty() {
                 md.push(Line::default());
             }
             if let Some(first) = md.first_mut() {
                 first.spans.insert(0, Span::styled("you: ", theme.user_style()));
             }
+            // The `outputPad` horizontal padding (Pi `Box(outputPad, 1)`, user-message.ts:31).
+            pad_lines(&mut md, output_pad);
             // Project the `userMessageBg` role onto the block (audit #6: the bg roles were dead; the
             // "ratatui can't carry bg" claim was wrong — `insert_before` writes cell bg fine). No-op
             // when the theme omits the role (terminal default shows through).
@@ -1132,13 +1176,17 @@ pub(crate) fn entry_lines(entry: &Entry, theme: &UiTheme, width: usize) -> Vec<L
             md
         }
         Entry::Assistant(text) => {
-            let mut md = crate::markdown::render(text, width.saturating_sub(11).max(1), theme);
+            let mut md =
+                crate::markdown::render(text, width.saturating_sub(11 + output_pad).max(1), theme);
             if md.is_empty() {
                 md.push(Line::default());
             }
             if let Some(first) = md.first_mut() {
                 first.spans.insert(0, Span::styled("assistant: ", theme.accent_style()));
             }
+            // The `outputPad` horizontal padding (Pi `Markdown(content, outputPad, 0)`,
+            // assistant-message.ts:103).
+            pad_lines(&mut md, output_pad);
             md
         }
         Entry::Tool(run) => {
@@ -1303,6 +1351,72 @@ pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
         (!um.is_empty()).then(|| um.to_string())
     };
     Some(ParsedSkillBlock { name: name.to_string(), location: location.to_string(), content, user_message })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod output_pad_tests {
+    use super::*;
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// F12: a fresh transcript defaults to Pi's `outputPad = 1` and `set_output_pad` drives it.
+    #[test]
+    fn output_pad_defaults_to_one_and_is_settable() {
+        let mut view = TranscriptView::new();
+        assert_eq!(view.output_pad(), 1, "Pi's default outputPad is 1");
+        view.set_output_pad(0);
+        assert_eq!(view.output_pad(), 0);
+    }
+
+    /// `outputPad` left-indents user/assistant committed lines; `0` renders flush-left, `1` prepends a
+    /// single leading column ahead of the `you:`/`assistant:` accent label.
+    #[test]
+    fn output_pad_left_indents_committed_messages() {
+        let theme = UiTheme::dark();
+        // pad = 1 → a leading space before the label.
+        let u1 = entry_lines(&Entry::User("hello".into()), &theme, 80, 1);
+        assert!(line_text(&u1[0]).starts_with(" you: "), "pad=1 user: {:?}", line_text(&u1[0]));
+        let a1 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1);
+        assert!(
+            line_text(&a1[0]).starts_with(" assistant: "),
+            "pad=1 assistant: {:?}",
+            line_text(&a1[0])
+        );
+        // pad = 0 → flush-left (no leading space).
+        let u0 = entry_lines(&Entry::User("hello".into()), &theme, 80, 0);
+        assert!(line_text(&u0[0]).starts_with("you: "), "pad=0 user: {:?}", line_text(&u0[0]));
+        let a0 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 0);
+        assert!(
+            line_text(&a0[0]).starts_with("assistant: "),
+            "pad=0 assistant: {:?}",
+            line_text(&a0[0])
+        );
+    }
+
+    /// The live streaming partial honors the pad too (Pi keeps the outputPad on the in-flight
+    /// `AssistantMessageComponent`). Rendering the active region with pad=1 vs pad=0 shifts the line.
+    #[test]
+    fn output_pad_indents_the_live_streaming_partial() {
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_assistant_delta("streaming answer");
+        let padded = view.lines(80, &theme);
+        assert!(
+            line_text(&padded[0]).starts_with(" assistant: "),
+            "pad=1 live: {:?}",
+            line_text(&padded[0])
+        );
+        view.set_output_pad(0);
+        let flush = view.lines(80, &theme);
+        assert!(
+            line_text(&flush[0]).starts_with("assistant: "),
+            "pad=0 live: {:?}",
+            line_text(&flush[0])
+        );
+    }
 }
 
 #[cfg(test)]

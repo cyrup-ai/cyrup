@@ -6,6 +6,7 @@
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cyrup_tui::{
     FilterMode, SelectKeymap, Selector, SelectorOutcome, TreeKind, TreeNode, TreeSelector, UiTheme,
+    FIELD_SEP,
 };
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -119,4 +120,84 @@ fn esc_cancels() {
     let mut sel = TreeSelector::new(sample());
     let out = sel.handle(&key(KeyCode::Esc), &SelectKeymap::default());
     assert_eq!(out, SelectorOutcome::Cancel);
+}
+
+fn ch(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+}
+
+/// F16: pressing `e` opens the inline label editor (no longer a dead no-op). The body shows the
+/// `Label (empty to remove):` prompt and the save/cancel hint (Pi `LabelInput.render`,
+/// tree-selector.ts:1256-1270).
+#[test]
+fn e_opens_the_label_editor_overlay() {
+    let theme = UiTheme::dark();
+    let mut sel = TreeSelector::new(sample());
+    let out = sel.handle(&ch('e'), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Redraw, "`e` opens the editor and redraws");
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 80, 12), &theme)).unwrap();
+    let text = buf_string(&terminal);
+    assert!(text.contains("Label (empty to remove):"), "label prompt shown: {text}");
+    assert!(text.contains("enter save"), "save/cancel hint shown: {text}");
+}
+
+/// While the editor is open it captures ALL keys as literal text — `z` types a `z` instead of folding,
+/// digits do not switch filters (Pi's `if (this.labelInput)` route, tree-selector.ts:1373-1379). On
+/// confirm it emits an `Apply("{entry_id}\u{1f}{label}")` payload (the persist seam) and stays open,
+/// and the node's label star turns on locally.
+#[test]
+fn label_editor_captures_keys_and_confirms_with_apply_payload() {
+    let mut sel = TreeSelector::new(sample());
+    // Select the un-labeled root and open the editor.
+    assert_eq!(sel.selected_id().as_deref(), Some("root"));
+    sel.handle(&ch('e'), &SelectKeymap::default());
+    // Type "z1x" — every char is literal; the filter stays default and nothing folds.
+    for c in ['z', '1', 'x'] {
+        assert_eq!(sel.handle(&ch(c), &SelectKeymap::default()), SelectorOutcome::Redraw);
+    }
+    assert_eq!(sel.filter(), FilterMode::Default, "digits typed literally, no filter change");
+    assert_eq!(sel.visible_indices().len(), 6, "`z`/`x` typed literally, no fold/unfold");
+    // Confirm → the persist payload carries the entry id + the typed label; the slot stays open.
+    let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Apply(format!("root{FIELD_SEP}z1x")));
+    // The local star is set so the tree reflects the new label immediately: `root` was NOT labeled in
+    // `sample()`, but labeled-only now includes it alongside the pre-labeled `f`.
+    sel.set_filter(FilterMode::LabeledOnly);
+    let labeled = sel.visible_ids();
+    assert!(labeled.contains(&"root".to_string()), "root gained a label star: {labeled:?}");
+    assert!(labeled.contains(&"f".to_string()), "pre-labeled node still present: {labeled:?}");
+}
+
+/// Confirming an EMPTY buffer clears the label (Pi `value || undefined` → remove; the payload's label
+/// segment is empty and `apply_label` drops empty labels).
+#[test]
+fn label_editor_empty_confirm_removes_label() {
+    let mut sel = TreeSelector::new(sample());
+    // Move to the already-labeled "fix footer" node (`f`).
+    while sel.selected_id().as_deref() != Some("f") {
+        sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
+    }
+    sel.handle(&ch('e'), &SelectKeymap::default());
+    // Confirm with an empty buffer → remove.
+    let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Apply(format!("f{FIELD_SEP}")));
+    // The star is cleared locally: labeled-only now excludes `f`.
+    sel.set_filter(FilterMode::LabeledOnly);
+    assert!(!sel.visible_ids().contains(&"f".to_string()), "label star cleared after empty confirm");
+}
+
+/// Esc inside the editor discards the edit (no `Apply`, no label change) and returns to the tree.
+#[test]
+fn label_editor_esc_discards() {
+    let mut sel = TreeSelector::new(sample());
+    // Label the already-labeled node's neighbor to prove nothing persists on cancel.
+    sel.handle(&ch('e'), &SelectKeymap::default());
+    sel.handle(&ch('x'), &SelectKeymap::default());
+    let out = sel.handle(&key(KeyCode::Esc), &SelectKeymap::default());
+    assert_eq!(out, SelectorOutcome::Redraw, "esc discards without an Apply");
+    // The editor closed: a subsequent `z` folds again (tree keys are live once more).
+    sel.handle(&key(KeyCode::Down), &SelectKeymap::default()); // row 1 (foldable model)
+    sel.handle(&ch('z'), &SelectKeymap::default());
+    assert_eq!(sel.visible_indices().len(), 5, "tree keys live again after cancel");
 }
