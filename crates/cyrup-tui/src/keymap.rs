@@ -79,11 +79,13 @@ pub enum Action {
     /// prepends their text (joined by blank lines) to the current editor buffer; shows a
     /// `No queued messages to restore` status when nothing is queued.
     Dequeue,
-    /// Paste a system-clipboard image, attaching it to the next prompt (Ctrl+V; Windows: Alt+V) —
-    /// `app.clipboard.pasteImage` (`handleClipboardImagePaste`, interactive-mode.ts:2537-2557;
-    /// `core/keybindings.ts:106-109`). Reads the clipboard image via `arboard`, writes it to a
-    /// `cyrup-clipboard-<uuid>.png` temp file, and attaches it through the `@`-mention image path. Gated
-    /// on an image actually being present (Pi `clipboard.hasImage()`); a bare Ctrl+V with no clipboard
+    /// Paste a system-clipboard image (Ctrl+V; Windows: Alt+V) — `app.clipboard.pasteImage`
+    /// (`handleClipboardImagePaste`, interactive-mode.ts:2537-2557; `core/keybindings.ts:106-109`).
+    /// Reads the clipboard image via `arboard`, writes it to a `cyrup-clipboard-<uuid>.png` temp file,
+    /// and inserts its PATH as text at the editor cursor (Pi's `insertTextAtCursor(filePath)`,
+    /// interactive-mode.ts:2552) — so on submit the path rides the outgoing user message AS TEXT, with
+    /// no image content block (the agent loads it on demand; the raster never floods context). Gated on
+    /// an image actually being present (Pi `clipboard.hasImage()`); a bare Ctrl+V with no clipboard
     /// image falls through to the editor so normal text behavior is preserved.
     ClipboardPasteImage,
 }

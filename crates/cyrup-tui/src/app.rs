@@ -575,15 +575,30 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Read a system-clipboard image and attach it to the next prompt (Ctrl+V; Pi
-    /// `handleClipboardImagePaste`, interactive-mode.ts:2537-2557), reusing the `@`-mention image
-    /// attach path ([`attach_image_path`](Self::attach_image_path)). Returns `true` when a clipboard
-    /// image was found, materialized to a `cyrup-clipboard-<uuid>.png` temp file, and attached; `false`
-    /// when the clipboard holds no image (Pi `clipboard.hasImage()` gate) or on any clipboard/encode/IO
-    /// error — so the caller lets the key fall through to the editor, preserving normal Ctrl+V behavior.
-    fn try_attach_clipboard_image(&mut self) -> bool {
+    /// Insert the temp-file PATH of a pasted clipboard image at the editor cursor as ordinary text —
+    /// Pi's literal mechanism (`this.editor.insertTextAtCursor(filePath)`,
+    /// interactive-mode.ts:2552). The bare path becomes editable text and, on submit, rides the
+    /// outgoing user message AS TEXT (no image content block): the agent loads the raster on demand
+    /// via a file-read tool, so a potentially huge image never floods context — Pi's deliberate
+    /// context-economy choice, which the former `pending_images` embed here violated. Kept separate
+    /// from the clipboard read so the path→editor step is unit-testable without a live system
+    /// clipboard (`try_paste_clipboard_image_path` supplies the path in the binary).
+    fn insert_clipboard_image_path(&mut self, path: &std::path::Path) {
+        self.state.editor.insert_str(&path.to_string_lossy());
+    }
+
+    /// Read a system-clipboard image, materialize it to a `cyrup-clipboard-<uuid>.png` temp file, and
+    /// insert its PATH as text at the editor cursor (Pi `handleClipboardImagePaste`,
+    /// interactive-mode.ts:2537-2557). Returns `true` when an image was found and its path pasted;
+    /// `false` when the clipboard holds no image (Pi `clipboard.hasImage()` gate) or on any
+    /// clipboard/encode/IO error — so the caller lets Ctrl+V fall through to the editor, preserving
+    /// normal text-paste behavior.
+    fn try_paste_clipboard_image_path(&mut self) -> bool {
         match read_clipboard_image_to_temp() {
-            Some(path) => self.attach_image_path(&path),
+            Some(path) => {
+                self.insert_clipboard_image_path(&path);
+                true
+            }
             None => false,
         }
     }
@@ -766,13 +781,14 @@ impl<B: Backend> App<B> {
                 //   • Ctrl+D on a non-empty buffer is forward-delete; it only exits on empty
                 //     (spec/tui/03 §6, spec/tui/07 §3.3).
                 if let Some(action) = self.state.keymap.action_for(key) {
-                    // `app.clipboard.pasteImage` (Ctrl+V): read a system-clipboard image and attach it
-                    // (Pi `handleClipboardImagePaste`, interactive-mode.ts:2537-2557). Gated on an image
+                    // `app.clipboard.pasteImage` (Ctrl+V): read a system-clipboard image and insert its
+                    // temp-file PATH as text at the editor cursor (Pi `handleClipboardImagePaste` →
+                    // `insertTextAtCursor(filePath)`, interactive-mode.ts:2537-2557). Gated on an image
                     // actually being present (Pi `clipboard.hasImage()`): when the clipboard holds no
                     // image the key is NOT swallowed — it falls through to the editor below so normal
                     // Ctrl+V behavior is preserved (do not break text paste).
                     if action == Action::ClipboardPasteImage {
-                        if self.try_attach_clipboard_image() {
+                        if self.try_paste_clipboard_image_path() {
                             return AppAction::Redraw;
                         }
                         // No image on the clipboard: fall through to the editor (text) handling below.
@@ -1047,9 +1063,9 @@ impl<B: Backend> App<B> {
             // `app.clipboard.pasteImage` (Ctrl+V) is resolved earlier in `handle_input` — it must be
             // able to fall through to the editor when the clipboard holds no image, which this arm
             // cannot do — so this arm is normally unreachable. It exists only to keep the match
-            // exhaustive; it attaches best-effort and redraws (no panic, per the no-panic policy).
+            // exhaustive; it pastes the path best-effort and redraws (no panic, per the no-panic policy).
             Action::ClipboardPasteImage => {
-                self.try_attach_clipboard_image();
+                self.try_paste_clipboard_image_path();
                 AppAction::Redraw
             }
         }
@@ -3443,5 +3459,63 @@ fn map_event(ev: Event) -> Option<InputEvent> {
         Event::FocusGained => Some(InputEvent::FocusGained),
         Event::FocusLost => Some(InputEvent::FocusLost),
         Event::Mouse(_) => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod clipboard_paste_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Pi's clipboard paste inserts the materialized temp-file PATH into the editor as ordinary text
+    /// (`this.editor.insertTextAtCursor(filePath)`, interactive-mode.ts:2552) — NOT an inline image.
+    /// This drives the exact `insert_clipboard_image_path` step the Ctrl+V handler calls, then the
+    /// real Enter-submit path, then the `UserInput` the run loop builds from that text — proving the
+    /// OUTGOING message the LLM receives is text carrying the path with NO image content block
+    /// (`AppAction::Submit` → `UserInput::text`, app.rs:3158; Pi `userContent = [{type:text}]` +
+    /// (empty) images, agent-session.ts:1117).
+    #[test]
+    fn clipboard_paste_inserts_path_as_text_with_no_image_block() {
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+
+        // The path a clipboard image is materialized to (mirrors the real `cyrup-clipboard-<uuid>.png`
+        // under the OS temp dir; it need not exist on disk — insertion is a pure text edit). On macOS
+        // this is `/var/folders/…/T/…`, a leading-slash path — the case that must NOT be mistaken for
+        // a slash command on submit.
+        let path = std::env::temp_dir().join("cyrup-clipboard-0198f000-test.png");
+        let path_str = path.to_string_lossy().to_string();
+
+        app.insert_clipboard_image_path(&path);
+
+        // Pi mechanism: the bare path is now editable text in the buffer …
+        assert_eq!(app.state().editor.text(), path_str, "path must land in the editor as text");
+        // … and is NOT embedded as an inline image (the former `pending_images` embed is gone), so the
+        // potentially-huge raster never floods context.
+        assert!(
+            app.pending_images().is_empty(),
+            "clipboard paste must not embed an image block into pending_images"
+        );
+
+        // Real submit path: plain Enter routes editor text → `dispatch_submission` → `AppAction::Submit`
+        // (a leading-slash temp path fuzzy-matches no command, so it dispatches as a text prompt).
+        let enter = InputEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = app.handle_input(&enter);
+        assert_eq!(
+            action,
+            AppAction::Submit(path_str.clone()),
+            "the pasted path must submit as a text prompt, not a slash command"
+        );
+
+        // The run loop turns that submitted text into the outgoing user message via `UserInput::text`
+        // (app.rs:3158): the LLM receives the path AS TEXT with an EMPTY image set. `into_agent_message`
+        // then yields a single text content block (Pi's `[{type:text,text}]` + no images).
+        let outgoing = UserInput::text(path_str.clone(), InputSource::Tui);
+        assert_eq!(outgoing.text, path_str, "outgoing message text is the pasted path");
+        assert!(
+            outgoing.images.is_empty(),
+            "outgoing user message must carry no image content block"
+        );
     }
 }
