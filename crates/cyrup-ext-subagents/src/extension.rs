@@ -3627,16 +3627,82 @@ pub fn registration_mode_from_env() -> Option<RegistrationMode> {
     )
 }
 
+/// The opt-in install env var for the SubAgents extension, mirroring its two sibling companions
+/// EXACTLY (`cyrup_intercom::INSTALL_ENV_VAR` = `CYRUP_INTERCOM`,
+/// `cyrup_permission_system::INSTALL_ENV_VAR` = `CYRUP_PERMISSION_SYSTEM`). In `pi`, `pi-subagents`
+/// is an OPTIONAL installable package; cyrup matches that — default OFF, attached for a plain
+/// top-level session only when opted in (see [`is_installed`]). When truthy, the orchestrator
+/// surface attaches even with no on-disk config file.
+pub const INSTALL_ENV_VAR: &str = "CYRUP_SUBAGENTS";
+
+/// `<agent_dir>/subagents/config.json` is the tier-3 per-installation extension config (R-SA-133
+/// tier 3) that `crates/cyrup/src/subagent_config.rs` loads; its mere PRESENCE is an install signal
+/// (the user created a subagents config, so they want the extension).
+const CONFIG_SUBDIR: &str = "subagents";
+const CONFIG_FILE: &str = "config.json";
+/// The project-scope opt-in location: `<cwd>/.cyrup/subagents/config.json`.
+const PROJECT_SUBDIR: &str = ".cyrup";
+
+/// Truthy-env test, identical to the two sibling companions' own `env_truthy`
+/// (`cyrup_intercom` / `cyrup_permission_system`): `1`/`true`/`on`/`yes` (trimmed) are truthy.
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// Whether the SubAgents extension is "installed" (opt-in) for a plain top-level session — mirrors
+/// `cyrup_intercom::is_installed` / `cyrup_permission_system::is_installed` EXACTLY: an explicit
+/// [`INSTALL_ENV_VAR`] (`CYRUP_SUBAGENTS`) opt-in, OR the presence of the tier-3 `config.json` at
+/// user scope (`<agent_dir>/subagents/config.json`, the file `crates/cyrup/src/subagent_config.rs`
+/// loads) OR project scope (`<cwd>/.cyrup/subagents/config.json`). NOT installed → a plain top-level
+/// session attaches NOTHING (zero overhead, default OFF). A spawned fanout child
+/// ([`RegistrationMode::ChildSafe`]) attaches REGARDLESS of this — exactly as intercom's
+/// child-orchestrator-metadata presence bypasses its own `is_installed` (its already-installed
+/// parent spawned it, so the child needs the restricted surface regardless).
+#[must_use]
+pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
+    if env_truthy(INSTALL_ENV_VAR) {
+        return true;
+    }
+    [
+        agent_dir.join(CONFIG_SUBDIR).join(CONFIG_FILE),
+        cwd.join(PROJECT_SUBDIR).join(CONFIG_SUBDIR).join(CONFIG_FILE),
+    ]
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Compose the child-mode gate ([`resolve_registration_mode`]) with the opt-in install signal
+/// (item 2 of the opt-in fix): a top-level [`RegistrationMode::Full`] survives ONLY when `installed`;
+/// a [`RegistrationMode::ChildSafe`] fanout child survives REGARDLESS (its already-installed parent
+/// spawned it — mirroring intercom's metadata-present bypass). Pure over its inputs so the composed
+/// gate is unit-testable without touching env or the filesystem.
+#[must_use]
+fn gate_on_install(mode: RegistrationMode, installed: bool) -> Option<RegistrationMode> {
+    match mode {
+        RegistrationMode::ChildSafe => Some(RegistrationMode::ChildSafe),
+        RegistrationMode::Full => installed.then_some(RegistrationMode::Full),
+    }
+}
+
 /// Build the subagent [`NativeExtension`] the `cyrup` binary should attach for the current process,
-/// or `None` when it must attach nothing (a plain subagent child) — the crate-side half of the T6
-/// child-mode gate `crates/cyrup/src/main.rs` calls at each of its three session-build sites. See
-/// [`subagent_extension_for`] for the pure, env-free form.
+/// or `None` when it must attach nothing — the crate-side half of the T6 child-mode gate composed
+/// with the opt-in install gate ([`is_installed`]), which `crates/cyrup/src/main.rs` calls at each of
+/// its three session-build sites. `None` is returned for a plain subagent child (registers nothing),
+/// and ALSO for a plain top-level session that has NOT opted in (default OFF). A fanout-authorized
+/// child attaches its restricted surface REGARDLESS of `is_installed`. See [`subagent_extension_for`]
+/// for the pure, env-free form.
 #[must_use]
 pub fn subagent_extension_for_env(
+    agent_dir: &Path,
     config: SubagentExtensionConfig,
     cwd: PathBuf,
 ) -> Option<Arc<dyn NativeExtension>> {
+    let installed = is_installed(agent_dir, &cwd);
     registration_mode_from_env()
+        .and_then(|mode| gate_on_install(mode, installed))
         .map(|mode| Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>)
 }
 
@@ -3652,36 +3718,44 @@ pub fn subagent_extension_for_env(
 /// this session, and falls back to [`subagent_extension_for_env`] when it is not.
 #[must_use]
 pub fn subagent_extension_for_env_with_channels(
+    agent_dir: &Path,
     config: SubagentExtensionConfig,
     cwd: PathBuf,
     delivery: Arc<dyn crate::tui::intercom::DeliveryChannel>,
     clarify: Arc<dyn crate::tui::intercom::ClarifyChannel>,
     steer: Arc<dyn crate::tui::intercom::SteerChannel>,
 ) -> Option<Arc<dyn NativeExtension>> {
-    registration_mode_from_env().map(|mode| match mode {
-        RegistrationMode::Full => {
-            Arc::new(SubagentsExtension::with_channels(config, cwd, delivery, clarify, steer))
-                as Arc<dyn NativeExtension>
-        }
-        RegistrationMode::ChildSafe => {
-            Arc::new(SubagentsExtension::with_mode(config, cwd, RegistrationMode::ChildSafe))
-                as Arc<dyn NativeExtension>
-        }
-    })
+    let installed = is_installed(agent_dir, &cwd);
+    registration_mode_from_env()
+        .and_then(|mode| gate_on_install(mode, installed))
+        .map(|mode| match mode {
+            RegistrationMode::Full => {
+                Arc::new(SubagentsExtension::with_channels(config, cwd, delivery, clarify, steer))
+                    as Arc<dyn NativeExtension>
+            }
+            RegistrationMode::ChildSafe => {
+                Arc::new(SubagentsExtension::with_mode(config, cwd, RegistrationMode::ChildSafe))
+                    as Arc<dyn NativeExtension>
+            }
+        })
 }
 
 /// The pure, env-free form of [`subagent_extension_for_env`]: resolve the [`RegistrationMode`] from
-/// the two explicit flags and build the extension (or `None` to register nothing). Kept separate so
-/// a test can assert the gate ("a plain child registers no subagent tool") deterministically without
-/// touching the process environment.
+/// the two explicit child flags, compose it with the explicit `installed` opt-in signal
+/// ([`gate_on_install`]), and build the extension (or `None` to register nothing). Kept separate so a
+/// test can assert the full gate deterministically without touching the process environment or the
+/// filesystem: a plain child registers nothing; a top-level session registers only when `installed`;
+/// a fanout-authorized child registers its restricted surface REGARDLESS of `installed`.
 #[must_use]
 pub fn subagent_extension_for(
     config: SubagentExtensionConfig,
     cwd: PathBuf,
     child: bool,
     fanout_authorized: bool,
+    installed: bool,
 ) -> Option<Arc<dyn NativeExtension>> {
     resolve_registration_mode(child, fanout_authorized)
+        .and_then(|mode| gate_on_install(mode, installed))
         .map(|mode| Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>)
 }
 
@@ -4918,14 +4992,16 @@ mod tests {
     async fn child_env_gate_controls_what_is_registered() {
         let cwd = std::env::temp_dir();
 
-        // Plain child → no extension → no `subagent` tool registered anywhere.
+        // Plain child → no extension → no `subagent` tool registered anywhere (regardless of the
+        // opt-in `installed` signal — a plain child is never gated on it).
         let disabled =
-            subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, false);
+            subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, false, true);
         assert!(disabled.is_none(), "a plain subagent child registers no subagent surface at all");
 
         // Fanout-authorized child → an extension whose init installs NO lifecycle subscriptions.
+        // `installed = false` proves the child-safe surface attaches REGARDLESS of the opt-in gate.
         let child_safe =
-            subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, true)
+            subagent_extension_for(SubagentExtensionConfig::default(), cwd.clone(), true, true, false)
                 .expect("a fanout-authorized child registers the restricted tool");
         let mut api = InitApi::new();
         child_safe.init(&mut api).await.expect("child-safe init succeeds");
@@ -4935,13 +5011,117 @@ mod tests {
         );
         assert!(!api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
 
-        // Non-child (root orchestrator) → the full lifecycle surface.
-        let full = subagent_extension_for(SubagentExtensionConfig::default(), cwd, false, false)
+        // Non-child (root orchestrator) that HAS opted in (`installed = true`) → the full lifecycle
+        // surface.
+        let full = subagent_extension_for(SubagentExtensionConfig::default(), cwd, false, false, true)
             .expect("a non-child process registers the full orchestrator extension");
         let mut api = InitApi::new();
         full.init(&mut api).await.expect("full init succeeds");
         assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionStart));
         assert!(api.subscriptions().contains(cyrup_ext::EventKind::SessionShutdown));
+    }
+
+    /// Opt-in gate, default OFF (mirrors `cyrup_permission_system` / `cyrup_intercom`): a plain
+    /// TOP-LEVEL (non-child) session with NO `CYRUP_SUBAGENTS` env and NO `subagents/config.json`
+    /// attaches NOTHING. Proven via the pure form with `installed = false` — deterministic, touching
+    /// neither the env nor the filesystem — which is exactly the value `is_installed` yields in the
+    /// no-opt-in state. (Requirement (a).)
+    #[test]
+    fn top_level_without_optin_attaches_nothing() {
+        let cwd = std::env::temp_dir();
+        let none = subagent_extension_for(
+            SubagentExtensionConfig::default(),
+            cwd,
+            /* child */ false,
+            /* fanout_authorized */ false,
+            /* installed */ false,
+        );
+        assert!(none.is_none(), "a top-level session that has not opted in attaches nothing");
+    }
+
+    /// The opt-in flip side (requirement (b)/(c) semantics via the pure form): once opted in
+    /// (`installed = true`, which both `CYRUP_SUBAGENTS=1` and a present `subagents/config.json` feed
+    /// through `is_installed`), a top-level session attaches the FULL orchestrator surface.
+    #[tokio::test]
+    async fn top_level_with_optin_attaches_full() {
+        let cwd = std::env::temp_dir();
+        let ext = subagent_extension_for(
+            SubagentExtensionConfig::default(),
+            cwd,
+            /* child */ false,
+            /* fanout_authorized */ false,
+            /* installed */ true,
+        )
+        .expect("an opted-in top-level session attaches the full orchestrator surface");
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.expect("full init succeeds");
+        assert!(
+            api.subscriptions().contains(cyrup_ext::EventKind::SessionStart),
+            "the full orchestrator surface installs the SessionStart housekeeping"
+        );
+    }
+
+    /// A fanout-authorized CHILD ([`RegistrationMode::ChildSafe`]) attaches its restricted surface
+    /// REGARDLESS of the opt-in signal: with `installed = false` (no env, no config) it STILL yields an
+    /// extension — mirroring intercom's child-orchestrator-metadata bypass of its own `is_installed`
+    /// (its already-installed parent spawned it). (Requirement (d).)
+    #[test]
+    fn fanout_child_attaches_regardless_of_optin() {
+        let cwd = std::env::temp_dir();
+        let ext = subagent_extension_for(
+            SubagentExtensionConfig::default(),
+            cwd,
+            /* child */ true,
+            /* fanout_authorized */ true,
+            /* installed */ false,
+        );
+        assert!(
+            ext.is_some(),
+            "a fanout-authorized child attaches its restricted surface regardless of is_installed"
+        );
+    }
+
+    /// `is_installed`'s two config-file signals (the env branch is exercised in the `tests/`
+    /// integration file, since this crate is `#![forbid(unsafe_code)]` and cannot mutate the process
+    /// env in a `src/` test): a tier-3 `<agent_dir>/subagents/config.json` at user scope, OR
+    /// `<cwd>/.cyrup/subagents/config.json` at project scope, each mark the extension installed; with
+    /// neither present (and no env), it is NOT installed.
+    #[test]
+    fn is_installed_reads_the_config_file_signals() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        // Neither file present, no `CYRUP_SUBAGENTS` in this process → not installed.
+        assert!(!is_installed(agent.path(), cwd.path()));
+
+        // User-scope tier-3 config present → installed.
+        let user_cfg = agent.path().join("subagents");
+        std::fs::create_dir_all(&user_cfg).expect("mkdir user subagents");
+        std::fs::write(user_cfg.join("config.json"), "{}").expect("write user config");
+        assert!(is_installed(agent.path(), cwd.path()));
+
+        // Project-scope config present (with a FRESH agent dir that has no user config) → installed.
+        let agent2 = tempfile::tempdir().expect("agent dir 2");
+        assert!(!is_installed(agent2.path(), cwd.path()), "sanity: agent2 has no user config yet");
+        let proj_cfg = cwd.path().join(".cyrup").join("subagents");
+        std::fs::create_dir_all(&proj_cfg).expect("mkdir project subagents");
+        std::fs::write(proj_cfg.join("config.json"), "{}").expect("write project config");
+        assert!(is_installed(agent2.path(), cwd.path()));
+    }
+
+    /// The composed install gate ([`gate_on_install`]) in isolation: a top-level `Full` survives ONLY
+    /// when installed; a `ChildSafe` fanout child survives REGARDLESS.
+    #[test]
+    fn gate_on_install_only_gates_full() {
+        assert_eq!(gate_on_install(RegistrationMode::Full, true), Some(RegistrationMode::Full));
+        assert_eq!(gate_on_install(RegistrationMode::Full, false), None);
+        assert_eq!(
+            gate_on_install(RegistrationMode::ChildSafe, true),
+            Some(RegistrationMode::ChildSafe)
+        );
+        assert_eq!(
+            gate_on_install(RegistrationMode::ChildSafe, false),
+            Some(RegistrationMode::ChildSafe)
+        );
     }
 
     /// T6 upfront agent-name validation for `/chain` (pi validates every named agent before starting

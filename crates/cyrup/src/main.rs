@@ -307,11 +307,14 @@ async fn run() -> anyhow::Result<i32> {
         let mut factory_builder = SessionFactory::new(provider, config)
             .settings_store(settings_store.clone())
             .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
-        // T6 child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`):
-        // attach the SubAgents extension only when this process is NOT a plain subagent child. A
-        // child re-execs with `CYRUP_SUBAGENT_CHILD=1`; a plain child registers nothing (returns
-        // `None` here), while a fanout-authorized child (`CYRUP_SUBAGENT_FANOUT_CHILD=1`) gets a
-        // restricted, mutation-blocked tool. `subagent_extension_for_env` encodes that decision.
+        // SubAgents opt-in gate (default OFF, mirrors the two sibling companions) composed with the T6
+        // child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`): a plain
+        // TOP-LEVEL session attaches the orchestrator surface ONLY when opted in (`is_installed`:
+        // `CYRUP_SUBAGENTS` truthy, or a `subagents/config.json` at user/project scope). A child
+        // re-execs with `CYRUP_SUBAGENT_CHILD=1`; a plain child registers nothing (returns `None`),
+        // while a fanout-authorized child (`CYRUP_SUBAGENT_FANOUT_CHILD=1`) gets a restricted,
+        // mutation-blocked tool REGARDLESS of `is_installed`. `subagent_extension_for_env` encodes
+        // that composed decision.
         // Intercom companion (spec/extensions/cyrup-intercom-port.md): the out-of-band supervisor
         // coordination bridge. Built FIRST (concrete) so its broker-backed delivery/clarify seam
         // channels can be handed to the SubAgents extension via `with_channels` (the port doc §8.4
@@ -322,12 +325,14 @@ async fn run() -> anyhow::Result<i32> {
             dirs.agent_dir.clone(),
             session_cwd.clone(),
         );
-        // T6 child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`):
-        // attach the SubAgents extension only when this process is NOT a plain subagent child. When
-        // intercom is attached this session, thread its real channels in (else keep the NoTransport/
-        // NoOp degrade defaults, R-SA-020).
+        // SubAgents opt-in gate composed with the T6 child-mode gate (see above): a plain top-level
+        // session attaches only when opted in (`is_installed`); a plain child registers nothing; a
+        // fanout-authorized child gets the restricted tool regardless. When intercom is attached this
+        // session, thread its real channels in (else keep the NoTransport/NoOp degrade defaults,
+        // R-SA-020).
         let subagent_ext = match &intercom_ext {
             Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                &dirs.agent_dir,
                 cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                 session_cwd.clone(),
                 ic.delivery_channel(),
@@ -335,6 +340,7 @@ async fn run() -> anyhow::Result<i32> {
                 ic.steer_channel(),
             ),
             None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                &dirs.agent_dir,
                 cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                 session_cwd.clone(),
             ),
@@ -413,11 +419,14 @@ async fn run() -> anyhow::Result<i32> {
                 dirs.agent_dir.clone(),
                 session_cwd.clone(),
             );
-            // T6 child-mode gate (see the interactive arm above): a plain subagent child registers
-            // nothing; a fanout-authorized child gets the restricted tool. Thread the intercom
-            // channels in when intercom is attached, else keep the NoTransport/NoOp degrade defaults.
+            // SubAgents opt-in gate + T6 child-mode gate (see the interactive arm above): a plain
+            // top-level session attaches only when opted in (`is_installed`); a plain subagent child
+            // registers nothing; a fanout-authorized child gets the restricted tool regardless. Thread
+            // the intercom channels in when intercom is attached, else keep the NoTransport/NoOp
+            // degrade defaults.
             let subagent_ext = match &intercom_ext {
                 Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                    &dirs.agent_dir,
                     cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                     session_cwd.clone(),
                     ic.delivery_channel(),
@@ -425,6 +434,7 @@ async fn run() -> anyhow::Result<i32> {
                     ic.steer_channel(),
                 ),
                 None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                    &dirs.agent_dir,
                     cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                     session_cwd.clone(),
                 ),
@@ -479,11 +489,14 @@ async fn run() -> anyhow::Result<i32> {
                 dirs.agent_dir.clone(),
                 session_cwd.clone(),
             );
-            // T6 child-mode gate (see the interactive arm above): a plain subagent child registers
-            // nothing; a fanout-authorized child gets the restricted tool. Thread the intercom
-            // channels in when intercom is attached, else keep the NoTransport/NoOp degrade defaults.
+            // SubAgents opt-in gate + T6 child-mode gate (see the interactive arm above): a plain
+            // top-level session attaches only when opted in (`is_installed`); a plain subagent child
+            // registers nothing; a fanout-authorized child gets the restricted tool regardless. Thread
+            // the intercom channels in when intercom is attached, else keep the NoTransport/NoOp
+            // degrade defaults.
             let subagent_ext = match &intercom_ext {
                 Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                    &dirs.agent_dir,
                     cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                     session_cwd.clone(),
                     ic.delivery_channel(),
@@ -491,6 +504,7 @@ async fn run() -> anyhow::Result<i32> {
                     ic.steer_channel(),
                 ),
                 None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                    &dirs.agent_dir,
                     cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
                     session_cwd.clone(),
                 ),
