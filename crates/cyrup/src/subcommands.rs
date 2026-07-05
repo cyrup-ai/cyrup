@@ -295,7 +295,12 @@ pub fn render_command_help(command: PackageCommand) -> String {
     const CFG: &str = ".cyrup";
     match command {
         PackageCommand::Install => format!(
-            "Usage:\n  {}\n\nInstall a package and add it to settings.\n\nOptions:\n  -l, --local       Install project-locally ({CFG}/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} install npm:@foo/bar\n  {APP} install git:github.com/user/repo\n  {APP} install git:git@github.com:user/repo\n  {APP} install https://github.com/user/repo\n  {APP} install ssh://git@github.com/user/repo\n  {APP} install ./local/path\n",
+            // The Pi `npm:@foo/bar` example is dropped here: `PackageSource::parse` hard-rejects the
+            // `npm:` channel in the Rust port (source.rs:79-81 — no JS runtime, R-09-021), so an
+            // `install npm:@foo/bar` is guaranteed to error. Advertising it in cyrup's OWN help would be
+            // dead-but-advertised (gap-analysis 13-cyrup §D). The remaining git/https/ssh/path examples
+            // mirror Pi's list (package-manager-cli.ts:104-110) minus that unsupported channel.
+            "Usage:\n  {}\n\nInstall a package and add it to settings.\n\nOptions:\n  -l, --local       Install project-locally ({CFG}/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} install git:github.com/user/repo\n  {APP} install git:git@github.com:user/repo\n  {APP} install https://github.com/user/repo\n  {APP} install ssh://git@github.com/user/repo\n  {APP} install ./local/path\n",
             usage(command)
         ),
         PackageCommand::Remove => format!(

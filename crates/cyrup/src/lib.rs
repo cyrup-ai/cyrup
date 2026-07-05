@@ -45,7 +45,7 @@ pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, r
 pub use session_resolve::{
     MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup, SessionRef,
     format_missing_session_cwd_prompt, match_session_arg, missing_session_cwd_error,
-    resolve_session_target,
+    resolve_session_target, session_cwd_is_missing,
 };
 pub use signals::spawn_abort_on_signal;
 pub use startup::{

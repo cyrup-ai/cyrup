@@ -99,6 +99,11 @@ async fn run() -> anyhow::Result<i32> {
     clap_argv.extend(clean_argv);
     let mut cli = Cli::parse_from(&clap_argv);
     cli.extension_flags = extension_flags;
+    // Trim each comma-split segment of `--models`/`--tools`/`--exclude-tools` and drop empty
+    // tool/exclude-tool names, matching Pi's post-split normalization (args.ts:114,120-129). clap's
+    // `value_delimiter = ','` splits but never trims, so `--tools "read, grep"` would otherwise keep
+    // `" grep"` and silently drop the tool. Run before any consumer reads these Vecs.
+    cli.normalize_list_flags();
     init_tracing(cli.verbose);
     timings.mark("parseArgs");
 
@@ -626,8 +631,35 @@ fn resolve_startup_ui(
         let sessions = gather_session_infos(dirs);
         match cyrup::run_resume_picker(&theme, &sessions, None)? {
             cyrup::ResumeChoice::Selected(path) => {
-                config.target = SessionTarget::Resume(path);
-                config.persist = !cli.no_session;
+                // Pi runs `getMissingSessionCwdIssue(sessionManager, cwd)` UNCONDITIONALLY after
+                // `createSessionManager` — which handles `--resume` by returning the opened manager
+                // (main.ts:321-332,573-585). So a `--resume`-selected session whose stored cwd is gone
+                // must still get the interactive Continue/Cancel prompt, exactly as the
+                // `--session`/`--session-id` open paths do via `resolve_session`. The picked session's
+                // stored cwd comes from its `SessionInfo` listing (Pi `sessionManager.getCwd()`).
+                let stored_cwd = sessions
+                    .iter()
+                    .find(|s| s.path == path)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_default();
+                if cyrup::session_cwd_is_missing(&stored_cwd) {
+                    let body =
+                        cyrup::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);
+                    match cyrup::run_missing_cwd_prompt(&theme, &body, &dirs.cwd)? {
+                        // Reopen the session against the current cwd (Pi `SessionManager.open(
+                        // sessionFile, sessionDir, selectedCwd)`, main.ts:580).
+                        cyrup::MissingCwdChoice::Continue => {
+                            config.target = SessionTarget::Resume(path);
+                            config.cwd_override = Some(dirs.cwd.clone());
+                            config.persist = !cli.no_session;
+                        }
+                        // Pi `if (!selectedCwd) process.exit(0)` (main.ts:577-578).
+                        cyrup::MissingCwdChoice::Cancel => return Ok(Some(0)),
+                    }
+                } else {
+                    config.target = SessionTarget::Resume(path);
+                    config.persist = !cli.no_session;
+                }
             }
             // Pi `console.log(chalk.dim("No session selected")); process.exit(0)` (main.ts:329).
             cyrup::ResumeChoice::Cancelled => {

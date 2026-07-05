@@ -2,8 +2,9 @@
 //!
 //! A 1:1 port of Pi `cli/file-processor.ts` + `cli/initial-message.ts`: `@`-prefixed positionals are
 //! file references. Each text file is wrapped `<file name="ABS">\n{content}\n</file>\n`
-//! (file-processor.ts:77); each image file is MIME-sniffed, downscaled to fit 2000×2000, attached as
-//! a base64 `Content::Image`, and referenced with an empty `<file name="ABS"></file>\n` tag
+//! (file-processor.ts:77); each image file is MIME-sniffed, downscaled to fit 2000×2000 AND re-encoded
+//! below the 4.5MB base64 cap (Pi `resizeImage`), attached as a base64 `Content::Image`, and
+//! referenced with an empty `<file name="ABS"></file>\n` tag
 //! (file-processor.ts:48-72). Empty files are skipped (file-processor.ts:43); a missing file is a
 //! hard error the bin maps to exit 1 (file-processor.ts:37). The initial message is
 //! `stdin ⧺ fileText ⧺ messages[0]` joined with `""` (initial-message.ts:27-40) — the file wrapper
@@ -196,31 +197,202 @@ fn supported_inline_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
-/// The `image` crate output format for a normalized MIME type.
-fn mime_to_format(mime: &str) -> image::ImageFormat {
-    match mime {
-        "image/jpeg" => image::ImageFormat::Jpeg,
-        "image/gif" => image::ImageFormat::Gif,
-        "image/webp" => image::ImageFormat::WebP,
-        _ => image::ImageFormat::Png,
+/// The 4.5MB base64-payload cap Pi enforces on inline images (Pi `DEFAULT_MAX_BYTES`,
+/// image-resize-core.ts:22): `4.5 · 1024 · 1024` bytes of base64, headroom below Anthropic's 5MB limit.
+const MAX_IMAGE_BASE64_BYTES: usize = 4_718_592;
+
+/// The JPEG quality ladder tried at each dimension step (Pi `qualitySteps`, image-resize-core.ts:122 —
+/// `Array.from(new Set([jpegQuality=80, 85, 70, 55, 40]))`).
+const JPEG_QUALITY_STEPS: [u8; 5] = [80, 85, 70, 55, 40];
+
+/// Why an image could not be inlined, mapping to Pi's two distinct `[Image omitted: …]` messages
+/// (image-process.ts:80-92): a normalization failure vs a resize-below-cap failure. The caller renders
+/// the matching placeholder into the `<file>` tag (Pi `processed.ok === false`, file-processor.ts).
+enum ImageOmit {
+    /// Pi `normalizeImage` returned null — an unsupported format that could not be converted to PNG.
+    Convert,
+    /// Pi `resizeImage` returned null — could not be re-encoded/downscaled below `maxBytes`.
+    Resize,
+}
+
+impl ImageOmit {
+    fn message(&self) -> &'static str {
+        match self {
+            ImageOmit::Convert => {
+                "[Image omitted: could not be converted to a supported inline image format.]"
+            }
+            ImageOmit::Resize => {
+                "[Image omitted: could not be resized below the inline image size limit.]"
+            }
+        }
     }
 }
 
-/// Process an image faithfully to Pi `processImage` (image-process.ts:71-118): KEEP the source MIME
-/// for the supported inline formats (PNG/JPEG/GIF/WebP) — converting only unsupported formats to PNG
-/// (with a `[Image converted from … to …]` hint) — and downscale to fit `MAX_IMAGE_EDGE`, emitting
-/// the `[Image: original WxH, displayed at WxH. Multiply coordinates by S …]` dimension note when a
-/// resize occurred (Pi `formatDimensionNote`, image-resize.ts:116). On any decode/encode failure
-/// returns `None` so the caller degrades to a text placeholder (Pi `processed.ok === false`).
-fn process_image(bytes: &[u8], detected_mime: &str) -> Option<ProcessedImage> {
-    // Normalize: keep the source format when supported inline, else convert to PNG.
+/// A settled resize result mirroring Pi `ResizedImage` (image-resize-core.ts:11-19): the base64 data,
+/// its (possibly format-switched) MIME, the original + displayed dimensions, and whether any re-encode
+/// or downscale occurred (drives `formatDimensionNote`).
+struct Resized {
+    data: String,
+    mime_type: String,
+    original_width: u32,
+    original_height: u32,
+    width: u32,
+    height: u32,
+    was_resized: bool,
+}
+
+/// The first base64-encoded candidate under the byte cap at a fixed dimension, tried in Pi's exact
+/// preference order (Pi `tryEncodings` candidate array, image-resize-core.ts:108-120): PNG first
+/// (lossless when it fits), then JPEG at each quality step. Returns `None` when nothing fits at these
+/// dimensions, so the caller shrinks and retries.
+fn first_candidate_under_cap(img: &image::DynamicImage) -> Option<(String, &'static str)> {
+    use image::ImageEncoder;
+
+    // PNG candidate (Pi `encodeCandidate(resized.get_bytes(), "image/png")`).
+    let mut png = Vec::new();
+    if img
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .is_ok()
+    {
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        if data.len() < MAX_IMAGE_BASE64_BYTES {
+            return Some((data, "image/png"));
+        }
+    }
+
+    // JPEG candidates at each quality step (Pi `resized.get_bytes_jpeg(quality)`); JPEG has no alpha
+    // channel, so flatten to RGB8 first (Photon's JPEG encoder likewise drops alpha).
+    let rgb = img.to_rgb8();
+    for quality in JPEG_QUALITY_STEPS {
+        let mut jpeg = Vec::new();
+        if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .is_ok()
+        {
+            let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+            if data.len() < MAX_IMAGE_BASE64_BYTES {
+                return Some((data, "image/jpeg"));
+            }
+        }
+    }
+    None
+}
+
+/// Resize an image to fit BOTH `MAX_IMAGE_EDGE` and the base64 byte cap — a 1:1 port of Pi
+/// `resizeImageInProcess` (image-resize-core.ts:59-164). If the input is already within the pixel
+/// bounds AND under the byte cap it is returned as-is (`was_resized = false`). Otherwise it is scaled
+/// to fit the pixel bounds and, at each dimension step, encoded PNG-first then JPEG down the quality
+/// ladder; the first candidate under the cap wins. When nothing fits, dimensions shrink by ×0.75 (min
+/// 1×1) and the ladder repeats. Returns `None` only when the image cannot be brought under the cap (Pi
+/// returns null → the caller emits the "could not be resized" placeholder).
+fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<Resized> {
+    // Pi `inputBase64Size = Math.ceil(inputBytes.byteLength / 3) * 4` (image-resize-core.ts:65).
+    let input_base64_size = input_bytes.len().div_ceil(3) * 4;
+
+    let decoded = image::load_from_memory(input_bytes).ok()?;
+    let original_width = decoded.width();
+    let original_height = decoded.height();
+
+    // Already within all limits (dimensions AND encoded size) → return untouched (Pi lines 83-93).
+    if original_width <= MAX_IMAGE_EDGE
+        && original_height <= MAX_IMAGE_EDGE
+        && input_base64_size < MAX_IMAGE_BASE64_BYTES
+    {
+        return Some(Resized {
+            data: base64::engine::general_purpose::STANDARD.encode(input_bytes),
+            mime_type: mime_type.to_string(),
+            original_width,
+            original_height,
+            width: original_width,
+            height: original_height,
+            was_resized: false,
+        });
+    }
+
+    // Initial target dimensions respecting the max edge, aspect-ratio-preserving (Pi lines 96-106,
+    // `Math.round`). `resize_exact` below then reproduces Photon's exact-size resize at each step.
+    let mut target_width = original_width;
+    let mut target_height = original_height;
+    if target_width > MAX_IMAGE_EDGE {
+        target_height =
+            ((target_height as f64 * MAX_IMAGE_EDGE as f64) / target_width as f64).round() as u32;
+        target_width = MAX_IMAGE_EDGE;
+    }
+    if target_height > MAX_IMAGE_EDGE {
+        target_width =
+            ((target_width as f64 * MAX_IMAGE_EDGE as f64) / target_height as f64).round() as u32;
+        target_height = MAX_IMAGE_EDGE;
+    }
+
+    let mut current_width = target_width.max(1);
+    let mut current_height = target_height.max(1);
+    loop {
+        let resized = decoded.resize_exact(
+            current_width,
+            current_height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        if let Some((data, mime)) = first_candidate_under_cap(&resized) {
+            return Some(Resized {
+                data,
+                mime_type: mime.to_string(),
+                original_width,
+                original_height,
+                width: current_width,
+                height: current_height,
+                was_resized: true,
+            });
+        }
+
+        if current_width == 1 && current_height == 1 {
+            break;
+        }
+        // Pi lines 146-153: shrink each axis by ×0.75 (floor, min 1); stop when neither axis moves.
+        let next_width = if current_width == 1 {
+            1
+        } else {
+            ((current_width as f64) * 0.75).floor().max(1.0) as u32
+        };
+        let next_height = if current_height == 1 {
+            1
+        } else {
+            ((current_height as f64) * 0.75).floor().max(1.0) as u32
+        };
+        if next_width == current_width && next_height == current_height {
+            break;
+        }
+        current_width = next_width;
+        current_height = next_height;
+    }
+    None
+}
+
+/// Process an image faithfully to Pi `processImage` (image-process.ts:71-118): first `normalizeImage`
+/// — KEEP the source MIME for the supported inline formats (PNG/JPEG/GIF/WebP), converting only
+/// unsupported formats to PNG — then `resizeImage`, the byte-cap re-encode ladder ([`resize_image`])
+/// that enforces the 4.5MB base64 limit AS WELL AS the 2000px edge. Emits the `[Image converted from …
+/// to …]` hint (compared against the FINAL re-encoded MIME, Pi image-process.ts:96) and the `[Image:
+/// original WxH, displayed at WxH. Multiply coordinates by S …]` dimension note when a resize occurred
+/// (Pi `formatDimensionNote`, image-resize.ts:116-123). Returns [`ImageOmit`] on failure so the caller
+/// emits Pi's matching placeholder (image-process.ts:80-92).
+fn process_image(bytes: &[u8], detected_mime: &str) -> Result<ProcessedImage, ImageOmit> {
+    // normalizeImage: keep the source format when supported inline, else convert to PNG.
     let (norm_mime, norm_bytes, converted_from): (String, Vec<u8>, Option<String>) =
         match supported_inline_mime(detected_mime) {
             Some(mime) => (mime.to_string(), bytes.to_vec(), None),
             None => {
-                let decoded = image::load_from_memory(bytes).ok()?;
+                // Pi `convertImageBytesToPng`; a decode/encode failure is the "could not be converted"
+                // omission (image-process.ts:79-83).
+                let decoded = image::load_from_memory(bytes).map_err(|_| ImageOmit::Convert)?;
                 let mut buf = std::io::Cursor::new(Vec::new());
-                decoded.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+                decoded
+                    .write_to(&mut buf, image::ImageFormat::Png)
+                    .map_err(|_| ImageOmit::Convert)?;
                 (
                     "image/png".to_string(),
                     buf.into_inner(),
@@ -236,42 +408,33 @@ fn process_image(bytes: &[u8], detected_mime: &str) -> Option<ProcessedImage> {
             }
         };
 
+    // resizeImage: the byte-cap re-encode ladder. `None` ⇒ the "could not be resized" omission.
+    let resized = resize_image(&norm_bytes, &norm_mime).ok_or(ImageOmit::Resize)?;
+
     let mut hints: Vec<String> = Vec::new();
+    // conversionHint(convertedFrom, resized.mimeType): compared against the FINAL MIME, so a BMP that
+    // converts to PNG but re-encodes to JPEG reads "converted from image/bmp to image/jpeg"
+    // (image-process.ts:67-69,96).
     if let Some(from) = converted_from.as_ref()
-        && from != &norm_mime
+        && from != &resized.mime_type
     {
-        hints.push(format!("[Image converted from {from} to {norm_mime}.]"));
-    }
-
-    let decoded = image::load_from_memory(&norm_bytes).ok()?;
-    let (ow, oh) = (decoded.width(), decoded.height());
-    if ow > MAX_IMAGE_EDGE || oh > MAX_IMAGE_EDGE {
-        let resized = decoded.resize(
-            MAX_IMAGE_EDGE,
-            MAX_IMAGE_EDGE,
-            image::imageops::FilterType::Lanczos3,
-        );
-        let (rw, rh) = (resized.width(), resized.height());
-        let mut buf = std::io::Cursor::new(Vec::new());
-        resized
-            .write_to(&mut buf, mime_to_format(&norm_mime))
-            .ok()?;
-        let scale = ow as f64 / rw.max(1) as f64;
         hints.push(format!(
-            "[Image: original {ow}x{oh}, displayed at {rw}x{rh}. Multiply coordinates by {scale:.2} to map to original image.]"
+            "[Image converted from {from} to {}.]",
+            resized.mime_type
         ));
-        let data = base64::engine::general_purpose::STANDARD.encode(buf.get_ref());
-        return Some(ProcessedImage {
-            data,
-            mime_type: norm_mime,
-            hints,
-        });
+    }
+    // formatDimensionNote (image-resize.ts:116-123): only when a resize/re-encode occurred.
+    if resized.was_resized {
+        let scale = resized.original_width as f64 / resized.width.max(1) as f64;
+        hints.push(format!(
+            "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {scale:.2} to map to original image.]",
+            resized.original_width, resized.original_height, resized.width, resized.height
+        ));
     }
 
-    let data = base64::engine::general_purpose::STANDARD.encode(&norm_bytes);
-    Some(ProcessedImage {
-        data,
-        mime_type: norm_mime,
+    Ok(ProcessedImage {
+        data: resized.data,
+        mime_type: resized.mime_type,
         hints,
     })
 }
@@ -296,7 +459,7 @@ async fn process_file_args(files: &[String], cwd: &Path) -> anyhow::Result<Proce
         let name = abs.display();
         match detect_image_mime(&bytes) {
             Some(mime) => match process_image(&bytes, mime) {
-                Some(processed) => {
+                Ok(processed) => {
                     out.images
                         .push(Content::Image { data: processed.data, mime_type: processed.mime_type });
                     // Reference the image with its processing hints (Pi file-processor.ts:67-72): the
@@ -311,9 +474,11 @@ async fn process_file_args(files: &[String], cwd: &Path) -> anyhow::Result<Proce
                     }
                 }
                 // Unprocessable image → text placeholder (Pi `processed.ok === false`,
-                // file-processor.ts:55-58).
-                None => out.text.push_str(&format!(
-                    "<file name=\"{name}\">[Image omitted: could not be converted to a supported inline image format.]</file>\n"
+                // file-processor.ts:55-58); the omission reason picks Pi's matching message
+                // (image-process.ts:80-92).
+                Err(reason) => out.text.push_str(&format!(
+                    "<file name=\"{name}\">{}</file>\n",
+                    reason.message()
                 )),
             },
             None => {

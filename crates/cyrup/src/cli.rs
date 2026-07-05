@@ -443,6 +443,28 @@ impl Cli {
         config.persist = !self.no_session && (explicit_session || mode == AppMode::Interactive);
         config
     }
+
+    /// Trim each comma-split segment of the delimited list flags, matching Pi's own post-split
+    /// normalization (`args.ts:114,120-129`). clap's `value_delimiter = ','` splits the value but never
+    /// trims, so a `--tools "read, grep"` would otherwise keep the leading-space `" grep"`, which then
+    /// fails the exact tool-name match and silently drops the tool. This must be called once on the
+    /// parsed CLI before any consumer reads these Vecs so every downstream site sees Pi-normalized names.
+    ///
+    /// The per-flag semantics are 1:1 with Pi:
+    /// - `--models` (`args.ts:115`): `.split(",").map((s) => s.trim())` — trim only, empties KEPT (Pi
+    ///   does not `.filter`; an empty pattern resolves to nothing, and keeping `[""]` for `--models ""`
+    ///   preserves Pi's non-empty `parsed.models` so the `--api-key`-requires-a-model gate matches).
+    /// - `--tools` / `--exclude-tools` (`args.ts:120-129`): `.split(",").map(trim).filter(len > 0)` —
+    ///   trim AND drop empty segments.
+    pub fn normalize_list_flags(&mut self) {
+        for pattern in &mut self.models {
+            *pattern = pattern.trim().to_string();
+        }
+        for list in [&mut self.tools, &mut self.exclude_tools] {
+            list.iter_mut().for_each(|name| *name = name.trim().to_string());
+            list.retain(|name| !name.is_empty());
+        }
+    }
 }
 
 /// Resolve a `--session`/`--session-id`/`--fork` reference (a path or a bare id) to a session file
@@ -1027,6 +1049,53 @@ mod tests {
             vec!["read".to_string(), "grep".to_string(), "find".to_string()]
         );
         assert_eq!(cli.exclude_tools, vec!["bash".to_string()]);
+    }
+
+    #[test]
+    fn list_flags_trim_each_comma_split_segment_and_drop_empties() {
+        // Pi `args.ts:120-129`: `--tools`/`--exclude-tools` split on ',' then trim + drop empties.
+        // clap's `value_delimiter = ','` splits but never trims, so `"read, grep"` arrives as
+        // `["read", " grep"]` — normalize_list_flags must trim the leading space so `grep` is kept
+        // (not silently dropped by the exact tool-name match) and drop the empty middle segment.
+        let mut cli = parse(&["--tools", "read, grep ,, find", "--exclude-tools", " bash , "]);
+        cli.normalize_list_flags();
+        assert_eq!(
+            cli.tools,
+            vec!["read".to_string(), "grep".to_string(), "find".to_string()],
+            "each tool trimmed; empty segments dropped"
+        );
+        assert_eq!(
+            cli.exclude_tools,
+            vec!["bash".to_string()],
+            "exclude-tools trimmed; trailing empty dropped"
+        );
+        // The trimmed lists must reach the SessionConfig the session consumes (the exact seam the bin
+        // threads via to_session_config): `grep` is enabled, not the silently-dropped `" grep"`.
+        let config = cli.to_session_config(&dirs(), AppMode::Print);
+        assert_eq!(
+            config.tools,
+            Some(vec![
+                "read".to_string(),
+                "grep".to_string(),
+                "find".to_string()
+            ])
+        );
+        assert_eq!(config.exclude_tools, vec!["bash".to_string()]);
+
+        // `--models` (`args.ts:115`): trim only, empties KEPT (Pi does not `.filter`).
+        let mut m = parse(&["--models", " claude-sonnet , gpt-4o:low "]);
+        m.normalize_list_flags();
+        assert_eq!(
+            m.models,
+            vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()]
+        );
+        let mut empty = parse(&["--models", ""]);
+        empty.normalize_list_flags();
+        assert_eq!(
+            empty.models,
+            vec![String::new()],
+            "an empty --models value stays a single empty pattern, matching Pi's unfiltered split"
+        );
     }
 
     #[test]

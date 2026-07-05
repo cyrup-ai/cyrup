@@ -30,6 +30,11 @@ pub async fn run_print_dispatch<W: Write>(
 }
 
 /// JSON dispatch: run the initial prompt then each follow-up, streaming every event as JSONL to `out`.
+///
+/// JSON mode ALWAYS returns exit 0 (Pi `print-mode.ts:34,129-148`): `exitCode` inits to `0` and is
+/// mutated only inside the `if (mode === "text")` branch, so a failed/aborted final turn NEVER changes
+/// the JSON-mode exit code — a consumer scripting `cyrup --mode json … ; echo $?` relies on the
+/// always-0 convention. (The terminal stop reason is still observable in the streamed event records.)
 pub async fn run_json_dispatch<W: Write>(
     session: &AgentSession,
     inputs: &Inputs,
@@ -39,7 +44,7 @@ pub async fn run_json_dispatch<W: Write>(
     for follow_up in &inputs.follow_ups {
         run_json(session, cli_input(follow_up), out).await?;
     }
-    Ok(exit_code(session).await)
+    Ok(0)
 }
 
 /// RPC dispatch: serve the persistent stdio line protocol over `reader`/`writer` (R-11-011…016).

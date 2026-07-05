@@ -75,14 +75,18 @@ async fn print_dispatch_replays_follow_ups_in_order() {
         .await
         .unwrap();
 
+    // PRINT mode emits ONLY the final transcript message (Pi print-mode.ts:129-146; cyrup commit
+    // a2c1bf5). The faux provider answers turns in script order, so the printed final is the
+    // follow-up's response ("second answer") — proving the follow-up (q2) was replayed AFTER the
+    // initial (q1) consumed "first answer" (R-11-009). The initial turn's text is NOT printed.
     let printed = String::from_utf8(out).unwrap();
-    let first = printed.find("first answer").expect("first answer printed");
-    let second = printed
-        .find("second answer")
-        .expect("second answer printed");
     assert!(
-        first < second,
-        "follow-up replayed after the initial run (R-11-009)"
+        printed.contains("second answer"),
+        "the follow-up's response is the final printed message, got: {printed:?}"
+    );
+    assert!(
+        !printed.contains("first answer"),
+        "only the final message is printed; the initial turn's text is suppressed, got: {printed:?}"
     );
 }
 
@@ -114,10 +118,18 @@ async fn json_dispatch_emits_ordered_event_stream() {
         })
         .collect();
 
+    // JSON mode writes `sessionManager.getHeader()` as JSONL line 1 before the event stream (Pi
+    // print-mode.ts:112-117; cyrup commit cbbde87), so the stream opens with the `session` header,
+    // then `agent_start`, and closes with `agent_end`.
     assert_eq!(
         kinds.first().map(String::as_str),
+        Some("session"),
+        "stream opens with the session header line"
+    );
+    assert_eq!(
+        kinds.get(1).map(String::as_str),
         Some("agent_start"),
-        "stream opens with agent_start"
+        "the first event after the header is agent_start"
     );
     assert_eq!(
         kinds.last().map(String::as_str),
@@ -125,6 +137,43 @@ async fn json_dispatch_emits_ordered_event_stream() {
         "stream closes with agent_end"
     );
     assert_eq!(code, 0);
+}
+
+/// JSON mode ALWAYS returns exit 0, even when the final turn errored/aborted (Pi print-mode.ts:34,
+/// 129-148: `exitCode` inits to 0 and is mutated only inside `if (mode === "text")`, so JSON never
+/// leaves 0). The contrast below shows the SAME failed turn in PRINT/text mode DOES surface exit 1 —
+/// so the divergence is JSON-mode-specific, not a session-wide change.
+#[tokio::test]
+async fn json_dispatch_always_exits_zero_even_on_failed_turn() {
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("boom")],
+        StopReason::Error,
+    )])
+    .await;
+
+    let mut out: Vec<u8> = Vec::new();
+    let code = run_json_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "JSON mode always returns 0 regardless of the terminal stop reason (Pi convention)"
+    );
+
+    // Contrast: the identical failed turn in PRINT/text mode surfaces exit 1 (print-mode.ts:135-137).
+    let (session2, _cwd2, _agent2) = session_with(vec![faux_assistant_message(
+        vec![faux_text("boom")],
+        StopReason::Error,
+    )])
+    .await;
+    let mut sink: Vec<u8> = Vec::new();
+    let text_code = run_print_dispatch(&session2, &text("hi", &[]), &mut sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        text_code, 1,
+        "PRINT/text mode DOES surface a failed final turn as exit 1"
+    );
 }
 
 /// `--session-id <fresh>` builds via the new `SessionTarget::CreateWithId` arm (Pi
