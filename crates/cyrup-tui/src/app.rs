@@ -458,6 +458,15 @@ pub struct App<B: Backend> {
     /// The current inline-viewport height (the live region's content height). Recomputed each
     /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
     viewport_height: u16,
+    /// Grow-only high-water mark for the live-region height WHILE a turn is active (streaming or a
+    /// live `!` bash block). During a turn the viewport pins at this floor and stops tracking
+    /// per-tool content churn, so the terminal is reconstructed (`resize_viewport` → `reanchor_inline`)
+    /// only on GENUINE geometry changes (terminal resize, editor multi-line growth, selector/overlay/
+    /// band) and the two idle↔active transitions per turn — never per completed tool. That stable
+    /// height is what lets ratatui cell-diff the message churn inside a fixed viewport with no full
+    /// repaint, eliminating the per-tool-call FLICKER. Reset to `0` the instant the turn goes idle so
+    /// the region collapses back to the compact editor/footer (the void-fix is preserved).
+    live_floor: u16,
 }
 
 impl<B: Backend> App<B> {
@@ -476,7 +485,7 @@ impl<B: Backend> App<B> {
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
         // `Terminal` is top-anchored at the backend's initial cursor; the rebuild fixes the anchor).
-        Ok(App { terminal, state, viewport_height: 0 })
+        Ok(App { terminal, state, viewport_height: 0, live_floor: 0 })
     }
 
     /// Immutable state access.
@@ -663,6 +672,9 @@ impl<B: Backend> App<B> {
         self.state.status.set_streaming(false);
         self.state.status.set_queued(0);
         self.state.indicator.idle();
+        // The new session starts idle, so drop the prior turn's grow-only height floor; the next
+        // `draw` collapses the viewport to the compact idle region (void-fix).
+        self.live_floor = 0;
         let msg = self.state.pending_swap_status.take().unwrap_or_else(|| "session replaced".into());
         self.state.transcript.push_status(msg);
     }
@@ -681,7 +693,24 @@ impl<B: Backend> App<B> {
         let size = self.terminal.backend().size().ok();
         let term_h = size.map(|s| s.height).unwrap_or(self.viewport_height).max(1);
         let term_w = size.map(|s| s.width).unwrap_or(80);
-        let desired = live_region_height(&self.state, term_w, term_h);
+        let raw = live_region_height(&self.state, term_w, term_h);
+        // Grow-only hysteresis GATED on the turn being active. `status.streaming` is set on
+        // `AgentStart` and cleared on `AgentEnd`, so it spans the WHOLE multi-step turn including the
+        // gaps between tools (it is NOT `transcript.has_active()`, which flickers false between tools
+        // and would re-trigger per-tool reconstruction); `has_bash()` covers a live `!`/`!!` run.
+        // While active, the viewport pins at its high-water (capped to the terminal height so a
+        // resize-shrink still reduces it) and stops tracking per-tool content churn — so
+        // `resize_viewport`/`reanchor_inline` fire only on genuine geometry changes, killing the
+        // per-tool FLICKER. Idle: drop the floor and size to the live content so the region collapses
+        // to the compact editor/footer (void-fix).
+        let turn_active = self.state.status.streaming || self.state.transcript.has_bash();
+        let desired = if turn_active {
+            self.live_floor = self.live_floor.max(raw).min(term_h);
+            self.live_floor
+        } else {
+            self.live_floor = 0;
+            raw
+        };
         if desired != self.viewport_height {
             self.resize_viewport(desired)?;
             self.viewport_height = desired;
@@ -2229,6 +2258,14 @@ impl<B: Backend> App<B> {
                     *is_error,
                     tool_result_text(result),
                 );
+                // Progressively flush finished tools to native scrollback mid-turn so the inline
+                // viewport holds only the running tail, not the whole turn's tool stack (the
+                // SCREEN-FILL disaster). The finished tool leaves `active_tools` here; the
+                // draw-after-every-event (`flush_committed` → `insert_before`) lands it above the
+                // viewport on the very next frame, and `terminal.draw` renders the tail without it —
+                // an atomic handoff, no duplicate/flash. Mirrors Pi's completed `tool-execution.ts`
+                // components scrolling up into native history as the turn proceeds.
+                self.state.transcript.commit_finished_leading_tools();
             }
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
                 self.state.status.set_queued(steering.len().saturating_add(follow_up.len()));
@@ -3516,6 +3553,59 @@ mod clipboard_paste_tests {
         assert!(
             outgoing.images.is_empty(),
             "outgoing user message must carry no image content block"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod live_floor_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// The FLICKER fix's height logic (a unit guard — the definitive check is the pty drive): while a
+    /// turn is active the live-region height uses a grow-only floor so it does NOT track per-tool
+    /// content churn (which is what forced a `resize_viewport`/`reanchor_inline` reconstruction — the
+    /// flicker source — on essentially every tool event). The instant the turn goes idle the floor
+    /// resets so the region collapses back to the compact editor/footer (void-fix).
+    #[test]
+    fn live_floor_grows_then_holds_during_a_turn_and_resets_when_idle() {
+        let mut app = App::new(TestBackend::new(80, 30), UiTheme::dark()).unwrap();
+        app.status_mut().set_model("anthropic/claude-opus-4-8");
+        app.draw().unwrap();
+        let idle = app.viewport_height();
+
+        // Turn goes active (AgentStart sets `status.streaming`); a burst of finished tools grows the
+        // live tail before it is committed.
+        app.status_mut().set_streaming(true);
+        for i in 0..8u32 {
+            let name = format!("read_{i}");
+            app.transcript_mut().push_tool_start(name.clone(), Some(format!("file_{i}.md")));
+            app.transcript_mut().push_tool_end(name, false, Some(format!("body {i}")));
+        }
+        app.draw().unwrap();
+        let grown = app.viewport_height();
+        assert!(grown > idle, "viewport should grow for the live tool tail ({grown} vs idle {idle})");
+
+        // The finished tools commit to native scrollback mid-turn (SCREEN-FILL fix): the live content
+        // collapses, but the floor HOLDS the viewport height so no reconstruction is triggered.
+        app.transcript_mut().commit_finished_leading_tools();
+        assert_eq!(app.state().transcript.active_tools().len(), 0, "finished tools left the tail");
+        app.draw().unwrap();
+        assert_eq!(
+            app.viewport_height(),
+            grown,
+            "grow-only floor must hold the height across the mid-turn commit (no per-tool reconstruct)"
+        );
+
+        // Turn goes idle (AgentEnd clears `status.streaming`): the floor resets and the region
+        // collapses back to the compact idle height (void-fix preserved).
+        app.status_mut().set_streaming(false);
+        app.draw().unwrap();
+        assert_eq!(
+            app.viewport_height(),
+            idle,
+            "idle viewport must collapse back to the compact region after the turn"
         );
     }
 }
