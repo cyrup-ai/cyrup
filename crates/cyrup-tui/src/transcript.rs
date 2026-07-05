@@ -18,23 +18,30 @@
 
 use cyrup_core::Content;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
+use serde_json::Value;
 
 use crate::bash::BashExecution;
 use crate::component::Component;
 use crate::theme::UiTheme;
 
 /// A committed transcript entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is intentionally omitted: [`ToolRun`] carries the raw `serde_json::Value` call args / result
+/// (so each tool can render its Pi-specific `renderCall`/`renderResult`), and `Value` is `PartialEq`
+/// but not `Eq` (floats). Nothing in the crate needs a total `Eq` on entries.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// A user submission.
     User(String),
     /// A finalized assistant message.
     Assistant(String),
-    /// A finished tool execution (`tool-execution.ts`): name + an optional one-line argument summary
-    /// + an optional result body (rendered as a unified diff when it looks like one) + error flag.
+    /// A finished tool execution (`tool-execution.ts`): the tool name + the raw call args + the raw
+    /// result value + error flag. Each built-in dispatches to its Pi-specific rich render
+    /// (`core/tools/{read,write,edit,bash,grep,find,ls}.ts` `renderCall`/`renderResult`).
     Tool(ToolRun),
     /// A status / notification line (model change, compaction, queue, …).
     Status(String),
@@ -60,20 +67,31 @@ pub enum Entry {
 }
 
 /// One tool execution, shown live in the viewport while it runs (`tool-execution.ts` pending box) and
-/// committed to scrollback when the turn ends. `expanded` rendering shows the full result body; the
-/// collapsed form shows only the marker line + a truncated preview (`Ctrl+O` toggles, `app.tools.expand`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// committed to scrollback when the turn ends. The block is tinted by execution state
+/// (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`), and each built-in renders its own Pi-specific
+/// `renderCall` header + `renderResult` body. `expanded` (`Ctrl+O`, `app.tools.expand`) shows the full
+/// result; the collapsed form shows each tool's preview (bash tail-5, grep head-15, find/ls head-20, a
+/// hidden read/write body, …).
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolRun {
     /// Tool name (`read`, `bash`, `edit`, …).
     pub name: String,
-    /// A one-line argument summary (e.g. a file path or command), if derivable.
-    pub args_summary: Option<String>,
-    /// The result/output body (multi-line allowed). `None` while still running.
-    pub result: Option<String>,
+    /// The raw tool-call arguments (`renderCall(args)`) — the path/command/pattern/offset/limit/…
+    /// each tool's header is built from. `Value::Null` when a start was missed.
+    pub args: Value,
+    /// The raw tool result (`{content, details, terminate}`; `renderResult(result)`) — carries the
+    /// per-tool `details` (edit `diff`, bash/read/grep/find/ls `truncation`, …). `None` while running.
+    pub result: Option<Value>,
     /// Whether the tool failed.
     pub is_error: bool,
-    /// Whether the execution has finished (drives the `⚙ …`-running vs `✓/✗`-done marker).
+    /// Whether the execution has finished (drives the pending→success/error background tint).
     pub done: bool,
+    /// Wall-clock start of the run, set on [`TranscriptView::push_tool_start`] — the basis for the
+    /// bash `Took …` duration line (`formatDuration`, bash.ts:197/284-288).
+    started_at: Option<std::time::Instant>,
+    /// Frozen run duration in milliseconds, set on [`TranscriptView::push_tool_end`]. Rendered as the
+    /// bash `Took {d}s` footer once the command finishes.
+    duration_ms: Option<u64>,
 }
 
 /// The scrolling conversation history.
@@ -258,19 +276,23 @@ impl TranscriptView {
         self.streaming = None;
     }
 
-    /// Record a tool starting (live in the viewport): name + optional one-line argument summary.
-    pub fn push_tool_start(&mut self, name: impl Into<String>, args_summary: Option<String>) {
+    /// Record a tool starting (live in the viewport): name + the raw call args (`ToolExecutionStart`).
+    /// The args drive the per-tool `renderCall` header (path/command/pattern/range/…).
+    pub fn push_tool_start(&mut self, name: impl Into<String>, args: Value) {
         self.active_tools.push(ToolRun {
             name: name.into(),
-            args_summary,
+            args,
             result: None,
             is_error: false,
             done: false,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
         });
     }
 
-    /// Update the latest still-running tool's partial result (`ToolExecutionUpdate`).
-    pub fn push_tool_update(&mut self, partial: Option<String>) {
+    /// Update the latest still-running tool's partial result (`ToolExecutionUpdate`): the raw partial
+    /// result value, rendered by the tool's `renderResult` with `isPartial = true`.
+    pub fn push_tool_update(&mut self, partial: Option<Value>) {
         if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done)
             && partial.is_some()
         {
@@ -278,26 +300,25 @@ impl TranscriptView {
         }
     }
 
-    /// Record a tool finishing: attach the result/error to the matching live run (the latest run with
-    /// that name still running, else a fresh done entry so a missed start never drops the result).
-    pub fn push_tool_end(
-        &mut self,
-        name: impl Into<String>,
-        is_error: bool,
-        result: Option<String>,
-    ) {
+    /// Record a tool finishing: attach the raw result/error to the matching live run (the latest run
+    /// with that name still running, else a fresh done entry so a missed start never drops the result).
+    /// Freezes the run duration for the bash `Took …` footer.
+    pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
         let name = name.into();
         if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name) {
             run.done = true;
             run.is_error = is_error;
             run.result = result;
+            run.duration_ms = run.started_at.map(|s| s.elapsed().as_millis() as u64);
         } else {
             self.active_tools.push(ToolRun {
                 name,
-                args_summary: None,
+                args: Value::Null,
                 result,
                 is_error,
                 done: true,
+                started_at: None,
+                duration_ms: None,
             });
         }
     }
@@ -448,105 +469,618 @@ impl TranscriptView {
     }
 }
 
-/// Render one tool execution into styled lines (`tool-execution.ts`): a marker line
-/// (`⚙ name(args)…` running · `✓ name(args)` ok · `✗ name(args)` error) plus, when there is a result,
-/// either the full body (`expanded`) or a one-line preview (collapsed). A result that looks like a
-/// unified diff is rendered via [`crate::diff::render_diff`] (`renderResult` diff path, `diff.ts`).
+/// Pi's default read/write byte + line truncation limits (`truncate.ts:11-12`).
+const DEFAULT_MAX_BYTES: u64 = 50 * 1024;
+/// The `app.tools.expand` key label used in every `… to expand` hint. Pi renders the live keybinding
+/// (`keyHint`); cyrup's transcript has no keymap handle, so it uses the immutable default (Ctrl+O), the
+/// same literal the existing bash/tool hints use.
+const EXPAND_KEY: &str = "ctrl+o";
+
+/// Render one tool execution into styled lines by dispatching on the tool name to its Pi-specific
+/// `renderCall`/`renderResult` (`tool-execution.ts` composes each built-in's renderers, not a generic
+/// one-liner): edit → a self-diff (`edit.ts:390`), bash → an output tail + truncation + `Took …`
+/// (`bash.ts:440`), read → a line-range header + a hidden-until-expanded body (`read.ts:329/339`),
+/// write → a content preview (`write.ts:227`), grep/find/ls → a match/entry list with limit notices
+/// (`grep.ts:370`, `find.ts:359`, `ls.ts:210`). The whole block is tinted by execution state
+/// (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`, tool-execution.ts:253-258) — the bg is the state
+/// affordance (Pi has no gear/check glyph), preceded by an untinted blank (the component's `Spacer(1)`,
+/// tool-execution.ts:63).
 pub(crate) fn tool_lines(
     run: &ToolRun,
     expanded: bool,
     width: usize,
     theme: &UiTheme,
 ) -> Vec<Line<'static>> {
-    let header_fg = if run.is_error {
-        theme.error_style()
-    } else if run.done {
-        theme.success_style()
-    } else {
-        theme.dim_style()
-    };
-    // The whole block is tinted by execution state (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`,
-    // tool-execution.ts:253-258, spec/tui/06 §5.1) — the bg is the affordance, not a box (audit #7).
-    let header_style = theme.tool_bg_style(header_fg, run.done, run.is_error);
-    let body_style = theme.tool_bg_style(theme.muted_style(), run.done, run.is_error);
-    let hint_style = theme.tool_bg_style(theme.dim_style(), run.done, run.is_error);
-    let mark = if !run.done {
-        "⚙"
-    } else if run.is_error {
-        "✗"
-    } else {
-        "✓"
-    };
-    let mut head = match &run.args_summary {
-        Some(args) => format!("  {mark} {}({args})", run.name),
-        None => format!("  {mark} {}", run.name),
-    };
-    if !run.done {
-        head.push('…');
+    let mut block: Vec<Line<'static>> = Vec::new();
+    match run.name.as_str() {
+        "read" => render_read(run, expanded, theme, &mut block),
+        "write" => render_write(run, expanded, theme, &mut block),
+        "edit" => render_edit(run, theme, &mut block),
+        "bash" => render_bash(run, expanded, theme, &mut block),
+        "grep" => render_grep(run, expanded, theme, &mut block),
+        "find" => render_find(run, expanded, theme, &mut block),
+        "ls" => render_ls(run, expanded, theme, &mut block),
+        _ => render_generic(run, theme, &mut block),
     }
-    let mut out = vec![Line::styled(pad_to(head, width), header_style)];
-    if let Some(result) = run.result.as_deref().filter(|r| !r.trim().is_empty()) {
-        if looks_like_diff(result) {
-            // Diffs always render in full (the change set is the point), 2-space indented.
-            for mut line in crate::diff::render_diff(result, theme) {
-                line.spans.insert(0, Span::styled("    ".to_string(), body_style));
-                out.push(line);
-            }
-        } else {
-            // The dominant agent surface is the spec block (spec/tui/06 §5.4), NOT a head-1 one-liner
-            // (audit #7): collapsed shows the **tail** of the last `TOOL_PREVIEW_LINES` logical lines
-            // (`bash-execution.ts:19`), expanded shows all; a `… N more lines (ctrl+o)` hint counts the
-            // hidden head.
-            let all: Vec<&str> = result.split('\n').collect();
-            let total = all.len();
-            let shown = if expanded { total } else { total.min(TOOL_PREVIEW_LINES) };
-            let hidden = total.saturating_sub(shown);
-            if hidden > 0 {
-                out.push(Line::styled(
-                    pad_to(format!("    … {hidden} more lines (ctrl+o)"), width),
-                    hint_style,
-                ));
-            }
-            for raw in all.into_iter().skip(hidden) {
-                out.push(Line::styled(pad_to(format!("    {raw}"), width), body_style));
-            }
-        }
-    }
+    // The block is state-tinted (bg-only); a leading untinted blank stands in for the component Spacer.
+    let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
+    let mut out = vec![Line::default()];
+    out.extend(finalize_block(block, width, bg));
     out
 }
 
-/// Collapsed tool/bash result preview length — the tail of this many logical lines
-/// (`bash-execution.ts:19`; the tool path mirrors it, spec/tui/06 §5.4).
-pub(crate) const TOOL_PREVIEW_LINES: usize = 20;
+/// Apply the shared tool-block chrome to each already-fg-styled line: a 1-column left inset (Pi's
+/// `Box(1, 1)` padding, tool-execution.ts:68) + a right-pad to `width` so the state tint fills the full
+/// content width (`applyBackgroundToLine`, markdown.ts:216), then patch the state background on.
+fn finalize_block(mut lines: Vec<Line<'static>>, width: usize, bg: Style) -> Vec<Line<'static>> {
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw(" "));
+        let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if len < width {
+            line.spans.push(Span::raw(" ".repeat(width - len)));
+        }
+        line.style = line.style.patch(bg);
+    }
+    lines
+}
 
-/// Right-pad `s` with spaces to `width` columns so a background tint fills the full content width
-/// (`applyBackgroundToLine`, markdown.ts:216). Char-based; CJK visible-width is a tracked residual.
-fn pad_to(s: String, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
-        s
-    } else {
-        format!("{s}{:pad$}", "", pad = width - len)
+// --- per-tool renderers ------------------------------------------------------------------------
+//
+// Each pushes fg-styled logical lines into `out`; `tool_lines` adds the leading spacer + state tint.
+
+/// `read` — header `read <path>:<range>` + (only when expanded/error) the file body (`read.ts:74-201`).
+fn render_read(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let mut spans = vec![Span::styled("read ", theme.tool_title_style())];
+    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+    if let Some(range) = read_line_range(&run.args) {
+        spans.push(Span::styled(range, theme.warning_style()));
+    }
+    out.push(Line::from(spans));
+    // `formatReadResult`: nothing below the header when collapsed & not an error (read.ts:173-175).
+    let Some(result) = &run.result else { return };
+    if !expanded && !run.is_error {
+        return;
+    }
+    let output = result_text(result);
+    let all = trim_trailing_empty(output.split('\n').collect());
+    let total = all.len();
+    let shown = if expanded { total } else { total.min(10) };
+    out.push(Line::default());
+    for l in all.iter().take(shown) {
+        out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+    }
+    let remaining = total.saturating_sub(shown);
+    if remaining > 0 {
+        out.push(more_lines_hint(remaining, None, theme));
+    }
+    push_read_truncation(result, theme, out);
+}
+
+/// `write` — header `write <path>` + a content preview from the call args (`write.ts:131-179`).
+fn render_write(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let mut spans = vec![Span::styled("write ", theme.tool_title_style())];
+    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+    out.push(Line::from(spans));
+    match str_arg(&run.args, &["content"]) {
+        StrArg::Invalid => {
+            out.push(Line::default());
+            out.push(Line::styled(
+                "[invalid content arg - expected string]".to_string(),
+                theme.error_style(),
+            ));
+        }
+        StrArg::Missing => {}
+        StrArg::Value(content) => {
+            let display = content.replace('\r', "");
+            let all = trim_trailing_empty(display.split('\n').collect());
+            let total = all.len();
+            let shown = if expanded { total } else { total.min(10) };
+            out.push(Line::default());
+            for l in all.iter().take(shown) {
+                out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+            }
+            let remaining = total.saturating_sub(shown);
+            if remaining > 0 {
+                out.push(more_lines_hint(remaining, Some(total), theme));
+            }
+        }
+    }
+    // `formatWriteResult` shows output only on error (write.ts:164-179).
+    if run.is_error && let Some(result) = &run.result {
+        push_error_body(result, theme, out);
     }
 }
 
-/// Heuristic: does `text` look like a pre-formatted unified diff (a majority of non-empty lines start
-/// with `+`/`-`/space followed by a line-number column)? Mirrors the edit-tool `renderResult` diff
-/// detection (`diff.ts` operates on exactly this shape).
-fn looks_like_diff(text: &str) -> bool {
-    let mut diffish = 0usize;
-    let mut total = 0usize;
-    for line in text.split('\n').filter(|l| !l.trim().is_empty()) {
-        total += 1;
-        let mut chars = line.chars();
-        if let Some(c) = chars.next()
-            && matches!(c, '+' | '-')
-            && chars.next().map(|n| n == ' ' || n.is_ascii_digit()).unwrap_or(false)
-        {
-            diffish += 1;
+/// `edit` — header `edit <path>` + the result self-diff (`edit.ts:200-227/363-431`, rendered via
+/// [`crate::diff::render_diff`], the port of `diff.ts`).
+fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let mut spans = vec![Span::styled("edit ", theme.tool_title_style())];
+    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+    out.push(Line::from(spans));
+    let Some(result) = &run.result else { return };
+    if run.is_error {
+        push_error_body(result, theme, out);
+        return;
+    }
+    if let Some(diff) = result
+        .get("details")
+        .and_then(|d| d.get("diff"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(Line::default());
+        out.extend(crate::diff::render_diff(diff, theme));
+    }
+}
+
+/// `bash` — header `$ <command> (timeout Ns)` + the output tail (collapsed = last 5 visual lines) +
+/// truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
+fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    // Header: `$ command`, bold, + a muted ` (timeout Ns)` suffix (`formatBashCall`).
+    let title = theme.tool_title_style();
+    let mut spans = Vec::new();
+    match str_arg(&run.args, &["command"]) {
+        StrArg::Invalid => {
+            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style()));
+        }
+        StrArg::Missing => {
+            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled("...".to_string(), theme.tool_output_style()));
+        }
+        StrArg::Value(cmd) => spans.push(Span::styled(format!("$ {cmd}"), title)),
+    }
+    if let Some(t) = run.args.get("timeout").and_then(Value::as_f64).filter(|t| *t != 0.0) {
+        // `${timeout}s` (bash.ts:204): JS renders an integer number without a trailing `.0`.
+        let disp = if t.fract() == 0.0 { format!("{}", t as i64) } else { format!("{t}") };
+        spans.push(Span::styled(format!(" (timeout {disp}s)"), theme.muted_style()));
+    }
+    out.push(Line::from(spans));
+
+    if let Some(result) = &run.result {
+        let raw = result_text(result);
+        let output = strip_bash_footer(raw.trim(), result, run.done);
+        if !output.is_empty() {
+            out.push(Line::default());
+            let all: Vec<&str> = output.split('\n').collect();
+            let total = all.len();
+            if expanded {
+                for l in &all {
+                    out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+                }
+            } else {
+                let shown = total.min(5);
+                let skipped = total - shown;
+                if skipped > 0 {
+                    out.push(Line::styled(
+                        format!("... ({skipped} earlier lines, {EXPAND_KEY} to expand)"),
+                        theme.muted_style(),
+                    ));
+                }
+                for l in all.iter().skip(skipped) {
+                    out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+                }
+            }
+        }
+        push_bash_warnings(result, theme, out);
+        if let Some(ms) = run.duration_ms {
+            out.push(Line::styled(
+                format!("Took {}", format_duration(ms)),
+                theme.muted_style(),
+            ));
         }
     }
-    total > 0 && diffish * 2 >= total
+}
+
+/// `grep` — header `grep /<pattern>/ in <path> (glob) limit N` + matching lines (head-15) + a
+/// `[Truncated: …]` notice (`grep.ts:68-121/370-379`).
+fn render_grep(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let title = theme.tool_title_style();
+    let outp = theme.tool_output_style();
+    let mut spans = vec![Span::styled("grep ".to_string(), title)];
+    match str_arg(&run.args, &["pattern"]) {
+        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Missing => spans.push(Span::styled("//".to_string(), theme.accent_style())),
+        StrArg::Value(p) => spans.push(Span::styled(format!("/{p}/"), theme.accent_style())),
+    }
+    spans.push(Span::styled(" in ".to_string(), outp));
+    push_search_path(&run.args, theme, &mut spans);
+    if let StrArg::Value(glob) = str_arg(&run.args, &["glob"]) {
+        spans.push(Span::styled(format!(" ({glob})"), outp));
+    }
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
+        spans.push(Span::styled(format!(" limit {limit}"), outp));
+    }
+    out.push(Line::from(spans));
+    push_list_output(run, expanded, 15, theme, out);
+    push_grep_warnings(run.result.as_ref(), theme, out);
+}
+
+/// `find` — header `find <pattern> in <path> (limit N)` + matching paths (head-20) + a `[Truncated: …]`
+/// notice (`find.ts:59-107/359-368`).
+fn render_find(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let title = theme.tool_title_style();
+    let outp = theme.tool_output_style();
+    let mut spans = vec![Span::styled("find ".to_string(), title)];
+    match str_arg(&run.args, &["pattern"]) {
+        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Missing => {}
+        StrArg::Value(p) => spans.push(Span::styled(p, theme.accent_style())),
+    }
+    spans.push(Span::styled(" in ".to_string(), outp));
+    push_search_path(&run.args, theme, &mut spans);
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
+        spans.push(Span::styled(format!(" (limit {limit})"), outp));
+    }
+    out.push(Line::from(spans));
+    push_list_output(run, expanded, 20, theme, out);
+    push_find_warnings(run.result.as_ref(), theme, out);
+}
+
+/// `ls` — header `ls <path> (limit N)` + entries (head-20) + a `[Truncated: …]` notice
+/// (`ls.ts:52-93/210-219`).
+fn render_ls(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let mut spans = vec![Span::styled("ls ".to_string(), theme.tool_title_style())];
+    spans.push(tool_path_span(&run.args, &["path"], Some("."), theme));
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
+        spans.push(Span::styled(format!(" (limit {limit})"), theme.tool_output_style()));
+    }
+    out.push(Line::from(spans));
+    push_list_output(run, expanded, 20, theme, out);
+    push_ls_warnings(run.result.as_ref(), theme, out);
+}
+
+/// Non-built-in tools fall back to Pi's `formatToolExecution` (tool-execution.ts:365-376): the bold
+/// tool name + pretty-printed args + any text output.
+fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
+    if !run.args.is_null()
+        && let Ok(pretty) = serde_json::to_string_pretty(&run.args)
+    {
+        out.push(Line::default());
+        for l in pretty.split('\n') {
+            out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+        }
+    }
+    if let Some(result) = &run.result {
+        let output = result_text(result);
+        if !output.trim().is_empty() {
+            for l in output.split('\n') {
+                out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+            }
+        }
+    }
+}
+
+// --- per-tool render helpers -------------------------------------------------------------------
+
+/// A coalesced string argument (`args.file_path ?? args.path`, then Pi's `str()`): a present non-string
+/// → [`StrArg::Invalid`] (`[invalid arg]`), absent/null/`""` → [`StrArg::Missing`], else the string.
+enum StrArg {
+    Invalid,
+    Missing,
+    Value(String),
+}
+
+/// `args[key0] ?? args[key1] ?? …` then `str()` (render-utils.ts:25-29): skip absent/JSON-null keys, a
+/// non-string value is `Invalid`, an empty string is `Missing`.
+fn str_arg(args: &Value, keys: &[&str]) -> StrArg {
+    for k in keys {
+        match args.get(k) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(s)) => {
+                return if s.is_empty() { StrArg::Missing } else { StrArg::Value(s.clone()) };
+            }
+            Some(_) => return StrArg::Invalid,
+        }
+    }
+    StrArg::Missing
+}
+
+/// `renderToolPath` (render-utils.ts:75-85): `[invalid arg]` for a non-string, the `emptyFallback`
+/// (else `...`) for an empty/absent path, otherwise the `~`-shortened path in accent. Hyperlinks are a
+/// terminal escape the cell grid does not carry (tracked residual).
+fn tool_path_span(
+    args: &Value,
+    keys: &[&str],
+    empty_fallback: Option<&str>,
+    theme: &UiTheme,
+) -> Span<'static> {
+    match str_arg(args, keys) {
+        StrArg::Invalid => Span::styled("[invalid arg]".to_string(), theme.error_style()),
+        StrArg::Missing => match empty_fallback {
+            Some(f) => Span::styled(shorten_path(f), theme.accent_style()),
+            None => Span::styled("...".to_string(), theme.tool_output_style()),
+        },
+        StrArg::Value(p) => Span::styled(shorten_path(&p), theme.accent_style()),
+    }
+}
+
+/// The `" in <path>"` tail shared by grep/find (`path = shortenPath(rawPath || ".")` in `toolOutput`, a
+/// non-string → `[invalid arg]`). The caller has already pushed the `" in "` label span.
+fn push_search_path(args: &Value, theme: &UiTheme, spans: &mut Vec<Span<'static>>) {
+    match str_arg(args, &["path"]) {
+        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Missing => {
+            spans.push(Span::styled(shorten_path("."), theme.tool_output_style()));
+        }
+        StrArg::Value(p) => spans.push(Span::styled(shorten_path(&p), theme.tool_output_style())),
+    }
+}
+
+/// `formatReadLineRange` (read.ts:67-72): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+fn read_line_range(args: &Value) -> Option<String> {
+    let offset = args.get("offset").and_then(Value::as_i64);
+    let limit = args.get("limit").and_then(Value::as_i64);
+    if offset.is_none() && limit.is_none() {
+        return None;
+    }
+    let start = offset.unwrap_or(1);
+    Some(match limit {
+        Some(l) => format!(":{start}-{}", start + l - 1),
+        None => format!(":{start}"),
+    })
+}
+
+/// A `... (N more lines[, M total], ctrl+o to expand)` hint (read/write/grep/find/ls collapsed tail).
+fn more_lines_hint(remaining: usize, total: Option<usize>, theme: &UiTheme) -> Line<'static> {
+    let text = match total {
+        Some(t) => format!("... ({remaining} more lines, {t} total, {EXPAND_KEY} to expand)"),
+        None => format!("... ({remaining} more lines, {EXPAND_KEY} to expand)"),
+    };
+    Line::styled(text, theme.muted_style())
+}
+
+/// Shared head-N list body for grep/find/ls (`\n` + first N output lines + a `… more` hint).
+fn push_list_output(
+    run: &ToolRun,
+    expanded: bool,
+    head: usize,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
+    let Some(result) = &run.result else { return };
+    let output = result_text(result);
+    let output = output.trim();
+    if output.is_empty() {
+        return;
+    }
+    let all: Vec<&str> = output.split('\n').collect();
+    let total = all.len();
+    let shown = if expanded { total } else { total.min(head) };
+    out.push(Line::default());
+    for l in all.iter().take(shown) {
+        out.push(Line::styled((*l).to_string(), theme.tool_output_style()));
+    }
+    let remaining = total.saturating_sub(shown);
+    if remaining > 0 {
+        out.push(more_lines_hint(remaining, None, theme));
+    }
+}
+
+/// Push an error body (`\n` + the result text in the error color): edit/write on failure.
+fn push_error_body(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let text = result_text(result);
+    if text.trim().is_empty() {
+        return;
+    }
+    out.push(Line::default());
+    for l in text.split('\n') {
+        out.push(Line::styled(l.to_string(), theme.error_style()));
+    }
+}
+
+/// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-64): join the `text`
+/// blocks of `{content:[…]}` (an `image` block → `[image]`), else a `text`/`output`/`stdout`/`message`
+/// string field, else a bare string/array. Carriage returns are stripped.
+fn result_text(result: &Value) -> String {
+    match result {
+        Value::String(s) => s.replace('\r', ""),
+        Value::Object(o) => {
+            if let Some(content) = o.get("content") {
+                return content_blocks_text(content);
+            }
+            for k in ["text", "output", "stdout", "message"] {
+                if let Some(Value::String(s)) = o.get(k) {
+                    return s.replace('\r', "");
+                }
+            }
+            String::new()
+        }
+        Value::Array(_) => content_blocks_text(result),
+        _ => String::new(),
+    }
+}
+
+/// Join a `content` block array into text (`text` blocks concatenated with `\n`; `image` → `[image]`).
+fn content_blocks_text(content: &Value) -> String {
+    match content {
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for it in items {
+                if let Some(obj) = it.as_object() {
+                    let ty = obj.get("type").and_then(Value::as_str);
+                    if matches!(ty, Some("text") | None)
+                        && let Some(Value::String(t)) = obj.get("text")
+                    {
+                        parts.push(t.replace('\r', ""));
+                        continue;
+                    }
+                    if ty == Some("image") {
+                        parts.push("[image]".to_string());
+                    }
+                } else if let Some(s) = it.as_str() {
+                    parts.push(s.replace('\r', ""));
+                }
+            }
+            parts.join("\n")
+        }
+        Value::String(s) => s.replace('\r', ""),
+        _ => String::new(),
+    }
+}
+
+/// Drop trailing empty lines (`trimTrailingEmptyLines`, read.ts:79-85 / write.ts:123-129).
+fn trim_trailing_empty(mut lines: Vec<&str>) -> Vec<&str> {
+    while lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+}
+
+/// The truncation object from `result.details.truncation` when `truncated` is set.
+fn truncation(result: &Value) -> Option<&Value> {
+    let t = result.get("details")?.get("truncation")?;
+    (t.get("truncated") == Some(&Value::Bool(true))).then_some(t)
+}
+
+fn tnum(t: &Value, key: &str) -> u64 {
+    t.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// `formatSize` (truncate.ts:61-69): `B` / `KB` / `MB`.
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// `formatDuration` (bash.ts:197-199): `{s}.{tenths}s`.
+fn format_duration(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+/// read `renderResult` truncation footer (read.ts:190-199).
+fn push_read_truncation(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let Some(t) = truncation(result) else { return };
+    let max_bytes = t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES);
+    let msg = if t.get("firstLineExceedsLimit") == Some(&Value::Bool(true)) {
+        format!("[First line exceeds {} limit]", format_size(max_bytes))
+    } else if t.get("truncatedBy").and_then(Value::as_str) == Some("lines") {
+        format!(
+            "[Truncated: showing {} of {} lines ({} line limit)]",
+            tnum(t, "outputLines"),
+            tnum(t, "totalLines"),
+            tnum(t, "maxLines"),
+        )
+    } else {
+        format!("[Truncated: {} lines shown ({} limit)]", tnum(t, "outputLines"), format_size(max_bytes))
+    };
+    out.push(Line::styled(msg, theme.warning_style()));
+}
+
+/// Strip the `\n\n[Showing lines … Full output: <path>]` footer bash bakes into the text but re-renders
+/// as a warning (bash.ts:226-231): only when finished + truncated + a `fullOutputPath` is present.
+fn strip_bash_footer(output: &str, result: &Value, done: bool) -> String {
+    let full = result.get("details").and_then(|d| d.get("fullOutputPath")).and_then(Value::as_str);
+    if done
+        && truncation(result).is_some()
+        && let Some(path) = full
+        && output.ends_with(']')
+        && let Some(idx) = output.rfind("\n\n[")
+        && output[idx..].contains(path)
+    {
+        return output[..idx].trim_end().to_string();
+    }
+    output.to_string()
+}
+
+/// bash `renderResult` truncation + full-output warnings (bash.ts:267-282).
+fn push_bash_warnings(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let full = result.get("details").and_then(|d| d.get("fullOutputPath")).and_then(Value::as_str);
+    let trunc = truncation(result);
+    if trunc.is_none() && full.is_none() {
+        return;
+    }
+    let mut warns = Vec::new();
+    if let Some(p) = full {
+        warns.push(format!("Full output: {p}"));
+    }
+    if let Some(t) = trunc {
+        if t.get("truncatedBy").and_then(Value::as_str) == Some("lines") {
+            warns.push(format!("Truncated: showing {} of {} lines", tnum(t, "outputLines"), tnum(t, "totalLines")));
+        } else {
+            let max_bytes = t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES);
+            warns.push(format!("Truncated: {} lines shown ({} limit)", tnum(t, "outputLines"), format_size(max_bytes)));
+        }
+    }
+    out.push(Line::styled(format!("[{}]", warns.join(". ")), theme.warning_style()));
+}
+
+/// grep `renderResult` warnings (grep.ts:110-119).
+fn push_grep_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let Some(result) = result else { return };
+    let details = result.get("details");
+    let match_limit = details.and_then(|d| d.get("matchLimitReached")).and_then(Value::as_u64);
+    let lines_trunc = details.and_then(|d| d.get("linesTruncated")) == Some(&Value::Bool(true));
+    let trunc = truncation(result);
+    if match_limit.is_none() && trunc.is_none() && !lines_trunc {
+        return;
+    }
+    let mut warns = Vec::new();
+    if let Some(n) = match_limit {
+        warns.push(format!("{n} matches limit"));
+    }
+    if let Some(t) = trunc {
+        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+    }
+    if lines_trunc {
+        warns.push("some lines truncated".to_string());
+    }
+    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+}
+
+/// find `renderResult` warnings (find.ts:98-105).
+fn push_find_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let Some(result) = result else { return };
+    let result_limit =
+        result.get("details").and_then(|d| d.get("resultLimitReached")).and_then(Value::as_u64);
+    let trunc = truncation(result);
+    if result_limit.is_none() && trunc.is_none() {
+        return;
+    }
+    let mut warns = Vec::new();
+    if let Some(n) = result_limit {
+        warns.push(format!("{n} results limit"));
+    }
+    if let Some(t) = trunc {
+        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+    }
+    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+}
+
+/// ls `renderResult` warnings (ls.ts:84-91).
+fn push_ls_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    let Some(result) = result else { return };
+    let entry_limit =
+        result.get("details").and_then(|d| d.get("entryLimitReached")).and_then(Value::as_u64);
+    let trunc = truncation(result);
+    if entry_limit.is_none() && trunc.is_none() {
+        return;
+    }
+    let mut warns = Vec::new();
+    if let Some(n) = entry_limit {
+        warns.push(format!("{n} entries limit"));
+    }
+    if let Some(t) = trunc {
+        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+    }
+    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+}
+
+/// `shortenPath` (render-utils.ts:10-17): replace a leading `$HOME` with `~`.
+fn shorten_path(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
 }
 
 /// The number of WRAPPED display rows `lines` occupy at `width`, using the **same** word-wrap
@@ -852,8 +1386,12 @@ mod progressive_commit_tests {
             // Simulate 20 finished tool calls arriving one at a time (the reported storm).
             for i in 0..20u32 {
                 let name = format!("read_{i}");
-                view.push_tool_start(name.clone(), Some(format!("file_{i}.md")));
-                view.push_tool_end(name, false, Some(format!("body of file {i}\nsecond line\nthird")));
+                view.push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+                view.push_tool_end(
+                    name,
+                    false,
+                    Some(format!("body of file {i}\nsecond line\nthird").into()),
+                );
                 // The app drains finished-leading tools after every ToolExecutionEnd.
                 view.commit_finished_leading_tools();
             }
@@ -874,9 +1412,9 @@ mod progressive_commit_tests {
     #[test]
     fn only_leading_finished_run_commits_running_tool_blocks() {
         let mut view = TranscriptView::new();
-        view.push_tool_start("a", None); // will stay running
-        view.push_tool_start("b", None);
-        view.push_tool_start("c", None);
+        view.push_tool_start("a", Value::Null); // will stay running
+        view.push_tool_start("b", Value::Null);
+        view.push_tool_start("c", Value::Null);
         // `b` finishes first, but `a` is still running ahead of it.
         view.push_tool_end("b", false, Some("b-result".into()));
         view.commit_finished_leading_tools();
@@ -897,7 +1435,7 @@ mod progressive_commit_tests {
     fn streaming_partial_blocks_tool_commit() {
         let mut view = TranscriptView::new();
         view.push_assistant_delta("thinking about the next step");
-        view.push_tool_start("read", None);
+        view.push_tool_start("read", Value::Null);
         view.push_tool_end("read", false, Some("result".into()));
         view.commit_finished_leading_tools();
         assert!(view.pending().is_empty(), "tool must not commit while assistant text is streaming");

@@ -439,6 +439,25 @@ impl UiTheme {
         self.with_bg(self.dim_style(), "customMessageBg")
     }
 
+    /// Tool-call title (the `read`/`edit`/`$`/`grep …` headers) — Pi `toolTitle` (= `text`, the base
+    /// foreground) rendered bold (`theme.fg("toolTitle", theme.bold(...))`, dark.json:44).
+    pub fn tool_title_style(&self) -> Style {
+        let mut s = Style::default().add_modifier(Modifier::BOLD);
+        if let Some(fg) = self.foreground {
+            s = s.fg(fg);
+        }
+        s
+    }
+
+    /// Tool output body — Pi `toolOutput` (= `gray`/`mediumGray`, dark.json:45). Prefers an explicit
+    /// `toolOutput` role, else falls back to the muted (gray) role.
+    pub fn tool_output_style(&self) -> Style {
+        match self.roles.get("toolOutput").copied() {
+            Some(c) => Style::default().fg(c),
+            None => self.muted_style(),
+        }
+    }
+
     /// Tool-execution block fill keyed by state (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`,
     /// tool-execution.ts:253-258, spec/tui/06 §5.1). `base` carries the foreground role; the bg is the
     /// state tint when the theme defines it.

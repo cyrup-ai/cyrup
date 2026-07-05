@@ -2247,16 +2247,21 @@ impl<B: Backend> App<B> {
                 self.ingest_stream_event(assistant_message_event);
             }
             AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
-                self.state.transcript.push_tool_start(tool_name.clone(), tool_args_summary(args));
+                // Hand the raw call args to the transcript so each built-in renders its Pi-specific
+                // `renderCall` header (path+range / `$ command` / `/pattern/` / …), not a generic
+                // one-liner (transcript.rs `tool_lines` dispatch).
+                self.state.transcript.push_tool_start(tool_name.clone(), args.clone());
             }
             AgentSessionEvent::ToolExecutionUpdate { partial_result, .. } => {
-                self.state.transcript.push_tool_update(tool_result_text(partial_result));
+                self.state.transcript.push_tool_update(Some(partial_result.clone()));
             }
             AgentSessionEvent::ToolExecutionEnd { tool_name, is_error, result, .. } => {
+                // The full `{content, details, terminate}` result flows through so `renderResult` can
+                // reach each tool's `details` (edit `diff`, bash/read truncation, …).
                 self.state.transcript.push_tool_end(
                     tool_name.clone(),
                     *is_error,
-                    tool_result_text(result),
+                    Some(result.clone()),
                 );
                 // Progressively flush finished tools to native scrollback mid-turn so the inline
                 // viewport holds only the running tail, not the whole turn's tool stack (the
@@ -2402,50 +2407,6 @@ impl<B: Backend> App<B> {
 /// Flatten a styled [`Line`] into its plain text (concatenated span content).
 fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
-}
-
-/// Derive a one-line argument summary for a tool call from its JSON args (`renderCall` summary,
-/// `tool-execution.ts`). Prefers the conventional positional keys (`file_path`/`path`/`command`/
-/// `pattern`/`url`/`query`); falls back to the first string value, else a compact JSON of scalars.
-fn tool_args_summary(args: &serde_json::Value) -> Option<String> {
-    let obj = args.as_object()?;
-    for key in ["file_path", "path", "command", "pattern", "url", "query", "prompt", "name"] {
-        if let Some(v) = obj.get(key).and_then(|v| v.as_str())
-            && !v.is_empty()
-        {
-            return Some(truncate_summary(v));
-        }
-    }
-    // First string-valued field, else nothing (avoid dumping nested objects).
-    obj.values()
-        .find_map(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(truncate_summary)
-}
-
-/// Extract human-readable text from a tool result JSON value (`getTextOutput`,
-/// `core/tools/render-utils.ts`): a string is used verbatim; an object's `text`/`output`/`content`
-/// string field is preferred; an array of `{text}` blocks is joined; otherwise `None`.
-fn tool_result_text(result: &serde_json::Value) -> Option<String> {
-    fn from_value(v: &serde_json::Value) -> Option<String> {
-        match v {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => {
-                for key in ["text", "output", "stdout", "content", "message"] {
-                    if let Some(s) = o.get(key).and_then(|x| x.as_str()) {
-                        return Some(s.to_string());
-                    }
-                }
-                None
-            }
-            serde_json::Value::Array(items) => {
-                let joined: Vec<String> = items.iter().filter_map(from_value).collect();
-                (!joined.is_empty()).then(|| joined.join("\n"))
-            }
-            _ => None,
-        }
-    }
-    from_value(result).filter(|s| !s.trim().is_empty())
 }
 
 /// Copy `text` to the system clipboard best-effort via the platform CLI (`pbcopy` on macOS, `xclip`/
@@ -3580,8 +3541,13 @@ mod live_floor_tests {
         app.status_mut().set_streaming(true);
         for i in 0..8u32 {
             let name = format!("read_{i}");
-            app.transcript_mut().push_tool_start(name.clone(), Some(format!("file_{i}.md")));
-            app.transcript_mut().push_tool_end(name, false, Some(format!("body {i}")));
+            app.transcript_mut()
+                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_end(
+                name,
+                false,
+                Some(serde_json::json!({ "content": [{ "type": "text", "text": format!("body {i}") }] })),
+            );
         }
         app.draw().unwrap();
         let grown = app.viewport_height();

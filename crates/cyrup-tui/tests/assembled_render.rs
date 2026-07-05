@@ -182,10 +182,12 @@ fn assembled_live_tool_block_shows_spec_block_with_state_bg_tint() {
     let mut app = App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap();
     app.status_mut().set_model("anthropic/claude-opus-4-8");
     app.transcript_mut().push_assistant_delta("running a tool");
-    app.transcript_mut().push_tool_start("read", Some("src/auth.rs".to_string()));
+    app.transcript_mut().push_tool_start("read", serde_json::json!({ "path": "src/auth.rs" }));
     app.draw().unwrap();
     let live = live_text(&app);
-    assert!(live.contains("⚙ read(src/auth.rs)"), "tool call header missing:\n{live}");
+    // Per-tool `renderCall`: `read <path>` (read.ts:74-77) — Pi has no gear/`read(...)` marker; the
+    // running affordance is the pending background tint asserted below.
+    assert!(live.contains("read src/auth.rs"), "tool call header missing:\n{live}");
     // Dark `toolPendingBg` = #282832 must reach real cells (the bg is the affordance, audit #6).
     assert!(
         has_bg(&app, ratatui::style::Color::Rgb(0x28, 0x28, 0x32)),
