@@ -11,6 +11,17 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Builds the real-broker-participant test-double binary (`cyrup-intercom-child-fixture`) used by this
+# crate's `tests/child_bridge_activation.rs` production-activation proof: unlike the scripted-NDJSON
+# `cyrup-subagent-fixture` (which only proves the spawn overlay DELIVERS the child-bridge env), that
+# binary actually READS the env via the production `read_child_orchestrator_metadata()` gate,
+# registers on the broker under its deterministic label, and completes a `contact_supervisor` round
+# trip. Never enabled for the real `cyrup` binary or any non-test build — the `[[bin]]` target below
+# is gated on `required-features` so it is not even compiled, let alone shipped, unless a caller
+# (this crate's own `cargo test --features test-fixtures`) explicitly opts in.
+test-fixtures = []
+
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
@@ -36,6 +47,17 @@ unicode-width = "0.2"
 # `tracing` is not (yet) a workspace-table dep; cyrup-ext-subagents pins it directly at the same
 # version — matched here rather than introducing a new workspace-wide version surface.
 tracing = "0.1.44"
+
+[[bin]]
+# The real-broker-participant test-double `cyrup`-child stand-in (the claim-6 production-activation
+# proof): reads its child-orchestrator metadata from the process env via the production
+# `read_child_orchestrator_metadata()` gate, registers on the broker under its deterministic label,
+# sends a `contact_supervisor`-shaped ask to its supervisor, and echoes the reply as final output.
+# Never built for, or shipped inside, the real `cyrup` binary — same `required-features` gating as
+# `cyrup-ext-subagents`'s `cyrup-subagent-fixture`.
+name = "cyrup-intercom-child-fixture"
+path = "src/bin/cyrup_intercom_child_fixture.rs"
+required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

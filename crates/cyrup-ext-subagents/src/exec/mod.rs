@@ -543,10 +543,14 @@ pub struct SingleResult {
     pub structured_output: Option<serde_json::Value>,
     pub acceptance: Option<AcceptanceLedger>,
     /// R-SA-037: an intercom-style blocking detach signal was observed — bypasses acceptance,
-    /// completion-guard, and output truncation entirely. Always `false` in every build of this
-    /// crate today: see [`crate::exec::fallback::AttemptSignal::detached`]'s doc comment for the
-    /// full, current explanation of why no live trigger for this exists yet and exactly what
-    /// future work (the R-SA-119/120 intercom wiring) would set it.
+    /// completion-guard, and output truncation entirely. Set from a REAL blocking-detach signal (the
+    /// R-SA-119/120 intercom wiring is now CLOSED): a child's blocking `contact_supervisor` ask on its
+    /// NDJSON stdout is detected by [`drive_attempt`], surfaced via [`crate::tui::intercom::spawn_clarify`]
+    /// against the executor's `AskLock` (backed in production by the intercom companion's real broker
+    /// `ClarifyChannel` threaded through [`RunOptions::clarify`]), and carried onto this flag — see
+    /// [`crate::exec::fallback::AttemptSignal::detached`]'s doc comment for the full wiring trace. When
+    /// no intercom channel is wired (headless / `RunOptions::clarify = None`) the drive loop still marks
+    /// the attempt detached but the `AskLock` degrades to its no-live-channel fallback.
     pub detached: bool,
     /// A soft interrupt was observed (`RunOptions.interrupt` fired) — like a timeout, this
     /// terminates the fallback ladder outright without advancing, but is recorded under its own
