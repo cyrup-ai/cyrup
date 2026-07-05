@@ -164,9 +164,24 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         "the _input.md artifact must contain the task the child was given; got: {input_body:?}"
     );
 
-    // The scratch dir (`.cyrup-subagent-scratch`) is transient and must be cleaned up after the run.
+    // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes under `.cyrup-subagent-scratch`
+    // is this run's persisted, observable child record and survives the orchestrator — exactly as
+    // it does on every other spawn path in this crate (the tool single/parallel/chain fan-outs and
+    // the background hop-2 runner all leave it in place; it is the observation channel
+    // `tool_parallel_chain_integration`/`companions_wiring_proof` read back). It is NOT swept by the
+    // foreground orchestrator: mirroring pi, which never deletes its persisted child NDJSON stream
+    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`pi-args.ts:233-236`
+    // `cleanupTempDir`, `execution.ts:677`) that lives outside the working tree.
+    let tee = std::fs::read_to_string(
+        work_dir
+            .path()
+            .join(".cyrup-subagent-scratch")
+            .join("attempt-0.jsonl"),
+    )
+    .unwrap_or_default();
     assert!(
-        !work_dir.path().join(".cyrup-subagent-scratch").exists(),
-        "the per-run spawn scratch dir must not be left behind in the working directory"
+        !tee.is_empty(),
+        "the per-attempt raw-stdout tee is this run's persisted child record and must survive the \
+         foreground orchestrator (it must not be swept away with the scratch dir)"
     );
 }

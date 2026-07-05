@@ -85,8 +85,12 @@ fn write_fixture_chain(
     name: &str,
     steps: &[cyrup_ext_subagents::discovery::types::ChainStepConfig],
 ) {
-    let dir = cwd.join(".cyrup").join("agents");
-    std::fs::create_dir_all(&dir).expect("mkdir .cyrup/agents");
+    // Saved chains live in the SEPARATE `.cyrup/chains` dir (pi `getUserChainDir`/
+    // `resolveNearestProjectChainDirs` = `<configDir>/chains`, NEVER the agents dir), which is what
+    // `resolve_project_chain_read_dirs` (`.cyrup/chains`) scans — writing to `.cyrup/agents` here
+    // meant `/run-chain` discovery never found the chain.
+    let dir = cwd.join(".cyrup").join("chains");
+    std::fs::create_dir_all(&dir).expect("mkdir .cyrup/chains");
     let payload = serde_json::json!({
         "name": name,
         "description": "a trivial fixture chain for /run-chain dispatch tests",

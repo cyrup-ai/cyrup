@@ -844,13 +844,21 @@ impl SubagentExecutor {
 
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
 
-        // T6: drop the transient, project-local `.cyrup-subagent-scratch` dir `run_sync` creates for
-        // this run (`@<tempfile>` task-text overflow, R-SA-047, + the per-attempt NDJSON tee,
-        // R-SA-058). pi keeps no such project-local scratch dir — its child event stream is captured
-        // in the swept artifacts `.jsonl` above, which supersedes the scratch tee here. Cleaned at the
-        // orchestrator (`run_foreground`) rather than inside `run_sync` itself so the low-level
-        // `run_sync`-direct tests that inspect the tee (R-SA-058) keep observing it. Best-effort.
-        let _ = std::fs::remove_dir_all(cwd.join(".cyrup-subagent-scratch"));
+        // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
+        // `<cwd>/.cyrup-subagent-scratch/attempt-<n>.jsonl` is this run's persisted, observable child
+        // record and MUST survive the orchestrator, exactly as it does on every other spawn path in
+        // this crate (the tool single/parallel/chain fan-outs and the background hop-2 runner all
+        // leave it in place — it is the single observation channel the crate's integration tests read
+        // back, e.g. `tool_parallel_chain_integration`'s `/run [model=…]` tee check and
+        // `companions_wiring_proof`). This mirrors pi, which likewise never deletes its persisted
+        // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
+        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
+        // `:233-236` `cleanupTempDir` removes it, invoked from
+        // `pi-subagents/src/runs/foreground/execution.ts:677`), a dir that lives OUTSIDE the working
+        // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
+        // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
+        // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
+        // every sibling path — so no such deletion is performed.
 
         Ok(result)
     }
