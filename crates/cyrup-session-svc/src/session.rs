@@ -6,6 +6,7 @@
 //! across every turn. No mode reaches behaviour that does not flow through this object.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cyrup_agent::{Agent, AgentMessage};
@@ -23,6 +24,7 @@ use cyrup_session::compaction::{
     CompactionPreparation, CompactionReason, CompactionSettings, Compactor, NoHooks,
 };
 use cyrup_session::context::SessionContext;
+use cyrup_session::header::SessionHeader;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ProcOps, ShellConfig};
 use tokio::sync::Mutex as AsyncMutex;
@@ -284,6 +286,12 @@ pub struct AgentSession {
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
     session_cancel: CancelToken,
     session_id: SessionId,
+    /// Latches `true` the first time a `--mode json` run writes the session header (Pi
+    /// `sessionManager.getHeader()` → JSONL line 1, print-mode.ts:112-117). Pi writes the header
+    /// exactly ONCE, before the whole message loop in `runPrintMode`; cyrup replays follow-up
+    /// prompts through additional [`crate::AgentSession::prompt`]-scoped `run_json` calls, so the
+    /// header emitter ([`Self::claim_json_header`]) consults this latch to stay one-shot per session.
+    json_header_written: AtomicBool,
     /// Facade-side mirror of the steering queue text (Pi `_steeringMessages`, agent-session.ts:476)
     /// for `queue_update` emission + introspection; the authoritative queue lives in the agent.
     steering_messages: Mutex<Vec<String>>,
@@ -399,6 +407,7 @@ impl AgentSession {
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
             session_id,
+            json_header_written: AtomicBool::new(false),
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
             model_fallback_message,
@@ -2247,6 +2256,25 @@ impl AgentSession {
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The session header record (Pi `sessionManager.getHeader()`, session-manager.ts:1208-1211):
+    /// `{type:"session", version, id, timestamp, cwd, parentSession?}`. This is the passthrough a
+    /// `--mode json` run serializes as JSONL line 1 before the event stream (Pi print-mode.ts:112-117).
+    /// A live session always carries a header (unlike Pi's `getHeader` which is nominally nullable
+    /// when no `session` entry exists — never the case for an opened/created manager), so this
+    /// returns the header directly rather than an `Option`.
+    pub async fn session_header(&self) -> SessionHeader {
+        self.manager.lock().await.header().clone()
+    }
+
+    /// Claim the one-shot JSON-mode header emission for this session. Returns `true` for the FIRST
+    /// caller and `false` thereafter, so that a multi-prompt `--mode json` run — whose initial
+    /// submission and each follow-up are dispatched as separate `run_json` calls — writes the header
+    /// line exactly once, matching Pi's single `getHeader()` write ahead of the whole message loop
+    /// in `runPrintMode` (print-mode.ts:112-119).
+    pub fn claim_json_header(&self) -> bool {
+        !self.json_header_written.swap(true, Ordering::SeqCst)
     }
 
     /// The on-disk session file, if this session is persisted.

@@ -13,6 +13,13 @@ use crate::error::ModesError;
 
 /// Run `input` to completion, emitting each [`AgentSessionEvent`] as one JSONL record to `out`.
 ///
+/// Before the first event, the session header (`sessionManager.getHeader()` →
+/// `{"type":"session",…}`) is written as JSONL line 1, matching Pi's `runPrintMode`, which writes
+/// `JSON.stringify(header)` ahead of the event subscription (print-mode.ts:112-117). The header is
+/// emitted at most once per session ([`AgentSession::claim_json_header`]): the bin replays follow-up
+/// prompts through further `run_json` calls, and Pi writes the header only once before its whole
+/// message loop, so only the first call here emits it.
+///
 /// The run event stream terminates after `agent_end`, so this returns once the run is complete.
 /// Each line is a single `serde_json` object (`{"type":"agent_start"}`, …); consumers split on `\n`.
 pub async fn run_json<W: Write>(
@@ -20,6 +27,12 @@ pub async fn run_json<W: Write>(
     input: impl Into<UserInput>,
     out: &mut W,
 ) -> Result<(), ModesError> {
+    if session.claim_json_header() {
+        let header = session.session_header().await;
+        let line = serde_json::to_string(&header)?;
+        writeln!(out, "{line}")?;
+        out.flush()?;
+    }
     let mut stream = session.prompt(input).await?;
     while let Some(ev) = stream.next().await {
         let line = serde_json::to_string(&ev)?;
