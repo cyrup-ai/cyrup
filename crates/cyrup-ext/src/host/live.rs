@@ -352,10 +352,14 @@ impl bindings::cyrup::ext::models::Host for HostState {
     }
     async fn set_model(&mut self, model_json: String) {
         let Ok(guest) = guest_of(self) else { return };
-        // COMMAND-only (deadlock rule): silently dropped from an event handler.
-        if guest.require_command_tier().is_err() {
-            return;
-        }
+        // GAP-11: `setModel` is allowed from ANY handler, matching Pi — Pi binds `setModel` with only
+        // `assertActive` (loader.ts:342-345), reachable from any handler, and it takes effect
+        // (agent-session.ts:1476-1490). We therefore do NOT gate this on the command tier. The op is
+        // QUEUED (`control` is a synchronous mpsc push that touches no wasm store, host_services.rs
+        // `control`) and applied at the store-free turn-boundary drain
+        // (`AgentSession::apply_pending_control`), where its state mutation lands as a fresh top-level
+        // effect — never re-entering the suspended event-hook store. So an event-tier `setModel` now
+        // TAKES EFFECT on the subsequent turn instead of being silently dropped (the former no-op).
         let v: Value = serde_json::from_str(&model_json).unwrap_or(Value::Null);
         let _ = guest.services.control(ControlOp::SetModel(v));
     }
@@ -367,14 +371,20 @@ impl bindings::cyrup::ext::models::Host for HostState {
     }
     async fn set_thinking_level(&mut self, level: String) -> Result<(), String> {
         let guest = guest_of(self)?;
-        // COMMAND-only (deadlock rule, R-08-008): reject an event-tier call with an OBSERVABLE
-        // error the guest can surface — matching every `control.*` op — instead of the former bare
-        // early return that silently dropped it (parity gap #12). Pi allows setThinkingLevel from
-        // any handler (runner.ts:330), but cyrup's `setThinkingLevel` routes through the
-        // command-tier `control` path (Pi's own re-emits `thinking_level_select`,
-        // agent-session.ts:1588 — a re-entrant dispatch a single-instance wasm store cannot make
-        // from a suspended event handler), so the restriction is real; here it is at least honest.
-        guest.require_command_tier()?;
+        // GAP-11: `setThinkingLevel` is allowed from ANY handler, matching Pi — Pi binds it with only
+        // `assertActive` (loader.ts:352-354; the runner emit is void/non-awaited,
+        // agent-session.ts:1541-1572) and it takes effect. We no longer gate on the command tier.
+        //
+        // The op is QUEUED (`control` is a synchronous mpsc push that touches no wasm store,
+        // host_services.rs `control`) and applied at the store-free turn-boundary drain
+        // (`AgentSession::apply_pending_control`). Its `thinking_level_select` re-emit
+        // (agent-session.ts:1560-1567) fires THERE as a FRESH top-level guest call — after the event
+        // hook's `LiveExtension.inner` store guard has already been released — so it never re-enters
+        // the suspended single-instance store. That deferral is what dissolves the R-08-008 deadlock
+        // the old command-tier gate guarded against (the same reason `with_session`/`bus_deliver`
+        // callbacks defer instead of running inline). An event-tier `setThinkingLevel` therefore TAKES
+        // EFFECT on the subsequent turn and the guest observes `Ok(())` — no longer an honest deadlock
+        // `Err`.
         guest.services.control(ControlOp::SetThinkingLevel(level))
     }
 }

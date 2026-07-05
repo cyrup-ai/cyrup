@@ -429,14 +429,53 @@ async fn a_quickly_exiting_detached_child_eventually_disappears_on_its_own() {
 // detached runner) is unaffected and eventually writes a valid terminal `status.json` +
 // `ResultFile`.
 
+use std::collections::BTreeMap;
+
+use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::runner_main::RunnerConfig;
 use cyrup_ext_subagents::background::{RunId, RunMode, RunPaths, RunState};
+use cyrup_ext_subagents::discovery::types::SystemPromptMode;
+use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 /// Path to the real, already-built `cyrup-subagent-orchestrator-sim` helper binary.
 fn orchestrator_sim_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cyrup-subagent-orchestrator-sim"))
+}
+
+/// A minimal resolved persona for a fixture-driven test (T0.1 / C13) — a real model so the
+/// fallback ladder is non-empty (the scripted fixture ignores `--model`), guard off, `Replace`
+/// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
+fn fixture_persona(name: &str) -> ResolvedAgentPersona {
+    ResolvedAgentPersona {
+        name: name.to_string(),
+        model: Some(ModelId::from("fixture-model")),
+        fallback_models: Vec::new(),
+        thinking: None,
+        system_prompt_mode: SystemPromptMode::Replace,
+        system_prompt_body: String::new(),
+        tools: None,
+        extensions: None,
+        subagent_only_extensions: Vec::new(),
+        output: None,
+        inherit_project_context: false,
+        inherit_skills: true,
+        skills: Vec::new(),
+        completion_guard: Some(false),
+        max_subagent_depth: None,
+        default_context: None,
+    }
+}
+
+/// The plan-time `resolved_agents` map covering every agent name any step in this file dispatches
+/// (`worker`/`first`; `second` is deliberately never dispatched but is included so a spurious
+/// dispatch would still resolve rather than masking the real assertion behind an `Unknown agent`).
+fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
+    ["worker", "first", "second"]
+        .into_iter()
+        .map(|name| (name.to_string(), fixture_persona(name)))
+        .collect()
 }
 
 /// Mirrors `tests/background_runner_main_integration.rs`'s own identical helper — a minimal,
@@ -453,6 +492,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         max_depth_override: None,
         structured_output_schema: None,
         output: None,
+        output_path: None,
         output_mode: None,
         reads: None,
         acceptance: None,
@@ -498,6 +538,15 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
+        // C7: carry the orchestrator's absolute roots so the detached runner subprocess rebuilds
+        // its RunPaths from THESE (never re-derives), writing its terminal ResultFile into the
+        // same results dir this test created.
+        async_root: async_root.clone(),
+        results_dir: results_dir.clone(),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -688,6 +737,15 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
+        // C7: carry the orchestrator's absolute roots so the detached runner subprocess rebuilds
+        // its RunPaths from THESE (never re-derives), writing its terminal ResultFile into the
+        // same results dir this test created.
+        async_root: async_root.clone(),
+        results_dir: results_dir.clone(),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)

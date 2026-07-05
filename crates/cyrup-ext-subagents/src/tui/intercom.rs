@@ -7,33 +7,26 @@
 //!
 //! 1. **Out-of-band result delivery** ([`IntercomPayload`]/[`deliver`]): a *best-effort*,
 //!    gracefully-degrading side-channel a grouped subagent result MAY be pushed through, in
-//!    addition to (never instead of) the ordinary inline tool-result payload. Per R-SA-125 and
-//!    func-SA §9 item 25 / arch-SA §12 item 7, no `pi-intercom` companion transport is confirmed
-//!    ported into this workspace today, so [`deliver`] always resolves to
-//!    [`DeliveryOutcome::NotDelivered`] in current builds — this module is written so that once a
-//!    real transport exists, wiring it in means supplying a [`DeliveryChannel`] impl and nothing
-//!    else changes at any call site (the timeout-race, allowlist-projection, and "never block/
-//!    error the caller's turn" contracts are already correct and already tested here).
+//!    addition to (never instead of) the ordinary inline tool-result payload. The `pi-intercom`
+//!    companion transport IS now ported (`cyrup-intercom`), and its broker-backed
+//!    [`DeliveryChannel`] impl (`cyrup-intercom/src/seams.rs`) is threaded into the executor via
+//!    `SubagentsExtension::with_channels` (from `crates/cyrup/src/main.rs`) — CLOSING
+//!    R-SA-123/124/125. With that channel, [`deliver`] confirms/degrades per the real broker; with
+//!    the [`NoTransportChannel`] default (no intercom wired) it resolves to
+//!    [`DeliveryOutcome::NotDelivered`] and every caller's full result stays inline, exactly as the
+//!    spec anticipates. The timeout-race, allowlist-projection, and "never block/error the caller's
+//!    turn" contracts hold across both.
 //! 2. **The foreground clarify/ask pause primitive** ([`ClarifyRequest`]/[`AskLock`]/
 //!    [`request_clarify`]): R-SA-119's "visibly pause the affected foreground flow while a child's
 //!    clarify request is outstanding" and R-SA-120's "at most one outstanding blocking ask per
-//!    orchestrator session" single-slot lock. Per arch-SA §12 item 6, a REAL, wired mechanism for
-//!    this now exists (`LiveHostServices::{confirm,input,select,editor}` in
-//!    `cyrup-session-svc/src/host_services.rs`, reachable via a constructor-time
-//!    `Arc<AgentSessionServices>`/`Arc<LiveHostServices>` handle mirroring this crate's existing
-//!    narrow, direct `cyrup-session` dependency for fork-context) — but reaching it requires
-//!    adding `cyrup-session-svc` as a dependency of this crate's `Cargo.toml` and threading a
-//!    handle through the extension's construction path, both of which are outside this single
-//!    file's ownership boundary for this task (this task owns only `tui/intercom.rs`). **This is
-//!    therefore explicitly deferred**: [`request_clarify`] implements the documented graceful
-//!    no-op fallback (mirrors `HostServices`' own deny-default behavior — "no sink" always
-//!    degrades to the deny value without blocking, `host_services.rs` doc comment on
-//!    `ui_roundtrip`) rather than reaching into `cyrup-session-svc` from here. The live-dialog
-//!    wiring (constructing this module's [`AskLock`] with a real `confirm`/`input`-backed
-//!    [`ClarifyChannel`] impl, plus the `Cargo.toml`/constructor-plumbing change) is left to
-//!    whichever later phase owns `lib.rs`/`extension.rs`'s construction path and, if needed,
-//!    `Cargo.toml` — see the module-level `NOTE(clarify-deferred)` marker below for the exact
-//!    seam a future phase fills in.
+//!    orchestrator session" single-slot lock. This is now WIRED end to end (R-SA-119/120/037
+//!    CLOSED): the intercom companion's broker-backed [`ClarifyChannel`] (`IntercomClarifyChannel`,
+//!    which surfaces the child's ask through the P-1-late-bound `HostServices::input` and routes the
+//!    answer back to the still-alive child over the broker) is threaded into the executor's
+//!    [`AskLock`] via `SubagentsExtension::with_channels`, and the exec drive loop fires
+//!    [`spawn_clarify`] against it on a child's blocking `contact_supervisor` ask (see the
+//!    `NOTE(clarify-wired)` marker below). With no channel wired (headless / SDK-embedder) the lock
+//!    degrades to the documented no-op fallback ([`ClarifyOutcome::NoLiveChannel`], never blocks).
 //!
 //! # What this file deliberately does NOT do (mandatory-mechanism guardrails)
 //!
@@ -128,6 +121,34 @@ impl IntercomPayload {
             total_tokens,
         }
     }
+
+    /// Builds an [`IntercomPayload`] for a FOREGROUND grouped (parallel/chain) run from its per-child
+    /// [`crate::spawn::chain_graph::StepResult`]s (R-SA-123/124/125). A second sanctioned constructor
+    /// alongside [`Self::from_result`], holding the identical allowlist discipline — every field is an
+    /// explicit, individually-named copy of an allowlisted value, never a blanket serialize of the
+    /// child results. A `None` child (a skipped/absent step) contributes an empty output string.
+    /// `success` is the caller's already-computed overall verdict (every present child succeeded).
+    /// `total_tokens` is `0` here: the chain-graph-local `StepResult` carries no per-step token usage
+    /// (unlike the background [`crate::background::ResultFile`] path, which sums real usage via
+    /// [`Self::from_result`]) — the out-of-band grouped-delivery summary simply omits it.
+    #[must_use]
+    pub fn from_group_children(
+        run_id: RunId,
+        agent: String,
+        success: bool,
+        children: &[Option<crate::spawn::chain_graph::StepResult>],
+    ) -> Self {
+        Self {
+            run_id,
+            agent,
+            success,
+            outputs: children
+                .iter()
+                .map(|c| c.as_ref().and_then(|r| r.final_output.clone()).unwrap_or_default())
+                .collect(),
+            total_tokens: 0,
+        }
+    }
 }
 
 // =================================================================================================
@@ -162,6 +183,46 @@ pub struct NoTransportChannel;
 
 impl DeliveryChannel for NoTransportChannel {
     fn send(&self, _payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+}
+
+// =================================================================================================
+// Steer channel — deliver an unsolicited follow-up to a live registered child (R-SA-086)
+// =================================================================================================
+
+/// A pluggable transport for delivering an UNSOLICITED steer message to an already-registered live
+/// subagent child, addressed by its deterministic broker presence target
+/// ([`crate::spawn::intercom_target::resolve_subagent_intercom_target`]).
+///
+/// This is a DISTINCT seam from [`DeliveryChannel`] (which relays a completed run's result to THIS
+/// orchestrator's own fixed supervisor) and [`ClarifyChannel`] (which only REPLIES to a correlated
+/// inbound child ask): neither can address an arbitrary child target with a fresh, unsolicited
+/// message. [`crate::extension::SubagentExecutor::control_resume`]'s `SteerRunning` arm drives this to
+/// deliver `action='resume'`'s follow-up to a still-running async child over the broker — pi's
+/// `deliverSubagentIntercomMessageEvent(events, target.intercomTarget, …)`
+/// (`subagent-executor.ts:860-878`). The "not registered" notice pi returns is ONLY the
+/// delivery-FAILED fallback (`Ok(false)`/`Err`), never the primary path.
+pub trait SteerChannel: Send + Sync {
+    /// Deliver `text` to the live child registered under `target`. `Ok(true)` = the broker confirmed
+    /// a registered receiver took delivery (the follow-up landed); `Ok(false)` = reachable transport
+    /// but no registered receiver at `target` (the genuine "not registered" fallback); `Err` = the
+    /// transport itself failed. Never panics or blocks past its own I/O.
+    fn steer(&self, target: String, text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+}
+
+/// The default steer channel: no transport wired (headless / SDK-embedder / no intercom this
+/// session). `steer` resolves immediately to `Ok(false)` — "no registered receiver reachable" — so
+/// [`crate::extension::SubagentExecutor::control_resume`] cleanly degrades to pi's "intercom target
+/// is not registered" guidance without a live broker, exactly the documented steady state when
+/// intercom is not attached. Replaced by the intercom companion's broker-backed impl
+/// (`cyrup-intercom::seams::IntercomSteerChannel`) via
+/// [`crate::extension::SubagentsExtension::with_channels`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoTransportSteerChannel;
+
+impl SteerChannel for NoTransportSteerChannel {
+    fn steer(&self, _target: String, _text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async { Ok(false) })
     }
 }
@@ -247,15 +308,16 @@ impl From<&IntercomPayload> for ReducedInlinePayload {
 // =================================================================================================
 // Clarify/ask pause primitive (R-SA-119/120)
 //
-// NOTE(clarify-deferred): a real `confirm`/`input`-backed `ClarifyChannel` implementation that
-// forwards through a constructor-time `Arc<cyrup_session_svc::host_services::LiveHostServices>`
-// handle (arch-SA §12 item 6) is deferred to whichever later phase owns this crate's
-// `Cargo.toml` + `lib.rs`/`extension.rs` construction path — adding the `cyrup-session-svc`
-// dependency and threading the handle through `SubagentsExtension::new` is outside this file's
-// single-file ownership boundary for this task. Everything in this section is written against
-// the `ClarifyChannel` trait below specifically so that wiring in the real implementation later
-// is additive (one new `impl ClarifyChannel for LiveHostServicesClarify { .. }` plus passing it
-// into `AskLock::new`), with no change needed to the single-slot-lock/pause semantics here.
+// NOTE(clarify-wired): the real `ClarifyChannel` is now wired (reconciliation §4 step 5 item 3 —
+// R-SA-119/120/037 CLOSED). The intercom companion's broker-backed `IntercomClarifyChannel`
+// (`cyrup-intercom/src/seams.rs`) — which surfaces the child's ask to the parent's human via the
+// P-1-late-bound `HostServices::input` and routes the answer back to the still-alive child over the
+// broker — is threaded into the executor via `SubagentsExtension::with_channels` (from the
+// `crates/cyrup/src/main.rs` session-build sites) and wrapped in the single-slot [`AskLock`] below.
+// The exec drive loop (`exec/mod.rs::drive_attempt`) fires [`spawn_clarify`] against that lock the
+// moment a child emits a blocking `contact_supervisor` ask (via `RunOptions::clarify` /
+// [`ClarifyDispatch`]). When no channel is wired (headless / SDK-embedder), the lock keeps the
+// documented [`NoOpClarifyChannel`] degrade default ([`ClarifyOutcome::NoLiveChannel`], never blocks).
 // =================================================================================================
 
 /// One outstanding blocking clarify/ask interaction a child run is waiting on (R-SA-119).
@@ -276,7 +338,7 @@ pub enum ClarifyOutcome {
     /// A response was obtained (whatever the pluggable [`ClarifyChannel`] returned).
     Answered(String),
     /// No live clarify UI is wired (the documented graceful fallback — see the module-level
-    /// `NOTE(clarify-deferred)` doc above). The affected flow still visibly pauses for the
+    /// `NOTE(clarify-wired)` doc above). The affected flow still visibly pauses for the
     /// duration of the attempt (R-SA-119) before this is returned; it is simply never able to
     /// resolve to an actual human answer until a real [`ClarifyChannel`] is wired in.
     NoLiveChannel,
@@ -286,7 +348,7 @@ pub enum ClarifyOutcome {
 }
 
 /// A pluggable clarify/ask transport (deliberately trait-based, not a concrete session handle —
-/// see `NOTE(clarify-deferred)` above for why this crate does not itself implement one against
+/// see `NOTE(clarify-wired)` above for why this crate does not itself implement one against
 /// `cyrup-session-svc` in this file).
 pub trait ClarifyChannel: Send + Sync {
     /// Present `request` to a live human/UI and await a response. Implementations should apply
@@ -297,7 +359,7 @@ pub trait ClarifyChannel: Send + Sync {
     fn ask(&self, request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
-/// The documented graceful no-op fallback (see the module-level `NOTE(clarify-deferred)` doc):
+/// The documented graceful no-op fallback (see the module-level `NOTE(clarify-wired)` doc):
 /// always reports [`ClarifyOutcome::NoLiveChannel`] via an `Err`, so [`request_clarify`]'s
 /// single-slot-lock bookkeeping and "visibly pause" contract are exercised even with no real UI
 /// wired, exactly mirroring `LiveHostServices::ui_roundtrip`'s own "no sink -> deny default,
@@ -326,16 +388,17 @@ pub struct AskLock {
 }
 
 impl AskLock {
-    /// Builds a lock backed by `channel`. Pass [`NoOpClarifyChannel::default()`] to get today's
-    /// documented graceful-fallback behavior (no live UI wired); a later phase substitutes a real
-    /// [`ClarifyChannel`] impl here (see `NOTE(clarify-deferred)`).
+    /// Builds a lock backed by `channel`. Production passes the intercom companion's real broker
+    /// [`ClarifyChannel`] here (threaded via `SubagentsExtension::with_channels`, see
+    /// `NOTE(clarify-wired)`); pass [`NoOpClarifyChannel::default()`] to get the documented
+    /// graceful-fallback behavior (no live UI wired — headless / SDK-embedder).
     #[must_use]
     pub fn new(channel: Arc<dyn ClarifyChannel>) -> Self {
         Self { channel, slots: AsyncMutex::new(HashMap::new()) }
     }
 
     /// Builds a lock using the documented no-op fallback (today's default — see
-    /// `NOTE(clarify-deferred)`).
+    /// `NOTE(clarify-wired)`).
     #[must_use]
     pub fn new_with_no_live_channel() -> Self {
         Self::new(Arc::new(NoOpClarifyChannel))
@@ -385,6 +448,39 @@ impl AskLock {
 /// through the returned receiver; dropping the receiver before it resolves does not cancel the
 /// underlying ask (a human may still be mid-answer), it only stops that particular caller from
 /// observing the outcome.
+/// The clarify/ask dispatch context the exec drive loop needs to fire a child's blocking
+/// `contact_supervisor` ask through [`spawn_clarify`] (R-SA-037 detach-trigger arm). Threaded from
+/// the executor's [`AskLock`] into [`crate::exec::RunOptions::clarify`] at the foreground run's spawn
+/// site; `None` there degrades to today's no-clarify behavior (the background hop-2 runner / tests
+/// with no channel). Carries the session-scoping key ([`AskLock`]'s single-slot key, R-SA-120) plus
+/// the run/step identity the [`ClarifyRequest`] surfaces (and the intercom `ClarifyChannel`
+/// correlates on).
+#[derive(Clone)]
+pub struct ClarifyDispatch {
+    /// The single-slot ask lock (R-SA-120), shared across every run this executor drives.
+    pub lock: Arc<AskLock>,
+    /// The orchestrator-session-scoping key for the single-slot lock (R-SA-120's "one outstanding
+    /// ask per orchestrator session").
+    pub session_key: String,
+    /// The run whose foreground flow pauses on the ask (surfaced + correlated).
+    pub run_id: RunId,
+    /// The affected step within that run's flow, if applicable (R-SA-119 pauses only the affected
+    /// step, not the whole orchestrator).
+    pub step_index: Option<u32>,
+}
+
+// `AskLock` wraps an `Arc<dyn ClarifyChannel>` + an `AsyncMutex` (neither `Debug`); a manual impl
+// keeps [`crate::exec::RunOptions`]'s derived `Debug` while never trying to format the channel.
+impl std::fmt::Debug for ClarifyDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClarifyDispatch")
+            .field("session_key", &self.session_key)
+            .field("run_id", &self.run_id)
+            .field("step_index", &self.step_index)
+            .finish_non_exhaustive()
+    }
+}
+
 pub fn spawn_clarify(lock: Arc<AskLock>, session_key: String, request: ClarifyRequest) -> oneshot::Receiver<ClarifyOutcome> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {

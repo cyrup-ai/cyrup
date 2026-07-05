@@ -12,6 +12,7 @@ use cyrup_core::{CancelToken, ExtensionId, Tool};
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Which context tier a handler runs in (arch-08 §6.3, the deadlock rule). Session-mutating control
@@ -32,6 +33,56 @@ pub enum ExtMode {
     Print,
 }
 
+/// Coordinates a sanctioned human-latency wait between a native `on_event` handler and the dispatch
+/// invocation budget (P-3, `spec/extensions/cyrup-permission-system-port.md §4`). The native
+/// dispatcher wraps every handler in a `DEFAULT_INVOKE_BUDGET` `tokio::time::timeout` and, on expiry,
+/// SKIPS the handler and PROCEEDS the action (`dispatch.rs`) — which for a permission gate's
+/// `before_tool_call` `ask` is **fail-OPEN**: a human who takes longer than the budget to answer would
+/// let the tool run ungated. A handler that must block on a human calls [`HostCtx::begin_human_wait`]
+/// to hold a [`HumanWaitGuard`] across the blocking call; while any guard is alive the dispatcher's
+/// budget watchdog ([`crate::dispatch::Dispatcher`]) is SUSPENDED — the native analog of the wasm epoch
+/// forgiveness the guest UI round-trip already has (arch-08 §6.5a). The wait stays bounded by the
+/// handler's OWN timeout (which fail-CLOSES to `Block`), so forgiveness is never an unbounded hang.
+/// Reentrant: a counter admits nested/back-to-back guards; the budget resumes only once it returns to
+/// 0. This is **permission-only** by construction — no other handler obtains a guard, so every other
+/// handler keeps the exact fail-fast budget behavior (a cooperative runaway that never begins a human
+/// wait is still timed out).
+#[derive(Debug, Default)]
+pub struct HumanWaitGate {
+    /// Number of live [`HumanWaitGuard`]s (a human wait is in progress while `> 0`). The dispatcher's
+    /// budget watchdog polls [`Self::is_waiting`] whenever the budget deadline elapses: while it holds,
+    /// the watchdog re-arms the deadline instead of firing (the budget clock only advances when NOT
+    /// waiting) — critically WITHOUT ever suspending the handler future itself, so the very call that
+    /// will drop the guard keeps running.
+    waiting: AtomicUsize,
+}
+
+impl HumanWaitGate {
+    /// True while at least one [`HumanWaitGuard`] is alive (a human wait is in progress right now).
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) > 0
+    }
+
+    fn begin(self: &Arc<Self>) -> HumanWaitGuard {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        HumanWaitGuard { gate: Arc::clone(self) }
+    }
+}
+
+/// RAII guard for a sanctioned human wait (see [`HumanWaitGate`]). While held, the dispatch budget is
+/// suspended; on drop (including during a panic unwind) it decrements the wait count so the budget
+/// resumes for the handler's (instant) post-decision wrap-up.
+#[must_use = "the dispatch budget is only suspended while the guard is held"]
+pub struct HumanWaitGuard {
+    gate: Arc<HumanWaitGate>,
+}
+
+impl Drop for HumanWaitGuard {
+    fn drop(&mut self) {
+        self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Context handed to an extension at dispatch (arch-08 §6.3). Event handlers get an `Event`-tier
 /// ctx (no session mutation); command handlers get a `Command`-tier ctx. The host check is
 /// authoritative even though the SDK also enforces it at the type level.
@@ -45,6 +96,10 @@ pub struct HostCtx {
     /// served by the `session`/`models`/`ui` capability imports; the native built-in path carries
     /// them inline so a built-in reaches the same surface without crossing a boundary (gap-08 #6).
     rich: HostCtxRich,
+    /// The sanctioned-human-wait coordinator (P-3). Shared (via `Arc`) with the dispatcher's budget
+    /// watchdog through [`Extension::human_wait_gate`], so a handler's [`Self::begin_human_wait`] and
+    /// the watchdog consult the SAME gate. One per handler ctx.
+    human_wait: Arc<HumanWaitGate>,
 }
 
 /// The richer fields a native built-in's [`HostCtx`] exposes (Pi `ExtensionContext`, types.ts:300-333):
@@ -68,12 +123,26 @@ pub struct HostCtxRich {
 impl HostCtx {
     /// An event-tier context (inside the agent/session flow): NO session mutation.
     pub fn event(mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
-        Self { mode, has_ui, cwd, tier: CtxTier::Event, rich: HostCtxRich::default() }
+        Self {
+            mode,
+            has_ui,
+            cwd,
+            tier: CtxTier::Event,
+            rich: HostCtxRich::default(),
+            human_wait: Arc::new(HumanWaitGate::default()),
+        }
     }
 
     /// A command-tier context (user-initiated, outside the loop): session mutation allowed.
     pub fn command(mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
-        Self { mode, has_ui, cwd, tier: CtxTier::Command, rich: HostCtxRich::default() }
+        Self {
+            mode,
+            has_ui,
+            cwd,
+            tier: CtxTier::Command,
+            rich: HostCtxRich::default(),
+            human_wait: Arc::new(HumanWaitGate::default()),
+        }
     }
 
     /// Attach the rich native-ctx fields (Pi `ExtensionContext`, gap-08 #6).
@@ -112,8 +181,29 @@ impl HostCtx {
         self.tier
     }
 
-    /// Deadlock guard (R-08-008): returns `Err(ExtError::Deadlock)` if a session-mutating control
-    /// op is attempted from an event handler. Authoritative regardless of the guest SDK's types.
+    /// Enter a sanctioned human-latency wait (P-3): hold the returned [`HumanWaitGuard`] across a
+    /// blocking human interaction (the permission gate's `before_tool_call` `ask` dialog) so the
+    /// dispatcher's invocation-budget watchdog is suspended and a slow human answer cannot fire the
+    /// budget and fail-OPEN the gate. The wait stays bounded by the caller's OWN timeout. Drop the
+    /// guard (or let it fall out of scope) the instant the human interaction returns.
+    #[must_use = "hold the guard across the human interaction; dropping it immediately does nothing"]
+    pub fn begin_human_wait(&self) -> HumanWaitGuard {
+        self.human_wait.begin()
+    }
+
+    /// The shared [`HumanWaitGate`] backing [`Self::begin_human_wait`] (P-3). The dispatcher reads this
+    /// (via [`Extension::human_wait_gate`]) so its budget watchdog consults the SAME gate the handler
+    /// signals through.
+    pub fn human_wait_gate(&self) -> Arc<HumanWaitGate> {
+        Arc::clone(&self.human_wait)
+    }
+
+    /// Deadlock guard (R-08-008): returns `Err(ExtError::Deadlock)` if a session-replacement /
+    /// turn-starting control op (new-session/switch/fork/navigate/reload/compact/wait-idle/
+    /// send-message/send-user-message) is attempted from an event handler. Authoritative regardless
+    /// of the guest SDK's types. GAP-11: `set_model`/`set_thinking_level` are EXEMPT — Pi allows them
+    /// from any handler (loader.ts:342-354); live.rs queues them unconditionally and they apply at the
+    /// store-free turn-boundary drain, so this gate is not consulted for them.
     pub fn require_command_tier(&self) -> Result<(), ExtError> {
         if self.tier == CtxTier::Command {
             Ok(())
@@ -192,6 +282,20 @@ pub trait NativeExtension: Send + Sync {
     ) -> Result<Option<String>, ExtError> {
         Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
     }
+
+    /// Late-bind the live `Arc<dyn HostServices>` backend (reconciliation §2 item 1 / P-1). Called by
+    /// [`crate::ExtensionHost::load_native_with_services`] BEFORE [`Self::init`], handing a native
+    /// built-in the SAME capability backend the WASM path already receives (via `discover_and_load`).
+    /// The default is a no-op — a built-in that needs none simply ignores it. A built-in that DOES
+    /// need late, out-of-`HostCtx` reach (a background tokio task that must resolve the live session
+    /// id/file, open a dialog, or inject a turn-triggering message) overrides this to STASH the `Arc`
+    /// in its own interior-mutable slot (`OnceLock`/`Mutex`). The captured `Arc` is a shared handle to
+    /// the one `LiveHostServices` the session late-attaches its manager / ui sink / inject sink to, so
+    /// capturing it early (before those attachments) is correct: the built-in observes them through
+    /// the `Arc`'s interior mutability when the background task actually runs. Gated on `wasm-host`
+    /// because the [`crate::host::HostServices`] trait itself only exists with the capability host.
+    #[cfg(feature = "wasm-host")]
+    fn set_host_services(&self, _services: Arc<dyn crate::host::HostServices>) {}
 }
 
 /// Wraps a `NativeExtension` into the unified [`Extension`] handle, applying panic containment
@@ -227,6 +331,14 @@ impl Extension for NativeHandle {
 
     fn subscriptions(&self) -> &Subscriptions {
         &self.subs
+    }
+
+    /// The P-3 human-wait gate for this native handler: its ctx's shared [`HumanWaitGate`]. The
+    /// dispatcher's budget watchdog reads it to forgive a sanctioned human wait (see
+    /// [`HostCtx::begin_human_wait`]). Only natives that actually block on a human (the permission
+    /// gate) ever set it waiting; for every other native it stays idle, preserving the fail-fast budget.
+    fn human_wait_gate(&self) -> Option<Arc<HumanWaitGate>> {
+        Some(self.ctx.human_wait_gate())
     }
 
     async fn invoke_event(

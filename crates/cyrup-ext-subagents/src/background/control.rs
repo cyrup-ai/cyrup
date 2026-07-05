@@ -72,7 +72,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cyrup_core::ModelId;
+
 use crate::error::SubagentError;
+use crate::exec::SingleResult;
 use crate::spawn::chain_graph::RunnerStep;
 
 use super::atomic::write_atomic_json;
@@ -243,6 +246,7 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         pending_appends: None,
         steps: Vec::new(),
         parallel_groups: None,
+        telemetry: crate::background::RunTelemetry::default(),
     }
 }
 
@@ -904,6 +908,10 @@ fn runner_step_output_names(step: &RunnerStep) -> Vec<String> {
             .iter()
             .filter_map(|single| single.output.clone())
             .collect(),
+        // A root-attachment step's imported output IS referenceable under its `output` name
+        // (R-SA-097: pi's `outputName`/`as`), so an appended step naming `{outputs.<that name>}`
+        // must see it declared here just like a `SingleStep`'s own `output`.
+        RunnerStep::ImportAsyncRoot(spec) => spec.output.clone().into_iter().collect(),
     }
 }
 
@@ -1258,6 +1266,215 @@ pub async fn poll_root_attachment(
 }
 
 // =================================================================================================
+// wait_for_imported_async_root — R-SA-097's polling loop around poll_root_attachment
+// =================================================================================================
+
+/// One imported async-root outcome, synthesized as a new chain's first step's result (R-SA-097; pi
+/// `chain-root-attachment.ts`'s `ImportedAsyncRootResult`). This is the loop-level product of
+/// polling another already-launched run to a terminal state and reading back the child result the
+/// attachment targeted; the background runner
+/// (`background/runner_main.rs::run_inner`) folds it into a [`SingleResult`] for THIS chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedAsyncRootResult {
+    /// The imported step's agent name — the target child's own agent, falling back to the target
+    /// run's top-level agent, then to the caller-supplied display name.
+    pub agent: String,
+    /// The imported final output text (or, for a failure, the error/summary that stands in for it,
+    /// mirroring pi's `output || error || ""` fallback).
+    pub output: String,
+    /// Whether the imported root completed successfully.
+    pub success: bool,
+    /// `0` on success, `1` otherwise (mirrors pi's `exitCode`).
+    pub exit_code: i32,
+    /// The failure message, present only when `!success`.
+    pub error: Option<String>,
+    /// The target child's persisted session-transcript path, if any.
+    pub session_file: Option<PathBuf>,
+    /// The model the target child's winning attempt used, if recorded.
+    pub model: Option<ModelId>,
+    /// Every model the target child attempted, if recorded.
+    pub attempted_models: Vec<ModelId>,
+    /// The target child's validated structured output, if any.
+    pub structured_output: Option<serde_json::Value>,
+}
+
+/// Poll `target_paths` at `poll_interval` until the attached async root goes terminal, then return
+/// its outcome synthesized as one [`ImportedAsyncRootResult`] (R-SA-097; pi
+/// `waitForImportedAsyncRoot`). This is the loop wrapping [`poll_root_attachment`]'s single-tick
+/// primitive: `AttachmentPoll::Ready` (the target's terminal `ResultFile` is authoritative) →
+/// [`build_imported_result`]; `AttachmentPoll::Failed` (terminal `status.json` but no result file
+/// even after the grace window) → [`output_from_terminal_status`]; `AttachmentPoll::StillWaiting` →
+/// sleep and poll again.
+///
+/// `run_id` is the target's run-id token (used only for the diagnostic messages pi's own fallbacks
+/// embed); `index` selects which child within a multi-child target result to import; `fallback_agent`
+/// is the display agent name used only when neither the result file nor the status file names one.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] for a genuine I/O failure reading the target's status/result
+/// files, or if the target run's directory does not exist at all while it is still non-terminal
+/// (pi's `directory does not exist` guard — a target that never started).
+pub async fn wait_for_imported_async_root(
+    target_paths: &RunPaths,
+    run_id: &str,
+    index: usize,
+    fallback_agent: &str,
+    poll_interval: Duration,
+) -> Result<ImportedAsyncRootResult, SubagentError> {
+    let mut terminal_first_observed_at: Option<i64> = None;
+    loop {
+        let (outcome, next_observed) =
+            poll_root_attachment(target_paths, terminal_first_observed_at).await?;
+        match outcome {
+            AttachmentPoll::Ready(result) => {
+                return Ok(build_imported_result(&result, run_id, index, fallback_agent));
+            }
+            AttachmentPoll::Failed => {
+                // The target's status.json went terminal but no ResultFile ever landed (past the
+                // grace window). Re-read the (still-present) status so the synthesized failure can
+                // name the target step's own agent/error, exactly as pi's `outputFromTerminalStatus`
+                // reads them off the terminal status.
+                let status = read_status_file(&target_paths.status).await?;
+                return Ok(output_from_terminal_status(
+                    status.as_ref(),
+                    target_paths,
+                    run_id,
+                    index,
+                    fallback_agent,
+                ));
+            }
+            AttachmentPoll::StillWaiting => {
+                terminal_first_observed_at = next_observed;
+                // pi's `!status && !fs.existsSync(root.asyncDir)` guard: a target that is not
+                // terminal AND whose run directory does not exist never started — surface that as a
+                // hard error rather than polling forever against a directory that will never appear.
+                if !tokio::fs::try_exists(&target_paths.run_dir).await.unwrap_or(false) {
+                    return Err(SubagentError::Spawn(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "Attached async root '{run_id}' directory does not exist: {}",
+                            target_paths.run_dir.display()
+                        ),
+                    )));
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+/// The terminal-state classification pi's `resultState` performs, adapted to this crate's
+/// [`ResultFile`]/[`SingleResult`] shapes (which carry an `exit_code` rather than pi's `success`
+/// boolean per child): a child that exited `0` is `Complete`; a child that exited non-zero is
+/// `Paused` iff the whole run is paused, else `Failed`; absent a child, the run's own
+/// state/`success` decides.
+fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState {
+    if let Some(child) = child {
+        if child.exit_code == 0 {
+            return RunState::Complete;
+        }
+        return if result.state == RunState::Paused { RunState::Paused } else { RunState::Failed };
+    }
+    match result.state {
+        RunState::Complete => RunState::Complete,
+        RunState::Failed => RunState::Failed,
+        RunState::Paused => RunState::Paused,
+        RunState::Queued | RunState::Running => {
+            if result.success { RunState::Complete } else { RunState::Failed }
+        }
+    }
+}
+
+/// Build the imported result from the target's authoritative terminal [`ResultFile`] (pi's
+/// `buildImportedResult`): pick the child at `index`, classify it, and project its
+/// agent/output/error/session/model fields into an [`ImportedAsyncRootResult`].
+fn build_imported_result(
+    result: &ResultFile,
+    run_id: &str,
+    index: usize,
+    fallback_agent: &str,
+) -> ImportedAsyncRootResult {
+    let child = result.results.get(index);
+    let success = imported_state(result, child) == RunState::Complete;
+
+    let agent = child
+        .map(|c| c.agent.clone())
+        .filter(|a| !a.is_empty())
+        .or_else(|| Some(result.agent.clone()).filter(|a| !a.is_empty()))
+        .unwrap_or_else(|| fallback_agent.to_string());
+
+    let output_text = child.and_then(|c| c.final_output.clone()).unwrap_or_default();
+    let error = child.and_then(|c| c.error.clone()).or_else(|| {
+        if success {
+            None
+        } else {
+            Some(format!(
+                "Attached async root {run_id} did not complete successfully."
+            ))
+        }
+    });
+    // pi's `success ? output : (output || error || "")`: keep the real output whenever it exists
+    // (or the run succeeded); only substitute the error text for an empty output on failure.
+    let output = if success || !output_text.is_empty() {
+        output_text
+    } else {
+        error.clone().unwrap_or_default()
+    };
+
+    ImportedAsyncRootResult {
+        agent,
+        output,
+        success,
+        exit_code: i32::from(!success),
+        error,
+        // `SingleResult` carries no per-child session file, so the target run's top-level
+        // `session_file` is the only faithful source here (a single-mode target's child session IS
+        // the run's session; for a multi-child target it is absent, matching pi's own
+        // `child?.sessionFile ?? … ?? status?.sessionFile` chain collapsing to the run session).
+        session_file: result.session_file.clone(),
+        model: child.and_then(|c| c.model.clone()),
+        attempted_models: child.map(|c| c.attempted_models.clone()).unwrap_or_default(),
+        structured_output: child.and_then(|c| c.structured_output.clone()),
+    }
+}
+
+/// Build a failed imported result when the target went terminal but never wrote a `ResultFile` (pi's
+/// `outputFromTerminalStatus`): name the target step's agent/error off the terminal `status.json`
+/// when available, else fall back to a "ended without a result file" diagnostic naming the missing
+/// result path.
+fn output_from_terminal_status(
+    status: Option<&RunStatus>,
+    target_paths: &RunPaths,
+    run_id: &str,
+    index: usize,
+    fallback_agent: &str,
+) -> ImportedAsyncRootResult {
+    let step = status.and_then(|s| s.steps.get(index));
+    let agent = step
+        .map(|s| s.agent.clone())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| fallback_agent.to_string());
+    let message = step.and_then(|s| s.error.clone()).unwrap_or_else(|| {
+        format!(
+            "Attached async root {run_id} ended without a result file at {}.",
+            target_paths.result.display()
+        )
+    });
+    ImportedAsyncRootResult {
+        agent,
+        output: message.clone(),
+        success: false,
+        exit_code: 1,
+        error: Some(message),
+        session_file: step.and_then(|s| s.session_file.clone()),
+        model: None,
+        attempted_models: Vec::new(),
+        structured_output: None,
+    }
+}
+
+// =================================================================================================
 // Time helper (mirrors background/mod.rs's private now_epoch_millis; duplicated rather than
 // exposed cross-module since arch-SA keeps each background/*.rs file's own timestamp policy
 // self-contained rather than introducing a shared time-utility module for one three-line helper)
@@ -1321,6 +1538,7 @@ mod tests {
             max_depth_override: None,
             structured_output_schema: None,
             output: output.map(str::to_string),
+            output_path: None,
             output_mode: None,
             reads: None,
             acceptance: None,
@@ -2026,6 +2244,205 @@ mod tests {
             outcome,
             AttachmentPoll::Failed,
             "terminal-but-no-result must be declared Failed only after the grace period elapses"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // wait_for_imported_async_root: R-SA-097 root-attachment loop (mirrors pi
+    // chain-root-attachment.test.ts)
+    // ---------------------------------------------------------------------------------------
+
+    fn imported_child(agent: &str, output: Option<&str>, exit_code: i32, error: Option<&str>) -> SingleResult {
+        SingleResult {
+            agent: agent.to_string(),
+            task: String::new(),
+            exit_code,
+            usage: cyrup_core::Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: output.map(str::to_string),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            error: error.map(str::to_string),
+            tool_calls: Vec::new(),
+            output_truncated: false,
+        }
+    }
+
+    fn imported_result_file(
+        run_id: &RunId,
+        state: RunState,
+        success: bool,
+        session_file: Option<PathBuf>,
+        children: Vec<SingleResult>,
+    ) -> ResultFile {
+        ResultFile {
+            id: run_id.clone(),
+            run_id: run_id.clone(),
+            agent: "root-agent".to_string(),
+            mode: RunMode::Single,
+            state,
+            success,
+            cwd: PathBuf::from("/tmp"),
+            session_file,
+            results: children,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_imported_async_root_imports_a_completed_child_result() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        let run_id = RunId::from_token("root-run-a");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let session_file = _dir.path().join("child.jsonl");
+        tokio::fs::write(&session_file, b"").await.expect("write session file");
+
+        let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
+        status.advance_state(RunState::Complete).expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        let result = imported_result_file(
+            &run_id,
+            RunState::Complete,
+            true,
+            Some(session_file.clone()),
+            vec![imported_child("worker", Some("root output"), 0, None)],
+        );
+        write_atomic_json(&paths.result, &result).await.expect("write result");
+
+        let imported = wait_for_imported_async_root(
+            &paths,
+            "root-run-a",
+            0,
+            "fallback",
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.agent, "worker");
+        assert_eq!(imported.output, "root output");
+        assert_eq!(imported.exit_code, 0);
+        assert!(imported.success);
+        assert_eq!(imported.session_file.as_deref(), Some(session_file.as_path()));
+    }
+
+    #[tokio::test]
+    async fn wait_for_imported_async_root_waits_for_a_running_child_to_finish() {
+        let (dir, async_root, results_dir) = temp_roots();
+        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        let run_id = RunId::from_token("root-run-late");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
+
+        // Write the terminal result only after the loop has already begun polling a still-running
+        // target — proving the loop keeps polling and picks up the late result file.
+        let result_path = paths.result.clone();
+        let late_run_id = run_id.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let result = imported_result_file(
+                &late_run_id,
+                RunState::Complete,
+                true,
+                None,
+                vec![imported_child("worker", Some("late root output"), 0, None)],
+            );
+            write_atomic_json(&result_path, &result).await.expect("write late result");
+        });
+
+        let imported = wait_for_imported_async_root(
+            &paths,
+            "root-run-late",
+            0,
+            "fallback",
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("import succeeds");
+        writer.await.expect("writer task joins");
+        drop(dir);
+
+        assert_eq!(imported.output, "late root output");
+        assert_eq!(imported.exit_code, 0);
+        assert!(imported.success);
+    }
+
+    #[tokio::test]
+    async fn wait_for_imported_async_root_imports_a_failed_child_as_a_failure() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        let run_id = RunId::from_token("root-run-fail");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut status = write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
+        status.advance_state(RunState::Failed).expect("Running -> Failed");
+        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+        let result = imported_result_file(
+            &run_id,
+            RunState::Failed,
+            false,
+            None,
+            vec![imported_child("worker", Some("root failed"), 1, Some("root failed"))],
+        );
+        write_atomic_json(&paths.result, &result).await.expect("write result");
+
+        let imported = wait_for_imported_async_root(
+            &paths,
+            "root-run-fail",
+            0,
+            "fallback",
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.exit_code, 1);
+        assert!(!imported.success);
+        assert_eq!(imported.error.as_deref(), Some("root failed"));
+        assert_eq!(imported.output, "root failed");
+    }
+
+    #[tokio::test]
+    async fn wait_for_imported_async_root_fails_a_terminal_root_with_no_result_file() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("root-run-noresult");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut status = write_running_status(
+            &paths,
+            &run_id,
+            RunMode::Single,
+            None,
+            vec![super::super::StepStatus::pending("worker")],
+        )
+        .await;
+        status.advance_state(RunState::Complete).expect("Running -> Complete");
+        write_atomic_json(&paths.status, &status).await.expect("write terminal status");
+
+        // No ResultFile is ever written. The loop polls: on the first tick it observes terminal
+        // status (StillWaiting, within grace); after the grace window elapses it reports Failed and
+        // synthesizes the "ended without a result file" diagnostic. A ~1s wall wait is inherent to
+        // ROOT_ATTACHMENT_GRACE (the single-tick grace math itself is unit-tested separately by
+        // `poll_root_attachment_fails_after_grace_period_elapses_with_no_result`).
+        let imported = wait_for_imported_async_root(
+            &paths,
+            "root-run-noresult",
+            0,
+            "fallback",
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.exit_code, 1);
+        assert!(!imported.success);
+        assert!(
+            imported.error.as_deref().unwrap_or_default().contains("ended without a result file"),
+            "expected an `ended without a result file` diagnostic, got: {:?}",
+            imported.error
         );
     }
 

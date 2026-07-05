@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{ModelId, ThinkingLevel};
+use cyrup_core::ModelId;
 
 use super::types::{AgentDefinition, AgentSource, OutputMode, OutputSpec, SystemPromptMode, ToolRef};
 use crate::fork_context::ContextMode;
@@ -89,7 +89,11 @@ const KNOWN_FIELDS: &[&str] = &[
     "completionGuard",
 ];
 
-fn is_known_field(key: &str) -> bool {
+/// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
+/// `agent-serializer.ts:4-26`). Exposed `pub(crate)` so `management.rs`'s agent serializer can apply
+/// the same "extra_fields loop skips known keys" guard pi's `serializeAgent` applies
+/// (`agent-serializer.ts:91-104`), keeping the two modules' notion of "known" in exact lockstep.
+pub(crate) fn is_known_field(key: &str) -> bool {
     KNOWN_FIELDS.contains(&key)
 }
 
@@ -153,6 +157,15 @@ impl ParsedFrontmatter {
 /// optional whitespace, then the rest of the line as the raw value. Returns `None` for lines that
 /// don't match (comments, blank lines, malformed lines) — such lines are silently ignored, never
 /// an error, matching source's own silent-ignore behavior for non-matching lines.
+///
+/// **Anchored at column 0.** Source runs this regex against the RAW (untrimmed) `line`
+/// (`frontmatter.ts:61`), and `^([\w-]+)` therefore requires the key to begin at the very start of
+/// the line — a leading space is not a `[\w-]` character, so an INDENTED `key: value` line does not
+/// match and is ignored (unless it was already consumed as a block-value continuation earlier in the
+/// loop). This function reproduces that by rejecting any key run containing a non-`[\w-]` byte (a
+/// leading space lands in the key slice and fails the check), so callers MUST pass the raw line, not
+/// a trimmed copy — passing a trimmed line would wrongly turn an indented orphan `key: value` into a
+/// field (the bug this anchoring fixes).
 fn match_key_value(line: &str) -> Option<(&str, &str)> {
     let colon_idx = line.find(':')?;
     let key = &line[..colon_idx];
@@ -278,7 +291,6 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
 
     for line in frontmatter_block.split('\n') {
         let indent = first_non_whitespace_offset(line);
-        let trimmed = line.trim();
 
         if current_key.is_some() && indent > current_indent.unwrap_or(0) {
             // Continuation of the current block value.
@@ -295,8 +307,11 @@ pub fn parse_frontmatter_block(content: &str) -> ParsedFrontmatter {
             &mut current_indent,
         );
 
-        let Some((key, raw_value)) = match_key_value(trimmed) else {
-            // Non-matching line (comment, blank, malformed): silently ignored, matching source.
+        // Match against the RAW line (source: `line.match(/^([\w-]+):.../)`, `frontmatter.ts:61`),
+        // NOT a trimmed copy: the `^`-anchor means an indented orphan `key: value` line that was not
+        // consumed as a block continuation above does not match here and is ignored, exactly as pi.
+        let Some((key, raw_value)) = match_key_value(line) else {
+            // Non-matching line (comment, blank, indented orphan, malformed): silently ignored.
             continue;
         };
         let value = strip_matching_quotes(raw_value.trim());
@@ -480,24 +495,25 @@ fn parse_tool_refs(raw: &str) -> Vec<ToolRef> {
         .collect()
 }
 
-/// `thinking: <value>` -> `Option<ThinkingLevel>`. Accepts the five on-level strings
-/// (case-sensitive, matching `ThinkingLevel`'s `rename_all = "camelCase"` wire form: `minimal`,
-/// `low`, `medium`, `high`, `xhigh`) plus the literal `off`, which maps to `None` (no reasoning) —
-/// mirroring `ModelThinkingLevel`'s off-inclusive value space at the frontmatter-string level even
-/// though `AgentDefinition::thinking` itself is typed as `Option<ThinkingLevel>` (the on-level
-/// subset only). An unrecognized string is treated as "not stated" (`None`) rather than aborting
-/// the whole file — thinking is not one of R-SA-005's two required fields, and a malformed
-/// individual field value elsewhere in an otherwise-valid frontmatter block MUST NOT cause a
-/// whole-file skip (only `name`/`description` absence and invalid `package` do that, R-SA-005/006).
-fn parse_thinking_level(raw: &str) -> Option<ThinkingLevel> {
-    match raw {
-        "off" => None,
-        "minimal" => Some(ThinkingLevel::Minimal),
-        "low" => Some(ThinkingLevel::Low),
-        "medium" => Some(ThinkingLevel::Medium),
-        "high" => Some(ThinkingLevel::High),
-        "xhigh" => Some(ThinkingLevel::Xhigh),
-        _ => None,
+/// `thinking: <value>` -> `Option<String>`. pi's `AgentConfig.thinking` (`agents.ts:103,171`) is an
+/// OPEN string, so this preserves the raw frontmatter value verbatim rather than coercing it into a
+/// closed on-only [`cyrup_core::ThinkingLevel`] enum:
+///
+/// - `Some("off")` — an EXPLICIT off, kept distinct from unset (`None`); the on-only enum could name
+///   neither, so the old closed-enum parse conflated the two.
+/// - `Some("high")` / etc. — a recognized on-level, preserved as its literal string.
+/// - `Some("super-duper")` — any other (future or provider-specific) level, PRESERVED rather than
+///   dropped — thinking is not one of R-SA-005's two required fields, so an unrecognized value never
+///   aborts the file and never silently disappears.
+/// - `None` — the frontmatter key was absent OR present-but-empty (pi treats an empty `thinking`
+///   value as falsy/no-op, so an empty value collapses to "unset" here; the key's literal presence
+///   is still recorded in `present_fields` for the serializer's preserve-frontmatter round-trip).
+fn parse_thinking_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -617,7 +633,7 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         .unwrap_or_default();
 
     let model = parsed.get("model").map(ModelId::from);
-    let thinking = parsed.get("thinking").and_then(parse_thinking_level);
+    let thinking = parsed.get("thinking").and_then(parse_thinking_value);
     let output = parsed.get("output").and_then(parse_output_spec);
     let default_progress = parse_bool_field(parsed.get("defaultProgress"));
     let interactive = parse_bool_field(parsed.get("interactive"));
@@ -625,7 +641,14 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         .get("maxSubagentDepth")
         .and_then(parse_max_subagent_depth);
     let completion_guard = parse_bool_field(parsed.get("completionGuard"));
-    let disabled = parse_bool_field(parsed.get("disabled"));
+    // `disabled` is NOT an honored agent-FILE frontmatter field. pi's `loadAgentsFromDir`
+    // (`agents.ts:1056-1195`) never reads `frontmatter.disabled` into `AgentConfig.disabled`, and
+    // `disabled` is absent from `KNOWN_FIELDS` (`agent-serializer.ts:4-26`) — so a `disabled:` line in
+    // an agent file is just an unknown extra field (round-tripped verbatim into `extra_fields`), NOT a
+    // flag. An agent is disabled ONLY by a settings override (`subagents.disableBuiltins` /
+    // `agentOverrides.<name>.disabled`), applied later by `merge.rs`. Parsing it here would let a
+    // handcrafted file disable itself, which pi does not permit; leave it `None` at parse time.
+    let disabled: Option<bool> = None;
 
     let present_fields: HashSet<String> = parsed.keys().map(str::to_string).collect();
     let extra_fields: BTreeMap<String, String> = parsed
@@ -755,6 +778,32 @@ mod tests {
         assert_eq!(parsed.get("permission"), Some("read: allow"));
     }
 
+    #[test]
+    fn indented_orphan_key_value_line_is_not_parsed_as_a_field() {
+        // BUG fix: pi matches `^([\w-]+):` against the RAW line (`frontmatter.ts:61`), so an INDENTED
+        // `key: value` line that is not a block-value continuation is ignored — it never becomes a
+        // field. (Matching against a trimmed copy, as the old code did, wrongly promoted it.) Here
+        // `description: Worker` has a non-empty value so it does NOT open a block, and the following
+        // indented `  orphan: value` line therefore fails the column-0 anchor and is dropped.
+        let content = "---\nname: worker\ndescription: Worker\n  orphan: value\n---\n\nBody\n";
+        let parsed = parse_frontmatter_block(content);
+        assert_eq!(parsed.get("name"), Some("worker"));
+        assert_eq!(parsed.get("description"), Some("Worker"));
+        assert_eq!(parsed.get("orphan"), None, "an indented orphan line must not become a field");
+        assert!(!parsed.fields.iter().any(|(k, _)| k == "orphan"));
+    }
+
+    #[test]
+    fn deeply_indented_orphan_line_after_a_flat_key_is_ignored_not_captured_as_block() {
+        // A flat key with a NON-EMPTY value never opens a block, so a subsequent indented line is a
+        // true orphan (ignored), not a continuation. Contrast with the `permission:` (empty-value)
+        // case, which DOES open a block.
+        let content = "---\nname: worker\ndescription: Worker\nmodel: anthropic/claude\n      stray: 1\n---\n\nBody\n";
+        let parsed = parse_frontmatter_block(content);
+        assert_eq!(parsed.get("model"), Some("anthropic/claude"));
+        assert!(!parsed.fields.iter().any(|(k, _)| k == "stray"));
+    }
+
     // -----------------------------------------------------------------------------------------
     // Layer 2: parse_agent_file — valid full frontmatter (pi-subagents scout.md/worker.md shape)
     // -----------------------------------------------------------------------------------------
@@ -781,7 +830,7 @@ mod tests {
                 ToolRef::Builtin("intercom".to_string()),
             ])
         );
-        assert_eq!(def.thinking, Some(ThinkingLevel::Low));
+        assert_eq!(def.thinking, Some("low".to_string()));
         assert_eq!(def.system_prompt_mode, SystemPromptMode::Replace);
         assert!(def.inherit_project_context);
         assert!(!def.inherit_skills);
@@ -983,17 +1032,64 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn unrecognized_thinking_value_falls_back_to_none_without_skipping_file() {
+    fn unknown_thinking_string_survives_and_does_not_skip_the_file() {
+        // pi `thinking` is an OPEN string: an arbitrary (future/provider-specific) value is preserved
+        // verbatim, never dropped, and never causes the file to be skipped.
         let content = "---\nname: worker\ndescription: Worker\nthinking: super-duper\n---\n\nBody\n";
         let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
-        assert_eq!(def.thinking, None);
+        assert_eq!(def.thinking, Some("super-duper".to_string()));
+        assert!(def.present_fields.contains("thinking"));
+        // It is a KNOWN field, so it does NOT leak into extra_fields even though it is unrecognized.
+        assert!(!def.extra_fields.contains_key("thinking"));
     }
 
     #[test]
-    fn thinking_off_maps_to_none() {
-        let content = "---\nname: worker\ndescription: Worker\nthinking: off\n---\n\nBody\n";
+    fn thinking_off_is_preserved_as_explicit_off_distinct_from_unset() {
+        // Explicit `off` must survive as `Some("off")` — distinct from an agent that says nothing
+        // (`None`). The old closed 5-level enum conflated both to `None`.
+        let off = parse_agent_file(
+            "---\nname: worker\ndescription: Worker\nthinking: off\n---\n\nBody\n",
+            AgentSource::Project,
+            Path::new("/w.md"),
+        )
+        .expect("parses");
+        assert_eq!(off.thinking, Some("off".to_string()));
+
+        let unset = parse_agent_file(
+            "---\nname: worker\ndescription: Worker\n---\n\nBody\n",
+            AgentSource::Project,
+            Path::new("/w.md"),
+        )
+        .expect("parses");
+        assert_eq!(unset.thinking, None);
+        assert_ne!(off.thinking, unset.thinking, "off must not be conflated with unset");
+    }
+
+    #[test]
+    fn empty_thinking_value_collapses_to_unset() {
+        // pi treats an empty `thinking` value as falsy/no-op; it collapses to `None` (unset), while
+        // the key's literal presence is still tracked for the serializer's preserve round-trip.
+        let content = "---\nname: worker\ndescription: Worker\nthinking:\n---\n\nBody\n";
         let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(def.thinking, None);
+        assert!(def.present_fields.contains("thinking"));
+    }
+
+    #[test]
+    fn disabled_in_an_agent_file_is_an_unknown_extra_field_not_an_honored_flag() {
+        // pi never reads `frontmatter.disabled` into `AgentConfig.disabled` (only settings disable an
+        // agent); `disabled` is not a KNOWN field, so a `disabled:` line round-trips into extra_fields
+        // and leaves the typed `disabled` flag untouched (`None`) — a handcrafted file cannot disable
+        // itself.
+        let content = "---\nname: worker\ndescription: Worker\ndisabled: true\n---\n\nBody\n";
+        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.disabled, None, "disabled: in a file must NOT set the honored flag");
+        assert_eq!(
+            def.extra_fields.get("disabled").map(String::as_str),
+            Some("true"),
+            "disabled: is round-tripped as an unknown extra field"
+        );
+        assert!(def.present_fields.contains("disabled"));
     }
 
     #[test]
@@ -1155,7 +1251,7 @@ mod tests {
         let def = parse_agent_file(SCOUT_MD, AgentSource::Builtin, Path::new("scout.md"))
             .expect("real scout.md must parse to Some");
         assert_eq!(def.name, "scout");
-        assert_eq!(def.thinking, Some(ThinkingLevel::Low));
+        assert_eq!(def.thinking, Some("low".to_string()));
         assert!(def.inherit_project_context);
         assert_eq!(def.default_progress, Some(true));
         assert_eq!(

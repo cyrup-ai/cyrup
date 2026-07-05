@@ -59,7 +59,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::discovery::{self, AgentDiscoveryConfig};
+use crate::discovery::types::AgentSource;
+use crate::discovery::{self, AgentDiscoveryConfig, AgentDiscoveryResult};
 use crate::registration::SubagentExtensionConfig;
 use crate::spawn::{self, SpawnCommand};
 
@@ -765,6 +766,225 @@ fn humanize_duration(d: Duration) -> String {
     }
 }
 
+// =================================================================================================
+// `/subagents-doctor` human-readable inventory report (pi `buildDoctorReport`, doctor.ts:189-222)
+//
+// This is the report `/subagents-doctor` actually renders for a terminal user: a Runtime/session
+// block, a Filesystem block naming the four scratch directories with each one's existence status,
+// and a Discovery block giving per-source agent/chain counts plus a skills inventory. It is a
+// DIFFERENT surface from [`DoctorRunner`] above (whose Ok/Warn/Fail concurrent checks remain
+// available as a structured, machine-referenceable diagnostic): pi's user-facing doctor is this
+// inventory, not a pass/fail check matrix, so this is what the command output reproduces.
+//
+// The pi Permission-system and Intercom-bridge sections are intentionally omitted — both report on
+// pi companion packages (`pi-permission-system`/`pi-intercom`) that have no cyrup analog today
+// (deferred-companion), so rendering them here would only ever emit "unavailable" placeholders.
+// =================================================================================================
+
+/// Everything [`build_doctor_report`] renders, assembled by the caller (normally `extension.rs`'s
+/// `/subagents-doctor` handler) from cyrup's own resolved directory/session/discovery state — this
+/// type performs no I/O beyond the four `Filesystem`-section existence stats [`build_doctor_report`]
+/// itself does, mirroring [`DoctorRunner`]'s "caller assembles already-resolved inputs" convention.
+#[derive(Clone, Debug)]
+pub struct DoctorReportInput<'a> {
+    /// The working directory the report is scoped to (Runtime `- cwd:` line).
+    pub cwd: &'a Path,
+    /// Whether background/async subagent runs can be spawned in this environment (pi
+    /// `isAsyncAvailable` — Runtime `- async support:` line).
+    pub async_available: bool,
+    /// The already-resolved configured session directory string, or `"not configured"` when no
+    /// session dir is configured (pi `formatConfiguredSessionDir`).
+    pub configured_session_dir: String,
+    /// The current session's on-disk `.jsonl` file, if a session is resolvable; its parent
+    /// directory is rendered as the `- current session dir:` line.
+    pub current_session_file: Option<PathBuf>,
+    /// The current session id, if known.
+    pub current_session_id: Option<String>,
+    /// A non-fatal session-manager error to surface (pi's `- session manager: failed —` line),
+    /// rendered only when present.
+    pub session_error: Option<String>,
+    /// `Filesystem` block: the temp-scope root (pi `TEMP_ROOT_DIR`).
+    pub temp_root_dir: PathBuf,
+    /// `Filesystem` block: the async-runs directory (pi `ASYNC_DIR`).
+    pub async_runs_dir: PathBuf,
+    /// `Filesystem` block: the terminal-results directory (pi `RESULTS_DIR`).
+    pub results_dir: PathBuf,
+    /// `Filesystem` block: the chain-runs directory (pi `CHAIN_RUNS_DIR`).
+    pub chain_runs_dir: PathBuf,
+    /// The full re-scan-per-call discovery result (pi `discoverAgentsAll(cwd)`), from which the
+    /// `Discovery` block derives per-source agent/chain counts and the skills inventory.
+    pub discovered: &'a AgentDiscoveryResult,
+}
+
+/// Per-`AgentSource` tallies for one population (agents or chains), rendered as pi's
+/// `"builtin B, package P, user U, project J"` breakdown (pi `formatSourceCounts`,
+/// doctor.ts:84-86).
+#[derive(Clone, Copy, Debug, Default)]
+struct SourceCounts {
+    builtin: usize,
+    package: usize,
+    user: usize,
+    project: usize,
+}
+
+impl SourceCounts {
+    fn record(&mut self, source: AgentSource) {
+        match source {
+            AgentSource::Builtin => self.builtin += 1,
+            AgentSource::Package => self.package += 1,
+            AgentSource::User => self.user += 1,
+            AgentSource::Project => self.project += 1,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.builtin + self.package + self.user + self.project
+    }
+
+    /// pi `formatSourceCounts`: `"builtin {b}, package {p}, user {u}, project {j}"`.
+    fn breakdown(self) -> String {
+        format!(
+            "builtin {}, package {}, user {}, project {}",
+            self.builtin, self.package, self.user, self.project
+        )
+    }
+}
+
+/// pi `formatExistingDirectory` (doctor.ts:72-82): render one `Filesystem`-block line reporting
+/// whether `dir_path` exists, is a directory, and (implicitly) is usable. cyrup reports existence +
+/// directory-ness rather than performing pi's `access(2)` R/W bit probe — this crate forbids the
+/// unsafe syscalls that check would need, and a doctor *report* is deliberately read-only (the
+/// mutating write-probe that proves real writability lives in [`DoctorRunner`]'s
+/// `temp-dir-writable` check, not in this inventory line).
+fn format_existing_directory(label: &str, dir_path: &Path) -> String {
+    match std::fs::metadata(dir_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            format!("- {label}: missing ({})", dir_path.display())
+        }
+        Err(err) => format!("- {label}: failed ({}) — {err}", dir_path.display()),
+        Ok(meta) if !meta.is_dir() => {
+            format!("- {label}: failed ({}) — not a directory", dir_path.display())
+        }
+        Ok(_) => format!("- {label}: ok ({})", dir_path.display()),
+    }
+}
+
+/// The `Discovery` block (pi `formatDiscovery`, doctor.ts:130-153): per-source agent + chain counts
+/// plus a skills inventory. Full skill discovery (pi `discoverAvailableSkills`) is a separate,
+/// not-yet-implemented subsystem (Tier 5, C4) in this crate, so the skills line reports the distinct
+/// skill *pointers* declared across discovered agents (real data available today) and names the
+/// deferral, rather than fabricating a source-tiered available-skills inventory that no code
+/// produces yet.
+fn format_discovery(discovered: &AgentDiscoveryResult) -> Vec<String> {
+    let mut agent_counts = SourceCounts::default();
+    for agent in &discovered.agents {
+        agent_counts.record(agent.source);
+    }
+    let mut chain_counts = SourceCounts::default();
+    for chain in &discovered.chains {
+        chain_counts.record(chain.source);
+    }
+
+    let mut skill_pointers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for agent in &discovered.agents {
+        for skill in &agent.skills {
+            skill_pointers.insert(skill.as_str());
+        }
+    }
+    let skills_line = if skill_pointers.is_empty() {
+        "- skills: total 0 (full skill discovery not implemented in this build — Tier 5)".to_string()
+    } else {
+        format!(
+            "- skills: total {} referenced by agents ({}) — full skill discovery not implemented \
+             in this build (Tier 5)",
+            skill_pointers.len(),
+            skill_pointers.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
+
+    vec![
+        format!(
+            "- agents: total {} ({})",
+            agent_counts.total(),
+            agent_counts.breakdown()
+        ),
+        format!(
+            "- chains: total {} ({})",
+            chain_counts.total(),
+            chain_counts.breakdown()
+        ),
+        skills_line,
+    ]
+}
+
+/// Render the `Runtime` block's session lines (pi `formatSessionLines`, doctor.ts:118-128).
+fn format_session_lines(input: &DoctorReportInput) -> Vec<String> {
+    let session_file = input.current_session_file.as_deref();
+    let mut lines = vec![
+        format!("- configured session dir: {}", input.configured_session_dir),
+        format!(
+            "- current session file: {}",
+            session_file.map_or_else(
+                || "not available".to_string(),
+                |path| path.display().to_string()
+            )
+        ),
+        format!(
+            "- current session dir: {}",
+            session_file
+                .and_then(Path::parent)
+                .map_or_else(|| "not available".to_string(), |dir| dir.display().to_string())
+        ),
+        format!(
+            "- current session id: {}",
+            input
+                .current_session_id
+                .clone()
+                .unwrap_or_else(|| "not available".to_string())
+        ),
+    ];
+    if let Some(error) = &input.session_error {
+        lines.push(format!("- session manager: failed — {error}"));
+    }
+    lines
+}
+
+/// Build the `/subagents-doctor` inventory report (pi `buildDoctorReport`, doctor.ts:189-222):
+/// a `Runtime` block (cwd, async support, session file/dir/id), a `Filesystem` block naming the
+/// four scratch directories with each one's existence status, and a `Discovery` block with
+/// per-source agent/chain counts plus a skills inventory.
+#[must_use]
+pub fn build_doctor_report(input: &DoctorReportInput) -> String {
+    let mut lines = vec![
+        "Subagents doctor report".to_string(),
+        String::new(),
+        "Runtime".to_string(),
+        format!("- cwd: {}", input.cwd.display()),
+        format!(
+            "- async support: {}",
+            if input.async_available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ),
+    ];
+    lines.extend(format_session_lines(input));
+
+    lines.push(String::new());
+    lines.push("Filesystem".to_string());
+    lines.push(format_existing_directory("temp root", &input.temp_root_dir));
+    lines.push(format_existing_directory("async runs", &input.async_runs_dir));
+    lines.push(format_existing_directory("results", &input.results_dir));
+    lines.push(format_existing_directory("chain runs", &input.chain_runs_dir));
+
+    lines.push(String::new());
+    lines.push("Discovery".to_string());
+    lines.extend(format_discovery(input.discovered));
+
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1108,7 +1328,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.path().join("release.chain.json"),
-            "{\"name\":\"release\",\"description\":\"d\",\"steps\":[]}",
+            "{\"name\":\"release\",\"description\":\"d\",\"chain\":[]}",
         )
         .expect("write chain file");
 
@@ -1140,7 +1360,7 @@ mod tests {
         // `parse_subagent_settings_malformed_shape_is_an_error` test; restated here only to
         // document — not silently assume — why `run_discovery_checks`'s Fail-mapping arm below has
         // no reachable unit-test fixture of its own under this crate's current type contracts).
-        let raw = serde_json::json!({ "overrides": "not-an-object" });
+        let raw = serde_json::json!({ "agentOverrides": "not-an-object" });
         let result = discovery::parse_subagent_settings(Some(&raw));
         assert!(
             matches!(result, Err(crate::error::SubagentError::MalformedSettings(_))),
@@ -1381,5 +1601,133 @@ mod tests {
         // exact Ok/Warn outcome is exercised precisely by the dedicated
         // `binary_resolution_*` unit tests above instead.
         assert!(report.find(CHECK_BINARY_RESOLUTION).is_some());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // build_doctor_report (pi `buildDoctorReport`, doctor.ts:189-222)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn build_doctor_report_has_four_filesystem_dirs_and_per_source_counts() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+
+        // Two project-scope agents + one project-scope chain, so the Discovery block reports a
+        // per-source count of exactly 2 agents / 1 chain, all at project scope.
+        write_agent(&dir.path().join("agents"), "scout.md", "scout");
+        write_agent(&dir.path().join("agents"), "worker.md", "worker");
+        std::fs::write(
+            dir.path().join("agents").join("release.chain.json"),
+            "{\"name\":\"release\",\"description\":\"d\",\"chain\":[]}",
+        )
+        .expect("write chain file");
+
+        let cfg = AgentDiscoveryConfig {
+            project_agent_dirs: vec![dir.path().join("agents")],
+            project_chain_dirs: vec![dir.path().join("agents")],
+            ..AgentDiscoveryConfig::default()
+        };
+        let discovered = discovery::discover_agents_all(&cfg).expect("discovery succeeds");
+
+        // Four real filesystem dirs: three exist, `results` is deliberately never created so the
+        // report's `missing` status is exercised too.
+        let temp_root = dir.path().join("temp-root");
+        let async_runs = dir.path().join("async");
+        let chain_runs = dir.path().join("chain-runs");
+        let results = dir.path().join("results-never-created");
+        for existing in [&temp_root, &async_runs, &chain_runs] {
+            std::fs::create_dir_all(existing).expect("mkdir dir");
+        }
+
+        let session_file = dir.path().join("sessions").join("s.jsonl");
+        let input = DoctorReportInput {
+            cwd: dir.path(),
+            async_available: true,
+            configured_session_dir: "not configured".to_string(),
+            current_session_file: Some(session_file.clone()),
+            current_session_id: Some("sess-123".to_string()),
+            session_error: None,
+            temp_root_dir: temp_root.clone(),
+            async_runs_dir: async_runs.clone(),
+            results_dir: results.clone(),
+            chain_runs_dir: chain_runs.clone(),
+            discovered: &discovered,
+        };
+
+        let report = build_doctor_report(&input);
+
+        // Header + the three mandated sections.
+        assert!(report.starts_with("Subagents doctor report\n"), "{report}");
+        assert!(report.contains("\nRuntime\n"), "{report}");
+        assert!(report.contains("\nFilesystem\n"), "{report}");
+        assert!(report.contains("\nDiscovery\n"), "{report}");
+
+        // The four Filesystem directory lines, each labelled + path + status.
+        assert!(
+            report.contains(&format!("- temp root: ok ({})", temp_root.display())),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("- async runs: ok ({})", async_runs.display())),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("- results: missing ({})", results.display())),
+            "a never-created dir must render `missing`: {report}"
+        );
+        assert!(
+            report.contains(&format!("- chain runs: ok ({})", chain_runs.display())),
+            "{report}"
+        );
+
+        // Per-source Discovery counts.
+        assert!(
+            report.contains("- agents: total 2 (builtin 0, package 0, user 0, project 2)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- chains: total 1 (builtin 0, package 0, user 0, project 1)"),
+            "{report}"
+        );
+        assert!(report.contains("- skills: total 0"), "{report}");
+
+        // Runtime/session block.
+        assert!(report.contains("- async support: available"), "{report}");
+        assert!(report.contains(&format!("- cwd: {}", dir.path().display())), "{report}");
+        assert!(report.contains("- current session id: sess-123"), "{report}");
+        assert!(
+            report.contains(&format!(
+                "- current session dir: {}",
+                dir.path().join("sessions").display()
+            )),
+            "the current session dir must be the session file's parent: {report}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_report_renders_session_error_and_unavailable_async() {
+        let discovered = AgentDiscoveryResult::default();
+        let input = DoctorReportInput {
+            cwd: Path::new("/tmp/proj"),
+            async_available: false,
+            configured_session_dir: "not configured".to_string(),
+            current_session_file: None,
+            current_session_id: None,
+            session_error: Some("boom".to_string()),
+            temp_root_dir: PathBuf::from("/tmp/subagents/temp"),
+            async_runs_dir: PathBuf::from("/tmp/subagents/async"),
+            results_dir: PathBuf::from("/tmp/subagents/results"),
+            chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
+            discovered: &discovered,
+        };
+
+        let report = build_doctor_report(&input);
+        assert!(report.contains("- async support: unavailable"), "{report}");
+        assert!(report.contains("- current session file: not available"), "{report}");
+        assert!(report.contains("- current session id: not available"), "{report}");
+        assert!(report.contains("- session manager: failed — boom"), "{report}");
+        assert!(
+            report.contains("- agents: total 0 (builtin 0, package 0, user 0, project 0)"),
+            "{report}"
+        );
     }
 }

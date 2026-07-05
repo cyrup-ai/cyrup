@@ -753,3 +753,114 @@ fn r08_008_deadlock_guard_on_event_tier() {
     let cmd = HostCtx::command(ExtMode::Tui, true, std::path::PathBuf::from("."));
     assert!(cmd.require_command_tier().is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// P-3 (permission-system-port §4): the dispatch-budget FORGIVENESS for a sanctioned human wait.
+// A `before_tool_call` handler that holds a `HostCtx::begin_human_wait()` guard across a wait LONGER
+// than the invocation budget must NOT be timed out (it would fail-OPEN a permission gate); a handler
+// that blocks the SAME duration WITHOUT the guard is still budget-contained (unchanged fail-fast).
+// ---------------------------------------------------------------------------
+use std::time::Duration;
+
+/// Holds a P-3 human-wait guard across a pure-async wait `wait` longer than the budget, then Blocks.
+struct HumanGateExt {
+    id: ExtensionId,
+    wait: Duration,
+}
+#[async_trait::async_trait]
+impl NativeExtension for HumanGateExt {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[EventKind::ToolCall]);
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
+        // Enter a sanctioned human wait: the dispatch budget is suspended while the guard is held.
+        let _human_wait = ctx.begin_human_wait();
+        tokio::time::sleep(self.wait).await; // a "slow human" — longer than the budget
+        HookOutcome::Block { reason: Some("human rejected".to_string()) }
+    }
+}
+
+/// Blocks the same duration WITHOUT any human-wait guard (a cooperative runaway).
+struct SlowNoGateExt {
+    id: ExtensionId,
+    wait: Duration,
+}
+#[async_trait::async_trait]
+impl NativeExtension for SlowNoGateExt {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[EventKind::ToolCall]);
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        tokio::time::sleep(self.wait).await;
+        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()) }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p3_human_wait_forgives_the_dispatch_budget() {
+    use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+    let subs = Subscriptions::empty().with(EventKind::ToolCall);
+    // A native handler ctx carries the shared HumanWaitGate the dispatcher consults.
+    let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
+    // The handler waits 400ms — WAY past the 80ms budget — while holding the human-wait guard.
+    let handle = Arc::new(NativeHandle::new(
+        Arc::new(HumanGateExt { id: "human-gate".into(), wait: Duration::from_millis(400) }),
+        subs,
+        ctx,
+    ));
+
+    let dispatcher = Dispatcher::with_budget(Duration::from_millis(80));
+    dispatcher.add(handle).unwrap();
+
+    let ev = HostEvent::ToolCall {
+        call_id: "c1".into(),
+        name: "bash".into(),
+        input: json!({ "command": "rm -rf /" }),
+    };
+    let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
+    // FORGIVEN: the slow human decision is honored (Blocked), NOT skipped-and-passed (fail-open).
+    match reduced {
+        Reduced::Blocked { reason, .. } => {
+            assert_eq!(reason.as_deref(), Some("human rejected"), "the human decision reached the gate");
+        }
+        other => panic!("expected the slow human decision to Block, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p3_no_human_wait_is_still_budget_contained() {
+    use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+    let subs = Subscriptions::empty().with(EventKind::ToolCall);
+    let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
+    // Same 400ms wait, but NO human-wait guard: a cooperative runaway → budget-contained + skipped.
+    let handle = Arc::new(NativeHandle::new(
+        Arc::new(SlowNoGateExt { id: "slow-no-gate".into(), wait: Duration::from_millis(400) }),
+        subs,
+        ctx,
+    ));
+
+    let dispatcher = Dispatcher::with_budget(Duration::from_millis(80));
+    dispatcher.add(handle).unwrap();
+
+    let ev = HostEvent::ToolCall {
+        call_id: "c2".into(),
+        name: "bash".into(),
+        input: json!({ "command": "echo hi" }),
+    };
+    let start = std::time::Instant::now();
+    let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
+    let elapsed = start.elapsed();
+    // The runaway is contained ~at the budget (not its full 400ms wait) and SKIPPED → action passes.
+    assert!(elapsed < Duration::from_millis(300), "budget-contained near 80ms, took {elapsed:?}");
+    assert!(matches!(reduced, Reduced::Pass(_)), "a budget-timed-out handler is skipped (action proceeds)");
+}

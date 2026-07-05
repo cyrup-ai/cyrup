@@ -74,6 +74,13 @@ pub mod slash_commands;
 /// warning text). See [`cost`] for the full subsystem doc, including the dual-recursion rationale.
 pub mod cost;
 
+/// Bundled packaged resources (R-SA-132/134): the 7 `prompts/*.md` recipe templates and the
+/// `skills/pi-subagents/SKILL.md` operational skill this extension ships, discovered through the
+/// SAME `cyrup-resources` manifest plumbing the builtin agent personas use. See [`resources`] for
+/// the full subsystem doc, including why the manifest's directory entries are expanded to concrete
+/// files here.
+pub mod resources;
+
 // -------------------------------------------------------------------------------------------
 // SubagentExtensionConfig (func-SA §4.7; arch-SA §3.8) — tier 3 of R-SA-133
 // -------------------------------------------------------------------------------------------
@@ -103,12 +110,28 @@ pub struct SubagentExtensionConfig {
     /// Cap on the total number of subagent spawns permitted within one orchestrator session,
     /// across every run mode. Default 40 (func-SA §4.7).
     pub max_subagent_spawns_per_session: u32,
-    /// Cap on the number of tasks accepted into a single `parallel`-shaped call. Default 8
-    /// (func-SA §4.7).
-    pub parallel_max_tasks: u32,
-    /// Bounded-concurrency semaphore size for one `ParallelGroup`/`DynamicGroup` fan-out. Default
-    /// 4 (func-SA §4.7).
-    pub parallel_concurrency: u32,
+    /// Top-level parallel fan-out limits, as a NESTED object matching pi's
+    /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (types.ts:829-832/874) — NOT two
+    /// flat `parallelMaxTasks`/`parallelConcurrency` keys. Read via the [`Self::parallel_max_tasks`]
+    /// / [`Self::parallel_concurrency`] accessors, which fall back to pi's defaults (8 / 4) when the
+    /// object, or a field within it, is omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<TopLevelParallelConfig>,
+    /// Live-control notice thresholds/channels — pi `ExtensionConfig.control?: ControlConfig`
+    /// (types.ts:101-110/873). Feeds the control-notice state machine (`tui/notices.rs`); a resolved
+    /// view is produced by pi's `resolveControlConfig`. `None` = every threshold defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlConfig>,
+    /// Chain-specific extension config — pi `ExtensionConfig.chain?: { dynamicFanout?: { maxItems? } }`
+    /// (types.ts:834-838/875): the per-run cap on how many items a dynamic fan-out may expand to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<ExtensionChainConfig>,
+    /// Proactive skill-subagent suggestion config — pi
+    /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
+    /// (types.ts:840-845/880): an object of tuning knobs, or the literal `false` to disable the
+    /// feature entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proactive_skill_subagents: Option<ProactiveSkillSubagents>,
     /// Default directory new subagent session files are written under, when neither an inline
     /// call override nor an agent-frontmatter default supplies one. `None` defers to this crate's
     /// own computed default (owned by `exec`/`background`, not this type).
@@ -126,18 +149,28 @@ pub struct SubagentExtensionConfig {
     /// created under. `None` defers to a per-repository computed default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_base_dir: Option<PathBuf>,
-    /// An optional external command invoked once per `worktree: true` group after worktree
-    /// creation, before any child process is spawned into it (R-SA-063). Shape mirrors
-    /// [`crate::spawn::worktree::HookSpec`] exactly — see [`HookSpec`]'s own doc for the planned
-    /// convergence once that module is updated to reference this type.
+    /// An optional external setup script invoked once per `worktree: true` group after worktree
+    /// creation, before any child process is spawned into it (R-SA-063). Matches pi's
+    /// `ExtensionConfig.worktreeSetupHook?: string` (types.ts:876): a bare **script-path string**
+    /// (e.g. `"./scripts/setup-worktree.mjs"`), NOT a `{ command, args }` object — pi resolves it
+    /// into a runnable `{ hookPath, timeoutMs }` at spawn time (`subagent-runner.ts:1975`). The
+    /// crate-internal runnable shape (`spawn::worktree`'s `WorktreeSetupHookConfig`/[`HookSpec`]) is
+    /// derived from this path plus [`Self::worktree_setup_hook_timeout_ms`] downstream, not stored
+    /// here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktree_setup_hook: Option<HookSpec>,
+    pub worktree_setup_hook: Option<PathBuf>,
     /// Timeout, in milliseconds, for the worktree setup hook (R-SA-063: "target 30000ms, if
     /// unset"). `None` here means "use the hard-coded 30000ms default" — the concrete default
     /// constant itself lives in `spawn::worktree::DEFAULT_HOOK_TIMEOUT`, not duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
 }
+
+/// pi's hardcoded default for `parallel.maxTasks` (func-SA §4.7) — the cap applied when the nested
+/// `parallel` object, or its `maxTasks` field, is omitted from `config.json`.
+pub const DEFAULT_PARALLEL_MAX_TASKS: u32 = 8;
+/// pi's hardcoded default for `parallel.concurrency` (func-SA §4.7).
+pub const DEFAULT_PARALLEL_CONCURRENCY: u32 = 4;
 
 impl Default for SubagentExtensionConfig {
     /// Tier 5 of R-SA-133: the hardcoded extension defaults every other tier layers on top of.
@@ -147,8 +180,10 @@ impl Default for SubagentExtensionConfig {
             force_top_level_async: false,
             global_concurrency_limit: 20,
             max_subagent_spawns_per_session: 40,
-            parallel_max_tasks: 8,
-            parallel_concurrency: 4,
+            parallel: None,
+            control: None,
+            chain: None,
+            proactive_skill_subagents: None,
             default_session_dir: None,
             single_run_output_base_dir: None,
             max_subagent_depth: 2,
@@ -156,6 +191,40 @@ impl Default for SubagentExtensionConfig {
             worktree_setup_hook: None,
             worktree_setup_hook_timeout_ms: None,
         }
+    }
+}
+
+impl SubagentExtensionConfig {
+    /// The effective `parallel.maxTasks` (pi `ExtensionConfig.parallel?.maxTasks`), falling back to
+    /// [`DEFAULT_PARALLEL_MAX_TASKS`] (8) when the nested `parallel` object — or its `maxTasks`
+    /// field — is omitted.
+    #[must_use]
+    pub fn parallel_max_tasks(&self) -> u32 {
+        self.parallel
+            .as_ref()
+            .and_then(|p| p.max_tasks)
+            .unwrap_or(DEFAULT_PARALLEL_MAX_TASKS)
+    }
+
+    /// The effective `parallel.concurrency` (pi `ExtensionConfig.parallel?.concurrency`), falling
+    /// back to [`DEFAULT_PARALLEL_CONCURRENCY`] (4) when the nested `parallel` object — or its
+    /// `concurrency` field — is omitted.
+    #[must_use]
+    pub fn parallel_concurrency(&self) -> u32 {
+        self.parallel
+            .as_ref()
+            .and_then(|p| p.concurrency)
+            .unwrap_or(DEFAULT_PARALLEL_CONCURRENCY)
+    }
+
+    /// The per-run dynamic-fanout item cap (pi `ExtensionConfig.chain?.dynamicFanout?.maxItems`),
+    /// or `None` when unconfigured (the fan-out subsystem then applies its own hard default).
+    #[must_use]
+    pub fn dynamic_fanout_max_items(&self) -> Option<u32> {
+        self.chain
+            .as_ref()
+            .and_then(|c| c.dynamic_fanout.as_ref())
+            .and_then(|d| d.max_items)
     }
 }
 
@@ -184,6 +253,137 @@ pub struct HookSpec {
     pub command: PathBuf,
     /// Arguments passed to `command`, before the JSON-on-stdin payload.
     pub args: Vec<String>,
+}
+
+// -------------------------------------------------------------------------------------------
+// Nested config objects (pi types.ts:829-882) — the shapes pi's ExtensionConfig nests
+// -------------------------------------------------------------------------------------------
+
+/// pi `TopLevelParallelConfig` (types.ts:829-832): the nested `parallel: { maxTasks?, concurrency? }`
+/// object of [`SubagentExtensionConfig`]. Both fields are optional; an omitted field defers to the
+/// hardcoded pi default via [`SubagentExtensionConfig::parallel_max_tasks`] /
+/// [`SubagentExtensionConfig::parallel_concurrency`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TopLevelParallelConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+}
+
+/// pi `ExtensionChainConfig` (types.ts:834-838): the nested `chain: { dynamicFanout?: { maxItems? } }`
+/// object of [`SubagentExtensionConfig`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExtensionChainConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_fanout: Option<DynamicFanoutConfig>,
+}
+
+/// The `chain.dynamicFanout` object (pi types.ts:835-837): the per-run cap on how many items a
+/// dynamic fan-out step may expand to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DynamicFanoutConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+}
+
+/// One control-notice event class (pi `ControlEventType`, types.ts:98): the two activity-state
+/// transitions a run may raise a control notice for. Serializes as `active_long_running` /
+/// `needs_attention` (matching pi's string union and [`crate::background::ActivityState`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlEventType {
+    ActiveLongRunning,
+    NeedsAttention,
+}
+
+/// One control-notice delivery channel (pi `ControlNotificationChannel`, types.ts:99). Serializes
+/// as `event` / `async` / `intercom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlNotificationChannel {
+    Event,
+    Async,
+    Intercom,
+}
+
+/// pi `ControlConfig` (types.ts:101-110): the live-control notice thresholds/channels nested under
+/// [`SubagentExtensionConfig::control`]. Every field is optional; pi's `resolveControlConfig`
+/// derives a fully-defaulted `ResolvedControlConfig` from this plus per-call overrides. This crate
+/// carries the raw config shape faithfully so the resolved view (owned by the control-notice
+/// subsystem, `tui/notices.rs`) can be produced from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ControlConfig {
+    /// Master enable/disable for control notices (pi `ControlConfig.enabled`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Idle time (ms) after which a run is flagged `needs_attention` (pi `needsAttentionAfterMs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_attention_after_ms: Option<u64>,
+    /// Elapsed time (ms) after which a still-running run raises an `active_long_running` notice (pi
+    /// `activeNoticeAfterMs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_ms: Option<u64>,
+    /// Turn count after which an `active_long_running` notice is raised (pi `activeNoticeAfterTurns`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_turns: Option<u64>,
+    /// Token count after which an `active_long_running` notice is raised (pi `activeNoticeAfterTokens`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_notice_after_tokens: Option<u64>,
+    /// Consecutive failed tool attempts that escalate a run to `needs_attention` (pi
+    /// `failedToolAttemptsBeforeAttention`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_tool_attempts_before_attention: Option<u32>,
+    /// Which event classes to actually notify on (pi `notifyOn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_on: Option<Vec<ControlEventType>>,
+    /// Which channels to deliver notices through (pi `notifyChannels`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_channels: Option<Vec<ControlNotificationChannel>>,
+}
+
+/// pi `ProactiveSkillSubagentsConfig` (types.ts:840-845): the tuning knobs for proactive
+/// skill-subagent suggestions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProactiveSkillSubagentsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_references: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_recommendations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_agent: Option<String>,
+}
+
+/// pi `proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false` (types.ts:880): either a
+/// tuning-knob object, or the literal `false` to disable the feature entirely. Deserialized
+/// untagged so both a JSON object and a bare `false` parse.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ProactiveSkillSubagents {
+    /// The literal `false` (or `true`) form — `false` disables the feature.
+    Toggle(bool),
+    /// The full config-object form.
+    Config(ProactiveSkillSubagentsConfig),
+}
+
+impl ProactiveSkillSubagents {
+    /// Whether proactive skill-subagent suggestions are enabled: `false` when set to the literal
+    /// `false`, or when the config object's own `enabled` field is `Some(false)`; otherwise enabled
+    /// (pi treats a bare object or an omitted `enabled` as on).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            ProactiveSkillSubagents::Toggle(on) => *on,
+            ProactiveSkillSubagents::Config(cfg) => cfg.enabled.unwrap_or(true),
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -459,12 +659,11 @@ pub fn resolve_effective_config(
         })
         .or_else(|| settings.default_model.clone());
 
-    let settings_max_depth = agent_name
-        .and_then(|name| settings.override_for(name))
-        .and_then(|ov| match ov.max_subagent_depth {
-            crate::discovery::types::OverrideField::Value(v) => Some(v),
-            _ => None,
-        });
+    // Tier 7: pi has NO per-agent `maxSubagentDepth` settings override (`BuiltinAgentOverrideConfig`,
+    // agents.ts:65-79, carries none) — an earlier port invented one and consulted it here. The
+    // settings tier therefore never supplies a max depth; it resolves from `config.json` (tier 3),
+    // agent frontmatter (tier 4), or the hardcoded default (tier 5) instead.
+    let settings_max_depth: Option<u32> = None;
 
     // `model`'s hardcoded (tier 5) default is "no model resolved" — `Option<String>::None` — so
     // this field's `T` for `resolve_field` is itself `Option<String>`, with every candidate
@@ -503,18 +702,18 @@ pub fn resolve_effective_config(
     let parallel_concurrency = FieldCandidates {
         inline_call_override: inline.parallel_concurrency,
         settings: None,
-        extension_config: Some(extension_config.parallel_concurrency),
+        extension_config: Some(extension_config.parallel_concurrency()),
         agent_frontmatter: None,
     }
-    .resolve(SubagentExtensionConfig::default().parallel_concurrency);
+    .resolve(SubagentExtensionConfig::default().parallel_concurrency());
 
     let parallel_max_tasks = FieldCandidates {
         inline_call_override: inline.parallel_max_tasks,
         settings: None,
-        extension_config: Some(extension_config.parallel_max_tasks),
+        extension_config: Some(extension_config.parallel_max_tasks()),
         agent_frontmatter: None,
     }
-    .resolve(SubagentExtensionConfig::default().parallel_max_tasks);
+    .resolve(SubagentExtensionConfig::default().parallel_max_tasks());
 
     EffectiveConfig {
         model,
@@ -543,9 +742,13 @@ mod tests {
         assert!(!cfg.force_top_level_async);
         assert_eq!(cfg.global_concurrency_limit, 20);
         assert_eq!(cfg.max_subagent_spawns_per_session, 40);
-        assert_eq!(cfg.parallel_max_tasks, 8);
-        assert_eq!(cfg.parallel_concurrency, 4);
+        assert_eq!(cfg.parallel_max_tasks(), 8);
+        assert_eq!(cfg.parallel_concurrency(), 4);
         assert_eq!(cfg.max_subagent_depth, 2);
+        assert!(cfg.parallel.is_none());
+        assert!(cfg.control.is_none());
+        assert!(cfg.chain.is_none());
+        assert!(cfg.proactive_skill_subagents.is_none());
         assert!(cfg.default_session_dir.is_none());
         assert!(cfg.single_run_output_base_dir.is_none());
         assert!(cfg.worktree_base_dir.is_none());
@@ -556,11 +759,30 @@ mod tests {
     #[test]
     fn subagent_extension_config_round_trips_through_json() {
         let cfg = SubagentExtensionConfig {
-            worktree_setup_hook: Some(HookSpec {
-                command: PathBuf::from("/usr/bin/setup-worktree"),
-                args: vec!["--quiet".to_string()],
-            }),
+            worktree_setup_hook: Some(PathBuf::from("./scripts/setup-worktree.mjs")),
             worktree_setup_hook_timeout_ms: Some(15_000),
+            parallel: Some(TopLevelParallelConfig {
+                max_tasks: Some(12),
+                concurrency: Some(3),
+            }),
+            control: Some(ControlConfig {
+                needs_attention_after_ms: Some(5_000),
+                notify_on: Some(vec![ControlEventType::NeedsAttention]),
+                notify_channels: Some(vec![ControlNotificationChannel::Async]),
+                ..ControlConfig::default()
+            }),
+            chain: Some(ExtensionChainConfig {
+                dynamic_fanout: Some(DynamicFanoutConfig {
+                    max_items: Some(100),
+                }),
+            }),
+            proactive_skill_subagents: Some(ProactiveSkillSubagents::Config(
+                ProactiveSkillSubagentsConfig {
+                    enabled: Some(true),
+                    min_references: Some(2),
+                    ..ProactiveSkillSubagentsConfig::default()
+                },
+            )),
             ..SubagentExtensionConfig::default()
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
@@ -578,7 +800,105 @@ mod tests {
             serde_json::from_str(r#"{"maxSubagentDepth": 5}"#).expect("deserialize partial");
         assert_eq!(cfg.max_subagent_depth, 5);
         assert_eq!(cfg.global_concurrency_limit, 20);
-        assert_eq!(cfg.parallel_max_tasks, 8);
+        assert_eq!(cfg.parallel_max_tasks(), 8);
+    }
+
+    #[test]
+    fn subagent_extension_config_parses_pi_control_and_nested_parallel_shapes() {
+        // The exact pi ExtensionConfig shape (types.ts:864-882): nested `parallel {}`, `control {}`
+        // with all eight keys, `chain.dynamicFanout.maxItems`, `proactiveSkillSubagents` as an
+        // object, and `worktreeSetupHook` as a bare script-path string.
+        let cfg: SubagentExtensionConfig = serde_json::from_str(
+            r#"{
+                "parallel": { "maxTasks": 16, "concurrency": 6 },
+                "control": {
+                    "enabled": true,
+                    "needsAttentionAfterMs": 45000,
+                    "activeNoticeAfterMs": 120000,
+                    "activeNoticeAfterTurns": 8,
+                    "activeNoticeAfterTokens": 50000,
+                    "failedToolAttemptsBeforeAttention": 3,
+                    "notifyOn": ["active_long_running", "needs_attention"],
+                    "notifyChannels": ["event", "async", "intercom"]
+                },
+                "chain": { "dynamicFanout": { "maxItems": 250 } },
+                "proactiveSkillSubagents": { "enabled": true, "minReferences": 2, "preferredAgent": "scout" },
+                "worktreeSetupHook": "./scripts/setup-worktree.mjs"
+            }"#,
+        )
+        .expect("deserialize pi-shaped config");
+
+        // Nested parallel.
+        assert_eq!(cfg.parallel_max_tasks(), 16);
+        assert_eq!(cfg.parallel_concurrency(), 6);
+
+        // Control block, all keys.
+        let control = cfg.control.as_ref().expect("control present");
+        assert_eq!(control.enabled, Some(true));
+        assert_eq!(control.needs_attention_after_ms, Some(45_000));
+        assert_eq!(control.active_notice_after_ms, Some(120_000));
+        assert_eq!(control.active_notice_after_turns, Some(8));
+        assert_eq!(control.active_notice_after_tokens, Some(50_000));
+        assert_eq!(control.failed_tool_attempts_before_attention, Some(3));
+        assert_eq!(
+            control.notify_on.as_deref(),
+            Some(
+                [
+                    ControlEventType::ActiveLongRunning,
+                    ControlEventType::NeedsAttention
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            control.notify_channels.as_deref(),
+            Some(
+                [
+                    ControlNotificationChannel::Event,
+                    ControlNotificationChannel::Async,
+                    ControlNotificationChannel::Intercom
+                ]
+                .as_slice()
+            )
+        );
+
+        // chain.dynamicFanout.maxItems.
+        assert_eq!(cfg.dynamic_fanout_max_items(), Some(250));
+
+        // proactiveSkillSubagents object form.
+        let proactive = cfg.proactive_skill_subagents.as_ref().expect("present");
+        assert!(matches!(proactive, ProactiveSkillSubagents::Config(_)));
+        if let ProactiveSkillSubagents::Config(c) = proactive {
+            assert_eq!(c.enabled, Some(true));
+            assert_eq!(c.min_references, Some(2));
+            assert_eq!(c.preferred_agent.as_deref(), Some("scout"));
+        }
+        assert!(proactive.is_enabled());
+
+        // worktreeSetupHook script-path string form.
+        assert_eq!(
+            cfg.worktree_setup_hook.as_deref(),
+            Some(std::path::Path::new("./scripts/setup-worktree.mjs"))
+        );
+    }
+
+    #[test]
+    fn proactive_skill_subagents_parses_false_toggle_and_reports_disabled() {
+        let cfg: SubagentExtensionConfig =
+            serde_json::from_str(r#"{ "proactiveSkillSubagents": false }"#)
+                .expect("deserialize false toggle");
+        let proactive = cfg.proactive_skill_subagents.as_ref().expect("present");
+        assert!(matches!(proactive, ProactiveSkillSubagents::Toggle(false)));
+        assert!(!proactive.is_enabled());
+    }
+
+    #[test]
+    fn nested_parallel_field_omission_falls_back_to_pi_defaults() {
+        // An empty `parallel: {}` object still defers each omitted field to the pi default.
+        let cfg: SubagentExtensionConfig =
+            serde_json::from_str(r#"{ "parallel": { "concurrency": 9 } }"#).expect("deserialize");
+        assert_eq!(cfg.parallel_concurrency(), 9);
+        assert_eq!(cfg.parallel_max_tasks(), DEFAULT_PARALLEL_MAX_TASKS);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -702,8 +1022,10 @@ mod tests {
         SubagentExtensionConfig {
             max_subagent_depth: 7,
             global_concurrency_limit: 99,
-            parallel_concurrency: 11,
-            parallel_max_tasks: 33,
+            parallel: Some(TopLevelParallelConfig {
+                concurrency: Some(11),
+                max_tasks: Some(33),
+            }),
             ..SubagentExtensionConfig::default()
         }
     }
@@ -721,7 +1043,6 @@ mod tests {
             agent_name.to_string(),
             AgentOverrideConfig {
                 model: OverrideField::Value("settings-override-model".to_string()),
-                max_subagent_depth: OverrideField::Value(1),
                 ..Default::default()
             },
         );
@@ -757,7 +1078,8 @@ mod tests {
     }
 
     /// Tier 2 (per-agent settings override) wins over config.json/frontmatter/hardcoded when tier
-    /// 1 is absent, for BOTH `model` and `max_subagent_depth`.
+    /// 1 is absent, for `model`. `max_subagent_depth` has NO settings-override tier (Tier 7: pi has
+    /// no per-agent `maxSubagentDepth` override), so it falls through tier 2 to config.json (tier 3).
     #[test]
     fn fixture_tier2_settings_agent_override_wins_when_inline_absent() {
         let inline = InlineConfigOverrides::default();
@@ -779,8 +1101,10 @@ mod tests {
         );
         assert_eq!(resolved.model.tier, ConfigTier::Settings);
 
-        assert_eq!(resolved.max_subagent_depth.value, 1);
-        assert_eq!(resolved.max_subagent_depth.tier, ConfigTier::Settings);
+        // The settings tier no longer supplies a per-agent max depth; it resolves from config.json
+        // (`extension_config_fixture` sets `max_subagent_depth: 7`), NOT the settings tier.
+        assert_eq!(resolved.max_subagent_depth.value, 7);
+        assert_eq!(resolved.max_subagent_depth.tier, ConfigTier::ExtensionConfig);
     }
 
     /// Tier 2 falls back to the FLAT `subagents.defaultModel` (not the per-agent override) when
@@ -914,7 +1238,10 @@ mod tests {
         // tier 3 supplies max_subagent_depth and parallel_concurrency
         let ext_cfg = SubagentExtensionConfig {
             max_subagent_depth: 9,
-            parallel_concurrency: 6,
+            parallel: Some(TopLevelParallelConfig {
+                concurrency: Some(6),
+                max_tasks: None,
+            }),
             ..SubagentExtensionConfig::default()
         };
         // tier 4 has nothing relevant left to contribute uniquely (model already won by tier 2)

@@ -1,0 +1,519 @@
+//! Artifact quadruple writer + housekeeping sweep — Rust port of pi `shared/artifacts.ts`
+//! (T6, remediation §Tier-6 "Artifact quadruple").
+//!
+//! Every foreground subagent run leaves a small, inspectable on-disk record under a scoped,
+//! per-`cwd` artifacts directory: `<runId>_<agent>[_i]_input.md` (the task the child was given),
+//! `<runId>_<agent>[_i]_output.md` (its delivered answer), `<runId>_<agent>[_i].jsonl` (the run's
+//! observable event stream), and `<runId>_<agent>[_i]_meta.json` (usage/model/exit-code metadata) —
+//! matching pi's `getArtifactPaths` (`shared/artifacts.ts:29-39`). The four filenames and the
+//! `[^\w.-] -> _` agent-name sanitization are byte-for-byte faithful to pi so an artifact consumer
+//! (a human, a follow-up run, a debugging tool) sees the exact same layout.
+//!
+//! Housekeeping mirrors pi one-for-one: [`cleanup_old_artifacts`] is the 24h-throttled 7-day sweep
+//! (`shared/artifacts.ts:57-86`, a `.last-cleanup` marker gates re-scanning to once per day and
+//! deletes any artifact older than `max_age_days`), [`cleanup_all_artifact_dirs`] fans that sweep
+//! across the temp + per-session artifact roots (`shared/artifacts.ts:88-112`), and
+//! [`cleanup_old_chain_dirs`] is pi's separate 24h chain-runs sweep (`shared/settings.ts:162-185`).
+//! All housekeeping is best-effort: a file that vanishes or is unreadable mid-scan is skipped, never
+//! fatal to the caller (extension startup must not fail on a stale artifact).
+//!
+//! Directory scoping reuses the SAME `<home>/.cyrup/subagents/<subdir>/<cwd_key>` layout the
+//! background async/results roots use ([`crate::background::run_artifact_roots`]) so a project's
+//! artifacts, chain-runs, async runs, and results all live together under one per-`cwd` scope —
+//! the Rust analog of pi's shared scoped `TEMP_ROOT_DIR`.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::background::{cwd_key, subagents_home};
+
+/// Project-local artifact root (pi `PROJECT_ARTIFACT_ROOT = ".pi-subagents"`, rebranded).
+const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
+/// The `artifacts` leaf under both the project root and the scoped temp root.
+const ARTIFACTS_SUBDIR: &str = "artifacts";
+/// The `chain-runs` leaf (pi `CHAIN_RUNS_DIR`'s leaf + `getProjectChainRunsDir`).
+const CHAIN_RUNS_SUBDIR: &str = "chain-runs";
+/// Per-session artifact leaf under a session directory (pi `getArtifactsDir` session branch).
+const SESSION_ARTIFACTS_SUBDIR: &str = "subagent-artifacts";
+/// The throttle marker file pi writes at the root of a swept dir (`shared/artifacts.ts:5`).
+const CLEANUP_MARKER_FILE: &str = ".last-cleanup";
+
+/// One day, in milliseconds — the sweep throttle window (pi `24 * 60 * 60 * 1000`) and the
+/// chain-runs max age (pi `CHAIN_DIR_MAX_AGE_MS`).
+const ONE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
+
+/// The default artifact-cleanup horizon (pi `DEFAULT_ARTIFACT_CONFIG.cleanupDays`, `types.ts:899`).
+pub const DEFAULT_CLEANUP_DAYS: u64 = 7;
+
+/// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `types.ts:464-469`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactPaths {
+    /// `<base>_input.md` — the task the child was given.
+    pub input_path: PathBuf,
+    /// `<base>_output.md` — the child's delivered answer.
+    pub output_path: PathBuf,
+    /// `<base>.jsonl` — the run's observable NDJSON event stream.
+    pub jsonl_path: PathBuf,
+    /// `<base>_meta.json` — usage/model/exit-code metadata.
+    pub metadata_path: PathBuf,
+}
+
+/// Which of the four artifact files to write + the cleanup horizon (pi `ArtifactConfig`,
+/// `types.ts:471-478`). The [`Default`] impl reproduces pi's `DEFAULT_ARTIFACT_CONFIG`
+/// (`types.ts:893-900`) exactly: input/output/metadata on, **jsonl off**, 7-day cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactConfig {
+    /// Master switch: when `false`, nothing is written at all (pi `enabled`).
+    pub enabled: bool,
+    /// Write `_input.md` (pi `includeInput`, default `true`).
+    pub include_input: bool,
+    /// Write `_output.md` (pi `includeOutput`, default `true`).
+    pub include_output: bool,
+    /// Write `.jsonl` (pi `includeJsonl`, default `false`).
+    pub include_jsonl: bool,
+    /// Write `_meta.json` (pi `includeMetadata`, default `true`).
+    pub include_metadata: bool,
+    /// Delete artifacts older than this many days on sweep (pi `cleanupDays`, default `7`).
+    pub cleanup_days: u64,
+}
+
+impl Default for ArtifactConfig {
+    fn default() -> Self {
+        // pi `DEFAULT_ARTIFACT_CONFIG` (`types.ts:893-900`).
+        Self {
+            enabled: true,
+            include_input: true,
+            include_output: true,
+            include_jsonl: false,
+            include_metadata: true,
+            cleanup_days: DEFAULT_CLEANUP_DAYS,
+        }
+    }
+}
+
+impl ArtifactConfig {
+    /// The config the foreground single-run path writes with (T6): identical to pi's default EXCEPT
+    /// that the `.jsonl` event stream is enabled, so every foreground run leaves the full artifact
+    /// quadruple (`_input.md`/`_output.md`/`.jsonl`/`_meta.json`) rather than only three files. pi
+    /// leaves `includeJsonl` off in its GLOBAL default but writes the same `.jsonl` path verbatim
+    /// once a caller enables it (`runs/foreground/execution.ts:976-978`); this crate opts the
+    /// foreground path into it so the run's observable event stream is always captured alongside its
+    /// input/output/metadata.
+    #[must_use]
+    pub fn foreground() -> Self {
+        Self {
+            include_jsonl: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// `<cwd>/.cyrup-subagents` (pi `getProjectSubagentsDir`, `shared/artifacts.ts:8-10`).
+#[must_use]
+pub fn project_subagents_dir(cwd: &Path) -> PathBuf {
+    cwd.join(PROJECT_ARTIFACT_ROOT)
+}
+
+/// `<cwd>/.cyrup-subagents/artifacts` (pi `getProjectArtifactsDir`, `shared/artifacts.ts:12-14`).
+#[must_use]
+pub fn project_artifacts_dir(cwd: &Path) -> PathBuf {
+    project_subagents_dir(cwd).join(ARTIFACTS_SUBDIR)
+}
+
+/// `<cwd>/.cyrup-subagents/chain-runs` (pi `getProjectChainRunsDir`, `shared/artifacts.ts:16-18`).
+#[must_use]
+pub fn project_chain_runs_dir(cwd: &Path) -> PathBuf {
+    project_subagents_dir(cwd).join(CHAIN_RUNS_SUBDIR)
+}
+
+/// The scoped-temp artifacts root for `cwd` — the Rust analog of pi's `TEMP_ARTIFACTS_DIR`
+/// (`types.ts:961`), keyed per-`cwd` under the SAME `<home>/.cyrup/subagents` root the async/results
+/// dirs use ([`crate::background::run_artifact_roots`]).
+#[must_use]
+pub fn temp_artifacts_dir(cwd: &Path) -> PathBuf {
+    subagents_home().join(ARTIFACTS_SUBDIR).join(cwd_key(cwd))
+}
+
+/// The scoped-temp chain-runs root for `cwd` — the Rust analog of pi's `CHAIN_RUNS_DIR`, keyed
+/// per-`cwd` alongside [`temp_artifacts_dir`].
+#[must_use]
+pub fn chain_runs_dir(cwd: &Path) -> PathBuf {
+    subagents_home().join(CHAIN_RUNS_SUBDIR).join(cwd_key(cwd))
+}
+
+/// Resolve the artifacts directory for a run (pi `getArtifactsDir`, `shared/artifacts.ts:20-27`):
+/// a `project_cwd` wins (project-local artifacts dir), else a `session_file`'s sibling
+/// `subagent-artifacts` dir, else the scoped temp root keyed by `temp_cwd`.
+#[must_use]
+pub fn resolve_artifacts_dir(
+    session_file: Option<&Path>,
+    project_cwd: Option<&Path>,
+    temp_cwd: &Path,
+) -> PathBuf {
+    if let Some(project) = project_cwd {
+        return project_artifacts_dir(project);
+    }
+    if let Some(session) = session_file
+        && let Some(parent) = session.parent()
+    {
+        return parent.join(SESSION_ARTIFACTS_SUBDIR);
+    }
+    temp_artifacts_dir(temp_cwd)
+}
+
+/// Replace every character outside pi's `[\w.-]` class with `_` (pi `safeAgent`,
+/// `shared/artifacts.ts:31`). `\w` in the pi regex (no `u` flag) is exactly ASCII `[A-Za-z0-9_]`.
+fn safe_agent(agent: &str) -> String {
+    agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The four artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:29-39`): base is
+/// `<runId>_<safeAgent>[_<index>]`, with a per-fan-out `_<index>` suffix only when `index` is set.
+#[must_use]
+pub fn artifact_paths(dir: &Path, run_id: &str, agent: &str, index: Option<usize>) -> ArtifactPaths {
+    let suffix = index.map_or_else(String::new, |i| format!("_{i}"));
+    let base = format!("{run_id}_{}{suffix}", safe_agent(agent));
+    ArtifactPaths {
+        input_path: dir.join(format!("{base}_input.md")),
+        output_path: dir.join(format!("{base}_output.md")),
+        jsonl_path: dir.join(format!("{base}.jsonl")),
+        metadata_path: dir.join(format!("{base}_meta.json")),
+    }
+}
+
+/// Create the artifacts dir + every missing parent (pi `ensureArtifactsDir`,
+/// `shared/artifacts.ts:41-43`).
+///
+/// # Errors
+/// Propagates the underlying `create_dir_all` error.
+pub fn ensure_artifacts_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Write one artifact file's UTF-8 content (pi `writeArtifact`, `shared/artifacts.ts:45-47`).
+///
+/// # Errors
+/// Propagates the underlying write error.
+pub fn write_artifact(path: &Path, content: &str) -> io::Result<()> {
+    std::fs::write(path, content)
+}
+
+/// Write a pretty-printed JSON metadata file (pi `writeMetadata`, `shared/artifacts.ts:49-51`,
+/// which uses `JSON.stringify(metadata, null, 2)`).
+///
+/// # Errors
+/// Propagates a serialization or write error.
+pub fn write_metadata(path: &Path, metadata: &serde_json::Value) -> io::Result<()> {
+    let body = serde_json::to_string_pretty(metadata)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, body)
+}
+
+/// Append one newline-terminated line to the `.jsonl` event stream (pi `appendJsonl`,
+/// `shared/artifacts.ts:53-55`).
+///
+/// # Errors
+/// Propagates the underlying open/append error.
+pub fn append_jsonl(path: &Path, line: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// A file's modification time in whole milliseconds since the Unix epoch, or `None` if it cannot be
+/// determined (matches pi reading `stat.mtimeMs`).
+fn mtime_ms(path: &Path) -> Option<u128> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis())
+}
+
+/// The current wall-clock time in whole milliseconds since the Unix epoch (matches pi `Date.now()`).
+fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+/// 24h-throttled sweep of artifacts older than `max_age_days` in one directory (pi
+/// `cleanupOldArtifacts`, `shared/artifacts.ts:57-86`).
+///
+/// A `.last-cleanup` marker at the dir root gates re-scanning to at most once per 24h: if the marker
+/// was touched within the last day the sweep returns immediately (this is what makes the sweep cheap
+/// to call on every session start). Otherwise every file whose mtime predates the `max_age_days`
+/// cutoff is deleted (the marker itself is always skipped), and the marker is rewritten with the
+/// current timestamp. Best-effort throughout — a file that disappears or is unreadable mid-scan is
+/// skipped so one bad entry never blocks the rest.
+pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
+    if !dir.exists() {
+        return;
+    }
+
+    let marker = dir.join(CLEANUP_MARKER_FILE);
+    let now = now_ms();
+
+    // Throttle: skip if the marker was written within the last 24h (pi `now - stat.mtimeMs < 24h`).
+    if let Some(marker_mtime) = mtime_ms(&marker)
+        && now.saturating_sub(marker_mtime) < ONE_DAY_MS
+    {
+        return;
+    }
+
+    let cutoff = now.saturating_sub(u128::from(max_age_days).saturating_mul(ONE_DAY_MS));
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(CLEANUP_MARKER_FILE) {
+            continue;
+        }
+        if let Some(file_mtime) = mtime_ms(&path)
+            && file_mtime < cutoff
+        {
+            // Best-effort: a directory or a vanished file is simply skipped.
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // Rewrite the throttle marker (pi `fs.writeFileSync(markerPath, String(now))`).
+    let _ = std::fs::write(&marker, now.to_string());
+}
+
+/// Sweep every artifact directory this crate writes to (pi `cleanupAllArtifactDirs`,
+/// `shared/artifacts.ts:88-112`): the scoped temp artifacts root for `cwd`, plus each persisted
+/// session's sibling `subagent-artifacts` directory under `<home>/.cyrup/sessions`. Best-effort: an
+/// unreadable sessions root or session dir is skipped rather than failing startup.
+pub fn cleanup_all_artifact_dirs(cwd: &Path, max_age_days: u64) {
+    cleanup_old_artifacts(&temp_artifacts_dir(cwd), max_age_days);
+
+    let sessions_base = subagents_home()
+        .parent()
+        .map(|home| home.join("sessions"))
+        .unwrap_or_else(|| subagents_home().join("sessions"));
+    let Ok(entries) = std::fs::read_dir(&sessions_base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let artifacts_dir = entry.path().join(SESSION_ARTIFACTS_SUBDIR);
+        cleanup_old_artifacts(&artifacts_dir, max_age_days);
+    }
+}
+
+/// Remove chain-run scratch directories older than 24h (pi `cleanupOldChainDirs`,
+/// `shared/settings.ts:162-185`). Unlike [`cleanup_old_artifacts`] this is unthrottled and operates
+/// on whole subdirectories (each `<chainRunsDir>/<runId>/`), matching pi. Best-effort: a dir that
+/// cannot be stat'd or removed is skipped.
+pub fn cleanup_old_chain_dirs(cwd: &Path) {
+    let dir = chain_runs_dir(cwd);
+    if !dir.exists() {
+        return;
+    }
+    let now = now_ms();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        if let Some(dir_mtime) = mtime_ms(&path)
+            && now.saturating_sub(dir_mtime) > ONE_DAY_MS
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// The four content payloads for one run's artifact quadruple (T6), passed as a bundle to
+/// [`write_run_artifacts`] so it stays under clippy's argument-count ceiling.
+#[derive(Clone, Copy, Debug)]
+pub struct RunArtifactContent<'a> {
+    /// The `_input.md` body — the task the child was given (pi writes `# Task for <agent>\n\n<task>`).
+    pub input: &'a str,
+    /// The `_output.md` body — the child's delivered answer.
+    pub output: &'a str,
+    /// The `_meta.json` value — usage/model/exit-code metadata.
+    pub metadata: &'a serde_json::Value,
+    /// The `.jsonl` event lines (one NDJSON record per line).
+    pub jsonl_lines: &'a [String],
+}
+
+/// Write the full artifact quadruple for one completed run (T6 orchestration helper). Ensures the
+/// dir exists, then writes each of the four files gated on `cfg` — input (the task), the delivered
+/// output, its metadata, and the run's NDJSON event lines. Every write is best-effort: a failed
+/// artifact write must never change the run's observable result, so errors are swallowed and the
+/// resolved [`ArtifactPaths`] is always returned (matching pi, whose artifact writes are likewise
+/// side-effects of an already-produced `SingleResult`).
+///
+/// Returns `None` when `cfg.enabled` is `false` (no artifacts written), else `Some(paths)`.
+pub fn write_run_artifacts(
+    dir: &Path,
+    run_id: &str,
+    agent: &str,
+    index: Option<usize>,
+    content: &RunArtifactContent<'_>,
+    cfg: &ArtifactConfig,
+) -> Option<ArtifactPaths> {
+    if !cfg.enabled {
+        return None;
+    }
+    let paths = artifact_paths(dir, run_id, agent, index);
+    if ensure_artifacts_dir(dir).is_err() {
+        // If the dir cannot be created, no file can be written; still return the intended paths so a
+        // caller can surface them, matching pi (which computes the paths before the dir write too).
+        return Some(paths);
+    }
+    if cfg.include_input {
+        let _ = write_artifact(&paths.input_path, content.input);
+    }
+    if cfg.include_output {
+        let _ = write_artifact(&paths.output_path, content.output);
+    }
+    if cfg.include_metadata {
+        let _ = write_metadata(&paths.metadata_path, content.metadata);
+    }
+    if cfg.include_jsonl {
+        for line in content.jsonl_lines {
+            let _ = append_jsonl(&paths.jsonl_path, line);
+        }
+        // An empty event stream still leaves a (0-byte) `.jsonl` so the quadruple is always present.
+        if content.jsonl_lines.is_empty() {
+            let _ = write_artifact(&paths.jsonl_path, "");
+        }
+    }
+    Some(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    #[test]
+    fn artifact_paths_match_pi_getartifactpaths_naming() {
+        let dir = Path::new("/tmp/arts");
+        // No index → no `_<i>` suffix (pi `suffix = index !== undefined ? ...`).
+        let p = artifact_paths(dir, "run123", "reviewer", None);
+        assert_eq!(p.input_path, dir.join("run123_reviewer_input.md"));
+        assert_eq!(p.output_path, dir.join("run123_reviewer_output.md"));
+        assert_eq!(p.jsonl_path, dir.join("run123_reviewer.jsonl"));
+        assert_eq!(p.metadata_path, dir.join("run123_reviewer_meta.json"));
+
+        // With index → `_<i>` between agent and the file-kind suffix.
+        let pi_idx = artifact_paths(dir, "run123", "reviewer", Some(2));
+        assert_eq!(pi_idx.input_path, dir.join("run123_reviewer_2_input.md"));
+        assert_eq!(pi_idx.jsonl_path, dir.join("run123_reviewer_2.jsonl"));
+    }
+
+    #[test]
+    fn safe_agent_replaces_non_word_chars_like_pi() {
+        // pi `agent.replace(/[^\w.-]/g, "_")`: keep [A-Za-z0-9_.-], everything else → `_`.
+        assert_eq!(safe_agent("code-analysis.custom"), "code-analysis.custom");
+        assert_eq!(safe_agent("weird agent/name!"), "weird_agent_name_");
+        assert_eq!(safe_agent("a_b.c-d"), "a_b.c-d");
+    }
+
+    #[test]
+    fn default_config_matches_pi_default_artifact_config() {
+        let c = ArtifactConfig::default();
+        assert!(c.enabled && c.include_input && c.include_output && c.include_metadata);
+        assert!(!c.include_jsonl, "pi DEFAULT_ARTIFACT_CONFIG.includeJsonl is false");
+        assert_eq!(c.cleanup_days, 7);
+        // The foreground variant additionally captures the event stream.
+        assert!(ArtifactConfig::foreground().include_jsonl);
+    }
+
+    #[test]
+    fn write_run_artifacts_writes_the_full_quadruple_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let art_dir = dir.path().join("arts");
+        let meta = serde_json::json!({ "runId": "r1", "agent": "worker", "exitCode": 0 });
+        let jsonl = ["{\"type\":\"final\"}".to_string()];
+        let paths = write_run_artifacts(
+            &art_dir,
+            "r1",
+            "worker",
+            None,
+            &RunArtifactContent {
+                input: "# Task for worker\n\ndo the thing",
+                output: "the answer",
+                metadata: &meta,
+                jsonl_lines: &jsonl,
+            },
+            &ArtifactConfig::foreground(),
+        )
+        .expect("enabled config writes artifacts");
+
+        for p in [&paths.input_path, &paths.output_path, &paths.jsonl_path, &paths.metadata_path] {
+            assert!(p.exists(), "expected artifact file to exist: {}", p.display());
+        }
+        assert_eq!(std::fs::read_to_string(&paths.output_path).unwrap(), "the answer");
+        assert!(std::fs::read_to_string(&paths.input_path).unwrap().contains("do the thing"));
+        assert!(std::fs::read_to_string(&paths.metadata_path).unwrap().contains("\"exitCode\": 0"));
+        assert!(std::fs::read_to_string(&paths.jsonl_path).unwrap().contains("\"type\":\"final\""));
+    }
+
+    #[test]
+    fn write_run_artifacts_omits_jsonl_under_pi_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({});
+        let paths = write_run_artifacts(
+            dir.path(),
+            "r2",
+            "worker",
+            None,
+            &RunArtifactContent { input: "in", output: "out", metadata: &meta, jsonl_lines: &[] },
+            &ArtifactConfig::default(),
+        )
+        .unwrap();
+        assert!(paths.input_path.exists() && paths.output_path.exists() && paths.metadata_path.exists());
+        assert!(!paths.jsonl_path.exists(), "pi default leaves the .jsonl unwritten");
+    }
+
+    #[test]
+    fn cleanup_removes_old_files_but_keeps_fresh_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old_output.md");
+        let fresh = dir.path().join("fresh_output.md");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&fresh, "fresh").unwrap();
+
+        // Backdate `old`'s mtime to 10 days ago (older than the 7-day horizon).
+        let ten_days_ago = SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+        let ft = filetime::FileTime::from_system_time(ten_days_ago);
+        filetime::set_file_mtime(&old, ft).unwrap();
+
+        cleanup_old_artifacts(dir.path(), DEFAULT_CLEANUP_DAYS);
+
+        assert!(!old.exists(), "a 10-day-old artifact is swept under the 7-day horizon");
+        assert!(fresh.exists(), "a fresh artifact survives the sweep");
+        assert!(dir.path().join(CLEANUP_MARKER_FILE).exists(), "the throttle marker is written");
+    }
+
+    #[test]
+    fn cleanup_is_throttled_by_a_fresh_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old_output.md");
+        std::fs::write(&old, "old").unwrap();
+        let ten_days_ago = SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+        filetime::set_file_mtime(&old, filetime::FileTime::from_system_time(ten_days_ago)).unwrap();
+
+        // A marker touched "now" must short-circuit the sweep entirely (pi 24h throttle).
+        std::fs::write(dir.path().join(CLEANUP_MARKER_FILE), now_ms().to_string()).unwrap();
+
+        cleanup_old_artifacts(dir.path(), DEFAULT_CLEANUP_DAYS);
+        assert!(old.exists(), "a fresh throttle marker skips the sweep, so the old file survives");
+    }
+}

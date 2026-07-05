@@ -70,7 +70,10 @@ fn command_ctx(cwd: &std::path::Path) -> HostCtx {
 // =====================================================================================================
 
 #[tokio::test]
-async fn subagents_models_command_reports_the_real_static_seed_catalog() {
+async fn subagents_models_command_reports_the_runtime_builtin_model_mapping() {
+    // pi `/subagents-models` (slash-commands.ts:1090-1111 -> `handleModels`) reports the RUNTIME
+    // builtin-agent -> model mapping, NOT a dump of the static provider catalog. This asserts the
+    // mapping's header/shape and that it no longer dumps the catalog.
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
@@ -89,12 +92,17 @@ async fn subagents_models_command_reports_the_real_static_seed_catalog() {
         !output.contains("recognized by the subagents extension"),
         "the stub placeholder text must be gone: {output}"
     );
-    let catalog = cyrup_provider::catalog::seed_catalog();
-    assert!(!catalog.is_empty(), "sanity: the seed catalog is genuinely non-empty");
-    let sample = catalog.first().expect("checked non-empty above");
     assert!(
-        output.contains(sample.id.as_str()),
-        "the rendered report must contain a REAL model id from the static seed catalog: {output}"
+        output.starts_with("Builtin subagent models\n"),
+        "the report must be the runtime builtin->model mapping, not a catalog dump: {output}"
+    );
+    assert!(
+        output.contains("Current session model:"),
+        "the runtime mapping reports the current session model line: {output}"
+    );
+    assert!(
+        !output.contains("reasoning="),
+        "the report must NOT dump the static provider catalog's per-model context/reasoning rows: {output}"
     );
 }
 

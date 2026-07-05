@@ -15,9 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{PackageId, ThinkingLevel};
+use cyrup_core::PackageId;
 use cyrup_ext_subagents::discovery::types::{
-    AgentOverrideConfig, AgentReadScope, AgentSource, OverrideField, SubagentSettings,
+    AgentOverrideConfig, AgentReadScope, AgentSource, LayeredOverrideSettings, OverrideField,
+    SubagentSettings, ToolRef,
 };
 use cyrup_ext_subagents::discovery::{AgentDiscoveryConfig, discover_agents, discover_agents_all};
 use cyrup_resources::package::source::PackageSource;
@@ -86,7 +87,9 @@ fn installed_packages_pointing_at(pkg_root: &Path) -> InstalledPackages {
 ///     scoped-user-only.md
 ///   project/
 ///     shared-name.md        (Project; wins the whole four-tier merge, R-SA-001)
-///     disabled-agent.md     (Project; disabled: true — visibility split, R-SA-013)
+///     disabled-agent.md     (Project; disabled via a project SETTINGS override — visibility split,
+///                            R-SA-013. A file-level `disabled:` is an unknown extra field, not the
+///                            honored flag — only settings disable an agent.)
 ///     nested-fanout.md      (Project; tools includes literal "subagent" -> R-SA-016 eligible)
 ///     mcp-only.md            (Project; tools is only "mcp:subagent" -> R-SA-016 NOT eligible)
 ///     depth-limited.md       (Project; maxSubagentDepth: 1 -> feeds R-SA-022's tightening input)
@@ -170,10 +173,12 @@ fn build_four_scope_fixture() -> FourScopeFixture {
         "shared-name",
         "project shared-name (must win the whole four-tier merge)",
     );
+    // Plain project agent — it is disabled below via a SETTINGS override, not a file-level
+    // `disabled:` line (which pi treats as an unknown extra field, never the honored flag).
     write_agent(
         &project_dir,
         "disabled-agent.md",
-        "disabled: true\n",
+        "",
         "disabled-agent",
         "a disabled project agent",
     );
@@ -219,13 +224,33 @@ fn build_four_scope_fixture() -> FourScopeFixture {
     overrides.insert(
         "delegate".to_string(),
         AgentOverrideConfig {
-            thinking: OverrideField::Value(ThinkingLevel::High),
+            thinking: OverrideField::Value("high".to_string()),
             ..Default::default()
         },
     );
-    let settings = SubagentSettings {
-        overrides,
-        ..Default::default()
+    // Tier 7: settings are carried unflattened, per scope. The `delegate` (builtin) override lives
+    // in the user scope. The project scope disables `disabled-agent` via a settings override — pi
+    // disables an agent ONLY through settings (`agentOverrides.<name>.disabled` / `disableBuiltins`),
+    // never a frontmatter `disabled:` line — so the R-SA-013 visibility split is driven from here.
+    let mut project_overrides = std::collections::BTreeMap::new();
+    project_overrides.insert(
+        "disabled-agent".to_string(),
+        AgentOverrideConfig {
+            disabled: OverrideField::Value(true),
+            ..Default::default()
+        },
+    );
+    let override_settings = LayeredOverrideSettings {
+        user: SubagentSettings {
+            overrides,
+            ..Default::default()
+        },
+        project: SubagentSettings {
+            overrides: project_overrides,
+            ..Default::default()
+        },
+        user_settings_path: PathBuf::from("/user/settings.json"),
+        project_settings_path: Some(PathBuf::from("/proj/settings.json")),
     };
 
     let cfg = AgentDiscoveryConfig {
@@ -238,7 +263,7 @@ fn build_four_scope_fixture() -> FourScopeFixture {
         user_chain_dirs: Vec::new(),
         project_agent_dirs: vec![project_dir],
         project_chain_dirs: Vec::new(),
-        settings,
+        override_settings,
     };
 
     FourScopeFixture { _root: root, cfg }
@@ -444,7 +469,7 @@ fn builtin_override_applies_end_to_end_through_full_discovery_pipeline() {
         .iter()
         .find(|a| a.name == "delegate")
         .expect("builtin delegate present");
-    assert_eq!(delegate.thinking, Some(ThinkingLevel::High));
+    assert_eq!(delegate.thinking, Some("high".to_string()));
     assert!(delegate.override_info.is_some());
 }
 
@@ -646,6 +671,71 @@ fn bundled_builtin_personas_are_visible_through_the_delegation_view_too() {
         assert!(
             result.agents.iter().any(|a| a.name == *expected_name),
             "delegation view must include bundled builtin persona '{expected_name}'"
+        );
+    }
+}
+
+/// The bare tool-name string a [`ToolRef`] carries, regardless of variant — a bare frontmatter
+/// tool name (no `mcp:` prefix) parses to [`ToolRef::Builtin`] (`from_tool_string`), but this test
+/// treats every variant uniformly so it asserts on the resolved name in all cases.
+fn tool_ref_name(tool: &ToolRef) -> &str {
+    match tool {
+        ToolRef::Builtin(name) | ToolRef::Mcp(name) | ToolRef::ExtensionPath(name) => name.as_str(),
+    }
+}
+
+/// T8 (16-cyrup-ext-subagents.md moderate row + remediation Tier 8): the bundled `researcher`
+/// persona must name only tools that ACTUALLY EXIST for a subagent child in cyrup. The earlier
+/// byte-for-byte port carried pi's `web_search`/`fetch_content`/`get_search_content` verbatim —
+/// none of which cyrup registers (cyrup-tools registers exactly `bash/edit/find/grep/ls/read/write`)
+/// — so a discovered researcher advertised three phantom tools to its child. This pins that the
+/// persona's resolved `tools` allowlist references only real tool names and NONE of the three
+/// phantom web-tool names.
+#[test]
+fn bundled_researcher_persona_names_only_real_cyrup_tools() {
+    // The tool names that genuinely exist for a subagent child: the registered `cyrup-tools` file
+    // tools, plus the subagent coordination tools the crate's own completion-guard read-only set
+    // recognizes (`intercom`/`contact_supervisor`) and that the other bundled personas reference.
+    const REAL_TOOL_NAMES: &[&str] = &[
+        "read",
+        "write",
+        "edit",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "intercom",
+        "contact_supervisor",
+    ];
+    // The phantom pi web tools cyrup does not register — must not appear in any bundled persona.
+    const PHANTOM_TOOL_NAMES: &[&str] = &["web_search", "fetch_content", "get_search_content"];
+
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let result = discover_agents_all(&cfg).expect("builtin-only discovery succeeds");
+    let researcher = result
+        .agents
+        .iter()
+        .find(|a| a.name == "researcher")
+        .expect("researcher persona must be discovered");
+    let tools = researcher
+        .tools
+        .as_ref()
+        .expect("researcher must declare a tools allowlist");
+    assert!(!tools.is_empty(), "researcher must declare at least one tool");
+
+    for tool in tools {
+        let name = tool_ref_name(tool);
+        assert!(
+            !PHANTOM_TOOL_NAMES.contains(&name),
+            "researcher must not reference the phantom (unregistered) tool '{name}'"
+        );
+        assert!(
+            REAL_TOOL_NAMES.contains(&name),
+            "researcher references '{name}', which is not a real cyrup tool; \
+             real tools are {REAL_TOOL_NAMES:?}"
         );
     }
 }

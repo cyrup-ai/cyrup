@@ -91,6 +91,10 @@ use std::io::Write;
 enum ScriptStep {
     /// Write `line` (plus a trailing `\n`) to stdout and flush immediately.
     Emit { line: String },
+    /// Write `line` (plus a trailing `\n`) to STDERR — for exercising the executor's
+    /// stderr-into-error surfacing on a non-zero exit (pi `execution.ts:686`). stderr is not
+    /// protocol data (R-SA-046), so this is diagnostic text a real child could equally emit.
+    EmitStderr { line: String },
     /// Sleep for `ms` milliseconds before continuing to the next step.
     SleepMs { ms: u64 },
 }
@@ -240,6 +244,10 @@ async fn main() {
             ScriptStep::Emit { line } => {
                 let _ = writeln!(out, "{line}");
                 let _ = out.flush();
+            }
+            ScriptStep::EmitStderr { line } => {
+                let _ = writeln!(std::io::stderr(), "{line}");
+                let _ = std::io::stderr().flush();
             }
             ScriptStep::SleepMs { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;

@@ -207,15 +207,60 @@ impl Dispatcher {
 
     /// Wrap one guest call with the invocation budget. The `Extension` impl already contains panics
     /// (native) and traps/epoch/OOM (wasm); this adds the time budget for cooperative runaways.
+    ///
+    /// P-3 forgiveness: a handler that exposes a [`crate::native::HumanWaitGate`]
+    /// ([`Extension::human_wait_gate`], today only the permission gate) may enter a sanctioned human
+    /// wait; while that gate `is_waiting()` the budget watchdog is SUSPENDED so a slow human answer
+    /// does not fire the budget and fail-OPEN the gate. A handler with no gate — or one whose gate is
+    /// idle (a cooperative runaway that never began a human wait) — keeps the exact fail-fast timeout.
     async fn invoke_contained(
         &self,
         ext: &Arc<dyn Extension>,
         ev: &HostEvent,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError> {
-        match tokio::time::timeout(self.budget, ext.invoke_event(ev, cancel)).await {
-            Ok(r) => r,
-            Err(_) => Err(ExtError::EpochTimeout),
+        let call = ext.invoke_event(ev, cancel);
+        match ext.human_wait_gate() {
+            Some(gate) => Self::invoke_with_human_wait_forgiveness(self.budget, &gate, call).await,
+            None => match tokio::time::timeout(self.budget, call).await {
+                Ok(r) => r,
+                Err(_) => Err(ExtError::EpochTimeout),
+            },
+        }
+    }
+
+    /// The budget watchdog that honors a sanctioned human wait (P-3). The `select!` ALWAYS polls the
+    /// handler future `call` (that is the branch that will drop the human-wait guard), racing it
+    /// against the budget deadline. When the deadline elapses it forgives ONLY if a human wait is in
+    /// progress — it re-arms the deadline a fresh budget out and keeps polling `call` (the budget clock
+    /// advances only while NOT waiting); it must NOT await anything else here, or it would suspend the
+    /// very handler whose completion ends the wait (a deadlock). With no human wait it fails the
+    /// handler with `EpochTimeout`, exactly as the plain budget path does for a cooperative runaway.
+    async fn invoke_with_human_wait_forgiveness<F>(
+        budget: Duration,
+        gate: &crate::native::HumanWaitGate,
+        call: F,
+    ) -> Result<HookOutcome, ExtError>
+    where
+        F: std::future::Future<Output = Result<HookOutcome, ExtError>>,
+    {
+        tokio::pin!(call);
+        let mut deadline = tokio::time::Instant::now() + budget;
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut call => return r,
+                () = tokio::time::sleep_until(deadline) => {
+                    if gate.is_waiting() {
+                        // Sanctioned human wait still in progress: forgive — push the deadline out a
+                        // fresh budget and loop, continuing to poll `call` (never suspend it).
+                        deadline = tokio::time::Instant::now() + budget;
+                    } else {
+                        // No human wait ⇒ a cooperative runaway: unchanged fail-fast behavior.
+                        return Err(ExtError::EpochTimeout);
+                    }
+                }
+            }
         }
     }
 

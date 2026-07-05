@@ -1,51 +1,41 @@
-//! Git-worktree isolation for `worktree: true` parallel fan-out groups (func-SA §5.3
-//! R-SA-060..065; arch-SA §6.4's "Worktree setup ordering" section).
+//! Git-worktree isolation for `worktree: true` parallel fan-out groups — a faithful port of
+//! pi-subagents' `src/runs/shared/worktree.ts`.
 //!
-//! # What this module does, and the ordering it enforces
+//! # What this module does (pi parity)
 //!
-//! For a `ParallelGroup` opted into worktree isolation, every concurrently-spawned child MUST get
-//! its own dedicated working directory carved out of the shared repository via `git worktree add`
-//! (R-SA-061) — never a shared cwd, which would let sibling children stomp on each other's
-//! uncommitted changes. The whole setup sequence is entirely synchronous-before-any-spawn
-//! (arch-SA §6.4):
+//! For a fan-out group opted into worktree isolation, every concurrently-spawned child gets its
+//! own dedicated working directory carved out of the shared repository via `git worktree add`
+//! (never a shared cwd, which would let siblings stomp on each other's uncommitted changes). This
+//! module reproduces pi's observable behavior exactly:
 //!
-//! 1. [`check_clean_working_tree`] — `git status --porcelain` MUST report empty output in the
-//!    shared cwd, or the entire group fails before any worktree (let alone any child process) is
-//!    created (R-SA-060). No partial/degraded non-isolated fallback is ever attempted.
-//! 2. [`reject_task_level_cwd_overrides`] — every task in the group is scanned for an explicit
-//!    `cwd` override, which would defeat isolation; if any is found, the whole group is rejected
-//!    (R-SA-062) with an all-tasks-failed result, never a partial run.
-//! 3. Only once both of the above pass, [`create_worktrees`] loops `git worktree add <path> -b
-//!    <branch> <base_commit>` once per task index (R-SA-061), and — if a hook is configured —
-//!    [`run_setup_hook`] invokes it with a bounded timeout (R-SA-063), enforcing the
-//!    synthetic-path safety rail (R-SA-064) against its response.
-//!
-//! Any failure at any point in step 3 triggers [`cleanup_worktrees`] (best-effort per worktree,
-//! R-SA-065) over whatever worktrees were already created, and the entire group aborts with zero
-//! children spawned — this module never hands back a partially-isolated group.
+//! - [`create_worktrees`] — verifies the shared tree is clean, resolves the repo-relative
+//!   subdirectory (so each child's `agent_cwd` maps to the same subpath inside its worktree),
+//!   creates one worktree/branch per task from `HEAD`, optionally symlinks `node_modules`, and runs
+//!   an optional **per-worktree** setup hook. A failure at any point rolls back everything created
+//!   so far and aborts with zero children spawned.
+//! - [`diff_worktrees`] / [`capture_worktree_diff`] — the harvest side (C18): after the group runs,
+//!   each worktree's work is captured as a per-task `.patch` plus a numstat summary, with
+//!   hook-declared synthetic paths (and the `node_modules` symlink) removed *before* diffing so
+//!   setup scaffolding never leaks into the captured patch.
+//! - [`cleanup_worktrees`] — best-effort removal of every worktree + branch, then `git worktree
+//!   prune`. Called on the **success** path (after harvest) as well as on rollback (C18).
+//! - [`find_worktree_task_cwd_conflict`] — rejects a group only when a task's own `cwd` override
+//!   points somewhere *other* than the shared cwd; a task cwd equal to the shared cwd is allowed.
 //!
 //! # Why this shells out to a real `git` subprocess, never a Rust git library
 //!
-//! Per func-SA §9 item 15, `git worktree`/`git status` invocation deliberately shells out via
-//! subprocess — consistent with this crate's subprocess-first design (func-SA §1.1) and exact
-//! stderr/stdout parity with the real `git` CLI's own error messages — rather than going through a
-//! Rust git library (e.g. `gix`, which `cyrup-resources` uses for its own clone/checkout needs;
-//! `git worktree` specifically has no mature `gix` equivalent as of this writing). This is a
-//! deliberate, documented choice, not an oversight: unlike `cyrup-resources`' clone/fetch/checkout
-//! needs (which gix serves well), `git worktree add`/`git status --porcelain` are thin,
-//! well-specified CLI surfaces this crate calls directly.
+//! `git worktree`/`git status`/`git diff` invocation deliberately shells out via subprocess —
+//! consistent with this crate's subprocess-first design and exact stderr/stdout parity with the
+//! real `git` CLI — rather than going through a Rust git library (`git worktree` has no mature
+//! `gix` equivalent). This mirrors pi's own `spawnSync("git", ...)` usage.
 //!
-//! # Scope note: `SingleStep`/`RunnerStep` integration is a later phase
+//! # Legacy compatibility surface
 //!
-//! `spawn::chain_graph::RunnerStep`/`ParallelGroup`/`SingleStep` (the real discriminated-union
-//! chain-graph types, arch-SA §2.2 Phase 3) are not yet built out in this crate (as of this file).
-//! This module is therefore written against a minimal, self-contained view of what it actually
-//! needs from a group of tasks — a per-task optional cwd override
-//! ([`reject_task_level_cwd_overrides`]'s `task_cwd_overrides: &[Option<&Path>]` parameter) and a
-//! task count ([`WorktreeGroupPlan::task_count`]) — rather than depending on the not-yet-existing
-//! `SingleStep` type. Once `spawn::chain_graph` lands, its fan-out driver is expected to call
-//! straight into [`setup_worktree_group`], passing each `SingleStep`'s own `cwd: Option<PathBuf>`
-//! field as that slice; no change to this module's own logic is anticipated.
+//! [`setup_worktree_group`] (plus [`WorktreeGroupConfig`]/[`WorktreeGroupPlan`]/
+//! [`WorktreeAssignment`], [`HookSpec`], [`DEFAULT_HOOK_TIMEOUT`], [`check_clean_working_tree`],
+//! [`reject_task_level_cwd_overrides`]) are retained as thin wrappers over the pi-faithful
+//! primitives so existing callers (`spawn::chain_graph::assign_worktree_cwds`) keep compiling while
+//! the crate converges on pi's `create_worktrees`/`diff_worktrees`/`cleanup_worktrees` contract.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -55,635 +45,1200 @@ use tokio::process::Command;
 
 use crate::error::SubagentError;
 
-/// Default bound on how long the optional setup hook may run before its worktree group is failed
-/// (R-SA-063: "target 30000ms, if unset").
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(30_000);
+/// Default bound on the optional setup hook's total runtime, in milliseconds (pi's
+/// `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`, 30000ms).
+pub const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS: u64 = 30_000;
 
-/// A configured worktree setup hook: an external command invoked once per worktree group, given a
-/// JSON payload on stdin and expected to answer with a JSON payload on stdout (R-SA-063).
+/// Legacy `Duration` alias of [`DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`], retained for existing
+/// doc-links (`acceptance.rs`, `registration/mod.rs`).
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS);
+
+/// Environment variable naming the base directory new worktrees are created under when neither a
+/// per-call `base_dir` nor an explicit config value is supplied (pi's `PI_SUBAGENTS_WORKTREE_DIR`,
+/// cyrup equivalent). When unset, the base directory defaults to [`std::env::temp_dir`].
+pub const WORKTREE_DIR_ENV: &str = "CYRUP_SUBAGENTS_WORKTREE_DIR";
+
+// =================================================================================================
+// Data model (pi worktree.ts interfaces)
+// =================================================================================================
+
+/// The result of [`create_worktrees`]: the resolved repo toplevel, every per-task worktree, and
+/// the common base commit the group was cut from (pi `WorktreeSetup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSetup {
+    /// The repository toplevel (`git rev-parse --show-toplevel`) every worktree hangs off of.
+    pub cwd: PathBuf,
+    /// One entry per task, in task order.
+    pub worktrees: Vec<WorktreeInfo>,
+    /// The commit (`git rev-parse HEAD` at setup time) diffs are taken against.
+    pub base_commit: String,
+}
+
+/// One concurrently-spawned child's dedicated worktree (pi `WorktreeInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    /// The worktree root directory (`git worktree add <path>`).
+    pub path: PathBuf,
+    /// The directory the child should actually use as its `cwd` — `path` joined with the same
+    /// repo-relative subdirectory the caller's shared cwd sat in (so a child launched from
+    /// `<repo>/packages/app` runs in `<worktree>/packages/app`).
+    pub agent_cwd: PathBuf,
+    /// The branch `git worktree add -b <branch> HEAD` created.
+    pub branch: String,
+    /// This task's 0-based position within the group.
+    pub index: u32,
+    /// Whether a `node_modules` symlink was created into this worktree.
+    pub node_modules_linked: bool,
+    /// Worktree-relative paths (e.g. `node_modules`, hook-declared scaffolding) excluded from this
+    /// worktree's captured diff.
+    pub synthetic_paths: Vec<String>,
+}
+
+/// A per-task captured diff (pi `WorktreeDiff`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeDiff {
+    /// The task's 0-based index.
+    pub index: u32,
+    /// The agent name (or `task-<n>` fallback) this diff belongs to.
+    pub agent: String,
+    /// The worktree's branch.
+    pub branch: String,
+    /// `git diff --cached --stat <base>` output (trimmed).
+    pub diff_stat: String,
+    /// Files changed, from `--numstat`.
+    pub files_changed: u64,
+    /// Total insertions, from `--numstat`.
+    pub insertions: u64,
+    /// Total deletions, from `--numstat`.
+    pub deletions: u64,
+    /// The `.patch` file this diff was written to.
+    pub patch_path: PathBuf,
+}
+
+/// A task whose explicit `cwd` override conflicts with worktree isolation (pi
+/// `WorktreeTaskCwdConflict`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeTaskCwdConflict {
+    /// The offending task's index.
+    pub index: usize,
+    /// The offending task's agent name.
+    pub agent: String,
+    /// The offending (raw) cwd value the task declared.
+    pub cwd: String,
+}
+
+/// Configuration for the optional per-worktree setup hook (pi `WorktreeSetupHookConfig`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeSetupHookConfig {
+    /// Absolute or repo-relative path to the hook executable (a bare command name is rejected).
+    pub hook_path: String,
+    /// Optional per-hook timeout override, in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Options accepted by [`create_worktrees`] (pi `CreateWorktreesOptions`).
+#[derive(Debug, Clone, Default)]
+pub struct CreateWorktreesOptions {
+    /// Per-task agent names (used to enrich the hook payload); indexed by task position.
+    pub agents: Option<Vec<String>>,
+    /// The optional per-worktree setup hook.
+    pub setup_hook: Option<WorktreeSetupHookConfig>,
+    /// Base directory override; see [`WORKTREE_DIR_ENV`] and [`std::env::temp_dir`] for the
+    /// resolution order.
+    pub base_dir: Option<String>,
+}
+
+/// The resolved, validated setup hook (pi `ResolvedWorktreeSetupHook`).
+#[derive(Debug, Clone)]
+struct ResolvedWorktreeSetupHook {
+    hook_path: PathBuf,
+    timeout_ms: u64,
+}
+
+/// The JSON payload written to a per-worktree setup hook's stdin (pi `WorktreeSetupHookInput`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeSetupHookInput<'a> {
+    version: u8,
+    repo_root: &'a Path,
+    worktree_path: &'a Path,
+    agent_cwd: &'a Path,
+    branch: &'a str,
+    index: u32,
+    run_id: &'a str,
+    base_commit: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+}
+
+/// The JSON payload expected back from a setup hook's stdout (pi `WorktreeSetupHookOutput`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeSetupHookOutput {
+    #[serde(default)]
+    synthetic_paths: Option<serde_json::Value>,
+}
+
+/// The resolved repository state (pi `RepoState`).
+struct RepoState {
+    toplevel: PathBuf,
+    cwd_relative: String,
+    base_commit: String,
+}
+
+/// The raw result of one `git` invocation (pi `GitResult`).
+struct GitResult {
+    stdout: String,
+    stderr: String,
+    status: Option<i32>,
+}
+
+// =================================================================================================
+// git subprocess helpers (pi runGit / runGitChecked)
+// =================================================================================================
+
+async fn run_git(cwd: &Path, args: &[&str]) -> Result<GitResult, SubagentError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(SubagentError::Spawn)?;
+    Ok(GitResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status: output.status.code(),
+    })
+}
+
+async fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<String, SubagentError> {
+    let result = run_git(cwd, args).await?;
+    if result.status != Some(0) {
+        let command = format!("git -C {} {}", cwd.display(), args.join(" "));
+        let stderr = result.stderr.trim();
+        let stdout = result.stdout.trim();
+        let message = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{command} failed")
+        };
+        return Err(SubagentError::WorktreeSetup(message));
+    }
+    Ok(result.stdout)
+}
+
+// =================================================================================================
+// Path helpers
+// =================================================================================================
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Lexically normalize a path (resolve `.`/`..` textually, without touching the filesystem) —
+/// the equivalent of Node's `path.resolve`/`path.normalize` for the containment checks below,
+/// which must work on worktree paths that may not exist yet.
+fn lexical_normalize(base: &Path, relative: &Path) -> PathBuf {
+    let joined = base.join(relative);
+    let mut out: Vec<std::path::Component<'_>> = Vec::new();
+    for comp in joined.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                match out.last() {
+                    Some(std::path::Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    _ => out.push(comp),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.iter().map(|component| component.as_os_str()).collect()
+}
+
+/// pi `normalizeComparableCwd`: absolute-resolve then realpath, falling back to the unresolved
+/// absolute path when realpath resolution is unavailable.
+fn normalize_comparable_cwd(cwd: &Path) -> PathBuf {
+    let resolved = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
+}
+
+/// pi `safePatchAgentName`: replace every character outside `[\w.-]` with `_`.
+fn safe_patch_agent_name(agent: &str) -> String {
+    agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// pi `buildWorktreeBranch` (cyrup-prefixed): `cyrup-parallel-<runId>-<index>`.
+fn build_worktree_branch(run_id: &str, index: u32) -> String {
+    format!("cyrup-parallel-{run_id}-{index}")
+}
+
+/// pi `buildWorktreePath` (cyrup-prefixed): `<baseDir>/cyrup-worktree-<runId>-<index>`.
+fn build_worktree_path(base_dir: &Path, run_id: &str, index: u32) -> PathBuf {
+    base_dir.join(format!("cyrup-worktree-{run_id}-{index}"))
+}
+
+/// pi `resolveWorktreeBaseDir`.
+fn resolve_worktree_base_dir(
+    configured_base_dir: Option<&str>,
+    repo_root: &Path,
+) -> Result<PathBuf, SubagentError> {
+    let raw = configured_base_dir
+        .map(str::to_string)
+        .or_else(|| std::env::var(WORKTREE_DIR_ENV).ok());
+    let Some(raw) = raw else {
+        return Ok(std::env::temp_dir());
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree base directory cannot be empty".to_string(),
+        ));
+    }
+
+    let expanded: PathBuf = trimmed
+        .strip_prefix("~/")
+        .map_or_else(|| PathBuf::from(trimmed), |rest| home_dir().join(rest));
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        repo_root.join(expanded)
+    };
+    std::fs::create_dir_all(&resolved).map_err(|err| {
+        SubagentError::WorktreeSetup(format!(
+            "failed to create worktree base directory {}: {err}",
+            resolved.display()
+        ))
+    })?;
+    Ok(resolved)
+}
+
+/// pi `resolveRepoCwdRelative`: verify `cwd` is inside a work tree, then return its normalized
+/// repo-relative prefix (`""` at the repo root).
+async fn resolve_repo_cwd_relative(cwd: &Path) -> Result<String, SubagentError> {
+    let repo_check = run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
+    if repo_check.status != Some(0) || repo_check.stdout.trim() != "true" {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree isolation requires a git repository".to_string(),
+        ));
+    }
+    let raw_prefix = run_git_checked(cwd, &["rev-parse", "--show-prefix"]).await?;
+    let stripped = raw_prefix.trim().trim_end_matches(['/', '\\']);
+    if stripped.is_empty() {
+        return Ok(String::new());
+    }
+    let normalized = lexical_normalize(Path::new(""), Path::new(stripped));
+    let normalized = normalized.to_string_lossy().into_owned();
+    Ok(if normalized == "." { String::new() } else { normalized })
+}
+
+/// pi `resolveExpectedWorktreeAgentCwd`: compute (without creating anything) the `agent_cwd` a
+/// task at `index` would receive, for previewing/reporting a worktree layout up front.
 ///
-/// Mirrors func-SA §4.7's `HookSpec` data-model entry and arch-SA §3.8's
-/// `registration::HookSpec` shape exactly; defined locally in this module (rather than imported
-/// from `crate::registration`) because `registration::HookSpec` has not yet been declared as of
-/// this file (`registration/mod.rs` is still a doc-comment-only stub in this crate's current
-/// build-out) — once it lands, the two shapes are expected to be identical and this module's own
-/// definition can be replaced by a type alias without changing any call site's behavior.
+/// # Errors
+///
+/// Returns [`SubagentError::WorktreeSetup`] if `cwd` is not inside a git work tree or the base
+/// directory cannot be resolved.
+pub async fn resolve_expected_worktree_agent_cwd(
+    cwd: &Path,
+    run_id: &str,
+    index: u32,
+    base_dir: Option<&str>,
+) -> Result<PathBuf, SubagentError> {
+    let cwd_relative = resolve_repo_cwd_relative(cwd).await?;
+    let repo_root = PathBuf::from(
+        run_git_checked(cwd, &["rev-parse", "--show-toplevel"])
+            .await?
+            .trim(),
+    );
+    let base = resolve_worktree_base_dir(base_dir, &repo_root)?;
+    let worktree_path = build_worktree_path(&base, run_id, index);
+    Ok(if cwd_relative.is_empty() {
+        worktree_path
+    } else {
+        worktree_path.join(&cwd_relative)
+    })
+}
+
+/// pi `resolveRepoState`.
+async fn resolve_repo_state(cwd: &Path) -> Result<RepoState, SubagentError> {
+    let cwd_relative = resolve_repo_cwd_relative(cwd).await?;
+    let toplevel = PathBuf::from(
+        run_git_checked(cwd, &["rev-parse", "--show-toplevel"])
+            .await?
+            .trim(),
+    );
+
+    let status = run_git_checked(&toplevel, &["status", "--porcelain"]).await?;
+    if !status.trim().is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+                .to_string(),
+        ));
+    }
+
+    let base_commit = run_git_checked(&toplevel, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+    Ok(RepoState {
+        toplevel,
+        cwd_relative,
+        base_commit,
+    })
+}
+
+// =================================================================================================
+// Task cwd conflict detection (pi findWorktreeTaskCwdConflict / formatWorktreeTaskCwdConflict)
+// =================================================================================================
+
+/// pi `findWorktreeTaskCwdConflict`: return the first task whose `cwd` override resolves to a
+/// directory *other* than the shared cwd. A task with no `cwd`, or a `cwd` equal to the shared cwd
+/// (including a relative `.`), is allowed.
+///
+/// `tasks` is a slice of `(agent, cwd)` pairs, `cwd` being the task's optional raw override.
+#[must_use]
+pub fn find_worktree_task_cwd_conflict(
+    tasks: &[(&str, Option<&str>)],
+    shared_cwd: &Path,
+) -> Option<WorktreeTaskCwdConflict> {
+    let normalized_shared = normalize_comparable_cwd(shared_cwd);
+    for (index, (agent, cwd)) in tasks.iter().enumerate() {
+        let Some(cwd) = cwd else { continue };
+        let task_cwd = if Path::new(cwd).is_absolute() {
+            PathBuf::from(cwd)
+        } else {
+            std::path::absolute(shared_cwd.join(cwd)).unwrap_or_else(|_| shared_cwd.join(cwd))
+        };
+        if normalize_comparable_cwd(&task_cwd) == normalized_shared {
+            continue;
+        }
+        return Some(WorktreeTaskCwdConflict {
+            index,
+            agent: (*agent).to_string(),
+            cwd: (*cwd).to_string(),
+        });
+    }
+    None
+}
+
+/// pi `formatWorktreeTaskCwdConflict`.
+#[must_use]
+pub fn format_worktree_task_cwd_conflict(
+    conflict: &WorktreeTaskCwdConflict,
+    shared_cwd: &Path,
+) -> String {
+    format!(
+        "worktree isolation uses the shared cwd ({}); task {} ({}) sets cwd to {}. Remove \
+         task-level cwd overrides or disable worktree.",
+        shared_cwd.display(),
+        conflict.index + 1,
+        conflict.agent,
+        conflict.cwd
+    )
+}
+
+// =================================================================================================
+// node_modules symlinking (pi linkNodeModulesIfPresent)
+// =================================================================================================
+
+fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> bool {
+    let node_modules_path = toplevel.join("node_modules");
+    let node_modules_link_path = worktree_path.join("node_modules");
+    if !node_modules_path.exists() || node_modules_link_path.symlink_metadata().is_ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&node_modules_path, &node_modules_link_path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::os::windows::fs::symlink_dir(&node_modules_path, &node_modules_link_path).is_ok()
+    }
+}
+
+// =================================================================================================
+// Setup hook resolution + invocation (pi resolveWorktreeSetupHook / runWorktreeSetupHook)
+// =================================================================================================
+
+fn parse_hook_timeout(timeout_ms: Option<u64>) -> Result<u64, SubagentError> {
+    match timeout_ms {
+        None => Ok(DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS),
+        Some(0) => Err(SubagentError::WorktreeSetup(
+            "worktree setup hook timeout must be an integer greater than 0".to_string(),
+        )),
+        Some(value) => Ok(value),
+    }
+}
+
+/// pi `resolveWorktreeSetupHook`: expand `~/`, require an absolute or repo-relative path (reject a
+/// bare command name), and require the resolved path to be an existing file.
+fn resolve_worktree_setup_hook(
+    repo_root: &Path,
+    config: Option<&WorktreeSetupHookConfig>,
+) -> Result<Option<ResolvedWorktreeSetupHook>, SubagentError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let hook_path = config.hook_path.trim();
+    if hook_path.is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree setup hook path cannot be empty".to_string(),
+        ));
+    }
+
+    let expanded: PathBuf = hook_path
+        .strip_prefix("~/")
+        .map_or_else(|| PathBuf::from(hook_path), |rest| home_dir().join(rest));
+
+    let resolved_path = if expanded.is_absolute() {
+        expanded
+    } else if hook_path.contains('/') || hook_path.contains('\\') {
+        repo_root.join(&expanded)
+    } else {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree setup hook must be an absolute path or a repo-relative path".to_string(),
+        ));
+    };
+
+    let metadata = std::fs::metadata(&resolved_path).map_err(|_| {
+        SubagentError::WorktreeSetup(format!(
+            "worktree setup hook not found: {}",
+            resolved_path.display()
+        ))
+    })?;
+    if metadata.is_dir() {
+        return Err(SubagentError::WorktreeSetup(format!(
+            "worktree setup hook must be a file, got directory: {}",
+            resolved_path.display()
+        )));
+    }
+
+    Ok(Some(ResolvedWorktreeSetupHook {
+        hook_path: resolved_path,
+        timeout_ms: parse_hook_timeout(config.timeout_ms)?,
+    }))
+}
+
+/// pi `normalizeSyntheticPath`: a hook-declared path must be relative, non-empty, and contained
+/// within (but not equal to) the worktree root.
+fn normalize_synthetic_path(worktree_path: &Path, raw_path: &str) -> Result<String, SubagentError> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "synthetic path cannot be empty".to_string(),
+        ));
+    }
+    if Path::new(trimmed).is_absolute() {
+        return Err(SubagentError::WorktreeSetup(format!(
+            "synthetic path must be relative: {raw_path}"
+        )));
+    }
+    let resolved = lexical_normalize(worktree_path, Path::new(trimmed));
+    let relative = resolved.strip_prefix(worktree_path).ok();
+    match relative {
+        None => Err(SubagentError::WorktreeSetup(format!(
+            "synthetic path escapes the worktree root: {raw_path}"
+        ))),
+        Some(rel) if rel.as_os_str().is_empty() => Err(SubagentError::WorktreeSetup(format!(
+            "synthetic path cannot target the worktree root: {raw_path}"
+        ))),
+        Some(rel) => Ok(rel.to_string_lossy().into_owned()),
+    }
+}
+
+/// pi `hasTrackedEntries`: `git ls-files -- <relativePath>` reports a tracked match.
+async fn has_tracked_entries(worktree_path: &Path, relative_path: &str) -> bool {
+    match run_git(worktree_path, &["ls-files", "--", relative_path]).await {
+        Ok(result) => result.status == Some(0) && !result.stdout.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// pi `parseWorktreeSetupHookOutput` + the `syntheticPaths` validation loop of
+/// `runWorktreeSetupHook`.
+async fn parse_and_validate_hook_output(
+    worktree_path: &Path,
+    raw_stdout: &str,
+) -> Result<Vec<String>, SubagentError> {
+    let trimmed = raw_stdout.trim();
+    if trimmed.is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree setup hook returned empty stdout; expected JSON object".to_string(),
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        SubagentError::WorktreeSetup(format!("worktree setup hook returned invalid JSON: {err}"))
+    })?;
+    if !parsed.is_object() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree setup hook stdout must be a JSON object".to_string(),
+        ));
+    }
+    let output: WorktreeSetupHookOutput = serde_json::from_value(parsed).map_err(|err| {
+        SubagentError::WorktreeSetup(format!("worktree setup hook returned invalid JSON: {err}"))
+    })?;
+
+    let Some(raw_synthetic) = output.synthetic_paths else {
+        return Ok(Vec::new());
+    };
+    let serde_json::Value::Array(candidates) = raw_synthetic else {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree setup hook output field 'syntheticPaths' must be an array of relative paths"
+                .to_string(),
+        ));
+    };
+
+    let mut unique: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let serde_json::Value::String(candidate) = candidate else {
+            return Err(SubagentError::WorktreeSetup(
+                "worktree setup hook output field 'syntheticPaths' must contain only strings"
+                    .to_string(),
+            ));
+        };
+        let normalized = normalize_synthetic_path(worktree_path, &candidate)?;
+        if has_tracked_entries(worktree_path, &normalized).await {
+            return Err(SubagentError::WorktreeSetup(format!(
+                "worktree setup hook cannot mark tracked paths as synthetic: {normalized}"
+            )));
+        }
+        if !unique.contains(&normalized) {
+            unique.push(normalized);
+        }
+    }
+    Ok(unique)
+}
+
+/// pi `runWorktreeSetupHook`: invoke the hook (no args) with the worktree as cwd, the input JSON on
+/// stdin, bounded by the resolved timeout, and validate its `syntheticPaths` response.
+async fn run_worktree_setup_hook(
+    hook: &ResolvedWorktreeSetupHook,
+    input: &WorktreeSetupHookInput<'_>,
+) -> Result<Vec<String>, SubagentError> {
+    let timeout = Duration::from_millis(hook.timeout_ms);
+    let payload = serde_json::to_vec(input).map_err(|err| {
+        SubagentError::WorktreeSetup(format!("failed to serialize worktree setup hook input: {err}"))
+    })?;
+    let worktree_path = input.worktree_path;
+
+    let call = async {
+        let mut child = Command::new(&hook.hook_path)
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}"))
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&payload).await.map_err(SubagentError::Spawn)?;
+            stdin.shutdown().await.map_err(SubagentError::Spawn)?;
+            drop(stdin);
+        }
+
+        let mut stdout_buf = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            stdout
+                .read_to_end(&mut stdout_buf)
+                .await
+                .map_err(SubagentError::Spawn)?;
+        }
+        let mut stderr_buf = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_end(&mut stderr_buf).await;
+        }
+
+        let status = child.wait().await.map_err(SubagentError::Spawn)?;
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_buf);
+            let stdout = String::from_utf8_lossy(&stdout_buf);
+            let details = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                "no output".to_string()
+            };
+            let code = status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string());
+            return Err(SubagentError::WorktreeSetup(format!(
+                "worktree setup hook failed with exit code {code}: {details}"
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+        parse_and_validate_hook_output(worktree_path, &stdout).await
+    };
+
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(SubagentError::WorktreeSetup(format!(
+            "worktree setup hook timed out after {}ms",
+            hook.timeout_ms
+        ))),
+    }
+}
+
+// =================================================================================================
+// Worktree creation (pi createSingleWorktree / createWorktrees)
+// =================================================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn create_single_worktree(
+    toplevel: &Path,
+    cwd_relative: &str,
+    run_id: &str,
+    index: u32,
+    base_commit: &str,
+    setup_hook: Option<&ResolvedWorktreeSetupHook>,
+    agent: Option<&str>,
+    base_dir: &Path,
+) -> Result<WorktreeInfo, SubagentError> {
+    let branch = build_worktree_branch(run_id, index);
+    let worktree_path = build_worktree_path(base_dir, run_id, index);
+
+    let add = run_git(
+        toplevel,
+        &[
+            "worktree",
+            "add",
+            &worktree_path.to_string_lossy(),
+            "-b",
+            &branch,
+            "HEAD",
+        ],
+    )
+    .await?;
+    if add.status != Some(0) {
+        let stderr = add.stderr.trim();
+        let stdout = add.stdout.trim();
+        let message = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("failed to create worktree {}", worktree_path.display())
+        };
+        return Err(SubagentError::WorktreeSetup(message));
+    }
+
+    let agent_cwd = if cwd_relative.is_empty() {
+        worktree_path.clone()
+    } else {
+        worktree_path.join(cwd_relative)
+    };
+
+    // Everything past `worktree add` is best-effort-rolled-back on failure so a half-set-up
+    // worktree is never handed back (pi createSingleWorktree's try/catch).
+    let build = async {
+        let node_modules_linked = link_node_modules_if_present(toplevel, &worktree_path);
+        let mut synthetic_paths: Vec<String> = if node_modules_linked {
+            vec!["node_modules".to_string()]
+        } else {
+            Vec::new()
+        };
+
+        if let Some(hook) = setup_hook {
+            let hook_synthetic = run_worktree_setup_hook(
+                hook,
+                &WorktreeSetupHookInput {
+                    version: 1,
+                    repo_root: toplevel,
+                    worktree_path: worktree_path.as_path(),
+                    agent_cwd: agent_cwd.as_path(),
+                    branch: branch.as_str(),
+                    index,
+                    run_id,
+                    base_commit,
+                    agent,
+                },
+            )
+            .await?;
+            synthetic_paths.extend(hook_synthetic);
+        }
+
+        Ok::<WorktreeInfo, SubagentError>(WorktreeInfo {
+            path: worktree_path.clone(),
+            agent_cwd,
+            branch: branch.clone(),
+            index,
+            node_modules_linked,
+            synthetic_paths,
+        })
+    }
+    .await;
+
+    match build {
+        Ok(info) => Ok(info),
+        Err(err) => {
+            let _ = run_git(
+                toplevel,
+                &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
+            )
+            .await;
+            let _ = run_git(toplevel, &["branch", "-D", &branch]).await;
+            Err(err)
+        }
+    }
+}
+
+/// pi `createWorktrees`: the full synchronous-before-any-spawn setup sequence. On any failure,
+/// every worktree created so far is cleaned up before the error propagates.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::WorktreeSetup`] if the tree is dirty, `cwd` is not a git repo, a
+/// `git worktree add` fails, or the setup hook fails/times out/violates the synthetic-path rail.
+pub async fn create_worktrees(
+    cwd: &Path,
+    run_id: &str,
+    count: u32,
+    options: Option<&CreateWorktreesOptions>,
+) -> Result<WorktreeSetup, SubagentError> {
+    let repo = resolve_repo_state(cwd).await?;
+    let setup_hook =
+        resolve_worktree_setup_hook(&repo.toplevel, options.and_then(|o| o.setup_hook.as_ref()))?;
+    let base_dir =
+        resolve_worktree_base_dir(options.and_then(|o| o.base_dir.as_deref()), &repo.toplevel)?;
+
+    let mut worktrees: Vec<WorktreeInfo> = Vec::new();
+    for index in 0..count {
+        let agent = options
+            .and_then(|o| o.agents.as_ref())
+            .and_then(|agents| agents.get(index as usize))
+            .map(String::as_str);
+        match create_single_worktree(
+            &repo.toplevel,
+            &repo.cwd_relative,
+            run_id,
+            index,
+            &repo.base_commit,
+            setup_hook.as_ref(),
+            agent,
+            &base_dir,
+        )
+        .await
+        {
+            Ok(info) => worktrees.push(info),
+            Err(err) => {
+                cleanup_worktrees(&WorktreeSetup {
+                    cwd: repo.toplevel.clone(),
+                    worktrees,
+                    base_commit: repo.base_commit.clone(),
+                })
+                .await;
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(WorktreeSetup {
+        cwd: repo.toplevel,
+        worktrees,
+        base_commit: repo.base_commit,
+    })
+}
+
+// =================================================================================================
+// Diff harvest (pi captureWorktreeDiff / diffWorktrees / formatWorktreeDiffSummary)
+// =================================================================================================
+
+fn remove_synthetic_path(worktree: &WorktreeInfo, synthetic_path: &str) {
+    let resolved = lexical_normalize(&worktree.path, Path::new(synthetic_path));
+    let Some(relative) = resolved.strip_prefix(&worktree.path).ok() else {
+        return;
+    };
+    if relative.as_os_str().is_empty() {
+        return;
+    }
+    let Ok(stat) = std::fs::symlink_metadata(&resolved) else {
+        return;
+    };
+    if stat.file_type().is_symlink() {
+        let _ = std::fs::remove_file(&resolved);
+    } else if stat.is_dir() {
+        let _ = std::fs::remove_dir_all(&resolved);
+    } else {
+        let _ = std::fs::remove_file(&resolved);
+    }
+}
+
+fn remove_synthetic_paths_before_diff(worktree: &WorktreeInfo) {
+    let mut seen: Vec<&str> = Vec::new();
+    for synthetic_path in &worktree.synthetic_paths {
+        if seen.contains(&synthetic_path.as_str()) {
+            continue;
+        }
+        seen.push(synthetic_path.as_str());
+        remove_synthetic_path(worktree, synthetic_path);
+    }
+}
+
+fn empty_diff(index: u32, agent: &str, branch: &str, patch_path: &Path) -> WorktreeDiff {
+    WorktreeDiff {
+        index,
+        agent: agent.to_string(),
+        branch: branch.to_string(),
+        diff_stat: String::new(),
+        files_changed: 0,
+        insertions: 0,
+        deletions: 0,
+        patch_path: patch_path.to_path_buf(),
+    }
+}
+
+fn parse_numstat(numstat: &str) -> (u64, u64, u64) {
+    let mut files_changed = 0u64;
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    for line in numstat.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut parts = line.split('\t');
+        let (Some(raw_ins), Some(raw_del)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        files_changed += 1;
+        if !raw_ins.is_empty() && raw_ins.bytes().all(|b| b.is_ascii_digit()) {
+            insertions += raw_ins.parse::<u64>().unwrap_or(0);
+        }
+        if !raw_del.is_empty() && raw_del.bytes().all(|b| b.is_ascii_digit()) {
+            deletions += raw_del.parse::<u64>().unwrap_or(0);
+        }
+    }
+    (files_changed, insertions, deletions)
+}
+
+/// pi `captureWorktreeDiff`: strip synthetic paths, stage everything, and capture the stat/patch/
+/// numstat diff against the group's base commit, writing the patch to `patch_path`.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::WorktreeSetup`] on any `git` failure or if the patch file cannot be
+/// written.
+pub async fn capture_worktree_diff(
+    setup: &WorktreeSetup,
+    worktree: &WorktreeInfo,
+    agent: &str,
+    patch_path: &Path,
+) -> Result<WorktreeDiff, SubagentError> {
+    remove_synthetic_paths_before_diff(worktree);
+    run_git_checked(&worktree.path, &["add", "-A"]).await?;
+    let diff_stat = run_git_checked(
+        &worktree.path,
+        &["diff", "--cached", "--stat", &setup.base_commit],
+    )
+    .await?
+    .trim()
+    .to_string();
+    let patch =
+        run_git_checked(&worktree.path, &["diff", "--cached", &setup.base_commit]).await?;
+    let numstat = run_git_checked(
+        &worktree.path,
+        &["diff", "--cached", "--numstat", &setup.base_commit],
+    )
+    .await?;
+
+    std::fs::write(patch_path, &patch).map_err(SubagentError::Spawn)?;
+
+    if patch.trim().is_empty() {
+        return Ok(empty_diff(worktree.index, agent, &worktree.branch, patch_path));
+    }
+
+    let (files_changed, insertions, deletions) = parse_numstat(&numstat);
+    Ok(WorktreeDiff {
+        index: worktree.index,
+        agent: agent.to_string(),
+        branch: worktree.branch.clone(),
+        diff_stat,
+        files_changed,
+        insertions,
+        deletions,
+        patch_path: patch_path.to_path_buf(),
+    })
+}
+
+fn write_empty_patch(patch_path: &Path) {
+    let _ = std::fs::write(patch_path, "");
+}
+
+/// pi `diffWorktrees`: capture one `.patch` per worktree under `diffs_dir`, mapping any per-task
+/// capture failure to an empty patch + empty diff rather than failing the whole harvest.
+pub async fn diff_worktrees(
+    setup: &WorktreeSetup,
+    agents: &[String],
+    diffs_dir: &Path,
+) -> Vec<WorktreeDiff> {
+    if std::fs::create_dir_all(diffs_dir).is_err() {
+        // Returning no diffs is safer than failing the whole command on artifact-dir issues.
+        return Vec::new();
+    }
+
+    let mut diffs = Vec::new();
+    for (index, worktree) in setup.worktrees.iter().enumerate() {
+        let agent = agents
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("task-{}", index + 1));
+        let patch_path = diffs_dir.join(format!(
+            "task-{index}-{}.patch",
+            safe_patch_agent_name(&agent)
+        ));
+        match capture_worktree_diff(setup, worktree, &agent, &patch_path).await {
+            Ok(diff) => diffs.push(diff),
+            Err(_) => {
+                write_empty_patch(&patch_path);
+                let idx = u32::try_from(index).unwrap_or(u32::MAX);
+                diffs.push(empty_diff(idx, &agent, &worktree.branch, &patch_path));
+            }
+        }
+    }
+    diffs
+}
+
+/// pi `cleanupWorktrees`: best-effort removal of every worktree + branch (reverse order), then
+/// `git worktree prune`. Safe to call on the **success** path after harvest, as well as on
+/// rollback.
+pub async fn cleanup_worktrees(setup: &WorktreeSetup) {
+    for worktree in setup.worktrees.iter().rev() {
+        let _ = run_git(
+            &setup.cwd,
+            &["worktree", "remove", "--force", &worktree.path.to_string_lossy()],
+        )
+        .await;
+        let _ = run_git(&setup.cwd, &["branch", "-D", &worktree.branch]).await;
+    }
+    let _ = run_git(&setup.cwd, &["worktree", "prune"]).await;
+}
+
+fn has_worktree_changes(diff: &WorktreeDiff) -> bool {
+    diff.files_changed > 0
+        || diff.insertions > 0
+        || diff.deletions > 0
+        || !diff.diff_stat.trim().is_empty()
+}
+
+/// pi `formatWorktreeDiffSummary`: a human-readable summary of the changed worktrees, or the empty
+/// string when nothing changed.
+#[must_use]
+pub fn format_worktree_diff_summary(diffs: &[WorktreeDiff]) -> String {
+    let changed: Vec<&WorktreeDiff> = diffs.iter().filter(|d| has_worktree_changes(d)).collect();
+    let Some(first) = changed.first() else {
+        return String::new();
+    };
+
+    let mut lines: Vec<String> = vec!["=== Worktree Changes ===".to_string(), String::new()];
+    for diff in &changed {
+        lines.push(format!(
+            "--- Task {} ({}): {} files changed, +{} -{} ---",
+            diff.index + 1,
+            diff.agent,
+            diff.files_changed,
+            diff.insertions,
+            diff.deletions
+        ));
+        if !diff.diff_stat.trim().is_empty() {
+            lines.push(diff.diff_stat.clone());
+        }
+        lines.push(String::new());
+    }
+
+    let patches_dir = first
+        .patch_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    lines.push(format!("Full patches: {}", patches_dir.display()));
+    lines.join("\n").trim_end().to_string()
+}
+
+// =================================================================================================
+// Legacy compatibility surface (thin wrappers over the pi-faithful primitives)
+// =================================================================================================
+
+/// A configured external hook command (legacy shape retained for `registration/mod.rs` doc-links
+/// and the `spawn::chain_graph` caller). The pi-faithful hook contract is
+/// [`WorktreeSetupHookConfig`]; this shape's `command` maps onto `hook_path` and its `args` are
+/// currently ignored by the per-worktree invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookSpec {
     /// The executable to invoke.
     pub command: PathBuf,
-    /// Arguments passed to `command`, before the JSON-on-stdin payload.
+    /// Legacy positional arguments (unused by the pi-faithful per-worktree hook contract).
     pub args: Vec<String>,
 }
 
-/// The JSON payload written to the hook's stdin (R-SA-063 target shape:
-/// `{ worktree_paths: [...], base_commit, group_id }`).
-#[derive(Debug, Clone, serde::Serialize)]
-struct HookRequest<'a> {
-    worktree_paths: &'a [PathBuf],
-    base_commit: &'a str,
-    group_id: &'a str,
+/// Legacy per-group config accepted by [`setup_worktree_group`].
+#[derive(Debug, Clone)]
+pub struct WorktreeGroupConfig<'a> {
+    /// A stable id for this fan-out group (used as the pi `runId`).
+    pub group_id: &'a str,
+    /// Directory new worktrees are created under.
+    pub worktree_base_dir: &'a Path,
+    /// The optional setup hook.
+    pub setup_hook: Option<&'a HookSpec>,
+    /// Bound on the setup hook's runtime, in milliseconds.
+    pub setup_hook_timeout_ms: Option<u64>,
 }
 
-/// The JSON payload expected back on the hook's stdout (R-SA-063 target shape:
-/// `{ ok: bool, synthetic_paths: Option<[{ worktree_index, path }]>, error: Option<String> }`).
-#[derive(Debug, Clone, serde::Deserialize)]
-struct HookResponse {
-    ok: bool,
-    #[serde(default)]
-    synthetic_paths: Option<Vec<SyntheticPathEntry>>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// One `syntheticPaths` entry from a hook response: a path (relative to its worktree's root) the
-/// hook declares should be excluded from that worktree's diff — e.g. a lockfile the hook itself
-/// regenerated as setup scaffolding, not part of the agent's real work (R-SA-064).
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SyntheticPathEntry {
-    worktree_index: u32,
-    path: PathBuf,
-}
-
-/// One concurrently-spawned child's dedicated worktree assignment (func-SA §4.4's
-/// `WorktreeAssignment`).
+/// Legacy per-task worktree assignment. `path` is the child's actual `cwd` (pi `agentCwd`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeAssignment {
-    /// The dedicated worktree directory this task's child MUST use as its `cwd` (R-SA-061) —
-    /// never a shared cwd.
+    /// The directory the child MUST run in (the pi `agentCwd`).
     pub path: PathBuf,
-    /// The branch `git worktree add -b <branch>` created for this worktree.
+    /// The branch created for this worktree.
     pub branch: String,
-    /// The commit every worktree in the group was created from (`git status --porcelain`'s clean
-    /// check and `git worktree add ... HEAD`'s resolution both happen against this same commit,
-    /// so every sibling worktree in a group starts from an identical base).
+    /// The group's common base commit.
     pub base_commit: String,
-    /// This task's position within the group (0-based) — the same index that both
-    /// `HookRequest.worktree_paths` and a `SyntheticPathEntry.worktree_index` reference.
+    /// The task's 0-based index.
     pub index: u32,
-    /// Paths (relative to `path`) the setup hook declared as synthetic (R-SA-064) — excluded from
-    /// this worktree's diff by whatever downstream consumer computes one. Empty when no hook is
-    /// configured, or when the hook declared none for this index.
+    /// Worktree-relative synthetic paths declared for this worktree.
     pub synthetic_paths: Vec<PathBuf>,
 }
 
-/// Result of [`setup_worktree_group`]: every assignment plus the base commit the whole group was
-/// cut from, for callers that want to log/report it independently of any one assignment.
+/// Legacy plan returned by [`setup_worktree_group`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeGroupPlan {
-    /// One assignment per task, in original task order (index 0..N).
+    /// One assignment per task, in task order.
     pub assignments: Vec<WorktreeAssignment>,
-    /// The commit the whole group was branched from.
+    /// The group's common base commit.
     pub base_commit: String,
 }
 
 impl WorktreeGroupPlan {
-    /// Number of tasks (and therefore worktrees) in this plan.
+    /// Number of tasks (and worktrees) in this plan.
     #[must_use]
     pub fn task_count(&self) -> usize {
         self.assignments.len()
     }
 }
 
-// -------------------------------------------------------------------------------------------
-// Step 1 (R-SA-060): dirty-working-tree precondition, BEFORE any worktree or child is created.
-// -------------------------------------------------------------------------------------------
-
-/// Verify `git status --porcelain` reports an empty (clean) working tree in `repo_cwd` (R-SA-060).
+/// Legacy entry point retained for `spawn::chain_graph::assign_worktree_cwds`. Delegates to the
+/// pi-faithful [`create_worktrees`], returning each worktree's `agent_cwd` as the assignment path.
 ///
-/// This is the FIRST check in the whole worktree-setup sequence and MUST run — and MUST be
-/// observed to fail the entire group — before any `git worktree add` invocation and before any
-/// subagent child process is spawned. There is no partial/degraded non-isolated fallback: a dirty
-/// tree fails the group outright, it never silently falls back to running children against the
-/// shared, unisolated cwd.
+/// Unlike the old strict all-overrides-rejected behavior, this now allows a task `cwd` equal to
+/// the shared cwd (pi `findWorktreeTaskCwdConflict`), rejecting only genuinely divergent overrides.
 ///
 /// # Errors
 ///
-/// Returns [`SubagentError::WorktreeSetup`] if:
-/// - the `git` invocation itself fails to spawn or exits nonzero (surfacing `git`'s own stderr
-///   verbatim, per this module's "exact stderr/stdout parity" design note), or
-/// - `git status --porcelain` reports ANY non-empty output (the tree is dirty).
-pub async fn check_clean_working_tree(repo_cwd: &Path) -> Result<(), SubagentError> {
-    let output = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .current_dir(repo_cwd)
-        .output()
-        .await
-        .map_err(SubagentError::Spawn)?;
+/// Propagates [`create_worktrees`]' errors, or [`SubagentError::WorktreeSetup`] if a task declares
+/// a divergent `cwd` override.
+pub async fn setup_worktree_group(
+    repo_cwd: &Path,
+    task_cwd_overrides: &[Option<&Path>],
+    config: &WorktreeGroupConfig<'_>,
+) -> Result<WorktreeGroupPlan, SubagentError> {
+    let owned_cwds: Vec<Option<String>> = task_cwd_overrides
+        .iter()
+        .map(|c| c.map(|p| p.to_string_lossy().into_owned()))
+        .collect();
+    let tasks: Vec<(&str, Option<&str>)> = owned_cwds
+        .iter()
+        .map(|c| ("task", c.as_deref()))
+        .collect();
+    if let Some(conflict) = find_worktree_task_cwd_conflict(&tasks, repo_cwd) {
+        return Err(SubagentError::WorktreeSetup(format_worktree_task_cwd_conflict(
+            &conflict, repo_cwd,
+        )));
+    }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let setup_hook = config.setup_hook.map(|hook| WorktreeSetupHookConfig {
+        hook_path: hook.command.to_string_lossy().into_owned(),
+        timeout_ms: config.setup_hook_timeout_ms,
+    });
+    let options = CreateWorktreesOptions {
+        agents: None,
+        setup_hook,
+        base_dir: Some(config.worktree_base_dir.to_string_lossy().into_owned()),
+    };
+
+    let count = u32::try_from(task_cwd_overrides.len()).unwrap_or(u32::MAX);
+    let setup = create_worktrees(repo_cwd, config.group_id, count, Some(&options)).await?;
+
+    let assignments = setup
+        .worktrees
+        .iter()
+        .map(|w| WorktreeAssignment {
+            path: w.agent_cwd.clone(),
+            branch: w.branch.clone(),
+            base_commit: setup.base_commit.clone(),
+            index: w.index,
+            synthetic_paths: w.synthetic_paths.iter().map(PathBuf::from).collect(),
+        })
+        .collect();
+
+    Ok(WorktreeGroupPlan {
+        assignments,
+        base_commit: setup.base_commit,
+    })
+}
+
+/// Legacy standalone dirty-tree precondition (retained for doc-links). Equivalent to the check
+/// [`create_worktrees`] performs internally via [`resolve_repo_state`].
+///
+/// # Errors
+///
+/// Returns [`SubagentError::WorktreeSetup`] if `git status --porcelain` fails or reports a dirty
+/// tree.
+pub async fn check_clean_working_tree(repo_cwd: &Path) -> Result<(), SubagentError> {
+    let status = run_git(repo_cwd, &["status", "--porcelain"]).await?;
+    if status.status != Some(0) {
         return Err(SubagentError::WorktreeSetup(format!(
             "git status --porcelain failed in {}: {}",
             repo_cwd.display(),
-            stderr.trim()
+            status.stderr.trim()
         )));
     }
-
-    if !output.stdout.is_empty() {
-        let dirty = String::from_utf8_lossy(&output.stdout);
-        return Err(SubagentError::WorktreeSetup(format!(
-            "working tree at {} is not clean (git status --porcelain reported {} line(s)); \
-             worktree isolation requires a clean tree, no partial/degraded fallback is \
-             attempted:\n{}",
-            repo_cwd.display(),
-            dirty.lines().count(),
-            dirty.trim()
-        )));
+    if !status.stdout.trim().is_empty() {
+        return Err(SubagentError::WorktreeSetup(
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+                .to_string(),
+        ));
     }
-
     Ok(())
 }
 
-// -------------------------------------------------------------------------------------------
-// Step 2 (R-SA-062): reject any task-level cwd override before any worktree is created.
-// -------------------------------------------------------------------------------------------
-
-/// Reject the whole group if any task explicitly set its own `cwd` (R-SA-062).
-///
-/// A per-task `cwd` override would defeat worktree isolation outright (the child would run
-/// against that explicit path instead of its dedicated worktree), so this check MUST run before
-/// any `git worktree add` call — producing an all-tasks-failed result rather than partially
-/// running the tasks that did not set an override.
-///
-/// `task_cwd_overrides` is one entry per task in the group, `Some(path)` when that task
-/// explicitly declared its own cwd, `None` otherwise (see this module's header doc for why this
-/// takes a plain slice rather than a `SingleStep` — that real type is a later build-out phase).
+/// Legacy strict override rejection (retained for doc-links). Prefer
+/// [`find_worktree_task_cwd_conflict`], which allows a task `cwd` equal to the shared cwd.
 ///
 /// # Errors
 ///
-/// Returns [`SubagentError::WorktreeSetup`] naming every offending task index if one or more
-/// entries are `Some`.
+/// Returns [`SubagentError::WorktreeSetup`] naming every task index whose entry is `Some`.
 pub fn reject_task_level_cwd_overrides(
     task_cwd_overrides: &[Option<&Path>],
 ) -> Result<(), SubagentError> {
     let offenders: Vec<String> = task_cwd_overrides
         .iter()
         .enumerate()
-        .filter_map(|(index, cwd)| {
-            cwd.map(|path| format!("task[{index}]={}", path.display()))
-        })
+        .filter_map(|(index, cwd)| cwd.map(|path| format!("task[{index}]={}", path.display())))
         .collect();
-
     if offenders.is_empty() {
         return Ok(());
     }
-
     Err(SubagentError::WorktreeSetup(format!(
-        "worktree: true groups cannot honor per-task cwd overrides (would defeat isolation); \
-         reject the whole group before any worktree is created: {}",
+        "worktree: true groups cannot honor per-task cwd overrides (would defeat isolation): {}",
         offenders.join(", ")
     )))
-}
-
-// -------------------------------------------------------------------------------------------
-// Step 3a (R-SA-061): one worktree per concurrent child, from a common base commit.
-// -------------------------------------------------------------------------------------------
-
-/// Resolve the commit hash `HEAD` currently points at in `repo_cwd` — the single common base
-/// commit every worktree in the group is created from (R-SA-061's `... HEAD` target, pinned to
-/// one concrete hash up front so every sibling worktree is provably cut from the identical base
-/// even if something else touches the shared repo's `HEAD` mid-setup).
-async fn resolve_base_commit(repo_cwd: &Path) -> Result<String, SubagentError> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(repo_cwd)
-        .output()
-        .await
-        .map_err(SubagentError::Spawn)?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SubagentError::WorktreeSetup(format!(
-            "git rev-parse HEAD failed in {}: {}",
-            repo_cwd.display(),
-            stderr.trim()
-        )));
-    }
-
-    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if commit.is_empty() {
-        return Err(SubagentError::WorktreeSetup(format!(
-            "git rev-parse HEAD returned empty output in {}",
-            repo_cwd.display()
-        )));
-    }
-    Ok(commit)
-}
-
-/// Create exactly one worktree via `git worktree add <path> -b <branch> <base_commit>` (R-SA-061).
-///
-/// `branch` MUST be unique within the repository (typical callers derive it from the group id and
-/// task index, e.g. `subagent/<group_id>/<index>`) — `git worktree add -b` itself fails loudly if
-/// the branch already exists, which this function surfaces verbatim rather than silently
-/// resolving.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] if the `git worktree add` invocation fails to spawn or
-/// exits nonzero, surfacing `git`'s own stderr.
-async fn create_one_worktree(
-    repo_cwd: &Path,
-    path: &Path,
-    branch: &str,
-    base_commit: &str,
-) -> Result<(), SubagentError> {
-    let output = Command::new("git")
-        .arg("worktree")
-        .arg("add")
-        .arg(path)
-        .arg("-b")
-        .arg(branch)
-        .arg(base_commit)
-        .current_dir(repo_cwd)
-        .output()
-        .await
-        .map_err(SubagentError::Spawn)?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SubagentError::WorktreeSetup(format!(
-            "git worktree add {} -b {branch} {base_commit} failed: {}",
-            path.display(),
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-/// Remove exactly one worktree (and its branch) — the unit of work [`cleanup_worktrees`] applies
-/// best-effort, per-worktree (R-SA-065).
-///
-/// `git worktree remove --force` is used (rather than a plain `remove`) because a worktree
-/// abandoned mid-setup (e.g. the group failed after this one was created but before a sibling
-/// was) may still have the working-directory-only state `git` would otherwise refuse to discard
-/// without `--force` (an untracked file the setup hook wrote, for instance) — cleanup here is
-/// explicitly best-effort disposal, not a preservation-preferring operation. The branch is deleted
-/// afterward (`git branch -D`) so a repeatedly-failing/retried group does not accumulate orphaned
-/// branches; branch deletion failure (e.g. the worktree removal already implicitly cleaned it up
-/// on some git versions) is swallowed, matching this function's own best-effort contract.
-///
-/// # Errors
-///
-/// Returns `Err` only if the `git worktree remove` invocation itself fails to spawn or exits
-/// nonzero — branch-deletion failures are always swallowed (see above). Callers
-/// ([`cleanup_worktrees`]) are expected to collect, not propagate, this `Err` so one worktree's
-/// cleanup failure never blocks its siblings' cleanup (R-SA-065).
-async fn remove_one_worktree(
-    repo_cwd: &Path,
-    assignment: &WorktreeAssignment,
-) -> Result<(), SubagentError> {
-    let output = Command::new("git")
-        .arg("worktree")
-        .arg("remove")
-        .arg("--force")
-        .arg(&assignment.path)
-        .current_dir(repo_cwd)
-        .output()
-        .await
-        .map_err(SubagentError::Spawn)?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SubagentError::WorktreeSetup(format!(
-            "git worktree remove --force {} failed: {}",
-            assignment.path.display(),
-            stderr.trim()
-        )));
-    }
-
-    // Best-effort branch cleanup — deliberately swallowed (see doc comment above).
-    let _ = Command::new("git")
-        .arg("branch")
-        .arg("-D")
-        .arg(&assignment.branch)
-        .current_dir(repo_cwd)
-        .output()
-        .await;
-
-    Ok(())
-}
-
-/// Best-effort cleanup of every worktree in `assignments` (R-SA-065): one worktree's removal
-/// failure MUST NOT prevent the rest from being attempted. Returns the list of `(index, error)`
-/// pairs for whichever removals failed, so the caller can log/report them without the cleanup
-/// pass itself aborting partway through.
-///
-/// This is deliberately infallible at the function-signature level (it never returns `Result`)
-/// precisely because R-SA-065 makes cleanup a best-effort operation, never one whose own failure
-/// should propagate as if it were a setup failure — callers that need to know cleanup was fully
-/// successful inspect the returned `Vec`'s emptiness themselves.
-pub async fn cleanup_worktrees(
-    repo_cwd: &Path,
-    assignments: &[WorktreeAssignment],
-) -> Vec<(u32, SubagentError)> {
-    let mut failures = Vec::new();
-    for assignment in assignments {
-        if let Err(err) = remove_one_worktree(repo_cwd, assignment).await {
-            tracing::warn!(
-                index = assignment.index,
-                path = %assignment.path.display(),
-                error = %err,
-                "best-effort worktree cleanup failed for one sibling (R-SA-065); continuing with \
-                 the rest of the group"
-            );
-            failures.push((assignment.index, err));
-        }
-    }
-    failures
-}
-
-// -------------------------------------------------------------------------------------------
-// Step 3b (R-SA-063/064): optional setup hook, JSON stdin/stdout contract, bounded timeout.
-// -------------------------------------------------------------------------------------------
-
-/// Invoke the configured worktree setup hook once for the whole group (R-SA-063).
-///
-/// Writes `req` as a single JSON document to the hook's stdin (then closes stdin so a
-/// well-behaved hook sees EOF and can proceed to respond), reads its ENTIRE stdout, and parses
-/// that as a single JSON [`HookResponse`] document — bounded by `timeout_ms` end-to-end (spawn
-/// through response-read), falling back to [`DEFAULT_HOOK_TIMEOUT`] when `timeout_ms` is `None`
-/// exactly as R-SA-063 specifies ("falling back to a fixed default, target 30000ms, if unset").
-///
-/// A hook that exceeds its timeout, exits nonzero, or fails to spawn at all is folded into a
-/// single `SubagentError::WorktreeSetup` — from the caller's perspective (`setup_worktree_group`)
-/// every one of these failure modes has the identical consequence: fail the entire worktree group
-/// before any subagent child is spawned (R-SA-063's own text). A hook that spawns, runs to
-/// completion within the timeout, but answers `{"ok": false, "error": "..."}` is likewise folded
-/// into the same error variant, carrying the hook's own `error` string forward verbatim so the
-/// orchestrator's surfaced failure reason is the hook author's, not a generic message.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] on any of: spawn failure, request-serialization
-/// failure (unexpected — `HookRequest` is a plain, always-serializable struct), timeout, nonzero
-/// exit, malformed/non-JSON stdout, or an explicit `{"ok": false, ...}` response.
-async fn run_setup_hook(
-    hook: &HookSpec,
-    req: &HookRequest<'_>,
-    timeout_ms: Option<u64>,
-) -> Result<HookResponse, SubagentError> {
-    let timeout = timeout_ms.map_or(DEFAULT_HOOK_TIMEOUT, Duration::from_millis);
-
-    let call = async {
-        let payload = serde_json::to_vec(req).map_err(|err| {
-            SubagentError::WorktreeSetup(format!(
-                "failed to serialize worktree setup hook request: {err}"
-            ))
-        })?;
-
-        let mut child = Command::new(&hook.command)
-            .args(&hook.args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(SubagentError::Spawn)?;
-
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            SubagentError::WorktreeSetup("worktree setup hook stdin was not piped".to_string())
-        })?;
-        stdin.write_all(&payload).await.map_err(SubagentError::Spawn)?;
-        stdin.shutdown().await.map_err(SubagentError::Spawn)?;
-        drop(stdin); // close our end so the hook reliably observes EOF on its stdin
-
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            SubagentError::WorktreeSetup("worktree setup hook stdout was not piped".to_string())
-        })?;
-        let mut stdout_buf = Vec::new();
-        stdout
-            .read_to_end(&mut stdout_buf)
-            .await
-            .map_err(SubagentError::Spawn)?;
-
-        let status = child.wait().await.map_err(SubagentError::Spawn)?;
-
-        if !status.success() {
-            let mut stderr_buf = Vec::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_end(&mut stderr_buf).await;
-            }
-            return Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook {} exited nonzero ({status}): {}",
-                hook.command.display(),
-                String::from_utf8_lossy(&stderr_buf).trim()
-            )));
-        }
-
-        let response: HookResponse = serde_json::from_slice(&stdout_buf).map_err(|err| {
-            SubagentError::WorktreeSetup(format!(
-                "worktree setup hook {} produced non-JSON/malformed stdout: {err}",
-                hook.command.display()
-            ))
-        })?;
-
-        if !response.ok {
-            return Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook {} reported failure: {}",
-                hook.command.display(),
-                response.error.as_deref().unwrap_or("(no error message)")
-            )));
-        }
-
-        Ok(response)
-    };
-
-    match tokio::time::timeout(timeout, call).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(SubagentError::WorktreeSetup(format!(
-            "worktree setup hook {} exceeded its {}ms timeout",
-            hook.command.display(),
-            timeout.as_millis()
-        ))),
-    }
-}
-
-/// Validate a hook's declared `synthetic_paths` against the safety rail (R-SA-064) and fold them
-/// into each [`WorktreeAssignment`]'s own `synthetic_paths` field.
-///
-/// Two independent checks, either of which fails the ENTIRE setup (not just the offending entry):
-/// 1. Every declared path MUST be relative to its worktree root — an absolute path is rejected
-///    outright (a hook has no legitimate reason to declare a synthetic path outside the worktree
-///    it was told about).
-/// 2. A path that names a *tracked* git file (i.e. `git ls-files` inside that worktree reports it)
-///    MUST fail setup rather than silently excluding real work from the diff — the whole point of
-///    this rail is that a hook cannot use "synthetic" to quietly hide committed/tracked changes.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] if any declared path is absolute, references an
-/// out-of-range `worktree_index`, or names a tracked file.
-async fn apply_synthetic_paths(
-    assignments: &mut [WorktreeAssignment],
-    synthetic_paths: Vec<SyntheticPathEntry>,
-) -> Result<(), SubagentError> {
-    for entry in synthetic_paths {
-        if entry.path.is_absolute() {
-            return Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook declared an absolute synthetic path {} for worktree_index \
-                 {} — synthetic paths must be relative to the worktree root (R-SA-064)",
-                entry.path.display(),
-                entry.worktree_index
-            )));
-        }
-
-        let assignment = assignments
-            .iter_mut()
-            .find(|a| a.index == entry.worktree_index)
-            .ok_or_else(|| {
-                SubagentError::WorktreeSetup(format!(
-                    "worktree setup hook declared a synthetic path for out-of-range \
-                     worktree_index {}",
-                    entry.worktree_index
-                ))
-            })?;
-
-        if is_tracked_file(&assignment.path, &entry.path).await? {
-            return Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook marked tracked file {} (worktree_index {}) as synthetic — \
-                 marking a TRACKED git file as synthetic must fail setup rather than silently \
-                 excluding real work from the diff (R-SA-064)",
-                entry.path.display(),
-                entry.worktree_index
-            )));
-        }
-
-        assignment.synthetic_paths.push(entry.path);
-    }
-    Ok(())
-}
-
-/// Whether `relative_path` (relative to `worktree_path`) is tracked by git in that worktree —
-/// the R-SA-064 safety-rail check `apply_synthetic_paths` runs against every hook-declared
-/// synthetic path.
-///
-/// Uses `git ls-files --error-unmatch` — the standard, exact-match way to ask "does git track
-/// this exact path" (as opposed to `git ls-files <path>` alone, which can match unexpectedly
-/// against pathspec-glob semantics for some inputs); a nonzero exit means untracked (not an
-/// error condition for this function — that is the expected outcome for a genuinely synthetic
-/// path), while a spawn failure is a real error since it means the check itself could not run.
-async fn is_tracked_file(worktree_path: &Path, relative_path: &Path) -> Result<bool, SubagentError> {
-    let output = Command::new("git")
-        .arg("ls-files")
-        .arg("--error-unmatch")
-        .arg(relative_path)
-        .current_dir(worktree_path)
-        .output()
-        .await
-        .map_err(SubagentError::Spawn)?;
-    Ok(output.status.success())
-}
-
-// -------------------------------------------------------------------------------------------
-// Orchestration: the whole synchronous-before-any-spawn sequence (arch-SA §6.4).
-// -------------------------------------------------------------------------------------------
-
-/// Everything [`setup_worktree_group`] needs beyond the shared repo cwd and task count.
-#[derive(Debug, Clone)]
-pub struct WorktreeGroupConfig<'a> {
-    /// A stable id for this fan-out group (e.g. a chain-step id or a freshly minted UUID) — used
-    /// both to derive unique worktree/branch paths and as `HookRequest.group_id` (R-SA-063).
-    pub group_id: &'a str,
-    /// Directory new worktrees are created under (typically
-    /// `SubagentExtensionConfig.worktree_base_dir`, or a `std::env::temp_dir()`-rooted default
-    /// when unset) — kept separate from `repo_cwd` since worktrees are commonly placed outside
-    /// the primary checkout to avoid polluting its own directory listing.
-    pub worktree_base_dir: &'a Path,
-    /// The optional setup hook (R-SA-063); `None` skips step 3b entirely.
-    pub setup_hook: Option<&'a HookSpec>,
-    /// Bound on the setup hook's total runtime (R-SA-063); `None` falls back to
-    /// [`DEFAULT_HOOK_TIMEOUT`].
-    pub setup_hook_timeout_ms: Option<u64>,
-}
-
-/// Run the complete, synchronous-before-any-spawn worktree-group setup sequence (R-SA-060..064),
-/// in the exact order arch-SA §6.4 specifies.
-///
-/// `repo_cwd` is the shared repository working directory the group's tasks would otherwise all
-/// run against. `task_cwd_overrides` is one entry per task (see this module's header doc for why
-/// this is a plain slice rather than a `SingleStep` list).
-///
-/// On ANY failure at any step, whatever worktrees were already created by THIS call are cleaned
-/// up (best-effort, R-SA-065) before the error is returned — callers never observe a partially
-/// set up group and never need to run their own cleanup pass over a failed [`setup_worktree_group`]
-/// call's partial state.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] (or [`SubagentError::Spawn`] for a `git`/hook
-/// subprocess I/O failure) if: the working tree is dirty (R-SA-060), any task set an explicit cwd
-/// (R-SA-062), any `git worktree add` invocation fails, the setup hook fails/times out/rejects
-/// (R-SA-063), or a hook-declared synthetic path fails the safety rail (R-SA-064).
-pub async fn setup_worktree_group(
-    repo_cwd: &Path,
-    task_cwd_overrides: &[Option<&Path>],
-    config: &WorktreeGroupConfig<'_>,
-) -> Result<WorktreeGroupPlan, SubagentError> {
-    // Step 1 (R-SA-060): dirty-tree precondition, before ANYTHING else.
-    check_clean_working_tree(repo_cwd).await?;
-
-    // Step 2 (R-SA-062): reject any task-level cwd override, still before any worktree exists.
-    reject_task_level_cwd_overrides(task_cwd_overrides)?;
-
-    let base_commit = resolve_base_commit(repo_cwd).await?;
-
-    // Step 3a (R-SA-061): one worktree per task, from the common base commit resolved above.
-    let mut assignments = Vec::with_capacity(task_cwd_overrides.len());
-    for index in 0..task_cwd_overrides.len() {
-        let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
-        let branch = format!("subagent/{}/{index_u32}", config.group_id);
-        let path = config
-            .worktree_base_dir
-            .join(format!("{}-{index_u32}", config.group_id));
-
-        if let Err(err) = create_one_worktree(repo_cwd, &path, &branch, &base_commit).await {
-            // Roll back every worktree created so far in THIS call (R-SA-065, best-effort) before
-            // propagating — the group must abort with zero children spawned and zero leftover
-            // half-set-up worktrees from this attempt.
-            cleanup_worktrees(repo_cwd, &assignments).await;
-            return Err(err);
-        }
-
-        assignments.push(WorktreeAssignment {
-            path,
-            branch,
-            base_commit: base_commit.clone(),
-            index: index_u32,
-            synthetic_paths: Vec::new(),
-        });
-    }
-
-    // Step 3b (R-SA-063/064): optional setup hook, only after every worktree above exists.
-    if let Some(hook) = config.setup_hook {
-        let worktree_paths: Vec<PathBuf> = assignments.iter().map(|a| a.path.clone()).collect();
-        let req = HookRequest {
-            worktree_paths: &worktree_paths,
-            base_commit: &base_commit,
-            group_id: config.group_id,
-        };
-
-        let response = match run_setup_hook(hook, &req, config.setup_hook_timeout_ms).await {
-            Ok(response) => response,
-            Err(err) => {
-                cleanup_worktrees(repo_cwd, &assignments).await;
-                return Err(err);
-            }
-        };
-
-        if let Some(synthetic_paths) = response.synthetic_paths
-            && let Err(err) = apply_synthetic_paths(&mut assignments, synthetic_paths).await
-        {
-            cleanup_worktrees(repo_cwd, &assignments).await;
-            return Err(err);
-        }
-    }
-
-    Ok(WorktreeGroupPlan {
-        assignments,
-        base_commit,
-    })
 }
 
 #[cfg(test)]
@@ -698,10 +1253,8 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
 
-    /// Create a real, throwaway git repository with one committed file, returning its directory.
-    /// Mirrors `crates/cyrup-resources/tests/resources.rs`'s own `make_local_git_repo` helper —
-    /// this crate spawns real `git` subprocesses in tests rather than mocking git behavior, per
-    /// this codebase's standing convention.
+    /// A real, throwaway git repo with one committed file, a `.gitignore` ignoring `node_modules/`,
+    /// and a tracked `tracked.txt` — mirrors pi's worktree.test.ts `createRepo`.
     fn make_real_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run = |args: &[&str]| {
@@ -710,486 +1263,476 @@ mod tests {
                 .args(args)
                 .status()
                 .expect("git spawns");
-            assert!(status.success(), "git {args:?} must succeed in the test fixture");
+            assert!(status.success(), "git {args:?} must succeed in the fixture");
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        std::fs::write(dir.path().join("README.md"), "hello\n").expect("seed file");
+        run(&["config", "user.name", "Worktree Tests"]);
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").expect("gitignore");
+        std::fs::write(dir.path().join("tracked.txt"), "initial\n").expect("tracked");
         run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "init"]);
+        run(&["commit", "-q", "-m", "initial commit"]);
         dir
     }
 
-    fn default_config<'a>(group_id: &'a str, worktree_base_dir: &'a Path) -> WorktreeGroupConfig<'a> {
-        WorktreeGroupConfig {
-            group_id,
-            worktree_base_dir,
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write_hook_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("hook dir");
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        (dir, hook)
+    }
+
+    // ---- structure / cwd mapping / base-dir ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_returns_expected_structure() {
+        let repo = make_real_git_repo();
+        let setup = create_worktrees(repo.path(), "structure", 2, None)
+            .await
+            .expect("create");
+        assert_eq!(setup.worktrees.len(), 2);
+        assert_eq!(setup.cwd, PathBuf::from(git(repo.path(), &["rev-parse", "--show-toplevel"])));
+        for (i, wt) in setup.worktrees.iter().enumerate() {
+            assert_eq!(wt.branch, format!("cyrup-parallel-structure-{i}"));
+            assert_eq!(wt.index, u32::try_from(i).unwrap());
+            assert_eq!(wt.agent_cwd, wt.path);
+            assert!(!wt.node_modules_linked);
+            assert!(wt.synthetic_paths.is_empty());
+            assert!(wt.path.is_dir());
+        }
+        cleanup_worktrees(&setup).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_maps_subdirectory_cwd_to_agent_cwd() {
+        let repo = make_real_git_repo();
+        let nested = repo.path().join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("index.ts"), "export const v = 1;\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "add nested"]);
+
+        let setup = create_worktrees(&nested, "subdir", 1, None).await.expect("create");
+        assert_eq!(
+            setup.worktrees[0].agent_cwd,
+            setup.worktrees[0].path.join("packages").join("app")
+        );
+        cleanup_worktrees(&setup).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creates_worktrees_under_a_configured_base_directory() {
+        let repo = make_real_git_repo();
+        let base_parent = tempfile::tempdir().unwrap();
+        let base_dir = base_parent.path().join("nested");
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "base-dir", 1, Some(&options))
+            .await
+            .expect("create");
+        assert_eq!(setup.worktrees[0].path, base_dir.join("cyrup-worktree-base-dir-0"));
+        assert!(base_dir.exists());
+        cleanup_worktrees(&setup).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_rejects_dirty_repositories() {
+        let repo = make_real_git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        let err = create_worktrees(repo.path(), "dirty", 1, None)
+            .await
+            .expect_err("dirty rejects");
+        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
+        assert!(msg.contains("clean git working tree"), "{msg}");
+        // No worktree was created.
+        let list = git(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert_eq!(list.matches("worktree ").count(), 1);
+    }
+
+    // ---- cwd-conflict (allow-equal) ----
+
+    #[test]
+    fn conflict_allows_omitted_or_matching_task_cwd() {
+        let shared = Path::new("/tmp/repo");
+        assert!(find_worktree_task_cwd_conflict(
+            &[("worker-a", None), ("worker-b", Some("/tmp/repo"))],
+            shared
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn conflict_allows_relative_dot_task_cwd() {
+        let shared = Path::new("/tmp/repo");
+        assert!(find_worktree_task_cwd_conflict(&[("worker-a", Some("."))], shared).is_none());
+    }
+
+    #[test]
+    fn conflict_returns_first_divergent_task_cwd() {
+        let shared = Path::new("/tmp/repo");
+        let conflict = find_worktree_task_cwd_conflict(
+            &[("worker-a", Some("/tmp/repo")), ("worker-b", Some("/tmp/repo/packages/app"))],
+            shared,
+        )
+        .expect("conflict");
+        assert_eq!(conflict.index, 1);
+        assert_eq!(conflict.agent, "worker-b");
+        assert_eq!(conflict.cwd, "/tmp/repo/packages/app");
+    }
+
+    // ---- MANDATED: a successful worktree group captures per-task diffs and cleans up ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_group_captures_per_task_diffs_and_cleans_up() {
+        let repo = make_real_git_repo();
+        // A node_modules dir that must NOT appear in any diff (symlinked + synthetic).
+        let node_modules = repo.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("fixture.txt"), "fixture\n").unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "diff", 2, Some(&options))
+            .await
+            .expect("create");
+        assert_eq!(setup.worktrees.len(), 2);
+
+        // Each worktree does distinct work: committed, modified, and new files.
+        for (i, wt) in setup.worktrees.iter().enumerate() {
+            std::fs::write(wt.path.join("committed.ts"), format!("export const c{i} = true;\n"))
+                .unwrap();
+            git(&wt.path, &["add", "committed.ts"]);
+            git(&wt.path, &["commit", "-q", "-m", "committed change"]);
+            std::fs::write(wt.path.join("tracked.txt"), format!("modified-{i}\n")).unwrap();
+            std::fs::write(wt.path.join("new-file.ts"), "export const added = true;\n").unwrap();
+        }
+
+        let diffs_dir = repo.path().join("artifacts").join("worktree-diffs");
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let diffs = diff_worktrees(&setup, &agents, &diffs_dir).await;
+
+        assert_eq!(diffs.len(), 2);
+        for (i, diff) in diffs.iter().enumerate() {
+            assert_eq!(diff.agent, agents[i]);
+            assert_eq!(diff.files_changed, 3, "3 files per worktree, got {}", diff.files_changed);
+            assert!(diff.insertions > 0);
+            assert!(diff.patch_path.exists(), "per-task patch file must exist");
+            let patch = std::fs::read_to_string(&diff.patch_path).unwrap();
+            assert!(patch.contains("committed.ts"));
+            assert!(patch.contains("tracked.txt"));
+            assert!(patch.contains("new-file.ts"));
+            // node_modules symlink was stripped before diffing — never leaks in.
+            assert!(!patch.contains("diff --git a/node_modules b/node_modules"), "{patch}");
+        }
+
+        let summary = format_worktree_diff_summary(&diffs);
+        assert!(summary.contains("=== Worktree Changes ==="));
+        assert!(summary.contains("Full patches:"));
+
+        // Success-path cleanup: worktrees and branches are gone (C18).
+        let paths: Vec<PathBuf> = setup.worktrees.iter().map(|w| w.path.clone()).collect();
+        let branches: Vec<String> = setup.worktrees.iter().map(|w| w.branch.clone()).collect();
+        cleanup_worktrees(&setup).await;
+        for path in &paths {
+            assert!(!path.exists(), "worktree {} must be removed", path.display());
+        }
+        for branch in &branches {
+            let listed = git(repo.path(), &["branch", "--list", branch]);
+            assert!(listed.trim().is_empty(), "branch {branch} must be deleted");
+        }
+        let list = git(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert_eq!(list.matches("worktree ").count(), 1, "only primary remains");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_modules_symlinked_and_registered_as_synthetic() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        let node_modules = repo.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("fixture.txt"), "fixture\n").unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "node-modules", 1, Some(&options))
+            .await
+            .expect("create");
+        assert!(setup.worktrees[0].node_modules_linked);
+        assert_eq!(setup.worktrees[0].synthetic_paths, vec!["node_modules".to_string()]);
+        let link = setup.worktrees[0].path.join("node_modules");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        cleanup_worktrees(&setup).await;
+    }
+
+    // ---- per-worktree setup hook ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runs_a_repo_relative_setup_hook_and_records_synthetic_paths() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        // Commit the hook into the repo so the working tree stays clean (a repo-relative hook path
+        // must still resolve against the repo root and run per-worktree).
+        let hook_rel_dir = repo.path().join("hooks");
+        std::fs::create_dir_all(&hook_rel_dir).unwrap();
+        let hook_in_repo = hook_rel_dir.join("hook.sh");
+        std::fs::write(
+            &hook_in_repo,
+            "#!/bin/sh\nmkdir -p .venv; echo cfg > .venv/pyvenv.cfg; printf '{\"syntheticPaths\":[\".venv\"]}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_in_repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "add hook"]);
+
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: "hooks/hook.sh".to_string(),
+                timeout_ms: Some(5_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "hook-rel", 1, Some(&options))
+            .await
+            .expect("create");
+        assert!(setup.worktrees[0].synthetic_paths.contains(&".venv".to_string()));
+        cleanup_worktrees(&setup).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_bare_command_names_for_setup_hooks() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: "node".to_string(),
+                timeout_ms: None,
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = create_worktrees(repo.path(), "hook-bare", 1, Some(&options))
+            .await
+            .expect_err("bare command rejected");
+        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
+        assert!(msg.contains("absolute path or a repo-relative path"), "{msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_tracked_synthetic_paths_from_hook_output() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        let (_d, hook) = write_hook_script("cat > /dev/null; printf '{\"syntheticPaths\":[\"tracked.txt\"]}'");
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(5_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = create_worktrees(repo.path(), "hook-tracked", 1, Some(&options))
+            .await
+            .expect_err("tracked synthetic rejected");
+        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
+        assert!(msg.contains("cannot mark tracked paths as synthetic"), "{msg}");
+        // Rollback ran — nothing left under the base dir.
+        let remaining: Vec<_> = std::fs::read_dir(base.path()).unwrap().collect();
+        assert!(remaining.is_empty(), "rollback must clean up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excludes_hook_created_synthetic_files_from_captured_patch() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        let (_d, hook) = write_hook_script(
+            "cat > /dev/null; printf 'TOKEN=secret\\n' > .env.local; printf '{\"syntheticPaths\":[\".env.local\"]}'",
+        );
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(5_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "hook-diff", 1, Some(&options))
+            .await
+            .expect("create");
+        std::fs::write(setup.worktrees[0].path.join("tracked.txt"), "modified-by-agent\n").unwrap();
+        let diffs = diff_worktrees(&setup, &["agent-a".to_string()], &repo.path().join("hook-diff")).await;
+        let patch = std::fs::read_to_string(&diffs[0].patch_path).unwrap();
+        assert!(patch.contains("tracked.txt"));
+        assert!(!patch.contains(".env.local"), "synthetic hook file must be excluded: {patch}");
+        cleanup_worktrees(&setup).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleans_up_created_worktrees_when_a_later_hook_setup_fails() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        // Fail only for index 1.
+        let (_d, hook) = write_hook_script(
+            "payload=$(cat); case \"$payload\" in *'\"index\":1'*) echo fail 1>&2; exit 1;; esac; printf '{\"syntheticPaths\":[]}'",
+        );
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(5_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = create_worktrees(repo.path(), "hook-cleanup", 2, Some(&options))
+            .await
+            .expect_err("second hook fails");
+        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
+        let branches = git(repo.path(), &["branch", "--list", "cyrup-parallel-hook-cleanup-*"]);
+        assert!(branches.trim().is_empty(), "temp branches must be cleaned up: {branches}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hook_that_exceeds_timeout_fails_within_the_bound() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = make_real_git_repo();
+        let (_d, hook) = write_hook_script("sleep 30");
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(200),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let err = create_worktrees(repo.path(), "hook-timeout", 1, Some(&options))
+            .await
+            .expect_err("timeout");
+        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
+        assert!(started.elapsed() < Duration::from_secs(5), "must be bounded: {:?}", started.elapsed());
+    }
+
+    // ---- preview ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn previews_expected_worktree_agent_cwd_for_subdirectories() {
+        let repo = make_real_git_repo();
+        let nested = repo.path().join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("index.ts"), "export const v = 1;\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "nested"]);
+
+        let base = tempfile::tempdir().unwrap();
+        let previewed = resolve_expected_worktree_agent_cwd(
+            &nested,
+            "preview",
+            2,
+            Some(&base.path().to_string_lossy()),
+        )
+        .await
+        .expect("preview");
+        assert_eq!(
+            previewed,
+            base.path().join("cyrup-worktree-preview-2").join("packages").join("app")
+        );
+    }
+
+    // ---- legacy compat surface ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_worktree_group_compat_returns_agent_cwds() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let config = WorktreeGroupConfig {
+            group_id: "compat",
+            worktree_base_dir: base.path(),
             setup_hook: None,
             setup_hook_timeout_ms: None,
-        }
-    }
-
-    // ---- R-SA-060: dirty tree rejects before any child spawns ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_clean_tree_passes_the_precondition_check() {
-        let repo = make_real_git_repo();
-        check_clean_working_tree(repo.path())
-            .await
-            .expect("a freshly committed repo must be reported clean");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dirty_tree_is_rejected_by_the_precondition_check_alone() {
-        let repo = make_real_git_repo();
-        std::fs::write(repo.path().join("uncommitted.txt"), "dirty").expect("dirty the tree");
-
-        let err = check_clean_working_tree(repo.path())
-            .await
-            .expect_err("an untracked file must make the tree dirty");
-        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-    }
-
-    /// The real, end-to-end proof this task asks for: a dirty tree causes
-    /// [`setup_worktree_group`] to fail WITHOUT creating a single worktree — verified by
-    /// asserting no worktree directory (or `git worktree list` entry beyond the primary checkout)
-    /// exists afterward, i.e. nothing that would have become a spawned child's cwd was ever
-    /// created.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dirty_tree_rejects_the_whole_group_before_any_worktree_or_child_is_created() {
-        let repo = make_real_git_repo();
-        std::fs::write(repo.path().join("uncommitted.txt"), "dirty").expect("dirty the tree");
-
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-        let config = default_config("group-dirty", worktree_base.path());
-
-        let overrides: Vec<Option<&Path>> = vec![None, None, None];
-        let err = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect_err("a dirty tree must reject the entire group");
-        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-
-        // Zero worktrees were created: `git worktree list` reports only the primary checkout.
-        let list = StdCommand::new("git")
-            .current_dir(repo.path())
-            .args(["worktree", "list", "--porcelain"])
-            .output()
-            .expect("git worktree list runs");
-        let list_text = String::from_utf8_lossy(&list.stdout);
-        assert_eq!(
-            list_text.matches("worktree ").count(),
-            1,
-            "only the primary checkout must be listed — no worktree was created before the \
-             dirty-tree rejection, got:\n{list_text}"
-        );
-
-        // And nothing was materialized under the worktree base dir either.
-        let created: Vec<_> = std::fs::read_dir(worktree_base.path())
-            .expect("worktree base dir is readable")
-            .collect();
-        assert!(
-            created.is_empty(),
-            "no worktree directories should exist under the worktree base dir at all"
-        );
-    }
-
-    // ---- R-SA-062: task-level cwd override rejects the whole group ----
-
-    #[test]
-    fn no_overrides_passes() {
+        };
         let overrides: Vec<Option<&Path>> = vec![None, None];
-        reject_task_level_cwd_overrides(&overrides).expect("no overrides must pass");
-    }
-
-    #[test]
-    fn a_single_task_level_cwd_override_rejects_the_whole_group() {
-        let explicit = PathBuf::from("/some/explicit/cwd");
-        let overrides: Vec<Option<&Path>> = vec![None, Some(explicit.as_path()), None];
-        let err = reject_task_level_cwd_overrides(&overrides)
-            .expect_err("any explicit cwd override must reject the whole group");
-        let SubagentError::WorktreeSetup(message) = err else {
-            panic!("expected WorktreeSetup, got a different variant");
-        };
-        assert!(
-            message.contains("task[1]"),
-            "the offending task index must be named in the error: {message}"
-        );
-    }
-
-    // ---- R-SA-061: N concurrent tasks get N distinct real worktree paths ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn n_tasks_get_n_distinct_real_worktree_directories_each_with_a_dedicated_cwd() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-        let config = default_config("group-fanout", worktree_base.path());
-
-        const N: usize = 4;
-        let overrides: Vec<Option<&Path>> = vec![None; N];
-        let plan = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect("a clean tree with no cwd overrides must succeed");
-
-        assert_eq!(plan.task_count(), N, "one assignment per task");
-
-        // Every assignment's path is a real, existing, DISTINCT directory on disk.
-        let mut seen = std::collections::HashSet::new();
-        for assignment in &plan.assignments {
-            assert!(
-                assignment.path.is_dir(),
-                "assignment path {} must be a real directory on disk",
-                assignment.path.display()
-            );
-            assert!(
-                seen.insert(assignment.path.clone()),
-                "assignment path {} was assigned to more than one task — must be distinct",
-                assignment.path.display()
-            );
-            // Each worktree is a genuine, independent git working tree rooted at HEAD's content.
-            assert!(
-                assignment.path.join("README.md").exists(),
-                "the worktree at {} must contain the checked-out base-commit content",
-                assignment.path.display()
-            );
-        }
-        assert_eq!(seen.len(), N, "N distinct worktree paths for N tasks");
-
-        // `git worktree list` independently confirms N+1 entries (N worktrees + the primary
-        // checkout) exist at the OS/git level, not merely in this function's return value.
-        let list = StdCommand::new("git")
-            .current_dir(repo.path())
-            .args(["worktree", "list", "--porcelain"])
-            .output()
-            .expect("git worktree list runs");
-        let list_text = String::from_utf8_lossy(&list.stdout);
-        assert_eq!(
-            list_text.matches("worktree ").count(),
-            N + 1,
-            "git itself must report N worktrees plus the primary checkout, got:\n{list_text}"
-        );
-
-        // Every assignment shares the identical base commit (a common base commit per R-SA-061).
-        let base_commits: std::collections::HashSet<_> =
-            plan.assignments.iter().map(|a| a.base_commit.clone()).collect();
-        assert_eq!(
-            base_commits.len(),
-            1,
-            "every worktree in the group must be cut from the SAME base commit"
-        );
-    }
-
-    // ---- R-SA-065: best-effort cleanup removes worktrees even when one item's cleanup fails ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cleanup_removes_worktrees_even_when_one_items_cleanup_fails() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-        let config = default_config("group-cleanup", worktree_base.path());
-
-        const N: usize = 3;
-        let overrides: Vec<Option<&Path>> = vec![None; N];
-        let plan = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect("setup succeeds");
-        assert_eq!(plan.task_count(), N);
-
-        // Sabotage exactly ONE worktree's removal ahead of time via `git worktree lock` — git
-        // refuses to `remove` (even with a single `--force`) a LOCKED worktree, requiring a
-        // double `-f -f` this crate's `remove_one_worktree` deliberately does not pass (locking
-        // is a real, git-native way to guard a worktree against accidental removal, which is
-        // exactly the kind of genuine failure `remove_one_worktree` must surface rather than
-        // silently paper over) — while the other two worktrees remain perfectly removable. (An
-        // earlier version of this test tried deleting the worktree directory out from under git
-        // instead, but modern git's `worktree remove --force` tolerates an already-missing
-        // directory and succeeds anyway, so that approach never actually exercised the failure
-        // path this test needs — `lock` is the reliable, git-native way to force a real
-        // `git worktree remove` failure.)
-        let sabotaged_index = 1usize;
-        let sabotaged_path = plan.assignments[sabotaged_index].path.clone();
-        let lock_status = StdCommand::new("git")
-            .current_dir(repo.path())
-            .args([
-                "worktree",
-                "lock",
-                "--reason",
-                "sabotage-for-test",
-                sabotaged_path.to_string_lossy().as_ref(),
-            ])
-            .status()
-            .expect("git worktree lock runs");
-        assert!(lock_status.success(), "sabotage: locking one worktree must succeed");
-
-        let failures = cleanup_worktrees(repo.path(), &plan.assignments).await;
-
-        // The sabotaged (locked) worktree must still genuinely exist — its removal really did
-        // fail, this is not merely a reported-but-not-real failure.
-        assert!(
-            sabotaged_path.exists(),
-            "the locked worktree's removal must have genuinely failed, leaving it in place"
-        );
-
-        // The two non-sabotaged worktrees must have been removed regardless of the sabotaged
-        // one's outcome — proving cleanup is genuinely per-item best-effort, not all-or-nothing.
-        for (index, assignment) in plan.assignments.iter().enumerate() {
-            if index == sabotaged_index {
-                continue;
-            }
-            assert!(
-                !assignment.path.exists(),
-                "non-sabotaged worktree at {} must have been removed by cleanup",
-                assignment.path.display()
-            );
-        }
-
-        // `git worktree list` must reflect that the non-sabotaged worktrees are gone at the git
-        // level too (not merely that their directories vanished).
-        let list = StdCommand::new("git")
-            .current_dir(repo.path())
-            .args(["worktree", "list", "--porcelain"])
-            .output()
-            .expect("git worktree list runs");
-        let list_text = String::from_utf8_lossy(&list.stdout);
-        for (index, assignment) in plan.assignments.iter().enumerate() {
-            if index == sabotaged_index {
-                continue;
-            }
-            assert!(
-                !list_text.contains(assignment.path.to_string_lossy().as_ref()),
-                "git itself must no longer list the cleaned-up worktree at {}, got:\n{list_text}",
-                assignment.path.display()
-            );
-        }
-
-        // And cleanup did not silently swallow the one real failure — it is reported back, tagged
-        // with the offending index, so a caller can log/surface it.
-        assert!(
-            !failures.is_empty(),
-            "the sabotaged worktree's removal failure must be reported, not silently dropped"
-        );
-        assert!(
-            failures
-                .iter()
-                .any(|(index, _)| *index == u32::try_from(sabotaged_index).unwrap_or(u32::MAX)),
-            "the reported failure must be tagged with the sabotaged worktree's own index"
-        );
-    }
-
-    // ---- R-SA-063: setup hook JSON stdin/stdout contract + bounded timeout ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_successful_hook_receives_the_documented_request_shape_and_its_ok_response_is_applied() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        // A real `sh` script standing in for the hook: read stdin (discard, but implicitly prove
-        // it was written to since a hook that never got the payload would hang here and trip the
-        // bounded-drain further down if EOF is never observed on our side), echo a fixed `ok`
-        // JSON response.
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec![
-                "-c".to_string(),
-                "cat > /dev/null; printf '{\"ok\":true}'".to_string(),
-            ],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-hook-ok",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(5_000),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None, None];
-        let plan = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect("an ok:true hook response must let setup succeed");
+        let plan = setup_worktree_group(repo.path(), &overrides, &config).await.expect("group");
         assert_eq!(plan.task_count(), 2);
+        for a in &plan.assignments {
+            assert!(a.path.is_dir());
+        }
+        let setup = WorktreeSetup {
+            cwd: PathBuf::from(git(repo.path(), &["rev-parse", "--show-toplevel"])),
+            worktrees: plan
+                .assignments
+                .iter()
+                .map(|a| WorktreeInfo {
+                    path: a.path.clone(),
+                    agent_cwd: a.path.clone(),
+                    branch: a.branch.clone(),
+                    index: a.index,
+                    node_modules_linked: false,
+                    synthetic_paths: Vec::new(),
+                })
+                .collect(),
+            base_commit: plan.base_commit.clone(),
+        };
+        cleanup_worktrees(&setup).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hook_reporting_ok_false_fails_the_whole_group_and_cleans_up() {
+    async fn check_clean_working_tree_detects_dirty() {
         let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec![
-                "-c".to_string(),
-                "cat > /dev/null; printf '{\"ok\":false,\"error\":\"setup script failed\"}'"
-                    .to_string(),
-            ],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-hook-fail",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(5_000),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None, None];
-        let err = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect_err("ok:false must fail the whole group");
-        let SubagentError::WorktreeSetup(message) = err else {
-            panic!("expected WorktreeSetup");
-        };
-        assert!(message.contains("setup script failed"));
-
-        // Cleanup ran: nothing was left behind under the worktree base dir.
-        let remaining: Vec<_> = std::fs::read_dir(worktree_base.path())
-            .expect("worktree base dir readable")
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "a rejected hook must leave zero worktrees behind (cleanup ran)"
-        );
+        check_clean_working_tree(repo.path()).await.expect("clean");
+        std::fs::write(repo.path().join("x.txt"), "dirty").unwrap();
+        assert!(check_clean_working_tree(repo.path()).await.is_err());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hook_that_exceeds_its_timeout_fails_the_group_within_the_bound() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        // A real, slow hook: sleeps far longer than the configured timeout.
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec!["-c".to_string(), "sleep 30".to_string()],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-hook-timeout",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(200),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None];
-        let started = tokio::time::Instant::now();
-        let err = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect_err("a hook that outlives its timeout must fail the group");
-        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the timeout must be genuinely bounded, not fall through to the hook's own 30s sleep, \
-             got {:?}",
-            started.elapsed()
-        );
-    }
-
-    // ---- R-SA-064: synthetic-path safety rail ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hook_declaring_a_relative_untracked_synthetic_path_is_accepted() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec![
-                "-c".to_string(),
-                "cat > /dev/null; printf '{\"ok\":true,\"synthetic_paths\":[{\"worktree_index\":0,\"path\":\"generated/lock.json\"}]}'"
-                    .to_string(),
-            ],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-synthetic-ok",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(5_000),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None];
-        let plan = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect("an untracked, relative synthetic path must be accepted");
-        assert_eq!(
-            plan.assignments[0].synthetic_paths,
-            vec![PathBuf::from("generated/lock.json")]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hook_declaring_an_absolute_synthetic_path_fails_setup() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec![
-                "-c".to_string(),
-                "cat > /dev/null; printf '{\"ok\":true,\"synthetic_paths\":[{\"worktree_index\":0,\"path\":\"/etc/passwd\"}]}'"
-                    .to_string(),
-            ],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-synthetic-absolute",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(5_000),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None];
-        let err = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect_err("an absolute synthetic path must fail setup");
-        assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hook_marking_a_tracked_file_as_synthetic_fails_setup_rather_than_hiding_it() {
-        let repo = make_real_git_repo();
-        let worktree_base = tempfile::tempdir().expect("worktree base dir");
-
-        // README.md is tracked (committed in `make_real_git_repo`) — declaring IT as synthetic
-        // must be rejected outright, per R-SA-064's exact text.
-        let hook = HookSpec {
-            command: PathBuf::from("sh"),
-            args: vec![
-                "-c".to_string(),
-                "cat > /dev/null; printf '{\"ok\":true,\"synthetic_paths\":[{\"worktree_index\":0,\"path\":\"README.md\"}]}'"
-                    .to_string(),
-            ],
-        };
-        let config = WorktreeGroupConfig {
-            group_id: "group-synthetic-tracked",
-            worktree_base_dir: worktree_base.path(),
-            setup_hook: Some(&hook),
-            setup_hook_timeout_ms: Some(5_000),
-        };
-
-        let overrides: Vec<Option<&Path>> = vec![None];
-        let err = setup_worktree_group(repo.path(), &overrides, &config)
-            .await
-            .expect_err("marking a TRACKED file as synthetic must fail setup, not hide it");
-        let SubagentError::WorktreeSetup(message) = err else {
-            panic!("expected WorktreeSetup");
-        };
-        assert!(message.contains("README.md"));
-
-        // And cleanup ran — the rejected group leaves no worktrees behind.
-        let remaining: Vec<_> = std::fs::read_dir(worktree_base.path())
-            .expect("worktree base dir readable")
-            .collect();
-        assert!(remaining.is_empty(), "a rejected group must clean up after itself");
-    }
-
-    // ---- is_tracked_file: direct unit coverage of the safety-rail primitive ----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn is_tracked_file_distinguishes_tracked_from_untracked() {
-        let repo = make_real_git_repo();
-        assert!(
-            is_tracked_file(repo.path(), Path::new("README.md"))
-                .await
-                .expect("check runs"),
-            "README.md was committed by the fixture and must be reported tracked"
-        );
-        assert!(
-            !is_tracked_file(repo.path(), Path::new("never-existed.txt"))
-                .await
-                .expect("check runs"),
-            "a path that was never created/tracked must be reported untracked"
-        );
+    #[test]
+    fn reject_task_level_cwd_overrides_names_offenders() {
+        let explicit = PathBuf::from("/x");
+        let overrides: Vec<Option<&Path>> = vec![None, Some(explicit.as_path())];
+        let err = reject_task_level_cwd_overrides(&overrides).expect_err("reject");
+        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong") };
+        assert!(msg.contains("task[1]"), "{msg}");
     }
 }

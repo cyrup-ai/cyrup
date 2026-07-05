@@ -29,10 +29,11 @@
 //! scan order) — this module performs no filesystem I/O of its own.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::types::{
-    AgentDefinition, AgentOverrideConfig, AgentOverrideInfo, AgentSource, OverrideField,
-    OverrideScope, SubagentSettings,
+    AgentDefinition, AgentModelSourceInfo, AgentOverrideConfig, AgentOverrideInfo, AgentSource,
+    LayeredOverrideSettings, OverrideField, OverrideScope,
 };
 use crate::error::SubagentError;
 
@@ -126,7 +127,7 @@ pub fn merge_tiers(tiers: TieredAgents) -> HashMap<String, AgentDefinition> {
 /// applied to this function's output — not duplicated here.
 pub fn discover_and_merge(
     tiers: TieredAgents,
-    settings: &SubagentSettings,
+    settings: &LayeredOverrideSettings,
 ) -> Result<HashMap<String, AgentDefinition>, SubagentError> {
     let mut merged = merge_tiers(tiers);
     apply_overrides(&mut merged, settings)?;
@@ -137,71 +138,187 @@ pub fn discover_and_merge(
 // Override application (R-SA-010/011/012, §6.2.1)
 // -------------------------------------------------------------------------------------------
 
-/// Apply `subagents.overrides.<name>` settings-based overrides to an already-merged agent map, in
-/// place (arch-SA §6.2.1). Three passes, strictly ordered:
+/// Apply the `subagents.*` settings layer to an already-merged agent map, in place (arch-SA
+/// §6.2.1; a direct port of pi's `applySubagentDefaultModel` + `applyBuiltinOverrides` +
+/// `applyCustomAgentOverrides`, `agents.ts:730-943`, driven from `discoverAgents`,
+/// `agents.ts:1282-1322`).
 ///
-/// 1. **Builtin branch (R-SA-010)**: for each [`AgentSource::Builtin`] entry with a matching
-///    override, unconditionally overwrite every field the override delta actually states
-///    (`Value`/`ExplicitClear`; `Unset` fields are left untouched) — full-replace semantics,
-///    ignoring `present_fields` entirely (a builtin agent's frontmatter is not user-authored, so
-///    "field already present on disk" carries no fill-unset-only meaning for it).
-/// 2. **Custom branch (R-SA-010)**: for each [`AgentSource::User`]/[`AgentSource::Project`] entry
-///    with a matching override, apply a field from the delta **only when that field was absent
-///    from the agent's own on-disk frontmatter** (`!present_fields.contains(field_name)`) —
-///    fill-unset-only semantics. An explicitly-present field on disk blocks the override for that
-///    field regardless of the override's own value, even if the two happen to agree.
-/// 3. **Global `disableThinking` pass (R-SA-012)**, run last, applied to every entry regardless of
-///    source: project-scope `disableThinking` wins over user-scope, and is skipped per-agent if
-///    that same agent's own override (in the *same* scope that would otherwise apply
-///    `disableThinking`) already explicitly set `thinking` — an override that names a concrete
-///    thinking level for an agent must not then be silently clobbered by the blanket
-///    `disableThinking` knob from that same scope.
+/// **Tier 7 — real two-scope threading.** [`LayeredOverrideSettings`] carries the user- and
+/// project-scope settings UNFLATTENED (each with its own `settings.json` path), so this function
+/// resolves project-beats-user precedence at APPLICATION time and records the true winning scope +
+/// settings-file path in [`AgentOverrideInfo`] — not the pre-Tier-7 shape that flattened both
+/// scopes into one map (losing which scope an override came from) and always stamped `Project` /
+/// the agent's own `.md` path.
 ///
-/// Per R-SA-012, "project override checked before user override; only one is ever applied" governs
-/// per-agent *override delta* selection: [`SubagentSettings`] as modeled here carries a single
-/// flattened `overrides` map (already the caller-resolved, single winning scope per agent name —
-/// `discovery/mod.rs`'s settings-layering responsibility, R-SA-133, not this function's), so this
-/// function's own scope-precedence responsibility is limited to the `disableThinking` pass, which
-/// is the one field in [`SubagentSettings`] that is NOT itself agent-scoped and therefore
-/// genuinely needs its own explicit project-over-user resolution here.
+/// pi runs its passes per TIER before merging; because merge never alters the fields these passes
+/// read, running them here over the already-merged winner (dispatched by `agent.source`) is
+/// observably identical — and the surviving winner is the only agent whose provenance is visible:
+///
+/// - `applySubagentDefaultModel` (`agents.ts:730-739`): fill every model-less agent from the
+///   resolved (project-over-user) `defaultModel`.
+/// - `applyBuiltinOverrides` (`agents.ts:785-838`): for each [`AgentSource::Builtin`] agent, in
+///   pi's exact branch order — project override ▷ project bulk-disable ▷ user override ▷ user
+///   bulk-disable ▷ none — then the `disableThinking` clear (BUILTINS ONLY, skipped when the
+///   winning-scope override already set `thinking`).
+/// - `applyCustomAgentOverrides` (`agents.ts:923-943`): for each [`AgentSource::User`]/
+///   [`AgentSource::Project`] agent, project override ▷ user override (fill-unset-only; the applied
+///   `scope` is the SETTINGS scope, never the agent's own source). `systemPrompt` and
+///   `disableBuiltins`/`disableThinking` are BUILTIN-only — custom agents never see them.
 pub fn apply_overrides(
     merged: &mut HashMap<String, AgentDefinition>,
-    settings: &SubagentSettings,
+    settings: &LayeredOverrideSettings,
 ) -> Result<(), SubagentError> {
-    // Pass 1 + 2: per-agent `subagents.overrides.<name>` deltas.
-    for (name, delta) in &settings.overrides {
-        let Some(agent) = merged.get_mut(name) else {
-            // An override targeting an agent name that discovery never found is not itself a
-            // malformed-settings condition (R-SA-009 reserves that abort for a malformed *shape*
-            // of the overrides map, not for a dangling name reference) — silently no-op.
-            continue;
-        };
+    // applySubagentDefaultModel: resolve the winning defaultModel (project scope wins when the
+    // project scope exists and declares one), then fill every model-less agent BEFORE per-agent
+    // overrides run so an explicit `agentOverrides.<name>.model` still wins by overwriting it.
+    apply_default_model(merged, resolve_default_model(settings).as_deref());
+
+    // applyBuiltinOverrides header (agents.ts:792-798): resolve the bulk-disable / disableThinking
+    // scope selection ONCE, up front, exactly as pi does before mapping over the builtin list.
+    let project_scoped = settings.project_settings_path.is_some();
+    let project_bulk_disabled = project_scoped && settings.project.disable_builtins == Some(true);
+    // pi: userBulkDisabled only when the project scope said NOTHING about disableBuiltins — a
+    // project `disableBuiltins: false` re-enables what a user `true` disabled.
+    let user_bulk_disabled =
+        settings.project.disable_builtins.is_none() && settings.user.disable_builtins == Some(true);
+    let project_thinking_configured = project_scoped && settings.project.disable_thinking.is_some();
+    let disable_thinking = if project_thinking_configured {
+        settings.project.disable_thinking == Some(true)
+    } else {
+        settings.user.disable_thinking == Some(true)
+    };
+    let disable_thinking_meta = match (project_thinking_configured, &settings.project_settings_path)
+    {
+        (true, Some(path)) => (OverrideScope::Project, path.clone()),
+        _ => (OverrideScope::User, settings.user_settings_path.clone()),
+    };
+
+    for agent in merged.values_mut() {
         match agent.source {
-            AgentSource::Builtin => apply_builtin_override(agent, delta),
-            AgentSource::User | AgentSource::Project => apply_custom_override(agent, delta),
-            // Package-sourced agents are not exposed for settings-based override in
-            // pi-subagents' own source contract (only Builtin full-replace and User/Project
-            // fill-unset-only are specified, R-SA-010) — left untouched.
+            AgentSource::Builtin => apply_builtin_agent(
+                agent,
+                settings,
+                project_bulk_disabled,
+                user_bulk_disabled,
+                project_thinking_configured,
+                disable_thinking,
+                &disable_thinking_meta,
+            ),
+            AgentSource::User | AgentSource::Project => apply_custom_agent(agent, settings),
+            // Package-sourced agents are not exposed for settings-based override in pi's own source
+            // contract (only Builtin full-replace and User/Project fill-unset-only) — left untouched.
             AgentSource::Package => {}
         }
     }
 
-    // Pass 3: global disableThinking, project-scope wins over user-scope (R-SA-012), run last so
-    // it observes any `thinking` value pass 1/2 may have just set.
-    apply_disable_thinking_pass(merged, settings);
-
     Ok(())
 }
 
-/// R-SA-010's builtin branch: unconditionally overwrite every field the delta actually states.
-/// `Unset` fields are left alone; `ExplicitClear` resets a field to its type's "absent" value;
-/// `Value(v)` replaces it with `v`. Also records [`AgentOverrideInfo`] provenance (`scope` is
-/// deliberately not distinguished as User vs. Project *for the builtin branch* — a builtin
-/// override's originating settings scope is orthogonal to R-SA-010's full-replace semantics, and
-/// `discovery/mod.rs` is responsible for supplying `settings.overrides` already resolved to the
-/// single winning scope, R-SA-133 — so `OverrideScope::Project` is used here as a fixed sentinel
-/// meaning "settings-resolved," not a claim about which literal scope file the delta came from).
-fn apply_builtin_override(agent: &mut AgentDefinition, delta: &AgentOverrideConfig) {
+/// pi `resolveSubagentDefaultModel` (`agents.ts:716-728`): the project-scope `defaultModel` wins
+/// when the project scope exists and declares one, else the user-scope value (or `None`).
+fn resolve_default_model(settings: &LayeredOverrideSettings) -> Option<String> {
+    if settings.project_settings_path.is_some()
+        && let Some(dm) = settings.project.default_model.as_ref()
+    {
+        return Some(dm.clone());
+    }
+    settings.user.default_model.clone()
+}
+
+/// pi `applySubagentDefaultModel` (`agents.ts:730-739`): fill every agent that has no resolved
+/// `model` from the (already project-over-user resolved) `defaultModel`, stamping
+/// [`AgentModelSourceInfo::SettingsDefault`] provenance so management/`/subagents-doctor` surfaces
+/// can report *why* the model resolved that way. Runs before per-agent overrides so an explicit
+/// `agentOverrides.<name>.model` still wins by overwriting the filled default. A `None` default is
+/// a no-op, leaving a frontmatter-model agent's `model_source` untouched.
+fn apply_default_model(merged: &mut HashMap<String, AgentDefinition>, default_model: Option<&str>) {
+    let Some(dm) = default_model else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.model.is_none() {
+            agent.model = Some(cyrup_core::ModelId::from(dm.to_string()));
+            agent.model_source = Some(AgentModelSourceInfo::SettingsDefault);
+        }
+    }
+}
+
+/// pi `applyBuiltinOverrides`' per-agent body (`agents.ts:805-836`) for ONE builtin agent: pick the
+/// single winning override / bulk-disable in pi's exact branch order (project override ▷ project
+/// bulk-disable ▷ user override ▷ user bulk-disable ▷ none), apply it with the true settings scope +
+/// path, then run the `disableThinking` clear unless the winning-scope override explicitly set
+/// `thinking`. Every project-scope branch is additionally gated on the project scope actually
+/// existing (`project_settings_path.is_some()`), matching pi's `projectSettingsPath !== null` guard.
+fn apply_builtin_agent(
+    agent: &mut AgentDefinition,
+    settings: &LayeredOverrideSettings,
+    project_bulk_disabled: bool,
+    user_bulk_disabled: bool,
+    project_thinking_configured: bool,
+    disable_thinking: bool,
+    disable_thinking_meta: &(OverrideScope, PathBuf),
+) {
+    let project_override = settings.project.overrides.get(&agent.name);
+    let user_override = settings.user.overrides.get(&agent.name);
+    let mut explicit_thinking_override = false;
+
+    if let (Some(delta), Some(path)) = (project_override, settings.project_settings_path.as_ref()) {
+        apply_builtin_override(agent, delta, OverrideScope::Project, path.clone());
+        explicit_thinking_override = delta.thinking.is_present();
+    } else if project_bulk_disabled {
+        if let Some(path) = settings.project_settings_path.as_ref() {
+            apply_builtin_override(agent, &disable_delta(), OverrideScope::Project, path.clone());
+        }
+    } else if let Some(delta) = user_override {
+        apply_builtin_override(
+            agent,
+            delta,
+            OverrideScope::User,
+            settings.user_settings_path.clone(),
+        );
+        // pi (agents.ts:825): a user override's `thinking` counts as an explicit opt-in ONLY when
+        // the project scope did not configure `disableThinking` (a project `disableThinking`
+        // overrides a user per-agent `thinking` — agent-overrides.test.ts:193-213).
+        explicit_thinking_override = !project_thinking_configured && delta.thinking.is_present();
+    } else if user_bulk_disabled {
+        apply_builtin_override(
+            agent,
+            &disable_delta(),
+            OverrideScope::User,
+            settings.user_settings_path.clone(),
+        );
+    }
+
+    // applyGlobalThinking / clearBuiltinThinking (agents.ts:776-803).
+    if disable_thinking && !explicit_thinking_override {
+        clear_builtin_thinking(agent, disable_thinking_meta.0, disable_thinking_meta.1.clone());
+    }
+}
+
+/// The `{ disabled: true }` override delta pi's bulk-disable arms pass to `applyBuiltinOverride`
+/// (`agents.ts:816/831`).
+fn disable_delta() -> AgentOverrideConfig {
+    AgentOverrideConfig {
+        disabled: OverrideField::Value(true),
+        ..AgentOverrideConfig::default()
+    }
+}
+
+/// pi `applyBuiltinOverride` (`agents.ts:741-774`): full-replace every field the delta states
+/// (`Value` sets, `ExplicitClear` resets to the field's absent value, `Unset` is left alone), and
+/// record [`AgentOverrideInfo`] provenance with `base` = the agent snapshot BEFORE this override.
+/// pi's callers only ever pass a non-empty delta — a parsed override entry with no fields is dropped
+/// at read time (`parseBuiltinOverrideEntry` returns `undefined`), and the bulk-disable arms pass an
+/// explicit `{ disabled: true }`. Because this crate's settings deserialize CAN yield an all-`Unset`
+/// entry (serde does not drop it), the `is_empty` short-circuit here reproduces pi's "empty entries
+/// are never applied" — an empty delta records no provenance. `systemPrompt` (the builtin body
+/// replacement) is applied here and ONLY here (pi's custom-agent branch omits it).
+fn apply_builtin_override(
+    agent: &mut AgentDefinition,
+    delta: &AgentOverrideConfig,
+    scope: OverrideScope,
+    settings_path: PathBuf,
+) {
     if delta.is_empty() {
         return;
     }
@@ -210,26 +327,57 @@ fn apply_builtin_override(agent: &mut AgentDefinition, delta: &AgentOverrideConf
     apply_field_full_replace(&mut agent.model, &delta.model, None, |v| {
         Some(cyrup_core::ModelId::from(v.clone()))
     });
+    // Record model provenance when the override touched `model`: a concrete value is a
+    // settings-override source; an explicit clear leaves the agent with no model (source cleared).
+    match &delta.model {
+        OverrideField::Value(_) => {
+            agent.model_source = Some(AgentModelSourceInfo::SettingsOverride);
+        }
+        OverrideField::ExplicitClear => agent.model_source = None,
+        OverrideField::Unset => {}
+    }
     apply_field_full_replace(
         &mut agent.fallback_models,
         &delta.fallback_models,
         Vec::new(),
         |v| v.iter().cloned().map(cyrup_core::ModelId::from).collect(),
     );
-    apply_field_full_replace(&mut agent.thinking, &delta.thinking, None, |v| Some(*v));
-    apply_field_full_replace(&mut agent.tools, &delta.tools, None, |v| Some(v.clone()));
+    apply_field_full_replace(&mut agent.thinking, &delta.thinking, None, |v| Some(v.clone()));
     apply_field_full_replace(
         &mut agent.system_prompt_mode,
         &delta.system_prompt_mode,
         crate::discovery::types::SystemPromptMode::Replace,
         |v| *v,
     );
-    apply_field_full_replace(&mut agent.disabled, &delta.disabled, None, |v| Some(*v));
     apply_field_full_replace(
-        &mut agent.max_subagent_depth,
-        &delta.max_subagent_depth,
-        None,
-        |v| Some(*v),
+        &mut agent.inherit_project_context,
+        &delta.inherit_project_context,
+        false,
+        |v| *v,
+    );
+    apply_field_full_replace(&mut agent.inherit_skills, &delta.inherit_skills, false, |v| *v);
+    apply_field_full_replace(&mut agent.default_context, &delta.default_context, None, |v| {
+        Some(*v)
+    });
+    apply_field_full_replace(&mut agent.disabled, &delta.disabled, None, |v| Some(*v));
+    // pi `systemPrompt` (agents.ts:761): replace the BUILTIN persona's own body prose.
+    apply_field_full_replace(
+        &mut agent.system_prompt_body,
+        &delta.system_prompt,
+        String::new(),
+        |v| v.clone(),
+    );
+    apply_field_full_replace(&mut agent.skills, &delta.skills, Vec::new(), |v| v.clone());
+    // pi `tools`/`false` clears to the EMPTY allowlist (`[]`, "no tools"), NOT to `None`
+    // ("no restriction") — agents.ts:764 `splitToolList(false ? [] : tools)`.
+    apply_field_full_replace(&mut agent.tools, &delta.tools, Some(Vec::new()), |v| {
+        Some(v.clone())
+    });
+    apply_field_full_replace(
+        &mut agent.subagent_only_extensions,
+        &delta.subagent_only_extensions,
+        Vec::new(),
+        |v| v.clone(),
     );
     apply_field_full_replace(
         &mut agent.completion_guard,
@@ -239,10 +387,33 @@ fn apply_builtin_override(agent: &mut AgentDefinition, delta: &AgentOverrideConf
     );
 
     agent.override_info = Some(AgentOverrideInfo {
-        scope: OverrideScope::Project,
-        settings_path: agent.file_path.clone(),
+        scope,
+        settings_path,
         base_snapshot,
     });
+}
+
+/// pi `clearBuiltinThinking` (`agents.ts:776-783`): a no-op when the agent has no `thinking`;
+/// otherwise drop `thinking` and record disable-thinking provenance ONLY if the agent has no
+/// override recorded yet (a per-agent override already applied in this pass keeps its own
+/// provenance/base). The snapshot is captured BEFORE the clear.
+fn clear_builtin_thinking(
+    agent: &mut AgentDefinition,
+    scope: OverrideScope,
+    settings_path: PathBuf,
+) {
+    if agent.thinking.is_none() {
+        return;
+    }
+    if agent.override_info.is_none() {
+        let base_snapshot = Box::new(agent.clone());
+        agent.override_info = Some(AgentOverrideInfo {
+            scope,
+            settings_path,
+            base_snapshot,
+        });
+    }
+    agent.thinking = None;
 }
 
 /// One field's full-replace application (R-SA-010 builtin branch): `Unset` is a no-op,
@@ -270,30 +441,60 @@ fn apply_field_full_replace<T, F>(
     }
 }
 
-/// R-SA-010's custom (User/Project) branch: fill-unset-only. A field from the delta is applied
-/// **only when that field's key was absent from the agent's own on-disk frontmatter**
-/// (`!agent.present_fields.contains(field_name)`) — an explicitly-present field on disk blocks the
-/// override for that field unconditionally, regardless of the override delta's own value (even an
-/// `ExplicitClear` is blocked by presence: presence itself, not the override's intent, is the
-/// gate).
-fn apply_custom_override(agent: &mut AgentDefinition, delta: &AgentOverrideConfig) {
-    if delta.is_empty() {
-        return;
+/// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:930-942`): project override wins over
+/// user override; only ONE is ever applied, with the SETTINGS scope/path (never the agent's own
+/// source). The project branch is gated on the project scope actually existing.
+fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSettings) {
+    if let (Some(delta), Some(path)) = (
+        settings.project.overrides.get(&agent.name),
+        settings.project_settings_path.as_ref(),
+    ) {
+        apply_custom_override(agent, delta, OverrideScope::Project, path.clone());
+    } else if let Some(delta) = settings.user.overrides.get(&agent.name) {
+        apply_custom_override(
+            agent,
+            delta,
+            OverrideScope::User,
+            settings.user_settings_path.clone(),
+        );
     }
+}
+
+/// pi `applyCustomAgentOverride` (`agents.ts:845-921`): fill-unset-only — a field is applied only
+/// when its frontmatter key was absent from the agent's own on-disk frontmatter (an explicitly
+/// present field blocks the override for that field unconditionally, regardless of the delta's own
+/// value). `systemPrompt` is deliberately NOT a custom-agent override (pi omits it here — it only
+/// ever replaces a BUILTIN body). Provenance uses the passed settings `scope`/`settings_path`
+/// (never the agent's own source), recorded only when at least one field actually applied.
+fn apply_custom_override(
+    agent: &mut AgentDefinition,
+    delta: &AgentOverrideConfig,
+    scope: OverrideScope,
+    settings_path: PathBuf,
+) {
     let base_snapshot = Box::new(agent.clone());
     let mut applied_any = false;
 
-    applied_any |= apply_field_fill_unset(
+    let model_applied = apply_field_fill_unset(
         &mut agent.model,
-        "model",
+        &["model"],
         &agent.present_fields,
         &delta.model,
         None,
         |v| Some(cyrup_core::ModelId::from(v.clone())),
     );
+    if model_applied {
+        // The fill only runs when `model` was absent from disk AND the delta stated it; a concrete
+        // value is a settings-override source, an explicit clear leaves no model.
+        agent.model_source = match &delta.model {
+            OverrideField::Value(_) => Some(AgentModelSourceInfo::SettingsOverride),
+            _ => None,
+        };
+    }
+    applied_any |= model_applied;
     applied_any |= apply_field_fill_unset(
         &mut agent.fallback_models,
-        "fallbackModels",
+        &["fallbackModels"],
         &agent.present_fields,
         &delta.fallback_models,
         Vec::new(),
@@ -301,47 +502,81 @@ fn apply_custom_override(agent: &mut AgentDefinition, delta: &AgentOverrideConfi
     );
     applied_any |= apply_field_fill_unset(
         &mut agent.thinking,
-        "thinking",
+        &["thinking"],
         &agent.present_fields,
         &delta.thinking,
-        None,
-        |v| Some(*v),
-    );
-    applied_any |= apply_field_fill_unset(
-        &mut agent.tools,
-        "tools",
-        &agent.present_fields,
-        &delta.tools,
         None,
         |v| Some(v.clone()),
     );
     applied_any |= apply_field_fill_unset(
         &mut agent.system_prompt_mode,
-        "systemPromptMode",
+        &["systemPromptMode"],
         &agent.present_fields,
         &delta.system_prompt_mode,
         crate::discovery::types::SystemPromptMode::Replace,
         |v| *v,
     );
     applied_any |= apply_field_fill_unset(
-        &mut agent.disabled,
-        "disabled",
+        &mut agent.inherit_project_context,
+        &["inheritProjectContext"],
         &agent.present_fields,
-        &delta.disabled,
+        &delta.inherit_project_context,
+        false,
+        |v| *v,
+    );
+    applied_any |= apply_field_fill_unset(
+        &mut agent.inherit_skills,
+        &["inheritSkills"],
+        &agent.present_fields,
+        &delta.inherit_skills,
+        false,
+        |v| *v,
+    );
+    applied_any |= apply_field_fill_unset(
+        &mut agent.default_context,
+        &["defaultContext"],
+        &agent.present_fields,
+        &delta.default_context,
         None,
         |v| Some(*v),
     );
+    // pi `disabled` custom arm (agents.ts:893-896) gates on the runtime VALUE (`agent.disabled ===
+    // undefined`), not frontmatter-field presence, and has no `| false` clear form.
+    if agent.disabled.is_none()
+        && let OverrideField::Value(v) = &delta.disabled
+    {
+        agent.disabled = Some(*v);
+        applied_any = true;
+    }
+    // pi checks BOTH `skill` and `skills` frontmatter keys for the skills fill (agents.ts:898).
     applied_any |= apply_field_fill_unset(
-        &mut agent.max_subagent_depth,
-        "maxSubagentDepth",
+        &mut agent.skills,
+        &["skill", "skills"],
         &agent.present_fields,
-        &delta.max_subagent_depth,
-        None,
-        |v| Some(*v),
+        &delta.skills,
+        Vec::new(),
+        |v| v.clone(),
+    );
+    // pi `tools`/`false` clears to the EMPTY allowlist, NOT `None` (agents.ts:900-905).
+    applied_any |= apply_field_fill_unset(
+        &mut agent.tools,
+        &["tools"],
+        &agent.present_fields,
+        &delta.tools,
+        Some(Vec::new()),
+        |v| Some(v.clone()),
+    );
+    applied_any |= apply_field_fill_unset(
+        &mut agent.subagent_only_extensions,
+        &["subagentOnlyExtensions"],
+        &agent.present_fields,
+        &delta.subagent_only_extensions,
+        Vec::new(),
+        |v| v.clone(),
     );
     applied_any |= apply_field_fill_unset(
         &mut agent.completion_guard,
-        "completionGuard",
+        &["completionGuard"],
         &agent.present_fields,
         &delta.completion_guard,
         None,
@@ -349,13 +584,9 @@ fn apply_custom_override(agent: &mut AgentDefinition, delta: &AgentOverrideConfi
     );
 
     if applied_any {
-        let scope = match agent.source {
-            AgentSource::Project => OverrideScope::Project,
-            _ => OverrideScope::User,
-        };
         agent.override_info = Some(AgentOverrideInfo {
             scope,
-            settings_path: agent.file_path.clone(),
+            settings_path,
             base_snapshot,
         });
     }
@@ -364,19 +595,24 @@ fn apply_custom_override(agent: &mut AgentDefinition, delta: &AgentOverrideConfi
 /// One field's fill-unset-only application (R-SA-010 custom branch). Returns `true` iff the field
 /// was actually applied (i.e. it was both present-in-delta and absent-from-disk) — used by the
 /// caller to decide whether [`AgentOverrideInfo`] provenance should be recorded at all (R-SA-010's
-/// data model note: "present only when at least one override field actually applied"). Takes
-/// `clear_value` by parameter (mirroring [`apply_field_full_replace`]'s own signature/rationale)
-/// rather than an `F: Default` bound, so this helper works uniformly across `Option<_>`/`Vec<_>`
-/// fields AND plain-enum fields like `SystemPromptMode` that have no `Default` impl of their own.
+/// data model note: "present only when at least one override field actually applied"). Takes a
+/// slice of `frontmatter_fields` (rather than a single name) because pi's `fill` gate checks a
+/// LIST of keys for at least one field — notably `skills`, which pi blocks on either `skill` OR
+/// `skills` being present on disk (`agents.ts:898`). Takes `clear_value` by parameter (rather than
+/// an `F: Default` bound) so this helper works uniformly across `Option<_>`/`Vec<_>` fields AND
+/// plain-value fields like `bool`/`SystemPromptMode` that have no `Default` impl of their own.
 fn apply_field_fill_unset<T, F>(
     target: &mut F,
-    field_name: &str,
+    frontmatter_fields: &[&str],
     present_fields: &std::collections::HashSet<String>,
     delta: &OverrideField<T>,
     clear_value: F,
     to_target: impl FnOnce(&T) -> F,
 ) -> bool {
-    if present_fields.contains(field_name) {
+    if frontmatter_fields
+        .iter()
+        .any(|field| present_fields.contains(*field))
+    {
         // Explicitly present on disk: the override is blocked for this field, full stop —
         // regardless of the delta's own value or the delta's own Unset/ExplicitClear/Value state.
         return false;
@@ -394,40 +630,6 @@ fn apply_field_fill_unset<T, F>(
     }
 }
 
-/// R-SA-012: project-scope `subagents.disableThinking` wins over user-scope, applied after
-/// per-agent overrides (pass 1/2 above already ran), and skipped per-agent when that agent's own
-/// override already explicitly set `thinking` in the scope that would otherwise supply
-/// `disableThinking` — an override that names a concrete thinking level must not be silently
-/// clobbered by the blanket knob from the same scope.
-///
-/// [`SubagentSettings`] as modeled in this crate carries one flattened `disable_thinking: Option<
-/// bool>` (already scope-resolved by `discovery/mod.rs`'s settings-layering step, R-SA-133 — the
-/// project-vs-user precedence for *which value wins* is that caller's responsibility, mirroring
-/// how `overrides` is already a single flattened map rather than two parallel per-scope maps).
-/// This function's own remaining responsibility is exactly the "skipped per-agent if that agent's
-/// own override already set `thinking`" carve-out, which needs the per-agent `overrides` map to
-/// evaluate — the project-over-user scope selection for the *blanket* flag itself is encoded by
-/// `discovery/mod.rs` resolving `settings.disable_thinking` from the correct scope before calling
-/// this function at all.
-fn apply_disable_thinking_pass(
-    merged: &mut HashMap<String, AgentDefinition>,
-    settings: &SubagentSettings,
-) {
-    let Some(true) = settings.disable_thinking else {
-        return;
-    };
-    for (name, agent) in merged.iter_mut() {
-        let already_set_thinking_via_override = settings
-            .overrides
-            .get(name)
-            .is_some_and(|delta| delta.thinking.is_present());
-        if already_set_thinking_via_override {
-            continue;
-        }
-        agent.thinking = None;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -435,10 +637,55 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use cyrup_core::ThinkingLevel;
-
     use super::*;
-    use crate::discovery::types::{OutputSpec, SystemPromptMode, ToolRef};
+    use crate::discovery::types::{OutputSpec, SubagentSettings, SystemPromptMode, ToolRef};
+    use crate::fork_context::ContextMode;
+
+    // Two fixed settings-file paths the two-scope helpers below stamp into provenance, so every
+    // override-scope assertion can check the EXACT `settings.json` path (never the agent's own `.md`).
+    const USER_SETTINGS: &str = "/user/settings.json";
+    const PROJECT_SETTINGS: &str = "/proj/settings.json";
+
+    /// A [`LayeredOverrideSettings`] carrying only user-scope settings, with a project scope that
+    /// EXISTS (non-`None` path, mirroring pi's always-non-null `projectSettingsPath`) but is empty —
+    /// the common "user customized, project didn't" shape.
+    fn user_scope(user: SubagentSettings) -> LayeredOverrideSettings {
+        LayeredOverrideSettings {
+            user,
+            project: SubagentSettings::default(),
+            user_settings_path: PathBuf::from(USER_SETTINGS),
+            project_settings_path: Some(PathBuf::from(PROJECT_SETTINGS)),
+        }
+    }
+
+    /// A [`LayeredOverrideSettings`] carrying only project-scope settings (empty user scope).
+    fn project_scope(project: SubagentSettings) -> LayeredOverrideSettings {
+        LayeredOverrideSettings {
+            user: SubagentSettings::default(),
+            project,
+            user_settings_path: PathBuf::from(USER_SETTINGS),
+            project_settings_path: Some(PathBuf::from(PROJECT_SETTINGS)),
+        }
+    }
+
+    /// Both scopes populated, each with its own settings path (project wins per pi).
+    fn two_scope(user: SubagentSettings, project: SubagentSettings) -> LayeredOverrideSettings {
+        LayeredOverrideSettings {
+            user,
+            project,
+            user_settings_path: PathBuf::from(USER_SETTINGS),
+            project_settings_path: Some(PathBuf::from(PROJECT_SETTINGS)),
+        }
+    }
+
+    fn settings_with_override(name: &str, cfg: AgentOverrideConfig) -> SubagentSettings {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(name.to_string(), cfg);
+        SubagentSettings {
+            overrides,
+            ..Default::default()
+        }
+    }
 
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
@@ -716,31 +963,32 @@ mod tests {
     fn builtin_override_fully_replaces_every_delta_field_unconditionally() {
         let mut merged = HashMap::new();
         let mut a = agent("delegate", AgentSource::Builtin, "/builtin/delegate.md");
-        a.thinking = Some(ThinkingLevel::Low);
+        a.thinking = Some("low".to_string());
         a.present_fields.insert("thinking".to_string());
         merged.insert("delegate".to_string(), a);
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "delegate".to_string(),
+        let settings = user_scope(settings_with_override(
+            "delegate",
             AgentOverrideConfig {
-                thinking: OverrideField::Value(ThinkingLevel::High),
+                thinking: OverrideField::Value("high".to_string()),
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("delegate").expect("present");
         assert_eq!(
             updated.thinking,
-            Some(ThinkingLevel::High),
+            Some("high".to_string()),
             "builtin branch overwrites even a field present on disk"
         );
-        assert!(updated.override_info.is_some());
+        let info = updated.override_info.as_ref().expect("override recorded");
+        assert_eq!(info.scope, OverrideScope::User);
+        assert_eq!(
+            info.settings_path,
+            PathBuf::from(USER_SETTINGS),
+            "provenance path must be the settings.json, not the agent's own .md"
+        );
     }
 
     #[test]
@@ -750,21 +998,73 @@ mod tests {
         a.disabled = Some(true);
         merged.insert("delegate".to_string(), a);
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "delegate".to_string(),
+        let settings = user_scope(settings_with_override(
+            "delegate",
             AgentOverrideConfig {
                 disabled: OverrideField::ExplicitClear,
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert_eq!(merged.get("delegate").expect("present").disabled, None);
+    }
+
+    #[test]
+    fn system_prompt_override_replaces_a_builtin_body() {
+        // pi `applyBuiltinOverride` (agents.ts:761): a `systemPrompt` override replaces the builtin
+        // persona's own body prose. This is one of the six fields an earlier port dropped.
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md");
+        a.system_prompt_body = "original reviewer body".to_string();
+        merged.insert("reviewer".to_string(), a);
+
+        let settings = user_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                system_prompt: OverrideField::Value("You are the overridden reviewer.".to_string()),
+                ..Default::default()
+            },
+        ));
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(
+            updated.system_prompt_body, "You are the overridden reviewer.",
+            "systemPrompt override must replace the builtin body"
+        );
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").scope,
+            OverrideScope::User
+        );
+    }
+
+    #[test]
+    fn system_prompt_override_does_not_apply_to_a_custom_agent() {
+        // pi's `applyCustomAgentOverride` omits `systemPrompt` entirely (only `applyBuiltinOverride`
+        // sets it) — a custom agent's body is never replaced by a settings override.
+        let mut merged = HashMap::new();
+        let mut a = agent("implementer", AgentSource::Project, "/proj/impl.md");
+        a.system_prompt_body = "custom implementer body".to_string();
+        merged.insert("implementer".to_string(), a);
+
+        let settings = project_scope(settings_with_override(
+            "implementer",
+            AgentOverrideConfig {
+                system_prompt: OverrideField::Value("SHOULD NOT APPLY".to_string()),
+                ..Default::default()
+            },
+        ));
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("implementer").expect("present");
+        assert_eq!(
+            updated.system_prompt_body, "custom implementer body",
+            "systemPrompt is builtin-only; a custom agent body must be untouched"
+        );
+        // systemPrompt was the ONLY delta field and it is not a custom-agent field, so nothing
+        // applied and no provenance is recorded.
+        assert!(updated.override_info.is_none());
     }
 
     #[test]
@@ -781,19 +1081,14 @@ mod tests {
         a.model = Some("anthropic/claude-sonnet-4".into());
         merged.insert("reviewer".to_string(), a);
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "reviewer".to_string(),
+        let settings = project_scope(settings_with_override(
+            "reviewer",
             AgentOverrideConfig {
                 model: OverrideField::Value("openai/gpt-5".to_string()),
-                thinking: OverrideField::Value(ThinkingLevel::High),
+                thinking: OverrideField::Value("high".to_string()),
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
@@ -805,7 +1100,7 @@ mod tests {
         );
         assert_eq!(
             updated.thinking,
-            Some(ThinkingLevel::High),
+            Some("high".to_string()),
             "absent-on-disk field must accept the override value"
         );
     }
@@ -821,18 +1116,13 @@ mod tests {
         );
         merged.insert("reviewer".to_string(), a);
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "reviewer".to_string(),
+        let settings = user_scope(settings_with_override(
+            "reviewer",
             AgentOverrideConfig {
                 completion_guard: OverrideField::ExplicitClear,
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         // Presence on disk blocks the override outright — even though the on-disk value here
@@ -848,7 +1138,7 @@ mod tests {
             "untouched".to_string(),
             agent("untouched", AgentSource::User, "/user/untouched.md"),
         );
-        let settings = SubagentSettings::default();
+        let settings = user_scope(SubagentSettings::default());
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert!(merged.get("untouched").expect("present").override_info.is_none());
     }
@@ -860,18 +1150,13 @@ mod tests {
             "pkgagent".to_string(),
             agent("pkgagent", AgentSource::Package, "/pkg/pkgagent.md"),
         );
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "pkgagent".to_string(),
+        let settings = user_scope(settings_with_override(
+            "pkgagent",
             AgentOverrideConfig {
-                thinking: OverrideField::Value(ThinkingLevel::High),
+                thinking: OverrideField::Value("high".to_string()),
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("pkgagent").expect("present");
         assert_eq!(updated.thinking, None, "package-sourced agents are not overridable");
@@ -885,12 +1170,10 @@ mod tests {
             "reviewer".to_string(),
             agent("reviewer", AgentSource::Project, "/proj/reviewer.md"),
         );
-        let mut overrides = BTreeMap::new();
-        overrides.insert("reviewer".to_string(), AgentOverrideConfig::default());
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        let settings = project_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig::default(),
+        ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert!(merged.get("reviewer").expect("present").override_info.is_none());
     }
@@ -898,21 +1181,84 @@ mod tests {
     #[test]
     fn override_targeting_unknown_agent_name_is_silently_ignored() {
         let mut merged: HashMap<String, AgentDefinition> = HashMap::new();
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "ghost".to_string(),
+        let settings = user_scope(settings_with_override(
+            "ghost",
             AgentOverrideConfig {
-                thinking: OverrideField::Value(ThinkingLevel::High),
+                thinking: OverrideField::Value("high".to_string()),
                 ..Default::default()
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
         // Must not error and must not panic.
         apply_overrides(&mut merged, &settings).expect("apply succeeds even with a dangling name");
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn user_override_on_a_project_agent_records_user_scope_and_settings_path() {
+        // pi agent-overrides.test.ts:374-385: a project-SOURCED custom agent with ONLY a user-scope
+        // override entry gets the override applied at scope "user" (the SETTINGS scope), NOT the
+        // agent's own `project` source — and the provenance path is the user `settings.json`, not
+        // the agent's `.md`. This is the exact provenance defect Tier 7 fixes.
+        let mut merged = HashMap::new();
+        merged.insert(
+            "implementer".to_string(),
+            agent("implementer", AgentSource::Project, "/proj/impl.md"),
+        );
+        let settings = user_scope(settings_with_override(
+            "implementer",
+            AgentOverrideConfig {
+                model: OverrideField::Value("anthropic/claude-sonnet-4-6".to_string()),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("implementer").expect("present");
+        assert_eq!(updated.model, Some("anthropic/claude-sonnet-4-6".into()));
+        let info = updated.override_info.as_ref().expect("override recorded");
+        assert_eq!(
+            info.scope,
+            OverrideScope::User,
+            "scope is the settings scope (user), NOT the agent's own project source"
+        );
+        assert_eq!(
+            info.settings_path,
+            PathBuf::from(USER_SETTINGS),
+            "settings_path is the user settings.json, NOT the agent's own .md"
+        );
+    }
+
+    #[test]
+    fn project_override_beats_user_override_on_a_custom_agent() {
+        // pi agent-overrides.test.ts:387-401: a same-named user+project override on a project custom
+        // agent -> the PROJECT override wins, at scope "project".
+        let mut merged = HashMap::new();
+        merged.insert(
+            "implementer".to_string(),
+            agent("implementer", AgentSource::Project, "/proj/impl.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "implementer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("anthropic/claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "implementer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    ..Default::default()
+                },
+            ),
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("implementer").expect("present");
+        assert_eq!(updated.model, Some("openai/gpt-5.4".into()), "project override wins");
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").scope,
+            OverrideScope::Project
+        );
     }
 
     #[test]
@@ -922,33 +1268,47 @@ mod tests {
             "reviewer".to_string(),
             agent("reviewer", AgentSource::Project, "/proj/reviewer.md"),
         );
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "reviewer".to_string(),
+        let settings = project_scope(settings_with_override(
+            "reviewer",
             AgentOverrideConfig {
                 model: OverrideField::Value("openai/gpt-5".to_string()),
                 fallback_models: OverrideField::Value(vec!["anthropic/claude-sonnet-4".to_string()]),
-                thinking: OverrideField::Value(ThinkingLevel::Medium),
-                tools: OverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
+                thinking: OverrideField::Value("medium".to_string()),
                 system_prompt_mode: OverrideField::Value(SystemPromptMode::Append),
+                inherit_project_context: OverrideField::Value(true),
+                inherit_skills: OverrideField::Value(true),
+                default_context: OverrideField::Value(ContextMode::Fork),
                 disabled: OverrideField::Value(true),
-                max_subagent_depth: OverrideField::Value(3),
+                // systemPrompt is set but must NOT apply to a custom agent (builtin-only field).
+                system_prompt: OverrideField::Value("should not apply".to_string()),
+                skills: OverrideField::Value(vec!["tdd".to_string()]),
+                tools: OverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
+                subagent_only_extensions: OverrideField::Value(vec![
+                    "./tools/child-review.ts".to_string(),
+                ]),
                 completion_guard: OverrideField::Value(false),
             },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
+        ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
         assert_eq!(updated.model, Some("openai/gpt-5".into()));
         assert_eq!(updated.fallback_models, vec!["anthropic/claude-sonnet-4".into()]);
-        assert_eq!(updated.thinking, Some(ThinkingLevel::Medium));
-        assert_eq!(updated.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
+        assert_eq!(updated.thinking, Some("medium".to_string()));
         assert_eq!(updated.system_prompt_mode, SystemPromptMode::Append);
+        assert!(updated.inherit_project_context);
+        assert!(updated.inherit_skills);
+        assert_eq!(updated.default_context, Some(ContextMode::Fork));
         assert_eq!(updated.disabled, Some(true));
-        assert_eq!(updated.max_subagent_depth, Some(3));
+        assert_eq!(
+            updated.system_prompt_body, "reviewer body",
+            "systemPrompt is builtin-only and must not touch a custom agent's body"
+        );
+        assert_eq!(updated.skills, vec!["tdd".to_string()]);
+        assert_eq!(updated.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
+        assert_eq!(
+            updated.subagent_only_extensions,
+            vec!["./tools/child-review.ts".to_string()]
+        );
         assert_eq!(updated.completion_guard, Some(false));
         assert!(updated.override_info.is_some());
     }
@@ -960,89 +1320,412 @@ mod tests {
     #[test]
     fn disable_thinking_pass_clears_thinking_when_flag_set() {
         let mut merged = HashMap::new();
-        let mut a = agent("worker", AgentSource::Project, "/proj/worker.md");
-        a.thinking = Some(ThinkingLevel::High);
+        let mut a = agent("worker", AgentSource::Builtin, "/builtin/worker.md");
+        a.thinking = Some("high".to_string());
         merged.insert("worker".to_string(), a);
 
-        let settings = SubagentSettings {
+        let settings = user_scope(SubagentSettings {
             disable_thinking: Some(true),
             ..Default::default()
-        };
+        });
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert_eq!(merged.get("worker").expect("present").thinking, None);
     }
 
     #[test]
+    fn disable_thinking_does_not_touch_custom_user_or_project_agents() {
+        // BUILTINS ONLY (pi `applyBuiltinOverrides`): a custom User/Project agent's own frontmatter
+        // `thinking` survives the global `disableThinking` knob untouched, while a sibling builtin's
+        // is cleared — the required "disableThinking does not touch custom agents" behavior.
+        let mut merged = HashMap::new();
+        let mut u = agent("custom-user", AgentSource::User, "/user/custom.md");
+        u.thinking = Some("high".to_string());
+        merged.insert("custom-user".to_string(), u);
+        let mut p = agent("custom-proj", AgentSource::Project, "/proj/custom.md");
+        p.thinking = Some("low".to_string());
+        merged.insert("custom-proj".to_string(), p);
+        let mut b = agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md");
+        b.thinking = Some("medium".to_string());
+        merged.insert("reviewer".to_string(), b);
+
+        let settings = user_scope(SubagentSettings {
+            disable_thinking: Some(true),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("custom-user").expect("present").thinking,
+            Some("high".to_string()),
+            "custom user agent thinking must survive disableThinking"
+        );
+        assert_eq!(
+            merged.get("custom-proj").expect("present").thinking,
+            Some("low".to_string()),
+            "custom project agent thinking must survive disableThinking"
+        );
+        assert_eq!(
+            merged.get("reviewer").expect("present").thinking,
+            None,
+            "a sibling builtin's thinking IS cleared"
+        );
+    }
+
+    #[test]
+    fn disable_thinking_builtin_with_no_override_records_the_settings_path() {
+        // pi agent-overrides.test.ts:151-169: a user `disableThinking` clearing a builtin with no
+        // per-agent override records provenance whose path is the user `settings.json`.
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md");
+        a.thinking = Some("high".to_string());
+        merged.insert("reviewer".to_string(), a);
+
+        let settings = user_scope(SubagentSettings {
+            disable_thinking: Some(true),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.thinking, None);
+        let info = updated.override_info.as_ref().expect("disableThinking records provenance");
+        assert_eq!(info.scope, OverrideScope::User);
+        assert_eq!(info.settings_path, PathBuf::from(USER_SETTINGS));
+    }
+
+    #[test]
     fn disable_thinking_pass_is_no_op_when_flag_absent_or_false() {
         let mut merged = HashMap::new();
-        let mut a = agent("worker", AgentSource::Project, "/proj/worker.md");
-        a.thinking = Some(ThinkingLevel::High);
+        let mut a = agent("worker", AgentSource::Builtin, "/builtin/worker.md");
+        a.thinking = Some("high".to_string());
         merged.insert("worker".to_string(), a);
 
-        let settings = SubagentSettings::default();
+        let settings = user_scope(SubagentSettings::default());
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
-        assert_eq!(merged.get("worker").expect("present").thinking, Some(ThinkingLevel::High));
+        assert_eq!(merged.get("worker").expect("present").thinking, Some("high".to_string()));
 
         let mut merged2 = HashMap::new();
-        let mut a2 = agent("worker2", AgentSource::Project, "/proj/worker2.md");
-        a2.thinking = Some(ThinkingLevel::High);
+        let mut a2 = agent("worker2", AgentSource::Builtin, "/builtin/worker2.md");
+        a2.thinking = Some("high".to_string());
         merged2.insert("worker2".to_string(), a2);
-        let settings_false = SubagentSettings {
+        let settings_false = user_scope(SubagentSettings {
             disable_thinking: Some(false),
             ..Default::default()
-        };
+        });
         apply_overrides(&mut merged2, &settings_false).expect("apply succeeds");
         assert_eq!(
             merged2.get("worker2").expect("present").thinking,
-            Some(ThinkingLevel::High)
+            Some("high".to_string())
         );
     }
 
     #[test]
     fn disable_thinking_pass_skips_agent_whose_own_override_already_set_thinking() {
+        // pi agent-overrides.test.ts:172-191: a same-scope explicit `thinking` override opts back in.
         let mut merged = HashMap::new();
-        // Absent on disk, so the per-agent override applies first (pass 1/2), setting a concrete
-        // thinking level; the subsequent disableThinking pass must then leave it alone.
+        // Absent on disk, so the per-agent override applies first, setting a concrete thinking
+        // level; the subsequent disableThinking clear must then leave it alone.
         merged.insert(
             "worker".to_string(),
-            agent("worker", AgentSource::Project, "/proj/worker.md"),
+            agent("worker", AgentSource::Builtin, "/builtin/worker.md"),
         );
 
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "worker".to_string(),
-            AgentOverrideConfig {
-                thinking: OverrideField::Value(ThinkingLevel::Xhigh),
-                ..Default::default()
-            },
-        );
-        let settings = SubagentSettings {
-            overrides,
+        let settings = user_scope(SubagentSettings {
+            overrides: settings_with_override(
+                "worker",
+                AgentOverrideConfig {
+                    thinking: OverrideField::Value("xhigh".to_string()),
+                    ..Default::default()
+                },
+            )
+            .overrides,
             disable_thinking: Some(true),
             ..Default::default()
-        };
+        });
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert_eq!(
             merged.get("worker").expect("present").thinking,
-            Some(ThinkingLevel::Xhigh),
+            Some("xhigh".to_string()),
             "an override that explicitly set thinking must survive the disableThinking pass"
         );
     }
 
     #[test]
-    fn disable_thinking_pass_applies_to_agents_with_no_override_entry_at_all() {
+    fn project_disable_thinking_overrides_a_user_thinking_override() {
+        // pi agent-overrides.test.ts:193-213: a project-scope `disableThinking` clears the builtin
+        // even though a USER per-agent override requested a concrete `thinking` — a user override's
+        // thinking does NOT opt back in when the project scope configured disableThinking.
         let mut merged = HashMap::new();
-        let mut a = agent("bystander", AgentSource::User, "/user/bystander.md");
-        a.thinking = Some(ThinkingLevel::Low);
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    thinking: OverrideField::Value("xhigh".to_string()),
+                    ..Default::default()
+                },
+            ),
+            SubagentSettings {
+                disable_thinking: Some(true),
+                ..Default::default()
+            },
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("reviewer").expect("present").thinking,
+            None,
+            "project disableThinking must beat a user per-agent thinking override"
+        );
+    }
+
+    #[test]
+    fn disable_thinking_pass_applies_to_builtins_with_no_override_entry_at_all() {
+        let mut merged = HashMap::new();
+        let mut a = agent("bystander", AgentSource::Builtin, "/builtin/bystander.md");
+        a.thinking = Some("low".to_string());
         merged.insert("bystander".to_string(), a);
 
-        let settings = SubagentSettings {
+        let settings = user_scope(SubagentSettings {
             disable_thinking: Some(true),
             ..Default::default()
-        };
+        });
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         assert_eq!(merged.get("bystander").expect("present").thinking, None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // R-SA-133: subagents.defaultModel fills model-less agents across every tier
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn default_model_fills_model_less_agents_across_all_tiers_and_records_source() {
+        let mut merged = HashMap::new();
+        merged.insert("b".to_string(), agent("b", AgentSource::Builtin, "/b/b.md"));
+        merged.insert("u".to_string(), agent("u", AgentSource::User, "/u/u.md"));
+        merged.insert("p".to_string(), agent("p", AgentSource::Project, "/p/p.md"));
+        let mut with_model = agent("k", AgentSource::User, "/u/k.md");
+        with_model.model = Some("google/gemini-3-pro".into());
+        merged.insert("k".to_string(), with_model);
+
+        let settings = user_scope(SubagentSettings {
+            default_model: Some("deepseek-v4-flash".to_string()),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        for name in ["b", "u", "p"] {
+            let a = merged.get(name).expect("present");
+            assert_eq!(a.model, Some("deepseek-v4-flash".into()), "{name} filled from default");
+            assert_eq!(
+                a.model_source,
+                Some(AgentModelSourceInfo::SettingsDefault),
+                "{name} model source is defaultModel"
+            );
+        }
+        // An agent with its own model keeps it and is NOT stamped SettingsDefault.
+        let k = merged.get("k").expect("present");
+        assert_eq!(k.model, Some("google/gemini-3-pro".into()));
+        assert_eq!(k.model_source, None);
+    }
+
+    #[test]
+    fn project_default_model_beats_user_default_model() {
+        // pi agent-overrides.test.ts:87-99: project `defaultModel` wins over a user one.
+        let mut merged = HashMap::new();
+        merged.insert("worker".to_string(), agent("worker", AgentSource::Builtin, "/b/worker.md"));
+        let settings = two_scope(
+            SubagentSettings {
+                default_model: Some("deepseek-v4-flash".to_string()),
+                ..Default::default()
+            },
+            SubagentSettings {
+                default_model: Some("deepseek-v4-pro".to_string()),
+                ..Default::default()
+            },
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("worker").expect("present").model,
+            Some("deepseek-v4-pro".into()),
+            "project defaultModel must win over the user defaultModel"
+        );
+    }
+
+    #[test]
+    fn per_agent_model_override_wins_over_default_model_and_records_override_source() {
+        let mut merged = HashMap::new();
+        merged.insert("oracle".to_string(), agent("oracle", AgentSource::Builtin, "/b/oracle.md"));
+        merged.insert("scout".to_string(), agent("scout", AgentSource::Builtin, "/b/scout.md"));
+
+        let settings = user_scope(SubagentSettings {
+            overrides: settings_with_override(
+                "oracle",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("deepseek-v4-pro".to_string()),
+                    ..Default::default()
+                },
+            )
+            .overrides,
+            default_model: Some("deepseek-v4-flash".to_string()),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let oracle = merged.get("oracle").expect("present");
+        assert_eq!(oracle.model, Some("deepseek-v4-pro".into()), "override beats default");
+        assert_eq!(oracle.model_source, Some(AgentModelSourceInfo::SettingsOverride));
+        // No-override builtin still gets the default.
+        assert_eq!(merged.get("scout").expect("present").model, Some("deepseek-v4-flash".into()));
+    }
+
+    #[test]
+    fn project_override_beats_user_override_on_a_builtin() {
+        // pi agent-overrides.test.ts:247-262: a same-named user+project override on a builtin -> the
+        // PROJECT override wins entirely, at scope "project" with the project settings.json path.
+        let mut merged = HashMap::new();
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai-codex/gpt-5.4-mini".to_string()),
+                    thinking: OverrideField::Value("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.model, Some("openai-codex/gpt-5.4-mini".into()), "project override wins");
+        assert_eq!(updated.thinking, Some("high".to_string()));
+        let info = updated.override_info.as_ref().expect("recorded");
+        assert_eq!(info.scope, OverrideScope::Project);
+        assert_eq!(info.settings_path, PathBuf::from(PROJECT_SETTINGS));
+    }
+
+    #[test]
+    fn model_false_clears_even_when_default_model_is_present() {
+        // pi `agent-overrides.test.ts:72/84`: `model: false` -> undefined, defeating defaultModel.
+        let mut merged = HashMap::new();
+        merged.insert("reviewer".to_string(), agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"));
+        let settings = user_scope(SubagentSettings {
+            overrides: settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::ExplicitClear,
+                    ..Default::default()
+                },
+            )
+            .overrides,
+            default_model: Some("deepseek-v4-flash".to_string()),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(merged.get("reviewer").expect("present").model, None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // R-SA-012: subagents.disableBuiltins bulk-disables builtins only
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn disable_builtins_disables_builtins_but_not_custom_agents() {
+        let mut merged = HashMap::new();
+        merged.insert("reviewer".to_string(), agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"));
+        merged.insert("implementer".to_string(), agent("implementer", AgentSource::Project, "/p/impl.md"));
+
+        let settings = user_scope(SubagentSettings {
+            disable_builtins: Some(true),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(merged.get("reviewer").expect("present").disabled, Some(true));
+        assert_ne!(
+            merged.get("implementer").expect("present").disabled,
+            Some(true),
+            "disableBuiltins must not disable custom agents"
+        );
+    }
+
+    #[test]
+    fn disable_builtins_false_or_absent_leaves_builtins_enabled() {
+        for flag in [None, Some(false)] {
+            let mut merged = HashMap::new();
+            merged.insert("reviewer".to_string(), agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"));
+            let settings = user_scope(SubagentSettings {
+                disable_builtins: flag,
+                ..Default::default()
+            });
+            apply_overrides(&mut merged, &settings).expect("apply succeeds");
+            assert_ne!(
+                merged.get("reviewer").expect("present").disabled,
+                Some(true),
+                "disableBuiltins={flag:?} must not disable"
+            );
+        }
+    }
+
+    #[test]
+    fn project_disable_builtins_false_re_enables_a_user_true() {
+        // pi (agents.ts:793): userBulkDisabled only when the project scope said NOTHING about
+        // disableBuiltins — a project `false` re-enables what a user `true` disabled.
+        let mut merged = HashMap::new();
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"),
+        );
+        let settings = two_scope(
+            SubagentSettings {
+                disable_builtins: Some(true),
+                ..Default::default()
+            },
+            SubagentSettings {
+                disable_builtins: Some(false),
+                ..Default::default()
+            },
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_ne!(
+            merged.get("reviewer").expect("present").disabled,
+            Some(true),
+            "a project disableBuiltins:false must re-enable a user-disabled builtin"
+        );
+    }
+
+    #[test]
+    fn disable_builtins_skips_a_builtin_carrying_a_per_agent_override() {
+        // A per-agent override takes precedence over the bulk-disable branch (pi checks it first),
+        // so the builtin stays enabled and the override's own fields apply.
+        let mut merged = HashMap::new();
+        merged.insert("reviewer".to_string(), agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"));
+        let settings = user_scope(SubagentSettings {
+            overrides: settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5".to_string()),
+                    ..Default::default()
+                },
+            )
+            .overrides,
+            disable_builtins: Some(true),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let reviewer = merged.get("reviewer").expect("present");
+        assert_ne!(reviewer.disabled, Some(true), "override beats bulk-disable");
+        assert_eq!(reviewer.model, Some("openai/gpt-5".into()));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1062,30 +1745,39 @@ mod tests {
                 &[],
             )],
         };
-        let mut overrides = BTreeMap::new();
-        overrides.insert(
-            "reviewer".to_string(),
-            AgentOverrideConfig {
-                model: OverrideField::Value("openai/gpt-5".to_string()),
-                ..Default::default()
-            },
+        // The project-agent `reviewer` override lives in the project scope; the builtin `delegate`
+        // disable lives in the user scope — exercising both branches with their true provenance.
+        let settings = two_scope(
+            settings_with_override(
+                "delegate",
+                AgentOverrideConfig {
+                    disabled: OverrideField::Value(true),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5".to_string()),
+                    ..Default::default()
+                },
+            ),
         );
-        overrides.insert(
-            "delegate".to_string(),
-            AgentOverrideConfig {
-                disabled: OverrideField::Value(true),
-                ..Default::default()
-            },
-        );
-        let settings = SubagentSettings {
-            overrides,
-            ..Default::default()
-        };
 
         let merged = discover_and_merge(tiers, &settings).expect("merge succeeds");
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged.get("reviewer").expect("present").model, Some("openai/gpt-5".into()));
-        assert_eq!(merged.get("delegate").expect("present").disabled, Some(true));
+        let reviewer = merged.get("reviewer").expect("present");
+        assert_eq!(reviewer.model, Some("openai/gpt-5".into()));
+        assert_eq!(
+            reviewer.override_info.as_ref().expect("recorded").scope,
+            OverrideScope::Project
+        );
+        let delegate = merged.get("delegate").expect("present");
+        assert_eq!(delegate.disabled, Some(true));
+        assert_eq!(
+            delegate.override_info.as_ref().expect("recorded").scope,
+            OverrideScope::User
+        );
     }
 
     // Sanity: OutputSpec import is exercised elsewhere in the crate's own types tests; referenced

@@ -1066,7 +1066,9 @@ dependencies = [
  "clap",
  "cyrup-config",
  "cyrup-ext-subagents",
+ "cyrup-intercom",
  "cyrup-modes",
+ "cyrup-permission-system",
  "cyrup-provider",
  "cyrup-resources",
  "cyrup-sdk",
@@ -1176,6 +1178,7 @@ dependencies = [
  "cyrup-session",
  "cyrup-session-svc",
  "cyrup-test-support",
+ "filetime",
  "jsonschema",
  "libc",
  "nix 0.31.3",
@@ -1183,10 +1186,32 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cyrup-intercom"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cyrup-core",
+ "cyrup-ext",
+ "cyrup-ext-subagents",
+ "cyrup-permission-system",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "unicode-width",
  "uuid",
 ]
 
@@ -1206,6 +1231,31 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "cyrup-permission-system"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "cyrup-config",
+ "cyrup-core",
+ "cyrup-ext",
+ "cyrup-ext-subagents",
+ "cyrup-provider",
+ "cyrup-session-svc",
+ "cyrup-test-support",
+ "getrandom 0.3.4",
+ "notify",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -808,16 +808,17 @@ impl Models {
         None
     }
 
-    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25 / parity
-    /// gap #12).
+    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25 / GAP-11).
     ///
-    /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `runner.ts:330`, no tier
-    /// gate). cyrup routes it through the command-tier `control` path (the deadlock rule, arch-08
-    /// §6.3: Pi's `setThinkingLevel` re-emits `thinking_level_select`, `agent-session.ts:1588` — a
-    /// re-entrant dispatch a single-instance wasm store cannot legally make from a suspended event
-    /// handler). The restriction is therefore surfaced as an OBSERVABLE `Err` when called from an
-    /// event handler — matching every `control.*` op — instead of the former silent no-op. Returns
-    /// `Ok(())` when it takes effect (command tier), `Err(reason)` when rejected (event tier).
+    /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `loader.ts:352-354` /
+    /// `runner.ts:330`, no tier gate) and it takes effect. cyrup now matches this: the call is QUEUED
+    /// as a control op and applied at the store-free turn-boundary drain
+    /// (`AgentSession::apply_pending_control`), so its `thinking_level_select` re-emit
+    /// (`agent-session.ts:1560-1567`) runs as a fresh top-level guest call after the event hook's wasm
+    /// store guard is released — never a re-entry into the suspended single-instance store (the
+    /// R-08-008 deadlock the old command-tier gate guarded against is dissolved by deferral). So this
+    /// returns `Ok(())` and the new level takes effect on the SUBSEQUENT turn, whether called from a
+    /// command handler or an event handler.
     pub fn set_thinking_level(&self, level: &str) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
         {

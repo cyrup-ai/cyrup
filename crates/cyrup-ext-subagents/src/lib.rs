@@ -24,6 +24,10 @@
 )]
 #![forbid(unsafe_code)]
 
+/// Artifact quadruple writer + housekeeping sweep (T6) — Rust port of pi `shared/artifacts.ts`. See
+/// [`artifacts`] for the four-file `<runId>_<agent>[_i]_{input.md,output.md,.jsonl,_meta.json}`
+/// layout and the 24h-throttled 7-day cleanup contract.
+pub mod artifacts;
 pub mod background;
 pub mod discovery;
 pub mod error;
@@ -37,3 +41,15 @@ pub mod jsonl;
 pub mod registration;
 pub mod spawn;
 pub mod tui;
+
+// P-5 (cyrup-permission-system-port.md §4 / reconciliation §2): re-export the `background::control`
+// file-channel primitives + the R-SA-P1 parent-session anchor const at the crate root so the
+// permission companion's child→parent ask-forwarding spool (its own P-4 build) consumes them
+// cross-crate as BUILDING BLOCKS (not as the subagents interrupt channel — permission replicates
+// pi's own nonce-bound request/response spool on top of these). These are already `pub` at
+// `background::control::*`/`exec::*`; the flat re-export is the ergonomic P-5 surface the port doc
+// names. This crate only ever WRITES the anchor (`build_attempt_spawn_plan`); permission reads it.
+pub use background::control::{
+    validate_contains_root, validate_safe_token, watch_control_inbox, CONTROL_INBOX_POLL_INTERVAL,
+};
+pub use exec::{AGENT_NAME_ENV_VAR, PARENT_SESSION_ENV_VAR};

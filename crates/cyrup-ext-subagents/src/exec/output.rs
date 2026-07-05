@@ -310,6 +310,381 @@ pub fn extract_final_output(events: &[SubagentEvent]) -> Option<String> {
 }
 
 // ============================================================================================
+// Exit-0 re-diagnosis: detectSubagentError + trailing assistant errorMessage + empty-output
+// classification (pi `detectSubagentError` `utils.ts:390-460`; the assistantError state machine +
+// empty-output check in `execution.ts:556-790`). Tier T3, group A.
+//
+// pi re-diagnoses a child that EXITED ZERO for latent failures its process exit code alone did not
+// surface — a trailing failed tool/provider call, a still-set assistant `errorMessage`, or an
+// empty/cold-start response — flipping the run to a failure (and, for the empty-output case, a
+// *retryable* one so the model-fallback ladder advances). These are pure functions over the parsed
+// event stream; `exec/mod.rs`'s per-attempt driver wires them into the `AttemptSignal` so the
+// ladder's retry decision (`is_retryable_model_failure`) observes the re-diagnosed error.
+// ============================================================================================
+
+/// The exact message pi surfaces (and the model-fallback classifier treats as retryable via its
+/// `cold.?start`/`empty response`/`no output` patterns, `model-fallback.ts:129-131`) when a
+/// zero-exit attempt produced no usable final text — a likely model cold-start or empty response
+/// (`execution.ts:788`).
+pub const EMPTY_OUTPUT_ERROR: &str =
+    "Subagent produced no output (possible model cold-start or empty response).";
+
+/// The paused-success sentinel pi delivers for a soft-interrupted run (`execution.ts:731,752`) —
+/// exit 0, cleared error, this text as the final output.
+pub const INTERRUPTED_FINAL_OUTPUT: &str = "Interrupted. Waiting for explicit next action.";
+
+/// A re-diagnosed subagent failure discovered by [`detect_subagent_error`] on an otherwise
+/// exit-zero run — a faithful port of pi's `ErrorInfo` (`utils.ts:390-460`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedSubagentError {
+    /// The exit code to attribute to the run — either parsed out of the failing tool/bash output
+    /// (`exit(?:ed)? … (\d+)`) or `1` when no numeric code was recoverable.
+    pub exit_code: i32,
+    /// The failing tool's name (pi `toolName`), or `"tool"`/`"bash"` when unnamed — becomes the
+    /// `<errorType> failed …` prefix of the surfaced error message.
+    pub error_type: String,
+    /// The first 200 characters of the failing tool/bash output, if any (pi `details.slice(0, 200)`).
+    pub details: Option<String>,
+}
+
+impl DetectedSubagentError {
+    /// The surfaced error message, exactly matching pi's `execution.ts:776-778`:
+    /// `"<errorType> failed (exit <code>): <details>"` when details are present, otherwise
+    /// `"<errorType> failed with exit code <code>"`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match &self.details {
+            Some(details) => format!(
+                "{} failed (exit {}): {details}",
+                self.error_type, self.exit_code
+            ),
+            None => format!("{} failed with exit code {}", self.error_type, self.exit_code),
+        }
+    }
+}
+
+/// The `fatalPatterns` bash-output substrings pi treats as a hard failure even at a zero (or
+/// absent) parsed exit code (`utils.ts:442-451`), lowercased for a case-insensitive `contains`
+/// test (pi's patterns are all `/…/i` regexes that reduce to a plain substring here; `killed|`
+/// `terminated` is the one alternation, split into its two members).
+const FATAL_BASH_PATTERNS: &[&str] = &[
+    "command not found",
+    "permission denied",
+    "no such file or directory",
+    "segmentation fault",
+    "killed",
+    "terminated",
+    "out of memory",
+    "connection refused",
+    "timeout",
+];
+
+/// Skip ASCII whitespace in `bytes` starting at `pos`, returning the first non-whitespace offset.
+fn skip_ascii_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Port of pi's exit-code regex `exit(?:ed)?\s*(?:with\s*)?(?:code|status)?\s*[:\s]?\s*(\d+)`
+/// (`utils.ts:416/431`), case-insensitive, returning the first matched numeric code. Hand-rolled
+/// (no `regex` dependency, matching this crate's `is_retryable_model_failure`/`regexlite`
+/// convention): the pattern is anchored at `exit`/`exited`, so only occurrences of that literal
+/// need be probed, each followed by the fixed optional `with`/`code`/`status`/`:` scaffold before
+/// the digits.
+fn parse_exit_code(text: &str) -> Option<i32> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = lower.get(search_from..).and_then(|s| s.find("exit")) {
+        let start = search_from + rel;
+        let mut pos = start + "exit".len();
+        // Optional "ed" (exit -> exited).
+        if lower.get(pos..).is_some_and(|s| s.starts_with("ed")) {
+            pos += "ed".len();
+        }
+        pos = skip_ascii_ws(bytes, pos);
+        // Optional "with".
+        if lower.get(pos..).is_some_and(|s| s.starts_with("with")) {
+            pos += "with".len();
+            pos = skip_ascii_ws(bytes, pos);
+        }
+        // Optional "code" | "status".
+        if lower.get(pos..).is_some_and(|s| s.starts_with("code")) {
+            pos += "code".len();
+        } else if lower.get(pos..).is_some_and(|s| s.starts_with("status")) {
+            pos += "status".len();
+        }
+        pos = skip_ascii_ws(bytes, pos);
+        // Optional single ":" separator ([:\s]? — the `\s` alternative is subsumed by the
+        // surrounding `\s*`).
+        if bytes.get(pos) == Some(&b':') {
+            pos += 1;
+        }
+        pos = skip_ascii_ws(bytes, pos);
+        // Required (\d+).
+        let digits_start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos > digits_start
+            && let Some(code) = lower.get(digits_start..pos).and_then(|d| d.parse::<i32>().ok())
+        {
+            return Some(code);
+        }
+        // No digits followed this `exit`; probe the next occurrence (pi's non-global `.match`
+        // likewise falls through to the next anchor position).
+        search_from = start + "exit".len();
+    }
+    None
+}
+
+/// The first 200 characters of `text` (pi `.slice(0, 200)`), cut on a UTF-8 character boundary
+/// (JS slices by UTF-16 code unit; taking whole chars is the closest boundary-safe equivalent for
+/// diagnostic text).
+fn first_200_chars(text: &str) -> String {
+    text.chars().take(200).collect()
+}
+
+/// Extract the first `{"type":"text"}` text out of a [`SubagentEvent::ToolExecutionEnd`]'s `result`
+/// value — pi's `msg.content.find((c) => c.type === "text")?.text` (`utils.ts:414/427`), adapted to
+/// cyrup's real wire shape where a tool result serializes as
+/// `{"content":[{"type":"text","text":…}],"details":…,"terminate":…}` (`cyrup-agent`
+/// `result_value_of`, `agent.rs:113-115`). Tolerant of the shapes a real/scripted child can emit: a
+/// bare string result, a `{content:[…]}` object, or a bare `[…]` array of content parts.
+fn extract_tool_result_text(result: &serde_json::Value) -> Option<String> {
+    fn first_text_part(parts: &[serde_json::Value]) -> Option<String> {
+        parts.iter().find_map(|part| {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+    }
+    match result {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => first_text_part(parts),
+        serde_json::Value::Object(_) => result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|parts| first_text_part(parts))
+            .or_else(|| {
+                result
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+        _ => None,
+    }
+}
+
+/// One entry in the flat "messages" projection [`detect_subagent_error`] scans — the cyrup analog
+/// of pi's interleaved `result.messages` (assistant `message_end` + `toolResult` `tool_result_end`).
+/// cyrup's wire has no `tool_result_end` message; a tool result arrives as a
+/// [`SubagentEvent::ToolExecutionEnd`], so that variant plays pi's `role === "toolResult"` role.
+struct DiagMessage {
+    /// pi's per-message `hasText` for the assistant-anchor scan: an assistant message with at least
+    /// one non-empty text part.
+    is_assistant_with_text: bool,
+    /// `Some` iff this entry is a tool result (a `ToolExecutionEnd`), carrying exactly what pi's
+    /// `toolResult`-role branch inspects.
+    tool_result: Option<DiagToolResult>,
+}
+
+struct DiagToolResult {
+    tool_name: String,
+    is_error: bool,
+    text: Option<String>,
+}
+
+/// Port of pi's `detectSubagentError` (`utils.ts:390-460`): re-diagnose a run for a trailing
+/// tool/provider failure that has *no subsequent assistant text recovering from it*.
+///
+/// The reverse scan starts strictly *after* the last assistant message that carried real text — a
+/// tool/bash error the agent went on to speak about (i.e. it "recovered") is deliberately NOT
+/// treated as a run failure, matching pi's `lastAssistantTextIndex`/`scanStart` gate. Within the
+/// tail region, in reverse:
+/// - an explicitly `isError` tool result fails the run (its parsed exit code, or `1`);
+/// - a `bash` result whose text parses a non-zero exit code fails the run;
+/// - a `bash` result matching any [`FATAL_BASH_PATTERNS`] substring fails the run (exit `1`).
+///
+/// Returns `None` when nothing in the tail region indicates a failure.
+#[must_use]
+pub fn detect_subagent_error(events: &[SubagentEvent]) -> Option<DetectedSubagentError> {
+    let messages: Vec<DiagMessage> = events
+        .iter()
+        .filter_map(|event| match event {
+            SubagentEvent::MessageEnd { message } => {
+                let is_assistant =
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant");
+                let is_assistant_with_text = is_assistant
+                    && assistant_text_parts(message)
+                        .iter()
+                        .any(|part| !part.trim().is_empty());
+                Some(DiagMessage {
+                    is_assistant_with_text,
+                    tool_result: None,
+                })
+            }
+            SubagentEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error,
+                ..
+            } => Some(DiagMessage {
+                is_assistant_with_text: false,
+                tool_result: Some(DiagToolResult {
+                    tool_name: tool_name.clone(),
+                    is_error: *is_error,
+                    text: extract_tool_result_text(result),
+                }),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let scan_start = messages
+        .iter()
+        .rposition(|m| m.is_assistant_with_text)
+        .map_or(0, |idx| idx + 1);
+
+    for message in messages.get(scan_start..).unwrap_or_default().iter().rev() {
+        let Some(tool_result) = &message.tool_result else {
+            continue; // pi: `if (msg.role !== "toolResult") continue;`
+        };
+
+        if tool_result.is_error {
+            let details = tool_result.text.clone();
+            let exit_code = details
+                .as_deref()
+                .and_then(parse_exit_code)
+                .unwrap_or(1);
+            return Some(DetectedSubagentError {
+                exit_code,
+                error_type: if tool_result.tool_name.is_empty() {
+                    "tool".to_string()
+                } else {
+                    tool_result.tool_name.clone()
+                },
+                details: details.as_deref().map(first_200_chars),
+            });
+        }
+
+        if tool_result.tool_name != "bash" {
+            continue;
+        }
+        let Some(output) = &tool_result.text else {
+            continue;
+        };
+        if let Some(code) = parse_exit_code(output)
+            && code != 0
+        {
+            return Some(DetectedSubagentError {
+                exit_code: code,
+                error_type: "bash".to_string(),
+                details: Some(first_200_chars(output)),
+            });
+        }
+        let lowered = output.to_ascii_lowercase();
+        if FATAL_BASH_PATTERNS
+            .iter()
+            .any(|pattern| lowered.contains(pattern))
+        {
+            return Some(DetectedSubagentError {
+                exit_code: 1,
+                error_type: "bash".to_string(),
+                details: Some(first_200_chars(output)),
+            });
+        }
+    }
+
+    None
+}
+
+/// Port of pi's live `assistantError` state machine (`execution.ts:571,578-582`): the trailing,
+/// still-uncleared assistant `errorMessage`, if any.
+///
+/// Each assistant `message_end` with a non-empty `errorMessage` sets the trailing error; a
+/// subsequent *clean terminal stop* (`stopReason === "stop"`, no tool-call part, no `errorMessage`,
+/// and real text) clears it — modelling pi's "the agent produced a real answer after the transient
+/// provider error, so treat the run as recovered". A pure fold over the event stream (pi computes
+/// it live only because it also drives control events off it; the terminal value is a pure function
+/// of the ordered messages).
+#[must_use]
+pub fn trailing_assistant_error(events: &[SubagentEvent]) -> Option<String> {
+    let mut assistant_error: Option<String> = None;
+    for event in events {
+        let SubagentEvent::MessageEnd { message } = event else {
+            continue;
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let error_message = message
+            .get("errorMessage")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let Some(err) = error_message {
+            assistant_error = Some(err.to_string());
+        }
+        if is_terminal_assistant_stop(event) {
+            let has_text = assistant_text_parts(message)
+                .iter()
+                .any(|part| !part.trim().is_empty());
+            if error_message.is_none() && has_text {
+                assistant_error = None;
+            }
+        }
+    }
+    assistant_error
+}
+
+/// Whether `event` is a *terminal assistant stop*: an assistant `message_end` with
+/// `stopReason === "stop"` and no `toolCall` content part (pi `execution.ts:575-578`). This is the
+/// signal pi (and, per Tier T3 group A, cyrup's `drive_attempt`) uses to open the final-stop
+/// grace-drain window, and the anchor [`trailing_assistant_error`]'s clear condition keys off.
+#[must_use]
+pub fn is_terminal_assistant_stop(event: &SubagentEvent) -> bool {
+    let SubagentEvent::MessageEnd { message } = event else {
+        return false;
+    };
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return false;
+    }
+    if message.get("stopReason").and_then(serde_json::Value::as_str) != Some("stop") {
+        return false;
+    }
+    let has_tool_call = message
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("toolCall")
+            })
+        });
+    !has_tool_call
+}
+
+/// Whether a `message_end` event carries a non-empty assistant `errorMessage` — pi's truthy
+/// `evt.message.errorMessage` test (`execution.ts:580`), i.e. an empty string counts as "no error".
+/// Used by the final-stop grace-drain to decide whether a forced-drained terminal stop was *clean*
+/// (`forcedDrainAfterFinalSuccess`, `execution.ts:685`).
+#[must_use]
+pub fn message_end_has_error_message(event: &SubagentEvent) -> bool {
+    let SubagentEvent::MessageEnd { message } = event else {
+        return false;
+    };
+    message
+        .get("errorMessage")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+// ============================================================================================
 // R-SA-024/025/031: File-only output-path handoff
 // ============================================================================================
 
@@ -475,6 +850,98 @@ fn persist_orchestrator_output(
                  output also failed: {write_err}"
             )),
         },
+    }
+}
+
+// ============================================================================================
+// Saved-output reference message (pi `formatSavedOutputReference`, single-output.ts:73-83)
+// ============================================================================================
+
+/// The "output saved to a file" reference pi surfaces to the caller once a step/run with an
+/// `output` file path finishes cleanly — the `bytes`/`lines` are measured over the FULL (untruncated)
+/// persisted content, and `message` is the exact human-readable line appended to (or, in
+/// `outputMode: "file-only"`, substituted for) the delivered output. Faithful port of pi-subagents'
+/// `SavedOutputReference` (`single-output.ts:73-83`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedOutputReference {
+    /// The absolute on-disk path the output was saved to.
+    pub path: std::path::PathBuf,
+    /// Byte length of the full (untruncated) persisted content.
+    pub bytes: usize,
+    /// Line count of the full (untruncated) persisted content, counted pi's single-output way
+    /// (newline separators, plus one more unless the text ends in a newline; empty text is 0 lines).
+    pub lines: usize,
+    /// The `Output saved to: <path> (<size>, <n> line(s)). Read this file if needed.` message.
+    pub message: String,
+}
+
+/// pi `formatByteSize` (`single-output.ts:61-71`): `"<n> B"` under 1024, else a 1-decimal
+/// `KB`/`MB`/`GB`/`TB` value WITH a space before the unit — deliberately distinct from
+/// [`format_bytes`]'s no-space `"12.3KB"` truncation-marker form (pi keeps two different byte
+/// formatters for these two surfaces; this one is the saved-output-reference form).
+fn format_byte_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index < units.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    format!("{value:.1} {}", units.get(unit_index).copied().unwrap_or("TB"))
+}
+
+/// pi single-output `countLines` (`single-output.ts:55-59`): count `\r\n`/`\r`/`\n` separators, plus
+/// one more unless the text ends in a `\r`/`\n`; empty text is 0 lines. Deliberately NOT
+/// [`count_lines`] (the truncation-marker line count, which counts `split('\n')` segments and so
+/// differs for trailing-newline text) — this matches the exact counter pi uses for the saved-output
+/// reference.
+fn count_reference_lines(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let bytes = text.as_bytes();
+    let mut separators = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes.get(i) {
+            Some(b'\r') => {
+                separators += 1;
+                if matches!(bytes.get(i + 1), Some(b'\n')) {
+                    i += 1;
+                }
+            }
+            Some(b'\n') => separators += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let ends_with_newline = text.ends_with('\r') || text.ends_with('\n');
+    separators + usize::from(!ends_with_newline)
+}
+
+/// pi `formatSavedOutputReference` (`single-output.ts:73-83`): build the [`SavedOutputReference`]
+/// for `saved_path` measured over `full_output`. `saved_path` is expected to already be absolute
+/// (the caller resolves a relative `output` against the run/chain cwd before spawning — pi's own
+/// `resolveSingleOutputPath`); it is used verbatim as the reported/message path so the message names
+/// the exact file the child (or orchestrator) wrote.
+#[must_use]
+pub fn format_saved_output_reference(saved_path: &Path, full_output: &str) -> SavedOutputReference {
+    let bytes = full_output.len();
+    let lines = count_reference_lines(full_output);
+    let line_word = if lines == 1 { "line" } else { "lines" };
+    let message = format!(
+        "Output saved to: {} ({}, {lines} {line_word}). Read this file if needed.",
+        saved_path.display(),
+        format_byte_size(bytes),
+    );
+    SavedOutputReference {
+        path: saved_path.to_path_buf(),
+        bytes,
+        lines,
+        message,
     }
 }
 
@@ -858,6 +1325,165 @@ mod tests {
     fn only_error_messages_returns_none() {
         let events = vec![message_end_error(&["never returned"])];
         assert_eq!(extract_final_output(&events), None);
+    }
+
+    // ---- detect_subagent_error / trailing_assistant_error / terminal-stop helpers ----
+
+    fn tool_result_end(tool_name: &str, text: &str, is_error: bool) -> SubagentEvent {
+        // cyrup's real tool-result wire shape (`agent.rs:113-115`):
+        // `{"content":[{"type":"text","text":…}],"details":null,"terminate":false}`.
+        SubagentEvent::ToolExecutionEnd {
+            tool_call_id: "tc".into(),
+            tool_name: tool_name.to_string(),
+            result: serde_json::json!({
+                "content": [{"type": "text", "text": text}],
+                "details": serde_json::Value::Null,
+                "terminate": false
+            }),
+            is_error,
+        }
+    }
+
+    fn message_end_with_error(text: &str, error_message: &str) -> SubagentEvent {
+        SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "stopReason": "error",
+                "errorMessage": error_message,
+            }),
+        }
+    }
+
+    /// A clean terminal assistant stop (`stopReason: "stop"`, no `errorMessage`) — the real wire
+    /// shape (`message_end_line` in `tests/exec_run_sync_integration.rs`; pi `events.assistantMessage`).
+    /// The bare `message_end` helper above deliberately omits `stopReason` (it exists for
+    /// extract_final_output tests that do not care), so a terminal-stop assertion must build the
+    /// stop explicitly.
+    fn assistant_stop(text: &str) -> SubagentEvent {
+        SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "stopReason": "stop",
+            }),
+        }
+    }
+
+    #[test]
+    fn parse_exit_code_matches_pi_regex_shapes() {
+        assert_eq!(parse_exit_code("process exited with code 127"), Some(127));
+        assert_eq!(parse_exit_code("exit 1"), Some(1));
+        assert_eq!(parse_exit_code("exit code: 2"), Some(2));
+        assert_eq!(parse_exit_code("exit status 3"), Some(3));
+        assert_eq!(parse_exit_code("exited with code 0"), Some(0));
+        assert_eq!(parse_exit_code("no numeric code here"), None);
+        assert_eq!(parse_exit_code("exiting the loop cleanly"), None);
+    }
+
+    #[test]
+    fn detect_subagent_error_flags_a_trailing_nonzero_bash_exit() {
+        // pi "does not retry on ordinary task/tool failures": a bash result reporting exit 127,
+        // with NO later assistant text, is a run failure diagnosed at exit code 127.
+        let events = vec![tool_result_end("bash", "process exited with code 127", false)];
+        let detected = detect_subagent_error(&events).expect("must diagnose a failure");
+        assert_eq!(detected.exit_code, 127);
+        assert_eq!(detected.error_type, "bash");
+        assert_eq!(
+            detected.message(),
+            "bash failed (exit 127): process exited with code 127"
+        );
+    }
+
+    #[test]
+    fn detect_subagent_error_flags_an_explicit_is_error_tool_result() {
+        let events = vec![tool_result_end("read", "EISDIR: illegal operation", true)];
+        let detected = detect_subagent_error(&events).expect("must diagnose a failure");
+        assert_eq!(detected.exit_code, 1); // no numeric code in the text
+        assert_eq!(detected.error_type, "read");
+    }
+
+    #[test]
+    fn detect_subagent_error_flags_a_fatal_bash_pattern_without_a_code() {
+        let events = vec![tool_result_end("bash", "bash: frobnicate: command not found", false)];
+        let detected = detect_subagent_error(&events).expect("must diagnose a fatal pattern");
+        assert_eq!(detected.exit_code, 1);
+        assert_eq!(detected.error_type, "bash");
+    }
+
+    #[test]
+    fn detect_subagent_error_ignores_a_tool_error_the_assistant_recovered_from() {
+        // pi "treats recovered child tool errors as successful": the tool error precedes the last
+        // assistant text, so it is BEFORE scan_start and must not be diagnosed.
+        let events = vec![
+            tool_result_end("read", "EISDIR: illegal operation", true),
+            message_end("assistant", &["Done"]),
+        ];
+        assert_eq!(detect_subagent_error(&events), None);
+    }
+
+    #[test]
+    fn detect_subagent_error_ignores_a_recovered_zero_exit_bash_result() {
+        let events = vec![
+            tool_result_end("bash", "ran fine, exit 0", false),
+            message_end("assistant", &["all good"]),
+        ];
+        assert_eq!(detect_subagent_error(&events), None);
+    }
+
+    #[test]
+    fn trailing_assistant_error_is_cleared_by_a_clean_recovering_stop() {
+        // pi "treats recovered assistant provider errors as successful": errorMessage then a clean
+        // terminal stop with real text clears it.
+        let events = vec![
+            message_end_with_error("temporary provider failure", "provider transport failed"),
+            assistant_stop("Recovered"),
+        ];
+        assert_eq!(trailing_assistant_error(&events), None);
+    }
+
+    #[test]
+    fn trailing_assistant_error_survives_an_empty_stop() {
+        // pi "keeps provider errors failed when followed only by empty assistant output": a clean
+        // terminal stop with EMPTY text does NOT clear the error (the clear requires real text).
+        let events = vec![
+            message_end_with_error("temporary provider failure", "provider transport failed"),
+            assistant_stop(""),
+        ];
+        assert_eq!(
+            trailing_assistant_error(&events).as_deref(),
+            Some("provider transport failed")
+        );
+    }
+
+    #[test]
+    fn is_terminal_assistant_stop_requires_stop_reason_and_no_tool_call() {
+        assert!(is_terminal_assistant_stop(&assistant_stop("done")));
+        // A message with no explicit stopReason is NOT a terminal stop.
+        assert!(!is_terminal_assistant_stop(&message_end("assistant", &["done"])));
+        let with_tool_call = SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "toolCall", "name": "edit"}],
+                "stopReason": "stop",
+            }),
+        };
+        assert!(!is_terminal_assistant_stop(&with_tool_call));
+        assert!(!is_terminal_assistant_stop(&message_end_error(&["boom"])));
+    }
+
+    #[test]
+    fn message_end_has_error_message_is_a_truthy_test() {
+        assert!(message_end_has_error_message(&message_end_with_error(
+            "x", "boom"
+        )));
+        assert!(!message_end_has_error_message(&message_end("assistant", &["ok"])));
+        let empty_error = SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "assistant", "content": [], "errorMessage": ""
+            }),
+        };
+        assert!(!message_end_has_error_message(&empty_error));
     }
 
     // ---- OutputCap / truncate_output: UTF-8 boundary safety ----

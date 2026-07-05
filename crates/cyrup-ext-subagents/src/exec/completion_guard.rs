@@ -60,7 +60,7 @@ const READ_ONLY_BUILTIN_TOOLS: &[&str] = &[
 /// set (`[A-Za-z0-9_]`). Every source pattern this module ports only ever brackets plain ASCII
 /// alphabetic phrases with `\b`, so this narrower definition (vs. full Unicode word-break rules)
 /// is faithful for this exact pattern set.
-fn is_word_char(ch: char) -> bool {
+pub(crate) fn is_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
@@ -69,7 +69,7 @@ fn is_word_char(ch: char) -> bool {
 /// position where the character immediately before the match (if any) and the character
 /// immediately after the match (if any) are both non-word characters. This is the single building
 /// block every source `/\bphrase\b/i` pattern in this module reduces to.
-fn word_boundary_contains(haystack_lower: &str, needle: &str) -> bool {
+pub(crate) fn word_boundary_contains(haystack_lower: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
@@ -107,7 +107,7 @@ fn word_boundary_contains(haystack_lower: &str, needle: &str) -> bool {
 }
 
 /// True if any of `needles` matches `haystack_lower` per [`word_boundary_contains`].
-fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool {
+pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool {
     needles
         .iter()
         .any(|needle| word_boundary_contains(haystack_lower, needle))
@@ -558,62 +558,43 @@ pub fn expects_implementation_mutation(agent: &str, task: &str) -> bool {
     matches_general_implementation(&stripped_lower)
 }
 
-/// Source: `hasMutationToolCall(messages)`, re-scoped to this crate's dependency-free
-/// [`SubagentEvent`] transcript instead of a rich `Message[]` array (this crate has zero
-/// dependency on `cyrup-agent`'s message types, module docs above). A completed tool call is
-/// represented on the wire as one [`SubagentEvent::ToolExecutionEnd`] per R-SA-057/058 — this
-/// function scans those (not `ToolExecutionStart`, since a call that never finished executing,
-/// e.g. the child was killed mid-tool-call, should not count as an "attempted mutation" for this
-/// guard's purposes any more than the source's own `toolCall`-content-part scan would count a
-/// call whose result was never appended to `messages`).
+/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:121-135`), re-scoped to this
+/// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
+/// crate has zero dependency on `cyrup-agent`'s message types, module docs above).
+///
+/// The source scans the assistant messages' `toolCall` **content parts** — the tool CALL, carrying
+/// its `arguments` — NOT the tool result. This crate's wire analogue of "an assistant emitted a
+/// tool call, with its requested arguments" is [`SubagentEvent::ToolExecutionStart`], which is the
+/// only event on the wire carrying the call's `args` (`ToolExecutionEnd` echoes only
+/// `result`/`is_error`, per `exec/ndjson.rs`'s wire-shape module doc). This function therefore
+/// scans `ToolExecutionStart` events, matching the source exactly: a call is counted from the
+/// moment it is REQUESTED, so a mutating call that started but never produced a
+/// `ToolExecutionEnd` (the child was killed mid-tool-call, or the tool never finished) STILL counts
+/// as an attempted mutation — precisely the "count never-completed calls" behavior the source's own
+/// message-part walk exhibits (a `toolCall` part is present in the assistant message regardless of
+/// whether a corresponding `toolResult` was ever appended).
 ///
 /// Returns true on the first `edit`/`write` tool call observed, or the first `bash` call whose
-/// `command` argument [`is_mutating_bash_command`] classifies as mutating.
+/// `command` argument [`is_mutating_bash_command`] classifies as mutating (the source's
+/// `part.arguments.command` read, applied here to the start event's `args.command`).
 #[must_use]
 pub fn has_mutation_tool_call(events: &[SubagentEvent]) -> bool {
     events.iter().any(|event| {
-        let SubagentEvent::ToolExecutionEnd {
-            tool_name, result: _, ..
+        let SubagentEvent::ToolExecutionStart {
+            tool_name, args, ..
         } = event
         else {
             return false;
         };
         match tool_name.as_str() {
             "edit" | "write" => true,
-            "bash" => {
-                let SubagentEvent::ToolExecutionEnd { .. } = event else {
-                    return false;
-                };
-                tool_call_command_arg(event)
-                    .is_some_and(|command| is_mutating_bash_command(&command))
-            }
+            "bash" => args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_mutating_bash_command),
             _ => false,
         }
     })
-}
-
-/// Extracts a `bash` tool call's `command` string argument from the matching
-/// [`SubagentEvent::ToolExecutionStart`]... but this guard only has [`SubagentEvent::ToolExecutionEnd`]
-/// in hand at the point [`has_mutation_tool_call`] inspects it, and `ToolExecutionEnd` does not
-/// echo back the original `args` (only `result`/`is_error`, per `exec/ndjson.rs`'s wire-shape
-/// module doc). `bash` tool results conventionally embed the executed command in their `result`
-/// payload (`{"command": "...", "stdout": "...", ...}` or, at minimum, echo the command inline in
-/// free-form result text) — this helper looks for a `command` string field on `result` first
-/// (structured case), then falls back to treating a bare-string `result` as the command itself
-/// only if it has no other shape to read from. This mirrors the practical reality that
-/// `ToolExecutionEnd.result` is the sole surface this crate can observe for a finished `bash` call
-/// (module docs on `exec/ndjson.rs`: no rich `AssistantMessage`/tool-call-args type is ever
-/// available here) while staying conservative: a `result` shape this helper cannot confidently
-/// read as a command yields `None`, and [`has_mutation_tool_call`] then correctly does not count
-/// that call as an attempted mutation rather than guessing.
-fn tool_call_command_arg(event: &SubagentEvent) -> Option<String> {
-    let SubagentEvent::ToolExecutionEnd { result, .. } = event else {
-        return None;
-    };
-    if let Some(command) = result.get("command").and_then(serde_json::Value::as_str) {
-        return Some(command.to_string());
-    }
-    None
 }
 
 /// Source: `isMutatingBashCommand` (`long-running-guard.ts`). A bash command counts as mutating
@@ -1099,6 +1080,20 @@ mod tests {
         }
     }
 
+    /// Build a tool CALL event (`ToolExecutionStart`) carrying the call's `args` — the wire event
+    /// [`has_mutation_tool_call`] scans (the source scans assistant `toolCall` content parts, i.e.
+    /// the CALL with its arguments, never the tool result).
+    fn tool_start(name: &str, args: serde_json::Value) -> SubagentEvent {
+        SubagentEvent::ToolExecutionStart {
+            tool_call_id: "c1".into(),
+            tool_name: name.to_string(),
+            args,
+        }
+    }
+
+    /// A finished tool call (`ToolExecutionEnd`) — used only to prove that the guard scans the
+    /// CALL, not the RESULT: a mutating `command` echoed back only in a `ToolExecutionEnd.result`
+    /// (with no corresponding start) must NOT be counted.
     fn tool_end(name: &str, result: serde_json::Value) -> SubagentEvent {
         SubagentEvent::ToolExecutionEnd {
             tool_call_id: "c1".into(),
@@ -1205,8 +1200,36 @@ mod tests {
 
     #[test]
     fn edit_and_write_tool_calls_count_as_mutation_attempts() {
-        assert!(has_mutation_tool_call(&[tool_end("edit", serde_json::json!({"path": "a.ts"}))]));
-        assert!(has_mutation_tool_call(&[tool_end("write", serde_json::json!({"path": "a.ts"}))]));
+        assert!(has_mutation_tool_call(&[tool_start("edit", serde_json::json!({"path": "a.ts"}))]));
+        assert!(has_mutation_tool_call(&[tool_start("write", serde_json::json!({"path": "a.ts"}))]));
+    }
+
+    #[test]
+    fn a_never_completed_mutating_call_still_counts_as_an_attempt() {
+        // The source scans the assistant `toolCall` part, present the moment the model requests
+        // the call — a mutating call that started but produced no `ToolExecutionEnd` (child killed
+        // mid-tool-call, or the tool never finished) must STILL count. Only the start event is
+        // present here; no matching end.
+        let start_only = vec![tool_start("edit", serde_json::json!({"path": "a.ts"}))];
+        assert!(has_mutation_tool_call(&start_only));
+
+        let bash_start_only = vec![tool_start(
+            "bash",
+            serde_json::json!({"command": "rm -rf build"}),
+        )];
+        assert!(has_mutation_tool_call(&bash_start_only));
+    }
+
+    #[test]
+    fn a_mutating_command_only_in_the_result_payload_is_not_counted() {
+        // Regression for the ported bug: the guard must read the tool CALL's args, never the tool
+        // RESULT. A `ToolExecutionEnd` whose `result` merely echoes a mutating command — with no
+        // corresponding start event — must NOT be counted as an attempted mutation.
+        let end_only = vec![tool_end(
+            "bash",
+            serde_json::json!({"command": "rm -rf build", "stdout": ""}),
+        )];
+        assert!(!has_mutation_tool_call(&end_only));
     }
 
     #[test]
@@ -1229,17 +1252,14 @@ mod tests {
     }
 
     #[test]
-    fn has_mutation_tool_call_reads_bash_command_from_structured_result() {
-        let events = vec![tool_end(
+    fn has_mutation_tool_call_reads_bash_command_from_call_args() {
+        let events = vec![tool_start(
             "bash",
-            serde_json::json!({"command": "rm -rf build", "stdout": ""}),
+            serde_json::json!({"command": "rm -rf build"}),
         )];
         assert!(has_mutation_tool_call(&events));
 
-        let non_mutating = vec![tool_end(
-            "bash",
-            serde_json::json!({"command": "ls -la", "stdout": ""}),
-        )];
+        let non_mutating = vec![tool_start("bash", serde_json::json!({"command": "ls -la"}))];
         assert!(!has_mutation_tool_call(&non_mutating));
     }
 
@@ -1395,7 +1415,7 @@ mod tests {
     #[test]
     fn implementation_task_with_mutation_attempt_does_not_trigger() {
         let a = agent("worker", None, None);
-        let events = vec![tool_end("edit", serde_json::json!({"path": "test.ts"}))];
+        let events = vec![tool_start("edit", serde_json::json!({"path": "test.ts"}))];
         let result = evaluate_completion_mutation_guard(&a, "Fix the failing test", &events);
         assert!(!result.triggered);
     }

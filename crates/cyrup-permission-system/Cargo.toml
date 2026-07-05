@@ -1,0 +1,83 @@
+[package]
+name = "cyrup-permission-system"
+description = "Permission system: allow/ask/deny policy gate over tool calls (native cyrup-ext extension; port of pi-permission-system)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-ext = { workspace = true }
+# P-5 (port doc §4 / reconciliation §2): the child→parent ask-forwarding spool (`forwarding.rs`)
+# consumes the `cyrup-ext-subagents::background::control` file-channel primitives as BUILDING BLOCKS —
+# `validate_safe_token`/`validate_contains_root` (safe path-token guard before any `Path::join`),
+# `CONTROL_INBOX_POLL_INTERVAL` (the poll cadence) — AND the R-SA-P1 parent-session anchor const
+# `PARENT_SESSION_ENV_VAR` (`CYRUP_SUBAGENT_PARENT_SESSION`), the routing key a child reads to address
+# its parent's inbox. The spool MECHANISM itself (nonce-bound request/response message shapes, the
+# `wx`/0o600 atomic write, the 0o700 session dirs, the directory layout) is pi's OWN, replicated here
+# (`permission-forwarding.ts` + `index.ts:1030-1504`), NOT the subagents interrupt channel.
+cyrup-ext-subagents = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+# The child forwarding wait (`forwarding::wait_for_forwarded_approval`) is an async poll loop awaited
+# under a `HostCtx::begin_human_wait` P-3 guard; the parent forwarding WATCHER is a spawned `tokio`
+# task the parent session installs on `SessionStart` (running OUTSIDE any live `HostCtx`, reachable via
+# the captured `HostServices` Arc). Both need the async runtime + timers + the `fs` bridge.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+# The parent watcher's request-inbox directory watch (pi's `fs.watch` + 2s poll, `index.ts:909-953,
+# 1904-2031`): a `notify::PollWatcher` mirroring `control.rs`'s `watch_control_inbox` pattern, polling
+# at `CONTROL_INBOX_POLL_INTERVAL`.
+notify = { workspace = true }
+# Forwarding message identity + at-most-once request creation (pi `randomUUID()`, `index.ts:1167,1282`):
+# the request id + the per-write `<path>.<pid>.<uuid>.tmp` temp-file name.
+uuid = { workspace = true, features = ["v4"] }
+# The 256-bit response nonce (pi `randomBytes(32).toString("base64url")`, `index.ts:1135-1137`):
+# `getrandom` fills 32 CSPRNG bytes; `base64` URL-safe-no-pad encodes them (matches Node `base64url`).
+getrandom = "0.3"
+base64 = { workspace = true }
+# The wildcard compiler (`wildcard.rs`, pi `wildcard-matcher.ts:13-27`) needs the dotAll (`s`) flag —
+# `RegexBuilder::dot_matches_new_line(true)` — so multi-line bash/heredoc commands are matched by
+# `.*` across newlines (the load-bearing fix pi's `wildcard-multiline.test.ts`/Issue #24 verifies).
+# `regex` is already resolved in the workspace lock transitively (ignore/globset/grep-regex); this
+# promotes it to a direct dependency.
+regex = "1"
+# SHA-256 for the permission-prompt dedup fingerprint (`dedup.rs`, pi `index.ts:735`
+# `createHash("sha256").update(fingerprint).digest("hex")`). Same version `cyrup-ext-subagents`
+# already pins directly (0.11.0); no new workspace-wide version surface.
+sha2 = "0.11.0"
+
+[dev-dependencies]
+# The FULLY-WIRED integration proof (`tests/gate_integration.rs`, R-PERM-010/012/050): a real
+# assembled `AgentSession` (built by `cyrup-test-support`'s `Harness`) where a scripted `bash` tool
+# call is genuinely blocked by a deny rule and genuinely allowed by an allow rule THROUGH the
+# registered `before_tool_call` hook — not a unit test of the engine in isolation.
+cyrup-test-support = { path = "../cyrup-test-support" }
+cyrup-provider = { workspace = true }
+# The LIVE-human-dialog integration proof (`tests/human_dialog.rs`, R-PERM-022): a real assembled
+# interactive `AgentSession` whose scripted UI sink (`LiveHostServices::set_ui_sink`, the SAME seam the
+# TUI/RPC renderer feeds at runtime) answers the permission `select` dialog, so an ask-tier tool call
+# blocks, the human "approves", and the tool proceeds THROUGH the registered `before_tool_call` hook +
+# the real `LocalAskChannel` dialog path. Needs the session-svc `LiveHostServices` + `Ui{Kind,Reply}`.
+cyrup-session-svc = { path = "../cyrup-session-svc" }
+# `AppMode::Interactive` (has_ui=true) on the harness options, so the gate takes the live-dialog branch.
+cyrup-config = { workspace = true }
+# The FULLY-WIRED child→parent forwarding proof (`tests/forwarding_subprocess.rs`, R-PERM-040/041/043):
+# a REAL detached `cyrup-permission-system` child subprocess drives its wired `before_tool_call` gate +
+# `ForwardingAskChannel` (writing a nonce-bound request into the PARENT spool and blocking), while the
+# PARENT process runs the REAL `spawn_forwarding_watcher` against a scripted `HostServices` human sink.
+# Needs `cyrup_ext`'s ctx/event/host-services surface (the `wasm-host` feature carries `HostServices`)
+# + `cyrup_core::ToolCallId` to construct the `ToolCall` event the child's gate decides on.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
+cyrup-core = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+async-trait = { workspace = true }

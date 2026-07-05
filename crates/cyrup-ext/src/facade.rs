@@ -161,6 +161,31 @@ impl ExtensionHost {
     /// Load a compiled-in native extension (R-ARCH-EXT-003). Awaits `init` (R-08-001), registers its
     /// tools/commands, builds its subscription bitset, and wires it into the dispatcher in load order.
     pub async fn load_native(&self, ext: Arc<dyn NativeExtension>) -> Result<(), ExtError> {
+        self.load_native_inner(ext).await
+    }
+
+    /// As [`Self::load_native`], but late-binds the live `Arc<dyn HostServices>` into the native
+    /// extension BEFORE `init` (reconciliation §2 item 1 / P-1). The session builder threads its own
+    /// `LiveHostServices` here so a native built-in captures the SAME backend the WASM path already
+    /// gets via `discover_and_load` — letting a background tokio task the built-in spawns reach the
+    /// real session id/file, dialogs, and message-injection OUTSIDE any live `HostCtx`. Binding before
+    /// `init` means an `init`-spawned background task already holds the backend; the session attaches
+    /// the manager / ui sink / inject sink LATER (builder steps 6/10 + the mode entry point), and the
+    /// captured `Arc` observes those through interior mutability, so early capture is correct.
+    #[cfg(feature = "wasm-host")]
+    pub async fn load_native_with_services(
+        &self,
+        ext: Arc<dyn NativeExtension>,
+        services: Arc<dyn crate::host::HostServices>,
+    ) -> Result<(), ExtError> {
+        ext.set_host_services(services);
+        self.load_native_inner(ext).await
+    }
+
+    /// The shared native-load body (register tools/commands, build subscriptions, wire into the
+    /// dispatcher). [`Self::load_native`] and [`Self::load_native_with_services`] differ only in
+    /// whether they first late-bind the host-services slot (P-1).
+    async fn load_native_inner(&self, ext: Arc<dyn NativeExtension>) -> Result<(), ExtError> {
         let id = ext.id();
         self.reserve_id(&id)?;
 

@@ -289,3 +289,90 @@ async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess
     let (is_error, result) = tool_ends[0];
     assert!(is_error, "an unresolvable agent name must surface as a tool error, got: {result:#?}");
 }
+
+/// T3 group C — a FAILED single run surfaces as a tool ERROR whose content carries the failure
+/// text (pi `formatFailedSingleRunOutput` + `isError: true`, `subagent-executor.ts:2752-2757`).
+/// cyrup's `ToolResult` has no `isError` flag, so the faithful analogue is `Err(ToolError)` — which
+/// the runtime renders as a `tool_execution_end` with `is_error: true` carrying the message. Proven
+/// end to end: the REAL fixture child exits non-zero with detail on its real stderr pipe, and that
+/// stderr is surfaced into the model-facing content, not buried in `details` JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_error_text() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+
+    let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
+    write_fixture_persona(work_dir.path(), "worker");
+
+    const STDERR_DETAIL: &str = "fatal: the child crashed while applying the change";
+    let script = serde_json::json!({
+        "steps": [
+            { "kind": "emit", "line": message_end_line("partial progress before the crash") },
+            { "kind": "emit_stderr", "line": STDERR_DETAIL },
+        ],
+        "exit_code": 2
+    });
+    let script_path = work_dir.path().join("fixture-script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write fixture script");
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig::default(),
+        work_dir.path().to_path_buf(),
+    ));
+
+    let harness = create_harness_with_extensions(HarnessOptions {
+        native_extensions: vec![extension],
+        responses: vec![
+            FauxResponse::tool_call(
+                "subagent",
+                serde_json::json!({ "agent": "worker", "task": "apply the change" }),
+            ),
+            FauxResponse::text("noted the subagent failure"),
+        ],
+        ..HarnessOptions::default()
+    })
+    .await
+    .expect("harness builds a real, fully-wired AgentSession with the extension loaded");
+
+    let events = harness.run("delegate the change to the worker subagent").await;
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+
+    let events = events.expect("the turn completes even though the tool call itself fails");
+
+    let tool_ends: Vec<(bool, &serde_json::Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd { is_error, result, .. } => {
+                Some((*is_error, result))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
+    let (is_error, result) = tool_ends[0];
+    assert!(
+        is_error,
+        "a failed single run must set the tool error flag (pi isError: true), got: {result:#?}"
+    );
+    let result_text = result.to_string();
+    assert!(
+        result_text.contains(STDERR_DETAIL),
+        "the failed run's error text (the child's surfaced stderr) must be in the model-facing \
+         CONTENT, not buried in details JSON — got: {result_text}"
+    );
+    assert!(
+        result_text.contains("Output:") && result_text.contains("partial progress before the crash"),
+        "formatFailedSingleRunOutput must include the partial Output block: {result_text}"
+    );
+}

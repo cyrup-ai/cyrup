@@ -55,6 +55,13 @@ use crate::fork_context::ContextMode;
 /// why every function there is deliberately terminal-free and `cyrup-tui`-free.
 pub mod render;
 
+/// The typed, serializable render-payload shapes `cyrup-tui` consumes for the live subagent
+/// surfaces (C19/C20/C21): the foreground live-progress payload streamed through the host
+/// `ToolUpdateSink`, the inline subagent-result surface payload, and the persistent async-jobs
+/// widget feed — plus the NDJSON-folding accumulator behind the foreground live sink. See that
+/// module's own doc for the clearly-labeled remaining `cyrup-tui`-side rendering step.
+pub mod events;
+
 /// `ControlNoticeState`: the debounce/actionability/dedup state machine for control notices
 /// (R-SA-114-118/121/122; arch-SA §6.7). See that module's own docs for the full design.
 pub mod notices;

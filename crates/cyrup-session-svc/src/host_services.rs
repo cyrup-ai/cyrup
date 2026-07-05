@@ -9,7 +9,7 @@
 //! while the session's manager is async-locked. `LiveHostServices` therefore reads from a small
 //! sync snapshot the session pushes on model/state changes, plus the provider's (sync) model list.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
     ControlOp, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse,
-    HttpStreamResponse, NotifyKind, ProcSpawnSpec,
+    HttpStreamResponse, HumanInteractionLock, NotifyKind, ProcSpawnSpec,
 };
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
@@ -169,7 +169,44 @@ struct LiveSnapshot {
     used_tokens: u64,
     session_name: Option<String>,
     thinking_level: Option<String>,
+    /// The live session id (P-2), cached at [`LiveHostServices::attach_session`]. Immutable per
+    /// session, so the cache is never stale — the sync `session_id()` read returns it directly (no
+    /// manager lock), which keeps the id available even to a background caller while an in-progress
+    /// turn holds the manager's async lock (the permission spool routes hard on this id).
+    session_id: Option<String>,
+    /// The last-known persisted session-file path (P-2), cached at attach. Only a FALLBACK for
+    /// `session_file()` when the live manager lock is momentarily contended — the file is deferred
+    /// until the first assistant message and changes on fork, so the live read is authoritative.
+    session_file: Option<PathBuf>,
 }
+
+/// A host-originated message injection routed from a background task's `inject_message` to the live
+/// session's turn loop (Pi `pi.sendMessage(message, {triggerTurn})` → `sendCustomMessage`,
+/// agent-session.ts:1337-1370). The REQUEST payload of the late-bound [`InjectSink`]; carries the
+/// fields the trait's [`HostServices::inject_message`] takes so the sink can drive the async
+/// append/turn on the live session. Closes R-SA-101 (cyrup-ext-subagents background completion).
+///
+/// [`HostServices::inject_message`]: cyrup_ext::host::HostServices::inject_message
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectMessage {
+    /// The message body (Pi `content`).
+    pub content: String,
+    /// A custom (non-LLM) message tag when `Some` (Pi `customType`, e.g. `"subagent-notify"`); a
+    /// plain user message when `None`.
+    pub custom_type: Option<String>,
+    /// Whether the message is surfaced to the user (Pi `display`).
+    pub display: bool,
+    /// Whether to re-enter the agent turn loop over the injected message (Pi `{ triggerTurn: true }`).
+    pub trigger_turn: bool,
+}
+
+/// A fire-and-forget message-injection sink: [`LiveHostServices::inject_message`] forwards an
+/// [`InjectMessage`] here; the installed sink (bound by `AgentSession::into_shared`) spawns the async
+/// inject/turn on the live session and returns immediately, so the sync caller never blocks for the
+/// whole turn (the same sync→async bridge the [`ControlSink`] uses). `None` until bound (the default
+/// host, a headless-by-value session): `inject_message` then reports the seam unavailable, matching
+/// the trait's deny default.
+pub type InjectSink = Arc<dyn Fn(InjectMessage) -> Result<(), String> + Send + Sync>;
 
 /// The live host-services backend (arch-08 §5.6).
 pub struct LiveHostServices {
@@ -233,6 +270,19 @@ pub struct LiveHostServices {
     /// ([`Self::with_exec_timeout`]) so the fallback-timeout path is exercisable without a real test
     /// waiting the full production duration.
     exec_timeout: Duration,
+    /// The late-bound message-injection sink (R-SA-101 / P-2). A guest or a native extension's
+    /// background task calls the SYNC [`HostServices::inject_message`]; that forwards an
+    /// [`InjectMessage`] here, and the installed sink spawns the async append/turn on the live session
+    /// (bound by `AgentSession::into_shared`). `None` until bound (default host / headless-by-value
+    /// session): the ui-style sync→async bridge is inert and `inject_message` reports it unavailable.
+    inject_sink: Mutex<Option<InjectSink>>,
+    /// The ONE session-scoped human-interaction lock (C3, reconciliation §1 / §4 step 6). Created
+    /// eagerly at construction (immutable for the session's life) and handed to BOTH companion
+    /// extensions through [`HostServices::human_interaction_lock`], so the permission gate's `ask`
+    /// dialog and the intercom clarify's supervisor prompt serialize on the SAME lock and can never
+    /// prompt the same human at once. Every native handed this backend Arc (via `set_host_services`)
+    /// reads the identical lock.
+    human_interaction: Arc<HumanInteractionLock>,
 }
 
 impl LiveHostServices {
@@ -256,6 +306,8 @@ impl LiveHostServices {
             dynamic_tools: Mutex::new(None),
             pending_active_tools: Mutex::new(None),
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
+            inject_sink: Mutex::new(None),
+            human_interaction: Arc::new(HumanInteractionLock::new()),
         }
     }
 
@@ -403,9 +455,25 @@ impl LiveHostServices {
 
     /// Attach the running session's tree manager so a guest's state-mutating capabilities
     /// (`append_entry`/`set_session_name`/`set_label`) reach the REAL session tree (arch-08 §5.6).
-    /// The builder calls this once the `Arc<AsyncMutex<SessionManager>>` exists (step 10).
+    /// The builder calls this once the `Arc<AsyncMutex<SessionManager>>` exists (step 10). Also caches
+    /// the immutable session id (+ current file) into the sync snapshot for the P-2 `session_id()`/
+    /// `session_file()` reads, so a background caller resolves them even while a turn holds the manager
+    /// lock. The manager is uncontended at attach time (build), so the non-blocking `try_lock` succeeds.
     pub fn attach_session(&self, manager: Arc<AsyncMutex<SessionManager>>) {
+        if let Ok(mgr) = manager.try_lock() {
+            let mut snap = Self::lock(&self.snapshot);
+            snap.session_id = Some(mgr.session_id().as_str().to_string());
+            snap.session_file = mgr.session_file().map(Path::to_path_buf);
+        }
         *Self::lock(&self.manager) = Some(manager);
+    }
+
+    /// Attach the late-bound message-injection sink (R-SA-101 / P-2). `AgentSession::into_shared` binds
+    /// a sink that upgrades a weak self-handle and spawns the async inject/turn, so a background task
+    /// calling [`HostServices::inject_message`] reaches THIS session's live turn loop. Idempotent:
+    /// re-binding replaces the sink (a fresh session generation gets a fresh handle).
+    pub fn set_inject_sink(&self, sink: InjectSink) {
+        *Self::lock(&self.inject_sink) = Some(sink);
     }
 
     /// Share the session's authoritative dynamic-tool view so a guest's `setActiveTools`/
@@ -560,6 +628,56 @@ impl HostServices for LiveHostServices {
 
     fn session_name(&self) -> Option<String> {
         Self::lock(&self.snapshot).session_name.clone()
+    }
+
+    fn session_id(&self) -> Option<String> {
+        // The immutable session id, cached at `attach_session`. A sync read of the snapshot (no
+        // manager lock) so a background caller resolves it even while a turn holds the async lock
+        // (P-2; the permission spool routes hard on this id).
+        Self::lock(&self.snapshot).session_id.clone()
+    }
+
+    fn human_interaction_lock(&self) -> Option<Arc<HumanInteractionLock>> {
+        // C3 (reconciliation §1 / §4 step 6): the ONE session-scoped lock BOTH companions serialize
+        // their human prompts on. Every native handed this backend Arc via `set_host_services` reads
+        // this SAME instance, so a permission `ask` dialog and an intercom clarify can never prompt the
+        // same human simultaneously.
+        Some(Arc::clone(&self.human_interaction))
+    }
+
+    fn session_file(&self) -> Option<PathBuf> {
+        // The LIVE persisted file (deferred until the first assistant message; changes on fork), read
+        // from the attached tree manager. `Ok(_)` — attached and read (the value may itself be `None`
+        // if not yet persisted); `Err(_)` — unattached OR the lock is momentarily contended (a
+        // background caller during an in-progress turn), in which case fall back to the cached
+        // snapshot (P-2). Non-blocking `try_lock` (via `with_manager`) — never a hang, never a panic.
+        match self.with_manager(|mgr| Ok(mgr.session_file().map(Path::to_path_buf))) {
+            Ok(file) => file,
+            Err(_) => Self::lock(&self.snapshot).session_file.clone(),
+        }
+    }
+
+    fn inject_message(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        trigger_turn: bool,
+    ) -> Result<(), String> {
+        // Forward onto the late-bound inject sink (bound by `AgentSession::into_shared`), which spawns
+        // the async append/turn on the live session and returns immediately — the sync caller (guest
+        // or a native extension's background task) never blocks for the whole turn (R-SA-101 / P-2).
+        // No sink (default host / headless-by-value session) ⇒ the seam is unavailable, matching the
+        // trait deny default.
+        let sink = Self::lock(&self.inject_sink)
+            .clone()
+            .ok_or("message injection not wired to a live session")?;
+        sink(InjectMessage {
+            content: content.to_string(),
+            custom_type: custom_type.map(str::to_string),
+            display,
+            trigger_turn,
+        })
     }
 
     fn control(&self, op: ControlOp) -> Result<(), String> {
@@ -775,6 +893,16 @@ impl HostServices for LiveHostServices {
         // agent-session.ts:2281,813). `None` until the shared view is attached (default host).
         let dt = Self::lock(&self.dynamic_tools).clone()?;
         Some(Self::lock(&dt).active_names())
+    }
+
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        // The live session's FULL registered tool set (Pi `getAllTools`, agent-session.ts:790-799) —
+        // the whole enable-able `_toolRegistry`, NOT the exposed subset `active_tools` returns. This is
+        // the `getAllTools` analog the permission companion's registry / unknown-tool gate checks
+        // against (pi-permission-system index.ts:2218-2228). `None` until the shared dynamic-tool view
+        // is attached (default host: no live agent → the companion skips the registry gate).
+        let dt = Self::lock(&self.dynamic_tools).clone()?;
+        Some(Self::lock(&dt).all().into_iter().map(|t| t.name).collect())
     }
 
     fn set_active_tools(&self, names: &[String]) {

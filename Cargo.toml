@@ -19,6 +19,8 @@ members = [
     "crates/cyrup-test-support",
     "crates/cyrup-ext-sdk",
     "crates/cyrup-ext-subagents",
+    "crates/cyrup-permission-system",
+    "crates/cyrup-intercom",
 ]
 # cyrup-ext-sdk is the GUEST sdk (compiled to wasm32-wasip2); it is NOT part of the
 # host binary build graph (arch-00 §2.2), so it is excluded from default-members.
@@ -39,6 +41,8 @@ default-members = [
     "crates/cyrup",
     "crates/cyrup-test-support",
     "crates/cyrup-ext-subagents",
+    "crates/cyrup-permission-system",
+    "crates/cyrup-intercom",
 ]
 
 [workspace.package]
@@ -73,6 +77,8 @@ cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.0.0" }
 cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.0.0" }
 cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
 cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
+cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.0.0" }
+cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---

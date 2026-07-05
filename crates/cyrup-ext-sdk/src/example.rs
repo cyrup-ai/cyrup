@@ -44,9 +44,10 @@ pub fn build() -> ExtensionApi {
     // Notify hook: announce activation when a run starts.
     api.on_agent_start(|ctx| {
         ctx.ui().notify("demo extension active");
-        // parity gap #12: set_thinking_level from an EVENT handler. Pi allows this from any handler
-        // (runner.ts:330); cyrup routes it through the command-tier `control` path (deadlock rule),
-        // so from an event handler it must surface an OBSERVABLE error — never a silent no-op.
+        // GAP-11: set_thinking_level from an EVENT handler. Pi allows this from any handler
+        // (loader.ts:352-354 / runner.ts:330, no tier gate) and it TAKES EFFECT. cyrup now QUEUES the
+        // op and applies it at the store-free turn-boundary drain (never rejects it), so the guest
+        // observes `Ok(())` and the level changes on the subsequent turn — matching Pi.
         match ctx.models().set_thinking_level("minimal") {
             Ok(()) => ctx.ui().notify("thinking level set from agent_start"),
             Err(e) => ctx.ui().notify(&format!("thinking level rejected: {e}")),
@@ -82,14 +83,61 @@ pub fn build() -> ExtensionApi {
 
     // message_end (gap-08 #3): redact a user message whose text is "redact me", preserving the role
     // (the host rejects a role change, Pi runner.ts:785).
-    api.on_message_end(|ev, _ctx| {
+    api.on_message_end(|ev, ctx| {
         let role = ev.message.get("role").and_then(|r| r.as_str());
-        let text = ev.message.get("content").and_then(|c| c.as_str());
+        // cyrup serializes `UserMessage.content` as the array form `[{type:"text",text}]` (Pi's real
+        // entry points always build the array; the bare-string shorthand is only read-tolerated,
+        // never written — cyrup-core message.rs). Read the first text block's `text`, falling back to
+        // the bare-string shorthand so this stays 1:1 with Pi's `string | Content[]` tolerance.
+        let content = ev.message.get("content");
+        let text = content.and_then(|c| c.as_str()).or_else(|| {
+            content
+                .and_then(|c| c.as_array())
+                .and_then(|blocks| blocks.first())
+                .and_then(|first| first.get("text"))
+                .and_then(|t| t.as_str())
+        });
         if role == Some("user") && text == Some("redact me") {
             Outcome::replace_message(json!({ "role": "user", "content": "[redacted]", "timestamp": 0 }))
+        } else if role == Some("user") && text == Some("gap11switch") {
+            // GAP-11 INDEPENDENT VERIFICATION: call BOTH set_model and set_thinking_level from this
+            // EVENT handler (on_message_end fires DURING the run, while the wasm store is held). Pi
+            // allows both from any handler and they take effect (loader.ts:342-354). The host must
+            // QUEUE each op (never reject/drop it) and apply it at the store-free turn-boundary drain,
+            // so the SUBSEQUENT turn uses the new model/level.
+            //
+            // The ergonomic SDK exposes `set_model` only on `CommandCtx`; to exercise the HOST's
+            // event-tier `set_model` import we call the raw WIT binding directly (WIT `set-model`
+            // returns void — fire-and-forget — so the guest observes the EFFECT, not a return value).
+            // The host parses `model-json` with serde_json (live.rs `set_model`), so pass valid JSON
+            // — the object form `{provider, model}` (parse_model_ref accepts it), exactly what the
+            // SDK's `CommandCtx::set_model` encodes for a typed ref.
+            #[cfg(target_arch = "wasm32")]
+            crate::guest::bindings::cyrup::ext::models::set_model(
+                r#"{"provider":"faux","model":"faux-2"}"#,
+            );
+            ctx.ui().notify("gap11: set_model called from message_end");
+            match ctx.models().set_thinking_level("high") {
+                Ok(()) => ctx.ui().notify("gap11: set_thinking_level ok from message_end"),
+                Err(e) => ctx.ui().notify(&format!("gap11: set_thinking_level err from message_end: {e}")),
+            }
+            Outcome::noop()
         } else {
             Outcome::noop()
         }
+    });
+
+    // GAP-11 RE-ENTRANCY PROOF: subscribe to `thinking_level_select` (and `model_select`). When an
+    // event-tier `set_thinking_level` is applied at the store-free turn-boundary drain, the host
+    // RE-EMITS `thinking_level_select` back to the guest (agent-session.ts:1560-1567) — a FRESH
+    // top-level guest call that re-enters the single-instance wasm store. This is EXACTLY the re-entry
+    // the old command-tier gate guarded against: if the drain point were not store-free, this re-entry
+    // would deadlock/hang. The handler notifies so a test can prove the re-emit reached the guest.
+    api.on_thinking_level_select(|ev, ctx| {
+        ctx.ui().notify(&format!("tls re-emit reached guest: {}", ev.level));
+    });
+    api.on_model_select(|ev, ctx| {
+        ctx.ui().notify(&format!("model_select re-emit reached guest: {}", ev.model));
     });
 
     // before_provider_request (gap-08 #4): tag the outbound payload — Pi replaces the payload
@@ -467,6 +515,27 @@ pub fn build() -> ExtensionApi {
                 Err(e) => {
                     ctx.ui().notify(&format!("thinking level rejected: {e}"));
                     Ok(Some(format!("thinking level rejected: {e}")))
+                }
+            }
+        },
+    );
+
+    // GAP-11 command-tier proof: a guest COMMAND calling set_model must still apply after the
+    // event-tier gate was removed. Command tier was always permitted (R-08-008); this pins that the
+    // fix did not regress it.
+    api.register_command(
+        "gap11setmodel",
+        CommandDescriptor::new("Set the model from a command (GAP-11 command-tier proof)."),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let target = args.trim();
+            match ctx.set_model(target) {
+                Ok(()) => {
+                    ctx.ui().notify(&format!("model set: {target}"));
+                    Ok(Some(format!("model set: {target}")))
+                }
+                Err(e) => {
+                    ctx.ui().notify(&format!("model rejected: {e}"));
+                    Ok(Some(format!("model rejected: {e}")))
                 }
             }
         },

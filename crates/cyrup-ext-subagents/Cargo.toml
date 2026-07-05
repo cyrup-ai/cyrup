@@ -51,6 +51,12 @@ jsonschema = { workspace = true }
 # nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
 uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
+# SHA-256 for the direct-MCP metadata-cache config-identity hash (`exec/mcp_direct_tools.rs`,
+# pi `computeMcpServerHash`) — the resolver validates a cached server's tool/resource metadata is
+# still current by hashing the resolution-relevant fields of its `mcp.json` definition and
+# comparing against the cache's stamped `configHash`. Same version `cyrup-config` already pins for
+# its own PKCE/auth hashing, so no new workspace-wide version surface is introduced.
+sha2 = "0.11.0"
 tracing = "0.1.44"
 # `tui/render.rs`'s pure fold-to-aggregate rendering functions (R-SA-106..113) return
 # `ratatui::text::Line`/`Span` values so a live terminal owner (`cyrup-tui`, out of scope for
@@ -84,6 +90,13 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `artifacts.rs`'s 7-day sweep / 24h-throttle unit tests must backdate an artifact's mtime to prove
+# a file older than the cleanup horizon is deleted while a fresh one survives; `std::fs` has no
+# portable mtime setter and this crate is `#![forbid(unsafe_code)]` (so a `libc::utimes` call is not
+# available in a `src/`-module test). `filetime` is already in the workspace lock (a transitive
+# dependency), so this adds no new resolution surface — it only surfaces the existing crate as a
+# dev-only dependency. Dev-only: never referenced from production code.
+filetime = "0.2"
 # `tui::render`'s tests paint into a real `TestBackend` grid via `cyrup_test_support::tui::
 # TestTerminal` (mirroring `crates/cyrup-tui/tests/assembled_render.rs`'s whole-buffer text-grid
 # pattern) rather than asserting on `Line`/`Span` structure alone. Not aliased in

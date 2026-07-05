@@ -15,6 +15,7 @@
 pub mod cli;
 pub mod diagnostics;
 pub mod input;
+pub mod intercom_broker_cmd;
 pub mod migrations;
 pub mod output_guard;
 pub mod provider;

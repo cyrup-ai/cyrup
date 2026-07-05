@@ -75,6 +75,15 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(cyrup::subagent_runner_cmd::dispatch(&raw).await);
     }
 
+    // Internal `__intercom-broker` pre-dispatch (spec/extensions/cyrup-intercom-port.md §7.3): the
+    // hidden subcommand the per-session intercom extension re-execs `current_exe()` into to stand up
+    // the standalone broker PROCESS (a Unix-socket hub). Recognized and dispatched here, before any
+    // user-facing arg leniency/clap parsing, exactly like `__subagent-runner` above (the broker's own
+    // `--config`-free argv must never reach the user-facing `Cli` surface).
+    if cyrup::intercom_broker_cmd::is_selected(&raw) {
+        return Ok(cyrup::intercom_broker_cmd::dispatch().await);
+    }
+
     // Package/config subcommand pre-dispatch (Pi main.ts:486, before arg parsing). Resolve dirs with
     // no CLI overrides for the subcommand's package/project roots.
     if subcommands::first_subcommand(&argv).is_some() {
@@ -295,17 +304,60 @@ async fn run() -> anyhow::Result<i32> {
         let target = config.target.clone();
         let fresh = is_fresh_target(&target);
         let session_cwd = config.cwd.clone();
-        let factory = Arc::new(
-            SessionFactory::new(provider, config)
-                .settings_store(settings_store.clone())
-                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
-                .with_native_extension(Arc::new(
-                    cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
-                        cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
-                        session_cwd,
-                    ),
-                )),
+        let mut factory_builder = SessionFactory::new(provider, config)
+            .settings_store(settings_store.clone())
+            .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+        // T6 child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`):
+        // attach the SubAgents extension only when this process is NOT a plain subagent child. A
+        // child re-execs with `CYRUP_SUBAGENT_CHILD=1`; a plain child registers nothing (returns
+        // `None` here), while a fanout-authorized child (`CYRUP_SUBAGENT_FANOUT_CHILD=1`) gets a
+        // restricted, mutation-blocked tool. `subagent_extension_for_env` encodes that decision.
+        // Intercom companion (spec/extensions/cyrup-intercom-port.md): the out-of-band supervisor
+        // coordination bridge. Built FIRST (concrete) so its broker-backed delivery/clarify seam
+        // channels can be handed to the SubAgents extension via `with_channels` (the port doc §8.4
+        // item 1 / P5 handoff — CLOSING R-SA-037/119/120/123/124/125). Child-mode gated — a subagent
+        // child with orchestrator metadata always attaches so `contact_supervisor` registers; a plain
+        // session attaches only when opted in (`_concrete` returns `None` otherwise, no broker).
+        let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
+            dirs.agent_dir.clone(),
+            session_cwd.clone(),
         );
+        // T6 child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`):
+        // attach the SubAgents extension only when this process is NOT a plain subagent child. When
+        // intercom is attached this session, thread its real channels in (else keep the NoTransport/
+        // NoOp degrade defaults, R-SA-020).
+        let subagent_ext = match &intercom_ext {
+            Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                session_cwd.clone(),
+                ic.delivery_channel(),
+                ic.clarify_channel(),
+                ic.steer_channel(),
+            ),
+            None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                session_cwd.clone(),
+            ),
+        };
+        // Attach subagents first (matching prior load order), then the intercom extension itself.
+        if let Some(ext) = subagent_ext {
+            factory_builder = factory_builder.with_native_extension(ext);
+        }
+        if let Some(ic) = intercom_ext {
+            factory_builder = factory_builder.with_native_extension(ic);
+        }
+        // Permission system (port doc §4): the opt-in allow/ask/deny gate over tool calls, attached
+        // via the SAME `.with_native_extension(...)` seam. `permission_extension_for_env` selects the
+        // role by the `CYRUP_SUBAGENT_CHILD` signal — a subagent child loads the gate with the
+        // child→parent ask-FORWARDING channel, this (root) session loads it with the in-session dialog
+        // + the forwarding watcher — and returns `None` only when the gate is not installed (DI-5).
+        if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
+            dirs.agent_dir.clone(),
+            session_cwd,
+        ) {
+            factory_builder = factory_builder.with_native_extension(ext);
+        }
+        let factory = Arc::new(factory_builder);
         let runtime = Arc::new(
             AgentSessionRuntime::create(factory, target)
                 .await
@@ -351,17 +403,46 @@ async fn run() -> anyhow::Result<i32> {
             let target = config.target.clone();
             let fresh = is_fresh_target(&target);
             let session_cwd = config.cwd.clone();
-            let factory = Arc::new(
-                SessionFactory::new(provider, config)
-                    .settings_store(settings_store.clone())
-                    .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
-                    .with_native_extension(Arc::new(
-                        cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
-                            cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
-                            session_cwd,
-                        ),
-                    )),
+            let mut factory_builder = SessionFactory::new(provider, config)
+                .settings_store(settings_store.clone())
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+            // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
+            // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
+            // 119/120/123/124/125). Child-mode gated; `_concrete` returns `None` for a plain session.
+            let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
+                dirs.agent_dir.clone(),
+                session_cwd.clone(),
             );
+            // T6 child-mode gate (see the interactive arm above): a plain subagent child registers
+            // nothing; a fanout-authorized child gets the restricted tool. Thread the intercom
+            // channels in when intercom is attached, else keep the NoTransport/NoOp degrade defaults.
+            let subagent_ext = match &intercom_ext {
+                Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                    cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                    session_cwd.clone(),
+                    ic.delivery_channel(),
+                    ic.clarify_channel(),
+                    ic.steer_channel(),
+                ),
+                None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                    cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                    session_cwd.clone(),
+                ),
+            };
+            if let Some(ext) = subagent_ext {
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
+            if let Some(ic) = intercom_ext {
+                factory_builder = factory_builder.with_native_extension(ic);
+            }
+            // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + child-gating.
+            if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
+                dirs.agent_dir.clone(),
+                session_cwd,
+            ) {
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
+            let factory = Arc::new(factory_builder);
             let runtime = match AgentSessionRuntime::create(factory, target).await {
                 Ok(r) => Arc::new(r),
                 // Non-interactive no-models-available guard (Pi main.ts:795-798): print the provider
@@ -386,18 +467,51 @@ async fn run() -> anyhow::Result<i32> {
             // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
             let fresh = is_fresh_target(&config.target);
             let session_cwd = config.cwd.clone();
-            let session = match SessionBuilder::new(provider, config)
+            let mut builder = SessionBuilder::new(provider, config)
                 .settings_store(settings_store.clone())
-                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver))
-                .with_native_extension(Arc::new(
-                    cyrup_ext_subagents::extension::SubagentsExtension::with_config_and_cwd(
-                        cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
-                        session_cwd,
-                    ),
-                ))
-                .build()
-                .await
-            {
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+            // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
+            // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
+            // 119/120/123/124/125). The one-shot print/json mode is exactly what a spawned subagent
+            // child re-execs into, so the child branch of `_concrete` is what registers the child
+            // surface there.
+            let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
+                dirs.agent_dir.clone(),
+                session_cwd.clone(),
+            );
+            // T6 child-mode gate (see the interactive arm above): a plain subagent child registers
+            // nothing; a fanout-authorized child gets the restricted tool. Thread the intercom
+            // channels in when intercom is attached, else keep the NoTransport/NoOp degrade defaults.
+            let subagent_ext = match &intercom_ext {
+                Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                    cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                    session_cwd.clone(),
+                    ic.delivery_channel(),
+                    ic.clarify_channel(),
+                    ic.steer_channel(),
+                ),
+                None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                    cyrup::subagent_config::load_subagent_extension_config(&dirs.agent_dir),
+                    session_cwd.clone(),
+                ),
+            };
+            if let Some(ext) = subagent_ext {
+                builder = builder.with_native_extension(ext);
+            }
+            if let Some(ic) = intercom_ext {
+                builder = builder.with_native_extension(ic);
+            }
+            // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + role selection.
+            // The one-shot print/json mode is exactly what a spawned subagent child re-execs into, so
+            // `permission_extension_for_env` loads the child→parent ask-FORWARDING channel here when
+            // this is a `CYRUP_SUBAGENT_CHILD` and the gate is installed (P-4, forwarding.rs).
+            if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
+                dirs.agent_dir.clone(),
+                session_cwd,
+            ) {
+                builder = builder.with_native_extension(ext);
+            }
+            let session = match builder.build().await {
                 // Bind the self-handle (via `into_shared`) so the post-run loop — auto-retry,
                 // post-run auto-compaction, queued continuations — fires for one-shot print/json runs.
                 Ok(s) => s.into_shared(),

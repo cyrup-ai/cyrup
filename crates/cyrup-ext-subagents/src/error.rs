@@ -76,6 +76,14 @@ pub enum SubagentError {
     #[error("structured output missing or invalid: {0}")]
     StructuredOutputInvalid(String),
 
+    /// A `{outputs.name}` chain-output template reference was malformed, or named an output no
+    /// strictly-earlier step produced (R-SA-053; pi `ChainOutputValidationError`,
+    /// `chain-outputs.ts:85-93`). Carries pi's exact user/LLM-facing message verbatim so the
+    /// observable diagnostic matches (`Unknown chain output reference '{outputs.x}'.` /
+    /// `Invalid chain output reference '…'. Use {outputs.name} with /^[A-Za-z_][A-Za-z0-9_]*$/ names.`).
+    #[error("{0}")]
+    ChainOutputInvalid(String),
+
     /// A run-id selector matched more than one candidate across namespaces (R-SA-080).
     #[error("run id ambiguous: {0}")]
     AmbiguousRunId(String),

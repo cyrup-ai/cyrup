@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // Re-exported for downstream backends (e.g. `cyrup-session-svc::LiveHostServices`), which reach
 // these DTOs the same way it reaches `ExecOutput`/`DialogOptions` (`cyrup_ext::host::{..}`).
@@ -94,6 +95,60 @@ pub enum ControlOp {
     SendUserMessage { content: String, opts: Value },
     SetModel(Value),
     SetThinkingLevel(String),
+}
+
+/// The ONE host-owned, session-scoped lock that serializes HUMAN interactions across the companion
+/// extensions (C3, reconciliation §1 / §4 step 6). It is the single point at which a prompt-to-the-
+/// human is serialized: the permission gate's `ask` dialog (cyrup-permission-system `resolve_ask`) and
+/// the intercom clarify's supervisor prompt (cyrup-intercom `IntercomClarifyChannel::ask`) each acquire
+/// this SAME lock before surfacing anything to the human, so a permission approval and a subagent
+/// clarify can never prompt the same human simultaneously. It REPLACES the two former private single-
+/// slot locks — permission's `Semaphore(1)` and intercom's `AskLock` slots map — which each guarded
+/// only their own companion and could therefore double-prompt when both were installed.
+///
+/// Owned by the live session's [`HostServices`] backend (one instance per session, `LiveHostServices`)
+/// and reached by both companions — which run OUTSIDE any live `HostCtx`, so the captured backend Arc,
+/// not a ctx field, is the load-bearing handle — through [`HostServices::human_interaction_lock`]. A
+/// single permit models "at most one human prompt open at a time". Both current callers WAIT via
+/// [`Self::acquire`] (the permission `ask` and the intercom clarify each surface after any in-flight
+/// prompt finishes, never dropping a legitimate request); a reject-immediately ("busy") variant is not
+/// added until a caller needs it (workspace no-dead-primitives policy).
+///
+/// Backed by an `Arc<Semaphore>` so the guard holds an OWNED permit (no borrow of `self`), which is
+/// what lets a companion hold it across the `.await` of a blocking dialog without a self-referential
+/// future.
+#[derive(Debug)]
+pub struct HumanInteractionLock {
+    slot: Arc<Semaphore>,
+}
+
+impl Default for HumanInteractionLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HumanInteractionLock {
+    /// A fresh, unheld lock (one permit).
+    #[must_use]
+    pub fn new() -> Self {
+        Self { slot: Arc::new(Semaphore::new(1)) }
+    }
+
+    /// Acquire the single human-interaction slot, WAITING until any in-flight prompt finishes. Hold
+    /// the returned guard across the blocking dialog; dropping it releases the slot. The semaphore is
+    /// never closed (nothing calls `Semaphore::close`), so acquisition cannot fail — the guard degrades
+    /// to "unheld" in the impossible closed case rather than panicking (workspace no-panic policy).
+    pub async fn acquire(&self) -> HumanInteractionGuard {
+        HumanInteractionGuard { _permit: Arc::clone(&self.slot).acquire_owned().await.ok() }
+    }
+}
+
+/// RAII guard for the single human-interaction slot (see [`HumanInteractionLock`]). While held, no
+/// other companion can open a human prompt; on drop (including a panic unwind) the slot is released.
+#[must_use = "the human-interaction slot is only held while this guard is alive"]
+pub struct HumanInteractionGuard {
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// The pluggable host backend for interactive capabilities (arch-08 §3.6). Every method defaults to
@@ -196,6 +251,59 @@ pub trait HostServices: Send + Sync {
         None
     }
 
+    /// The live session's id (Pi `sessionManager.getSessionId()`, index.ts:960-970 in
+    /// pi-permission-system). Net-new alongside [`Self::session_name`] (P-2, reconciliation §2 item 2);
+    /// `None` when no live session backend is attached (the default host has no session). Immutable per
+    /// session, so a backend may cache it. Hard-required by the permission companion (its request/response
+    /// spool routes on the parent session id) and by the shared subagents spawn-site parent-session
+    /// anchor; an upgrade for intercom target-resolution.
+    fn session_id(&self) -> Option<String> {
+        None
+    }
+
+    /// The ONE host-owned, session-scoped human-interaction lock (C3, reconciliation §1 / §4 step 6).
+    /// Both companion extensions acquire this SAME lock before surfacing a prompt to the human — the
+    /// permission gate's `ask` dialog and the intercom clarify's supervisor prompt — so the two can
+    /// never prompt the same human simultaneously. `None` on the default host (no live human to
+    /// serialize); the live session backend ([`crate::host::LiveExtension`]'s `LiveHostServices`)
+    /// returns `Some(<the session lock>)`, the SAME [`HumanInteractionLock`] instance on every call, so
+    /// both companions (each handed the identical session backend `Arc`) converge on one lock. See
+    /// [`HumanInteractionLock`] for why the captured backend Arc — not a `HostCtx` field — is the
+    /// load-bearing handle (both human paths run outside any live `HostCtx`).
+    fn human_interaction_lock(&self) -> Option<Arc<HumanInteractionLock>> {
+        None
+    }
+
+    /// The live session's persisted file path (Pi `sessionManager.sessionFilePath`). `None` when
+    /// unattached, headless, or the session is not persisted (an ephemeral/in-memory session). This is
+    /// the REAL orchestrator session file that cyrup-ext-subagents fork-context branches from, instead
+    /// of its current `SessionManager::continue_recent(cwd)` most-recent-mtime HEURISTIC
+    /// (`extension.rs:385-420`), which can pick the wrong session under multiple sessions per cwd (P-2).
+    fn session_file(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Inject a user-visible message into the live session and OPTIONALLY trigger an agent turn over it
+    /// (Pi `pi.sendMessage({content, customType, display}, {triggerTurn})` → `sendCustomMessage`,
+    /// agent-session.ts:1337-1370). `custom_type = Some(t)` tags a custom (non-LLM) message (e.g.
+    /// `"subagent-notify"`); `None` is a plain user message. `display` controls surfacing; `trigger_turn`
+    /// re-enters the agent turn loop OVER the injected message — the `triggerTurn` branch cyrup's own
+    /// `send_custom_message` otherwise lacked. Denied by default (`Err`) — the default host owns no live
+    /// turn loop. This is the seam that lets a native extension's background task surface a completed
+    /// result INTO the parent session (a real turn), closing R-SA-101 (cyrup-ext-subagents' background
+    /// completion currently degrades to a stderr `LoggingCompletionSink`); [`HookOutcome`] has no such
+    /// variant (Noop/Block/Mutate/Handled only), so this belongs on the capability backend, not a hook
+    /// return. [`HookOutcome`]: crate::contract::HookOutcome
+    fn inject_message(
+        &self,
+        _content: &str,
+        _custom_type: Option<&str>,
+        _display: bool,
+        _trigger_turn: bool,
+    ) -> Result<(), String> {
+        Err("message injection not available".into())
+    }
+
     // --- models ---
     fn models(&self) -> Value {
         json!([])
@@ -287,7 +395,9 @@ pub trait HostServices: Send + Sync {
         Err("proc capability not granted".into())
     }
 
-    // --- command-tier control (arch-08 §6.3); the deadlock guard is applied BEFORE this is called ---
+    // --- control (arch-08 §6.3). The deadlock guard is applied by live.rs BEFORE this is called for
+    // the session-replacement / turn-starting ops; GAP-11 exempts SetModel/SetThinkingLevel (queued
+    // from any tier, applied at the store-free turn-boundary drain), so those reach here ungated. ---
     fn control(&self, _op: ControlOp) -> Result<(), String> {
         Err("control capability not available".into())
     }
@@ -313,6 +423,22 @@ pub trait HostServices: Send + Sync {
     /// bookkeeping. The session service returns `Some(active_tool_names())` so a guest's
     /// `getActiveTools` reflects the REAL agent tool set.
     fn active_tools(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The live session's FULL registered tool set — every enable-able tool by name, BEFORE any
+    /// permission exposure-filtering (Pi `getAllTools`, agent-session.ts:790-799 → the merged
+    /// `_toolRegistry`). This is the `getAllTools` analog the permission companion's registry /
+    /// unknown-tool gate checks a requested tool name against (pi-permission-system index.ts:2218-2228,
+    /// `checkRequestedToolRegistration`) — deliberately DISTINCT from [`Self::active_tools`], which is
+    /// the RESTRICTED/exposed subset (Pi `getActiveTools`): a tool that is registered but hidden by the
+    /// gate's own `setActiveTools` shaping must still read as registered, or the gate would falsely
+    /// block it as unknown. `None` when no live session backend is attached (the default host has no
+    /// agent) — the companion then SKIPS the registry gate rather than false-blocking every tool. The
+    /// session service returns `Some(<full registry names>)` from its dynamic-tool view
+    /// (`DynamicToolState::all`), which is stable per session (pi's `getAllTools` likewise does not
+    /// shrink under `setActiveTools`).
+    fn all_tool_names(&self) -> Option<Vec<String>> {
         None
     }
 
@@ -1020,7 +1146,11 @@ impl GuestState {
         self.tier.lock().map(|g| *g).unwrap_or(CtxTier::Event)
     }
 
-    /// Deadlock guard (R-08-008): control ops require the command tier.
+    /// Deadlock guard (R-08-008): the session-replacement / turn-starting control ops
+    /// (new-session/switch/fork/navigate/reload/compact/wait-idle/send-message/send-user-message)
+    /// require the command tier. GAP-11: `set_model`/`set_thinking_level` are EXEMPT — they are pure
+    /// agent-state mutations that Pi allows from any handler (loader.ts:342-354), so live.rs no longer
+    /// calls this for them; they queue unconditionally and apply at the store-free turn-boundary drain.
     pub fn require_command_tier(&self) -> Result<(), String> {
         if self.tier() == CtxTier::Command {
             Ok(())

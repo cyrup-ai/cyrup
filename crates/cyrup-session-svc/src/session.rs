@@ -36,6 +36,7 @@ use crate::event::{
     core_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted, PromptOptions,
     StreamingBehavior, UserInput,
 };
+use crate::host_services::InjectMessage;
 use crate::provider_swap::ProviderSwap;
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
@@ -451,6 +452,26 @@ impl AgentSession {
         let handle = self.handle.clone();
         let arc = Arc::new(self);
         let _ = handle.weak.set(Arc::downgrade(&arc));
+        // Bind the late-bound message-injection sink (R-SA-101 / P-2): a background task calling
+        // `LiveHostServices::inject_message` (e.g. cyrup-ext-subagents' completion sink, or a native
+        // extension holding the P-1 host-services Arc) reaches THIS live session's turn loop. The sink
+        // upgrades a weak self-handle and spawns the async inject/turn on the captured runtime, so the
+        // SYNC caller never blocks for the whole turn. Bound only on a shared session — a by-value
+        // session has no post-run driver to run the turn anyway. If `into_shared` runs outside a tokio
+        // runtime (some by-value tests), the captured handle is `None` and the sink degrades to an
+        // `Err` rather than panicking (workspace denies `panic`).
+        let weak = Arc::downgrade(&arc);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        arc.services.host_services.set_inject_sink(Arc::new(move |msg: InjectMessage| {
+            let session = weak.upgrade().ok_or("inject_message: session dropped")?;
+            let runtime = runtime.clone().ok_or("inject_message: no runtime to inject on")?;
+            runtime.spawn(async move {
+                let _ = session
+                    .inject_message(msg.content, msg.custom_type, msg.display, msg.trigger_turn)
+                    .await;
+            });
+            Ok(())
+        }));
         arc
     }
 
@@ -553,10 +574,23 @@ impl AgentSession {
     async fn drive_run(self: Arc<Self>, messages: Vec<AgentMessage>) {
         if let Ok(handle) = self.agent.prompt(messages).await {
             let _ = handle.finished().await;
+            // GAP-11: apply the event-tier control ops (set_model / set_thinking_level) a guest queued
+            // from `on_message_end` / a mid-turn tool hook / `on_agent_end`. This runs at a STORE-FREE
+            // point — the whole run's ordered subscriber dispatch has returned, so every
+            // `LiveExtension.inner` store guard is released and the drain's `thinking_level_select` /
+            // `model_select` re-emit is a fresh top-level guest call, never a re-entry into the
+            // suspended event-hook store (see live.rs `set_thinking_level`). This is the "before the
+            // next turn" point the control queue promises, so the SUBSEQUENT `continue_run` (and the
+            // next user turn) reads the new `agent.model` / `thinking_level`. Uses the `Send`-safe
+            // focused drain (not the full `apply_pending_control`) because this future is spawned:
+            // only SetModel/SetThinkingLevel can reach the queue from an event handler.
+            self.apply_pending_agent_control().await;
             while self.handle_post_agent_run().await {
                 match self.agent.continue_run().await {
                     Ok(h) => {
                         let _ = h.finished().await;
+                        // Same store-free turn-boundary drain after each continuation settles.
+                        self.apply_pending_agent_control().await;
                     }
                     Err(_) => break,
                 }
@@ -685,6 +719,15 @@ impl AgentSession {
         ) {
             return Ok(Prepared::Handled);
         }
+        // GAP-11: apply any event-tier control op (set_model / set_thinking_level) an `on_input`
+        // handler just queued, at this STORE-FREE point — `emit_input_event` has returned, releasing
+        // every `LiveExtension.inner` guard, so the drain's re-emit is a fresh top-level guest call
+        // (never a re-entry). This makes an `on_input` `setModel`/`setThinkingLevel` take effect on
+        // the turn now being assembled, matching Pi, whose synchronous `on_input` mutation lands
+        // before the dispatched turn (agent-session.ts:1015-1033). The focused drain never re-enters
+        // `prepare` (unlike the full `apply_pending_control`'s `SendUserMessage` arm), keeping this
+        // hot path free of the boxed async-recursion edge.
+        self.apply_pending_agent_control().await;
         // 2. While streaming, expand then queue per `streamingBehavior` (Pi agent-session.ts:1043-
         //    1056). Without a behavior the submission is rejected (Pi throws at :1044).
         if streaming {
@@ -928,10 +971,25 @@ impl AgentSession {
 
         let mut messages = vec![user_msg];
         messages.extend(pending);
+        // Pi `setActiveTools` (pi-permission-system index.ts:2155): a `before_agent_start` handler may
+        // have RESTRICTED the active tool set via `HostServices::set_active_tools` (the permission
+        // companion's `shouldExposeTool` shaping), which stages a `(tools, prompt)` push. Drain + apply
+        // it IN-TURN here — before `spawn_run` — so the restriction shapes THIS turn (turn 1), not the
+        // next turn boundary where `apply_pending_agent_control` would otherwise pick it up. Apply ONLY
+        // the restricted tool ARRAY; the `DynamicToolState`-rebuilt prompt is DISCARDED so it cannot
+        // clobber the handler's own sanitized system prompt applied just below (pi's `setActiveTools`
+        // and its returned `systemPrompt` are independent). Draining it here also leaves
+        // `pending_active_tools` empty for the later `apply_pending_agent_control` drains, so the
+        // restriction is applied exactly once.
+        if let Some((tools, _rebuilt_prompt)) =
+            self.services.host_services.take_pending_active_tools()
+        {
+            self.agent.set_tools(tools).await;
+        }
         if let Reduced::Pass(ev) = reduced
             && let HostEvent::BeforeAgentStart { system_prompt, injected, .. } = *ev
         {
-            // Apply the (possibly handler-replaced) system prompt; reset to base otherwise.
+            // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base otherwise.
             if &system_prompt == base {
                 self.agent.set_system_prompt(base.clone()).await;
             } else {
@@ -2115,31 +2173,83 @@ impl AgentSession {
         let ops = self.services.host_services.take_pending_control();
         let mut deferred = Vec::new();
         for op in ops {
-            match op {
-                ControlOp::SetThinkingLevel(level) => {
-                    if let Some(lv) = crate::builder::thinking_level_from_str(&level) {
-                        let _ = self.set_thinking_level(lv).await;
-                    }
-                }
-                ControlOp::SetModel(v) => {
-                    if let Some((provider, model)) = parse_model_ref(&v) {
-                        let _ = self.set_model_id(provider, model).await;
-                    }
-                }
-                ControlOp::SendUserMessage { content, .. } => {
+            // Agent-state ops (SetModel/SetThinkingLevel) apply in place via the shared helper; it
+            // returns `Some(op)` for anything it did not handle so the routing below stays exhaustive.
+            match self.apply_agent_state_op(op).await {
+                None => {}
+                Some(ControlOp::SendUserMessage { content, .. }) => {
                     // A guest `sendUserMessage` op re-enters the prompt path (`send_user_message` →
                     // `prompt_accepted` → `prepare` → `try_execute_extension_command`), closing an
                     // `async fn` cycle. Box this cold re-entry edge so the future stays finitely
                     // sized (E0733) without adding indirection to the hot prompt path.
                     let _ = Box::pin(self.send_user_message(content, None)).await;
                 }
-                ControlOp::Compact => {
+                Some(ControlOp::Compact) => {
                     let _ = self.compact(None).await;
                 }
-                other => deferred.push(other),
+                Some(other) => deferred.push(other),
             }
         }
         deferred
+    }
+
+    /// Apply a single AGENT-STATE control op (`SetModel`/`SetThinkingLevel`) in place, returning
+    /// `None` when it was one of those (handled) or `Some(op)` when it is some other op the caller
+    /// must route itself. Both are pure agent-state mutations the next turn reads (Pi
+    /// `setModel`/`setThinkingLevel`, agent-session.ts:1476-1490 / 1541-1572). Shared by
+    /// [`Self::apply_pending_control`] (command-tier drain) and [`Self::apply_pending_agent_control`]
+    /// (GAP-11 event-tier turn-boundary drain) so the two never drift. Note it does NOT touch the
+    /// `send_user_message`/`compact` re-entry arms — whose prompt-path futures are `!Send` — so a
+    /// caller that needs a `Send` future (the spawned post-run driver) can use it.
+    async fn apply_agent_state_op(&self, op: ControlOp) -> Option<ControlOp> {
+        match op {
+            ControlOp::SetThinkingLevel(level) => {
+                if let Some(lv) = crate::builder::thinking_level_from_str(&level) {
+                    let _ = self.set_thinking_level(lv).await;
+                }
+                None
+            }
+            ControlOp::SetModel(v) => {
+                if let Some((provider, model)) = parse_model_ref(&v) {
+                    let _ = self.set_model_id(provider, model).await;
+                }
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    /// GAP-11 event-tier turn-boundary drain: apply the AGENT-STATE control ops
+    /// (`SetModel`/`SetThinkingLevel`) a guest queued from an EVENT handler (`on_message_end` /
+    /// `on_input` / a mid-turn tool hook / `on_agent_end`), at a STORE-FREE point (after a run settles
+    /// or after `emit_input_event` returns — every `LiveExtension.inner` store guard released), so the
+    /// change takes effect on the SUBSEQUENT turn, matching Pi (which mutates synchronously from any
+    /// handler, loader.ts:342-354). The re-emit (`thinking_level_select`/`model_select`) fires here as
+    /// a fresh top-level guest call, never a re-entry into the suspended event-hook store.
+    ///
+    /// This is the `Send`-safe subset of [`Self::apply_pending_control`]: only SetModel/
+    /// SetThinkingLevel can reach the queue from an event handler (every other control op stays
+    /// command-tier-gated in live.rs), and this never touches the `!Send` `send_user_message`/
+    /// `compact` arms — so it runs inside the spawned post-run driver ([`Self::drive_run`]). It also
+    /// drains the same pending facade-event / active-tool fan-out `apply_pending_control` does, so a
+    /// guest that appended/renamed/restricted tools from the event handler is observed here too. Any
+    /// op it does not handle is re-queued (never dropped) for the command-tier drain.
+    async fn apply_pending_agent_control(&self) {
+        for ev in self.services.host_services.take_pending_events() {
+            self.fanout_emit(ev).await;
+        }
+        if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
+            self.push_active_tools(tools, prompt).await;
+        }
+        for op in self.services.host_services.take_pending_control() {
+            if let Some(other) = self.apply_agent_state_op(op).await {
+                // Unreachable in practice — live.rs gates every non-agent-state control op to the
+                // command tier, so only SetModel/SetThinkingLevel can be queued from an event handler.
+                // Re-queue (never drop) as a guard so a future gating change can't silently lose a
+                // command-tier op; the command-tier drain (`apply_pending_control`) will handle it.
+                let _ = cyrup_ext::host::HostServices::control(&*self.services.host_services, other);
+            }
+        }
     }
 
     // --------------------------------------------------------------- thinking control ----
@@ -2577,6 +2687,56 @@ impl AgentSession {
                 self.fanout_emit(AgentSessionEvent::MessageStart { message: msg.clone() }).await;
                 self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg }).await;
             }
+        }
+        Ok(())
+    }
+
+    /// Inject a host-originated message into the live session and optionally trigger an agent turn
+    /// (Pi `sendCustomMessage(message, { triggerTurn })`, agent-session.ts:1337-1370). Backs the
+    /// late-bound [`crate::host_services::LiveHostServices`] inject sink a background task drives
+    /// (R-SA-101 / P-2) — the seam that surfaces a completed background result INTO the parent
+    /// session's turn loop instead of stderr. Reproduces Pi's three cases:
+    ///
+    /// * **`custom_type = None`** — a plain user message: Pi `sendUserMessage`, which ALWAYS triggers a
+    ///   turn (steer/follow-up while streaming). `display`/`trigger_turn` don't apply to a user message.
+    /// * **`Some(kind)` while streaming** — queue the custom message onto the active run (Pi `steer`).
+    /// * **`Some(kind)`, idle, `trigger_turn`** — run a fresh turn OVER the custom message (Pi
+    ///   `_runAgentPrompt(appMessage)`, `spawn_run(vec![msg])`) — the `triggerTurn` branch cyrup's
+    ///   `send_custom_message` lacked.
+    /// * **`Some(kind)`, idle, no `trigger_turn`** — persist + surface durably (Pi's else-branch).
+    pub async fn inject_message(
+        &self,
+        content: String,
+        custom_type: Option<String>,
+        display: bool,
+        trigger_turn: bool,
+    ) -> Result<(), SessionServiceError> {
+        let Some(kind) = custom_type else {
+            // A plain user message: Pi `sendUserMessage` always triggers a turn (and steers/follows-up
+            // while streaming). Boxed like the `SendUserMessage` control edge (`apply_pending_control`)
+            // so the re-entry into the prompt path stays finitely sized (E0733).
+            let _ = Box::pin(self.send_user_message(content, None)).await?;
+            return Ok(());
+        };
+        let msg = AgentMessage::Custom {
+            kind: kind.clone(),
+            payload: serde_json::Value::String(content.clone()),
+            timestamp: Some(now_ms()),
+        };
+        if self.is_streaming().await {
+            // Pi: while streaming, queue onto the active run (steer).
+            self.agent.steer(msg);
+        } else if trigger_turn {
+            // Pi `_runAgentPrompt(appMessage)`: run a turn whose input IS the injected message.
+            self.spawn_run(vec![msg]).await?;
+        } else {
+            // Pi else-branch: append durably + surface via message_start/message_end.
+            self.manager
+                .lock()
+                .await
+                .append_custom_message(&kind, serde_json::Value::String(content), display, None)?;
+            self.fanout_emit(AgentSessionEvent::MessageStart { message: msg.clone() }).await;
+            self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg }).await;
         }
         Ok(())
     }

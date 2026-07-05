@@ -35,9 +35,20 @@ pub mod parallel;
 pub mod signal;
 
 /// Git-worktree cwd isolation for `worktree: true` parallel fan-out groups (R-SA-060..065). See
-/// [`worktree`] for the dirty-tree precondition check, per-task worktree creation, best-effort
-/// cleanup, and the optional setup-hook JSON stdin/stdout contract.
+/// [`worktree`] for the dirty-tree precondition check, per-task worktree creation, diff harvest,
+/// best-effort cleanup, and the optional per-worktree setup-hook JSON stdin/stdout contract.
 pub mod worktree;
+
+/// Nested-run ancestry path addressing (`CYRUP_SUBAGENT_PARENT_PATH`): safe-id validation,
+/// sanitization, and env encode/decode. See [`nested_path`]; a faithful port of pi's
+/// `runs/shared/nested-path.ts`.
+pub mod nested_path;
+
+/// Nested-run event relay + capability-gated control routing (C17): the [`nested_events::NestedRoute`]
+/// event-sink/control-inbox protocol, capability tokens, fanout-child authorization env, and the
+/// grandparent [`nested_events::project_nested_events`] registry projection. A faithful port of pi's
+/// `runs/shared/nested-events.ts`.
+pub mod nested_events;
 
 /// The linear chain/workflow-graph walker (R-SA-052/053): `RunnerStep` (`SingleStep |
 /// ParallelGroup | DynamicGroup`), `ChainGraph = Vec<RunnerStep>`, and `walk_chain`'s strict
@@ -47,6 +58,23 @@ pub mod worktree;
 /// (`discovery::types::ChainDefinition::steps`, `discovery::chains`/`discovery::management`, the
 /// background runner-config file, a later phase's `exec/`) references rather than re-declaring.
 pub mod chain_graph;
+
+/// Deterministic subagent↔supervisor intercom addressing (a port of pi's
+/// `intercom/intercom-bridge.ts:83-97`): [`intercom_target::resolve_subagent_intercom_target`] (each
+/// child's own broker presence label + the parent's steer address) and
+/// [`intercom_target::orchestrator_presence_target`] (a supervisor's own presence target), plus the
+/// child-bridge identity env-var names the spawn overlay writes. Lives here (not in `cyrup-intercom`)
+/// because the dependency edge runs `cyrup-intercom -> cyrup-ext-subagents`, and the parent-side
+/// target computation runs at this crate's spawn site.
+pub mod intercom_target;
+
+/// Per-item dynamic fan-out semantics (R-SA-053 / C16): a faithful port of pi's
+/// `runs/shared/dynamic-fanout.ts` supplying [`chain_graph::walk_chain`]'s `DynamicGroup` arm with
+/// per-element `{item}`/`{item.path}` template substitution, `expand.key` item keys, the `maxItems`
+/// cap, `onEmpty`, duplicate-key/colliding-id detection, and the collect-record shape + aggregate
+/// schema validation. See [`dynamic_fanout`] for the pure, taxonomy-agnostic helpers the walker and
+/// the chain-parse validator both drive.
+pub mod dynamic_fanout;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -280,7 +308,12 @@ pub enum NdjsonEvent {
 pub struct SpawnedChild {
     child: tokio::process::Child,
     stdout_lines: Lines<BufReader<ChildStdout>>,
-    stderr_lines: Lines<BufReader<ChildStderr>>,
+    /// The child's stderr reader. R-SA-046: stderr is diagnostic, never protocol data — but on a
+    /// non-zero exit its trailing content is surfaced into the run's error (pi `execution.ts:686`),
+    /// so the executor moves it out via [`SpawnedChild::take_stderr`] before consuming the child and
+    /// drains the orphaned reader to EOF afterward (the dead child's closed write end guarantees a
+    /// prompt EOF). `None` once taken.
+    stderr_lines: Option<Lines<BufReader<ChildStderr>>>,
     /// Raw NDJSON stdout lines, teed unmodified as they are read (R-SA-058), written lazily via
     /// [`SpawnedChild::next_event`] rather than buffered and flushed at exit. Size-capped at
     /// [`crate::jsonl::DEFAULT_JSONL_CAP_BYTES`] per file (R-SA-136/146): once the cap is reached,
@@ -381,7 +414,7 @@ impl SpawnedChild {
         Ok(Self {
             child,
             stdout_lines: BufReader::new(stdout).lines(),
-            stderr_lines: BufReader::new(stderr).lines(),
+            stderr_lines: Some(BufReader::new(stderr).lines()),
             jsonl_writer,
             temp_files: spec.temp_files,
             exited: false,
@@ -426,19 +459,18 @@ impl SpawnedChild {
         Some(Ok(NdjsonLine { raw: line, parsed }))
     }
 
-    /// Drain and discard one line of the child's stderr, if one is immediately available without
-    /// blocking the caller's own event loop indefinitely — returns `Ok(None)` once stderr reaches
-    /// EOF. stderr is not protocol data (R-SA-046's rationale in [`SpawnedChild::spawn`]'s doc
-    /// comment); this exists purely so the pipe buffer never fills and stalls a chatty child.
-    /// Callers normally drive this on a separate `tokio::select!` arm alongside
-    /// [`SpawnedChild::next_event`], never awaited to completion before stdout is fully drained
-    /// (a child that writes heavily to both streams could otherwise deadlock the parent).
-    pub async fn next_stderr_line(&mut self) -> Option<Result<String, SubagentError>> {
-        match self.stderr_lines.next_line().await {
-            Ok(Some(line)) => Some(Ok(line)),
-            Ok(None) => None,
-            Err(err) => Some(Err(SubagentError::Spawn(err))),
-        }
+    /// Move the child's stderr reader out of this [`SpawnedChild`] so the executor can drain it
+    /// independently of the stdout read loop and — after the child is consumed by
+    /// [`SpawnedChild::terminate`]/[`SpawnedChild::finish`] — read whatever the (now-dead) child
+    /// wrote to stderr, surfacing it into the run's error on a non-zero exit (pi `execution.ts:686`).
+    ///
+    /// Returns a [`CapturedStderr`] wrapper (rather than the raw tokio reader type) so the executor
+    /// module never needs to name `Lines<BufReader<ChildStderr>>` itself. Returns an empty capture
+    /// on the second and later calls (the reader is taken exactly once). stderr is not protocol data
+    /// (R-SA-046) — this is purely for the diagnostic-into-error surfacing, never for parsing NDJSON.
+    #[must_use]
+    pub fn take_stderr(&mut self) -> CapturedStderr {
+        CapturedStderr(self.stderr_lines.take())
     }
 
     /// Wait, with a bounded timeout, for a child that has already emitted its final message to
@@ -506,6 +538,37 @@ impl SpawnedChild {
     /// either exit path has run.
     pub fn finish(self) {
         cleanup_temp_files(&self.temp_files); // R-SA-067: cleaned up on this (success) path too
+    }
+}
+
+/// The child's stderr reader, moved out of a [`SpawnedChild`] by [`SpawnedChild::take_stderr`]. Its
+/// trailing content is surfaced into a failed run's error (pi `execution.ts:686`: on a non-zero
+/// exit `result.error = stderrBuf.trim()` when no richer error is already set). Kept opaque so the
+/// executor never depends on the concrete `tokio::io::Lines`/`BufReader`/`ChildStderr` types.
+pub struct CapturedStderr(Option<Lines<BufReader<ChildStderr>>>);
+
+impl CapturedStderr {
+    /// Read every remaining line of the child's stderr to EOF and return it as one string (lines
+    /// re-joined with a trailing `\n` each, matching how the child wrote them). Intended to be
+    /// called AFTER the child has been consumed (`terminate`/`finish`) and is therefore dead — the
+    /// closed write end guarantees a prompt EOF, so this never blocks on a live child. A per-read
+    /// bounded timeout is applied defensively so a pathological never-EOF pipe cannot hang the run.
+    /// Returns an empty string when the reader was never present (e.g. a second call, or a spawn
+    /// that never captured stderr).
+    pub async fn drain_to_string(self) -> String {
+        let Some(mut lines) = self.0 else {
+            return String::new();
+        };
+        let mut buf = String::new();
+        // Loops until EOF (`Ok(Ok(None))`), a read error (`Ok(Err(_))`), or the defensive per-read
+        // timeout (`Err(_)`) — any of which fails the `while let` pattern and ends the drain.
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
+        {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
     }
 }
 

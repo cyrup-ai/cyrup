@@ -1,51 +1,53 @@
-//! Chain-file discovery (func-SA §5.1 R-SA-015; arch-SA §6.2.2).
+//! Chain-file discovery + parsing (func-SA §5.1 R-SA-015; arch-SA §6.2.2), a faithful port of
+//! `pi-subagents/src/agents/chain-serializer.ts` (`parseChain`/`parseJsonChain`) plus
+//! `agents.ts::loadChainsFromDir`'s directory scan + `.chain.json` > `.chain.md` precedence.
 //!
-//! A "chain" is a saved, named `RunnerStep` sequence, authored either as `<name>.chain.md`
-//! (frontmatter grammar, matching agent `.md` files) or `<name>.chain.json` (plain
-//! `serde_json`). Within a single directory's recursive scan, `.chain.json` MUST take
-//! precedence over a `.chain.md` file of the *same name*, and that precedence check is
-//! explicit — never derived from alphabetical scan order (R-SA-015). Across different scan
-//! *scopes* (e.g. user directory vs. project directory), same-named chains are never collapsed
-//! into one entry: both survive, each tagged with its own [`AgentSource`], and disambiguation is
-//! deferred to the consumer (`discovery/mod.rs`'s four-scope orchestration, R-SA-001, which is
-//! not owned by this file).
+//! A "chain" is a saved, named step sequence authored either as `<name>.chain.md` (the `## <agent>`
+//! body-section grammar — the same frontmatter shape as agent `.md` files, then one section per
+//! step) or `<name>.chain.json` (a root object with a `chain` array). Both parse into a
+//! [`ChainDefinition`] whose `steps` are [`ChainStepConfig`] authoring shapes.
 //!
-//! A malformed chain file produces a non-fatal [`ChainDiscoveryDiagnostic`] — neither the abort
-//! reserved for malformed `subagents.*` settings, nor the silent per-file skip reserved for
-//! malformed agent frontmatter (R-SA-009's three-way throw/silent-skip/diagnostic distinction).
+//! # `.chain.md` grammar (`chain-serializer.ts:9-126`)
 //!
-//! # Deferred: full `RunnerStep` field population
+//! Leading `---`-delimited frontmatter supplies `name`+`description` (both REQUIRED — absence is a
+//! parse error, never a silent stem-name fallback) and an optional `package`. The body is split on
+//! `^##\s+(.+)$` header lines: each section's config lines (`output`/`phase`/`label`/`as`/
+//! `outputSchema`/`outputMode`/`reads`/`model`/`skills`/`progress`) run until the first blank line,
+//! and everything after that blank line is the step's task. An inline `outputSchema` value
+//! (starting `{`/`[`) is rejected — `.chain.md` `outputSchema` must be a schema-file path.
 //!
-//! [`crate::spawn::chain_graph::RunnerStep`] is, as of this file, a temporary placeholder unit
-//! struct (`spawn/chain_graph.rs`'s own header) standing in for the real `SingleStep |
-//! ParallelGroup | DynamicGroup` discriminated union that a later phase of this crate's build-out
-//! owns (arch-SA §2.2 Phase 3, `spawn/chain_graph.rs`). That real type will carry a `Deserialize`
-//! impl once it lands. Until then, this module parses each chain file's `steps` array/block only
-//! far enough to determine **how many** steps it declares and **in what order**, materializing one
-//! placeholder [`RunnerStep`](crate::spawn::chain_graph::RunnerStep) value per parsed step object
-//! — preserving `steps.len()` and step ordering faithfully (both are asserted by this module's own
-//! tests) without inventing a shape for fields that belong to that later phase. When
-//! `chain_graph.rs` lands its real `RunnerStep` with `Deserialize`, `parse_chain_json_steps`/
-//! `parse_chain_md_steps` below are the sole call sites that need updating to deserialize full
-//! step content instead of counting objects — the directory-scan/precedence algorithm itself
-//! (this file's actual R-SA-015 deliverable) does not change.
+//! # `.chain.json` grammar (`chain-serializer.ts:128-199`)
 //!
-//! # Deferred: full agent-frontmatter grammar
+//! A root JSON object with a required string `name`, string `description`, and array `chain` (NOT
+//! `steps` — reading the wrong root key was the prior invented behavior this port removes). Each
+//! `chain[]` element must be an object; each element's `acceptance` (and, for a static-parallel
+//! step, each `parallel[]` task's `acceptance`; for a dynamic step, the single `parallel` template
+//! object's `acceptance`) is validated via [`validate_acceptance_input`]; the whole `chain` array
+//! is then run through [`validate_chain_output_bindings`] (named-output uniqueness, `{outputs.x}`
+//! reference resolution, dynamic-fanout shape) exactly as pi does with `{ maxItems: MAX }`.
 //!
-//! `discovery/frontmatter.rs` (arch-SA §2.2's hand-rolled YAML-subset parser, §6.2.3) is owned by
-//! a separate concurrently-authored file and is not yet present. `.chain.md` uses "the same
-//! frontmatter grammar" as agent `.md` files (arch-SA §4.1), so once `frontmatter.rs` lands, the
-//! minimal local `extract_frontmatter_block` helper below should be replaced with a call into
-//! that shared parser rather than maintained as a second implementation. Until then this module
-//! implements only the narrow subset it actually needs (flat `key: value` pairs plus one
-//! indented-block value for `steps`) so `.chain.md` discovery is real and testable now rather
-//! than blocked on that other file.
+//! # Precedence + diagnostics (R-SA-015 / R-SA-009)
+//!
+//! Within one directory scan, a `.chain.json` beats a same-name `.chain.md` regardless of scan
+//! order (explicit format check, never derived from alphabetical order). Across scan *scopes*
+//! (user vs. project), same-named chains are both retained, each tagged with its own
+//! [`AgentSource`]. A malformed chain file produces a non-fatal [`ChainDiscoveryDiagnostic`]
+//! (neither the abort reserved for malformed `subagents.*` settings, nor the silent per-file skip
+//! reserved for malformed agent frontmatter).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::types::{AgentSource, ChainDefinition, ChainDiscoveryDiagnostic};
-use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+use serde_json::Value;
+
+use super::frontmatter::parse_frontmatter_block;
+use super::types::{
+    AgentSource, ChainDefinition, ChainDiscoveryDiagnostic, ChainListBinding, ChainOutputBinding,
+    ChainStepConfig, OutputMode,
+};
+use crate::spawn::chain_graph::{
+    DynamicGroupSpec, OnEmpty, ParallelGroupSpec, RunnerStep, SingleStepSpec,
+};
 
 /// File extension suffix recognized for JSON-format chain files (higher precedence, R-SA-015).
 const CHAIN_JSON_SUFFIX: &str = ".chain.json";
@@ -59,6 +61,16 @@ const CHAIN_MD_SUFFIX: &str = ".chain.md";
 /// files are never legitimately nested under a skill bundle).
 const SKILLS_DIR_SEGMENT: &str = "skills";
 
+/// The `maxItems` value pi passes into `validateChainOutputBindings` at chain-parse time
+/// (`chain-serializer.ts:177`, `Number.MAX_SAFE_INTEGER`) — parse-time validation never enforces a
+/// concrete fan-out ceiling; that is a run-time concern. Kept as the JS safe-integer maximum so a
+/// dynamic step's own `maxItems` (if any) is the only ceiling checked here.
+const CHAIN_PARSE_MAX_ITEMS: u64 = 9_007_199_254_740_991;
+
+// -------------------------------------------------------------------------------------------
+// Directory scan + precedence (agents.ts::loadChainsFromDir)
+// -------------------------------------------------------------------------------------------
+
 /// One directory scan's outcome: the winning [`ChainDefinition`] per name (after applying
 /// R-SA-015's `.chain.json` > `.chain.md` same-name precedence) plus any non-fatal parse
 /// diagnostics collected along the way.
@@ -70,15 +82,8 @@ pub struct ChainScanResult {
 
 /// Scan `root` recursively for chain files (`*.chain.json` / `*.chain.md`), tag every discovered
 /// [`ChainDefinition`] with `source`, and apply R-SA-015's same-directory-scan, same-name
-/// `.chain.json` > `.chain.md` precedence.
-///
-/// Traversal order follows R-SA-004's alphabetical-by-filename, depth-first convention (mirrored
-/// from `cyrup-resources`' own `scan_skill_dir` walk, `crates/cyrup-resources/src/discovery.rs`):
-/// each directory's children are sorted before iteration, and a subdirectory is fully descended
-/// before its next sibling is visited. That traversal order is irrelevant to *this* function's own
-/// precedence outcome (format precedence is checked explicitly per R-SA-015, never derived from
-/// scan order) but is kept consistent with the rest of this crate's discovery code for a
-/// deterministic, reproducible `diagnostics` ordering.
+/// `.chain.json` > `.chain.md` precedence (keyed on the *parsed* runtime name, exactly as
+/// `agents.ts::loadChainsFromDir` keys its `Map` on `chain.name`).
 ///
 /// A directory that does not exist (or is not readable) yields an empty, non-error result — an
 /// absent scope directory is not itself a malformed-chain-file condition.
@@ -103,8 +108,7 @@ pub fn scan_chain_dir(root: &Path, source: AgentSource) -> ChainScanResult {
 /// flat list, **without** merging across scopes (R-SA-015's cross-scope retention rule). Two
 /// scopes that each define a chain named `"release"` both appear in the returned `Vec`, each
 /// tagged with its own [`AgentSource`] — disambiguation among same-named cross-scope chains is
-/// deliberately left to the consumer (management/execution-time lookup in a later phase's
-/// `discovery/mod.rs`, not this file).
+/// deliberately left to the consumer (`discovery/mod.rs`'s four-scope orchestration).
 pub fn scan_chain_scopes(scopes: &[(PathBuf, AgentSource)]) -> ChainScanResult {
     let mut chains = Vec::new();
     let mut diagnostics = Vec::new();
@@ -172,45 +176,34 @@ fn walk_dir(
             continue;
         };
 
-        let name = chain_name_from_file_name(file_name, format);
-        if name.is_empty() {
-            diagnostics.push(ChainDiscoveryDiagnostic {
-                file_path: path,
-                source,
-                message: "chain file name has no name component before its suffix".to_string(),
-            });
-            continue;
-        }
-
         let parsed = match format {
-            ChainFileFormat::Json => parse_chain_json(&path, &name, source),
-            ChainFileFormat::Md => parse_chain_md(&path, &name, source),
+            ChainFileFormat::Json => parse_chain_json(&path, source),
+            ChainFileFormat::Md => parse_chain_md(&path, source),
         };
 
-        let definition = match parsed {
-            Ok(def) => def,
+        match parsed {
+            Ok(def) => {
+                // Key on the PARSED runtime name (`chain.name`), matching pi's `Map<chain.name>`.
+                let name = def.name.clone();
+                insert_with_format_precedence(by_name, name, def, format);
+            }
             Err(message) => {
                 diagnostics.push(ChainDiscoveryDiagnostic {
                     file_path: path,
                     source,
                     message,
                 });
-                continue;
             }
-        };
-
-        insert_with_format_precedence(by_name, name, definition, format);
+        }
     }
 }
 
-/// R-SA-015's core rule, isolated to one call site: `.chain.json` always wins over a same-name
-/// `.chain.md` **regardless of which was scanned first**. Concretely:
+/// R-SA-015's core rule, isolated to one call site (mirrors `loadChainsFromDir`'s `if (existing &&
+/// existing.filePath.endsWith(".chain.json") && filePath.endsWith(".chain.md")) continue`):
+/// `.chain.json` always wins over a same-name `.chain.md` **regardless of which was scanned first**.
 /// - No existing candidate for this name: insert unconditionally.
-/// - Existing candidate is `Json` and the new one is `Md`: keep the existing `Json` candidate.
-/// - Existing candidate is `Md` and the new one is `Json`: replace with the new `Json` candidate.
-/// - Both `Json` or both `Md` (two same-format, same-name files in different subdirectories of one
-///   scan root): last-scanned-wins, consistent with this crate's directory-walk-order convention
-///   elsewhere (R-SA-004) — format precedence, not scan order, is what R-SA-015 constrains.
+/// - Existing is `Json` and the new one is `Md`: keep the existing `Json` candidate.
+/// - Otherwise (existing `Md` + new `Json`, or same-format collision): last-scanned-wins.
 fn insert_with_format_precedence(
     by_name: &mut HashMap<String, ChainCandidate>,
     name: String,
@@ -230,243 +223,1263 @@ fn insert_with_format_precedence(
     }
 }
 
-/// Strip the recognized chain-file suffix to recover the chain's name, e.g.
-/// `"release.chain.json"` -> `"release"`.
-fn chain_name_from_file_name(file_name: &str, format: ChainFileFormat) -> String {
-    let suffix = match format {
-        ChainFileFormat::Json => CHAIN_JSON_SUFFIX,
-        ChainFileFormat::Md => CHAIN_MD_SUFFIX,
+// -------------------------------------------------------------------------------------------
+// `.chain.json` parsing (parseJsonChain, chain-serializer.ts:128-199)
+// -------------------------------------------------------------------------------------------
+
+/// Parse a `.chain.json` file into a [`ChainDefinition`]. Reads the root `chain` array (erroring on
+/// absence), validates per-step acceptance + chain output bindings, and qualifies the runtime name.
+fn parse_chain_json(path: &Path, source: AgentSource) -> Result<ChainDefinition, String> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read chain file: {e}"))?;
+    let file_display = path.display();
+
+    let parsed: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Invalid JSON chain '{file_display}': {e}"))?;
+    let Value::Object(input) = &parsed else {
+        return Err(format!("JSON chain '{file_display}' must contain an object root."));
     };
-    file_name
-        .strip_suffix(suffix)
-        .unwrap_or(file_name)
-        .to_string()
-}
 
-// -------------------------------------------------------------------------------------------
-// `.chain.json` parsing
-// -------------------------------------------------------------------------------------------
-
-/// Parse a `.chain.json` file into a [`ChainDefinition`]. Plain `serde_json` (arch-SA §4.1) — no
-/// frontmatter delimiters involved for this format.
-fn parse_chain_json(
-    path: &Path,
-    file_name_key: &str,
-    source: AgentSource,
-) -> Result<ChainDefinition, String> {
-    let raw =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read chain file: {e}"))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in chain file: {e}"))?;
-
-    let name = value
+    let name = input
         .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| file_name_key.to_string());
-    let description = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("JSON chain '{file_display}' must include string name."))?;
+    let description = input
         .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let steps = parse_chain_json_steps(&value)?;
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("JSON chain '{file_display}' must include string description."))?;
+
+    let Some(Value::Array(chain)) = input.get("chain") else {
+        return Err(format!("JSON chain '{file_display}' must include array chain."));
+    };
+
+    for (index, step) in chain.iter().enumerate() {
+        let step_no = index + 1;
+        if !step.is_object() {
+            return Err(format!(
+                "JSON chain '{file_display}' step {step_no} must be an object."
+            ));
+        }
+        let acceptance_errors =
+            validate_acceptance_input(step.get("acceptance"), &format!("step {step_no} acceptance"));
+        if !acceptance_errors.is_empty() {
+            return Err(format!(
+                "Invalid JSON chain '{file_display}': {}",
+                acceptance_errors.join(" ")
+            ));
+        }
+        match step.get("parallel") {
+            Some(Value::Array(tasks)) => {
+                for (task_index, task) in tasks.iter().enumerate() {
+                    if !task.is_object() {
+                        continue;
+                    }
+                    let task_errors = validate_acceptance_input(
+                        task.get("acceptance"),
+                        &format!(
+                            "step {step_no} parallel task {} acceptance",
+                            task_index + 1
+                        ),
+                    );
+                    if !task_errors.is_empty() {
+                        return Err(format!(
+                            "Invalid JSON chain '{file_display}': {}",
+                            task_errors.join(" ")
+                        ));
+                    }
+                }
+            }
+            Some(template) if template.is_object() => {
+                let template_errors = validate_acceptance_input(
+                    template.get("acceptance"),
+                    &format!("step {step_no} dynamic template acceptance"),
+                );
+                if !template_errors.is_empty() {
+                    return Err(format!(
+                        "Invalid JSON chain '{file_display}': {}",
+                        template_errors.join(" ")
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    validate_chain_output_bindings(chain)
+        .map_err(|message| format!("Invalid JSON chain '{file_display}': {message}"))?;
+
+    let package_name = parse_chain_package_name(
+        input.get("package").and_then(Value::as_str),
+        &format!("Chain '{name}' package"),
+    )?;
+
+    let mut extra_fields: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in input {
+        if key == "name" || key == "package" || key == "description" || key == "chain" {
+            continue;
+        }
+        if let Some(text) = value.as_str() {
+            extra_fields.insert(key.clone(), text.to_string());
+        }
+    }
+
+    let mut steps = Vec::with_capacity(chain.len());
+    for step in chain {
+        let config: ChainStepConfig = serde_json::from_value(step.clone())
+            .map_err(|e| format!("Invalid JSON chain '{file_display}': {e}"))?;
+        steps.push(config);
+    }
 
     Ok(ChainDefinition {
-        name,
-        description,
+        name: build_runtime_name(name, package_name.as_deref()),
+        local_name: name.to_string(),
+        package_name,
+        description: description.to_string(),
         source,
         file_path: path.to_path_buf(),
         steps,
+        extra_fields,
     })
 }
 
-/// Extract the `steps` array from a parsed `.chain.json` document, deserializing each element as
-/// a real, tagged [`RunnerStep`] (`spawn::chain_graph::RunnerStep` now has its real
-/// `SingleStep | ParallelGroup | DynamicGroup` shape and a `Deserialize` impl — this file's
-/// former "Deferred: full `RunnerStep` field population" placeholder era, see the module-level
-/// doc's own note on this being the anticipated follow-up). An element that is present but does
-/// not deserialize as a well-formed tagged `RunnerStep` is treated as a per-element malformed-step
-/// condition and fails the whole chain file (surfaced as a [`ChainDiscoveryDiagnostic`] by this
-/// file's caller, `walk_dir`) rather than silently degrading to a placeholder step, so a
-/// genuinely malformed step is never silently misrepresented as a valid (if empty) one.
-fn parse_chain_json_steps(value: &serde_json::Value) -> Result<Vec<RunnerStep>, String> {
-    match value.get("steps") {
-        None => Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                serde_json::from_value::<RunnerStep>(item.clone())
-                    .map_err(|e| format!("chain step[{index}] is not a valid RunnerStep: {e}"))
-            })
-            .collect(),
-        Some(_) => Err("chain file's \"steps\" field must be an array".to_string()),
-    }
-}
-
 // -------------------------------------------------------------------------------------------
-// `.chain.md` parsing (frontmatter grammar)
+// `.chain.md` parsing (parseChain, chain-serializer.ts:9-126)
 // -------------------------------------------------------------------------------------------
 
-/// Parse a `.chain.md` file into a [`ChainDefinition`]. Uses the same frontmatter shape as agent
-/// `.md` files (arch-SA §4.1): a leading `---`-delimited block of flat `key: value` pairs, with
-/// `steps` supplied either as a fenced JSON array value or as a nested indented block whose lines
-/// are themselves flat `key: value` step stubs (one blank-line-or-`-`-prefixed entry per step).
-/// See this file's module header for why this is a narrow, self-contained subset rather than a
-/// call into `discovery/frontmatter.rs` (not yet present).
-fn parse_chain_md(
-    path: &Path,
-    file_name_key: &str,
-    source: AgentSource,
-) -> Result<ChainDefinition, String> {
+/// Parse a `.chain.md` file into a [`ChainDefinition`]. Uses the shared agent/chain frontmatter
+/// grammar for `name`/`description`/`package`, then the `## <agent>` body-section grammar for steps.
+fn parse_chain_md(path: &Path, source: AgentSource) -> Result<ChainDefinition, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read chain file: {e}"))?;
-    let (frontmatter, _body) = extract_frontmatter_block(&raw)
-        .ok_or_else(|| "chain file is missing a --- delimited frontmatter block".to_string())?;
+    let parsed = parse_frontmatter_block(&raw);
 
-    let fields = parse_flat_frontmatter(frontmatter);
+    let name = parsed.get("name").unwrap_or("");
+    let description = parsed.get("description").unwrap_or("");
+    if name.is_empty() || description.is_empty() {
+        return Err("Chain frontmatter must include name and description".to_string());
+    }
+    let name = name.to_string();
+    let description = description.to_string();
 
-    let name = fields
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| file_name_key.to_string());
-    let description = fields.get("description").cloned().unwrap_or_default();
-    let steps = parse_chain_md_steps(frontmatter)?;
+    let steps = parse_md_step_sections(&parsed.body)?;
+
+    let package_name =
+        parse_chain_package_name(parsed.get("package"), &format!("Chain '{name}' package"))?;
+
+    let mut extra_fields: BTreeMap<String, String> = BTreeMap::new();
+    for key in parsed.keys() {
+        if key == "name" || key == "package" || key == "description" {
+            continue;
+        }
+        if let Some(value) = parsed.get(key) {
+            extra_fields.insert(key.to_string(), value.to_string());
+        }
+    }
 
     Ok(ChainDefinition {
-        name,
+        name: build_runtime_name(&name, package_name.as_deref()),
+        local_name: name,
+        package_name,
         description,
         source,
         file_path: path.to_path_buf(),
         steps,
+        extra_fields,
     })
 }
 
-/// Split a `.md` file's content into its `---`-delimited frontmatter block and trailing body.
-/// Returns `None` if the file does not open with a frontmatter delimiter line.
-fn extract_frontmatter_block(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw.strip_prefix("---")?;
-    let rest = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))?;
-    let end = rest.find("\n---")?;
-    let frontmatter = &rest[..end];
-    let after_delim = &rest[end + 4..];
-    let body = after_delim
-        .strip_prefix('\n')
-        .or_else(|| after_delim.strip_prefix("\r\n"))
-        .unwrap_or(after_delim);
-    Some((frontmatter, body))
+/// One `## <agent>` header found in the body, with the byte offsets pi's `matchAll` + slice logic
+/// (`chain-serializer.ts:93-104`) needs: the header line's own start (the section's *end* boundary
+/// for the preceding step) and the offset immediately after the header line (this section's start).
+struct MdHeader {
+    agent: String,
+    line_start: usize,
+    body_start: usize,
 }
 
-/// Parse the flat (non-indented) `key: value` lines of a frontmatter block into a map. Indented
-/// continuation lines (used by the `steps:` block, handled separately by
-/// [`parse_chain_md_steps`]) are skipped here rather than folded into a value, matching arch-SA
-/// §6.2.3's "flat key: value plus one level of block-indent values" grammar description.
-fn parse_flat_frontmatter(frontmatter: &str) -> HashMap<String, String> {
-    let mut fields = HashMap::new();
-    for line in frontmatter.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
+/// Split a `.chain.md` body into its `## <agent>` sections and parse each into a
+/// [`ChainStepConfig`] (`chain-serializer.ts:93-104`). Section bodies run from just after a header
+/// line to just before the next header line (or end of body), then are `trim_end`-ed.
+fn parse_md_step_sections(body: &str) -> Result<Vec<ChainStepConfig>, String> {
+    let mut headers: Vec<MdHeader> = Vec::new();
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(agent) = match_chain_header(content) {
+            headers.push(MdHeader {
+                agent,
+                line_start,
+                body_start: offset,
+            });
         }
-        let Some((key, value)) = line.split_once(':') else {
+    }
+
+    let mut steps = Vec::with_capacity(headers.len());
+    for (index, header) in headers.iter().enumerate() {
+        let section_end = headers
+            .get(index + 1)
+            .map_or(body.len(), |next| next.line_start);
+        let section = body
+            .get(header.body_start..section_end)
+            .unwrap_or("")
+            .trim_end();
+        steps.push(parse_step_body(&header.agent, section)?);
+    }
+    Ok(steps)
+}
+
+/// Match one `## <agent>` header line, returning the trimmed agent name (mirrors
+/// `^##\s+(.+)[^\S\n]*$`): requires `##` followed by at least one space/tab, then a non-empty
+/// remainder. Returns `None` for `###`-style deeper headers, `##`-with-no-space, or an all-blank
+/// remainder.
+fn match_chain_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("##")?;
+    let after_ws = rest.trim_start_matches([' ', '\t']);
+    if after_ws.len() == rest.len() {
+        // No whitespace after `##` (e.g. `###` or `##name`): `\s+` requires at least one.
+        return None;
+    }
+    let agent = after_ws.trim();
+    if agent.is_empty() {
+        return None;
+    }
+    Some(agent.to_string())
+}
+
+/// Parse one section's body into a [`ChainStepConfig`] (`parseStepBody`, `chain-serializer.ts:9-85`):
+/// config lines (`key: value`) up to the first blank line, then the remainder (trimmed) as the task.
+fn parse_step_body(agent: &str, section_body: &str) -> Result<ChainStepConfig, String> {
+    let lines: Vec<&str> = section_body.split('\n').collect();
+    let blank_index = lines.iter().position(|line| line.trim().is_empty());
+
+    let config_lines: &[&str] = match blank_index {
+        Some(index) => lines.get(..index).unwrap_or(&[]),
+        None => &lines,
+    };
+    let task = match blank_index {
+        Some(index) => lines
+            .get(index + 1..)
+            .map(|rest| rest.join("\n"))
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        None => String::new(),
+    };
+
+    let mut step = ChainStepConfig {
+        agent: Some(agent.to_string()),
+        task: Some(task),
+        ..ChainStepConfig::default()
+    };
+
+    for line in config_lines {
+        let Some((key, raw_value)) = match_config_line(line) else {
             continue;
         };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
+        let key = key.to_ascii_lowercase();
+        let raw_value = raw_value.trim();
+
+        match key.as_str() {
+            "output" => {
+                if raw_value == "false" {
+                    step.output = Some(ChainOutputBinding::Toggle(false));
+                } else if !raw_value.is_empty() {
+                    step.output = Some(ChainOutputBinding::Name(raw_value.to_string()));
+                }
+            }
+            "phase" => {
+                if !raw_value.is_empty() {
+                    step.phase = Some(raw_value.to_string());
+                }
+            }
+            "label" => {
+                if !raw_value.is_empty() {
+                    step.label = Some(raw_value.to_string());
+                }
+            }
+            "as" => {
+                if !raw_value.is_empty() {
+                    step.as_ = Some(raw_value.to_string());
+                }
+            }
+            "outputschema" => {
+                if raw_value.starts_with('{') || raw_value.starts_with('[') {
+                    return Err("Inline outputSchema values are not supported in .chain.md files; use a schema file path.".to_string());
+                }
+                if !raw_value.is_empty() {
+                    step.output_schema = Some(Value::String(raw_value.to_string()));
+                }
+            }
+            "outputmode" => {
+                if raw_value == "inline" || raw_value == "file-only" {
+                    step.output_mode = Some(raw_value.to_string());
+                }
+            }
+            "reads" => {
+                step.reads = Some(parse_list_binding(raw_value));
+            }
+            "model" => {
+                if !raw_value.is_empty() {
+                    step.model = Some(raw_value.to_string());
+                }
+            }
+            "skills" => {
+                step.skills = Some(parse_list_binding(raw_value));
+            }
+            "progress" => {
+                if raw_value == "true" {
+                    step.progress = Some(true);
+                } else if raw_value == "false" {
+                    step.progress = Some(false);
+                }
+            }
+            _ => {}
         }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        fields.insert(key.to_string(), value.to_string());
     }
-    fields
+
+    Ok(step)
 }
 
-/// Extract the `steps:` block from a `.chain.md` frontmatter section. Two shapes are accepted:
-/// - `steps: [...]` — a single-line inline JSON array, parsed with `serde_json`.
-/// - `steps:` followed by indented lines, each indented line beginning a new step stub — the step
-///   *count* is the number of top-level indented entries (lines starting with `- ` at the first
-///   indent level), matching this file's "count and order only" deferral (see module header).
+/// pi's `reads`/`skills` config-line parsing: `false` -> disabled; otherwise a comma-separated,
+/// trimmed, empty-filtered list (which itself collapses to `false` when nothing remains).
+fn parse_list_binding(raw_value: &str) -> ChainListBinding {
+    if raw_value == "false" {
+        return ChainListBinding::Toggle(false);
+    }
+    let list: Vec<String> = raw_value
+        .split(',')
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if list.is_empty() {
+        ChainListBinding::Toggle(false)
+    } else {
+        ChainListBinding::List(list)
+    }
+}
+
+/// Match one frontmatter/config `key: value` line (mirrors `^([\w-]+):\s*(.*)$`): the key must be
+/// the whole run of `[A-Za-z0-9_-]` before the first `:`, with the trimmed remainder as the value.
+fn match_config_line(line: &str) -> Option<(&str, &str)> {
+    let colon = line.find(':')?;
+    let key = line.get(..colon)?;
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let value = line.get(colon + 1..)?;
+    Some((key, value.trim_start()))
+}
+
+// -------------------------------------------------------------------------------------------
+// Package identity (identity.ts::parsePackageName / normalizePackageName / buildRuntimeName)
+// -------------------------------------------------------------------------------------------
+
+/// Port of `identity.ts::buildRuntimeName` — `{package}.{local}` when a non-empty package is set,
+/// else the bare local name.
+fn build_runtime_name(local: &str, package: Option<&str>) -> String {
+    match package {
+        Some(pkg) if !pkg.is_empty() => format!("{pkg}.{local}"),
+        _ => local.to_string(),
+    }
+}
+
+/// Port of `identity.ts::parsePackageName` for chain frontmatter/JSON `package`: `None`/empty ->
+/// `Ok(None)`; a value that fails to normalize to a valid identifier -> `Err(<label> is invalid
+/// after sanitization.)` (surfaced by the caller as a per-file [`ChainDiscoveryDiagnostic`]).
+fn parse_chain_package_name(value: Option<&str>, label: &str) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match normalize_package_name(raw) {
+        Some(pkg) if is_valid_package_identifier(&pkg) => Ok(Some(pkg)),
+        _ => Err(format!("{label} is invalid after sanitization.")),
+    }
+}
+
+/// Port of `identity.ts::normalizePackageName`: trim; lowercase; whitespace runs -> single `-`;
+/// strip any char outside `[a-z0-9.-]`; collapse repeated `-` then repeated `.`; trim leading/
+/// trailing `-`/`.`. Returns `None` when the result is empty (source's `if (!trimmed) return`).
+fn normalize_package_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lowered = trimmed.to_lowercase();
+
+    let mut collapsed_ws = String::with_capacity(lowered.len());
+    let mut last_was_ws = false;
+    for ch in lowered.chars() {
+        if ch.is_whitespace() {
+            if !last_was_ws {
+                collapsed_ws.push('-');
+            }
+            last_was_ws = true;
+        } else {
+            collapsed_ws.push(ch);
+            last_was_ws = false;
+        }
+    }
+
+    let filtered: String = collapsed_ws
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    let collapsed_hyphen = collapse_repeated_char(&filtered, '-');
+    let collapsed_dot = collapse_repeated_char(&collapsed_hyphen, '.');
+    let final_name = collapsed_dot
+        .trim_start_matches(['-', '.'])
+        .trim_end_matches(['-', '.'])
+        .to_string();
+
+    if final_name.is_empty() {
+        None
+    } else {
+        Some(final_name)
+    }
+}
+
+fn collapse_repeated_char(s: &str, target: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_was_target = false;
+    for ch in s.chars() {
+        if ch == target {
+            if !prev_was_target {
+                out.push(ch);
+            }
+            prev_was_target = true;
+        } else {
+            out.push(ch);
+            prev_was_target = false;
+        }
+    }
+    out
+}
+
+/// `^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$` — lowercase alphanumeric/hyphen segments,
+/// dot-separated, each segment starting with an alphanumeric character.
+fn is_valid_package_identifier(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    })
+}
+
+// -------------------------------------------------------------------------------------------
+// Acceptance validation (acceptance.ts::validateAcceptanceInput)
+// -------------------------------------------------------------------------------------------
+
+const VALID_ACCEPTANCE_LEVELS: &[&str] =
+    &["auto", "none", "attested", "checked", "verified", "reviewed"];
+const VALID_ACCEPTANCE_EVIDENCE: &[&str] = &[
+    "changed-files",
+    "tests-added",
+    "commands-run",
+    "validation-output",
+    "residual-risks",
+    "no-staged-files",
+    "diff-summary",
+    "review-findings",
+    "manual-notes",
+];
+const ACCEPTANCE_CONFIG_KEYS: &[&str] =
+    &["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"];
+const ACCEPTANCE_GATE_KEYS: &[&str] = &["id", "must", "evidence", "severity"];
+const ACCEPTANCE_VERIFY_KEYS: &[&str] =
+    &["id", "command", "timeoutMs", "cwd", "env", "allowFailure"];
+const ACCEPTANCE_REVIEW_KEYS: &[&str] = &["agent", "focus", "required"];
+
+/// Faithful port of `acceptance.ts::validateAcceptanceInput`: collects (never throws) a list of
+/// human-readable validation errors for one `AcceptanceInput` value. `input` is the raw field value
+/// (or `None` when the key is absent -> no errors, matching source's `input === undefined`).
+fn validate_acceptance_input(input: Option<&Value>, path_label: &str) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    let Some(input) = input else {
+        return errors;
+    };
+    if input == &Value::Bool(false) {
+        return errors;
+    }
+    if let Some(level) = input.as_str() {
+        if !VALID_ACCEPTANCE_LEVELS.contains(&level) {
+            errors.push(format!("{path_label} has invalid level '{level}'."));
+        }
+        return errors;
+    }
+    let Some(object) = input.as_object() else {
+        errors.push(format!(
+            "{path_label} must be a string level, false, or an object."
+        ));
+        return errors;
+    };
+
+    for key in object.keys() {
+        if !ACCEPTANCE_CONFIG_KEYS.contains(&key.as_str()) {
+            errors.push(format!("{path_label}.{key} is not supported."));
+        }
+    }
+    if let Some(level) = object.get("level") {
+        let valid = level
+            .as_str()
+            .is_some_and(|s| VALID_ACCEPTANCE_LEVELS.contains(&s));
+        if !valid {
+            errors.push(format!(
+                "{path_label}.level must be one of auto, none, attested, checked, verified, reviewed."
+            ));
+        }
+    }
+    if object.get("level").and_then(Value::as_str) == Some("none") {
+        let reason_ok = object
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty());
+        if !reason_ok {
+            errors.push(format!(
+                "{path_label}.reason is required when level is none."
+            ));
+        }
+    }
+    if object.get("reason").is_some_and(|reason| !reason.is_string()) {
+        errors.push(format!("{path_label}.reason must be a string."));
+    }
+    match object.get("criteria") {
+        None => {}
+        Some(Value::Array(criteria)) => {
+            for (index, criterion) in criteria.iter().enumerate() {
+                if criterion.is_string() {
+                    continue;
+                }
+                let criterion_path = format!("{path_label}.criteria[{index}]");
+                let Some(gate) = criterion.as_object() else {
+                    errors.push(format!("{criterion_path} must be a string or an object."));
+                    continue;
+                };
+                for key in gate.keys() {
+                    if !ACCEPTANCE_GATE_KEYS.contains(&key.as_str()) {
+                        errors.push(format!("{criterion_path}.{key} is not supported."));
+                    }
+                }
+                if gate
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id.trim().is_empty())
+                {
+                    errors.push(format!("{criterion_path}.id is required."));
+                }
+                if gate
+                    .get("must")
+                    .and_then(Value::as_str)
+                    .is_none_or(|must| must.trim().is_empty())
+                {
+                    errors.push(format!("{criterion_path}.must is required."));
+                }
+                validate_evidence_array(
+                    gate.get("evidence"),
+                    &format!("{criterion_path}.evidence"),
+                    &mut errors,
+                );
+                if let Some(severity) = gate.get("severity") {
+                    let ok = matches!(severity.as_str(), Some("required") | Some("recommended"));
+                    if !ok {
+                        errors.push(format!(
+                            "{criterion_path}.severity must be required or recommended."
+                        ));
+                    }
+                }
+            }
+        }
+        Some(_) => errors.push(format!("{path_label}.criteria must be an array.")),
+    }
+    validate_evidence_array(
+        object.get("evidence"),
+        &format!("{path_label}.evidence"),
+        &mut errors,
+    );
+    match object.get("verify") {
+        None => {}
+        Some(Value::Array(commands)) => {
+            for (index, command) in commands.iter().enumerate() {
+                let command_path = format!("{path_label}.verify[{index}]");
+                let Some(cmd) = command.as_object() else {
+                    errors.push(format!("{command_path} must be an object."));
+                    continue;
+                };
+                for key in cmd.keys() {
+                    if !ACCEPTANCE_VERIFY_KEYS.contains(&key.as_str()) {
+                        errors.push(format!("{command_path}.{key} is not supported."));
+                    }
+                }
+                if cmd
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id.trim().is_empty())
+                {
+                    errors.push(format!("{command_path}.id is required."));
+                }
+                if cmd
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| c.trim().is_empty())
+                {
+                    errors.push(format!("{command_path}.command is required."));
+                }
+                if let Some(timeout) = cmd.get("timeoutMs") {
+                    let ok = timeout.as_u64().is_some_and(|v| v >= 1);
+                    if !ok {
+                        errors.push(format!(
+                            "{command_path}.timeoutMs must be an integer >= 1."
+                        ));
+                    }
+                }
+                if cmd.get("cwd").is_some_and(|cwd| !cwd.is_string()) {
+                    errors.push(format!("{command_path}.cwd must be a string."));
+                }
+                if let Some(env) = cmd.get("env") {
+                    match env.as_object() {
+                        Some(map) => {
+                            for (env_key, env_value) in map {
+                                if !env_value.is_string() {
+                                    errors.push(format!(
+                                        "{command_path}.env.{env_key} must be a string."
+                                    ));
+                                }
+                            }
+                        }
+                        None => errors.push(format!("{command_path}.env must be an object.")),
+                    }
+                }
+                if cmd
+                    .get("allowFailure")
+                    .is_some_and(|value| !value.is_boolean())
+                {
+                    errors.push(format!("{command_path}.allowFailure must be a boolean."));
+                }
+            }
+        }
+        Some(_) => errors.push(format!("{path_label}.verify must be an array.")),
+    }
+    if let Some(review) = object.get("review")
+        && review != &Value::Bool(false)
+    {
+        match review.as_object() {
+            Some(map) => {
+                for key in map.keys() {
+                    if !ACCEPTANCE_REVIEW_KEYS.contains(&key.as_str()) {
+                        errors.push(format!("{path_label}.review.{key} is not supported."));
+                    }
+                }
+                if map.get("agent").is_some_and(|v| !v.is_string()) {
+                    errors.push(format!("{path_label}.review.agent must be a string."));
+                }
+                if map.get("focus").is_some_and(|v| !v.is_string()) {
+                    errors.push(format!("{path_label}.review.focus must be a string."));
+                }
+                if map.get("required").is_some_and(|v| !v.is_boolean()) {
+                    errors.push(format!("{path_label}.review.required must be a boolean."));
+                }
+            }
+            None => errors.push(format!("{path_label}.review must be false or an object.")),
+        }
+    }
+    match object.get("stopRules") {
+        None => {}
+        Some(Value::Array(rules)) => {
+            for (index, item) in rules.iter().enumerate() {
+                if !item.is_string() {
+                    errors.push(format!("{path_label}.stopRules[{index}] must be a string."));
+                }
+            }
+        }
+        Some(_) => errors.push(format!("{path_label}.stopRules must be an array.")),
+    }
+    errors
+}
+
+/// Shared validation for an `evidence` array (top-level and per-criterion), mirroring source's two
+/// identical `Array.isArray(...) ? per-item VALID_EVIDENCE check : "must be an array"` blocks.
+fn validate_evidence_array(value: Option<&Value>, path_label: &str, errors: &mut Vec<String>) {
+    match value {
+        None => {}
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                let ok = item
+                    .as_str()
+                    .is_some_and(|kind| VALID_ACCEPTANCE_EVIDENCE.contains(&kind));
+                if !ok {
+                    errors.push(format!(
+                        "{path_label}[{index}] is not a supported evidence kind."
+                    ));
+                }
+            }
+        }
+        Some(_) => errors.push(format!("{path_label} must be an array.")),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Chain output-binding validation (chain-outputs.ts::validateChainOutputBindings)
+// -------------------------------------------------------------------------------------------
+
+/// Faithful port of `chain-outputs.ts::validateChainOutputBindings` (with the empty context pi uses
+/// at parse time): named-output uniqueness + safe names, `{outputs.x}` reference resolution against
+/// strictly-earlier steps, and dynamic-fanout shape validation. Errors surface as pi's
+/// `ChainOutputValidationError` message text (wrapped `Invalid JSON chain '<path>': ...` by the
+/// caller).
+fn validate_chain_output_bindings(steps: &[Value]) -> Result<(), String> {
+    let mut available: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for (step_index, step) in steps.iter().enumerate() {
+        let display = step_index + 1;
+
+        if has_dynamic_fanout_fields(step) {
+            if !is_dynamic_parallel_step(step) {
+                return Err(format!(
+                    "Dynamic chain step {display} requires expand, a single parallel template object, and collect; dynamic expand/collect cannot be mixed with static parallel arrays."
+                ));
+            }
+            validate_dynamic_step_shape(step, display, CHAIN_PARSE_MAX_ITEMS)?;
+            let source_output = step
+                .get("expand")
+                .and_then(|expand| expand.get("from"))
+                .and_then(|from| from.get("output"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !available.contains(source_output) {
+                return Err(format!(
+                    "Dynamic chain step {display} references unknown output '{source_output}'. Named outputs are only available after producing step/group completes."
+                ));
+            }
+        }
+
+        for name in output_names_for_step(step) {
+            if !is_safe_output_name(&name) {
+                return Err(format!(
+                    "Invalid chain output name '{name}' at step {display}. Use /^[A-Za-z_][A-Za-z0-9_]*$/."
+                ));
+            }
+            if seen.contains(&name) {
+                return Err(format!(
+                    "Duplicate chain output name '{name}'. Each as name must be unique."
+                ));
+            }
+            seen.insert(name);
+        }
+
+        for template in task_templates_for_step(step) {
+            for (raw_reference, name) in extract_output_refs(&template) {
+                if !is_safe_output_name(&name) {
+                    return Err(format!(
+                        "Invalid chain output reference '{raw_reference}' at step {display}. Use {{outputs.name}} with /^[A-Za-z_][A-Za-z0-9_]*$/ names."
+                    ));
+                }
+                if !available.contains(&name) {
+                    return Err(format!(
+                        "Unknown chain output reference '{raw_reference}' at step {display}. Named outputs are only available after producing step/group completes."
+                    ));
+                }
+            }
+        }
+
+        for name in output_names_for_step(step) {
+            available.insert(name);
+        }
+    }
+    Ok(())
+}
+
+/// `settings.ts::isParallelStep`: has a `parallel` key whose value is an array.
+fn is_parallel_step(step: &Value) -> bool {
+    matches!(step.get("parallel"), Some(Value::Array(_)))
+}
+
+/// `settings.ts::isDynamicParallelStep`: has `expand` + `collect` + a non-array `parallel`.
+fn is_dynamic_parallel_step(step: &Value) -> bool {
+    step.get("expand").is_some()
+        && step.get("collect").is_some()
+        && step
+            .get("parallel")
+            .is_some_and(|parallel| !parallel.is_array())
+}
+
+/// `dynamic-fanout.ts::hasDynamicFanoutFields`: an object with an `expand` or `collect` key.
+fn has_dynamic_fanout_fields(step: &Value) -> bool {
+    step.is_object() && (step.get("expand").is_some() || step.get("collect").is_some())
+}
+
+/// `chain-outputs.ts::outputNamesForStep`: the named outputs a step registers (parallel tasks'
+/// `as`, a dynamic step's `collect.as`, or a sequential step's `as`).
+fn output_names_for_step(step: &Value) -> Vec<String> {
+    if is_parallel_step(step) {
+        return step
+            .get("parallel")
+            .and_then(Value::as_array)
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|task| task.get("as").and_then(Value::as_str))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    if is_dynamic_parallel_step(step) {
+        return step
+            .get("collect")
+            .and_then(|collect| collect.get("as"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default();
+    }
+    step.get("as")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default()
+}
+
+/// `chain-outputs.ts::taskTemplatesForStep`: the task-template strings a step's `{outputs.x}`
+/// references are scanned in (each parallel task's `task`, a dynamic template's `task`+`label`, or
+/// a sequential step's `task`), defaulting an absent task to `{previous}`.
+fn task_templates_for_step(step: &Value) -> Vec<String> {
+    if is_parallel_step(step) {
+        return step
+            .get("parallel")
+            .and_then(Value::as_array)
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .map(|task| {
+                        task.get("task")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{previous}")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    if is_dynamic_parallel_step(step) {
+        let parallel = step.get("parallel");
+        let task = parallel
+            .and_then(|p| p.get("task"))
+            .and_then(Value::as_str)
+            .unwrap_or("{previous}")
+            .to_string();
+        let label = parallel
+            .and_then(|p| p.get("label"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return [task, label]
+            .into_iter()
+            .filter(|template| !template.is_empty())
+            .collect();
+    }
+    vec![
+        step.get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("{previous}")
+            .to_string(),
+    ]
+}
+
+/// Extract every `{outputs.<name>}` reference from a template (mirrors `\{outputs\.([^}]*)\}`),
+/// returning each `(raw_match, name)` pair.
+fn extract_output_refs(template: &str) -> Vec<(String, String)> {
+    const PREFIX: &str = "{outputs.";
+    let mut refs = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(PREFIX) {
+        let after = rest.get(start + PREFIX.len()..).unwrap_or("");
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let name = after.get(..end).unwrap_or("");
+        refs.push((format!("{{outputs.{name}}}"), name.to_string()));
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    refs
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$` — a safe chain-output/item identifier.
+fn is_safe_output_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Structural port of `dynamic-fanout.ts::validateDynamicStepShape` (key whitelists, `expand.from`,
+/// safe names, JSON-Pointer syntax, `maxItems`, single-template `parallel`, `collect.as`), including
+/// the deep per-item template-reference validation of `parallel.task`/`parallel.label`
+/// (`assertNoUnresolvedItemReferences`, the `{item.path}` grammar in `dynamic-fanout.ts:208-213`) —
+/// delegated to [`crate::spawn::dynamic_fanout::assert_no_unresolved_item_references`] (C16) so a
+/// malformed item reference is rejected at chain-parse time, exactly as pi's
+/// `validateChainOutputBindings` does.
+fn validate_dynamic_step_shape(
+    step: &Value,
+    display: usize,
+    config_max_items: u64,
+) -> Result<(), String> {
+    let prefix = format!("Dynamic chain step {display}");
+    assert_only_keys(step, DYNAMIC_STEP_KEYS, &prefix)?;
+
+    let expand = step.get("expand");
+    let from = expand.and_then(|expand| expand.get("from"));
+    let (Some(expand), Some(from)) = (expand, from) else {
+        return Err(format!("{prefix} requires expand.from."));
+    };
+    assert_only_keys(expand, DYNAMIC_EXPAND_KEYS, &format!("{prefix} expand"))?;
+    assert_only_keys(from, DYNAMIC_EXPAND_FROM_KEYS, &format!("{prefix} expand.from"))?;
+
+    let output = from.get("output").and_then(Value::as_str).unwrap_or_default();
+    if !is_safe_output_name(output) {
+        return Err(format!(
+            "{prefix} has invalid expand.from.output '{output}'."
+        ));
+    }
+    let path = from.get("path").and_then(Value::as_str).unwrap_or_default();
+    assert_json_pointer(path, &format!("{prefix} expand.from.path"))?;
+    if let Some(key) = expand.get("key").and_then(Value::as_str) {
+        assert_json_pointer(key, &format!("{prefix} expand.key"))?;
+    }
+    let item_name = expand.get("item").and_then(Value::as_str).unwrap_or("item");
+    if !is_safe_output_name(item_name) {
+        return Err(format!("{prefix} has invalid expand.item '{item_name}'."));
+    }
+    if let Some(max_items) = expand.get("maxItems")
+        && !is_non_negative_integer(max_items)
+    {
+        return Err(format!("{prefix} expand.maxItems must be an integer >= 0."));
+    }
+    // `config.maxItems` is always the parse-time `MAX_SAFE_INTEGER`, so it is a valid non-negative
+    // integer by construction and the "requires expand.maxItems or config.maxItems" branch (both
+    // undefined) can never fire here — matching `chain-serializer.ts:177`.
+    let _ = config_max_items;
+
+    match step.get("parallel") {
+        Some(parallel) if parallel.is_object() => {
+            assert_only_keys(
+                parallel,
+                DYNAMIC_PARALLEL_KEYS,
+                &format!("{prefix} parallel"),
+            )?;
+            if parallel.get("expand").is_some() {
+                return Err(format!("{prefix} does not support nested dynamic fanout."));
+            }
+            if parallel
+                .get("agent")
+                .and_then(Value::as_str)
+                .is_none_or(|agent| agent.is_empty())
+            {
+                return Err(format!("{prefix} parallel.agent is required."));
+            }
+            // C16 (`dynamic-fanout.ts:208-213`): reject a malformed / unknown item reference in the
+            // `parallel.task`/`parallel.label` templates at parse time.
+            for (label, field) in [("parallel.task", "task"), ("parallel.label", "label")] {
+                if let Some(template) = parallel.get(field).and_then(Value::as_str)
+                    && !template.is_empty()
+                {
+                    crate::spawn::dynamic_fanout::assert_no_unresolved_item_references(
+                        template,
+                        item_name,
+                        &format!("{prefix} {label}"),
+                    )?;
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{prefix} requires a single parallel template object and cannot mix dynamic expand/collect with static parallel arrays."
+            ));
+        }
+    }
+
+    let collect_as = step
+        .get("collect")
+        .and_then(|collect| collect.get("as"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if collect_as.is_empty() || !is_safe_output_name(collect_as) {
+        return Err(format!(
+            "{prefix} requires collect.as with a safe output name."
+        ));
+    }
+    if let Some(collect) = step.get("collect") {
+        assert_only_keys(collect, DYNAMIC_COLLECT_KEYS, &format!("{prefix} collect"))?;
+    }
+    Ok(())
+}
+
+const DYNAMIC_STEP_KEYS: &[&str] = &[
+    "expand",
+    "parallel",
+    "collect",
+    "concurrency",
+    "failFast",
+    "phase",
+    "label",
+    "acceptance",
+];
+const DYNAMIC_EXPAND_KEYS: &[&str] = &["from", "item", "key", "maxItems", "onEmpty"];
+const DYNAMIC_EXPAND_FROM_KEYS: &[&str] = &["output", "path"];
+const DYNAMIC_PARALLEL_KEYS: &[&str] = &[
+    "agent",
+    "task",
+    "phase",
+    "label",
+    "outputSchema",
+    "cwd",
+    "output",
+    "outputMode",
+    "reads",
+    "progress",
+    "skill",
+    "model",
+    "acceptance",
+];
+const DYNAMIC_COLLECT_KEYS: &[&str] = &["as", "outputSchema"];
+
+/// `dynamic-fanout.ts::assertOnlyKeys`: the value must be a JSON object whose every key is in
+/// `allowed`.
+fn assert_only_keys(value: &Value, allowed: &[&str], label: &str) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("{label} must be an object."));
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{label} does not support field '{key}'."));
+        }
+    }
+    Ok(())
+}
+
+/// `dynamic-fanout.ts::assertJsonPointer`: `""` is valid; otherwise it must start with `/` and
+/// contain no invalid `~`-escape (a `~` not followed by `0` or `1`).
+fn assert_json_pointer(pointer: &str, label: &str) -> Result<(), String> {
+    if pointer.is_empty() {
+        return Ok(());
+    }
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return Err(format!("{label} must be a JSON Pointer starting with '/'."));
+    };
+    for segment in rest.split('/') {
+        if has_invalid_tilde_escape(segment) {
+            return Err(format!("{label} contains invalid JSON Pointer escape."));
+        }
+    }
+    Ok(())
+}
+
+/// A `~` not immediately followed by `0` or `1` (mirrors `/~(?![01])/`).
+fn has_invalid_tilde_escape(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes.get(index) == Some(&b'~')
+            && !matches!(bytes.get(index + 1), Some(&b'0') | Some(&b'1'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `Number.isInteger(v) && v >= 0` for a JSON value (accepts a whole-number float like `4.0`, which
+/// `Number.isInteger` treats as an integer).
+fn is_non_negative_integer(value: &Value) -> bool {
+    if value.as_u64().is_some() {
+        return true;
+    }
+    value
+        .as_f64()
+        .is_some_and(|f| f >= 0.0 && f.fract() == 0.0)
+}
+
+// -------------------------------------------------------------------------------------------
+// Authoring -> runtime bridge (ChainStepConfig -> RunnerStep)
+// -------------------------------------------------------------------------------------------
+
+/// Convert one parsed [`ChainStepConfig`] authoring shape into the runtime dispatch form
+/// [`RunnerStep`] the chain-graph walker executes. The step's shape selects the variant exactly as
+/// pi's runtime step guards do: an array `parallel` -> [`RunnerStep::ParallelGroup`]; an
+/// `expand`+`collect` with an object `parallel` -> [`RunnerStep::DynamicGroup`]; otherwise
+/// [`RunnerStep::SingleStep`].
 ///
-/// Absence of a `steps:` key yields an empty step list rather than an error — a chain file with no
-/// steps yet (e.g. scaffolded but not filled in) is not itself malformed.
-fn parse_chain_md_steps(frontmatter: &str) -> Result<Vec<RunnerStep>, String> {
-    let mut lines = frontmatter.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-        let Some((key, inline_value)) = line.split_once(':') else {
-            continue;
-        };
-        if key.trim() != "steps" {
-            continue;
-        }
-
-        let inline_value = inline_value.trim();
-        if !inline_value.is_empty() {
-            // Inline `steps: [...]` form.
-            let value: serde_json::Value = serde_json::from_str(inline_value)
-                .map_err(|e| format!("invalid inline \"steps\" JSON array: {e}"))?;
-            return parse_chain_json_steps(&serde_json::json!({ "steps": value }));
-        }
-
-        // Block form: count indented top-level list-entry lines (`  - ...`) that follow, until a
-        // non-indented (or end-of-frontmatter) line is reached. Each stub line (e.g.
-        // `- agent: reviewer`) carries no structured per-step JSON this narrow frontmatter
-        // subset attempts to parse (see this file's module header's "Deferred: full
-        // agent-frontmatter grammar" note), so each is materialized as a minimal, valid
-        // placeholder `RunnerStep::SingleStep` — preserving count and order only, exactly
-        // mirroring `discovery::management::placeholder_runner_step`'s identical convention for
-        // the same "preserve count, not content" need.
-        let mut count = 0usize;
-        while let Some(next) = lines.peek() {
-            if !(next.starts_with(' ') || next.starts_with('\t')) {
-                break;
-            }
-            let trimmed = next.trim_start();
-            if trimmed.starts_with("- ") || trimmed == "-" {
-                count += 1;
-            }
-            lines.next();
-        }
-        return Ok((0..count).map(|_| placeholder_runner_step()).collect());
+/// This is a STRUCTURAL bridge: it carries the real agent NAME (never a placeholder persona — name
+/// resolution to a full `AgentConfig` remains the executor's job), the task, and the fields
+/// `SingleStepSpec` has a home for (`output` = pi's `as` named-output key, `output_mode`, `reads`),
+/// exactly mirroring `registration::slash_commands::step_token_to_spec`'s established mapping. Like
+/// that converter, it defers to a later phase (T0.1 plan-time enrichment): the per-step `model`
+/// string is not resolved to a `ModelId` here (`model: None` -> the persona's own model), a
+/// path-form `outputSchema` is not loaded into `structured_output_schema`, an object-form
+/// `acceptance` is not lowered into a runtime contract, and a static `parallel`/`dynamic` group's
+/// `concurrency` falls back to `default_concurrency` when the step omits it.
+pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u32) -> RunnerStep {
+    if let Some(Value::Array(items)) = &step.parallel {
+        let steps: Vec<SingleStepSpec> = items.iter().filter_map(value_to_single_step_spec).collect();
+        return RunnerStep::ParallelGroup(ParallelGroupSpec {
+            steps,
+            concurrency: chain_concurrency(step, default_concurrency),
+            fail_fast: step.fail_fast.unwrap_or(false),
+            worktree: step.worktree.unwrap_or(false),
+        });
     }
-    Ok(Vec::new())
+
+    if let (Some(expand), Some(collect), Some(parallel)) =
+        (&step.expand, &step.collect, &step.parallel)
+        && parallel.is_object()
+    {
+        let template = value_to_single_step_spec(parallel).unwrap_or_else(empty_single_step_spec);
+        return RunnerStep::DynamicGroup(DynamicGroupSpec {
+            expand: dynamic_expand_pointer(expand),
+            template: Box::new(template),
+            collect: collect
+                .get("as")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            concurrency: chain_concurrency(step, default_concurrency),
+            // C16: carry pi's `expand.{item,key,maxItems,onEmpty}` and `collect.outputSchema`
+            // through to the runtime `DynamicGroupSpec` so the walker can substitute each item's
+            // task, cap/dedup the fan-out, and validate the collect record shape.
+            item: expand
+                .get("item")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            key: expand.get("key").and_then(Value::as_str).map(str::to_string),
+            max_items: expand
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            on_empty: match expand.get("onEmpty").and_then(Value::as_str) {
+                Some("fail") => OnEmpty::Fail,
+                _ => OnEmpty::Skip,
+            },
+            collect_schema: collect.get("outputSchema").cloned(),
+        });
+    }
+
+    RunnerStep::SingleStep(chain_step_to_single_step_spec(step))
 }
 
-/// Build one minimal, valid placeholder [`RunnerStep::SingleStep`] — used only to preserve step
-/// *count* for `.chain.md`'s block-form `steps:` stub lines, which carry no structured per-step
-/// content this narrow frontmatter subset attempts to parse (see [`parse_chain_md_steps`]'s own
-/// doc comment). Every field left at its "no override" default so this placeholder carries no
-/// spurious behavior if ever (mis)dispatched directly. Mirrors `discovery::management`'s own
-/// private `placeholder_runner_step` helper's identical convention for the same "preserve count,
-/// not content" need in that sibling module (each module keeps its own copy rather than sharing
-/// one `pub` helper, since neither module's placeholder-construction need is itself part of
-/// either module's own public contract).
-fn placeholder_runner_step() -> RunnerStep {
-    RunnerStep::SingleStep(SingleStepSpec {
-        agent: String::new(),
-        task: String::new(),
-        cwd: None,
+/// Build a [`DynamicGroupSpec::expand`] pointer (`outputs.<name>[<json-pointer>]`) from a chain
+/// step's `expand.from.{output,path}` — the shape [`crate::spawn::chain_graph::OutputRegistry::
+/// resolve_pointer`] consumes.
+fn dynamic_expand_pointer(expand: &Value) -> String {
+    let from = expand.get("from");
+    let output = from
+        .and_then(|from| from.get("output"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = from
+        .and_then(|from| from.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("outputs.{output}{path}")
+}
+
+fn chain_concurrency(step: &ChainStepConfig, default_concurrency: u32) -> u32 {
+    step.concurrency
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(default_concurrency)
+}
+
+/// Convert one raw parallel-task-item [`Value`] into a [`SingleStepSpec`] by first deserializing it
+/// into a [`ChainStepConfig`] (skipping any element that is not a well-formed step object).
+fn value_to_single_step_spec(value: &Value) -> Option<SingleStepSpec> {
+    let config: ChainStepConfig = serde_json::from_value(value.clone()).ok()?;
+    Some(chain_step_to_single_step_spec(&config))
+}
+
+fn empty_single_step_spec() -> SingleStepSpec {
+    chain_step_to_single_step_spec(&ChainStepConfig::default())
+}
+
+/// Map a sequential [`ChainStepConfig`] onto a [`SingleStepSpec`] (see
+/// [`chain_step_to_runner_step`] for the deferral rationale).
+fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
+    SingleStepSpec {
+        agent: step.agent.clone().unwrap_or_default(),
+        task: step.task.clone().unwrap_or_default(),
+        cwd: step
+            .extra
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
         model: None,
         tools: None,
         extensions: None,
         session_file: None,
         max_depth_override: None,
         structured_output_schema: None,
-        output: None,
-        output_mode: None,
-        reads: None,
-        acceptance: None,
+        output: step.as_.clone(),
+        // pi's `output` binding is the output FILE path (`ChainOutputBinding::Name`); the
+        // `Toggle(false)` "no output" sentinel and an empty string both map to `None` (no file).
+        // Distinct from `output` above, which carries pi's `as` registry KEY.
+        output_path: match &step.output {
+            Some(crate::discovery::types::ChainOutputBinding::Name(path)) if !path.is_empty() => {
+                Some(path.clone())
+            }
+            _ => None,
+        },
+        output_mode: step.output_mode.as_deref().and_then(parse_output_mode),
+        reads: match &step.reads {
+            Some(ChainListBinding::List(paths)) => {
+                Some(paths.iter().map(PathBuf::from).collect())
+            }
+            Some(ChainListBinding::Toggle(_)) | None => None,
+        },
+        acceptance: step
+            .acceptance
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_string),
         context: None,
         agent_scope: None,
-    })
+    }
+}
+
+fn parse_output_mode(value: &str) -> Option<OutputMode> {
+    match value {
+        "inline" => Some(OutputMode::Inline),
+        "file-only" => Some(OutputMode::FileOnly),
+        "file-and-inline" => Some(OutputMode::FileAndInline),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -476,34 +1489,208 @@ mod tests {
         path
     }
 
-    /// Each element is a real, minimal, well-formed tagged `RunnerStep::SingleStep` JSON object
-    /// (`spawn::chain_graph::RunnerStep` now has a real `Deserialize` impl this module's own
-    /// `parse_chain_json_steps` deserializes against, no longer a placeholder-counting shim) —
-    /// `i` is folded into `agent`/`task` purely so distinct steps are trivially distinguishable
-    /// in any test assertion that wants to, without every fixture step needing to be identical.
+    /// A real pi-format `.chain.json`: root object with `name`/`description`/`chain` array. Each
+    /// step is a minimal sequential step with a distinct agent/task.
     fn sample_json(steps: usize) -> String {
         let steps_json: Vec<String> = (0..steps)
-            .map(|i| {
-                format!(
-                    "{{\"kind\":\"singleStep\",\"agent\":\"agent-{i}\",\"task\":\"task-{i}\"}}"
-                )
-            })
+            .map(|i| format!("{{\"agent\":\"agent-{i}\",\"task\":\"task-{i}\"}}"))
             .collect();
         format!(
-            "{{\"name\":\"release\",\"description\":\"release chain\",\"steps\":[{}]}}",
+            "{{\"name\":\"release\",\"description\":\"release chain\",\"chain\":[{}]}}",
             steps_json.join(",")
         )
     }
 
+    /// A real pi-format `.chain.md`: frontmatter `name`/`description`, then one `## agent-i` section
+    /// per step, each with a distinct task after the blank line.
     fn sample_md(steps: usize) -> String {
-        let mut steps_block = String::new();
-        for _ in 0..steps {
-            steps_block.push_str("  - agent: reviewer\n");
+        let mut body = String::new();
+        for i in 0..steps {
+            if i > 0 {
+                body.push('\n');
+            }
+            body.push_str(&format!("## agent-{i}\n\ntask-{i}\n"));
         }
-        format!(
-            "---\nname: release\ndescription: release chain (md)\nsteps:\n{steps_block}---\nBody text.\n"
-        )
+        format!("---\nname: release\ndescription: release chain (md)\n---\n\n{body}")
     }
+
+    // ---- The task's three required fixtures ----
+
+    #[test]
+    fn two_step_chain_md_parses_to_two_steps_with_correct_agent_task_and_config() {
+        let content = "---\nname: review-chain\ndescription: Review chain\n---\n\n## reviewer\noutput: report.md\noutputMode: file-only\nas: reviewNotes\n\nReview the diff\n\n## fixer\nmodel: fast-model\nreads: src/a.rs, src/b.rs\n\nApply the fixes from {outputs.reviewNotes}\n";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "review-chain.chain.md", content);
+
+        let def = parse_chain_md(&path, AgentSource::Project).expect("parse md chain");
+        assert_eq!(def.name, "review-chain");
+        assert_eq!(def.local_name, "review-chain");
+        assert_eq!(def.package_name, None);
+        assert_eq!(def.description, "Review chain");
+        assert_eq!(def.steps.len(), 2);
+
+        let first = &def.steps[0];
+        assert_eq!(first.agent.as_deref(), Some("reviewer"));
+        assert_eq!(first.task.as_deref(), Some("Review the diff"));
+        assert_eq!(
+            first.output,
+            Some(ChainOutputBinding::Name("report.md".to_string()))
+        );
+        assert_eq!(first.output_mode.as_deref(), Some("file-only"));
+        assert_eq!(first.as_.as_deref(), Some("reviewNotes"));
+
+        let second = &def.steps[1];
+        assert_eq!(second.agent.as_deref(), Some("fixer"));
+        assert_eq!(
+            second.task.as_deref(),
+            Some("Apply the fixes from {outputs.reviewNotes}")
+        );
+        assert_eq!(second.model.as_deref(), Some("fast-model"));
+        assert_eq!(
+            second.reads,
+            Some(ChainListBinding::List(vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn chain_json_with_chain_array_parses_correctly() {
+        let content = "{\"name\":\"dynamic-review\",\"description\":\"Review dynamic targets\",\"chain\":[{\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},{\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"item\":\"target\",\"key\":\"/path\",\"maxItems\":4},\"parallel\":{\"agent\":\"reviewer\",\"task\":\"Review {target.path}\",\"outputSchema\":{\"type\":\"object\"}},\"collect\":{\"as\":\"reviews\"}}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "dynamic-review.chain.json", content);
+
+        let def = parse_chain_json(&path, AgentSource::Project).expect("parse json chain");
+        assert_eq!(def.name, "dynamic-review");
+        assert_eq!(def.steps.len(), 2);
+        assert_eq!(def.steps[0].agent.as_deref(), Some("scout"));
+        assert_eq!(def.steps[0].as_.as_deref(), Some("targets"));
+        assert_eq!(
+            def.steps[0].output_schema,
+            Some(serde_json::json!({ "type": "object" }))
+        );
+        // The dynamic step retained its raw collect/expand/parallel shapes.
+        assert_eq!(
+            def.steps[1].collect,
+            Some(serde_json::json!({ "as": "reviews" }))
+        );
+        assert!(def.steps[1].expand.is_some());
+        assert!(def.steps[1].parallel.is_some());
+    }
+
+    #[test]
+    fn packaged_chain_gets_its_qualified_runtime_name() {
+        let json_content = "{\"name\":\"release\",\"package\":\"code-analysis\",\"description\":\"Packaged release chain\",\"chain\":[{\"agent\":\"scout\",\"task\":\"go\"}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json_path = write(tmp.path(), "release.chain.json", json_content);
+        let json_def = parse_chain_json(&json_path, AgentSource::User).expect("parse json chain");
+        assert_eq!(json_def.name, "code-analysis.release");
+        assert_eq!(json_def.local_name, "release");
+        assert_eq!(json_def.package_name.as_deref(), Some("code-analysis"));
+
+        let md_content = "---\nname: release\npackage: Code Analysis\ndescription: Packaged release chain (md)\n---\n\n## scout\n\ngo\n";
+        let md_path = write(tmp.path(), "release-md.chain.md", md_content);
+        let md_def = parse_chain_md(&md_path, AgentSource::User).expect("parse md chain");
+        // `Code Analysis` normalizes to `code-analysis` (lowercase, whitespace -> hyphen).
+        assert_eq!(md_def.name, "code-analysis.release");
+        assert_eq!(md_def.package_name.as_deref(), Some("code-analysis"));
+    }
+
+    // ---- Pinned pi chain-serializer.test.ts behaviors ----
+
+    #[test]
+    fn inline_output_schema_in_md_is_rejected() {
+        let content = "---\nname: review-chain\ndescription: Review chain\n---\n\n## reviewer\noutputSchema: {\"type\":\"object\"}\n\nReview the diff\n";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "review-chain.chain.md", content);
+        let err = parse_chain_md(&path, AgentSource::Project).expect_err("inline schema rejected");
+        assert!(
+            err.contains("Inline outputSchema values are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn md_chain_missing_name_or_description_errors() {
+        let content = "---\nname: only-name\n---\n\n## reviewer\n\ntask\n";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "broken.chain.md", content);
+        let err = parse_chain_md(&path, AgentSource::Project).expect_err("missing description");
+        assert!(
+            err.contains("Chain frontmatter must include name and description"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn json_chain_missing_chain_array_errors() {
+        let content = "{\"name\":\"n\",\"description\":\"d\"}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "no-chain.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User).expect_err("missing chain array");
+        assert!(err.contains("must include array chain"), "{err}");
+    }
+
+    #[test]
+    fn json_chain_non_object_step_is_rejected() {
+        let content = "{\"name\":\"bad\",\"description\":\"Bad\",\"chain\":[1]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "bad.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User).expect_err("non-object step");
+        assert!(err.contains("step 1 must be an object"), "{err}");
+    }
+
+    #[test]
+    fn json_chain_bad_acceptance_reason_required() {
+        let content = "{\"name\":\"bad-acceptance\",\"description\":\"Bad acceptance\",\"chain\":[{\"agent\":\"worker\",\"acceptance\":{\"level\":\"none\"}}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "bad-acceptance.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User).expect_err("acceptance reason required");
+        assert!(err.contains("step 1 acceptance.reason is required"), "{err}");
+    }
+
+    #[test]
+    fn json_chain_valid_acceptance_parses() {
+        let content = "{\"name\":\"accepted-chain\",\"description\":\"Chain with acceptance gates\",\"chain\":[{\"agent\":\"worker\",\"task\":\"Fix bug\",\"acceptance\":{\"level\":\"checked\",\"evidence\":[\"changed-files\",\"commands-run\"]}},{\"parallel\":[{\"agent\":\"reviewer\",\"task\":\"Review\",\"acceptance\":\"attested\"}]}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "accepted-chain.chain.json", content);
+        let def = parse_chain_json(&path, AgentSource::Project).expect("valid acceptance parses");
+        assert_eq!(def.steps.len(), 2);
+        assert_eq!(
+            def.steps[0].acceptance,
+            Some(serde_json::json!({ "level": "checked", "evidence": ["changed-files", "commands-run"] }))
+        );
+    }
+
+    #[test]
+    fn invalid_dynamic_chain_mixing_static_parallel_arrays_is_rejected() {
+        let content = "{\"name\":\"bad-dynamic-review\",\"description\":\"Bad dynamic targets\",\"chain\":[{\"agent\":\"scout\",\"task\":\"Return targets\",\"as\":\"targets\",\"outputSchema\":{\"type\":\"object\"}},{\"expand\":{\"from\":{\"output\":\"targets\",\"path\":\"/items\"},\"maxItems\":4},\"parallel\":[{\"agent\":\"reviewer\",\"task\":\"Review\"}],\"collect\":{\"as\":\"reviews\"}}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "bad-dynamic-review.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::Project).expect_err("static parallel arrays");
+        assert!(err.contains("static parallel arrays"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_chain_output_names_are_rejected() {
+        let content = "{\"name\":\"dupe\",\"description\":\"Dupe outputs\",\"chain\":[{\"agent\":\"a\",\"task\":\"t\",\"as\":\"x\"},{\"agent\":\"b\",\"task\":\"t\",\"as\":\"x\"}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "dupe.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User).expect_err("duplicate output name");
+        assert!(err.contains("Duplicate chain output name 'x'"), "{err}");
+    }
+
+    #[test]
+    fn unknown_output_reference_is_rejected() {
+        let content = "{\"name\":\"ref\",\"description\":\"Bad ref\",\"chain\":[{\"agent\":\"a\",\"task\":\"use {outputs.missing}\"}]}";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write(tmp.path(), "ref.chain.json", content);
+        let err = parse_chain_json(&path, AgentSource::User).expect_err("unknown output ref");
+        assert!(err.contains("Unknown chain output reference"), "{err}");
+    }
+
+    // ---- Directory scan / R-SA-015 precedence (updated to pi-format fixtures) ----
 
     #[test]
     fn chain_json_wins_over_chain_md_at_same_scope_and_name() {
@@ -522,32 +1709,33 @@ mod tests {
 
     #[test]
     fn chain_json_wins_over_chain_md_regardless_of_alphabetical_scan_order() {
-        // ".chain.json" < ".chain.md" is NOT the point being tested here; both filenames sort
-        // the same either way ("release.chain.json" < "release.chain.md" alphabetically), so
-        // additionally verify the reverse-insertion code path directly via the internal helper,
-        // proving the precedence is an explicit format check rather than an artifact of
-        // alphabetical order (R-SA-015).
         let mut by_name: HashMap<String, ChainCandidate> = HashMap::new();
-        let json_def = ChainDefinition {
+        let json_def = |steps: usize| ChainDefinition {
             name: "release".to_string(),
+            local_name: "release".to_string(),
+            package_name: None,
             description: "json".to_string(),
             source: AgentSource::User,
             file_path: PathBuf::from("/scope/release.chain.json"),
-            steps: vec![placeholder_runner_step(), placeholder_runner_step()],
+            steps: vec![ChainStepConfig::default(); steps],
+            extra_fields: BTreeMap::new(),
         };
         let md_def = ChainDefinition {
             name: "release".to_string(),
+            local_name: "release".to_string(),
+            package_name: None,
             description: "md".to_string(),
             source: AgentSource::User,
             file_path: PathBuf::from("/scope/release.chain.md"),
-            steps: vec![placeholder_runner_step()],
+            steps: vec![ChainStepConfig::default()],
+            extra_fields: BTreeMap::new(),
         };
 
         // Insert Json first, then Md: Md must not win.
         insert_with_format_precedence(
             &mut by_name,
             "release".to_string(),
-            json_def,
+            json_def(2),
             ChainFileFormat::Json,
         );
         insert_with_format_precedence(
@@ -556,38 +1744,36 @@ mod tests {
             md_def,
             ChainFileFormat::Md,
         );
-        let winner = &by_name.get("release").expect("winner present").definition;
-        assert_eq!(winner.file_path, PathBuf::from("/scope/release.chain.json"));
+        assert_eq!(
+            by_name.get("release").expect("winner present").definition.file_path,
+            PathBuf::from("/scope/release.chain.json")
+        );
 
-        // Insert Md first, then Json: Json must win (overwrite).
+        // Insert Md first, then Json: Json must win.
         let mut by_name2: HashMap<String, ChainCandidate> = HashMap::new();
         insert_with_format_precedence(
             &mut by_name2,
             "release".to_string(),
             ChainDefinition {
                 name: "release".to_string(),
+                local_name: "release".to_string(),
+                package_name: None,
                 description: "md".to_string(),
                 source: AgentSource::User,
                 file_path: PathBuf::from("/scope/release.chain.md"),
-                steps: vec![placeholder_runner_step()],
+                steps: vec![ChainStepConfig::default()],
+                extra_fields: BTreeMap::new(),
             },
             ChainFileFormat::Md,
         );
         insert_with_format_precedence(
             &mut by_name2,
             "release".to_string(),
-            ChainDefinition {
-                name: "release".to_string(),
-                description: "json".to_string(),
-                source: AgentSource::User,
-                file_path: PathBuf::from("/scope/release.chain.json"),
-                steps: vec![placeholder_runner_step(), placeholder_runner_step()],
-            },
+            json_def(2),
             ChainFileFormat::Json,
         );
-        let winner2 = &by_name2.get("release").expect("winner present").definition;
         assert_eq!(
-            winner2.file_path,
+            by_name2.get("release").expect("winner present").definition.file_path,
             PathBuf::from("/scope/release.chain.json")
         );
     }
@@ -597,22 +1783,14 @@ mod tests {
         let json_tmp = tempfile::tempdir().expect("tempdir");
         write(json_tmp.path(), "release.chain.json", &sample_json(2));
         let json_result = scan_chain_dir(json_tmp.path(), AgentSource::User);
-        assert!(
-            json_result.diagnostics.is_empty(),
-            "{:?}",
-            json_result.diagnostics
-        );
+        assert!(json_result.diagnostics.is_empty(), "{:?}", json_result.diagnostics);
         assert_eq!(json_result.chains.len(), 1);
         let from_json = &json_result.chains[0];
 
         let md_tmp = tempfile::tempdir().expect("tempdir");
         write(md_tmp.path(), "release.chain.md", &sample_md(2));
         let md_result = scan_chain_dir(md_tmp.path(), AgentSource::User);
-        assert!(
-            md_result.diagnostics.is_empty(),
-            "{:?}",
-            md_result.diagnostics
-        );
+        assert!(md_result.diagnostics.is_empty(), "{:?}", md_result.diagnostics);
         assert_eq!(md_result.chains.len(), 1);
         let from_md = &md_result.chains[0];
 
@@ -635,12 +1813,7 @@ mod tests {
 
         assert_eq!(result.chains.len(), 2);
         assert!(result.chains.iter().any(|c| c.source == AgentSource::User));
-        assert!(
-            result
-                .chains
-                .iter()
-                .any(|c| c.source == AgentSource::Project)
-        );
+        assert!(result.chains.iter().any(|c| c.source == AgentSource::Project));
     }
 
     #[test]
@@ -651,12 +1824,7 @@ mod tests {
 
         let result = scan_chain_dir(tmp.path(), AgentSource::Project);
         assert_eq!(result.diagnostics.len(), 1);
-        assert!(
-            result.diagnostics[0]
-                .file_path
-                .ends_with("broken.chain.json")
-        );
-        // Sibling file discovery continues unaffected.
+        assert!(result.diagnostics[0].file_path.ends_with("broken.chain.json"));
         assert_eq!(result.chains.len(), 1);
         assert_eq!(result.chains[0].name, "release");
     }
@@ -664,11 +1832,7 @@ mod tests {
     #[test]
     fn malformed_md_chain_file_missing_frontmatter_produces_diagnostic() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "broken.chain.md",
-            "no frontmatter here at all\n",
-        );
+        write(tmp.path(), "broken.chain.md", "no frontmatter here at all\n");
 
         let result = scan_chain_dir(tmp.path(), AgentSource::User);
         assert_eq!(result.diagnostics.len(), 1);
@@ -680,14 +1844,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let nested = tmp.path().join("nested");
         std::fs::create_dir_all(&nested).expect("mkdir nested");
-        // No "name" field in the body: the discovered chain's name falls back to the file stem
-        // ("deep"), keeping this test focused on recursive traversal rather than on the
-        // separately-covered name-field-vs-filename precedence (see
-        // `chain_name_defaults_to_file_stem_when_name_field_absent`).
         write(
             &nested,
             "deep.chain.json",
-            "{\"steps\":[{\"kind\":\"singleStep\",\"agent\":\"a\",\"task\":\"t\"}]}",
+            "{\"name\":\"deep\",\"description\":\"deep chain\",\"chain\":[{\"agent\":\"a\",\"task\":\"t\"}]}",
         );
 
         let result = scan_chain_dir(tmp.path(), AgentSource::Project);
@@ -716,25 +1876,88 @@ mod tests {
     }
 
     #[test]
-    fn absent_steps_key_yields_empty_step_list_not_malformed() {
+    fn empty_chain_array_yields_zero_steps_not_malformed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write(
             tmp.path(),
-            "no-steps.chain.json",
-            "{\"name\":\"no-steps\",\"description\":\"d\"}",
+            "empty.chain.json",
+            "{\"name\":\"empty\",\"description\":\"d\",\"chain\":[]}",
         );
         let result = scan_chain_dir(tmp.path(), AgentSource::User);
-        assert!(result.diagnostics.is_empty());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(result.chains.len(), 1);
         assert!(result.chains[0].steps.is_empty());
     }
 
     #[test]
-    fn chain_name_defaults_to_file_stem_when_name_field_absent() {
+    fn json_chain_missing_name_produces_diagnostic() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "unnamed.chain.json", "{\"steps\":[]}");
+        write(tmp.path(), "unnamed.chain.json", "{\"chain\":[]}");
         let result = scan_chain_dir(tmp.path(), AgentSource::User);
-        assert_eq!(result.chains.len(), 1);
-        assert_eq!(result.chains[0].name, "unnamed");
+        assert!(result.chains.is_empty());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].message.contains("must include string name"));
+    }
+
+    // ---- Authoring -> runtime bridge ----
+
+    #[test]
+    fn chain_step_to_runner_step_maps_sequential_agent_and_task() {
+        let step = ChainStepConfig {
+            agent: Some("reviewer".to_string()),
+            task: Some("review it".to_string()),
+            as_: Some("notes".to_string()),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&step, 4) {
+            RunnerStep::SingleStep(spec) => {
+                assert_eq!(spec.agent, "reviewer");
+                assert_eq!(spec.task, "review it");
+                assert_eq!(spec.output.as_deref(), Some("notes"));
+                assert!(spec.model.is_none());
+            }
+            other => panic!("expected SingleStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_step_to_runner_step_maps_static_parallel_group() {
+        let step = ChainStepConfig {
+            parallel: Some(serde_json::json!([
+                { "agent": "a", "task": "ta" },
+                { "agent": "b", "task": "tb" }
+            ])),
+            concurrency: Some(2),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&step, 8) {
+            RunnerStep::ParallelGroup(group) => {
+                assert_eq!(group.steps.len(), 2);
+                assert_eq!(group.concurrency, 2);
+                assert_eq!(group.steps[0].agent, "a");
+                assert_eq!(group.steps[1].agent, "b");
+            }
+            other => panic!("expected ParallelGroup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_step_to_runner_step_maps_dynamic_group_expand_pointer() {
+        let step = ChainStepConfig {
+            expand: Some(serde_json::json!({ "from": { "output": "targets", "path": "/items" } })),
+            parallel: Some(serde_json::json!({ "agent": "reviewer", "task": "review" })),
+            collect: Some(serde_json::json!({ "as": "reviews" })),
+            concurrency: Some(3),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&step, 8) {
+            RunnerStep::DynamicGroup(group) => {
+                assert_eq!(group.expand, "outputs.targets/items");
+                assert_eq!(group.collect, "reviews");
+                assert_eq!(group.concurrency, 3);
+                assert_eq!(group.template.agent, "reviewer");
+            }
+            other => panic!("expected DynamicGroup, got {other:?}"),
+        }
     }
 }

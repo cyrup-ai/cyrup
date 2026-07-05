@@ -134,67 +134,198 @@ pub fn build_model_candidates(
 // R-SA-039: retryable-failure classification
 // -------------------------------------------------------------------------------------------
 
-/// The fixed retryable-failure pattern set (R-SA-039), a verbatim 1:1 port of pi-subagents'
-/// `RETRYABLE_MODEL_FAILURE_PATTERNS` (`pi-subagents/src/runs/shared/model-fallback.ts:98-133`).
+/// One retryable-failure pattern (R-SA-039), a dependency-free re-typing of one of pi-subagents'
+/// case-insensitive JS regexes in `RETRYABLE_MODEL_FAILURE_PATTERNS`
+/// (`pi-subagents/src/runs/shared/model-fallback.ts:98-133`).
 ///
-/// Pi's own list is a set of case-insensitive JS regexes; every one of them reduces, for the
-/// realistic error-message text this classifier is ever applied to, to a plain case-insensitive
-/// substring test — none of Pi's patterns here rely on alternation *within* one pattern, anchors,
-/// or capture groups (`\s*`/`\b…\b`/`?` all collapse to "the literal word or phrase appears
-/// somewhere in the message" for prose-shaped provider error text). This crate does not depend on
-/// the `regex` crate (workspace dependency budget; mirrors `cyrup-provider::utils::regexlite`'s
-/// own dependency-free approach for the analogous `retry.ts`/`overflow.ts` ports), so each pattern
-/// below is the literal substring [`is_retryable_model_failure`] searches for, case-insensitively,
-/// rather than a compiled regex.
+/// This crate does not depend on the `regex` crate (workspace dependency budget; mirrors
+/// `cyrup-provider::utils::regexlite`'s own dependency-free approach for the analogous
+/// `retry.ts`/`overflow.ts` ports). An earlier port collapsed EVERY pi regex to a plain
+/// case-insensitive substring test — but two of pi's regex constructs do NOT reduce to substrings
+/// and doing so introduced real false positives and lost real generality:
 ///
-/// Kept as a `const` array (not compiled/cached state) since substring search needs no
-/// precompilation step, unlike `regexlite::Regex`.
-const RETRYABLE_MODEL_FAILURE_PATTERNS: &[&str] = &[
-    "rate limit",
-    "ratelimit",
-    "too many requests",
-    "429",
-    "quota",
-    "billing",
-    "credit",
-    "auth",
-    "unauthoriz",
-    "unauthoris",
-    "forbidden",
-    "api key",
-    "token expired",
-    "invalid key",
-    "provider unavailable",
-    "provider is unavailable",
-    "model unavailable",
-    "model is unavailable",
-    "model disabled",
-    "model is disabled",
-    "model not found",
-    "unknown model",
-    "overloaded",
-    "service unavailable",
-    "temporarily unavailable",
-    "temporary unavailable",
-    "connection refused",
-    "fetch failed",
-    "network error",
-    "socket hang up",
-    "upstream",
-    "timed out",
-    "timeout",
-    "502",
-    "503",
-    "504",
-    "cold start",
-    "cold-start",
-    "coldstart",
-    "empty response",
-    "no output",
-    "model load",
-    "model fail",
-    "model error",
+/// - The bare HTTP-status regexes `\b429\b`/`\b502\b`/`\b503\b`/`\b504\b` are **word-bounded**: a
+///   plain `"429"` substring wrongly fires on `"processed 4290 rows"` or `"sku 50249"`. Ported
+///   here as [`RetryPattern::WordNumber`], which requires the digits to sit on a `\b`-style
+///   word boundary (no adjacent `[A-Za-z0-9_]`), exactly like pi.
+/// - The `.*` sequence regexes `provider.*unavailable`/`model.*(?:load|fail|error)`/… match the two
+///   ends across arbitrary intervening text on the SAME line (JS `.` never crosses `\n`); the
+///   substring port hardcoded a couple of literal variants (`"provider unavailable"`,
+///   `"provider is unavailable"`) and silently dropped every other phrasing (`"provider foo is
+///   currently unavailable"`). Ported here as [`RetryPattern::Then`]/[`RetryPattern::ThenAny`],
+///   evaluated per line so a genuinely intervening clause still matches but a `provider` and an
+///   `unavailable` on two DIFFERENT lines do not (faithful to `.`-no-newline).
+///
+/// The `?`/`\s*`/`(?:…)?` optional-run constructs are ported as
+/// [`RetryPattern::OptionalCharBetween`]/[`RetryPattern::OptionalWsBetween`]/
+/// [`RetryPattern::OptionalWordBetween`] so `cold.?start`, `rate\s*limit`, `timed? out`, and
+/// `temporar(?:ily)? unavailable` match exactly what pi's regexes do (and no more — e.g.
+/// `temporar(?:ily)? unavailable` matches `"temporarily unavailable"` but NOT `"temporary
+/// unavailable"`, matching pi).
+enum RetryPattern {
+    /// Case-insensitive literal substring (pi `/quota/i`, `/forbidden/i`, `/auth(?:entication)?/i`
+    /// — the last collapses to `"auth"` since any string containing `auth` matches regardless of
+    /// the optional suffix).
+    Contains(&'static str),
+    /// A bare numeric HTTP-status token bounded by `\b` on both sides (pi `/\b429\b/`) — matches
+    /// only when the digits are NOT adjacent to another word character `[A-Za-z0-9_]`.
+    WordNumber(&'static str),
+    /// Case-insensitive `first.*second` on one line: `first` occurs, then `second` occurs at or
+    /// after the end of that `first` match, within the same line (pi `/provider.*unavailable/i`).
+    Then(&'static str, &'static str),
+    /// Case-insensitive `first.*(?:a|b|c)` on one line (pi `/model.*(?:load|fail|error)/i`).
+    ThenAny(&'static str, &'static [&'static str]),
+    /// Case-insensitive `first.?second`: `first`, then an optional single character, then `second`
+    /// (pi `/cold.?start/i` → `coldstart`/`cold start`/`cold-start`).
+    OptionalCharBetween(&'static str, &'static str),
+    /// Case-insensitive `first\s*second`: `first`, then zero or more whitespace, then `second`
+    /// (pi `/rate\s*limit/i`).
+    OptionalWsBetween(&'static str, &'static str),
+    /// Case-insensitive `first(?:middle)?second`: `first`, then an optional literal `middle`, then
+    /// `second` (pi `/temporar(?:ily)? unavailable/i` → first=`temporar`, middle=`ily`,
+    /// second=` unavailable`; pi `/timed? out/i` → first=`time`, middle=`d`, second=` out`).
+    OptionalWordBetween(&'static str, &'static str, &'static str),
+}
+
+/// The fixed retryable-failure pattern set (R-SA-039), in pi's exact `RETRYABLE_MODEL_FAILURE_PATTERNS`
+/// declaration order (`model-fallback.ts:98-133`).
+const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
+    RetryPattern::OptionalWsBetween("rate", "limit"), // /rate\s*limit/i
+    RetryPattern::Contains("too many requests"),
+    RetryPattern::WordNumber("429"), // /\b429\b/
+    RetryPattern::Contains("quota"),
+    RetryPattern::Contains("billing"),
+    RetryPattern::Contains("credit"),
+    RetryPattern::Contains("auth"), // /auth(?:entication)?/i
+    RetryPattern::Contains("unauthorized"), // /unauthori[sz]ed/i, US spelling
+    RetryPattern::Contains("unauthorised"), // /unauthori[sz]ed/i, UK spelling
+    RetryPattern::Contains("forbidden"),
+    RetryPattern::Contains("api key"),
+    RetryPattern::Contains("token expired"),
+    RetryPattern::Contains("invalid key"),
+    RetryPattern::Then("provider", "unavailable"), // /provider.*unavailable/i
+    RetryPattern::Then("model", "unavailable"),    // /model.*unavailable/i
+    RetryPattern::Then("model", "disabled"),       // /model.*disabled/i
+    RetryPattern::Then("model", "not found"),      // /model.*not found/i
+    RetryPattern::Contains("unknown model"),
+    RetryPattern::Contains("overloaded"),
+    RetryPattern::Contains("service unavailable"),
+    RetryPattern::OptionalWordBetween("temporar", "ily", " unavailable"), // /temporar(?:ily)? unavailable/i
+    RetryPattern::Contains("connection refused"),
+    RetryPattern::Contains("fetch failed"),
+    RetryPattern::Contains("network error"),
+    RetryPattern::Contains("socket hang up"),
+    RetryPattern::Contains("upstream"),
+    RetryPattern::OptionalWordBetween("time", "d", " out"), // /timed? out/i
+    RetryPattern::Contains("timeout"),
+    RetryPattern::WordNumber("502"), // /\b502\b/
+    RetryPattern::WordNumber("503"), // /\b503\b/
+    RetryPattern::WordNumber("504"), // /\b504\b/
+    RetryPattern::OptionalCharBetween("cold", "start"), // /cold.?start/i
+    RetryPattern::Contains("empty response"),
+    RetryPattern::Contains("no output"),
+    RetryPattern::ThenAny("model", &["load", "fail", "error"]), // /model.*(?:load|fail|error)/i
 ];
+
+/// Whether a byte is a regex `\w`/`\b`-boundary word character (`[A-Za-z0-9_]`).
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Advance past exactly one UTF-8 character of `s`, returning the remainder (or `""` if `s` had a
+/// single character). `None` only for an already-empty `s`.
+fn skip_one_char(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices();
+    chars.next()?; // consume the first character
+    match chars.next() {
+        Some((idx, _)) => s.get(idx..),
+        None => Some(""),
+    }
+}
+
+/// `\b<num>\b`: does `num` (ASCII digits) appear on a word boundary anywhere in `hay`?
+fn matches_word_number(hay: &str, num: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let mut search_start = 0;
+    while let Some(rel) = hay.get(search_start..).and_then(|s| s.find(num)) {
+        let start = search_start + rel;
+        let end = start + num.len();
+        let before_ok = start == 0 || bytes.get(start - 1).is_none_or(|&b| !is_word_byte(b));
+        let after_ok = bytes.get(end).is_none_or(|&b| !is_word_byte(b));
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = start + 1;
+    }
+    false
+}
+
+/// Whether `line` (already lowercased) matches `pattern`. `line` is a single line — the `.*`/`\s*`
+/// constructs never cross a `\n` (JS `.`-no-newline), so [`is_retryable_model_failure`] applies
+/// this per line.
+fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
+    match pattern {
+        RetryPattern::Contains(needle) => line.contains(needle),
+        RetryPattern::WordNumber(num) => matches_word_number(line, num),
+        RetryPattern::Then(first, second) => match line.find(first) {
+            Some(pos) => line
+                .get(pos + first.len()..)
+                .is_some_and(|rest| rest.contains(second)),
+            None => false,
+        },
+        RetryPattern::ThenAny(first, seconds) => match line.find(first) {
+            Some(pos) => line.get(pos + first.len()..).is_some_and(|rest| {
+                seconds.iter().any(|second| rest.contains(second))
+            }),
+            None => false,
+        },
+        RetryPattern::OptionalCharBetween(first, second) => {
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + first.len()..)
+                    && (rest.starts_with(second)
+                        || skip_one_char(rest).is_some_and(|r| r.starts_with(second)))
+                {
+                    return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
+        RetryPattern::OptionalWsBetween(first, second) => {
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + first.len()..)
+                    && rest
+                        .trim_start_matches(char::is_whitespace)
+                        .starts_with(second)
+                {
+                    return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
+        RetryPattern::OptionalWordBetween(first, middle, second) => {
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + first.len()..)
+                    && (rest.starts_with(second)
+                        || rest
+                            .strip_prefix(middle)
+                            .is_some_and(|r| r.starts_with(second)))
+                {
+                    return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
+    }
+}
 
 /// Classify whether a failed attempt's error text matches a known retryable-failure pattern
 /// (R-SA-039).
@@ -203,7 +334,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[&str] = &[
 /// whether the failure was a timeout: R-SA-036's load-bearing ordering rule ("timeout terminates
 /// the ladder... unlike other retryable failures") requires the *caller* ([`run_fallback_ladder`])
 /// to check `timed_out` as a wholly distinct branch **before** ever consulting this function,
-/// because the retryable-pattern set above deliberately includes `"timed out"`/`"timeout"` (a
+/// because the retryable-pattern set above deliberately includes `timed? out`/`timeout` (a
 /// real, common provider-error phrase for a *provider-side* request timeout, distinct from *this
 /// orchestrator's own* wall-clock deadline expiring) — a timeout-classified attempt's error text
 /// can plainly match this classifier's own patterns, which would otherwise wrongly continue the
@@ -223,9 +354,12 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
         return false;
     }
     let haystack = error.to_lowercase();
-    RETRYABLE_MODEL_FAILURE_PATTERNS
-        .iter()
-        .any(|pattern| haystack.contains(pattern))
+    // Per-line so the `.*`/`\s*`/`.?` constructs never cross a newline (JS `.`-no-newline). A
+    // `Contains`/`WordNumber` needle can never straddle a `\n` either, so per-line evaluation is
+    // equivalent to whole-string for those and correct for the sequence patterns.
+    haystack
+        .split('\n')
+        .any(|line| RETRYABLE_MODEL_FAILURE_PATTERNS.iter().any(|p| line_matches(line, p)))
 }
 
 /// Format the "prior attempt failed" note appended into the next attempt's initial
@@ -340,47 +474,29 @@ pub struct AttemptSignal {
     /// `timed_out`, since downstream gate-bypass behavior distinguishes the two (R-SA-037 bypasses
     /// acceptance/completion-guard/truncation entirely; R-SA-036 does not).
     ///
-    /// # Why this is always `false` today (not a bug)
+    /// # How this is now wired (R-SA-037, reconciliation §4 step 5 item 3 — CLOSED)
     ///
-    /// There is currently **no live trigger path anywhere in this crate** that can ever set this
-    /// `true`, and that is intentional, not an oversight:
+    /// This field is now set from a REAL blocking-detach signal, via the intercom-companion wiring:
     ///
-    /// - The only production [`AttemptRunner`] impl, `exec::mod::SpawnedChildAttemptRunner`,
-    ///   hardcodes `detached: false` on every `AttemptSignal` it constructs (see that impl's own
-    ///   `run_attempt`, `exec/mod.rs`).
-    /// - The NDJSON wire union a child subprocess actually emits, [`crate::exec::ndjson::SubagentEvent`],
-    ///   has **no variant at all** carrying a "child is blocked on an intercom-style
-    ///   supervisor-clarify interaction" signal — so even a fully-faithful `AttemptRunner` reading
-    ///   every event on the wire today has nothing to observe that would justify setting this
-    ///   field.
-    /// - `crate::tui::intercom`'s `ClarifyRequest`/`AskLock`/`request_clarify` machinery (the
-    ///   actual R-SA-119/120 clarify/ask primitive) is a real, tested, in-memory single-slot lock,
-    ///   but it is explicitly documented (see that module's own `NOTE(clarify-deferred)`) as not
-    ///   wired to any live human-facing channel and not connected to this crate's spawn/exec path
-    ///   at all — it has no way to observe a real child subprocess's stdout, and nothing in
-    ///   `exec/` calls into it.
+    /// 1. A child that blocks on a `contact_supervisor` supervisor-clarify ask (the intercom
+    ///    `ask_and_wait` reasons `need_decision`/`interview`, `contact_supervisor.rs:81-101`) emits
+    ///    an ordinary `ToolExecutionStart` for the `contact_supervisor` tool on its NDJSON stdout —
+    ///    no new wire variant is needed (the recipe's "reuse an existing clarify-shaped event").
+    /// 2. `exec::mod::drive_attempt`'s NDJSON loop detects it (`contact_supervisor_block_prompt`),
+    ///    fires `crate::tui::intercom::spawn_clarify` against the executor's single-slot
+    ///    [`crate::tui::intercom::AskLock`] — backed in production by the intercom companion's real
+    ///    broker `ClarifyChannel` (threaded via `SubagentsExtension::with_channels` →
+    ///    `RunOptions::clarify`) — which surfaces the ask to the parent's human and routes the answer
+    ///    back to the still-alive child over the BROKER (a transport independent of this stdout pipe).
+    /// 3. `SpawnedChildAttemptRunner::run_attempt` carries the drive loop's `detached` observation
+    ///    onto this field, so the ladder does not advance and `run_sync`'s acceptance/completion-guard/
+    ///    truncation gate is bypassed — both of which already correctly branch on this flag.
     ///
-    /// This is the sanctioned, documented deferral tracked as architecture.md §12 open questions
-    /// item 6 (the `LiveHostServices`/`ui_sink` wiring is currently WASM-guest-only; reaching it
-    /// from this native extension requires adding a `cyrup-session-svc` dependency and threading a
-    /// constructor-time handle through `SubagentsExtension::new`, neither of which exists yet) and
-    /// func-SA §9 item 25 / architecture.md §12 item 7 (the `pi-intercom` companion transport's
-    /// Rust-port status is unconfirmed, so there is not even an external signal source to wire
-    /// from on the other end). **Do not fabricate a synthetic trigger for this field** (e.g. a
-    /// heuristic guess from output text, a fake NDJSON event, or a test-only backdoor reachable
-    /// from production code) — doing so would create a false "intercom detach" signal with no
-    /// real supervisor-clarify interaction behind it.
-    ///
-    /// A future phase that completes R-SA-119/120's live wiring should set this field from a real
-    /// blocking-detach signal by: (1) adding a `SubagentEvent` variant (or reusing an existing
-    /// clarify-shaped event once one exists on the wire) that a child emits when it blocks on a
-    /// supervisor-clarify interaction, (2) having `SpawnedChildAttemptRunner::run_attempt` observe
-    /// that event via `drive_attempt`'s NDJSON loop and route it through a constructed
-    /// `tui::intercom::AskLock` backed by a real `ClarifyChannel` (per `tui/intercom.rs`'s own
-    /// `NOTE(clarify-deferred)` seam), and (3) setting `AttemptSignal::detached = true` on that
-    /// attempt's outcome instead of the current unconditional `false` — with no change required to
-    /// `run_fallback_ladder`'s or `run_sync`'s own gate-bypass logic, both of which already
-    /// correctly branch on this flag.
+    /// When no intercom channel is wired (headless / SDK-embedder / a run with `RunOptions::clarify
+    /// = None`), the drive loop degrades gracefully: it still marks the attempt detached but the
+    /// `AskLock` degrades to its no-live-channel fallback (`ClarifyOutcome::NoLiveChannel`), never
+    /// blocking. **Do not fabricate a synthetic trigger** from output-text heuristics — the trigger
+    /// is a real `contact_supervisor` blocking-ask event on the child's own wire.
     pub detached: bool,
 }
 
@@ -771,6 +887,85 @@ mod tests {
         assert!(!is_retryable_model_failure(None));
         assert!(!is_retryable_model_failure(Some("")));
         assert!(!is_retryable_model_failure(Some("   ")));
+    }
+
+    #[test]
+    fn bare_http_status_codes_require_a_word_boundary_and_do_not_false_positive_on_larger_numbers() {
+        // pi `/\b429\b/` etc. — a status code embedded in a LARGER number is NOT a rate-limit/5xx
+        // signal. The prior bare-substring port wrongly fired on all of these.
+        for msg in [
+            "processed 4290 rows",
+            "sku 50249 shipped",
+            "error code 45021 encountered",
+            "offset 15040 of 20000",
+            "id x429y not found",
+        ] {
+            assert!(
+                !is_retryable_model_failure(Some(msg)),
+                "a status code embedded in a larger token must NOT be retryable: {msg}"
+            );
+        }
+        // ...but a genuine, word-bounded status code still is.
+        for msg in ["HTTP 429", "(429) Too Many", "got 502 from upstream", "-> 503", "504."] {
+            assert!(
+                is_retryable_model_failure(Some(msg)),
+                "a word-bounded status code MUST be retryable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_patterns_match_across_intervening_text_on_the_same_line() {
+        // pi `/provider.*unavailable/i` / `/model.*(?:load|fail|error)/i` — restored `.*` generality
+        // the hardcoded-variant substring port had dropped.
+        for msg in [
+            "the model provider is currently unavailable",
+            "provider openai returned: service is unavailable right now",
+            "model claude-x is temporarily disabled for this account",
+            "model gpt-9 could not be loaded: weights failed to fetch",
+        ] {
+            assert!(
+                is_retryable_model_failure(Some(msg)),
+                "a `.*` sequence pattern must match across intervening words: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_patterns_do_not_cross_a_newline() {
+        // JS `.` never matches `\n`, so `provider` on one line and `unavailable` on another is NOT
+        // a `provider.*unavailable` match — each pattern is evaluated per line.
+        assert!(
+            !is_retryable_model_failure(Some("provider foo\nthe endpoint is unavailable")),
+            "a `.*` sequence must not span a newline"
+        );
+        // But two independent lines, one of which independently matches, still trips.
+        assert!(is_retryable_model_failure(Some(
+            "some benign context\nthe provider is unavailable"
+        )));
+    }
+
+    #[test]
+    fn optional_run_patterns_match_exactly_what_pi_does() {
+        // `/cold.?start/i`, `/rate\s*limit/i`, `/timed? out/i`, `/temporar(?:ily)? unavailable/i`.
+        for msg in [
+            "coldstart penalty",
+            "cold start penalty",
+            "cold-start penalty",
+            "ratelimit hit",
+            "rate  limit hit", // \s* allows more than one space
+            "request time out",
+            "request timed out",
+            "temporarily unavailable",
+        ] {
+            assert!(is_retryable_model_failure(Some(msg)), "expected retryable: {msg}");
+        }
+        // `temporar(?:ily)? unavailable` matches "temporarily"/"temporar unavailable" but NOT the
+        // "temporary unavailable" spelling (faithful to pi's regex, which has no `y` branch).
+        assert!(
+            !is_retryable_model_failure(Some("temporary glitch, retry later")),
+            "\"temporary\" alone must not match the temporar(?:ily)? unavailable pattern"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

@@ -619,8 +619,15 @@ impl SessionBuilder {
         let host = ExtensionHost::with_wasm(host_config)?;
         #[cfg(not(feature = "wasm-host"))]
         let host = ExtensionHost::new(host_config);
+        // P-1 (reconciliation §2 item 1): late-bind the session's OWN `host_services` into every
+        // native built-in — the SAME `LiveHostServices` the WASM path gets via `discover_and_load`
+        // below — so a native extension can reach the live session id/file, dialogs, and
+        // message-injection from a background task OUTSIDE any `HostCtx`. `load_native_with_services`
+        // calls `NativeExtension::set_host_services` before `init`; the manager / ui sink / inject sink
+        // attach later (steps 6/10 + the mode entry point) and the captured `Arc` observes them.
+        let native_services: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
         for ext in self.native_extensions {
-            host.load_native(ext).await?;
+            host.load_native_with_services(ext, native_services.clone()).await?;
         }
         let ext_host = Arc::new(host);
 
@@ -818,10 +825,24 @@ impl SessionBuilder {
         };
         let system_prompt = SystemPromptBuilder::new().build(&prompt_inputs);
 
-        // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool plus the
-        // caller's custom tools are enable-able; the active set starts at the build-time selection.
+        // The extension-shaped active tool set (Pi `pi.getActiveTools()` after extension `active_tools`
+        // merge): base build-time selection PLUS any extension additions/overrides (e.g. a native
+        // extension that overrides a built-in `bash`). Computed here (moved ahead of the registry) so
+        // the dynamic registry below can include these overrides — see the extend below.
+        let active_tools = ext_host.active_tools(&base_tools)?;
+
+        // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
+        // custom tools, AND the extension-contributed/override tools are enable-able; the active set
+        // starts at the build-time selection. Including the extension tools is load-bearing: (a) the
+        // permission companion's registry / unknown-tool gate checks `all_tool_names` against this
+        // registry (an extension tool absent here would be falsely blocked as "unknown"), and (b) a
+        // `setActiveTools` rebuild (`DynamicToolState::set_active`) looks tools up BY NAME in this
+        // registry — an extension override (recording/test double or a real replacement of a built-in)
+        // must survive the rebuild rather than being replaced by the shadowed built-in. Extended LAST
+        // so an override wins the `BTreeMap`-by-name dedup in `DynamicToolState::new`.
         let mut registry_tools = visible.clone();
         registry_tools.extend(cfg.custom_tools.iter().cloned());
+        registry_tools.extend(active_tools.iter().cloned());
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools
             .iter()
             .map(|t| (t.name().to_string(), tool_contribution(t.name())))
@@ -847,7 +868,7 @@ impl SessionBuilder {
             existing.messages.iter().map(core_message_to_agent).collect();
 
         // ---- 8. extension host seams (cyrup-ext) — the host itself was built at step 4b ---------
-        let active_tools = ext_host.active_tools(&base_tools)?;
+        // (`active_tools` was computed above, ahead of the dynamic-tool registry.)
         let session_cancel = CancelToken::new();
         let ext_subscriber = ext_host.subscriber(session_cancel.clone());
         let ext_hooks = ext_host.hooks();

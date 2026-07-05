@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 
 use cyrup_config::{SettingsManager, SettingsScope};
 
-use crate::discovery::types::SubagentSettings;
+use crate::discovery::types::{AgentOverrideConfig, OverrideField, SubagentSettings};
 use crate::error::SubagentError;
 
 // =================================================================================================
@@ -295,6 +295,443 @@ pub fn describe_profiles(
         out.insert(name, loaded);
     }
     Ok(out)
+}
+
+// =================================================================================================
+// Profile FILE SHAPE (pi `buildProfileFile`, profiles.ts:385-400) + tier selection
+// =================================================================================================
+//
+// A GENERATED profile (`/subagents-generate-profiles <provider>`) is NOT merely a single
+// `defaultModel`; pi writes a per-agent `subagents.agentOverrides` map assigning EACH of the 8
+// builtin agents to one of three model tiers (`buildProfileFile`, profiles.ts:385-400) — and this
+// port additionally sets a representative `subagents.defaultModel` (the medium tier) so the
+// profile is a complete policy that also covers non-builtin/custom agents (see
+// [`build_profile_file`]). The tier→model mapping is
+// chosen by `pickTierModels` (profiles.ts:348-359) from the provider's ranked model list. The
+// LIVE-PROBE model *classification/ranking* (`refreshProviderModelCatalog`'s per-model probe +
+// `classifyModel`) is a sanctioned deferral (func-SA §9 item 31) — but the profile FILE SHAPE, the
+// tier-position math, and the per-provider catalog artifact are all pure, faithful, and ported
+// here. The caller (`extension.rs`) supplies the ranked model list (today from the static seed
+// catalog, the deferred-live-probe stand-in) and this module writes the pi-shaped files.
+
+/// The three model tiers a generated profile assigns across the 8 builtin agents (pi
+/// `pickTierModels` result, profiles.ts:348-359). Each is a model reference string (pi uses a
+/// fully-qualified `provider/id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierModels {
+    pub cheap: String,
+    pub medium: String,
+    pub strong: String,
+}
+
+/// Which of pi's two profile flavors a generation pass produces (`ProfileKind`, profiles.ts:12).
+/// Selects the tier *positions* used to pick cheap/medium/strong models from the provider's ranked
+/// model list (`profilePositions`, profiles.ts:342-346).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProfileKind {
+    /// Quota-optimized: bias toward the cheaper end of the ranked list (`{0, 1/3, 2/3}`), and drop
+    /// the single most-expensive model from the selection pool when more than one model exists.
+    Quota,
+    /// Quality-optimized: bias toward the stronger end of the ranked list (`{1/3, 2/3, 1}`).
+    Quality,
+}
+
+impl ProfileKind {
+    /// The profile-name suffix pi uses for this flavor (`<provider>.quota`/`<provider>.quality`).
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match self {
+            ProfileKind::Quota => "quota",
+            ProfileKind::Quality => "quality",
+        }
+    }
+}
+
+/// The 8 builtin agent names in pi's `buildProfileFile` grouping (profiles.ts:389-396): two
+/// cheap-tier, three medium-tier, three strong-tier — every one of the 8 builtins is assigned.
+pub const PROFILE_CHEAP_AGENTS: [&str; 2] = ["scout", "delegate"];
+/// See [`PROFILE_CHEAP_AGENTS`].
+pub const PROFILE_MEDIUM_AGENTS: [&str; 3] = ["planner", "context-builder", "researcher"];
+/// See [`PROFILE_CHEAP_AGENTS`].
+pub const PROFILE_STRONG_AGENTS: [&str; 3] = ["worker", "reviewer", "oracle"];
+
+/// One agent's tier override: a per-agent `{ model }` delta, the only field pi's profile files
+/// ever set.
+fn tier_override(model: &str) -> AgentOverrideConfig {
+    AgentOverrideConfig {
+        model: OverrideField::Value(model.to_string()),
+        ..AgentOverrideConfig::default()
+    }
+}
+
+/// Build a subagent profile file from a tier assignment — pi `buildProfileFile`
+/// (profiles.ts:385-400). Writes `subagents.agentOverrides.<agent>.model` for ALL EIGHT builtin
+/// agents: scout/delegate → `cheap`, planner/context-builder/researcher → `medium`,
+/// worker/reviewer/oracle → `strong`. (pi's `buildProfileFile` takes a `kind` argument it does not
+/// read — the tier assignment alone determines the file — so this port takes only the models.)
+///
+/// In addition to the 8-agent tier map, this sets `subagents.defaultModel` to the `medium` tier —
+/// the profile's representative fallback model for any agent that is NOT one of the 8 builtins
+/// (e.g. a user-authored custom agent that declares no model of its own). Without this, loading a
+/// generated profile would cover the builtins but silently leave every custom agent to fall
+/// through to the crate-global default; carrying the medium tier as `defaultModel` makes each
+/// generated profile a complete, self-contained model policy, and keeps quota vs. quality profiles
+/// distinct at the default level too (their `medium` picks differ by construction).
+#[must_use]
+pub fn build_profile_file(models: &TierModels) -> NamedProfile {
+    let mut overrides = BTreeMap::new();
+    for agent in PROFILE_CHEAP_AGENTS {
+        overrides.insert(agent.to_string(), tier_override(&models.cheap));
+    }
+    for agent in PROFILE_MEDIUM_AGENTS {
+        overrides.insert(agent.to_string(), tier_override(&models.medium));
+    }
+    for agent in PROFILE_STRONG_AGENTS {
+        overrides.insert(agent.to_string(), tier_override(&models.strong));
+    }
+    NamedProfile {
+        subagents: SubagentSettings {
+            overrides,
+            default_model: Some(models.medium.clone()),
+            ..SubagentSettings::default()
+        },
+    }
+}
+
+/// The cheap/medium/strong sampling positions for `kind` (pi `profilePositions`,
+/// profiles.ts:342-346), each a `0.0..=1.0` fraction into the ranked selection pool.
+fn profile_positions(kind: ProfileKind) -> (f64, f64, f64) {
+    match kind {
+        ProfileKind::Quota => (0.0, 1.0 / 3.0, 2.0 / 3.0),
+        ProfileKind::Quality => (1.0 / 3.0, 2.0 / 3.0, 1.0),
+    }
+}
+
+/// Map a `0.0..=1.0` position into a valid index of a `count`-element list (pi `roundIndex`,
+/// profiles.ts:337-340): `count <= 1` collapses to `0`; otherwise `round((count-1) * position)`,
+/// clamped into `0..=count-1`.
+fn round_index(count: usize, position: f64) -> usize {
+    if count <= 1 {
+        return 0;
+    }
+    let max = count - 1;
+    let raw = ((max as f64) * position).round();
+    let clamped = raw.clamp(0.0, max as f64);
+    clamped as usize
+}
+
+/// Pick the cheap/medium/strong models for `kind` from a RANKED model list (pi `pickTierModels`,
+/// profiles.ts:348-359): quality samples the whole list; quota drops the single most-expensive
+/// (last) model from the selection pool when more than one exists, then samples that shorter pool.
+///
+/// `ranked_models` MUST already be in ascending capability/rank order (cheapest/weakest first),
+/// matching pi's `models.sort((a,b) => a.derived.profileRank - b.derived.profileRank)` before this
+/// call — this function performs no ranking of its own (the ranking signal is the deferred
+/// live-probe classifier's job; the caller supplies its best available ordering).
+///
+/// # Errors
+///
+/// Returns [`SubagentError::MalformedSettings`] if `ranked_models` is empty (pi throws "No provider
+/// models are available for profile generation.").
+pub fn pick_tier_models(
+    ranked_models: &[String],
+    kind: ProfileKind,
+) -> Result<TierModels, SubagentError> {
+    if ranked_models.is_empty() {
+        return Err(SubagentError::MalformedSettings(
+            "no provider models are available for profile generation".to_string(),
+        ));
+    }
+    let pool: &[String] = if matches!(kind, ProfileKind::Quota) && ranked_models.len() > 1 {
+        ranked_models
+            .split_last()
+            .map(|(_, rest)| rest)
+            .unwrap_or(ranked_models)
+    } else {
+        ranked_models
+    };
+    let (cheap_pos, medium_pos, strong_pos) = profile_positions(kind);
+    let pick = |pos: f64| -> String {
+        let idx = round_index(pool.len(), pos);
+        pool.get(idx)
+            .or_else(|| pool.first())
+            .cloned()
+            .unwrap_or_default()
+    };
+    Ok(TierModels {
+        cheap: pick(cheap_pos),
+        medium: pick(medium_pos),
+        strong: pick(strong_pos),
+    })
+}
+
+/// The `worker`-tier model of a loaded profile, if it sets one (pi `getProfileWorkerModel`,
+/// slash-commands.ts:336-339) — the model `/subagents-load-profile` offers to switch the live
+/// session to. `None` when the profile does not override `worker`'s model (or sets it to blank).
+#[must_use]
+pub fn profile_worker_model(profile: &NamedProfile) -> Option<String> {
+    match profile.subagents.overrides.get("worker").map(|o| &o.model) {
+        Some(OverrideField::Value(model)) if !model.trim().is_empty() => {
+            Some(model.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+// =================================================================================================
+// Named-profile WRITE + file-based settings apply (pi writeJsonFile / applySubagentProfile)
+// =================================================================================================
+
+/// Serialize `profile` and write it to `<profiles_dir>/<name>.json` (pi `writeJsonFile`,
+/// profiles.ts:94-97: pretty-printed, two-space indent, trailing newline). Creates `profiles_dir`
+/// if absent. `name` is validated through [`profile_path`] before any filesystem access.
+///
+/// # Errors
+///
+/// - [`SubagentError::UnsafePathToken`] if `name` fails the R-SA-142 allowlist.
+/// - [`SubagentError::Spawn`] on a filesystem I/O failure.
+/// - [`SubagentError::MalformedSettings`] if `profile` cannot be serialized.
+pub fn write_named_profile(
+    profiles_dir: &Path,
+    name: &str,
+    profile: &NamedProfile,
+) -> Result<PathBuf, SubagentError> {
+    let path = profile_path(profiles_dir, name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
+    }
+    let mut text = serde_json::to_string_pretty(profile).map_err(|e| {
+        SubagentError::MalformedSettings(format!("could not serialize profile {name:?}: {e}"))
+    })?;
+    text.push('\n');
+    std::fs::write(&path, text).map_err(SubagentError::Spawn)?;
+    Ok(path)
+}
+
+/// The result of a `/subagents-generate-profiles` pass: both written profile paths plus the tier
+/// assignments each ended up with (mirrors pi `generateProfilesForProvider`'s return shape,
+/// profiles.ts:584).
+#[derive(Clone, Debug)]
+pub struct GeneratedProfiles {
+    pub quota_path: PathBuf,
+    pub quality_path: PathBuf,
+    pub quota_models: TierModels,
+    pub quality_models: TierModels,
+}
+
+/// Generate and write the `<provider>.quota` and `<provider>.quality` profiles from a RANKED model
+/// list — the pure, filesystem-writing core of `/subagents-generate-profiles` (pi
+/// `generateProfilesForProvider`, profiles.ts:579-606, minus the deferred live-probe catalog
+/// refresh the caller performs separately). Both files carry the full 8-agent tier map
+/// ([`build_profile_file`]).
+///
+/// # Errors
+///
+/// - [`SubagentError::UnsafePathToken`] if `provider` fails the R-SA-142 allowlist.
+/// - [`SubagentError::MalformedSettings`] if `ranked_models` is empty ([`pick_tier_models`]).
+/// - [`SubagentError::Spawn`] on a filesystem I/O failure.
+pub fn generate_provider_profiles(
+    profiles_dir: &Path,
+    provider: &str,
+    ranked_models: &[String],
+) -> Result<GeneratedProfiles, SubagentError> {
+    validate_profile_name(provider)?;
+    let quota_models = pick_tier_models(ranked_models, ProfileKind::Quota)?;
+    let quality_models = pick_tier_models(ranked_models, ProfileKind::Quality)?;
+    std::fs::create_dir_all(profiles_dir).map_err(SubagentError::Spawn)?;
+    let quota_path = write_named_profile(
+        profiles_dir,
+        &format!("{provider}.{}", ProfileKind::Quota.suffix()),
+        &build_profile_file(&quota_models),
+    )?;
+    let quality_path = write_named_profile(
+        profiles_dir,
+        &format!("{provider}.{}", ProfileKind::Quality.suffix()),
+        &build_profile_file(&quality_models),
+    )?;
+    Ok(GeneratedProfiles {
+        quota_path,
+        quality_path,
+        quota_models,
+        quality_models,
+    })
+}
+
+/// Apply a loaded profile by REPLACING ONLY the `subagents` key of an on-disk `settings.json`
+/// file, preserving every other top-level key (pi `applySubagentProfile`, profiles.ts:467-474 →
+/// `writeJsonFile`). This is the file-based counterpart to [`apply_profile`] (which targets a
+/// `cyrup-config` [`SettingsManager`] store): `/subagents-load-profile` writes the SAME user
+/// settings file the extension's discovery reads its `subagents.*` layer back from, so a loaded
+/// profile takes effect on the next discovery pass exactly as pi's does.
+///
+/// An absent settings file is treated as an empty object (pi `readSettingsFile`, profiles.ts:145-148);
+/// a settings file that is not a JSON object aborts with [`SubagentError::MalformedSettings`] (pi
+/// `readJsonObjectFile`, profiles.ts:85-92). Output matches pi `writeJsonFile`: pretty two-space
+/// indent + trailing newline, with the parent directory created if needed.
+///
+/// # Errors
+///
+/// - [`SubagentError::MalformedSettings`] if the existing settings file is not valid JSON or is not
+///   a JSON object, or if `profile.subagents` cannot be serialized.
+/// - [`SubagentError::Spawn`] on a filesystem I/O failure.
+pub fn apply_profile_to_settings_file(
+    settings_path: &Path,
+    profile: &NamedProfile,
+) -> Result<(), SubagentError> {
+    let mut root: serde_json::Map<String, serde_json::Value> = match std::fs::read_to_string(
+        settings_path,
+    ) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => {
+                return Err(SubagentError::MalformedSettings(format!(
+                    "settings file {} must contain a JSON object",
+                    settings_path.display()
+                )));
+            }
+            Err(e) => {
+                return Err(SubagentError::MalformedSettings(format!(
+                    "settings file {}: {e}",
+                    settings_path.display()
+                )));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(e) => return Err(SubagentError::Spawn(e)),
+    };
+
+    let subagents_value = serde_json::to_value(&profile.subagents).map_err(|e| {
+        SubagentError::MalformedSettings(format!("could not serialize profile subagents: {e}"))
+    })?;
+    root.insert("subagents".to_string(), subagents_value);
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
+    }
+    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(root)).map_err(|e| {
+        SubagentError::MalformedSettings(format!("could not serialize settings: {e}"))
+    })?;
+    text.push('\n');
+    std::fs::write(settings_path, text).map_err(SubagentError::Spawn)?;
+    Ok(())
+}
+
+// =================================================================================================
+// Per-provider model catalog files (pi getProviderModelsPath / readProviderModelCatalog)
+// =================================================================================================
+
+/// pi's default provider-catalog staleness window (`DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS`,
+/// profiles.ts:9): a cached per-provider catalog older than this is refreshed unless `--force`
+/// forces a rewrite of a still-fresh one.
+pub const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS: u64 = 7;
+
+/// The per-provider catalog directory under `profiles_dir` (pi `getProviderModelsDir`,
+/// profiles.ts:438-440: a `providers/` child of the profiles root).
+#[must_use]
+pub fn provider_models_dir(profiles_dir: &Path) -> PathBuf {
+    profiles_dir.join("providers")
+}
+
+/// The on-disk path of one provider's model catalog file (pi `getProviderModelsPath`,
+/// profiles.ts:448-450: `<providers>/<provider>.models.json`). Validates `provider` via
+/// [`validate_profile_name`] before constructing the path (R-SA-142).
+///
+/// # Errors
+///
+/// Returns [`SubagentError::UnsafePathToken`] if `provider` fails the R-SA-142 allowlist.
+pub fn provider_models_path(
+    profiles_dir: &Path,
+    provider: &str,
+) -> Result<PathBuf, SubagentError> {
+    validate_profile_name(provider)?;
+    Ok(provider_models_dir(profiles_dir).join(format!("{provider}.models.json")))
+}
+
+/// One model entry in a per-provider catalog file. The full live-probe `observed`/`derived`
+/// classification block (pi `ProviderModelCatalogModel`, profiles.ts:31-64) is a sanctioned
+/// deferral (func-SA §9 item 31); this ported subset carries the two fields every downstream
+/// consumer (profile generation, `/subagents-check-profile`) actually reads: the bare `id` and the
+/// fully-qualified `fullId` (`provider/id`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCatalogModel {
+    pub id: String,
+    pub full_id: String,
+}
+
+/// A per-provider model catalog file (pi `ProviderModelCatalogFile`, profiles.ts:66-72), the
+/// on-disk artifact `/subagents-refresh-provider-models` writes and `/subagents-generate-profiles`
+/// reads its ranked model list from. `refreshed_at_epoch_ms` stamps the write time for the
+/// [`is_provider_catalog_stale`] freshness/`--force` decision.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelCatalog {
+    pub provider: String,
+    pub refreshed_at_epoch_ms: u64,
+    pub max_age_days: u64,
+    pub sources: Vec<String>,
+    pub models: Vec<ProviderCatalogModel>,
+}
+
+/// Whether `catalog` is older than its `max_age_days` window as of `now_epoch_ms` (pi
+/// `isProviderModelCatalogStale`, profiles.ts:482-487). A catalog written in the future
+/// (`refreshed_at_epoch_ms > now_epoch_ms`, e.g. clock skew) is treated as fresh, never stale.
+#[must_use]
+pub fn is_provider_catalog_stale(
+    catalog: &ProviderModelCatalog,
+    now_epoch_ms: u64,
+    max_age_days: u64,
+) -> bool {
+    let max_age_ms = max_age_days.saturating_mul(24 * 60 * 60 * 1000);
+    now_epoch_ms.saturating_sub(catalog.refreshed_at_epoch_ms) > max_age_ms
+}
+
+/// Read one provider's cached catalog file, if present (pi `readProviderModelCatalog`,
+/// profiles.ts:476-480). `Ok(None)` when the file does not exist (a never-refreshed provider is a
+/// normal state, not an error).
+///
+/// # Errors
+///
+/// - [`SubagentError::UnsafePathToken`] if `provider` fails the R-SA-142 allowlist.
+/// - [`SubagentError::MalformedSettings`] if the file exists but is not a valid catalog JSON.
+/// - [`SubagentError::Spawn`] on a filesystem I/O failure other than not-found.
+pub fn read_provider_catalog(
+    profiles_dir: &Path,
+    provider: &str,
+) -> Result<Option<ProviderModelCatalog>, SubagentError> {
+    let path = provider_models_path(profiles_dir, provider)?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+            SubagentError::MalformedSettings(format!("provider catalog {provider:?}: {e}"))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SubagentError::Spawn(e)),
+    }
+}
+
+/// Write one provider's catalog file (pi `writeJsonFile` targeting `getProviderModelsPath`,
+/// profiles.ts:575), creating the `providers/` directory if absent. Pretty two-space indent +
+/// trailing newline, matching pi's `writeJsonFile`.
+///
+/// # Errors
+///
+/// - [`SubagentError::UnsafePathToken`] if `catalog.provider` fails the R-SA-142 allowlist.
+/// - [`SubagentError::MalformedSettings`] if `catalog` cannot be serialized.
+/// - [`SubagentError::Spawn`] on a filesystem I/O failure.
+pub fn write_provider_catalog(
+    profiles_dir: &Path,
+    catalog: &ProviderModelCatalog,
+) -> Result<PathBuf, SubagentError> {
+    let path = provider_models_path(profiles_dir, &catalog.provider)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
+    }
+    let mut text = serde_json::to_string_pretty(catalog).map_err(|e| {
+        SubagentError::MalformedSettings(format!("could not serialize provider catalog: {e}"))
+    })?;
+    text.push('\n');
+    std::fs::write(&path, text).map_err(SubagentError::Spawn)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -830,5 +1267,306 @@ mod tests {
         assert_eq!(described.len(), 2);
         assert!(described.get("good").expect("good entry present").is_ok());
         assert!(described.get("bad").expect("bad entry present").is_err());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // build_profile_file: the 8-agent tier map (pi buildProfileFile, profiles.ts:385-400)
+    // -----------------------------------------------------------------------------------------
+
+    fn override_model(profile: &NamedProfile, agent: &str) -> Option<String> {
+        match profile.subagents.overrides.get(agent).map(|o| &o.model) {
+            Some(OverrideField::Value(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn build_profile_file_assigns_all_eight_builtins_to_their_tier() {
+        let models = TierModels {
+            cheap: "prov/cheap-1".to_string(),
+            medium: "prov/medium-1".to_string(),
+            strong: "prov/strong-1".to_string(),
+        };
+        let profile = build_profile_file(&models);
+
+        // Exactly the 8 builtin agents, no more, no fewer.
+        assert_eq!(profile.subagents.overrides.len(), 8);
+
+        // scout/delegate -> cheap
+        assert_eq!(override_model(&profile, "scout").as_deref(), Some("prov/cheap-1"));
+        assert_eq!(override_model(&profile, "delegate").as_deref(), Some("prov/cheap-1"));
+        // planner/context-builder/researcher -> medium
+        assert_eq!(override_model(&profile, "planner").as_deref(), Some("prov/medium-1"));
+        assert_eq!(
+            override_model(&profile, "context-builder").as_deref(),
+            Some("prov/medium-1")
+        );
+        assert_eq!(
+            override_model(&profile, "researcher").as_deref(),
+            Some("prov/medium-1")
+        );
+        // worker/reviewer/oracle -> strong
+        assert_eq!(override_model(&profile, "worker").as_deref(), Some("prov/strong-1"));
+        assert_eq!(override_model(&profile, "reviewer").as_deref(), Some("prov/strong-1"));
+        assert_eq!(override_model(&profile, "oracle").as_deref(), Some("prov/strong-1"));
+    }
+
+    #[test]
+    fn build_profile_file_serializes_to_pi_agent_overrides_shape() {
+        let models = TierModels {
+            cheap: "openai-codex/gpt-5.3-codex-spark".to_string(),
+            medium: "openai-codex/gpt-5.4-mini".to_string(),
+            strong: "openai-codex/gpt-5.5".to_string(),
+        };
+        let profile = build_profile_file(&models);
+        let value = serde_json::to_value(&profile).expect("serialize");
+        // pi shape: { "subagents": { "agentOverrides": { "scout": { "model": "..." }, ... } } }
+        let scout_model = value
+            .get("subagents")
+            .and_then(|s| s.get("agentOverrides"))
+            .and_then(|a| a.get("scout"))
+            .and_then(|s| s.get("model"))
+            .and_then(|m| m.as_str());
+        assert_eq!(scout_model, Some("openai-codex/gpt-5.3-codex-spark"));
+        let worker_model = value
+            .get("subagents")
+            .and_then(|s| s.get("agentOverrides"))
+            .and_then(|a| a.get("worker"))
+            .and_then(|w| w.get("model"))
+            .and_then(|m| m.as_str());
+        assert_eq!(worker_model, Some("openai-codex/gpt-5.5"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // pick_tier_models: pi profiles.test.ts:169-189 executable-spec scenario, reproduced exactly
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn pick_tier_models_reproduces_pi_quota_and_quality_selection() {
+        // pi profiles.test.ts: a ranked list of four models; quota drops the last (most expensive)
+        // from its pool, quality samples the whole list.
+        let ranked = vec![
+            "openai-codex/gpt-5.3-codex-spark".to_string(),
+            "openai-codex/gpt-5.4-mini".to_string(),
+            "openai-codex/gpt-5.4".to_string(),
+            "openai-codex/gpt-5.5".to_string(),
+        ];
+
+        let quota = pick_tier_models(&ranked, ProfileKind::Quota).expect("quota");
+        assert_eq!(quota.cheap, "openai-codex/gpt-5.3-codex-spark");
+        assert_eq!(quota.medium, "openai-codex/gpt-5.4-mini");
+        assert_eq!(quota.strong, "openai-codex/gpt-5.4-mini");
+
+        let quality = pick_tier_models(&ranked, ProfileKind::Quality).expect("quality");
+        assert_eq!(quality.cheap, "openai-codex/gpt-5.4-mini");
+        assert_eq!(quality.medium, "openai-codex/gpt-5.4");
+        assert_eq!(quality.strong, "openai-codex/gpt-5.5");
+    }
+
+    #[test]
+    fn pick_tier_models_single_model_maps_all_tiers_to_it() {
+        let ranked = vec!["only/model".to_string()];
+        let quota = pick_tier_models(&ranked, ProfileKind::Quota).expect("quota");
+        assert_eq!(quota.cheap, "only/model");
+        assert_eq!(quota.medium, "only/model");
+        assert_eq!(quota.strong, "only/model");
+        let quality = pick_tier_models(&ranked, ProfileKind::Quality).expect("quality");
+        assert_eq!(quality.strong, "only/model");
+    }
+
+    #[test]
+    fn pick_tier_models_rejects_empty_list() {
+        let empty: Vec<String> = Vec::new();
+        assert!(matches!(
+            pick_tier_models(&empty, ProfileKind::Quota),
+            Err(SubagentError::MalformedSettings(_))
+        ));
+    }
+
+    #[test]
+    fn round_index_edge_cases() {
+        assert_eq!(round_index(0, 0.5), 0);
+        assert_eq!(round_index(1, 0.9), 0);
+        assert_eq!(round_index(4, 0.0), 0);
+        assert_eq!(round_index(4, 1.0), 3);
+        assert_eq!(round_index(4, 1.0 / 3.0), 1);
+        assert_eq!(round_index(4, 2.0 / 3.0), 2);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // generate_provider_profiles: writes both files with the 8-agent tier map
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn generate_provider_profiles_writes_quota_and_quality_with_eight_agent_map() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let ranked = vec![
+            "prov/cheap".to_string(),
+            "prov/mid".to_string(),
+            "prov/strong".to_string(),
+        ];
+        let result =
+            generate_provider_profiles(tmp.path(), "prov", &ranked).expect("generate profiles");
+
+        assert!(result.quota_path.ends_with("prov.quota.json"));
+        assert!(result.quality_path.ends_with("prov.quality.json"));
+
+        // Both files are real, load back through the read-only loader, and carry all 8 agents.
+        let quota = load_profile(tmp.path(), "prov.quota").expect("load quota");
+        let quality = load_profile(tmp.path(), "prov.quality").expect("load quality");
+        assert_eq!(quota.subagents.overrides.len(), 8);
+        assert_eq!(quality.subagents.overrides.len(), 8);
+        assert_eq!(
+            override_model(&quota, "scout").as_deref(),
+            Some(result.quota_models.cheap.as_str())
+        );
+        assert_eq!(
+            override_model(&quality, "worker").as_deref(),
+            Some(result.quality_models.strong.as_str())
+        );
+
+        // Both files are discoverable via the ordinary profile listing.
+        let names = list_profiles(tmp.path()).expect("list");
+        assert!(names.contains(&"prov.quota".to_string()));
+        assert!(names.contains(&"prov.quality".to_string()));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // apply_profile_to_settings_file: file-based, replaces ONLY subagents (pi applySubagentProfile)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn apply_profile_to_settings_file_replaces_only_subagents_key() {
+        // Mirrors pi profiles.test.ts "applies a saved profile by replacing only settings.subagents".
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("agent").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            r#"{ "defaultModel": "openai/gpt-5", "subagents": { "agentOverrides": { "scout": { "model": "old" } } } }"#,
+        )
+        .expect("seed settings");
+
+        let profile = build_profile_file(&TierModels {
+            cheap: "openai-codex/gpt-5.3-codex-spark".to_string(),
+            medium: "openai-codex/gpt-5.4-mini".to_string(),
+            strong: "openai-codex/gpt-5.5".to_string(),
+        });
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        // Sibling top-level key untouched.
+        assert_eq!(written.get("defaultModel").and_then(|v| v.as_str()), Some("openai/gpt-5"));
+        // subagents replaced wholesale with the profile's 8-agent map.
+        let scout = written
+            .get("subagents")
+            .and_then(|s| s.get("agentOverrides"))
+            .and_then(|a| a.get("scout"))
+            .and_then(|s| s.get("model"))
+            .and_then(|m| m.as_str());
+        assert_eq!(scout, Some("openai-codex/gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn apply_profile_to_settings_file_creates_file_when_absent() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("nested").join("settings.json");
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                default_model: Some("fresh".to_string()),
+                ..Default::default()
+            },
+        };
+        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            written
+                .get("subagents")
+                .and_then(|s| s.get("defaultModel"))
+                .and_then(|m| m.as_str()),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn apply_profile_to_settings_file_rejects_non_object_settings() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(&settings_path, "[1, 2, 3]").expect("seed array settings");
+        let result = apply_profile_to_settings_file(&settings_path, &NamedProfile::default());
+        assert!(matches!(result, Err(SubagentError::MalformedSettings(_))));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // profile_worker_model (pi getProfileWorkerModel)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn profile_worker_model_reads_the_worker_tier_override() {
+        let profile = build_profile_file(&TierModels {
+            cheap: "c".to_string(),
+            medium: "m".to_string(),
+            strong: "s".to_string(),
+        });
+        assert_eq!(profile_worker_model(&profile).as_deref(), Some("s"));
+
+        assert!(profile_worker_model(&NamedProfile::default()).is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // per-provider catalog round-trip + staleness (pi ProviderModelCatalogFile / stale)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn provider_catalog_round_trips_and_staleness_respects_window() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let catalog = ProviderModelCatalog {
+            provider: "openai".to_string(),
+            refreshed_at_epoch_ms: 1_000_000,
+            max_age_days: DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
+            sources: vec!["runtime-registry".to_string()],
+            models: vec![ProviderCatalogModel {
+                id: "gpt-4o".to_string(),
+                full_id: "openai/gpt-4o".to_string(),
+            }],
+        };
+        let path = write_provider_catalog(tmp.path(), &catalog).expect("write catalog");
+        assert!(path.ends_with("providers/openai.models.json"));
+
+        let read = read_provider_catalog(tmp.path(), "openai")
+            .expect("read catalog")
+            .expect("catalog present");
+        assert_eq!(read, catalog);
+
+        assert!(read_provider_catalog(tmp.path(), "never-refreshed")
+            .expect("read absent")
+            .is_none());
+
+        let day_ms: u64 = 24 * 60 * 60 * 1000;
+        // Within the window: fresh.
+        assert!(!is_provider_catalog_stale(
+            &catalog,
+            catalog.refreshed_at_epoch_ms + day_ms,
+            DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS
+        ));
+        // Past the window: stale.
+        assert!(is_provider_catalog_stale(
+            &catalog,
+            catalog.refreshed_at_epoch_ms + day_ms * 8,
+            DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS
+        ));
+    }
+
+    #[test]
+    fn provider_models_path_rejects_unsafe_provider_name() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        assert!(matches!(
+            provider_models_path(tmp.path(), "../escape"),
+            Err(SubagentError::UnsafePathToken(_))
+        ));
     }
 }

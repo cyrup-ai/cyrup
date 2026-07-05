@@ -573,6 +573,238 @@ pub fn classify_outcome(result: &ResultFile) -> ClassifiedOutcome {
     }
 }
 
+// =================================================================================================
+// Completion notification (C6): format + deliver + delete (notify.ts / result-watcher.ts)
+// =================================================================================================
+
+/// The `subagent-notify` message a completed background run produces (pi `notify.ts:97-104`'s
+/// `pi.sendMessage({customType:"subagent-notify", content, display:true}, {triggerTurn:true})`).
+/// `custom_type`/`display`/`trigger_turn` are fixed exactly as pi fixes them; only `content` varies,
+/// built by [`format_completion_message`] to reproduce notify.ts's status/summary/session-line
+/// layout character-for-character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionMessage {
+    /// Always `"subagent-notify"` (pi's `customType`).
+    pub custom_type: String,
+    /// The rendered notification body (status header, blank line, summary, optional session line).
+    pub content: String,
+    /// Always `true` (pi's `display: true`).
+    pub display: bool,
+    /// Always `true` (pi's `{ triggerTurn: true }`) — the completion re-enters the parent's normal
+    /// turn/prompt path so the LLM sees and can act on the background result (R-SA-101).
+    pub trigger_turn: bool,
+}
+
+/// Where a delivered [`CompletionMessage`] is sent (R-SA-101's turn-re-entry hand-off). Injecting a
+/// message into a live session's turn loop needs a session/agent-turn handle this crate does not
+/// hold (`HostCtx` exposes no message channel today — see this module's R-SA-101 note and arch-SA
+/// §2.1/§12 item 10), so the concrete production sink is threaded in from the host through the
+/// extension facade; the crate ships a graceful-degradation default ([`LoggingCompletionSink`]) and
+/// a capturing sink for tests.
+///
+/// `deliver` returns `true` if the message was delivered (so the underlying result file may now be
+/// deleted, R-SA-099's delete-last), or `false` to leave it in place for retry-in-place on the next
+/// scan (R-SA-102).
+#[async_trait::async_trait]
+pub trait CompletionSink: Send + Sync {
+    /// Deliver one completion notification. See the trait doc for the `true`/`false` contract.
+    async fn deliver(&self, message: CompletionMessage) -> bool;
+}
+
+/// The graceful-degradation default sink: emits the formatted notification to stderr and reports it
+/// delivered (so the result file is deleted, upholding pi's delete-last contract). Swapping in a
+/// live-session turn-injection sink is the remaining outer-layer hand-off (R-SA-101) — until the
+/// host threads a message channel through the extension facade, this keeps the watcher's install →
+/// scan → format → delete pipeline observable and correct rather than silently discarding
+/// completions.
+#[derive(Debug, Default)]
+pub struct LoggingCompletionSink;
+
+#[async_trait::async_trait]
+impl CompletionSink for LoggingCompletionSink {
+    async fn deliver(&self, message: CompletionMessage) -> bool {
+        eprintln!("[subagent-notify] {}", message.content);
+        true
+    }
+}
+
+/// The REAL turn-injecting completion sink (R-SA-101): a completed background run's `subagent-notify`
+/// message is injected LIVE into the orchestrator session via the P-1
+/// [`cyrup_ext::host::HostServices::inject_message`] backend, with `trigger_turn: true` so the
+/// completion re-enters the parent's turn loop (pi `notify.ts:97-104`'s
+/// `pi.sendMessage({customType, content, display}, {triggerTurn: true})`) — instead of the
+/// stderr-only [`LoggingCompletionSink`] degradation. Installed by
+/// [`crate::extension::SubagentExecutor::install_completion_watcher`] whenever the host-services slot
+/// is bound (a live session is present); the logging sink remains the no-host-handle default.
+///
+/// `deliver` returns `true` (delete the result file, R-SA-099's delete-last) only when injection
+/// succeeded; a failed `inject_message` returns `false`, leaving the file in place for retry-in-place
+/// on the next scan (R-SA-102).
+pub struct HostServicesCompletionSink {
+    services: std::sync::Arc<dyn cyrup_ext::host::HostServices>,
+}
+
+impl HostServicesCompletionSink {
+    /// Build a sink over the late-bound live capability backend (P-1).
+    #[must_use]
+    pub fn new(services: std::sync::Arc<dyn cyrup_ext::host::HostServices>) -> Self {
+        Self { services }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompletionSink for HostServicesCompletionSink {
+    async fn deliver(&self, message: CompletionMessage) -> bool {
+        // `HostServices::inject_message` is a synchronous host round-trip (the live sink bridges it
+        // onto the session's turn loop); run it on a blocking thread so a slow turn-injection never
+        // stalls this async drain task. A `spawn_blocking` join failure or an `Err` from the sink
+        // (no live turn loop / injection unavailable) degrades to "not delivered" → the result file
+        // is retried in place next scan, never silently dropped.
+        let services = self.services.clone();
+        let CompletionMessage { custom_type, content, display, trigger_turn } = message;
+        tokio::task::spawn_blocking(move || {
+            services
+                .inject_message(&content, Some(custom_type.as_str()), display, trigger_turn)
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+/// Derive the human-facing summary text for a completed run from its per-child [`SingleResult`]s
+/// (pi's `SubagentResult.summary`, which this crate's [`ResultFile`] does not carry as a distinct
+/// field): each child contributes its `final_output` (or, absent that, its `error`), non-empty
+/// entries joined by a blank line. Empty overall yields `""`, which [`format_completion_message`]
+/// renders as pi's `"(no output)"` fallback (`notify.ts:86`).
+fn result_display_summary(result: &ResultFile) -> String {
+    result
+        .results
+        .iter()
+        .filter_map(|child| {
+            let text = child.final_output.clone().or_else(|| child.error.clone())?;
+            if text.trim().is_empty() { None } else { Some(text) }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Build the `subagent-notify` [`CompletionMessage`] for `result`, reproducing pi's `notify.ts`
+/// content layout (`notify.ts:58-104`): a `Background task <status>: **<agent>**` header, a blank
+/// line, the display summary (or `"(no output)"`), and — when a session file is present — a blank
+/// line followed by `Session file: <path>`. `<status>` is `completed`/`failed`/`paused` per
+/// [`classify_outcome`] (R-SA-100; a paused run is never reported as failed).
+#[must_use]
+pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
+    let status = match classify_outcome(result) {
+        ClassifiedOutcome::Completed => "completed",
+        ClassifiedOutcome::Failed => "failed",
+        ClassifiedOutcome::Paused => "paused",
+    };
+    let agent = if result.agent.is_empty() { "unknown" } else { result.agent.as_str() };
+
+    let summary = result_display_summary(result);
+    let display_summary = if summary.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        summary
+    };
+
+    // pi's `content` array: header, "", displaySummary, then (only if a session line exists) ""
+    // and the session line, joined by "\n" (`notify.ts:87-95`).
+    let mut lines: Vec<String> = vec![
+        format!("Background task {status}: **{agent}**"),
+        String::new(),
+        display_summary,
+    ];
+    if let Some(session_file) = &result.session_file {
+        lines.push(String::new());
+        lines.push(format!("Session file: {}", session_file.display()));
+    }
+
+    CompletionMessage {
+        custom_type: "subagent-notify".to_string(),
+        content: lines.join("\n"),
+        display: true,
+        trigger_turn: true,
+    }
+}
+
+/// A live completion-watcher: keeps a real `notify::PollWatcher` over `ResultsDir` alive and a
+/// background task draining it. Dropping this handle stops both (the poll-watcher is released and
+/// the drain task is aborted), so a session's watcher is torn down cleanly when the extension
+/// replaces or forgets it.
+pub struct CompletionWatcherHandle {
+    /// Held only to keep the underlying filesystem watch alive — dropped (stopping the watch) when
+    /// this handle is dropped.
+    _poll_watcher: notify::PollWatcher,
+    /// The background drain task; aborted on drop.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CompletionWatcherHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Install a live completion watcher over `results_dir` (C6; pi `result-watcher.ts` +
+/// `notify.ts`): construct a [`ResultsWatcher`], attach its real `notify::PollWatcher`
+/// ([`ResultsWatcher::install`]), and spawn a background task that on every filesystem wake-up (and
+/// once immediately, priming any results already on disk) scans for freshly-completed runs, formats
+/// each into a [`CompletionMessage`], delivers it via `sink`, and — only after successful delivery —
+/// deletes the result file (R-SA-099's delete-last; a failed delivery leaves the file for
+/// retry-in-place, R-SA-102). Returns a [`CompletionWatcherHandle`] the caller MUST retain for the
+/// watch to stay live.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the underlying `notify::PollWatcher` cannot be attached to
+/// `results_dir` (e.g. it does not exist — the caller must `mkdir` it first, mirroring how
+/// `AsyncRoot`/`ResultsDir` are established by extension initialization).
+pub fn install_completion_watcher(
+    results_dir: PathBuf,
+    sink: Arc<dyn CompletionSink>,
+) -> Result<CompletionWatcherHandle, SubagentError> {
+    let watcher = ResultsWatcher::new(results_dir);
+    let (poll_watcher, rx) = watcher.install()?;
+    let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink));
+    Ok(CompletionWatcherHandle { _poll_watcher: poll_watcher, task })
+}
+
+/// The background drain loop [`install_completion_watcher`] spawns: prime once (so results already
+/// on disk at install time are delivered without waiting for a filesystem event), then
+/// deliver-on-every-wake-up until the watch is dropped (the channel closes and `recv` yields
+/// `None`).
+async fn drive_completion_watcher(
+    watcher: ResultsWatcher,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    sink: Arc<dyn CompletionSink>,
+) {
+    deliver_pending_completions(&watcher, &sink).await;
+    while rx.recv().await.is_some() {
+        deliver_pending_completions(&watcher, &sink).await;
+    }
+}
+
+/// Scan once and deliver+delete every not-yet-notified completion (R-SA-099's parse → dedup →
+/// notify → delete-last sequence; the parse/dedup half is [`ResultsWatcher::scan`]'s, the
+/// notify/delete half is here). A delivery the sink reports as failed is recorded as a
+/// processing failure so the SAME result is retried on the next scan rather than lost (R-SA-102).
+async fn deliver_pending_completions(watcher: &ResultsWatcher, sink: &Arc<dyn CompletionSink>) {
+    let Ok(found) = watcher.scan().await else {
+        return;
+    };
+    for notification in found {
+        let message = format_completion_message(&notification.result);
+        if sink.deliver(message).await {
+            let _ = watcher.delete_after_notify(&notification).await;
+        } else {
+            watcher.record_processing_failure(&notification).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -585,6 +817,7 @@ mod tests {
     use super::*;
     use crate::background::RunMode;
     use crate::background::atomic::write_atomic_json;
+    use crate::exec::SingleResult;
 
     fn temp_results_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");
@@ -939,5 +1172,185 @@ mod tests {
             after.is_empty(),
             "a scan after the event burst has settled must not re-notify"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Completion notification (C6): format + install + deliver-exactly-once + delete
+    // ---------------------------------------------------------------------------------------
+
+    fn child_result(agent: &str, final_output: Option<&str>, exit_code: i32) -> SingleResult {
+        SingleResult {
+            agent: agent.to_string(),
+            task: String::new(),
+            exit_code,
+            usage: cyrup_core::Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: final_output.map(str::to_string),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            error: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+        }
+    }
+
+    fn result_with_children(
+        run_id: &str,
+        state: RunState,
+        success: bool,
+        session_file: Option<PathBuf>,
+        children: Vec<SingleResult>,
+    ) -> ResultFile {
+        ResultFile {
+            id: RunId::from_token(run_id),
+            run_id: RunId::from_token(run_id),
+            agent: "worker".to_string(),
+            mode: RunMode::Single,
+            state,
+            success,
+            cwd: PathBuf::from("/tmp"),
+            session_file,
+            results: children,
+        }
+    }
+
+    /// A capturing [`CompletionSink`] for tests: records every delivered message and reports
+    /// delivered.
+    #[derive(Clone, Default)]
+    struct CapturingSink {
+        delivered: Arc<AsyncMutex<Vec<CompletionMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CompletionSink for CapturingSink {
+        async fn deliver(&self, message: CompletionMessage) -> bool {
+            self.delivered.lock().await.push(message);
+            true
+        }
+    }
+
+    #[test]
+    fn format_completion_message_reproduces_notify_ts_layout() {
+        // Completed, with output and a session file.
+        let result = result_with_children(
+            "run-fmt-1",
+            RunState::Complete,
+            true,
+            Some(PathBuf::from("/tmp/session.jsonl")),
+            vec![child_result("worker", Some("Done"), 0)],
+        );
+        let msg = format_completion_message(&result);
+        assert_eq!(msg.custom_type, "subagent-notify");
+        assert!(msg.display);
+        assert!(msg.trigger_turn);
+        assert_eq!(
+            msg.content,
+            "Background task completed: **worker**\n\nDone\n\nSession file: /tmp/session.jsonl"
+        );
+
+        // Empty output falls back to "(no output)".
+        let empty = result_with_children(
+            "run-fmt-2",
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", None, 0)],
+        );
+        assert_eq!(
+            format_completion_message(&empty).content,
+            "Background task completed: **worker**\n\n(no output)"
+        );
+
+        // A paused run is reported paused, never failed (R-SA-100).
+        let paused = result_with_children(
+            "run-fmt-3",
+            RunState::Paused,
+            false,
+            None,
+            vec![child_result("worker", Some("Paused after interrupt."), 0)],
+        );
+        assert_eq!(
+            format_completion_message(&paused).content,
+            "Background task paused: **worker**\n\nPaused after interrupt."
+        );
+
+        // A failed run is reported failed.
+        let failed = result_with_children(
+            "run-fmt-4",
+            RunState::Failed,
+            false,
+            None,
+            vec![child_result("worker", Some("boom"), 1)],
+        );
+        assert!(
+            format_completion_message(&failed)
+                .content
+                .starts_with("Background task failed: **worker**")
+        );
+    }
+
+    /// The load-bearing C6 test: a completing background run fires EXACTLY ONE notify and its
+    /// result file is deleted. Uses the real `notify::PollWatcher` install + drain pipeline, a
+    /// capturing sink, and a real on-disk result file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_completion_watcher_fires_exactly_one_notify_and_deletes_the_result() {
+        let (_dir, results_dir) = temp_results_dir();
+        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+
+        let sink = CapturingSink::default();
+        let delivered = Arc::clone(&sink.delivered);
+        let handle = install_completion_watcher(results_dir.clone(), Arc::new(sink))
+            .expect("watcher installs");
+
+        // A completing background run writes its terminal ResultFile into ResultsDir (the runner's
+        // last file-writing act, R-SA-077).
+        let result = result_with_children(
+            "run-notify-1",
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some("all done"), 0)],
+        );
+        let result_path = results_dir.join("run-notify-1.json");
+        write_atomic_json(&result_path, &result).await.expect("write result");
+
+        // Wait for the watcher to fire and delete the file (bounded).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = delivered.lock().await.len();
+            let gone = !result_path.exists();
+            if count >= 1 && gone {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "watcher did not fire+delete in time: delivered={count}, file_gone={gone}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Let any duplicate poll ticks / filesystem events settle, then assert EXACTLY ONE notify.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let messages = delivered.lock().await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "a completing background run must fire exactly one notify, got: {messages:?}"
+        );
+        assert_eq!(messages[0].custom_type, "subagent-notify");
+        assert!(messages[0].trigger_turn, "the notify must trigger a turn (R-SA-101)");
+        assert_eq!(
+            messages[0].content,
+            "Background task completed: **worker**\n\nall done"
+        );
+        assert!(!result_path.exists(), "the result file must be deleted after notify");
+
+        drop(handle);
     }
 }

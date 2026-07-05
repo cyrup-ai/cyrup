@@ -7,13 +7,18 @@
 //! [`tokio::process::Child`] handle dropped without ever being awaited).
 //!
 //! This module is the sole caller of [`cyrup_ext_subagents::background::runner_main::run`]: it
-//! reads the `--config <path>` argv value, derives the run's [`RunPaths`] from that path per this
-//! subsystem's fixed on-disk layout convention (`<AsyncRoot>/<run_id>/runner-config.json`, with
-//! `ResultsDir` as `<AsyncRoot>'s parent>/results`, matching every existing test/call-site
-//! convention in `cyrup-ext-subagents` — see `background::spawn_detached`'s "`cfg_path` is passed
-//! verbatim" contract and every `RunPaths::for_run` call site across that crate's own test suite),
-//! and calls `run` directly. There is no separate loader/interpreter hop — `cyrup` is already one
-//! compiled binary (arch-SA §6.5).
+//! reads the `--config <path>` argv value, derives a PROVISIONAL [`RunPaths`] from that path per
+//! this subsystem's fixed on-disk layout convention (`<AsyncRoot>/<run_id>/runner-config.json`),
+//! and calls `run` directly. `run` itself then rebuilds the authoritative [`RunPaths`] from the
+//! ABSOLUTE `asyncRoot`/`resultsDir` the orchestrator resolved once (via the shared
+//! `cyrup_ext_subagents::background::run_artifact_roots`) and carried in the `RunnerConfig` — the
+//! C7 fix. The provisional [`RunPaths`] this module derives is consulted only on `run`'s
+//! pre-config-read error paths (a missing/corrupt config, where no `RunnerConfig::results_dir` is
+//! available); its `ResultsDir` is therefore derived through the SAME shared function
+//! ([`cyrup_ext_subagents::background::results_dir_for_async_root`]) the orchestrator used, so even
+//! that fallback targets the exact `<subagents_home>/results/<cwd_key>` dir the orchestrator
+//! created — never the divergent `<AsyncRoot>'s parent>/results` that C7 documents. There is no
+//! separate loader/interpreter hop — `cyrup` is already one compiled binary (arch-SA §6.5).
 //!
 //! Never advertised to users: not listed in `--help`, not one of [`crate::subcommands::SUBCOMMANDS`]
 //! (that list is for the package/config subcommands, a distinct concern), and dispatched from
@@ -91,22 +96,25 @@ fn parse_config_flag(rest: &[String]) -> Result<PathBuf, String> {
     found.ok_or_else(|| format!("{SUBCOMMAND}: missing required --config <path> argument"))
 }
 
-/// Derive this run's [`RunPaths`] from the one-shot `runner-config.json` handoff file's own path,
-/// per the fixed on-disk layout convention every other module/test in `cyrup-ext-subagents`
-/// already assumes:
+/// Derive this run's PROVISIONAL [`RunPaths`] from the one-shot `runner-config.json` handoff file's
+/// own path, per the fixed on-disk layout convention every other module/test in
+/// `cyrup-ext-subagents` already assumes:
 ///
 /// ```text
-/// <AsyncRoot>/<run_id>/runner-config.json   (= cfg_path)
-/// <AsyncRoot>/<run_id>/...                  (= run_dir  = cfg_path's parent)
-/// <run_id>                                  (= run_dir's own final path component)
-/// <AsyncRoot's parent>/results/<run_id>.json  (= the terminal ResultFile)
+/// <AsyncRoot>/<run_id>/runner-config.json          (= cfg_path)
+/// <AsyncRoot>/<run_id>/...                          (= run_dir   = cfg_path's parent)
+/// <run_id>                                          (= run_dir's own final path component)
+/// results_dir_for_async_root(<AsyncRoot>)/<run_id>.json  (= the terminal ResultFile)
 /// ```
 ///
 /// This mirrors `background::runner_main::run_id_from_paths`'s own "the run dir's final path
-/// component is always the run id" assumption, and every `RunPaths::for_run(&async_root,
-/// &results_dir, &run_id)` call site's `async_root`/`results_dir` sibling-directory convention
-/// (`tests/background_runner_main_integration.rs`, `background/mod.rs`'s own doctests, etc. all
-/// construct `results_dir` as `<parent>/results` next to `<parent>/async`).
+/// component is always the run id" assumption. The `ResultsDir` is NOT re-derived by ad-hoc path
+/// arithmetic here (which is exactly what diverged from the orchestrator in C7); it is obtained
+/// from the ONE shared function [`cyrup_ext_subagents::background::results_dir_for_async_root`], so
+/// for the standard `<subagents_home>/async/<cwd_key>` async-root shape it reconstructs the exact
+/// `<subagents_home>/results/<cwd_key>` sibling the orchestrator created. This whole derivation is
+/// PROVISIONAL: `run` overrides it with the absolute roots carried in the `RunnerConfig` on every
+/// non-error path, so it only ever governs where a pre-config-read failure record lands.
 ///
 /// # Errors
 ///
@@ -140,7 +148,15 @@ fn derive_run_paths(cfg_path: &Path) -> Result<RunPaths, String> {
             cfg_path.display()
         )
     })?;
-    let results_dir = async_root.parent().unwrap_or(async_root).join("results");
+    // C7: `ResultsDir` is derived through the ONE shared function
+    // (`cyrup_ext_subagents::background::results_dir_for_async_root`) so this fallback derivation
+    // reconstructs the EXACT results dir the orchestrator created — `<subagents_home>/results/
+    // <cwd_key>`, a sibling of the async root that PRESERVES the per-cwd key — rather than the old
+    // `async_root.parent()/results`, which dropped the key and nested `results` under `async`, so
+    // the terminal ResultFile write targeted a directory that never existed (C7). This is only ever
+    // consulted on the pre-config-read error path in [`run`]; on the happy path [`run`] rebuilds
+    // `RunPaths` from the authoritative absolute roots carried in the `RunnerConfig` itself.
+    let results_dir = cyrup_ext_subagents::background::results_dir_for_async_root(async_root);
 
     let run_id = cyrup_ext_subagents::background::RunId::from_token(run_id_token);
     Ok(RunPaths::for_run(async_root, &results_dir, &run_id))
@@ -240,6 +256,34 @@ mod tests {
         let paths = derive_run_paths(&cfg).expect("derives");
         assert_eq!(paths.run_dir, PathBuf::from("/base/async/a1b2c3d4"));
         assert_eq!(paths.result, PathBuf::from("/base/results/a1b2c3d4.json"));
+    }
+
+    #[test]
+    fn derive_run_paths_results_dir_is_the_orchestrator_sibling_for_the_standard_layout() {
+        // Standard orchestrator layout: <home>/.cyrup/subagents/async/<cwd_key>/<run_id>/config.
+        // C7 regression: the provisional ResultFile dir must be the SIBLING
+        // <home>/.cyrup/subagents/results/<cwd_key> (preserving the cwd key), never the pre-fix
+        // <home>/.cyrup/subagents/async/results that dropped the key and nested results under async.
+        let cfg = PathBuf::from(
+            "/home/me/.cyrup/subagents/async/abcd1234/run00099/runner-config.json",
+        );
+        let paths = derive_run_paths(&cfg).expect("derives");
+        assert_eq!(
+            paths.run_dir,
+            PathBuf::from("/home/me/.cyrup/subagents/async/abcd1234/run00099")
+        );
+        assert_eq!(
+            paths.result,
+            PathBuf::from("/home/me/.cyrup/subagents/results/abcd1234/run00099.json"),
+            "the ResultFile must be the per-cwd-key sibling of the async root, matching the \
+             orchestrator's own run_artifact_roots derivation (C7)"
+        );
+        assert!(
+            !paths
+                .result
+                .starts_with("/home/me/.cyrup/subagents/async"),
+            "the results dir must never be nested under the async tree"
+        );
     }
 
     #[test]

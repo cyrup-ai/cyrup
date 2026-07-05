@@ -63,6 +63,8 @@
 
 use std::path::PathBuf;
 
+use cyrup_core::ModelId;
+
 use crate::discovery::types::OutputMode;
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec};
 
@@ -1103,22 +1105,35 @@ pub fn step_token_to_spec(
         Some(InlineReads::ExplicitlyDisabled) | None => None,
     };
     let cwd = step.config.cwd.as_ref().map(PathBuf::from);
-    let _ = in_group; // `count` has no SingleStepSpec-level home; a later phase's DynamicGroup
-    // template-instantiation path is where a group's per-task `count` (fan-out width hint) would
-    // apply, per this file's own module-header note on deferred DynamicGroup template binding.
+    let _ = in_group; // `count` is a fan-out WIDTH multiplier, not a per-step field: it has no
+    // `SingleStepSpec`-level home, so it is applied by the GROUP builder (`parse_chain_command`'s
+    // parallel-group arm) that repeats this spec `count` times, exactly as pi's
+    // `expandChainParallelCounts` does — mirroring source's `opts.inGroup && config.count` gate,
+    // which likewise only ever attaches `count` to a task INSIDE a parallel group.
 
     Ok(SingleStepSpec {
         agent: step.name.clone(),
         task,
         cwd,
-        model: None, // `config.model` is a raw string; resolving it to a `ModelId` requires the
-        // model registry this pure-parsing module has no access to (deferred to `extension.rs`).
+        // T1 (inline-overrides major, `slash-commands.ts:877` `config.model ? {model} : {}`): the
+        // inline `[model=…]` override now reaches the child. `ModelId::from` is a plain string
+        // wrapper (no registry lookup) — the same `ModelId::from` the `/run` single-run path and
+        // `ExecSingleStepExecutor::run_single`'s per-step `model_override` already use — so a chain/
+        // parallel step's `[model=x]` is honored end to end (previously dropped to `None`, C-major).
+        model: step.config.model.clone().map(ModelId::from),
         tools: None,
         extensions: None,
         session_file: None,
         max_depth_override: None,
         structured_output_schema: None,
         output,
+        // pi's inline `[output=<path>]` is the output FILE path; the explicit `output=false`
+        // sentinel (`InlineOutput::ExplicitlyDisabled`) and an empty path map to `None` (no file).
+        // Distinct from `output` above (pi's `as` registry KEY, mapped from `as_output`).
+        output_path: match &step.config.output {
+            Some(InlineOutput::Path(path)) if !path.is_empty() => Some(path.clone()),
+            _ => None,
+        },
         output_mode,
         reads,
         acceptance: step.config.acceptance.clone(),
@@ -1387,10 +1402,21 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
         .iter()
         .map(|element| match element {
             ParsedChainElement::Group { tasks, config } => {
-                let steps = tasks
-                    .iter()
-                    .map(|t| step_token_to_spec(t, None, false, true))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // T1 (count fan-out, `slash-commands.ts:884` `opts.inGroup && config.count` +
+                // `subagent-executor.ts:1359` `expandChainParallelCounts`): an inline group task's
+                // `[count=N]` repeats that concrete task N times, widening the fan-out — the
+                // parse-time analogue of pi's `expandChainParallelCounts`, applied here where the
+                // group's static width is known. `count` is validated `>= 1` at parse time
+                // (`parse_inline_config` drops a non-positive `count`), so `unwrap_or(1)` is the
+                // "no `count` given → one instance" default, never a silent zero-width group.
+                let mut steps = Vec::new();
+                for t in tasks {
+                    let spec = step_token_to_spec(t, None, false, true)?;
+                    let repeats = t.config.count.unwrap_or(1);
+                    for _ in 0..repeats {
+                        steps.push(spec.clone());
+                    }
+                }
                 Ok(RunnerStep::ParallelGroup(ParallelGroupSpec {
                     steps,
                     concurrency: config.concurrency.unwrap_or(4),
@@ -1441,13 +1467,21 @@ pub fn parse_parallel_command(raw_args: &str) -> Result<ParsedParallelCommand, S
                 agent: step.name.clone(),
                 task,
                 cwd: step.config.cwd.as_ref().map(PathBuf::from),
-                model: None,
+                // T1: `/parallel`'s per-step `[model=…]` override reaches the child (pi
+                // `slash-commands.ts:1065` `config.model ? {model} : {}`), previously dropped.
+                model: step.config.model.clone().map(ModelId::from),
                 tools: None,
                 extensions: None,
                 session_file: None,
                 max_depth_override: None,
                 structured_output_schema: None,
                 output: None,
+                // pi's inline `[output=<path>]` output FILE path (`InlineOutput::Path`); the
+                // `output=false` sentinel / empty path map to `None` (no file).
+                output_path: match &step.config.output {
+                    Some(InlineOutput::Path(path)) if !path.is_empty() => Some(path.clone()),
+                    _ => None,
+                },
                 output_mode: step.config.output_mode,
                 reads: match &step.config.reads {
                     Some(InlineReads::Paths(paths)) => {

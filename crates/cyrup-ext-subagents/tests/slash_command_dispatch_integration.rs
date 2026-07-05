@@ -77,15 +77,20 @@ fn write_fixture_persona(cwd: &Path, local_name: &str) {
 
 /// Write a saved chain `.chain.json` file to `<cwd>/.cyrup/agents/<name>.chain.json` (the same
 /// directory root project-scope CHAIN discovery scans, per `SubagentExecutor::discovery_config`'s
-/// `project_chain_dirs` wiring) using the crate's own real `RunnerStep` (de)serialization, so the
-/// on-disk shape is guaranteed to match what `discovery::chains` actually parses.
-fn write_fixture_chain(cwd: &Path, name: &str, steps: &[cyrup_ext_subagents::spawn::chain_graph::RunnerStep]) {
+/// `project_chain_dirs` wiring) in the real pi `.chain.json` shape (a root `chain` array of
+/// [`ChainStepConfig`] authoring steps), so the on-disk shape is exactly what `discovery::chains`
+/// actually parses.
+fn write_fixture_chain(
+    cwd: &Path,
+    name: &str,
+    steps: &[cyrup_ext_subagents::discovery::types::ChainStepConfig],
+) {
     let dir = cwd.join(".cyrup").join("agents");
     std::fs::create_dir_all(&dir).expect("mkdir .cyrup/agents");
     let payload = serde_json::json!({
         "name": name,
         "description": "a trivial fixture chain for /run-chain dispatch tests",
-        "steps": steps,
+        "chain": steps,
     });
     std::fs::write(
         dir.join(format!("{name}.chain.json")),
@@ -94,29 +99,12 @@ fn write_fixture_chain(cwd: &Path, name: &str, steps: &[cyrup_ext_subagents::spa
     .expect("write fixture chain");
 }
 
-fn single_step(
-    agent: &str,
-    task: &str,
-) -> cyrup_ext_subagents::spawn::chain_graph::RunnerStep {
-    cyrup_ext_subagents::spawn::chain_graph::RunnerStep::SingleStep(
-        cyrup_ext_subagents::spawn::chain_graph::SingleStepSpec {
-            agent: agent.to_string(),
-            task: task.to_string(),
-            cwd: None,
-            model: None,
-            tools: None,
-            extensions: None,
-            session_file: None,
-            max_depth_override: None,
-            structured_output_schema: None,
-            output: None,
-            output_mode: None,
-            reads: None,
-            acceptance: None,
-            context: None,
-            agent_scope: None,
-        },
-    )
+fn single_step(agent: &str, task: &str) -> cyrup_ext_subagents::discovery::types::ChainStepConfig {
+    cyrup_ext_subagents::discovery::types::ChainStepConfig {
+        agent: Some(agent.to_string()),
+        task: Some(task.to_string()),
+        ..Default::default()
+    }
 }
 
 /// RAII guard installing `CYRUP_SUBAGENT_BINARY`/`CYRUP_SUBAGENT_FIXTURE_SCRIPT` for the life of

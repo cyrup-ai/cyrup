@@ -62,7 +62,10 @@ pub use loader::{
     LoadExtensionsResult,
 };
 pub use manifest::{Capabilities, ExtensionManifest, HOST_WORLD};
-pub use native::{CtxTier, ExtMode, HostCtx, HostCtxRich, InitApi, NativeExtension, NativeHandle};
+pub use native::{
+    CtxTier, ExtMode, HostCtx, HostCtxRich, HumanWaitGate, HumanWaitGuard, InitApi,
+    NativeExtension, NativeHandle,
+};
 pub use provider::{
     resolve_api_key, ModelCost, ModelRegistrySink, ProviderConfig, ProviderHub,
     ProviderModelConfig, ProviderRegistration,
@@ -75,9 +78,9 @@ pub use subscriber::ExtSubscriber;
 #[cfg(feature = "wasm-host")]
 pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
-    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, InstancePool,
-    LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec, RecordingServices, SharedBus, StoreLimits,
-    UiChrome, WasmExtension, WasmTool,
+    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
+    HumanInteractionLock, InstancePool, LiveExtension, NotifyKind, OAuthEvent, ProcSpawnSpec,
+    RecordingServices, SharedBus, StoreLimits, UiChrome, WasmExtension, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

@@ -86,6 +86,14 @@ pub mod watch;
 /// [`tracker`] for the full subsystem doc.
 pub mod tracker;
 
+/// Human-readable status-report rendering for the `status` control action (C5): the
+/// `run-status.ts:101-273` `inspectSubagentStatus` shape (a single run's full per-step progress
+/// report) plus the `async-status.ts` `listAsyncRuns`/`formatAsyncRunList` no-id "list active runs"
+/// shape. Pure rendering + reconciliation-gated disk reads over [`control::reconcile_before_control_op`];
+/// the four `subagent` control actions dispatch into this module and [`control`] from
+/// `extension.rs`. See [`run_status`] for the full subsystem doc.
+pub mod run_status;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -362,6 +370,298 @@ impl StepState {
 }
 
 // =================================================================================================
+// Live activity telemetry (func-SA §4.5; pi `subagent-runner.ts:1430-1581`, `shared/types.ts`)
+// =================================================================================================
+//
+// pi's detached runner folds each child NDJSON event into the run's `status.json` on a live cadence
+// (`updateStepFromChildEvent`, `subagent-runner.ts:1430-1517`) so a reader watching the file sees
+// `currentTool`/`recentTools`/`recentOutput`/`turnCount`/`toolCount`/`tokens`/`activityState`/
+// `lastActivityAt` per step, plus the top-level roll-ups those feed (`syncTopLevelCurrentTool`,
+// `statusPayload.toolCount`/`turnCount`/`totalTokens`). This section is the Rust port of that data
+// model, plus the pure per-event fold [`apply_child_event_to_step`] the detached runner
+// (`background/runner_main.rs`) drives from the child's real stdout events.
+
+/// pi's `ActivityState` (`shared/types.ts:97`): a run/step that is idle-but-long-running or has
+/// tripped a needs-attention control heuristic. Absent (`None` on the carrying field) is pi's
+/// "neither" default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    /// The step is still actively producing events but has been running a long time (pi's
+    /// `active_long_running`).
+    ActiveLongRunning,
+    /// The step tripped a needs-attention heuristic (repeated mutating-tool failures, idle past
+    /// threshold — pi's `needs_attention`).
+    NeedsAttention,
+}
+
+/// Accumulated per-step (and run-wide) token totals mirroring pi's `{ input, output, total }`
+/// telemetry shape (`subagent-runner.ts:1502-1507`). Kept distinct from [`cyrup_core::Usage`] (the
+/// richer, cost-bearing accounting record on [`StepStatus::usage`]) because pi's live telemetry
+/// carries only these three integers on `step.tokens`/`statusPayload.totalTokens`, and reproducing
+/// that exact on-the-wire shape is what a status-reading UI expects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTotals {
+    /// Input tokens accumulated so far.
+    pub input: u64,
+    /// Output tokens accumulated so far.
+    pub output: u64,
+    /// `input + output` accumulated so far (pi carries the redundant total explicitly).
+    pub total: u64,
+}
+
+impl TokenTotals {
+    /// Fold one turn's `(input, output)` into the running totals (pi's additive accumulation,
+    /// `subagent-runner.ts:1502-1507`).
+    fn add(&mut self, input: u64, output: u64) {
+        self.input = self.input.saturating_add(input);
+        self.output = self.output.saturating_add(output);
+        self.total = self.input.saturating_add(self.output);
+    }
+}
+
+/// One entry in a step's recent-tool ring (pi's `recentTools` element,
+/// `subagent-runner.ts:1448-1449`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentTool {
+    /// The tool's name.
+    pub tool: String,
+    /// A compact preview of the tool's arguments (pi's `currentToolArgs`).
+    pub args: String,
+    /// Wall-clock epoch-millis the tool call ended.
+    pub end_ms: i64,
+}
+
+/// Bounded cap on a step's `recent_tools`/`recent_output` rings so a long-running step's telemetry
+/// can never grow `status.json` without limit (pi slices to a recent window per append,
+/// `subagent-runner.ts:1460,1496`).
+const RECENT_RING_CAP: usize = 20;
+
+/// The live per-step activity telemetry pi folds from child events (`subagent-runner.ts:1430-1517`),
+/// carried on [`StepStatus`] via `#[serde(flatten)]` so these fields serialize at the SAME top level
+/// of each `status.json` step object pi writes them at (`currentTool`, `recentTools`, … are direct
+/// members of the step object, not a nested sub-object — `shared/types.ts:598-632`). Every field is
+/// `#[serde(default)]` + skip-if-empty so (a) an older `status.json` written before this data model
+/// existed still deserializes, and (b) a step that has produced no telemetry yet serializes to the
+/// exact same lean object shape it did before this model was added (no test asserting an exact
+/// pre-telemetry step shape regresses).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepTelemetry {
+    /// The tool currently executing in this step, if any (pi `step.currentTool`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    /// A compact preview of the current tool's arguments (pi `step.currentToolArgs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool_args: Option<String>,
+    /// Epoch-millis the current tool started (pi `step.currentToolStartedAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool_started_at: Option<i64>,
+    /// The filesystem path the current tool is operating on, when derivable (pi `step.currentPath`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
+    /// The most recent completed tool calls, oldest-first, capped at [`RECENT_RING_CAP`]
+    /// (pi `step.recentTools`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_tools: Vec<RecentTool>,
+    /// The most recent lines of assistant/tool output, oldest-first, capped at [`RECENT_RING_CAP`]
+    /// (pi `step.recentOutput`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_output: Vec<String>,
+    /// Count of tool calls started in this step (pi `step.toolCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u64>,
+    /// Count of assistant turns completed in this step (pi `step.turnCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Accumulated token totals for this step (pi `step.tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenTotals>,
+    /// The step's derived activity state (pi `step.activityState`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_state: Option<ActivityState>,
+    /// Epoch-millis of the most recent observed activity for this step (pi `step.lastActivityAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<i64>,
+    /// The active model's thinking level for this step, when reported (pi `step.thinking`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// The file this step wrote its final output to, when a file-output handoff was configured
+    /// (pi `step.outputFile`/the run-level `outputFile`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<PathBuf>,
+}
+
+/// The run-wide activity roll-ups pi maintains on the top-level `statusPayload`
+/// (`subagent-runner.ts:1444-1514`, `shared/types.ts:576-638`), carried on [`RunStatus`] via
+/// `#[serde(flatten)]` so they serialize at the SAME top level of `status.json` pi writes them at
+/// (`status.currentTool`, `status.toolCount`, …). Same `#[serde(default)]` + skip-if-empty
+/// backward-compatibility discipline as [`StepTelemetry`].
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTelemetry {
+    /// The tool currently executing anywhere in the run (pi `syncTopLevelCurrentTool`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    /// Total tool calls started across every step (pi `statusPayload.toolCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u64>,
+    /// Highest per-step turn count observed (pi `statusPayload.turnCount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Token totals summed across every step (pi `statusPayload.totalTokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<TokenTotals>,
+    /// The run's derived activity state (pi `statusPayload.activityState`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_state: Option<ActivityState>,
+    /// Epoch-millis of the most recent observed activity anywhere in the run
+    /// (pi `statusPayload.lastActivityAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<i64>,
+    /// The workflow-graph snapshot for this run (pi `statusPayload.workflowGraph`,
+    /// `shared/types.ts:597`) — node ids, phases, group-status precedence, `currentNodeId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_graph: Option<WorkflowGraphSnapshot>,
+}
+
+/// Fold one child NDJSON [`crate::exec::ndjson::SubagentEvent`] into a step's live telemetry — the
+/// Rust port of pi's `updateStepFromChildEvent` (`subagent-runner.ts:1430-1517`), scoped to the
+/// per-step [`StepTelemetry`] fields (the top-level roll-ups are the caller's job via
+/// [`RunStatus::sync_top_level_telemetry`], mirroring pi's `syncTopLevelCurrentTool` living outside
+/// the per-event fold). `now` is the caller's single epoch-millis reading for this event so every
+/// field stamped by one event agrees on one timestamp (pi reads `Date.now()` once per call).
+///
+/// Only the telemetry-bearing event kinds are acted on; every other event kind (turn boundaries,
+/// compaction, retries, unknown) simply bumps `last_activity_at`, exactly like pi's own fall-through.
+pub fn apply_child_event_to_step(
+    step: &mut StepStatus,
+    event: &crate::exec::ndjson::SubagentEvent,
+    now: i64,
+) {
+    use crate::exec::ndjson::SubagentEvent;
+    match event {
+        SubagentEvent::ToolExecutionStart { tool_name, args, .. } => {
+            step.telemetry.tool_count = Some(step.telemetry.tool_count.unwrap_or(0).saturating_add(1));
+            step.telemetry.current_tool = Some(tool_name.clone());
+            step.telemetry.current_tool_args = Some(preview_tool_args(args));
+            step.telemetry.current_tool_started_at = Some(now);
+            step.telemetry.current_path = resolve_current_path(args);
+        }
+        SubagentEvent::ToolExecutionEnd { result, .. } => {
+            if let Some(tool) = step.telemetry.current_tool.take() {
+                let args = step.telemetry.current_tool_args.take().unwrap_or_default();
+                push_bounded(
+                    &mut step.telemetry.recent_tools,
+                    RecentTool { tool, args, end_ms: now },
+                );
+            }
+            // A tool result carries text output pi folds into `recentOutput` (its own
+            // `tool_result_end` branch, `subagent-runner.ts:1456-1460`; cyrup's wire union collapses
+            // the result payload onto `tool_execution_end`, so the fold happens here).
+            let text = extract_event_text(result);
+            append_recent_output(&mut step.telemetry.recent_output, &text);
+            step.telemetry.current_tool_args = None;
+            step.telemetry.current_tool_started_at = None;
+            step.telemetry.current_path = None;
+        }
+        SubagentEvent::MessageEnd { message }
+            if message.get("role").and_then(serde_json::Value::as_str) == Some("assistant") =>
+        {
+            let text = message.get("content").map(extract_event_text).unwrap_or_default();
+            append_recent_output(&mut step.telemetry.recent_output, &text);
+            step.telemetry.turn_count =
+                Some(step.telemetry.turn_count.unwrap_or(0).saturating_add(1));
+            if let Some(usage) = event.assistant_usage() {
+                let mut tokens = step.telemetry.tokens.unwrap_or_default();
+                tokens.add(usage.input, usage.output);
+                step.telemetry.tokens = Some(tokens);
+            }
+        }
+        _ => {}
+    }
+    step.telemetry.last_activity_at = Some(now);
+}
+
+/// Push `item` onto a bounded recent-ring, dropping the oldest entry once [`RECENT_RING_CAP`] is
+/// exceeded (pi keeps only a recent window, `subagent-runner.ts:1460,1496`).
+fn push_bounded<T>(ring: &mut Vec<T>, item: T) {
+    ring.push(item);
+    if ring.len() > RECENT_RING_CAP {
+        let overflow = ring.len() - RECENT_RING_CAP;
+        ring.drain(..overflow);
+    }
+}
+
+/// Append the last few non-empty lines of `text` to a step's `recent_output` ring, bounded
+/// (pi's `appendRecentStepOutput(step, text.split("\n").slice(-10))`, `subagent-runner.ts:1460`).
+fn append_recent_output(ring: &mut Vec<String>, text: &str) {
+    let tail: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(10)
+        .map(str::to_string)
+        .collect();
+    for line in tail.into_iter().rev() {
+        push_bounded(ring, line);
+    }
+}
+
+/// Extract a compact preview of a tool call's arguments for `currentToolArgs`/a recent-tool entry
+/// (pi's `extractToolArgsPreview`, `subagent-runner.ts:1440`). A best-effort compact JSON rendering
+/// truncated so one pathological argument blob can never bloat `status.json`.
+fn preview_tool_args(args: &serde_json::Value) -> String {
+    const MAX: usize = 160;
+    let rendered = match args {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if rendered.chars().count() > MAX {
+        rendered.chars().take(MAX).collect::<String>() + "…"
+    } else {
+        rendered
+    }
+}
+
+/// Derive the filesystem path a tool is operating on from its arguments, when one of pi's
+/// well-known path-bearing argument keys is present (`resolveCurrentPath`,
+/// `subagent-runner.ts:1437`). Returns `None` when no path-like argument is found.
+fn resolve_current_path(args: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 6] = ["path", "file", "filePath", "file_path", "filename", "target"];
+    let object = args.as_object()?;
+    KEYS.iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+/// Extract human-readable text out of an opaque event payload `Value` — either a bare string, or a
+/// `[{type:"text", text:"…"}, …]` content array (the `AssistantMessage.content`/tool-result shape),
+/// mirroring pi's `extractTextFromContent` (`subagent-runner.ts`). Returns the empty string for any
+/// shape carrying no text.
+fn extract_event_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+// =================================================================================================
 // StepStatus / ParallelGroupStatus (func-SA §4.5)
 // =================================================================================================
 
@@ -395,6 +695,11 @@ pub struct StepStatus {
     /// Wall-clock end time (epoch milliseconds) once this step reached a terminal or paused
     /// state.
     pub ended_at: Option<i64>,
+    /// Live activity telemetry folded from this step's child events (pi
+    /// `subagent-runner.ts:1430-1517`) — flattened so its members serialize at the same top level
+    /// of the `status.json` step object pi writes them at (`shared/types.ts:598-632`).
+    #[serde(flatten, default)]
+    pub telemetry: StepTelemetry,
 }
 
 impl StepStatus {
@@ -412,6 +717,7 @@ impl StepStatus {
             nested_run_ids: Vec::new(),
             started_at: None,
             ended_at: None,
+            telemetry: StepTelemetry::default(),
         }
     }
 }
@@ -481,6 +787,11 @@ pub struct RunStatus {
     pub steps: Vec<StepStatus>,
     /// Per-parallel-group child status, for any `ParallelGroup`/`DynamicGroup` steps.
     pub parallel_groups: Option<Vec<ParallelGroupStatus>>,
+    /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
+    /// `statusPayload` telemetry, `subagent-runner.ts:1444-1514`) — flattened so its members
+    /// serialize at the same top level of `status.json` pi writes them at.
+    #[serde(flatten, default)]
+    pub telemetry: RunTelemetry,
 }
 
 impl RunStatus {
@@ -502,7 +813,44 @@ impl RunStatus {
             pending_appends: None,
             steps: Vec::new(),
             parallel_groups: None,
+            telemetry: RunTelemetry::default(),
         }
+    }
+
+    /// Roll the per-step telemetry of the step at `flat_index` up into the top-level
+    /// [`RunStatus::telemetry`] fields, mirroring pi's `syncTopLevelCurrentTool` +
+    /// `statusPayload.toolCount`/`turnCount`/`totalTokens`/`lastActivityAt` maintenance
+    /// (`subagent-runner.ts:1444-1514`). Recomputes `current_tool` from whichever step is currently
+    /// running (a step with a live `current_tool`), sums `tool_count`/`total_tokens` across every
+    /// step, and takes the max `turn_count` — so the roll-up is always internally consistent with
+    /// the per-step fields rather than a separately drifting counter.
+    pub fn sync_top_level_telemetry(&mut self, flat_index: usize) {
+        self.current_step = Some(flat_index);
+        let mut tool_total: u64 = 0;
+        let mut turn_max: u64 = 0;
+        let mut tokens = TokenTotals::default();
+        let mut current_tool: Option<String> = None;
+        let mut last_activity: Option<i64> = self.telemetry.last_activity_at;
+        for step in &self.steps {
+            tool_total = tool_total.saturating_add(step.telemetry.tool_count.unwrap_or(0));
+            turn_max = turn_max.max(step.telemetry.turn_count.unwrap_or(0));
+            if let Some(step_tokens) = step.telemetry.tokens {
+                tokens.add(step_tokens.input, step_tokens.output);
+            }
+            if current_tool.is_none()
+                && let Some(tool) = &step.telemetry.current_tool
+            {
+                current_tool = Some(tool.clone());
+            }
+            if let Some(activity) = step.telemetry.last_activity_at {
+                last_activity = Some(last_activity.map_or(activity, |prev| prev.max(activity)));
+            }
+        }
+        self.telemetry.current_tool = current_tool;
+        self.telemetry.tool_count = (tool_total > 0).then_some(tool_total);
+        self.telemetry.turn_count = (turn_max > 0).then_some(turn_max);
+        self.telemetry.total_tokens = (tokens.total > 0).then_some(tokens);
+        self.telemetry.last_activity_at = last_activity;
     }
 
     /// Constructs the **provisional, synthesized** status the spawn call site MUST supply for the
@@ -707,6 +1055,1072 @@ impl RunPaths {
 }
 
 // =================================================================================================
+// Shared async-root / results-dir derivation + ensureAccessibleDir-equivalent (C7)
+// =================================================================================================
+//
+// C7 root cause: the orchestrator (`extension.rs`) and the detached runner
+// (`crates/cyrup/src/subagent_runner_cmd.rs`) each derived the run's `ResultsDir` independently and
+// arrived at DIFFERENT directories, so every real background run's terminal `ResultFile` write
+// targeted a directory the orchestrator never created (and never watched) — the run appeared to
+// hang forever from the orchestrator's point of view. This section is the single shared source of
+// truth both sides now agree on: the orchestrator derives the two roots here, creates them, and
+// bakes their ABSOLUTE paths into `RunnerConfig` (`runner_main::RunnerConfig::async_root`/
+// `results_dir`); the runner then rebuilds its `RunPaths` from those exact absolute roots rather
+// than re-deriving them from the config-file path's own directory structure. Mirrors pi, where the
+// orchestrator computes `resultPath`/`asyncDir` and passes them verbatim in the runner config
+// (`async-execution.ts:650,895`) and the runner reads them straight back
+// (`subagent-runner.ts:1077,1085`) — never re-deriving `RESULTS_DIR`.
+
+/// Path segment, under the per-user subagents home, holding one directory per background run (each
+/// run's `status.json`, `events.jsonl`, control inbox, logs — everything EXCEPT the terminal
+/// [`ResultFile`]). Mirrors pi's `ASYNC_DIR` leaf (`shared/types.ts:959`).
+const ASYNC_SUBDIR: &str = "async";
+
+/// Path segment, under the per-user subagents home, holding the terminal [`ResultFile`] for every
+/// run (a flat `<run_id>.json` per finished run). A DELIBERATE SIBLING of [`ASYNC_SUBDIR`], never a
+/// child of it — "presence in this dir is the authoritative done signal" (R-SA-077) only works if
+/// the results dir can be watched independently of the still-being-written run dir. Mirrors pi's
+/// `RESULTS_DIR` leaf (`shared/types.ts:958`).
+const RESULTS_SUBDIR: &str = "results";
+
+/// The per-user root every subagent run-artifact directory hangs off: `<home>/.cyrup/subagents`,
+/// where `<home>` resolves from `CYRUP_HOME`, then `HOME`, then the OS temp dir. This is the
+/// single, shared resolution the orchestrator's own `default_async_root`/`default_results_dir`
+/// (`extension.rs`) now delegate to, so the two roots can never again drift apart the way C7
+/// documents.
+///
+/// `pub(crate)` so the artifacts/chain-runs housekeeping ([`crate::artifacts`]) can scope its own
+/// per-`cwd` roots under the SAME `<home>/.cyrup/subagents` tree the async/results roots use, rather
+/// than re-deriving (and risking drift from) this one resolution.
+pub(crate) fn subagents_home() -> PathBuf {
+    let base = std::env::var_os("CYRUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".cyrup").join("subagents")
+}
+
+/// A filesystem-safe key derived from `cwd`, so distinct projects' async/result roots never collide
+/// under the shared per-user `~/.cyrup/subagents` tree.
+///
+/// `pub(crate)` for the same reason as [`subagents_home`]: [`crate::artifacts`] keys its
+/// artifacts/chain-runs roots by the identical `cwd_key` so a project's artifacts sit beside its
+/// async/results dirs under one per-`cwd` scope.
+pub(crate) fn cwd_key(cwd: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The two sibling run-artifact roots for one working directory (C7): the `async_root` holding
+/// per-run directories and the `results_dir` holding terminal [`ResultFile`]s. Both are always
+/// keyed by the same `cwd` so a run's directory and its result file are guaranteed to belong to the
+/// same project scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunArtifactRoots {
+    /// `<home>/.cyrup/subagents/async/<cwd_key>` — passed as `RunPaths::for_run`'s `async_root`.
+    pub async_root: PathBuf,
+    /// `<home>/.cyrup/subagents/results/<cwd_key>` — passed as `RunPaths::for_run`'s `results_dir`.
+    pub results_dir: PathBuf,
+}
+
+/// THE single derivation of the per-`cwd` async-root and results-dir that both the orchestrator
+/// (at spawn time, `extension.rs`) and the runner (transitively, via the absolute paths this
+/// function's output is baked into `RunnerConfig` as) agree on — the fix for C7's divergent
+/// derivations. Pure path arithmetic; never touches the filesystem (creation is
+/// [`ensure_accessible_dir`]'s job).
+#[must_use]
+pub fn run_artifact_roots(cwd: &Path) -> RunArtifactRoots {
+    let home = subagents_home();
+    let key = cwd_key(cwd);
+    RunArtifactRoots {
+        async_root: home.join(ASYNC_SUBDIR).join(&key),
+        results_dir: home.join(RESULTS_SUBDIR).join(&key),
+    }
+}
+
+/// Reconstruct the SIBLING results-dir for an `async_root` produced by [`run_artifact_roots`],
+/// purely structurally (no `cwd`/env re-read). Given the standard layout
+/// `<home>/.cyrup/subagents/async/<cwd_key>`, returns `<home>/.cyrup/subagents/results/<cwd_key>` —
+/// i.e. it swaps the [`ASYNC_SUBDIR`] path segment for [`RESULTS_SUBDIR`] while PRESERVING the
+/// `<cwd_key>` leaf, which is exactly what C7's pre-fix `async_root.parent()/results` derivation got
+/// wrong (it dropped the `<cwd_key>` and nested `results` UNDER `async` instead of beside it).
+///
+/// This exists so the runner's config-path-structure fallback (used ONLY on the pre-config-read
+/// error path in `crates/cyrup/src/subagent_runner_cmd.rs`, where no authoritative
+/// `RunnerConfig::results_dir` has been read yet) still targets the SAME results dir the
+/// orchestrator created. For a non-standard `async_root` that does not match the
+/// `<...>/async/<key>` shape (e.g. a bare `<base>/async` used by lower-level unit fixtures), it
+/// degrades to a `results` sibling of `async_root`'s own parent.
+#[must_use]
+pub fn results_dir_for_async_root(async_root: &Path) -> PathBuf {
+    let parent = async_root.parent();
+    let is_standard_layout = parent
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == std::ffi::OsStr::new(ASYNC_SUBDIR));
+    if is_standard_layout
+        && let (Some(home), Some(key)) = (parent.and_then(Path::parent), async_root.file_name())
+    {
+        return home.join(RESULTS_SUBDIR).join(key);
+    }
+    async_root
+        .parent()
+        .unwrap_or(async_root)
+        .join(RESULTS_SUBDIR)
+}
+
+/// `ensureAccessibleDir`-equivalent (pi `extension/index.ts:97-110`): create `dir` (and every
+/// missing parent), then verify it is actually a READ+WRITE-accessible directory. On the rare
+/// platform edge pi guards against — a directory created shortly after wake-from-sleep on Windows
+/// with Azure AD/Entra ID can end up with a broken null DACL that makes it inaccessible to its own
+/// creator — the directory is dropped and recreated once before giving up.
+///
+/// Called on BOTH sides of C7: the orchestrator ensures `async_root`/`results_dir` at spawn time,
+/// and the runner ensures `results_dir` again immediately before the terminal [`ResultFile`] write
+/// (so the authoritative "done" signal always lands even if the orchestrator's own creation was
+/// skipped or the dir was since removed).
+///
+/// # Errors
+///
+/// Returns the underlying `io::Error` if the directory cannot be created, or a
+/// [`std::io::ErrorKind::PermissionDenied`] error if it still fails the read+write accessibility
+/// probe after a recreate attempt.
+pub async fn ensure_accessible_dir(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    if probe_dir_accessible(dir).await {
+        return Ok(());
+    }
+    // Broken-ACL recovery (Windows Azure-AD null-DACL case): drop and recreate once. A cleanup
+    // failure is deliberately best-effort — retry the mkdir/probe regardless, mirroring pi.
+    let _ = tokio::fs::remove_dir_all(dir).await;
+    tokio::fs::create_dir_all(dir).await?;
+    if probe_dir_accessible(dir).await {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "directory is not read/write accessible after recreate: {}",
+                dir.display()
+            ),
+        ))
+    }
+}
+
+/// Probe `dir` for read+write access the way pi's `fs.accessSync(R_OK | W_OK)` does, but portably:
+/// confirm it is a listable directory (read) and that a uniquely-named probe file can be created
+/// and removed inside it (write). Any failure returns `false`, which drives
+/// [`ensure_accessible_dir`]'s recreate-once recovery.
+async fn probe_dir_accessible(dir: &Path) -> bool {
+    match tokio::fs::metadata(dir).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return false,
+    }
+    let probe = dir.join(format!(
+        ".cyrup-access-probe-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    match tokio::fs::write(&probe, b"").await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&probe).await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// =================================================================================================
+// Workflow-graph snapshot (pi `runs/shared/workflow-graph.ts:73-206`)
+// =================================================================================================
+//
+// A faithful port of pi's `buildWorkflowGraphSnapshot`: given a run's declared step list plus its
+// per-step results/statuses, produces the node-id/phase/group-status-precedence/dynamic-metadata/
+// `currentNodeId` snapshot a status-reading UI renders (`shared/types.ts:33-65`). Node ids are the
+// exact pi shapes: `step-<N>` for a sequential step or a group, `step-<N>-agent-<M>` for a static
+// parallel child, `step-<N>-item-<key>` for a dynamic fan-out child. This is a pure function over
+// plain data — no filesystem, no discovery — so it reproduces `workflow-graph.test.ts` scenario for
+// scenario.
+
+/// A workflow node's lifecycle state (pi `WorkflowNodeStatus`, `shared/types.ts:33`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeStatus {
+    /// Declared but not yet started.
+    Pending,
+    /// Currently running.
+    Running,
+    /// Finished successfully.
+    Completed,
+    /// Finished with a failure.
+    Failed,
+    /// Interrupted mid-flight (soft pause).
+    Paused,
+    /// Detached (fire-and-forget) and no longer tracked inline.
+    Detached,
+}
+
+/// A workflow node's structural kind (pi `WorkflowGraphNode.kind`, `shared/types.ts:37`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowNodeKind {
+    /// A single sequential step.
+    Step,
+    /// A static-width parallel group container.
+    ParallelGroup,
+    /// A dynamic (runtime-width) fan-out group container.
+    DynamicParallelGroup,
+    /// One concurrently-dispatched child agent within a group.
+    Agent,
+}
+
+/// The run-shape tag on a [`WorkflowGraphSnapshot`] (pi `WorkflowGraphSnapshot.mode`,
+/// `shared/types.ts:61`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunMode {
+    /// A linear chain.
+    Chain,
+    /// A standalone static parallel fan-out.
+    Parallel,
+    /// One single agent invocation.
+    Single,
+}
+
+/// The `dynamic` metadata block on a dynamic-fan-out group node (pi `WorkflowGraphNode.dynamic`,
+/// `shared/types.ts:45-51`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDynamicMeta {
+    /// The named output the fan-out expands from.
+    pub source_output: String,
+    /// The JSON-pointer path within that output the array lives at.
+    pub source_path: String,
+    /// The per-item variable name (`item` by default).
+    pub item_name: String,
+    /// The optional `maxItems` cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
+    /// The named output the collected results register under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect_as: Option<String>,
+}
+
+/// One node of a [`WorkflowGraphSnapshot`] (pi `WorkflowGraphNode`, `shared/types.ts:35-57`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowGraphNode {
+    /// The stable node id (`step-<N>` / `step-<N>-agent-<M>` / `step-<N>-item-<key>`).
+    pub id: String,
+    /// The node's structural kind.
+    pub kind: WorkflowNodeKind,
+    /// The agent this node invokes, for a step/agent node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The declared phase this node belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The human-readable label.
+    pub label: String,
+    /// The node's lifecycle status.
+    pub status: WorkflowNodeStatus,
+    /// The node's flat (execution-order) index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat_index: Option<usize>,
+    /// The node's declared step index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    /// The item key, for a dynamic fan-out child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_key: Option<String>,
+    /// The named output this node's result registers under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
+    /// Whether this node produces a structured (schema-validated) output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<bool>,
+    /// This node's acceptance-ledger status, when evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_status: Option<String>,
+    /// This node's error text, when failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The dynamic-fan-out metadata, for a dynamic group node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<WorkflowDynamicMeta>,
+    /// This node's children, for a group container (present, possibly empty, only for a group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<WorkflowGraphNode>>,
+}
+
+/// A named phase grouping node ids (pi `WorkflowGraphSnapshot.phases[]`, `shared/types.ts:62`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPhase {
+    /// The phase title.
+    pub title: String,
+    /// The ids of every node in this phase, in declaration order.
+    pub node_ids: Vec<String>,
+}
+
+/// The full workflow-graph snapshot (pi `WorkflowGraphSnapshot`, `shared/types.ts:59-65`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowGraphSnapshot {
+    /// The run's id.
+    pub run_id: String,
+    /// The run shape.
+    pub mode: WorkflowRunMode,
+    /// The declared phases.
+    pub phases: Vec<WorkflowPhase>,
+    /// The nodes, in declaration/execution order.
+    pub nodes: Vec<WorkflowGraphNode>,
+    /// The id of the currently-active node, when one is determinable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_node_id: Option<String>,
+}
+
+/// One declared sequential step, or one static-parallel/dynamic child spec, as an input to
+/// [`build_workflow_graph_snapshot`] (pi's `SequentialStep`/parallel-task/`DynamicParallelStep`
+/// fields, projected to only what the graph builder reads).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowTaskSpec {
+    /// The agent name.
+    pub agent: Option<String>,
+    /// The declared phase.
+    pub phase: Option<String>,
+    /// The declared label.
+    pub label: Option<String>,
+    /// The named output (`as`).
+    pub output_name: Option<String>,
+    /// Whether this task produces a structured output (`Boolean(outputSchema)`).
+    pub structured: bool,
+}
+
+/// The dynamic-fan-out shape of one declared step (pi `DynamicParallelStep`, projected).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowDynamicStepSpec {
+    /// `expand.from.output`.
+    pub expand_from_output: String,
+    /// `expand.from.path`.
+    pub expand_from_path: String,
+    /// `expand.item` (`item` by default).
+    pub item_name: Option<String>,
+    /// `expand.maxItems`.
+    pub max_items: Option<usize>,
+    /// The whole step's `phase`/`label` (fallbacks for the group node).
+    pub step_phase: Option<String>,
+    /// The whole step's `label`.
+    pub step_label: Option<String>,
+    /// `parallel.phase`/`parallel.label` (the per-item template's phase/label).
+    pub template_phase: Option<String>,
+    /// `parallel.label`.
+    pub template_label: Option<String>,
+    /// `collect.as`.
+    pub collect_as: String,
+    /// `Boolean(collect.outputSchema)`.
+    pub collect_structured: bool,
+}
+
+/// One declared workflow step, as an input to [`build_workflow_graph_snapshot`] — the union
+/// pi's `ChainStep` is (`isParallelStep`/`isDynamicParallelStep`/sequential, `settings.ts`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowInputStep {
+    /// A single sequential step.
+    Sequential(WorkflowTaskSpec),
+    /// A static-width parallel group over these tasks.
+    Parallel(Vec<WorkflowTaskSpec>),
+    /// A dynamic (runtime-width) fan-out.
+    Dynamic(WorkflowDynamicStepSpec),
+}
+
+/// One materialized dynamic fan-out child, keyed by its resolved `itemKey`
+/// (pi `WorkflowGraphBuildInput.dynamicChildren`, `workflow-graph.ts:12`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowDynamicChild {
+    /// The child's agent.
+    pub agent: String,
+    /// The child's label override.
+    pub label: Option<String>,
+    /// The child's flat index.
+    pub flat_index: usize,
+    /// The resolved item key (sanitized into the node id).
+    pub item_key: String,
+    /// The child's named output.
+    pub output_name: Option<String>,
+    /// Whether the child produces a structured output.
+    pub structured: bool,
+    /// The child's own error text.
+    pub error: Option<String>,
+}
+
+/// A per-step result summary the builder reads for status derivation (pi
+/// `WorkflowGraphBuildInput.results[]`, `workflow-graph.ts:8`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowResultSummary {
+    /// The child's exit code (`0` = success).
+    pub exit_code: Option<i32>,
+    /// Whether the child detached.
+    pub detached: bool,
+    /// Whether the child was interrupted (soft pause).
+    pub interrupted: bool,
+    /// The child's error text.
+    pub error: Option<String>,
+    /// The child's acceptance-ledger status.
+    pub acceptance_status: Option<String>,
+}
+
+/// A per-step status override the builder reads (pi `WorkflowGraphBuildInput.stepStatuses[]`,
+/// `workflow-graph.ts:11`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowStepStatusInput {
+    /// The raw status string (`"complete"`/`"running"`/… normalized by the builder).
+    pub status: Option<String>,
+    /// The step's error text.
+    pub error: Option<String>,
+}
+
+/// A dynamic-group status override (pi `WorkflowGraphBuildInput.dynamicGroupStatuses`,
+/// `workflow-graph.ts:13`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowDynamicGroupStatus {
+    /// The forced group status (empty-skip `completed`, aggregate-failure `failed`, …).
+    pub status: WorkflowNodeStatus,
+    /// The group's error text.
+    pub error: Option<String>,
+    /// The group's acceptance-ledger status.
+    pub acceptance_status: Option<String>,
+}
+
+/// The full input to [`build_workflow_graph_snapshot`] (pi `WorkflowGraphBuildInput`,
+/// `workflow-graph.ts:4-14`).
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowGraphBuildInput {
+    /// The run's id.
+    pub run_id: String,
+    /// The run shape (`chain` by default, mirroring pi's `input.mode ?? "chain"`).
+    pub mode: Option<WorkflowRunMode>,
+    /// The declared steps.
+    pub steps: Vec<WorkflowInputStep>,
+    /// Per-flat-index result summaries.
+    pub results: Vec<WorkflowResultSummary>,
+    /// The currently-running flat index.
+    pub current_flat_index: Option<usize>,
+    /// The currently-running step index.
+    pub current_step_index: Option<usize>,
+    /// Per-flat-index status overrides.
+    pub step_statuses: Vec<WorkflowStepStatusInput>,
+    /// Materialized dynamic children, keyed by step index.
+    pub dynamic_children: std::collections::BTreeMap<usize, Vec<WorkflowDynamicChild>>,
+    /// Dynamic-group status overrides, keyed by step index.
+    pub dynamic_group_statuses: std::collections::BTreeMap<usize, WorkflowDynamicGroupStatus>,
+}
+
+/// Normalize a raw status string to a [`WorkflowNodeStatus`] (pi `normalizeStatus`,
+/// `workflow-graph.ts:16-34`) — `None` for an unrecognized value so the caller can fall through.
+fn normalize_workflow_status(status: Option<&str>) -> Option<WorkflowNodeStatus> {
+    match status {
+        Some("complete" | "completed") => Some(WorkflowNodeStatus::Completed),
+        Some("running") => Some(WorkflowNodeStatus::Running),
+        Some("failed") => Some(WorkflowNodeStatus::Failed),
+        Some("paused") => Some(WorkflowNodeStatus::Paused),
+        Some("detached") => Some(WorkflowNodeStatus::Detached),
+        Some("pending") => Some(WorkflowNodeStatus::Pending),
+        _ => None,
+    }
+}
+
+/// Derive a status from a per-step result (pi `resultStatus`, `workflow-graph.ts:36-41`).
+fn workflow_result_status(result: Option<&WorkflowResultSummary>) -> Option<WorkflowNodeStatus> {
+    let result = result?;
+    if result.detached {
+        return Some(WorkflowNodeStatus::Detached);
+    }
+    if result.interrupted {
+        return Some(WorkflowNodeStatus::Paused);
+    }
+    Some(if result.exit_code == Some(0) {
+        WorkflowNodeStatus::Completed
+    } else {
+        WorkflowNodeStatus::Failed
+    })
+}
+
+/// Resolve a node's status (pi `nodeStatus`, `workflow-graph.ts:43-47`): step-status override,
+/// then result-derived, then running-if-current, else pending.
+fn workflow_node_status(input: &WorkflowGraphBuildInput, flat_index: usize) -> WorkflowNodeStatus {
+    normalize_workflow_status(
+        input
+            .step_statuses
+            .get(flat_index)
+            .and_then(|s| s.status.as_deref()),
+    )
+    .or_else(|| workflow_result_status(input.results.get(flat_index)))
+    .unwrap_or(if input.current_flat_index == Some(flat_index) {
+        WorkflowNodeStatus::Running
+    } else {
+        WorkflowNodeStatus::Pending
+    })
+}
+
+/// Push a node id under its phase, creating the phase group in first-seen order (pi `pushPhase`,
+/// `workflow-graph.ts:49-57`).
+fn push_workflow_phase(phases: &mut Vec<WorkflowPhase>, phase: Option<&str>, node_id: &str) {
+    let Some(phase) = phase else { return };
+    if let Some(group) = phases.iter_mut().find(|candidate| candidate.title == phase) {
+        group.node_ids.push(node_id.to_string());
+    } else {
+        phases.push(WorkflowPhase {
+            title: phase.to_string(),
+            node_ids: vec![node_id.to_string()],
+        });
+    }
+}
+
+/// Summarize a parallel group's child statuses with pi's explicit precedence (pi
+/// `summarizeParallelStatuses`, `workflow-graph.ts:63-71`): running > failed > paused > detached >
+/// all-completed > any-completed(=running) > pending.
+fn summarize_parallel_statuses(statuses: &[WorkflowNodeStatus]) -> WorkflowNodeStatus {
+    if statuses.contains(&WorkflowNodeStatus::Running) {
+        return WorkflowNodeStatus::Running;
+    }
+    if statuses.contains(&WorkflowNodeStatus::Failed) {
+        return WorkflowNodeStatus::Failed;
+    }
+    if statuses.contains(&WorkflowNodeStatus::Paused) {
+        return WorkflowNodeStatus::Paused;
+    }
+    if statuses.contains(&WorkflowNodeStatus::Detached) {
+        return WorkflowNodeStatus::Detached;
+    }
+    if !statuses.is_empty() && statuses.iter().all(|s| *s == WorkflowNodeStatus::Completed) {
+        return WorkflowNodeStatus::Completed;
+    }
+    if statuses.contains(&WorkflowNodeStatus::Completed) {
+        return WorkflowNodeStatus::Running;
+    }
+    WorkflowNodeStatus::Pending
+}
+
+/// pi `seqLabel` (`workflow-graph.ts:59-61`): the step's trimmed label, else its agent, else
+/// `Step <n>`.
+fn seq_label(step: &WorkflowTaskSpec, step_index: usize) -> String {
+    let trimmed = step.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    trimmed
+        .map(str::to_string)
+        .or_else(|| step.agent.clone().filter(|a| !a.is_empty()))
+        .unwrap_or_else(|| format!("Step {}", step_index + 1))
+}
+
+/// Sanitize a dynamic item key into a node-id-safe token (pi's
+/// `task.itemKey.replace(/[^a-zA-Z0-9_-]/g, "-")`, `workflow-graph.ts:132`).
+fn sanitize_item_key(item_key: &str) -> String {
+    item_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect()
+}
+
+/// Build a [`WorkflowGraphSnapshot`] from declared steps + per-step results/statuses — the Rust port
+/// of pi's `buildWorkflowGraphSnapshot` (`workflow-graph.ts:73-206`), reproducing its exact node
+/// ids, phase grouping, group-status precedence, dynamic metadata, and `currentNodeId` selection.
+#[must_use]
+pub fn build_workflow_graph_snapshot(input: &WorkflowGraphBuildInput) -> WorkflowGraphSnapshot {
+    let mut nodes: Vec<WorkflowGraphNode> = Vec::new();
+    let mut phases: Vec<WorkflowPhase> = Vec::new();
+    let mut flat_index = 0usize;
+    let mut current_node_id: Option<String> = None;
+
+    for (step_index, step) in input.steps.iter().enumerate() {
+        match step {
+            WorkflowInputStep::Parallel(tasks) => {
+                let group_id = format!("step-{step_index}");
+                let mut children: Vec<WorkflowGraphNode> = Vec::new();
+                let mut child_statuses: Vec<WorkflowNodeStatus> = Vec::new();
+                for (task_index, task) in tasks.iter().enumerate() {
+                    let status = workflow_node_status(input, flat_index);
+                    child_statuses.push(status);
+                    let child_id = format!("step-{step_index}-agent-{task_index}");
+                    let label = task
+                        .label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| task.agent.clone().filter(|a| !a.is_empty()))
+                        .unwrap_or_else(|| format!("Agent {}", task_index + 1));
+                    let child = WorkflowGraphNode {
+                        id: child_id.clone(),
+                        kind: WorkflowNodeKind::Agent,
+                        agent: task.agent.clone(),
+                        phase: task.phase.clone(),
+                        label,
+                        status,
+                        flat_index: Some(flat_index),
+                        step_index: Some(step_index),
+                        item_key: None,
+                        output_name: task.output_name.clone(),
+                        structured: Some(task.structured),
+                        acceptance_status: input
+                            .results
+                            .get(flat_index)
+                            .and_then(|r| r.acceptance_status.clone()),
+                        error: input
+                            .step_statuses
+                            .get(flat_index)
+                            .and_then(|s| s.error.clone())
+                            .or_else(|| input.results.get(flat_index).and_then(|r| r.error.clone())),
+                        dynamic: None,
+                        children: None,
+                    };
+                    push_workflow_phase(&mut phases, task.phase.as_deref(), &child_id);
+                    if status == WorkflowNodeStatus::Running
+                        || input.current_flat_index == Some(flat_index)
+                    {
+                        current_node_id = Some(child_id.clone());
+                    }
+                    children.push(child);
+                    flat_index += 1;
+                }
+                let group_status = summarize_parallel_statuses(&child_statuses);
+                if input.current_step_index == Some(step_index) && current_node_id.is_none() {
+                    current_node_id = Some(group_id.clone());
+                }
+                nodes.push(WorkflowGraphNode {
+                    id: group_id,
+                    kind: WorkflowNodeKind::ParallelGroup,
+                    agent: None,
+                    phase: None,
+                    label: if tasks.len() == 1 {
+                        "Parallel task".to_string()
+                    } else {
+                        format!("Parallel group ({})", tasks.len())
+                    },
+                    status: group_status,
+                    flat_index: None,
+                    step_index: Some(step_index),
+                    item_key: None,
+                    output_name: None,
+                    structured: None,
+                    acceptance_status: None,
+                    error: None,
+                    dynamic: None,
+                    children: Some(children),
+                });
+                continue;
+            }
+            WorkflowInputStep::Dynamic(dynamic) => {
+                let group_id = format!("step-{step_index}");
+                let materialized = input.dynamic_children.get(&step_index);
+                let group_override = input.dynamic_group_statuses.get(&step_index);
+                let mut children: Vec<WorkflowGraphNode> = Vec::new();
+                let mut child_statuses: Vec<WorkflowNodeStatus> = Vec::new();
+                if let Some(materialized) = materialized {
+                    for task in materialized {
+                        let status = workflow_node_status(input, task.flat_index);
+                        child_statuses.push(status);
+                        let child_id =
+                            format!("step-{step_index}-item-{}", sanitize_item_key(&task.item_key));
+                        let phase = dynamic.template_phase.clone().or_else(|| dynamic.step_phase.clone());
+                        let label = task
+                            .label
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                dynamic
+                                    .template_label
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| format!("{} {}", task.agent, task.item_key));
+                        let child = WorkflowGraphNode {
+                            id: child_id.clone(),
+                            kind: WorkflowNodeKind::Agent,
+                            agent: Some(task.agent.clone()),
+                            phase: phase.clone(),
+                            label,
+                            status,
+                            flat_index: Some(task.flat_index),
+                            step_index: Some(step_index),
+                            item_key: Some(task.item_key.clone()),
+                            output_name: task.output_name.clone(),
+                            structured: Some(task.structured),
+                            acceptance_status: input
+                                .results
+                                .get(task.flat_index)
+                                .and_then(|r| r.acceptance_status.clone()),
+                            error: input
+                                .step_statuses
+                                .get(task.flat_index)
+                                .and_then(|s| s.error.clone())
+                                .or_else(|| {
+                                    input.results.get(task.flat_index).and_then(|r| r.error.clone())
+                                })
+                                .or_else(|| task.error.clone()),
+                            dynamic: None,
+                            children: None,
+                        };
+                        push_workflow_phase(&mut phases, phase.as_deref(), &child_id);
+                        if status == WorkflowNodeStatus::Running
+                            || input.current_flat_index == Some(task.flat_index)
+                        {
+                            current_node_id = Some(child_id.clone());
+                        }
+                        children.push(child);
+                    }
+                }
+                let group_status = group_override.map(|o| o.status).unwrap_or_else(|| {
+                    if children.is_empty() {
+                        if input.current_step_index == Some(step_index) {
+                            WorkflowNodeStatus::Running
+                        } else {
+                            WorkflowNodeStatus::Pending
+                        }
+                    } else {
+                        summarize_parallel_statuses(&child_statuses)
+                    }
+                });
+                if input.current_step_index == Some(step_index) && current_node_id.is_none() {
+                    current_node_id = Some(group_id.clone());
+                }
+                let label = dynamic
+                    .step_label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        dynamic
+                            .template_label
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("Dynamic fanout ({})", dynamic.collect_as));
+                nodes.push(WorkflowGraphNode {
+                    id: group_id,
+                    kind: WorkflowNodeKind::DynamicParallelGroup,
+                    agent: None,
+                    phase: None,
+                    label,
+                    status: group_status,
+                    flat_index: None,
+                    step_index: Some(step_index),
+                    item_key: None,
+                    output_name: Some(dynamic.collect_as.clone()),
+                    structured: Some(dynamic.collect_structured),
+                    acceptance_status: group_override.and_then(|o| o.acceptance_status.clone()),
+                    error: group_override.and_then(|o| o.error.clone()),
+                    dynamic: Some(WorkflowDynamicMeta {
+                        source_output: dynamic.expand_from_output.clone(),
+                        source_path: dynamic.expand_from_path.clone(),
+                        item_name: dynamic.item_name.clone().unwrap_or_else(|| "item".to_string()),
+                        max_items: dynamic.max_items,
+                        collect_as: Some(dynamic.collect_as.clone()),
+                    }),
+                    children: Some(children),
+                });
+                if let Some(materialized) = materialized
+                    && let Some(max) = materialized.iter().map(|c| c.flat_index + 1).max()
+                {
+                    flat_index = flat_index.max(max);
+                }
+                continue;
+            }
+            WorkflowInputStep::Sequential(seq) => {
+                let status = workflow_node_status(input, flat_index);
+                let id = format!("step-{step_index}");
+                nodes.push(WorkflowGraphNode {
+                    id: id.clone(),
+                    kind: WorkflowNodeKind::Step,
+                    agent: seq.agent.clone(),
+                    phase: seq.phase.clone(),
+                    label: seq_label(seq, step_index),
+                    status,
+                    flat_index: Some(flat_index),
+                    step_index: Some(step_index),
+                    item_key: None,
+                    output_name: seq.output_name.clone(),
+                    structured: Some(seq.structured),
+                    acceptance_status: input
+                        .results
+                        .get(flat_index)
+                        .and_then(|r| r.acceptance_status.clone()),
+                    error: input
+                        .step_statuses
+                        .get(flat_index)
+                        .and_then(|s| s.error.clone())
+                        .or_else(|| input.results.get(flat_index).and_then(|r| r.error.clone())),
+                    dynamic: None,
+                    children: None,
+                });
+                push_workflow_phase(&mut phases, seq.phase.as_deref(), &id);
+                if status == WorkflowNodeStatus::Running
+                    || input.current_flat_index == Some(flat_index)
+                    || input.current_step_index == Some(step_index)
+                {
+                    current_node_id = Some(id);
+                }
+                flat_index += 1;
+            }
+        }
+    }
+
+    WorkflowGraphSnapshot {
+        run_id: input.run_id.clone(),
+        mode: input.mode.unwrap_or(WorkflowRunMode::Chain),
+        phases,
+        nodes,
+        current_node_id,
+    }
+}
+
+/// Build a [`WorkflowGraphBuildInput`] from a background run's already-flattened [`RunnerStep`] list
+/// plus its live [`RunStatus`], so the detached runner (`background/runner_main.rs`) can embed a
+/// live workflow-graph snapshot in `status.json`. Each [`RunnerStep`] projects to a
+/// [`WorkflowInputStep`]; per-step status/errors come straight off `status.steps`
+/// ([`StepState`] normalized to the graph's own vocabulary). Note the cyrup [`crate::spawn::chain_graph::SingleStepSpec`]
+/// carries no `phase`/`label`, so those degrade to `None`/agent-name here — the richer, phase/label-
+/// bearing [`build_workflow_graph_snapshot`] path is exercised directly by the chain-plan layer that
+/// does have that metadata.
+#[must_use]
+pub fn workflow_graph_from_run(
+    steps: &[crate::spawn::chain_graph::RunnerStep],
+    status: &RunStatus,
+) -> WorkflowGraphSnapshot {
+    use crate::spawn::chain_graph::RunnerStep;
+    let mut input_steps: Vec<WorkflowInputStep> = Vec::new();
+    let mut results: Vec<WorkflowResultSummary> = Vec::new();
+    let mut step_statuses: Vec<WorkflowStepStatusInput> = Vec::new();
+
+    for (index, step) in steps.iter().enumerate() {
+        let step_status = status.steps.get(index);
+        let status_str = step_status.map(|s| match s.status {
+            StepState::Pending => "pending",
+            StepState::Running => "running",
+            StepState::Paused => "paused",
+            StepState::Complete => "complete",
+            StepState::Failed => "failed",
+        });
+        step_statuses.push(WorkflowStepStatusInput {
+            status: status_str.map(str::to_string),
+            error: step_status.and_then(|s| s.error.clone()),
+        });
+        results.push(WorkflowResultSummary::default());
+        match step {
+            RunnerStep::SingleStep(spec) => {
+                input_steps.push(WorkflowInputStep::Sequential(WorkflowTaskSpec {
+                    agent: Some(spec.agent.clone()),
+                    phase: None,
+                    label: None,
+                    output_name: spec.output.clone(),
+                    structured: spec.structured_output_schema.is_some(),
+                }));
+            }
+            RunnerStep::ImportAsyncRoot(spec) => {
+                input_steps.push(WorkflowInputStep::Sequential(WorkflowTaskSpec {
+                    agent: Some(spec.agent.clone()),
+                    phase: None,
+                    label: None,
+                    output_name: spec.output.clone(),
+                    structured: false,
+                }));
+            }
+            RunnerStep::ParallelGroup(group) => {
+                let tasks = group
+                    .steps
+                    .iter()
+                    .map(|s| WorkflowTaskSpec {
+                        agent: Some(s.agent.clone()),
+                        phase: None,
+                        label: None,
+                        output_name: s.output.clone(),
+                        structured: s.structured_output_schema.is_some(),
+                    })
+                    .collect();
+                input_steps.push(WorkflowInputStep::Parallel(tasks));
+            }
+            RunnerStep::DynamicGroup(dynamic) => {
+                input_steps.push(WorkflowInputStep::Dynamic(WorkflowDynamicStepSpec {
+                    expand_from_output: dynamic.expand.clone(),
+                    expand_from_path: String::new(),
+                    item_name: None,
+                    max_items: None,
+                    step_phase: None,
+                    step_label: None,
+                    template_phase: None,
+                    template_label: None,
+                    collect_as: dynamic.collect.clone(),
+                    collect_structured: dynamic.template.structured_output_schema.is_some(),
+                }));
+            }
+        }
+    }
+
+    let mode = match status.mode {
+        RunMode::Single => WorkflowRunMode::Single,
+        RunMode::Parallel => WorkflowRunMode::Parallel,
+        RunMode::Chain => WorkflowRunMode::Chain,
+    };
+
+    build_workflow_graph_snapshot(&WorkflowGraphBuildInput {
+        run_id: status.run_id.as_str().to_string(),
+        mode: Some(mode),
+        steps: input_steps,
+        results,
+        current_flat_index: status.current_step,
+        current_step_index: status.current_step,
+        step_statuses,
+        dynamic_children: std::collections::BTreeMap::new(),
+        dynamic_group_statuses: std::collections::BTreeMap::new(),
+    })
+}
+
+// =================================================================================================
+// Run-id PREFIX resolution over the async/results dirs (pi `run-id-resolver.ts` async slice +
+// `async-resume.ts::findAsyncRunPrefixMatches`)
+// =================================================================================================
+//
+// pi's control ops accept a run-id PREFIX and resolve it against the on-disk async/results dirs,
+// erroring on ambiguity and returning the resolved location (`resolveSubagentRunId`'s async branch,
+// `run-id-resolver.ts:54-83`; `findAsyncRunPrefixMatches`). This is the background/async slice of
+// that resolver — the only namespace this crate's background subsystem owns (the foreground-control
+// and nested-async namespaces pi also merges are separate subsystems). Both an EXACT id and a unique
+// PREFIX resolve; an ambiguous prefix is a hard error naming every match, exactly like pi.
+
+/// The on-disk location a resolved background run id maps to (pi `AsyncRunLocation`,
+/// `async-resume.ts`). At least one of `async_dir`/`result_path` is always `Some` (a run is
+/// resolvable iff its run dir OR its terminal result file exists).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsyncRunLocation {
+    /// The run's own directory (`<async_root>/<id>`), when it exists on disk.
+    pub async_dir: Option<PathBuf>,
+    /// The run's terminal result file (`<results_dir>/<id>.json`), when it exists on disk.
+    pub result_path: Option<PathBuf>,
+    /// The fully-resolved (non-prefix) run id.
+    pub resolved_id: RunId,
+}
+
+/// Why a run-id (prefix) failed to resolve (pi throws with these exact ambiguity/safety messages).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveRunIdError {
+    /// The id token was empty or contained a path separator / `..` (pi `assertSafeNestedId`).
+    #[error("'{0}' is not a safe id token")]
+    UnsafeToken(String),
+    /// The prefix matched more than one run (pi's "Ambiguous subagent run id prefix" throw).
+    #[error(
+        "Ambiguous subagent run id prefix '{prefix}' matched: {}. Provide a longer id.",
+        matches.join(", ")
+    )]
+    Ambiguous {
+        /// The ambiguous prefix as supplied.
+        prefix: String,
+        /// Every matched `async:<id>` label, in sorted order.
+        matches: Vec<String>,
+    },
+}
+
+/// A safe run-id token (pi `assertSafeNestedId`, `nested-events.ts`): non-empty, no path separator,
+/// no `..`.
+fn is_safe_run_id_token(token: &str) -> bool {
+    !token.is_empty()
+        && !token.contains('/')
+        && !token.contains('\\')
+        && !token.contains("..")
+}
+
+/// The exact-id location for `id`, if either its run dir or its terminal result file exists (pi
+/// `exactAsyncLocation`, `run-id-resolver.ts:19-28`). Pure filesystem existence checks only.
+fn exact_async_location(id: &str, async_root: &Path, results_dir: &Path) -> Option<AsyncRunLocation> {
+    let async_dir = async_root.join(id);
+    let result_path = results_dir.join(format!("{id}.json"));
+    let async_exists = async_dir.exists();
+    let result_exists = result_path.exists();
+    if !async_exists && !result_exists {
+        return None;
+    }
+    Some(AsyncRunLocation {
+        async_dir: async_exists.then_some(async_dir),
+        result_path: result_exists.then_some(result_path),
+        resolved_id: RunId::from_token(id),
+    })
+}
+
+/// Every background run whose id starts with `prefix`, gathered from BOTH the async run-dir tree and
+/// the results-dir (`<id>.json`) tree (pi `findAsyncRunPrefixMatches`, `async-resume.ts`). Returns a
+/// de-duplicated, id-sorted list of locations.
+#[must_use]
+pub fn find_async_run_prefix_matches(
+    prefix: &str,
+    async_root: &Path,
+    results_dir: &Path,
+) -> Vec<AsyncRunLocation> {
+    let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(async_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) {
+                ids.insert(name);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(results_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".json")
+                && stem.starts_with(prefix)
+            {
+                ids.insert(stem.to_string());
+            }
+        }
+    }
+    ids.into_iter()
+        .filter_map(|id| exact_async_location(&id, async_root, results_dir))
+        .collect()
+}
+
+/// Resolve `id` (an EXACT id or a unique PREFIX) to its on-disk [`AsyncRunLocation`] over
+/// `async_root`/`results_dir` — the background/async slice of pi's `resolveSubagentRunId`
+/// (`run-id-resolver.ts:54-83`). An exact match wins outright; otherwise a prefix that matches
+/// exactly one run resolves, a prefix matching several is [`ResolveRunIdError::Ambiguous`], and a
+/// prefix matching none is `Ok(None)`.
+///
+/// # Errors
+///
+/// [`ResolveRunIdError::UnsafeToken`] for an unsafe id token, or [`ResolveRunIdError::Ambiguous`]
+/// when a prefix matches more than one run.
+pub fn resolve_async_run_id(
+    id: &str,
+    async_root: &Path,
+    results_dir: &Path,
+) -> Result<Option<AsyncRunLocation>, ResolveRunIdError> {
+    if !is_safe_run_id_token(id) {
+        return Err(ResolveRunIdError::UnsafeToken(id.to_string()));
+    }
+    if let Some(exact) = exact_async_location(id, async_root, results_dir) {
+        return Ok(Some(exact));
+    }
+    let mut matches = find_async_run_prefix_matches(id, async_root, results_dir);
+    if matches.len() > 1 {
+        let labels = matches
+            .iter()
+            .map(|m| format!("async:{}", m.resolved_id.as_str()))
+            .collect::<Vec<_>>();
+        return Err(ResolveRunIdError::Ambiguous {
+            prefix: id.to_string(),
+            matches: labels,
+        });
+    }
+    Ok(matches.pop())
+}
+
+// =================================================================================================
 // Time helper
 // =================================================================================================
 
@@ -742,6 +2156,104 @@ fn now_epoch_millis() -> i64 {
     }
 }
 
+// =================================================================================================
+// Run-history recording (pi `runs/shared/run-history.ts`)
+// =================================================================================================
+//
+// pi appends one line per finished run to `<agentDir>/run-history.jsonl` via `recordRun`
+// (`run-history.ts:21-37`), a best-effort telemetry log a later `/subagents`-style surface reads
+// back. This is the Rust port of that write path, driven by the background runner's terminal
+// completion (`background/runner_main.rs::finish_run` records one entry per top-level result).
+
+/// One line of `run-history.jsonl` (pi `RunEntry`, `run-history.ts:5-12`): the agent, its (200-char-
+/// capped) task, a **seconds** epoch timestamp, an `"ok"`/`"error"` status, the run duration in
+/// milliseconds, and — only when nonzero — the failing exit code. Field names match pi's exact
+/// on-disk keys (`agent`/`task`/`ts`/`status`/`duration`/`exit`) so a reader of either runtime's
+/// history file sees the identical shape.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunHistoryEntry {
+    /// The agent this entry records.
+    pub agent: String,
+    /// The task text, truncated to pi's 200-character cap.
+    pub task: String,
+    /// Epoch **seconds** (pi's `Math.floor(Date.now() / 1000)`).
+    pub ts: i64,
+    /// `"ok"` for a clean exit, `"error"` otherwise (pi's `exitCode === 0 ? "ok" : "error"`).
+    pub status: String,
+    /// The run's duration in milliseconds.
+    pub duration: i64,
+    /// The failing exit code, present only when nonzero (pi's `...(exitCode !== 0 ? { exit } : {})`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+}
+
+/// The path pi writes run history to (`getAgentDir()/run-history.jsonl`), mapped onto cyrup's
+/// per-user subagents home: `<home>/.cyrup/subagents/run-history.jsonl`.
+#[must_use]
+pub fn run_history_path() -> PathBuf {
+    subagents_home().join("run-history.jsonl")
+}
+
+/// Append one [`RunHistoryEntry`] per `result` to `run-history.jsonl` (pi's `recordRun`,
+/// `run-history.ts:21-37`) — best-effort: a missing directory is created, and every I/O or
+/// serialization failure is silently swallowed so history recording can never fail a run (pi wraps
+/// the whole thing in a `try {} catch {}` for exactly this reason). `run_started_at` is the run's
+/// epoch-millis start, used to derive each entry's `duration`.
+pub async fn record_run_history(run_started_at: i64, results: &[SingleResult]) {
+    record_run_history_at(&run_history_path(), run_started_at, results).await;
+}
+
+/// The path-explicit core of [`record_run_history`], so tests can target a private temp path
+/// without mutating process-global `CYRUP_HOME`/`HOME` (the lib crate is `#![forbid(unsafe_code)]`,
+/// which blocks the `unsafe { set_var }` an env override would otherwise require in a `src/` test).
+async fn record_run_history_at(path: &Path, run_started_at: i64, results: &[SingleResult]) {
+    if results.is_empty() {
+        return;
+    }
+    let now = now_epoch_millis();
+    let duration = (now - run_started_at).max(0);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = tokio::fs::create_dir_all(parent).await;
+
+    let mut buf = String::new();
+    for result in results {
+        let entry = RunHistoryEntry {
+            agent: result.agent.clone(),
+            task: result.task.chars().take(200).collect(),
+            ts: now / 1000,
+            status: if result.exit_code == 0 { "ok" } else { "error" }.to_string(),
+            duration,
+            exit: (result.exit_code != 0).then_some(result.exit_code),
+        };
+        if let Ok(line) = serde_json::to_string(&entry) {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        // `tokio::fs::File` buffers writes internally and does NOT flush on drop, so a bare
+        // `write_all` can leave the bytes sitting in tokio's buffer (with the backing write still
+        // dispatched to the blocking pool) when the handle is dropped — the write then never lands
+        // and a reader sees an empty file. Flush explicitly so the entries are durable before the
+        // handle drops; still best-effort, so a flush error is swallowed like every other I/O error.
+        if file.write_all(buf.as_bytes()).await.is_ok() {
+            let _ = file.flush().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -753,6 +2265,108 @@ mod tests {
 
     use super::*;
     use std::collections::HashSet;
+
+    // ---------------------------------------------------------------------------------------
+    // Run-id PREFIX resolution (pi `run-id-resolver.ts` async slice)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_async_run_id_resolves_exact_and_unique_prefix_and_errors_on_ambiguous() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        std::fs::create_dir_all(&async_root).expect("mkdir async_root");
+        std::fs::create_dir_all(&results_dir).expect("mkdir results_dir");
+
+        // One run present as a run DIRECTORY, another present only as a terminal RESULT file.
+        std::fs::create_dir_all(async_root.join("deadbeef0001")).expect("mkdir run dir");
+        std::fs::write(results_dir.join("cafef00d0002.json"), b"{}").expect("write result file");
+
+        // An EXACT id (the dir-backed run) resolves.
+        let exact = resolve_async_run_id("deadbeef0001", &async_root, &results_dir)
+            .expect("no error")
+            .expect("exact id resolves");
+        assert_eq!(exact.resolved_id.as_str(), "deadbeef0001");
+        assert!(exact.async_dir.is_some());
+
+        // An EXACT id backed only by its terminal result file resolves via that file.
+        let exact_result = resolve_async_run_id("cafef00d0002", &async_root, &results_dir)
+            .expect("no error")
+            .expect("result-backed id resolves");
+        assert_eq!(exact_result.resolved_id.as_str(), "cafef00d0002");
+        assert!(exact_result.result_path.is_some());
+
+        // A unique PREFIX resolves to the single matching run (the load-bearing behavior this task
+        // calls for: control ops accept a run-id prefix, not only an exact id).
+        let by_prefix = resolve_async_run_id("deadbeef", &async_root, &results_dir)
+            .expect("no error")
+            .expect("unique prefix resolves");
+        assert_eq!(by_prefix.resolved_id.as_str(), "deadbeef0001");
+
+        // A prefix matching zero runs resolves to `None`, not an error.
+        let miss = resolve_async_run_id("zzzz", &async_root, &results_dir).expect("no error");
+        assert!(miss.is_none());
+
+        // A second run sharing the `deadbeef` prefix makes that prefix AMBIGUOUS — a hard error.
+        std::fs::create_dir_all(async_root.join("deadbeef9999")).expect("mkdir second run dir");
+        let ambiguous = resolve_async_run_id("deadbeef", &async_root, &results_dir);
+        assert!(
+            matches!(ambiguous, Err(ResolveRunIdError::Ambiguous { .. })),
+            "a prefix matching >1 run must be a hard Ambiguous error: {ambiguous:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Run-history recording (pi `run-history.ts`)
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn record_run_history_appends_one_ok_and_one_error_line() {
+        // Hermetic: write into a private temp path via the path-explicit core, so this never
+        // touches the real `~/.cyrup` and needs no `unsafe { set_var }` (blocked by the lib's
+        // `#![forbid(unsafe_code)]`).
+        let home = tempfile::tempdir().expect("real tempdir");
+        let history_path = home.path().join("run-history.jsonl");
+
+        let ok = SingleResult {
+            agent: "researcher".to_string(),
+            task: "look into the thing".to_string(),
+            exit_code: 0,
+            usage: Usage::default(),
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: Some("done".to_string()),
+            structured_output: None,
+            acceptance: None,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+            error: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+        };
+        let mut bad = ok.clone();
+        bad.agent = "writer".to_string();
+        bad.exit_code = 7;
+
+        record_run_history_at(&history_path, now_epoch_millis() - 1234, &[ok, bad]).await;
+
+        let contents = std::fs::read_to_string(&history_path).expect("history file exists");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per result: {contents:?}");
+
+        let first: RunHistoryEntry = serde_json::from_str(lines[0]).expect("parse first entry");
+        assert_eq!(first.agent, "researcher");
+        assert_eq!(first.status, "ok");
+        assert!(first.exit.is_none(), "a clean exit omits `exit`");
+        assert!(first.duration >= 0);
+
+        let second: RunHistoryEntry = serde_json::from_str(lines[1]).expect("parse second entry");
+        assert_eq!(second.agent, "writer");
+        assert_eq!(second.status, "error");
+        assert_eq!(second.exit, Some(7), "a nonzero exit records `exit`");
+    }
 
     // ---------------------------------------------------------------------------------------
     // RunId
@@ -1248,6 +2862,103 @@ mod tests {
             serde_json::to_string(&RunMode::Chain).expect("serializes"),
             "\"chain\""
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Shared async-root / results-dir derivation + ensureAccessibleDir (C7)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn run_artifact_roots_places_results_beside_async_keyed_by_the_same_cwd() {
+        // The two roots MUST share a subagents-home and a cwd key, differing only in the
+        // async/results segment — the exact invariant C7's divergent derivation broke.
+        let a = run_artifact_roots(Path::new("/some/project/a"));
+        let b = run_artifact_roots(Path::new("/some/project/b"));
+
+        let key = a.async_root.file_name().expect("async root has a key leaf");
+        assert_eq!(
+            a.results_dir.file_name(),
+            Some(key),
+            "both roots must be keyed by the same cwd"
+        );
+        assert_eq!(a.async_root.parent().and_then(Path::file_name), Some(std::ffi::OsStr::new("async")));
+        assert_eq!(a.results_dir.parent().and_then(Path::file_name), Some(std::ffi::OsStr::new("results")));
+        assert_eq!(
+            a.async_root.parent().and_then(Path::parent),
+            a.results_dir.parent().and_then(Path::parent),
+            "async/ and results/ must be siblings under one shared subagents home"
+        );
+
+        // Distinct cwds get distinct keys, so distinct roots — but the same shared home.
+        assert_ne!(a.async_root, b.async_root);
+        assert_ne!(a.results_dir, b.results_dir);
+        assert_eq!(
+            a.async_root.parent().and_then(Path::parent),
+            b.async_root.parent().and_then(Path::parent),
+            "the subagents-home prefix is shared across cwds"
+        );
+    }
+
+    #[test]
+    fn results_dir_for_async_root_recovers_the_orchestrator_sibling_for_the_standard_layout() {
+        // Standard layout: <home>/.cyrup/subagents/async/<key>  ->  .../results/<key>.
+        let roots = run_artifact_roots(Path::new("/home/me/project"));
+        let recovered = results_dir_for_async_root(&roots.async_root);
+        assert_eq!(
+            recovered, roots.results_dir,
+            "the structural fallback must reconstruct EXACTLY the orchestrator's results dir, \
+             preserving the cwd key (the C7 pre-fix derivation dropped it)"
+        );
+    }
+
+    #[test]
+    fn results_dir_for_async_root_never_nests_results_under_async() {
+        // C7's specific bug: the old `async_root.parent()/results` for a standard async_root
+        // nested `results` UNDER `async`. The fix must NOT.
+        let roots = run_artifact_roots(Path::new("/home/me/project"));
+        let recovered = results_dir_for_async_root(&roots.async_root);
+        assert!(
+            !recovered.starts_with(&roots.async_root),
+            "results dir must never live underneath the async root: {recovered:?}"
+        );
+        // Explicitly reject the exact wrong path the pre-fix code produced.
+        let wrong = roots.async_root.parent().unwrap().join("results");
+        assert_ne!(recovered, wrong.join(roots.async_root.file_name().unwrap()));
+    }
+
+    #[test]
+    fn results_dir_for_async_root_degrades_for_a_non_standard_async_root() {
+        // A bare `<base>/async` (no per-cwd key beneath a subagents home) is not the standard
+        // layout; the fallback degrades to a `results` sibling of async_root's parent, matching
+        // the fixed-layout fixtures the low-level runner subcommand's own unit tests assume.
+        let recovered = results_dir_for_async_root(Path::new("/base/async"));
+        assert_eq!(recovered, PathBuf::from("/base/results"));
+    }
+
+    #[tokio::test]
+    async fn ensure_accessible_dir_creates_a_missing_nested_directory() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let nested = dir.path().join("a").join("b").join("results");
+        assert!(!nested.exists());
+        ensure_accessible_dir(&nested).await.expect("creates the nested dir");
+        assert!(nested.is_dir(), "the full nested path must exist and be a directory");
+    }
+
+    #[tokio::test]
+    async fn ensure_accessible_dir_is_idempotent_on_an_existing_writable_dir() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let target = dir.path().join("results");
+        ensure_accessible_dir(&target).await.expect("first call creates");
+        // A probe file must NOT be left behind by the accessibility check.
+        ensure_accessible_dir(&target).await.expect("second call is a no-op");
+        let mut leftover_probes = 0usize;
+        let mut entries = tokio::fs::read_dir(&target).await.expect("readdir");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with(".cyrup-access-probe-") {
+                leftover_probes += 1;
+            }
+        }
+        assert_eq!(leftover_probes, 0, "the write probe must always be cleaned up");
     }
 
     // ---------------------------------------------------------------------------------------

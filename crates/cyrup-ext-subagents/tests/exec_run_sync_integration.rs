@@ -37,7 +37,7 @@ use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
-use cyrup_ext_subagents::exec::{AgentConfig, RunOptions};
+use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, ToolCallSummary};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
@@ -71,10 +71,16 @@ fn base_agent_config(model: &str) -> AgentConfig {
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
         fallback_models: Vec::new(),
+        thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
         system_prompt_body: String::new(),
         tools: None,
+        extensions: None,
+        subagent_only_extensions: Vec::new(),
         output: None,
+        inherit_project_context: false,
+        inherit_skills: true,
+        skills: Vec::new(),
         completion_guard: Some(false), // isolate this test from R-SA-034's own separate gate
         max_output: OutputCap::default(),
         max_subagent_depth: None,
@@ -89,6 +95,7 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
     RunOptions {
         cwd: cwd.to_path_buf(),
         deadline_at: None,
+        timeout_ms: None,
         output_path: None,
         output_mode: OutputMode::Inline,
         structured_output_schema: None,
@@ -99,10 +106,18 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
         interrupt: CancelToken::new(),
         share: None,
         session_dir: None,
+        skills: None,
+        runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
         acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
         fork_context: ForkContext::fresh(),
+        live_events: None,
+        parent_session_id: None,
+        clarify: None,
+        orchestrator_intercom_target: None,
+        run_id: None,
+        child_index: None,
     }
 }
 
@@ -195,17 +210,33 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
     assert!(!result.detached);
     assert!(!result.interrupted);
 
-    // R-SA-029: final-output extraction must have picked up the acceptance-report-shaped text.
+    // R-SA-029 + pi `stripAcceptanceReport` (execution.ts:823): the acceptance gate consumes the
+    // acceptance-report block for provenance, but it is STRIPPED from the DELIVERED output — the
+    // caller sees the human answer, never the machine report JSON (previously shown verbatim, the
+    // bug this closes).
     let output = result.final_output.expect("final_output must be extracted");
-    assert!(output.contains("acceptance-report"), "got: {output}");
-    assert!(output.contains("criteriaSatisfied"));
+    assert_eq!(
+        output, "I implemented the fix.",
+        "the trailing acceptance-report fence must be stripped from the delivered output, got: {output}"
+    );
+    assert!(!output.contains("acceptance-report"), "report fence must not leak into output: {output}");
+    assert!(!output.contains("criteriaSatisfied"));
 
     // R-SA-027: usage must have been accumulated from the child's message_end event.
     assert_eq!(result.usage.input, 42);
     assert_eq!(result.usage.output, 17);
 
-    // R-SA-043: result compaction — summarized tool_calls, not raw messages.
-    assert_eq!(result.tool_calls, vec!["edit".to_string()]);
+    // R-SA-043: result compaction — one `{text, expandedText}` tool-call PREVIEW (pi
+    // `ToolCallSummary`), sourced from the `tool_execution_start` request, NOT a bare tool name.
+    // The scripted `edit` call carried no path argument, so the preview is pi's `edit ` (the tool
+    // name followed by the empty shortened path), identical for the short and expanded forms.
+    assert_eq!(
+        result.tool_calls,
+        vec![ToolCallSummary {
+            text: "edit ".to_string(),
+            expanded_text: "edit ".to_string(),
+        }]
+    );
 
     // R-SA-032: acceptance ledger reached at least Checked given the real (non-triggered)
     // completion-mutation guard and the self-reported acceptance-report block.
@@ -539,5 +570,519 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     assert!(
         error.contains("structured output validation failed") && error.contains("count"),
         "expected a clear validation-error message naming the offending field, got: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
+    // pi `readStructuredOutput` (structured-output.ts:55-58, execution.ts:791-805): a declared
+    // `outputSchema` with NO captured structured value is a HARD failure EVEN WHEN the child
+    // produced prose — prose is never an exemption. The child here emits a non-empty prose answer
+    // but NO structured-output value at all.
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "emit", "line": message_end_line(
+                "Here is a perfectly nice prose answer with no structured output block at all.",
+                10, 5,
+            )},
+            {"kind": "emit", "line": r#"{"type":"agent_end"}"#}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-structured-missing-with-prose.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.structured_output_schema = Some(sample_structured_output_schema());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce the structured summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, well-behaved fixture child");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_ne!(
+        result.exit_code, 0,
+        "a declared schema with no structured value MUST fail even though prose was produced: {result:?}"
+    );
+    assert!(result.structured_output.is_none());
+    let error = result.error.expect("a missing-structured-output error must be present");
+    assert!(
+        error.contains("must finish by calling structured_output"),
+        "expected the pi 'Missing structured_output call' message, got: {error}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Tier T3 (group A) — exit-0 re-diagnosis, interrupt semantics, empty-output/fallback — driven
+// against the REAL scripted fixture child (no mocking), mirroring `single-execution.test.ts`
+// scenarios: a trailing tool failure after a zero exit becomes a failure; a soft interrupt is a
+// paused success; an empty (cold-start) output is a *retryable* failure that advances the ladder.
+// -------------------------------------------------------------------------------------------
+
+/// A `tool_execution_end` NDJSON line carrying the given text as its result, in cyrup's real tool-
+/// result wire shape (`{"content":[{"type":"text","text":…}],…}`, `agent.rs:113-115`).
+fn tool_execution_end_result_line(
+    tool_call_id: &str,
+    tool_name: &str,
+    text: &str,
+    is_error: bool,
+) -> String {
+    serde_json::json!({
+        "type": "tool_execution_end",
+        "toolCallId": tool_call_id,
+        "toolName": tool_name,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "details": serde_json::Value::Null,
+            "terminate": false
+        },
+        "isError": is_error
+    })
+    .to_string()
+}
+
+/// An empty terminal assistant `message_end` (clean `stopReason: "stop"`, no text) — the cold-start/
+/// empty-response shape pi's empty-output check classifies as a retryable failure.
+fn empty_message_end_line() -> String {
+    serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "usage": {
+                "input": 7, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 7,
+                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+            },
+            "stopReason": "stop"
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_does_not_retry() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The child EXITS ZERO, but its final activity was a failed `bash` call reporting a non-zero
+    // exit code, with NO assistant text recovering from it — pi `detectSubagentError`
+    // (`utils.ts:390-460`) flips this to a failure at the parsed exit code (127). Because
+    // "exit 127" matches NO retryable pattern, the fallback model must never be attempted.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": tool_execution_start_line("c1", "bash")},
+            {"kind": "emit", "line": tool_execution_end_result_line("c1", "bash", "process exited with code 127", false)}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-trailing-error.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let mut agent = base_agent_config("primary-model");
+    agent.fallback_models = vec![ModelId::from("fallback-model")]; // must NEVER be attempted
+    let mut opts = base_run_options(dir.path(), "primary-model");
+    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Run the build", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast fixture child");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(
+        result.exit_code, 127,
+        "detectSubagentError must flip a trailing bash exit 127 to a failure at that code: {result:?}"
+    );
+    let error = result.error.expect("a re-diagnosed error must be surfaced");
+    assert!(
+        error.contains("bash") && error.contains("127"),
+        "expected a bash exit-127 error message, got: {error}"
+    );
+    assert!(!result.timed_out);
+    assert!(!result.interrupted);
+    assert_eq!(
+        result.attempted_models.len(),
+        1,
+        "an exit-127 failure is NOT retryable, so the fallback model must never be attempted, got {:?}",
+        result.attempted_models
+    );
+    assert_eq!(result.attempted_models[0].as_str(), "primary-model");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A child that starts, then sleeps far longer than the test — the interrupt fires mid-run, and
+    // pi's soft-interrupt semantics (`execution.ts:722-761`) make this a PAUSED SUCCESS: exit 0,
+    // `interrupted: true`, a cleared error, and the "Interrupted. Waiting…" sentinel output — NOT
+    // an exit-1 failure.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "sleep_ms", "ms": 30_000}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-interrupt.json", &script);
+
+    let fixture = fixture_binary_path();
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    let interrupt = CancelToken::new();
+    opts.interrupt = interrupt.clone();
+
+    // Fire the interrupt shortly after the run begins (the child is by then blocked in its sleep).
+    let canceller = {
+        let interrupt = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            interrupt.cancel();
+        })
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15), // generous bound for the real SIGINT termination
+        cyrup_ext_subagents::exec::run_sync(&agent, "long running task", &opts),
+    )
+    .await
+    .expect("run_sync must return once the interrupt terminates the child");
+    let _ = canceller.await;
+
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(
+        result.exit_code, 0,
+        "a soft interrupt is a PAUSED SUCCESS (exit 0), not an exit-1 failure: {result:?}"
+    );
+    assert!(result.interrupted, "the interrupted flag must be set: {result:?}");
+    assert!(!result.timed_out, "an interrupt must not be reported as a timeout: {result:?}");
+    assert!(
+        result.error.is_none(),
+        "a paused-success interrupt must clear the error, got: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .final_output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Interrupted"),
+        "expected the paused-success sentinel output, got: {:?}",
+        result.final_output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback_ladder() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Every attempt (the single static script is reused for both models) emits a clean terminal
+    // stop with EMPTY text — pi's empty-output (cold-start) classification (`execution.ts:781-789`)
+    // makes this an exit-1 failure whose message ("no output") is RETRYABLE
+    // (`model-fallback.ts:129-131`), so the ladder ADVANCES to the fallback model (two attempts) —
+    // the observable proof that empty output triggers fallback, in contrast to the non-retryable
+    // trailing-tool failure above.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": empty_message_end_line()}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-empty-output.json", &script);
+
+    let fixture = fixture_binary_path();
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let mut agent = base_agent_config("primary-model");
+    agent.fallback_models = vec![ModelId::from("fallback-model")];
+    let mut opts = base_run_options(dir.path(), "primary-model");
+    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce a summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against fast fixture children");
+
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(
+        result.attempted_models.len(),
+        2,
+        "an empty-output failure is RETRYABLE, so the ladder MUST advance to the fallback model, \
+         got {:?}",
+        result.attempted_models
+    );
+    assert_eq!(
+        result.attempted_models,
+        vec![ModelId::from("primary-model"), ModelId::from("fallback-model")]
+    );
+    assert_eq!(result.model_attempts.len(), 2);
+    assert!(
+        result.model_attempts.iter().all(|attempt| !attempt.success),
+        "both empty-output attempts must be recorded as failures: {:?}",
+        result.model_attempts
+    );
+    assert_ne!(result.exit_code, 0, "the whole run fails once every attempt is empty: {result:?}");
+    let error = result.error.expect("a cold-start/empty-output error must be surfaced");
+    assert!(
+        error.to_lowercase().contains("no output") || error.to_lowercase().contains("cold-start"),
+        "expected the empty-output/cold-start error message, got: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is_retryable() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // pi `execution.ts:786`: the empty-output gate is
+    // `!finalText?.trim() && (!options.structuredOutput || missingStructuredOutput)`. When a
+    // structured-output schema IS declared but the child produced NEITHER prose NOR any
+    // structured-output value (`missingStructuredOutput` true), pi surfaces the RETRYABLE
+    // "no output" cold-start error at the per-attempt level, so the fallback ladder ADVANCES —
+    // it does NOT defer to a post-ladder, non-retryable "structured output missing" verdict. This
+    // is the observable proof that a schema-declared cold-start empty run still retries, matching
+    // the no-schema empty-output case above rather than short-circuiting on `structuredOutput`.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": empty_message_end_line()}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-empty-structured.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let mut agent = base_agent_config("primary-model");
+    agent.fallback_models = vec![ModelId::from("fallback-model")];
+    let mut opts = base_run_options(dir.path(), "primary-model");
+    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.structured_output_schema = Some(sample_structured_output_schema());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Produce a structured summary", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against fast fixture children");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(
+        result.attempted_models.len(),
+        2,
+        "a schema-declared but structured-missing AND empty-prose run is RETRYABLE, so the ladder \
+         MUST advance to the fallback model, got {:?}",
+        result.attempted_models
+    );
+    assert_eq!(
+        result.attempted_models,
+        vec![ModelId::from("primary-model"), ModelId::from("fallback-model")]
+    );
+    assert_ne!(result.exit_code, 0, "the whole run still fails once every attempt is empty: {result:?}");
+    let error = result.error.expect("a cold-start/empty-output error must be surfaced");
+    assert!(
+        error.to_lowercase().contains("no output") || error.to_lowercase().contains("cold-start"),
+        "expected the RETRYABLE empty-output/cold-start error (not a non-retryable \
+         structured-missing verdict), got: {error}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// T3 group C — timeout contract: a timed-out run's acceptance ledger is `rejected` (NOT
+// `not-required`), and its delivered output leads with the timeout message. Proven against the
+// REAL signal-escalation ladder (the fixture ignores SIGINT and sleeps far past the deadline, so
+// termination is confirmed only after SIGTERM), never a mock. pi `buildTimedOutAcceptanceLedger`
+// (`execution.ts:101-113,1089-1090`) + timeout preamble (`execution.ts:824-829`).
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_message() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "sleep_ms", "ms": 30_000}
+        ],
+        "ignore_sigint": true,
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-timeout-ledger.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    // A contract that REQUIRES acceptance (Checked) — so a timed-out run is `rejected`, not
+    // `not-required`. Both the nominal budget (for the message) and the wall-clock deadline are set.
+    opts.acceptance = Some(AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]));
+    opts.timeout_ms = Some(300);
+    opts.deadline_at = Some(std::time::Instant::now() + Duration::from_millis(300));
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        cyrup_ext_subagents::exec::run_sync(&agent, "long running task", &opts),
+    )
+    .await
+    .expect("run_sync must return once the real signal escalation confirms termination");
+
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert!(result.timed_out, "expected timed_out: true, got {result:?}");
+    assert_ne!(result.exit_code, 0, "a timed-out run must fail: {result:?}");
+
+    // The load-bearing assertion: the ledger is `rejected`, with a failed timeout runtime check —
+    // NOT the `not-required` a non-clean gate would otherwise yield.
+    let ledger = result
+        .acceptance
+        .expect("a timed-out run whose contract required acceptance must carry a ledger");
+    assert_eq!(
+        ledger.status,
+        AcceptanceStatus::Rejected,
+        "a timed-out run whose contract required acceptance must be REJECTED, got {ledger:?}"
+    );
+    assert!(
+        ledger
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("timed out"),
+        "the ledger must record the timeout as the reason acceptance was not evaluated: {ledger:?}"
+    );
+
+    // The delivered output leads with the timeout message (nominal budget), pi `formatTimeoutMessage`.
+    let output = result.final_output.expect("a timed-out run still delivers a message");
+    assert!(
+        output.contains("timed out after 300ms"),
+        "the delivered output must lead with the timeout message: {output}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// T3 group C — stderr surfacing: a child that exits non-zero with content on STDERR has that
+// stderr surfaced into `SingleResult::error` (pi `execution.ts:686`), not drained-and-discarded.
+// Proven against a REAL child that writes to its real stderr pipe and exits 2.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    const STDERR_DETAIL: &str = "fatal: the child could not open the workspace";
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "emit", "line": message_end_line("partial work before failing", 4, 2)},
+            {"kind": "emit_stderr", "line": STDERR_DETAIL},
+        ],
+        "exit_code": 2
+    });
+    let script_path = write_script(dir.path(), "script-stderr.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    // Single model, no fallback — the failure must not advance a ladder; assert on the one attempt.
+    let opts = base_run_options(dir.path(), "fixture-model");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "do the work", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, non-zero-exit fixture child");
+
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_ne!(result.exit_code, 0, "the child exited non-zero: {result:?}");
+    let error = result
+        .error
+        .expect("a non-zero-exit run with stderr must carry an error");
+    assert!(
+        error.contains(STDERR_DETAIL),
+        "the child's stderr must be surfaced into the result error (pi execution.ts:686), not \
+         drained-and-discarded — got: {error}"
     );
 }
