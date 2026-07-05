@@ -7,7 +7,11 @@
 )]
 
 use cyrup_tui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyrup_tui::{EditorOutcome, InputEditor};
+use cyrup_tui::{Component, EditorOutcome, InputEditor, UiTheme};
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui::Terminal;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -473,4 +477,87 @@ fn submit_expands_paste_marker() {
         }
         other => panic!("expected Submit, got {other:?}"),
     }
+}
+
+// ---- wrap-aware RENDER + height: long/pasted lines wrap AND grow the box (usability bug) ----
+
+/// Render an editor into a `w x h` headless `TestBackend` and return per-row `(symbols, reversed)`
+/// so tests can assert a long line flows across visual rows (nothing clipped) and where the
+/// reverse-video soft cursor lands. Row `y = 0` is the top rule; content starts at `y = 1`.
+fn render_rows(ed: &mut InputEditor, w: u16, h: u16) -> Vec<(String, bool)> {
+    let theme = UiTheme::dark();
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ed.render(f, Rect::new(0, 0, w, h), &theme)).unwrap();
+    let buf = term.backend().buffer();
+    let area = buf.area;
+    let mut rows = Vec::with_capacity(area.height as usize);
+    for y in 0..area.height {
+        let mut sym = String::new();
+        let mut reversed = false;
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                sym.push_str(cell.symbol());
+                reversed |= cell.modifier.contains(Modifier::REVERSED);
+            }
+        }
+        rows.push((sym, reversed));
+    }
+    rows
+}
+
+#[test]
+fn long_line_wraps_across_visual_rows_nothing_clipped() {
+    // (a) A single LOGICAL line wider than the box wraps within the width and flows onto the next
+    // row — the old renderer emitted one Line per logical line with no `.wrap`, clipping the tail.
+    // width 14 → view_width 13 → "alpha bravo charlie" wraps to "alpha bravo " + "charlie".
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "alpha bravo charlie");
+    let rows = render_rows(&mut ed, 14, 8);
+    // The head sits on the first content row (y=1), the wrapped tail on the second (y=2).
+    assert!(
+        rows[1].0.contains("alpha") && rows[1].0.contains("bravo"),
+        "first visual row missing the head:\n{rows:#?}"
+    );
+    assert!(
+        rows[2].0.contains("charlie"),
+        "second visual row missing the wrapped tail (clipped, not wrapped):\n{rows:#?}"
+    );
+    // The full text is present across the visual rows — nothing was dropped by clipping.
+    let visible: String = rows.iter().map(|(s, _)| s.as_str()).collect();
+    for word in ["alpha", "bravo", "charlie"] {
+        assert!(visible.contains(word), "word {word:?} clipped from render:\n{rows:#?}");
+    }
+}
+
+#[test]
+fn visual_line_count_grows_for_a_long_line() {
+    // (b) The app sizes the editor slot from the VISUAL line count (app.rs region_constraints), so a
+    // long line must report >=2 visual lines at the render content width (area.width - 1) to grow the
+    // box; an empty buffer stays a single visual line (slot floor).
+    let empty = InputEditor::new();
+    assert_eq!(empty.visual_line_count(13), 1, "empty buffer is a single visual line");
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "alpha bravo charlie");
+    assert!(
+        ed.visual_line_count(13) >= 2,
+        "long line did not grow the slot: count={}",
+        ed.visual_line_count(13)
+    );
+    // A wide width fits the whole line on one visual row again (no spurious growth).
+    assert_eq!(ed.visual_line_count(80), 1, "short-enough width should not wrap");
+}
+
+#[test]
+fn cursor_at_end_of_wrapped_line_renders_on_second_row() {
+    // (c) The caret at the end of a wrapped long line rides the SECOND visual row (Pi
+    // editor.ts:545-551): the reverse-video soft cursor must paint on that row, and the hardware
+    // cursor position must map there too.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "alpha bravo charlie"); // cursor at end (col 19) → last visual line "charlie"
+    let rows = render_rows(&mut ed, 14, 8);
+    assert!(!rows[1].1, "soft cursor must NOT be on the first visual row:\n{rows:#?}");
+    assert!(rows[2].1, "soft cursor (reverse cell) missing from the second visual row:\n{rows:#?}");
+    // The hardware-cursor y maps to the second content row (area.y + 1 + vrow == 2).
+    let (_, cy) = ed.cursor_in(Rect::new(0, 0, 14, 8)).unwrap();
+    assert_eq!(cy, 2, "hardware cursor not on the second visual row:\n{rows:#?}");
 }

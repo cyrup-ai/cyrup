@@ -2900,7 +2900,14 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 6] {
     // the two rule rows (spec/tui/05 §1.1, spec/tui/03 §3.1).
     let want_slot = match state.selector.as_ref() {
         Some(active) => active.inner.desired_height(width).clamp(3, max_editor),
-        None => (state.editor.line_count().min(u16::MAX as usize) as u16)
+        // Size from the VISUAL (wrapped) line count at the same content width the editor renders at
+        // (`view_width = area.width - 1`, one col reserved for the end-of-line cursor cell) so a long
+        // or pasted single logical line grows the box one row per wrapped visual line instead of
+        // clipping (Pi `editor.ts:1690`/`471`). The +2 is the two rule rows; the cap is unchanged.
+        None => (state
+            .editor
+            .visual_line_count(width.saturating_sub(1) as usize)
+            .min(u16::MAX as usize) as u16)
             .saturating_add(2)
             .clamp(3, max_editor),
     };

@@ -351,6 +351,18 @@ impl InputEditor {
         map
     }
 
+    /// The number of **visual** (wrapped) lines the buffer occupies at `width` columns — the total
+    /// [`VisualLine`] count of the wrap map built at an arbitrary width (`editor.ts:1690`
+    /// `build_visual_line_map(width).length`, the same primitive vertical motion uses). The app sizes
+    /// the editor slot from this so a long/pasted logical line grows the box one row per wrapped
+    /// visual line instead of clipping. Independent of [`view_width`](Self::view_width) so height
+    /// measurement and render agree when passed the same width. Always `>= 1`.
+    pub fn visual_line_count(&self, width: usize) -> usize {
+        let width = width.max(1);
+        let count: usize = self.lines.iter().map(|line| word_wrap_line(line, width).len()).sum();
+        count.max(1)
+    }
+
     /// Map the cursor `(row, col)` to its index in `map` (`editor.ts:1742` `find_current_visual_line`):
     /// the visual line of the cursor's logical row that contains `col`; when `col` sits exactly on a
     /// wrap boundary it belongs to the *start* of the following visual line, and an end-of-line cursor
@@ -1385,13 +1397,20 @@ impl InputEditor {
         if !self.focused {
             return None;
         }
-        // The first line is offset by the prompt glyph (`› `); later lines start flush.
-        let prompt = if self.row == 0 { PROMPT_W } else { 0 };
+        // Map the logical caret `(row, col)` to its VISUAL `(vrow, vcol)` via the wrap map (built at
+        // the render `view_width`) so the hardware cursor lands on the wrapped row/column, matching
+        // the reverse-video soft-cursor cell drawn in `render` (Pi `editor.ts:545-551`).
+        let map = self.visual_line_map();
+        let vi = self.current_visual_line(&map);
+        let vl = map.get(vi).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
+        let vcol = self.col.saturating_sub(vl.start);
+        // Only the first visual row carries the prompt-glyph offset (`› `); later rows start flush.
+        let prompt = if vi == 0 { PROMPT_W } else { 0 };
         let x = area
             .x
             .saturating_add(prompt)
-            .saturating_add(self.col.min(u16::MAX as usize) as u16);
-        let y = area.y.saturating_add(1).saturating_add(self.row.min(u16::MAX as usize) as u16);
+            .saturating_add(vcol.min(u16::MAX as usize) as u16);
+        let y = area.y.saturating_add(1).saturating_add(vi.min(u16::MAX as usize) as u16);
         let max_x = area.x.saturating_add(area.width).saturating_sub(1);
         let max_y = area.y.saturating_add(area.height).saturating_sub(1);
         Some((x.min(max_x), y.min(max_y)))
@@ -1505,27 +1524,42 @@ impl Component for InputEditor {
         let base = theme.base_style();
         let prompt_style = theme.accent_style();
         let cursor_style = base.add_modifier(Modifier::REVERSED);
-        let mut lines: Vec<Line> = Vec::with_capacity(self.lines.len());
-        for (r, logical) in self.lines.iter().enumerate() {
+        // Expand each LOGICAL line into its wrapped VISUAL lines at `view_width` (`editor.ts:1690`
+        // `build_visual_line_map`, the same primitive vertical motion uses) and emit one ratatui
+        // `Line` per visual line — so text past the width flows onto the next row instead of clipping
+        // (the `Paragraph` has no `.wrap`, so it renders exactly the rows we build). The soft cursor
+        // rides its VISUAL row/col, not the logical column.
+        let map = self.visual_line_map();
+        let cursor_vl = if self.focused { self.current_visual_line(&map) } else { usize::MAX };
+        let mut lines: Vec<Line> = Vec::with_capacity(map.len());
+        for (vi, vl) in map.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
-            if r == 0 {
+            // The prompt glyph anchors only the very first visual row (Pi first-line prompt).
+            if vi == 0 {
                 spans.push(Span::styled(PROMPT, prompt_style));
             }
-            if self.focused && r == self.row {
-                let col = self.col.min(logical.len());
-                let before: String = logical.iter().take(col).collect();
+            // The chars this visual line slices out of its logical line.
+            let seg: Vec<char> = self
+                .lines
+                .get(vl.logical)
+                .map(|l| l.iter().skip(vl.start).take(vl.len).copied().collect())
+                .unwrap_or_default();
+            if vi == cursor_vl {
+                // Cursor column within THIS visual line (0 at a wrap boundary; == len at line end).
+                let vcol = self.col.saturating_sub(vl.start).min(seg.len());
+                let before: String = seg.iter().take(vcol).collect();
                 spans.push(Span::styled(before, base));
-                match logical.get(col) {
+                match seg.get(vcol) {
                     Some(c) => {
                         spans.push(Span::styled(c.to_string(), cursor_style));
-                        let after: String = logical.iter().skip(col + 1).collect();
+                        let after: String = seg.iter().skip(vcol + 1).collect();
                         spans.push(Span::styled(after, base));
                     }
                     // End-of-line caret: a reverse-video space (Pi `editor.ts:550`).
                     None => spans.push(Span::styled(" ", cursor_style)),
                 }
             } else {
-                spans.push(Span::styled(logical.iter().collect::<String>(), base));
+                spans.push(Span::styled(seg.iter().collect::<String>(), base));
             }
             lines.push(Line::from(spans));
         }
