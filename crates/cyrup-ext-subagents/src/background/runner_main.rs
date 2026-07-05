@@ -79,7 +79,6 @@ use std::sync::Arc;
 
 use crate::error::SubagentError;
 use crate::exec::{self, AgentConfig, ResolvedAgentPersona, RunOptions, SingleResult};
-use crate::exec::fallback::ModelOverride;
 use crate::fork_context::{ContextMode, ForkContext};
 use crate::spawn::chain_graph::{
     ChainRunContext, OutputRegistry, RunnerStep, SingleStepExecutor, SingleStepSpec, StepResult,
@@ -211,6 +210,17 @@ pub struct RunnerConfig {
     /// each child un-bridged (the clean no-intercom path).
     #[serde(default)]
     pub orchestrator_intercom_target: Option<String>,
+    /// The launching orchestrator's live PARENT session model (pi `ctx.model`, `${provider}/${id}`),
+    /// resolved ONCE by the orchestrator from
+    /// [`crate::extension::SubagentExecutor::inherited_session_model`] at plan time and carried
+    /// verbatim into the detached runner so a step whose persona declares no `model:` (and carries no
+    /// per-step override) inherits the parent's model — this detached process has NO host-services
+    /// backend to read `current_model` from itself, so this config field is the only channel by which
+    /// the parent model reaches hop 2. `#[serde(default)]` (`None`) lets an older on-disk config still
+    /// deserialize — `None` leaves each inheriting step on its persona's own `model`/`fallback_models`
+    /// (the pre-inheritance behavior).
+    #[serde(default)]
+    pub inherited_session_model: Option<cyrup_core::ModelId>,
 }
 
 // =================================================================================================
@@ -935,6 +945,10 @@ async fn run_inner(
         // its `contact_supervisor` bridge addressed at the launching supervisor.
         orchestrator_intercom_target: config.orchestrator_intercom_target.clone(),
         run_id: Some(config.run_id.clone()),
+        // Session-model inheritance (pi `ctx.model`): the live parent session model the orchestrator
+        // captured at plan time, carried through the one-shot config (this detached process has no
+        // host-services backend of its own), so an inheriting step resolves the parent's model.
+        inherited_session_model: config.inherited_session_model.clone(),
     });
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
@@ -1436,6 +1450,17 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `control_resume` steers. Paired with [`Self::orchestrator_intercom_target`]: both `Some` is
     /// the child-bridge activation gate.
     pub(crate) run_id: Option<RunId>,
+    /// The live PARENT session model (pi `ctx.model`, `${provider}/${id}`), inherited by any step
+    /// whose persona declares no `model:` and that carries no per-step `model` override — the
+    /// analog of the foreground single-run path's `SubagentExecutor::inherited_session_model()`.
+    /// Threaded here (rather than read from a `HostServices` handle) because the detached hop-2
+    /// runner is a separate OS process with NO host-services backend at all: the orchestrator
+    /// captures it at plan time and carries it verbatim through
+    /// [`RunnerConfig::inherited_session_model`]. `None` (headless / no live session, or a detached
+    /// runner launched before any model was active) leaves each inheriting step's ladder to fall
+    /// through to its persona's own `model`/`fallback_models`, exactly as before this seam existed.
+    /// Consumed by [`Self::run_single`] via [`crate::exec::fallback::resolve_model_inheritance`].
+    pub(crate) inherited_session_model: Option<cyrup_core::ModelId>,
 }
 
 impl ExecSingleStepExecutor {
@@ -1460,12 +1485,21 @@ impl ExecSingleStepExecutor {
     /// path exactly as [`RunnerConfig`] does on the background path — so a foreground-spawned child's
     /// `contact_supervisor` reaches the live human orchestrator. `None`/absent leaves each child
     /// un-bridged (headless / no live intercom session).
+    ///
+    /// `inherited_session_model` (the live PARENT session model, via
+    /// `SubagentExecutor::inherited_session_model()`) is the model an inheriting foreground chain/
+    /// parallel step falls back to when its persona declares no `model:` and it carries no per-step
+    /// override — the SAME session-model inheritance the foreground single-run path applies, so a
+    /// `## reviewer` step with no configured model runs the parent's live model rather than an empty
+    /// ladder. `None` (headless / no live session) leaves each inheriting step on its persona's own
+    /// `model`/`fallback_models`, unchanged.
     #[must_use]
     pub(crate) fn foreground(
         depth: DepthEnvelope,
         resolved_agents: Arc<BTreeMap<String, ResolvedAgentPersona>>,
         orchestrator_intercom_target: Option<String>,
         run_id: Option<RunId>,
+        inherited_session_model: Option<cyrup_core::ModelId>,
     ) -> Self {
         Self {
             depth,
@@ -1478,6 +1512,7 @@ impl ExecSingleStepExecutor {
             telemetry: None,
             orchestrator_intercom_target,
             run_id,
+            inherited_session_model,
         }
     }
 }
@@ -1522,20 +1557,26 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         }
 
         // Model-fallback ladder inputs, mirroring the single-run path (`extension.rs::run_foreground`):
-        // a per-step `model` override wins (Explicit); otherwise inherit and let the persona's own
-        // `model`/`fallback_models` drive `build_model_candidates`. `available_models` is the union
-        // the availability filter selects from — the persona's fallback ladder + its own model +
-        // any per-step override — so a persona with a real configured model yields a non-empty
-        // ladder without any `--model default` placeholder ever being synthesized (the C13 defect).
+        // a per-step `model` override wins (Explicit); else a persona `model:` is primary (Inherit);
+        // else the live PARENT session model is inherited (pi `ctx.model`); else the ladder falls
+        // through to the persona's own `fallback_models`. `available_models` is the union the
+        // availability filter selects from — the persona's fallback ladder + its own model + any
+        // per-step override + (when inheriting) the parent session model — so a persona with a real
+        // configured model, OR an inheriting persona under a live parent, yields a non-empty ladder
+        // without any `--model default` placeholder ever being synthesized (the C13/inheritance
+        // defect). `self.inherited_session_model` is `None` for a headless runner or one launched
+        // before any model was active, which degrades to the persona's own models exactly as before.
         let mut available_models: Vec<cyrup_core::ModelId> = agent.fallback_models.clone();
         available_models.extend(agent.model.clone());
         if let Some(step_model) = &step.model {
             available_models.push(step_model.clone());
         }
-        let model_override = step
-            .model
-            .clone()
-            .map_or(ModelOverride::Inherit, ModelOverride::Explicit);
+        let model_override = crate::exec::fallback::resolve_model_inheritance(
+            step.model.as_ref(),
+            agent.model.as_ref(),
+            self.inherited_session_model.as_ref(),
+            &mut available_models,
+        );
 
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
@@ -2011,6 +2052,7 @@ mod tests {
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,
+            inherited_session_model: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
@@ -2072,6 +2114,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             orchestrator_intercom_target: None,
+            inherited_session_model: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2109,6 +2152,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             orchestrator_intercom_target: None,
+            inherited_session_model: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2218,6 +2262,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             orchestrator_intercom_target: None,
+            inherited_session_model: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -2466,6 +2511,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             orchestrator_intercom_target: None,
+            inherited_session_model: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");

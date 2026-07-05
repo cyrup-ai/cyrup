@@ -2682,6 +2682,60 @@ mod tests {
     }
 
     #[test]
+    fn an_inheriting_persona_spawns_the_child_with_the_parent_session_model() {
+        // (a) End-to-end resolution proof (no LLM): a persona with NO model of its own
+        // (model = None, fallback_models = []), run with NO per-call override, under a live parent
+        // session model X, resolves X as candidate #0 and spawns the child with `--model X`. Before
+        // this seam the ladder was empty and the run hard-failed with "no candidate model available".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("unused", &[]);
+        agent.model = None; // inheriting persona: no own model, no fallbacks
+        agent.thinking = None;
+
+        let inherited = ModelId::from("together/zai-org/GLM-5.2");
+        // available_models is built the way run_foreground_impl / run_single build it (persona
+        // fallbacks + own model), then resolve_model_inheritance folds in the inherited parent model.
+        let mut available_models: Vec<ModelId> =
+            agent.fallback_models.iter().cloned().chain(agent.model.clone()).collect();
+        let ov = crate::exec::fallback::resolve_model_inheritance(
+            None, // no per-call override
+            agent.model.as_ref(),
+            Some(&inherited),
+            &mut available_models,
+        );
+        assert!(
+            available_models.contains(&inherited),
+            "the inherited model must be added to available_models so the allowlist filter keeps it"
+        );
+
+        let candidates = build_model_candidates(
+            &ov,
+            agent.model.as_ref(),
+            &agent.fallback_models,
+            &available_models,
+        );
+        assert_eq!(
+            candidates,
+            vec![inherited.clone()],
+            "the inherited parent-session model is the sole/primary candidate (non-empty ladder)"
+        );
+
+        let opts = base_opts(dir.path(), &["together/zai-org/GLM-5.2"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(
+            argv[idx + 1], "together/zai-org/GLM-5.2",
+            "the child must spawn with the inherited parent session model as --model"
+        );
+    }
+
+    #[test]
     fn build_attempt_spawn_plan_emits_no_skills_only_when_the_agent_does_not_inherit_skills() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = base_opts(dir.path(), &["m1"]);

@@ -185,6 +185,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         original_task: String::new(),
         chain_dir: None,
         orchestrator_intercom_target: None,
+        inherited_session_model: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -316,6 +317,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         original_task: "ORIGINAL_TASK_MARKER".to_string(),
         chain_dir: None,
         orchestrator_intercom_target: None,
+        inherited_session_model: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -569,6 +571,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         original_task: String::new(),
         chain_dir: None,
         orchestrator_intercom_target: None,
+        inherited_session_model: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");

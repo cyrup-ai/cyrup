@@ -68,7 +68,7 @@ use crate::background::{run_status, RunId, RunMode, RunPaths, RunState};
 use crate::discovery::types::{AgentDefinition, AgentModelSourceInfo, AgentSource, OverrideScope};
 use crate::discovery::{discover_agents, AgentDiscoveryConfig};
 use crate::error::SubagentError;
-use crate::exec::fallback::ModelOverride;
+use crate::exec::fallback::resolve_model_inheritance;
 use crate::exec::{AgentConfig, ResolvedAgentPersona, RunOptions, SingleResult};
 use crate::fork_context::{
     resolve_effective_context, ContextMode, ForkContext, ForkContextResolver,
@@ -355,6 +355,20 @@ impl SubagentExecutor {
         let id = self.root_parent_session()?;
         let name = self.root_parent_session_name.get().map(String::as_str).filter(|s| !s.trim().is_empty());
         Some(crate::spawn::intercom_target::orchestrator_presence_target(name, &id))
+    }
+
+    /// The live PARENT session's current model as a `provider/id` [`ModelId`] — pi's `ctx.model`
+    /// (`pi-subagents/src/runs/shared/model-fallback.ts:47-59`), the model an inheriting subagent
+    /// (a persona with no `model:` of its own, run with no per-call override) resolves to. Read off
+    /// the bound P-1 [`cyrup_ext::host::HostServices`] backend
+    /// ([`cyrup_ext::host::HostServices::current_model`], returned by `LiveHostServices` as
+    /// `"{provider}/{model}"`), the SAME live-session seam `session_id`/`session_file`/
+    /// `inject_message` already reach. `None` when no live session backend is bound (headless /
+    /// SDK-embedder) or it has no active model yet — the ladder then falls through to the persona's
+    /// own `model`/`fallback_models` exactly as before (see [`crate::exec::fallback::resolve_model_inheritance`]).
+    #[must_use]
+    pub fn inherited_session_model(&self) -> Option<ModelId> {
+        self.host_services().and_then(|s| s.current_model()).map(ModelId::from)
     }
 
     /// The effective background-completion sink to install this session (R-SA-101). Precedence:
@@ -749,6 +763,21 @@ impl SubagentExecutor {
         if let Some(model) = &model_override {
             available_models.push(model.clone());
         }
+        // Session-model inheritance (pi `resolveSubagentModelOverride((params.model) ?? a.model,
+        // ctx.model, …)`, `subagent-executor.ts:1684`): when this run has NEITHER a per-call `model`
+        // override NOR a persona `model:` of its own, inherit the live PARENT session model
+        // (`HostServices::current_model`) as the primary candidate — otherwise an inheriting persona
+        // has an EMPTY ladder and the run hard-fails with "no candidate model available"
+        // (`exec/mod.rs`). `resolve_model_inheritance` both selects the effective override (per-call >
+        // persona > inherited) and pushes the inherited id into `available_models` so it survives the
+        // allowlist filter. `None` inherited (headless / no live session) degrades to the persona's
+        // own `model`/`fallback_models` exactly as before.
+        let effective_override = resolve_model_inheritance(
+            model_override.as_ref(),
+            agent_config.model.as_ref(),
+            self.inherited_session_model().as_ref(),
+            &mut available_models,
+        );
 
         // R-SA-035 / pi `resolveAttemptTimeout` (`execution.ts:91-99`): the orchestrator computes
         // the wall-clock `deadline_at` ONCE, here, from the nominal `timeout_ms` budget (pi
@@ -768,7 +797,7 @@ impl SubagentExecutor {
             output_path: None,
             output_mode: crate::discovery::types::OutputMode::Inline,
             structured_output_schema: None,
-            model_override: model_override.map_or(ModelOverride::Inherit, ModelOverride::Explicit),
+            model_override: effective_override,
             preferred_provider: None,
             available_models,
             cancel: CancelToken::new(),
@@ -1044,6 +1073,12 @@ impl SubagentExecutor {
             // spawned child activates its `contact_supervisor` bridge addressed at this supervisor.
             // `None` (headless / no live intercom session) leaves each child un-bridged.
             orchestrator_intercom_target: self.orchestrator_intercom_target(),
+            // Session-model inheritance (pi `ctx.model`): the live parent session model, resolved
+            // once here at plan time and carried into the detached runner (which has no host-services
+            // backend of its own), so a step whose persona declares no `model:` inherits the parent's
+            // model rather than hard-failing on an empty ladder. `None` (headless / no live session)
+            // leaves each inheriting step on its persona's own `model`/`fallback_models`.
+            inherited_session_model: self.inherited_session_model(),
         };
 
         let cfg_path = run_paths.run_dir.join("runner-config.json");
@@ -1115,6 +1150,10 @@ impl SubagentExecutor {
             Arc::new(resolved_agents),
             self.orchestrator_intercom_target(),
             Some(RunId::new()),
+            // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi `ctx.model`):
+            // an inheriting step (no persona `model:`, no per-step override) runs the parent's live
+            // model, the SAME inheritance the foreground single-run path applies.
+            self.inherited_session_model(),
         ));
         let global_limit = GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
         let ctx = ChainRunContext {
@@ -1388,15 +1427,21 @@ impl SubagentExecutor {
     /// single-agent form), erroring with the available-builtins list when the name is not a
     /// discovered builtin.
     ///
-    /// cyrup has no live model-registry / current-session-model handle threaded into this extension
-    /// (an outer-layer seam, Tier 8), so the "current session model" line and any registry-driven
-    /// re-resolution degrade to "(unavailable)"/inherit — the effective model shown is the persona's
-    /// own configured `model` (frontmatter / settings override / settings default), which is exactly
-    /// the runtime-loaded mapping this command exists to surface and which discovery already resolves
-    /// faithfully.
+    /// The live PARENT session model IS now threaded into this extension — read from the bound P-1
+    /// [`cyrup_ext::host::HostServices`] backend via [`Self::inherited_session_model`] (pi's
+    /// `ctx.model`) — so the "Current session model" line and an inheriting persona's effective model
+    /// render the REAL `provider/id` instead of "(unavailable)". A persona that declares its own
+    /// `model` still shows that (frontmatter / settings override / settings default); a persona with
+    /// no model shows the inherited session model when a live session is bound, and only degrades to
+    /// "(unavailable)"/"(inherits current session model)" when there is genuinely no live host
+    /// (headless / SDK-embedder / no active model yet).
     #[must_use]
     pub fn run_models_report(&self, cwd: &Path, requested_agent: Option<&str>) -> String {
-        let _ = self; // no executor state needed; a method for call-site symmetry with run_doctor.
+        // The live parent session model (pi `ctx.model`) an inheriting builtin resolves to; `None`
+        // when no live session backend is bound (headless / SDK-embedder) — then the display degrades
+        // to "(unavailable)" exactly as before this seam existed.
+        let current_model = self.inherited_session_model().map(|m| m.as_str().to_string());
+        let current_model = current_model.as_deref();
         let cfg = Self::discovery_config(cwd).unwrap_or_else(|_| Self::discovery_dirs_config(cwd));
         let discovered = match crate::discovery::discover_agents_all(&cfg) {
             Ok(discovered) => discovered,
@@ -1430,8 +1475,8 @@ impl SubagentExecutor {
                 String::new(),
                 format!("Agent: {requested}"),
                 "Effective model:".to_string(),
-                format!("  {}", resolved_builtin_model(agent)),
-                format!("Source: {}", format_model_source(agent)),
+                format!("  {}", resolved_builtin_model(agent, current_model)),
+                format!("Source: {}", format_model_source(agent, current_model)),
             ];
             if let Some(override_info) = &agent.override_info {
                 lines.push("Override file:".to_string());
@@ -1441,7 +1486,7 @@ impl SubagentExecutor {
                 lines.push("Disabled: true".to_string());
             }
             lines.push("Current session model:".to_string());
-            lines.push("  (unavailable)".to_string());
+            lines.push(format!("  {}", current_model.unwrap_or("(unavailable)")));
             return lines.join("\n");
         }
 
@@ -1449,7 +1494,7 @@ impl SubagentExecutor {
             "Builtin subagent models".to_string(),
             String::new(),
             "Current session model:".to_string(),
-            "  (unavailable)".to_string(),
+            format!("  {}", current_model.unwrap_or("(unavailable)")),
             String::new(),
         ];
         if builtins.is_empty() {
@@ -1463,8 +1508,8 @@ impl SubagentExecutor {
             };
             lines.push(agent.name.clone());
             lines.push("  model:".to_string());
-            lines.push(format!("    {}", resolved_builtin_model(agent)));
-            lines.push(format!("  source: {}{disabled_suffix}", format_model_source(agent)));
+            lines.push(format!("    {}", resolved_builtin_model(agent, current_model)));
+            lines.push(format!("  source: {}{disabled_suffix}", format_model_source(agent, current_model)));
             lines.push(String::new());
         }
         lines.join("\n")
@@ -3278,11 +3323,16 @@ impl SubagentTool {
         }
         let cfg = SubagentExecutor::discovery_config(&self.cwd)
             .map_err(|e| ToolError::new(e.to_string()))?;
+        // The live parent session model (pi `ctx.model`), so a `models` action routed through the
+        // management layer renders the real inherited model rather than `(unavailable)`. Bound to a
+        // local so the borrowed `&str` in `ManagementRequest` outlives the call.
+        let current_session_model = self.executor.inherited_session_model().map(|m| m.as_str().to_string());
         let req = crate::discovery::management::ManagementRequest {
             agent: p.agent.as_deref(),
             chain_name: p.chain_name.as_deref(),
             agent_scope: p.agent_scope.as_deref(),
             config: p.config.as_ref(),
+            current_session_model: current_session_model.as_deref(),
         };
         match crate::discovery::management::handle_management_action(&cfg, action, &req) {
             Ok(outcome) if !outcome.is_error => Ok(ToolResult {
@@ -4872,20 +4922,26 @@ fn render_chain_results(results: &[StepResult], is_group: &[bool], groups: &[Gro
 
 /// The effective model a discovered builtin persona resolves to for `/subagents-models` (pi
 /// `resolveSubagentModelOverride`'s cyrup-observable result): the persona's own configured `model`
-/// if it declares one, else the inherit-current-session-model intent (cyrup has no live session
-/// model to resolve it against — see [`SubagentExecutor::run_models_report`]'s doc).
-fn resolved_builtin_model(agent: &AgentDefinition) -> String {
+/// if it declares one, else — matching pi's `parentModel` inherit branch — the live
+/// `current_session_model` (`HostServices::current_model`, `provider/id`) when a session is bound,
+/// and only the "(inherits current session model)" placeholder when there is genuinely no live
+/// session model to resolve it against (see [`SubagentExecutor::run_models_report`]'s doc).
+fn resolved_builtin_model(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
     agent
         .model
         .as_ref()
         .map(|model| model.as_str().to_string())
+        .or_else(|| current_session_model.map(str::to_string))
         .unwrap_or_else(|| "(inherits current session model)".to_string())
 }
 
 /// Provenance of a builtin persona's resolved model (pi `formatModelSource`,
 /// agent-management.ts:565-578), derived from discovery's own `override_info`/`model_source`
-/// provenance rather than re-deriving the config-layering walk.
-fn format_model_source(agent: &AgentDefinition) -> String {
+/// provenance rather than re-deriving the config-layering walk. When the persona declares no
+/// `model` but a live `current_session_model` is bound, the inherit branch reports "inherits
+/// current session model" (pi `formatModelSource`, agent-management.ts:576) rather than the
+/// no-live-session degrade.
+fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
     if let Some(override_info) = &agent.override_info {
         let scope = match override_info.scope {
             OverrideScope::User => "user",
@@ -4900,6 +4956,8 @@ fn format_model_source(agent: &AgentDefinition) -> String {
         Some(AgentModelSourceInfo::Unresolved) | None => {
             if agent.model.is_some() {
                 "builtin agent config".to_string()
+            } else if current_session_model.is_some() {
+                "inherits current session model".to_string()
             } else {
                 "inherit requested, but no current session model is available".to_string()
             }
@@ -5824,6 +5882,51 @@ mod tests {
             unknown
                 .contains("Builtin agent 'definitely-not-a-builtin' not found. Available:"),
             "an unknown builtin name must be rejected with the available list: {unknown}"
+        );
+    }
+
+    /// A minimal [`cyrup_ext::host::HostServices`] double that reports only a canned current model
+    /// (every other capability keeps the trait's deny/None default) — the analog of
+    /// `cyrup-session-svc`'s `LiveHostServices` for proving the subagent session-model inheritance
+    /// seam reads `HostServices::current_model` without a real live session.
+    struct FixedModelHost(Option<String>);
+    impl cyrup_ext::host::HostServices for FixedModelHost {
+        fn current_model(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn inherited_session_model_reads_the_live_host_and_report_renders_it() {
+        // (a)/(d) at the executor seam: with NO host bound the inheritance degrades to `None` and the
+        // report shows `(unavailable)` exactly as before; once a host reporting model X is bound,
+        // `inherited_session_model()` returns X (pi `ctx.model`) and `/subagents-models` renders X on
+        // the `Current session model` line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+
+        // No host bound (headless / SDK-embedder default): genuine no-host degrade.
+        assert!(executor.inherited_session_model().is_none());
+        assert!(
+            executor
+                .run_models_report(dir.path(), None)
+                .contains("Current session model:\n  (unavailable)"),
+            "no live host must degrade to (unavailable)"
+        );
+
+        // Bind a live host reporting the parent session model.
+        executor.set_host_services(Arc::new(FixedModelHost(Some(
+            "together/zai-org/GLM-5.2".to_string(),
+        ))));
+        assert_eq!(
+            executor.inherited_session_model(),
+            Some(ModelId::from("together/zai-org/GLM-5.2")),
+            "inherited_session_model must read HostServices::current_model as a provider/id ModelId"
+        );
+        let report = executor.run_models_report(dir.path(), None);
+        assert!(
+            report.contains("Current session model:\n  together/zai-org/GLM-5.2"),
+            "the live inherited model must render on the report instead of (unavailable): {report}"
         );
     }
 

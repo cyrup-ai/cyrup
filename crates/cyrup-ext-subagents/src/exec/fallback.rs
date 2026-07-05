@@ -130,6 +130,62 @@ pub fn build_model_candidates(
     seen
 }
 
+/// Resolve one subagent attempt's effective [`ModelOverride`], folding in the INHERITED parent
+/// session model — the cyrup analog of pi's `resolveSubagentModelOverride(requestedModel,
+/// parentModel, availableModels, preferredProvider)`
+/// (`pi-subagents/src/runs/shared/model-fallback.ts:47-59`), where `requestedModel = task.model ??
+/// agentConfig.model` and `parentModel = ctx.model`.
+///
+/// Precedence, highest first (matching pi's `explicit ?? parentModel` branch, `model-fallback.ts:52-58`):
+///
+/// 1. `per_call_override` — an explicit per-call (`/run [model=…]`, tool `model`, single-run
+///    `model_override`) or per-step (chain step `model`) override. Returned as
+///    [`ModelOverride::Explicit`] so it is candidate #0.
+/// 2. `persona_model` — the resolved persona's own `model` (frontmatter / settings). Returned as
+///    [`ModelOverride::Inherit`] so [`build_model_candidates`] places the persona's already-present
+///    primary model first, exactly as before this seam existed (no behavior change for a persona
+///    that declares its own model).
+/// 3. `inherited_session_model` — the live PARENT session model
+///    ([`cyrup_ext::host::HostServices::current_model`], `${provider}/${id}`), used ONLY when
+///    neither an override nor a persona model is set. This is pi's `parentModel` inherit branch:
+///    without it an inheriting persona (`model = None`, `fallback_models = []`) has an EMPTY ladder,
+///    and [`run_fallback_ladder`]'s caller hard-fails the run with "no candidate model available"
+///    (`exec/mod.rs`) — the exact live blocker this seam closes. Returned as
+///    [`ModelOverride::Explicit`] so it is candidate #0, and PUSHED into `available_models` so
+///    [`build_model_candidates`]' allowlist filter does not immediately drop it.
+/// 4. Otherwise [`ModelOverride::Inherit`] with no inherited model — the genuine no-live-session
+///    degrade (headless / SDK-embedder / no active model yet): the ladder falls through to
+///    `persona_model` (absent in this arm) and the persona's `fallback_models` exactly as before,
+///    and an empty ladder stays the caller's hard pre-spawn error.
+///
+/// `available_models` is expected to ALREADY contain `per_call_override`/`persona_model`/the
+/// persona `fallback_models` (both production call sites build it that way before calling this);
+/// this function only ever ADDS the inherited model, never removes a caller-supplied candidate. Why
+/// inherit rather than let the child default: pi issue #266 (`model-fallback.ts:32-45`) — without
+/// an explicit `provider/id`, the child falls back to the global cross-session default, so one
+/// session's model choice contaminates another session's subagents (exactly R-SA-041's concern).
+#[must_use]
+pub fn resolve_model_inheritance(
+    per_call_override: Option<&ModelId>,
+    persona_model: Option<&ModelId>,
+    inherited_session_model: Option<&ModelId>,
+    available_models: &mut Vec<ModelId>,
+) -> ModelOverride {
+    match (per_call_override, persona_model) {
+        (Some(explicit), _) => ModelOverride::Explicit(explicit.clone()),
+        (None, Some(_)) => ModelOverride::Inherit,
+        (None, None) => match inherited_session_model {
+            Some(inherited) => {
+                if !available_models.contains(inherited) {
+                    available_models.push(inherited.clone());
+                }
+                ModelOverride::Explicit(inherited.clone())
+            }
+            None => ModelOverride::Inherit,
+        },
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // R-SA-039: retryable-failure classification
 // -------------------------------------------------------------------------------------------
@@ -819,6 +875,109 @@ mod tests {
     fn candidate_ladder_with_no_override_and_no_agent_model_is_empty() {
         let candidates = build_model_candidates(&ModelOverride::Inherit, None, &[], &[model("a")]);
         assert!(candidates.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // resolve_model_inheritance (R-SA-038/041; pi `resolveSubagentModelOverride`): precedence is
+    // per-call override > persona model > INHERITED parent session model > fallback_models, and the
+    // inherited model must survive `build_model_candidates`' allowlist filter (it is added to
+    // `available_models`) so it lands as candidate #0.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn inheritance_uses_the_parent_session_model_when_persona_has_no_model_and_no_override() {
+        // (a) the real blocker: an inheriting persona (model = None, fallback_models = []) with a
+        // live parent session model X ends up with X as candidate #0 — a NON-empty ladder, where
+        // before it was empty and the run hard-failed with "no candidate model available".
+        let inherited = model("together/zai-org/GLM-5.2");
+        let persona_model: Option<&ModelId> = None;
+        let persona_fallbacks: Vec<ModelId> = Vec::new();
+
+        // available_models is built the way both call sites build it: fallbacks + persona model.
+        let mut available_models: Vec<ModelId> =
+            persona_fallbacks.iter().cloned().chain(persona_model.cloned()).collect();
+        let ov = resolve_model_inheritance(None, persona_model, Some(&inherited), &mut available_models);
+
+        assert_eq!(ov, ModelOverride::Explicit(inherited.clone()));
+        assert!(
+            available_models.contains(&inherited),
+            "the inherited model must be added to available_models so the allowlist filter keeps it"
+        );
+        let candidates =
+            build_model_candidates(&ov, persona_model, &persona_fallbacks, &available_models);
+        assert_eq!(
+            candidates,
+            vec![inherited],
+            "the inherited parent-session model must be the primary (candidate #0), not filtered out"
+        );
+    }
+
+    #[test]
+    fn inheritance_yields_a_nonempty_ladder_where_inherit_sentinel_alone_would_be_empty() {
+        // Contrast with `candidate_ladder_with_no_override_and_no_agent_model_is_empty`: the bare
+        // Inherit sentinel + no persona model = empty ladder (the failure). With a live parent model
+        // threaded through resolve_model_inheritance, the same persona now resolves a candidate.
+        let inherited = model("anthropic/claude-opus-4-8");
+        let mut available_models: Vec<ModelId> = Vec::new();
+        let ov = resolve_model_inheritance(None, None, Some(&inherited), &mut available_models);
+        let candidates = build_model_candidates(&ov, None, &[], &available_models);
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates, vec![inherited]);
+    }
+
+    #[test]
+    fn a_per_call_override_wins_over_an_inherited_session_model() {
+        // (b) explicit per-call/per-step override beats inheritance.
+        let inherited = model("together/zai-org/GLM-5.2");
+        let per_call = model("z");
+        let mut available_models: Vec<ModelId> = vec![per_call.clone()];
+        let ov =
+            resolve_model_inheritance(Some(&per_call), None, Some(&inherited), &mut available_models);
+        assert_eq!(ov, ModelOverride::Explicit(per_call.clone()));
+        let candidates = build_model_candidates(&ov, None, &[], &available_models);
+        assert_eq!(candidates.first(), Some(&per_call), "per-call override is candidate #0");
+        assert!(
+            !candidates.contains(&inherited),
+            "inheritance must NOT be added when a per-call override is present"
+        );
+    }
+
+    #[test]
+    fn a_persona_model_wins_over_an_inherited_session_model() {
+        // (c) a persona that declares its own `model:` beats inheritance — resolve returns Inherit so
+        // build_model_candidates places the persona's own primary model first (unchanged behavior).
+        let inherited = model("together/zai-org/GLM-5.2");
+        let persona = model("x");
+        let mut available_models: Vec<ModelId> = vec![persona.clone()];
+        let ov =
+            resolve_model_inheritance(None, Some(&persona), Some(&inherited), &mut available_models);
+        assert_eq!(ov, ModelOverride::Inherit);
+        let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models);
+        assert_eq!(candidates.first(), Some(&persona), "persona model is candidate #0");
+        assert!(
+            !candidates.contains(&inherited),
+            "inheritance must NOT be added when the persona declares its own model"
+        );
+    }
+
+    #[test]
+    fn no_host_degrades_to_persona_fallbacks_exactly_as_before() {
+        // (d) no live session (inherited = None): resolve returns Inherit and adds nothing — the
+        // ladder falls through to the persona model + fallback_models exactly as before this seam.
+        let fallbacks = vec![model("f1"), model("f2")];
+        let mut available_models: Vec<ModelId> = fallbacks.clone();
+        let ov = resolve_model_inheritance(None, None, None, &mut available_models);
+        assert_eq!(ov, ModelOverride::Inherit);
+        assert_eq!(available_models, fallbacks, "no inherited model may be added when there is no host");
+        let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models);
+        assert_eq!(candidates, fallbacks, "the ladder is exactly the persona fallback list");
+
+        // ...and with neither a persona model nor fallbacks nor a host, the ladder stays empty (the
+        // caller's genuine hard pre-spawn error) — never a spuriously-invented candidate.
+        let mut empty_avail: Vec<ModelId> = Vec::new();
+        let ov = resolve_model_inheritance(None, None, None, &mut empty_avail);
+        assert_eq!(ov, ModelOverride::Inherit);
+        assert!(build_model_candidates(&ov, None, &[], &empty_avail).is_empty());
     }
 
     // ---------------------------------------------------------------------------------------

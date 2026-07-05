@@ -1180,10 +1180,14 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 //
 // Deferred here (documented, NOT silently claimed done), each gated on a subsystem outside this C3
 // task's scope:
-//   - model-registry warnings (`modelWarning`/`fallbackModelsWarning`) and live model resolution in
-//     `models` — need the model-registry / session-model handle that is `outer-layer` (Tier 8) and
-//     not threaded into this crate; the mapping here degrades to the agent's own discovery-resolved
-//     `model` + override provenance without a live registry (see [`format_model_source`]).
+//   - model-registry warnings (`modelWarning`/`fallbackModelsWarning`) in `models` — still need the
+//     live model-registry/catalog handle to validate a referenced model actually exists; that
+//     catalog probe remains deferred. Live SESSION-model resolution, however, is now wired: the
+//     parent session model (pi `ctx.model`) is threaded in via
+//     [`ManagementRequest::current_session_model`] (from
+//     [`cyrup_ext::host::HostServices::current_model`]), so an inheriting persona's effective model
+//     + the `Current session model` line render the real `provider/id` (see [`format_model_source`]),
+//     degrading to `(unavailable)` only with no live session.
 //   - skill warnings (`skillsWarning`) and proactive-skill suggestions in `list` — need the skills
 //     subsystem (C4 / Tier 5), entirely absent today.
 //   - companion suggestions in `list` — deferred-companion (no cyrup companion exists to integrate).
@@ -1222,6 +1226,13 @@ pub struct ManagementRequest<'a> {
     pub chain_name: Option<&'a str>,
     pub agent_scope: Option<&'a str>,
     pub config: Option<&'a serde_json::Value>,
+    /// The live PARENT session model (`provider/id`, from
+    /// [`cyrup_ext::host::HostServices::current_model`] — pi's `ctx.model`), threaded in by the
+    /// caller so [`handle_models`]'s `Current session model` line + `formatModelSource`'s inherit
+    /// branch render the REAL inherited model instead of `(unavailable)`. `None` (no live session
+    /// backend bound / headless) keeps the genuine no-host degrade. Only the `models` action reads
+    /// it; the other handlers ignore it.
+    pub current_session_model: Option<&'a str>,
 }
 
 /// The rendered outcome of a management action — pi's `result(text, isError)`
@@ -2346,11 +2357,13 @@ fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<Man
     Ok(ManagementOutcome { text: blocks.join("\n\n"), is_error: !any_found })
 }
 
-/// Degraded port of pi `formatModelSource` (`agent-management.ts:568-578`). Live "inherits current
-/// session model" resolution needs the model-registry/session handle that is `outer-layer` (Tier 8)
-/// and not threaded into this crate; here we classify purely from discovery-time provenance
-/// (`override_info` / `model_source`) and the agent's own resolved `model`.
-fn format_model_source(agent: &AgentDefinition) -> String {
+/// Port of pi `formatModelSource` (`agent-management.ts:568-578`). The live parent session model is
+/// now threaded in as `current_session_model` (from [`ManagementRequest::current_session_model`] /
+/// [`cyrup_ext::host::HostServices::current_model`]), so when the persona declares no `model` but a
+/// live session model is bound this reports "inherits current session model" (pi's own wording,
+/// agent-management.ts:576); otherwise it classifies from discovery-time provenance (`override_info`
+/// / `model_source`) and the agent's own resolved `model`.
+fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
     if let Some(info) = &agent.override_info
         && agent.model != info.base_snapshot.model
     {
@@ -2362,14 +2375,22 @@ fn format_model_source(agent: &AgentDefinition) -> String {
     if agent.model.is_some() {
         return "builtin agent config".to_string();
     }
+    if current_session_model.is_some() {
+        return "inherits current session model".to_string();
+    }
     "inherit requested, but no current session model is available".to_string()
 }
 
-/// pi `handleModels` (`agent-management.ts:580-647`), degraded: the live model registry + current
-/// session model are `outer-layer` (Tier 8), so `Current session model` renders `(unavailable)` and
-/// the effective model is the agent's own discovery-resolved `model` (or `(unresolved)`), classified
-/// by [`format_model_source`]. The requested-filter validation, override provenance, and disabled
-/// state are faithful.
+/// pi `handleModels` (`agent-management.ts:580-647`): the live parent session model is now threaded
+/// in via [`ManagementRequest::current_session_model`] (from
+/// [`cyrup_ext::host::HostServices::current_model`]), so `Current session model` renders the real
+/// `provider/id` and an inheriting persona's effective model falls back to it; both degrade to
+/// `(unavailable)`/`(unresolved)` only when there is genuinely no live session (headless /
+/// SDK-embedder). The requested-filter validation, override provenance, and disabled state are
+/// faithful. NB: the live `/subagents-models` slash + `subagent` tool `models` action route through
+/// [`crate::extension::SubagentExecutor::run_models_report`] (which has its own `HostServices`
+/// handle); this handler is the management-layer twin, reached via
+/// [`handle_management_action`] and this crate's tests.
 fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
     let requested = req.agent.map(str::trim).filter(|s| !s.is_empty());
     if let Some(name) = requested
@@ -2396,6 +2417,7 @@ fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
             .model
             .as_ref()
             .map(ToString::to_string)
+            .or_else(|| req.current_session_model.map(str::to_string))
             .unwrap_or_else(|| "(unresolved)".to_string());
         let mut lines = vec![
             "Builtin subagent model".to_string(),
@@ -2403,7 +2425,7 @@ fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
             format!("Agent: {name}"),
             "Effective model:".to_string(),
             format!("  {resolved}"),
-            format!("Source: {}", format_model_source(agent)),
+            format!("Source: {}", format_model_source(agent, req.current_session_model)),
         ];
         if let Some(info) = &agent.override_info {
             lines.push("Override file:".to_string());
@@ -2413,7 +2435,7 @@ fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
             lines.push("Disabled: true".to_string());
         }
         lines.push("Current session model:".to_string());
-        lines.push("  (unavailable)".to_string());
+        lines.push(format!("  {}", req.current_session_model.unwrap_or("(unavailable)")));
         return Ok(ManagementOutcome::ok(lines.join("\n")));
     }
 
@@ -2421,7 +2443,7 @@ fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
         "Builtin subagent models".to_string(),
         String::new(),
         "Current session model:".to_string(),
-        "  (unavailable)".to_string(),
+        format!("  {}", req.current_session_model.unwrap_or("(unavailable)")),
         String::new(),
     ];
     for name in BUILTIN_AGENT_NAMES {
@@ -2438,10 +2460,11 @@ fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<
                     .model
                     .as_ref()
                     .map(ToString::to_string)
+                    .or_else(|| req.current_session_model.map(str::to_string))
                     .unwrap_or_else(|| "(unresolved)".to_string());
                 let source = format!(
                     "{}{}",
-                    format_model_source(agent),
+                    format_model_source(agent, req.current_session_model),
                     if agent.disabled == Some(true) { "; disabled" } else { "" }
                 );
                 lines.push(name.to_string());
@@ -3528,7 +3551,13 @@ mod tests {
         scope: Option<&'a str>,
         config: Option<&'a serde_json::Value>,
     ) -> ManagementRequest<'a> {
-        ManagementRequest { agent, chain_name: chain, agent_scope: scope, config }
+        ManagementRequest {
+            agent,
+            chain_name: chain,
+            agent_scope: scope,
+            config,
+            current_session_model: None,
+        }
     }
 
     #[test]
@@ -3776,7 +3805,7 @@ mod tests {
     }
 
     #[test]
-    fn models_lists_builtin_mapping_without_a_live_registry() {
+    fn models_lists_builtin_mapping_without_a_live_session_degrades_to_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let out = handle_management_action(&cfg, "models", &mreq(None, None, None, None)).expect("models ok");
@@ -3785,8 +3814,38 @@ mod tests {
         for name in BUILTIN_AGENT_NAMES {
             assert!(out.text.contains(name), "missing builtin {name}: {}", out.text);
         }
-        // The live registry / session model is outer-layer (Tier 8) — documented degradation.
+        // (d) No live session model bound (`current_session_model: None`) ⇒ the genuine no-host
+        // degrade, exactly as before this seam existed.
         assert!(out.text.contains("Current session model:\n  (unavailable)"), "{}", out.text);
+    }
+
+    #[test]
+    fn models_renders_the_live_inherited_session_model_when_bound() {
+        // With a live parent session model threaded in (pi `ctx.model`), the report shows the REAL
+        // `provider/id` on the `Current session model` line, and an inheriting builtin (no own
+        // `model`) falls back to it as its effective model / "inherits current session model" source.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let model = "together/zai-org/GLM-5.2";
+        let req = ManagementRequest {
+            agent: None,
+            chain_name: None,
+            agent_scope: None,
+            config: None,
+            current_session_model: Some(model),
+        };
+        let out = handle_management_action(&cfg, "models", &req).expect("models ok");
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains(&format!("Current session model:\n  {model}")),
+            "the live inherited model must render instead of (unavailable): {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("(unavailable)"),
+            "no (unavailable) degrade when a live session model is bound: {}",
+            out.text
+        );
     }
 
     #[test]

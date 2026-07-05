@@ -547,6 +547,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         original_task: String::new(),
         chain_dir: None,
         orchestrator_intercom_target: None,
+        inherited_session_model: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -746,6 +747,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         original_task: String::new(),
         chain_dir: None,
         orchestrator_intercom_target: None,
+        inherited_session_model: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
