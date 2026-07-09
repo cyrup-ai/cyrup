@@ -221,6 +221,29 @@ pub struct RunnerConfig {
     /// (the pre-inheritance behavior).
     #[serde(default)]
     pub inherited_session_model: Option<cyrup_core::ModelId>,
+    /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:672,914`) —
+    /// resolved ONCE by the orchestrator from its own inherited env
+    /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
+    /// so a background run started from WITHIN an already-nested run relays its own descendants
+    /// through the SAME root route, never re-resolving env itself. `None` means this run is a
+    /// top-level (non-nested) run. `#[serde(default)]` lets an older on-disk config still
+    /// deserialize.
+    #[serde(default)]
+    pub nested_route: Option<crate::spawn::nested_events::NestedRoute>,
+    /// This run's own resolved ancestry address within `nested_route` (pi `config.nestedSelf`,
+    /// `async-execution.ts:673-678,915-920`) — `None` iff `nested_route` is also `None`.
+    /// `#[serde(default)]` lets an older on-disk config still deserialize.
+    #[serde(default)]
+    pub nested_self: Option<crate::spawn::nested_events::NestedParentAddress>,
+    /// The run-wide dynamic-fanout item cap (pi `config.chain.dynamicFanout.maxItems`), resolved
+    /// ONCE by the orchestrator (`SubagentExtensionConfig::dynamic_fanout_max_items`) at plan time
+    /// and carried here so the detached runner's own [`crate::spawn::chain_graph::ChainRunContext::
+    /// dynamic_fanout_max_items`] gets the SAME run-wide cap the foreground path applies — a
+    /// background `DynamicGroup` step whose own `expand.maxItems` is absent then falls back to this
+    /// value instead of always failing materialization. `#[serde(default)]` (`None`) lets an older
+    /// on-disk config still deserialize — `None` keeps the pre-fix "no config cap" behavior.
+    #[serde(default)]
+    pub dynamic_fanout_max_items: Option<u32>,
 }
 
 // =================================================================================================
@@ -953,6 +976,7 @@ async fn run_inner(
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
         deadline_at: None, // R-SA-036: background runs have no built-in wall-clock timeout.
+        timeout_ms: None, // Same R-SA-036 rationale: `timeoutMs`/`maxRuntimeMs` are foreground-only.
         cancel: cancel_root.clone(),
         global_limit,
         worktree_base_dir: config.worktree_base_dir.clone(),
@@ -963,7 +987,12 @@ async fn run_inner(
         // detached runner substitutes the SAME values the foreground `/chain` path does.
         original_task: config.original_task.clone(),
         chain_dir: config.chain_dir.clone(),
-        dynamic_fanout_max_items: None,
+        // C16 / pi `config.chain.dynamicFanout.maxItems`: the orchestrator resolves this ONCE at
+        // plan time (`config_snapshot().dynamic_fanout_max_items()`) and bakes it into the one-shot
+        // `RunnerConfig`, so a background dynamic-fanout step whose own `expand.maxItems` is absent
+        // falls back to the SAME run-wide cap the foreground path applies, rather than always
+        // failing materialization.
+        dynamic_fanout_max_items: config.dynamic_fanout_max_items,
     };
 
     loop {
@@ -1630,7 +1659,11 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let opts = RunOptions {
             cwd: effective_cwd,
             deadline_at: ctx.deadline_at,
-            timeout_ms: None,
+            // pi `chain-execution.ts:305-306,1118-1119`: every step's `runSync` call carries BOTH
+            // the chain-wide `deadlineAt` (raced against) and the nominal `timeoutMs` (only used to
+            // render the timed-out message) — the same two values for every step, never re-derived
+            // per step.
+            timeout_ms: ctx.timeout_ms,
             output_path,
             output_mode: step
                 .output_mode
@@ -2057,6 +2090,7 @@ mod tests {
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
             deadline_at: None,
+            timeout_ms: None,
             cancel: cyrup_core::CancelToken::new(),
             global_limit: GlobalConcurrencyLimit::new(4),
             worktree_base_dir: None,
@@ -2115,6 +2149,9 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2153,6 +2190,9 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2263,6 +2303,9 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -2512,6 +2555,9 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");

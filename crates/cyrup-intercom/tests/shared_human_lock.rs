@@ -74,6 +74,17 @@ impl HostServices for SharedSink {
         Some(Arc::clone(&self.human_lock))
     }
 
+    /// The permission gate's registry / unknown-tool check (pi `index.ts:2218-2228`,
+    /// `checkRequestedToolRegistration(toolName, pi.getAllTools())`) runs BEFORE any permission
+    /// check and fails CLOSED — blocking every tool, never reaching `resolve_ask`/`select` at
+    /// all — when [`HostServices::all_tool_names`] returns `None` (mirrors `tests/layers_wired.rs`'s
+    /// own `RegistryServices` test double, this crate-pair's established convention for exercising
+    /// the gate at all): a REAL host always reports its live tool registry, so this sink must too,
+    /// or the `bash` `ToolCall` this test drives never reaches the `select` dialog it asserts on.
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        Some(vec!["bash".to_string()])
+    }
+
     fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {
         let start = Instant::now();
         // The permission gate is now inside its `select` dialog HOLDING the shared lock — tell the test.

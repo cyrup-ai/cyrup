@@ -2,6 +2,8 @@
 //! to an anchored, **dotAll** regex; matching iterates **from the end** (last-match-wins). The
 //! dotAll (`s`) flag is load-bearing (`wildcard-matcher.ts:27`, Issue #24): a multi-line bash/heredoc
 //! command must be matched by `.*` across newlines, else it bypasses every rule to the default.
+//! On Windows the compiled regex is *also* case-insensitive (pi `process.platform === "win32" ?
+//! "si" : "s"`, `wildcard-matcher.ts:27`); every other platform stays case-sensitive.
 
 use regex::RegexBuilder;
 
@@ -28,6 +30,16 @@ impl<S> CompiledWildcard<S> {
 /// flag.
 #[must_use]
 pub fn compile<S>(pattern: &str, state: S) -> CompiledWildcard<S> {
+    // pi: `process.platform === "win32" ? "si" : "s"` — on Windows the compiled regex is also
+    // case-insensitive; every other platform is dotAll only (`wildcard-matcher.ts:27`).
+    compile_with_case_insensitive(pattern, state, cfg!(windows))
+}
+
+/// Same as [`compile`] but with the case-insensitive flag passed explicitly instead of derived
+/// from `cfg!(windows)`, so the win32 (`"si"`) branch of pi's platform check
+/// (`wildcard-matcher.ts:27`) is unit-testable on every host platform.
+#[must_use]
+pub fn compile_with_case_insensitive<S>(pattern: &str, state: S, case_insensitive: bool) -> CompiledWildcard<S> {
     let mut escaped = String::with_capacity(pattern.len() * 2 + 2);
     for ch in pattern.chars() {
         match ch {
@@ -51,7 +63,11 @@ pub fn compile<S>(pattern: &str, state: S) -> CompiledWildcard<S> {
     }
 
     let anchored = format!("^{escaped}$");
-    let regex = RegexBuilder::new(&anchored).dot_matches_new_line(true).build().ok();
+    let regex = RegexBuilder::new(&anchored)
+        .dot_matches_new_line(true)
+        .case_insensitive(case_insensitive)
+        .build()
+        .ok();
 
     CompiledWildcard { pattern: pattern.to_string(), state, regex }
 }
@@ -135,5 +151,31 @@ mod tests {
         let c = compile("read:/safe/*", ());
         assert!(c.is_match("read:/safe/file"));
         assert!(!c.is_match("read:/safe-evil/file"));
+    }
+
+    #[test]
+    fn windows_flag_makes_pattern_case_insensitive() {
+        // pi `wildcard-matcher.ts:27`: `process.platform === "win32" ? "si" : "s"` — on Windows the
+        // regex is compiled with BOTH dotAll and case-insensitive ("si"). Pre-fix, cyrup never set
+        // `case_insensitive` at all, so this would fail regardless of the flag passed in.
+        let c = compile_with_case_insensitive("GIT *", (), true);
+        assert!(c.is_match("git commit"));
+        assert!(c.is_match("GIT COMMIT"));
+    }
+
+    #[test]
+    fn non_windows_flag_keeps_pattern_case_sensitive() {
+        // Every other platform (pi's "s"-only branch) must stay case-sensitive.
+        let c = compile_with_case_insensitive("git *", (), false);
+        assert!(c.is_match("git commit"));
+        assert!(!c.is_match("GIT COMMIT"));
+    }
+
+    #[test]
+    fn compile_derives_case_insensitivity_from_host_platform() {
+        // `compile` must forward `cfg!(windows)` into the case-insensitive flag exactly as pi derives
+        // it from `process.platform === "win32"` (`wildcard-matcher.ts:27`).
+        let c = compile("git *", ());
+        assert_eq!(c.is_match("GIT COMMIT"), cfg!(windows));
     }
 }

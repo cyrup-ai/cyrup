@@ -28,6 +28,10 @@ use crate::types::{
 use crate::wildcard::{self, CompiledWildcard};
 
 const BUILT_IN_TOOL_NAMES: [&str; 7] = ["bash", "read", "write", "edit", "grep", "find", "ls"];
+
+/// pi `onWarning` ctor option's callback shape (`permission-manager.ts:620,631,643`): notified with a
+/// human-readable message whenever a policy file exists but fails to load/parse.
+type WarningCallback = Arc<dyn Fn(&str) + Send + Sync>;
 const SPECIAL_KEYS: [&str; 2] = ["doom_loop", "external_directory"];
 const MCP_BASELINE_TARGETS: [&str; 5] =
     ["mcp_status", "mcp_list", "mcp_search", "mcp_describe", "mcp_connect"];
@@ -105,12 +109,32 @@ pub struct PermissionManager {
     paths: ManagerPaths,
     resolved_cache: HashMap<String, (String, Arc<ResolvedPermissions>)>,
     mcp_names_cache: Option<(String, Vec<String>)>,
+    /// pi `onWarning` ctor option (`permission-manager.ts:620,631,643`): notified with a human-
+    /// readable message whenever a policy file exists but fails to load/parse (NOT when it is
+    /// simply absent — see [`notify_config_load_warning`]).
+    on_warning: Option<WarningCallback>,
 }
 
 impl PermissionManager {
     #[must_use]
     pub fn new(paths: ManagerPaths) -> Self {
-        Self { paths, resolved_cache: HashMap::new(), mcp_names_cache: None }
+        Self { paths, resolved_cache: HashMap::new(), mcp_names_cache: None, on_warning: None }
+    }
+
+    /// Register a warning callback (pi ctor's `onWarning` option, `permission-manager.ts:631,643`),
+    /// invoked by [`Self::load_global_config`]/[`Self::load_project_global_config`] when an existing
+    /// policy file fails to read or parse.
+    #[must_use]
+    pub fn with_on_warning(mut self, callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_warning = Some(Arc::new(callback));
+        self
+    }
+
+    /// pi `notifyWarning` (`permission-manager.ts:646-648`).
+    fn notify_warning(&self, message: &str) {
+        if let Some(cb) = &self.on_warning {
+            cb(message);
+        }
     }
 
     /// The single wired entry point (pi `checkPermission`, `permission-manager.ts:917-1047`).
@@ -145,11 +169,14 @@ impl PermissionManager {
             };
         }
 
-        // skill
+        // skill — pi checks `typeof skillName === "string"` (`permission-manager.ts:934-951`), i.e.
+        // ANY string value (including `""`/whitespace-only) enters the pattern-match branch
+        // untrimmed; only a non-string `name` (missing/number/etc.) falls back to the plain
+        // layered default. Do NOT require non-emptiness here (that's a divergence from pi).
         if normalized == "skill" {
-            let skill_name = get_non_empty_string(to_record(input).get("name"));
+            let skill_name = to_record(input).get("name").and_then(Value::as_str);
             if let Some(sn) = skill_name {
-                let result = find_compiled_match(&resolved.compiled_skills, &sn);
+                let result = find_compiled_match(&resolved.compiled_skills, sn);
                 let state = result
                     .as_ref()
                     .map(|r| r.state)
@@ -422,28 +449,51 @@ impl PermissionManager {
         format!("{global}|{project}|{agent}|{project_agent}")
     }
 
+    /// pi `loadGlobalConfig` (`permission-manager.ts:650-685`): on a read/parse failure of an
+    /// EXISTING file, warns (`formatJsoncConfigLoadWarning` + `notifyWarning`) before falling back
+    /// to the empty/ask config; a simply-absent file (`ENOENT`) is silent.
     fn load_global_config(&self) -> GlobalPermissionConfig {
-        let Ok(text) = std::fs::read_to_string(&self.paths.global_config_path) else {
-            return GlobalPermissionConfig::default();
+        let path = &self.paths.global_config_path;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                notify_config_load_error(self, &e, path, "using ask fallback");
+                return GlobalPermissionConfig::default();
+            }
         };
-        let Ok(value) = jsonc::parse_ordered(&text) else {
-            return GlobalPermissionConfig::default();
+        let path_str = path.display().to_string();
+        let value = match jsonc::parse_ordered_config(&text, &path_str, "permission config") {
+            Ok(v) => v,
+            Err(err) => {
+                self.notify_warning(&format!("{err}; using ask fallback."));
+                return GlobalPermissionConfig::default();
+            }
         };
         let permissions = normalize_raw_permission(&value);
         let default_policy = normalize_policy(value.get("defaultPolicy"));
         GlobalPermissionConfig { default_policy, permissions }
     }
 
+    /// pi `loadProjectGlobalConfig` (`permission-manager.ts:687-717`): same read/parse-warning
+    /// contract as [`Self::load_global_config`], but the fallback message + empty value differ.
     fn load_project_global_config(&self) -> AgentPermissions {
         let Some(path) = &self.paths.project_global_config_path else {
             return AgentPermissions::default();
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return AgentPermissions::default();
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                notify_config_load_error(self, &e, path, "ignoring project permission overrides");
+                return AgentPermissions::default();
+            }
         };
-        match jsonc::parse_ordered(&text) {
+        let path_str = path.display().to_string();
+        match jsonc::parse_ordered_config(&text, &path_str, "permission config") {
             Ok(value) => normalize_raw_permission(&value),
-            Err(_) => AgentPermissions::default(),
+            Err(err) => {
+                self.notify_warning(&format!("{err}; ignoring project permission overrides."));
+                AgentPermissions::default()
+            }
         }
     }
 
@@ -549,6 +599,26 @@ fn resolve_agent_markdown_path(dir: Option<&Path>, agent_name: Option<&str>) -> 
     } else {
         None
     }
+}
+
+/// pi `formatJsoncConfigLoadWarning`'s `isNodeErrorWithCode(error, "ENOENT")` branch
+/// (`jsonc-config.ts:43-45`) applied to a file-read failure: a simply-absent file is silent (no
+/// warning, matching a fresh install with no config yet); any other read error (permissions
+/// denied, I/O failure, ...) is warn-worthy, mirroring `loadGlobalConfig`/`loadProjectGlobalConfig`
+/// catch blocks (`permission-manager.ts:670-681`, `:702-711`).
+fn notify_config_load_error(
+    manager: &PermissionManager,
+    error: &std::io::Error,
+    path: &Path,
+    fallback_message: &str,
+) {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return;
+    }
+    manager.notify_warning(&format!(
+        "Failed to load permission config at '{}': {error}; {fallback_message}.",
+        path.display()
+    ));
 }
 
 fn file_stamp(path: &Path) -> String {
@@ -1111,5 +1181,77 @@ mod tests {
         assert!(resolve_agent_markdown_path(Some(&agents), Some("../secret")).is_none());
         // A normal name resolves inside the tree.
         assert!(resolve_agent_markdown_path(Some(&agents), Some("coder")).is_some());
+    }
+
+    // Regression test for the missing pi `onWarning`/`formatJsoncConfigLoadWarning` port
+    // (`jsonc-config.ts:37-52`, `permission-manager.ts:670-681`): pre-fix, `load_global_config`
+    // discarded a parse failure via `let Ok(..) else { return default }` with no warning path at
+    // all (`PermissionManager` had no `on_warning` field), so a syntactically broken existing
+    // config was silently treated exactly like an absent one.
+    #[test]
+    fn malformed_global_config_notifies_warning_and_falls_back_to_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("cyrup-permissions.jsonc");
+        write(&global, "{ not valid json");
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = warnings.clone();
+        let mut m = PermissionManager::new(ManagerPaths {
+            global_config_path: global,
+            agents_dir: dir.path().join("agents"),
+            project_global_config_path: None,
+            project_agents_dir: None,
+            legacy_global_settings_path: dir.path().join("settings.json"),
+            global_mcp_config_path: dir.path().join("mcp.json"),
+            mcp_server_names_override: Some(Vec::new()),
+        })
+        .with_on_warning(move |msg| warnings_clone.lock().unwrap().push(msg.to_string()));
+
+        let r = m.check_permission("bash", &serde_json::json!({"command":"ls"}), None);
+        assert_eq!(r.state, PermissionState::Ask);
+        let got = warnings.lock().unwrap();
+        assert_eq!(got.len(), 1, "expected exactly one warning, got {got:?}");
+        assert!(
+            got[0].contains("Failed to parse permission config"),
+            "unexpected warning text: {}",
+            got[0]
+        );
+    }
+
+    // A simply-absent config file must stay silent (pi's ENOENT suppression,
+    // `jsonc-config.ts:43-45`) — only an EXISTING-but-broken file warns.
+    #[test]
+    fn missing_global_config_does_not_notify_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("does-not-exist.jsonc");
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = warnings.clone();
+        let mut m = PermissionManager::new(ManagerPaths {
+            global_config_path: global,
+            agents_dir: dir.path().join("agents"),
+            project_global_config_path: None,
+            project_agents_dir: None,
+            legacy_global_settings_path: dir.path().join("settings.json"),
+            global_mcp_config_path: dir.path().join("mcp.json"),
+            mcp_server_names_override: Some(Vec::new()),
+        })
+        .with_on_warning(move |msg| warnings_clone.lock().unwrap().push(msg.to_string()));
+
+        let _ = m.check_permission("bash", &serde_json::json!({"command":"ls"}), None);
+        assert!(warnings.lock().unwrap().is_empty());
+    }
+
+    // Regression test for the skill-name emptiness divergence (pi `permission-manager.ts:934-951`
+    // checks `typeof skillName === "string"`, i.e. ANY string including `""`; pre-fix cyrup used
+    // `get_non_empty_string`, which trims and rejects empty/whitespace names, so an empty name
+    // never reached the pattern-match branch and a `"*": "allow"` skills wildcard was ignored).
+    #[test]
+    fn skill_empty_name_matches_wildcard_like_pi() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(dir.path(), r#"{ "skills": { "*": "allow" } }"#);
+        let r = m.check_permission("skill", &serde_json::json!({"name": ""}), None);
+        assert_eq!(r.state, PermissionState::Allow);
+        assert_eq!(r.matched_pattern.as_deref(), Some("*"));
     }
 }

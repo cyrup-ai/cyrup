@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::config::InboundTrigger;
+use crate::reply_tracker::IntercomContext;
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use crate::transport::protocol::{Attachment, Message, SessionInfo, now_ms};
@@ -40,13 +42,21 @@ const NON_INTERACTIVE_BUSY_NOTICE: &str =
 /// shape. Kept as a pure decision (no I/O) so the branch is unit-testable without a live host/broker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboundPolicy {
-    /// Interactive session (`has_ui`): drive an agent turn OVER the message via
-    /// `HostServices::inject_message(trigger_turn = true)` — which runs a fresh turn when the session
-    /// is idle and STEERS the message onto the active run when it is busy (the live host resolves the
-    /// idle-vs-busy split; pi's `isIdle() → sendIncomingMessage(entry,"trigger")` idle branch, with
-    /// the busy branch delivered as a steer rather than a next-idle queue — the ONE remaining
-    /// exact-parity nuance, "queue for next idle", needs a live `HostServices::is_idle` seam).
-    TriggerTurn,
+    /// Interactive session (`has_ui`): deliver the message through `HostServices::inject_message`,
+    /// with `trigger` deciding whether that call also drives/steers an agent turn OVER it (pi's
+    /// `shouldTriggerInboundMessage`, `index.ts:635-646`, applied at `sendIncomingMessage`'s
+    /// `delivery === "trigger" && shouldTriggerInboundMessage(entry)`, `index.ts:663-665`):
+    /// `config.inbound_trigger == Always` -> always `true`; `== Replies` -> `true` only when the
+    /// message is itself a reply (`reply_to.is_some()`); `== Never` -> always `false` (still
+    /// delivered, just without driving a turn — pi's `{ deliverAs: "followUp" }`).
+    ///
+    /// Still an OPEN exact-parity gap (unchanged by this fix, out of this file's scope): pi branches
+    /// FIRST on `ctx.isIdle()`, not on `hasUI` — an IDLE non-interactive session is delivered here
+    /// too, and a BUSY interactive session is queued (`pendingIdleMessages`, debounced) rather than
+    /// steered immediately. That needs a live `HostServices::is_idle` seam (`cyrup-ext`) plus a
+    /// pending-queue field on `SharedIntercomState` (`session_state.rs`), neither of which lives in
+    /// this file.
+    Deliver { trigger: bool },
     /// Non-interactive session (`!has_ui`) that received a fresh (non-reply) message while connected:
     /// send the sender the "running in non-interactive mode" busy auto-reply + `markReplied`
     /// (`index.ts:739-748`). Skipped for a message that is itself a reply (`reply_to.is_some()`).
@@ -56,13 +66,23 @@ pub enum InboundPolicy {
     SurfaceOnly,
 }
 
-/// Decide the inbound delivery policy (pi `index.ts:735-758`) from the session's static `has_ui` and
+/// Decide the inbound delivery policy (pi `index.ts:735-758`, gated by `shouldTriggerInboundMessage`,
+/// `index.ts:635-646`) from the session's static `has_ui`, the resolved `inbound_trigger` config, and
 /// whether the message is itself a reply. Pure — no host/broker I/O — so the branch is directly
 /// unit-testable. See [`InboundPolicy`].
 #[must_use]
-pub fn decide_inbound_policy(has_ui: bool, message: &Message) -> InboundPolicy {
+pub fn decide_inbound_policy(
+    has_ui: bool,
+    inbound_trigger: InboundTrigger,
+    message: &Message,
+) -> InboundPolicy {
     if has_ui {
-        InboundPolicy::TriggerTurn
+        let trigger = match inbound_trigger {
+            InboundTrigger::Always => true,
+            InboundTrigger::Replies => message.reply_to.is_some(),
+            InboundTrigger::Never => false,
+        };
+        InboundPolicy::Deliver { trigger }
     } else if message.reply_to.is_none() {
         InboundPolicy::AutoReply
     } else {
@@ -70,24 +90,40 @@ pub fn decide_inbound_policy(has_ui: bool, message: &Message) -> InboundPolicy {
     }
 }
 
-/// Drive an agent turn OVER an inbound message through the live `HostServices` (the interactive
-/// `has_ui` branch of [`decide_inbound_policy`], pi's idle-`sendIncomingMessage(entry,"trigger")`):
-/// build the message body and `inject_message(trigger_turn = true)` — the live host runs a fresh turn
-/// when idle and steers onto the active run when busy. `display = false` because the durable card was
-/// ALREADY surfaced via [`surface_incoming_message`]; this call only drives the turn, not a second
-/// visible copy. A no-op (returns `false`) when no `HostServices` is bound (headless/degraded).
-/// Returns whether the injection was attempted against a live host.
+/// Deliver an inbound message through the live `HostServices`, optionally driving/steering an agent
+/// turn OVER it (the interactive `has_ui` branch of [`decide_inbound_policy`], pi's
+/// `sendIncomingMessage(entry, "trigger")` gated by `shouldTriggerInboundMessage`): build the message
+/// body and `inject_message(trigger_turn = trigger)` — the live host runs a fresh turn when idle and
+/// steers onto the active run when busy, or (when `trigger` is `false`, `config.inbound_trigger`
+/// having declined it) delivers the message as a non-triggering follow-up entry (pi's
+/// `{ deliverAs: "followUp" }`). `display = false` because the durable card was ALREADY surfaced via
+/// [`surface_incoming_message`]; this call only drives delivery/the turn, not a second visible copy.
+/// A no-op (returns `false`) when no `HostServices` is bound (headless/degraded). Returns whether the
+/// injection was attempted against a live host.
 pub fn trigger_turn_over_inbound(
     state: &SharedIntercomState,
     from: &SessionInfo,
     message: &Message,
+    trigger: bool,
 ) -> bool {
     let Some(services) = state.host_services() else {
         return false;
     };
+    // `sendIncomingMessage` queues the turn context whenever `delivery !== "followUp"`
+    // (`index.ts:651-653`) — i.e. on every call through THIS ("trigger" delivery mode) path,
+    // regardless of whether `shouldTriggerInboundMessage` ultimately allows the turn-trigger itself.
+    // `ReplyTracker::begin_turn` (fired on the next `turn_start`, `extension.rs`'s `HostEvent::TurnStart`
+    // arm) shifts this queued context into `current_turn_context`, giving a bare
+    // `intercom({action:"reply"})` (no `to`) absolute priority over the "single pending"/`to`-filter
+    // fallbacks for the message that actually triggered/is steering this turn.
+    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
+        from: from.clone(),
+        message: message.clone(),
+        received_at: now_ms(),
+    });
     let body = build_inline_message(state, from, message).body().to_string();
-    if let Err(e) = services.inject_message(&body, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, true) {
-        tracing::warn!(error = %e, "intercom: failed to drive a turn over an inbound message");
+    if let Err(e) = services.inject_message(&body, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, trigger) {
+        tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
     true
 }
@@ -166,9 +202,9 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     //     static `has_ui` and the message shape, then routed to the real host/broker
                     //     seam: an interactive session drives/steers a turn OVER the message; a
                     //     non-interactive one sends the sender the busy auto-reply.
-                    match decide_inbound_policy(state.has_ui(), &message) {
-                        InboundPolicy::TriggerTurn => {
-                            trigger_turn_over_inbound(&state, &from, &message);
+                    match decide_inbound_policy(state.has_ui(), state.config.inbound_trigger, &message) {
+                        InboundPolicy::Deliver { trigger } => {
+                            trigger_turn_over_inbound(&state, &from, &message, trigger);
                         }
                         InboundPolicy::AutoReply => {
                             auto_reply_non_interactive(&state, &from, &message).await;
@@ -333,14 +369,62 @@ mod tests {
 
     #[test]
     fn inbound_policy_routes_by_has_ui_and_reply_shape() {
-        // Interactive (`has_ui`) → drive/steer a turn over the message regardless of its shape.
-        assert_eq!(decide_inbound_policy(true, &ask("hi")), InboundPolicy::TriggerTurn);
-        // Non-interactive + a fresh (non-reply) message → the busy auto-reply.
-        assert_eq!(decide_inbound_policy(false, &ask("hi")), InboundPolicy::AutoReply);
+        // Interactive (`has_ui`) + the default `Always` trigger policy → deliver AND trigger,
+        // regardless of the message's reply shape.
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Always, &ask("hi")),
+            InboundPolicy::Deliver { trigger: true }
+        );
+        // Non-interactive + a fresh (non-reply) message → the busy auto-reply (trigger policy is
+        // irrelevant to the non-interactive branch).
+        assert_eq!(
+            decide_inbound_policy(false, InboundTrigger::Always, &ask("hi")),
+            InboundPolicy::AutoReply
+        );
         // Non-interactive + a message that is itself a reply → nobody to auto-reply to → surface only.
         let mut reply = ask("hi");
         reply.reply_to = Some("q1".to_string());
-        assert_eq!(decide_inbound_policy(false, &reply), InboundPolicy::SurfaceOnly);
+        assert_eq!(
+            decide_inbound_policy(false, InboundTrigger::Always, &reply),
+            InboundPolicy::SurfaceOnly
+        );
+    }
+
+    #[test]
+    fn inbound_policy_honors_inbound_trigger_config_for_interactive_sessions() {
+        // Regression proof (pi `shouldTriggerInboundMessage`, `index.ts:635-646`): pre-fix,
+        // `decide_inbound_policy` ignored `config.inbound_trigger` entirely and ALWAYS drove a turn
+        // for an interactive (`has_ui`) session — this test fails against that behavior for both
+        // `Never` and `Replies`.
+        let fresh = ask("hi");
+        let mut reply = ask("hi");
+        reply.reply_to = Some("q1".to_string());
+
+        // `Never` → still deliver the message, but never drive/steer a turn — not even for a reply.
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Never, &fresh),
+            InboundPolicy::Deliver { trigger: false }
+        );
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Never, &reply),
+            InboundPolicy::Deliver { trigger: false }
+        );
+
+        // `Replies` → trigger only when the message is itself a reply to an outstanding ask.
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Replies, &fresh),
+            InboundPolicy::Deliver { trigger: false }
+        );
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Replies, &reply),
+            InboundPolicy::Deliver { trigger: true }
+        );
+
+        // `Always` → always trigger regardless of shape.
+        assert_eq!(
+            decide_inbound_policy(true, InboundTrigger::Always, &fresh),
+            InboundPolicy::Deliver { trigger: true }
+        );
     }
 
     #[tokio::test]

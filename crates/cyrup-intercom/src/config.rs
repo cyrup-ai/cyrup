@@ -143,25 +143,32 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
 }
 
 /// `getAskTimeoutMs` (`config.ts:7-18`): `CYRUP_INTERCOM_ASK_TIMEOUT_MS` if a positive integer, else
-/// [`DEFAULT_ASK_TIMEOUT_MS`]. An empty/unset value uses the default; a present-but-invalid value
-/// falls back to the default (pi throws; cyrup logs + defaults so a bad env never bricks a session).
-#[must_use]
-pub fn ask_timeout_ms() -> u64 {
+/// [`DEFAULT_ASK_TIMEOUT_MS`]. An empty/unset value uses the default. A present-but-invalid value
+/// (non-integer, non-positive, e.g. `"abc"`, `"0"`, `"-5"`, `"5000.5"`) is a hard `Err` — matching
+/// pi's uncaught `throw new Error("PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of
+/// milliseconds")` (`config.ts:14-16`), which crashes every call site rather than silently
+/// substituting a default.
+///
+/// # Errors
+/// Returns `Err` when `CYRUP_INTERCOM_ASK_TIMEOUT_MS` is set to a value that is not a positive
+/// integer number of milliseconds.
+pub fn ask_timeout_ms() -> Result<u64, String> {
     ask_timeout_ms_from(|k| std::env::var(k).ok())
 }
 
 /// The pure core of [`ask_timeout_ms`].
-#[must_use]
-pub fn ask_timeout_ms_from(env: impl Fn(&str) -> Option<String>) -> u64 {
+///
+/// # Errors
+/// See [`ask_timeout_ms`].
+pub fn ask_timeout_ms_from(env: impl Fn(&str) -> Option<String>) -> Result<u64, String> {
     match env(ENV_INTERCOM_ASK_TIMEOUT_MS) {
-        None => DEFAULT_ASK_TIMEOUT_MS,
-        Some(raw) if raw.trim().is_empty() => DEFAULT_ASK_TIMEOUT_MS,
+        None => Ok(DEFAULT_ASK_TIMEOUT_MS),
+        Some(raw) if raw.trim().is_empty() => Ok(DEFAULT_ASK_TIMEOUT_MS),
         Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(v) if v > 0 => v,
-            _ => {
-                tracing::warn!(value = %raw, "CYRUP_INTERCOM_ASK_TIMEOUT_MS must be a positive integer; using default");
-                DEFAULT_ASK_TIMEOUT_MS
-            }
+            Ok(v) if v > 0 => Ok(v),
+            _ => Err(format!(
+                "{ENV_INTERCOM_ASK_TIMEOUT_MS} must be a positive integer number of milliseconds"
+            )),
         },
     }
 }
@@ -215,10 +222,20 @@ mod tests {
 
     #[test]
     fn ask_timeout_default_and_override() {
-        assert_eq!(ask_timeout_ms_from(|_| None), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(|_| Some("   ".to_string())), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(|_| Some("5000".to_string())), 5000);
-        assert_eq!(ask_timeout_ms_from(|_| Some("-3".to_string())), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(|_| Some("0".to_string())), DEFAULT_ASK_TIMEOUT_MS);
+        assert_eq!(ask_timeout_ms_from(|_| None).unwrap(), DEFAULT_ASK_TIMEOUT_MS);
+        assert_eq!(ask_timeout_ms_from(|_| Some("   ".to_string())).unwrap(), DEFAULT_ASK_TIMEOUT_MS);
+        assert_eq!(ask_timeout_ms_from(|_| Some("5000".to_string())).unwrap(), 5000);
+    }
+
+    #[test]
+    fn ask_timeout_invalid_value_is_a_hard_error_not_a_silent_default() {
+        // config.ts:14-16 — pi throws on a non-positive/non-safe-integer value; it must never be
+        // silently swallowed into DEFAULT_ASK_TIMEOUT_MS (the pre-fix cyrup behavior). This test
+        // fails against that pre-fix behavior because `ask_timeout_ms_from` used to return a plain
+        // `u64` that silently defaulted instead of an `Err`.
+        assert!(ask_timeout_ms_from(|_| Some("-3".to_string())).is_err());
+        assert!(ask_timeout_ms_from(|_| Some("0".to_string())).is_err());
+        assert!(ask_timeout_ms_from(|_| Some("abc".to_string())).is_err());
+        assert!(ask_timeout_ms_from(|_| Some("5000.5".to_string())).is_err());
     }
 }

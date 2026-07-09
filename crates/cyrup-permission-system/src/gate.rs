@@ -4,7 +4,7 @@
 //! (`formatDenyReason` / `formatUserDeniedReason` / the ask-unavailable reason). The orchestration
 //! that CALLS these (the async gate on every `tool_call`) lives in `extension.rs`.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::common::{self, get_non_empty_string, to_record};
 use crate::evaluate;
@@ -217,8 +217,270 @@ pub fn format_user_denied_reason(
 /// Max inline tool-input preview length (pi `TOOL_INPUT_PREVIEW_MAX_LENGTH`, `index.ts:395`).
 const TOOL_INPUT_PREVIEW_MAX_LENGTH: usize = 200;
 
-/// pi `serializeToolInputPreview` + `truncateInlineText` (`index.ts:535-541,398-400`): a whitespace-
-/// collapsed JSON one-liner, truncated to 200 chars with an ellipsis; empty for `{}`/`null`/empty.
+/// Max inline sanitized-text summary length (pi `TOOL_TEXT_SUMMARY_MAX_LENGTH`, `index.ts:396`).
+const TOOL_TEXT_SUMMARY_MAX_LENGTH: usize = 80;
+
+/// pi `truncateInlineText` (`index.ts:398-400`): truncate to `max_length` chars with a trailing `…`.
+fn truncate_inline_text(value: &str, max_length: usize) -> String {
+    if value.chars().count() > max_length {
+        let head: String = value.chars().take(max_length).collect();
+        format!("{head}…")
+    } else {
+        value.to_string()
+    }
+}
+
+/// pi `sanitizeInlineText` (`index.ts:402-405`): whitespace-collapsed, trimmed, truncated inline
+/// text; `"empty text"` when nothing remains after normalization.
+fn sanitize_inline_text(value: &str, max_length: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        "empty text".to_string()
+    } else {
+        truncate_inline_text(&normalized, max_length)
+    }
+}
+
+/// pi `countTextLines` (`index.ts:407-413`): the number of `\r\n`/`\r`/`\n`-separated segments;
+/// `0` for an empty string (pi's falsy-string guard).
+fn count_text_lines(value: &str) -> usize {
+    if value.is_empty() {
+        return 0;
+    }
+    let bytes = value.as_bytes();
+    let mut count = 1usize;
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\r' => {
+                count += 1;
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => count += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
+/// pi `formatCount` (`index.ts:415-417`): `"{n} {singular|plural}"`.
+fn format_count(value: usize, singular: &str, plural: &str) -> String {
+    format!("{value} {}", if value == 1 { singular } else { plural })
+}
+
+/// pi `getPromptPath` (`index.ts:419-421`): the `path`, else `file_path`.
+fn get_prompt_path(input: &Map<String, Value>) -> Option<String> {
+    get_non_empty_string(input.get("path")).or_else(|| get_non_empty_string(input.get("file_path")))
+}
+
+/// pi `countEditPayloadLines` (`index.ts:423-431`): the line count of an edit's `lines` payload —
+/// the count of string entries for an array, `countTextLines` (minus one trailing `\n`) for a
+/// string, else `0`.
+fn count_edit_payload_lines(value: Option<&Value>) -> usize {
+    match value {
+        Some(Value::Array(items)) => items.iter().filter(|v| v.is_string()).count(),
+        Some(Value::String(s)) => {
+            let trimmed = s.strip_suffix('\n').unwrap_or(s);
+            count_text_lines(trimmed)
+        }
+        _ => 0,
+    }
+}
+
+/// pi `formatEditReference` (`index.ts:433-437`): a sanitized inline reference, or `"anchor"` when
+/// the value is not a non-empty string.
+fn format_edit_reference(value: Option<&Value>) -> String {
+    match value.and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => sanitize_inline_text(s, 40),
+        _ => "anchor".to_string(),
+    }
+}
+
+/// pi `STRUCTURED_EDIT_OPERATION_NAMES`-adjacent op-default: `edit.op` if a string, else
+/// `"replace_text"` (`index.ts:441`).
+fn structured_edit_op(edit: &Map<String, Value>) -> String {
+    edit.get("op").and_then(Value::as_str).unwrap_or("replace_text").to_string()
+}
+
+/// pi `formatStructuredEditSummary` (`index.ts:439-470`): the human-readable summary of a single
+/// structured edit payload, `None` for an unrecognized `op`.
+fn format_structured_edit_summary(edit: &Map<String, Value>, index: usize) -> Option<String> {
+    let ordinal = format!("edit #{}", index + 1);
+    let op = structured_edit_op(edit);
+
+    if let (Some(old_text), Some(new_text)) =
+        (edit.get("oldText").and_then(Value::as_str), edit.get("newText").and_then(Value::as_str))
+        && op == "replace_text"
+    {
+        return Some(format!(
+            "{ordinal} replaces {} with {}",
+            format_count(count_text_lines(old_text), "line", "lines"),
+            format_count(count_text_lines(new_text), "line", "lines")
+        ));
+    }
+
+    let line_count = format_count(count_edit_payload_lines(edit.get("lines")), "line", "lines");
+    match op.as_str() {
+        "replace" => {
+            let start = format_edit_reference(edit.get("pos"));
+            let end = match edit.get("end").and_then(Value::as_str) {
+                Some(e) if !e.trim().is_empty() => format!(" through {}", format_edit_reference(edit.get("end"))),
+                _ => String::new(),
+            };
+            Some(format!("{ordinal} replaces {line_count} at {start}{end}"))
+        }
+        "append" => {
+            let suffix = match edit.get("pos").and_then(Value::as_str) {
+                Some(_) => format!(" after {}", format_edit_reference(edit.get("pos"))),
+                None => " at EOF".to_string(),
+            };
+            Some(format!("{ordinal} appends {line_count}{suffix}"))
+        }
+        "prepend" => {
+            let suffix = match edit.get("pos").and_then(Value::as_str) {
+                Some(_) => format!(" before {}", format_edit_reference(edit.get("pos"))),
+                None => " at BOF".to_string(),
+            };
+            Some(format!("{ordinal} prepends {line_count}{suffix}"))
+        }
+        "delete" => {
+            let start = format_edit_reference(edit.get("pos"));
+            let end = match edit.get("end").and_then(Value::as_str) {
+                Some(e) if !e.trim().is_empty() => format!(" through {}", format_edit_reference(edit.get("end"))),
+                _ => String::new(),
+            };
+            Some(format!("{ordinal} deletes at {start}{end}"))
+        }
+        _ => None,
+    }
+}
+
+/// pi `getStructuredEditPayloads` (`index.ts:185-195`): the `edits` array verbatim, else a
+/// single-element `replace_text` payload synthesized from top-level `oldText`/`newText`, else empty.
+fn get_structured_edit_payloads(input: &Map<String, Value>) -> Vec<Value> {
+    if let Some(Value::Array(edits)) = input.get("edits") {
+        return edits.clone();
+    }
+    if let (Some(old_text), Some(new_text)) =
+        (input.get("oldText").and_then(Value::as_str), input.get("newText").and_then(Value::as_str))
+    {
+        return vec![serde_json::json!({
+            "op": "replace_text",
+            "oldText": old_text,
+            "newText": new_text,
+        })];
+    }
+    Vec::new()
+}
+
+/// pi `formatStructuredEditInputForPrompt` (`index.ts:472-489`): the `(N edits: ...)` summary for a
+/// structured-edit input, prefixed with `for 'path'` when a path is present; `fallback` (optionally
+/// path-prefixed) when there are no recognized edit summaries, `None` when there is no fallback either.
+fn format_structured_edit_input_for_prompt(
+    input: &Map<String, Value>,
+    fallback: Option<&str>,
+) -> Option<String> {
+    let path = get_prompt_path(input);
+    let summaries: Vec<String> = get_structured_edit_payloads(input)
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edit)| format_structured_edit_summary(to_record(edit), index))
+        .collect();
+    let path_part = path.map(|p| format!("for '{p}'"));
+
+    if summaries.is_empty() {
+        let fallback = fallback?;
+        return Some(match &path_part {
+            Some(pp) => format!("{pp} {fallback}"),
+            None => fallback.to_string(),
+        });
+    }
+
+    let extra_edits = if summaries.len() > 1 {
+        format!(", plus {}", format_count(summaries.len() - 1, "additional edit", "additional edits"))
+    } else {
+        String::new()
+    };
+    // `summaries` is provably non-empty here (the `is_empty()` early-return above), so `first()`
+    // always yields `Some`; `unwrap_or_default` just avoids an indexing-slicing panic path for a case
+    // that cannot occur, without reaching for `unwrap`/`expect`.
+    let first_summary = summaries.first().cloned().unwrap_or_default();
+    let summary =
+        format!("({}: {}{extra_edits})", format_count(summaries.len(), "edit", "edits"), first_summary);
+    Some(match &path_part {
+        Some(pp) => format!("{pp} {summary}"),
+        None => summary,
+    })
+}
+
+/// pi `formatEditInputForPrompt` (`index.ts:491-493`).
+fn format_edit_input_for_prompt(input: &Map<String, Value>) -> String {
+    format_structured_edit_input_for_prompt(input, Some("with edit input"))
+        .unwrap_or_else(|| "with edit input".to_string())
+}
+
+/// pi `formatWriteInputForPrompt` (`index.ts:495-500`).
+fn format_write_input_for_prompt(input: &Map<String, Value>) -> String {
+    let path = get_prompt_path(input);
+    let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+    let summary = format!(
+        "({}, {})",
+        format_count(count_text_lines(content), "line", "lines"),
+        format_count(content.chars().count(), "character", "characters")
+    );
+    match path {
+        Some(p) => format!("for '{p}' {summary}"),
+        None => summary,
+    }
+}
+
+/// pi `formatReadInputForPrompt` (`index.ts:502-512`).
+fn format_read_input_for_prompt(input: &Map<String, Value>) -> String {
+    let path = get_prompt_path(input);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = &path {
+        parts.push(format!("path '{p}'"));
+    }
+    if let Some(offset) = input.get("offset")
+        && offset.is_number()
+    {
+        parts.push(format!("offset {offset}"));
+    }
+    if let Some(limit) = input.get("limit")
+        && limit.is_number()
+    {
+        parts.push(format!("limit {limit}"));
+    }
+    if parts.is_empty() { String::new() } else { format!("for {}", parts.join(", ")) }
+}
+
+/// pi `formatSearchInputForPrompt` (`index.ts:514-533`).
+fn format_search_input_for_prompt(tool_name: &str, input: &Map<String, Value>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let path = get_prompt_path(input);
+    let pattern = get_non_empty_string(input.get("pattern"));
+    let glob = get_non_empty_string(input.get("glob"));
+
+    if let Some(p) = &pattern {
+        parts.push(format!("pattern '{}'", sanitize_inline_text(p, TOOL_TEXT_SUMMARY_MAX_LENGTH)));
+    }
+    if let Some(g) = &glob {
+        parts.push(format!("glob '{}'", sanitize_inline_text(g, TOOL_TEXT_SUMMARY_MAX_LENGTH)));
+    }
+    if let Some(p) = &path {
+        parts.push(format!("path '{p}'"));
+    } else if matches!(tool_name, "find" | "grep" | "ls") {
+        parts.push("current working directory".to_string());
+    }
+
+    if parts.is_empty() { String::new() } else { format!("for {}", parts.join(", ")) }
+}
+
+/// pi `serializeToolInputPreview` (`index.ts:535-542`): a whitespace-collapsed JSON one-liner; empty
+/// for `{}`/`null`/empty.
 fn serialize_tool_input_preview(input: &Value) -> String {
     if input.is_null() {
         return String::new();
@@ -229,24 +491,41 @@ fn serialize_tool_input_preview(input: &Value) -> String {
     if serialized == "{}" || serialized == "null" {
         return String::new();
     }
-    let collapsed = serialized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return String::new();
-    }
-    if collapsed.chars().count() > TOOL_INPUT_PREVIEW_MAX_LENGTH {
-        let head: String = collapsed.chars().take(TOOL_INPUT_PREVIEW_MAX_LENGTH).collect();
-        format!("{head}…")
+    serialized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// pi `formatJsonInputForPrompt` (`index.ts:544-547`): the generic `with input {json}` preview,
+/// truncated to [`TOOL_INPUT_PREVIEW_MAX_LENGTH`].
+fn format_json_input_for_prompt(input: &Value) -> String {
+    let inline = serialize_tool_input_preview(input);
+    if inline.is_empty() {
+        String::new()
     } else {
-        collapsed
+        format!("with input {}", truncate_inline_text(&inline, TOOL_INPUT_PREVIEW_MAX_LENGTH))
+    }
+}
+
+/// pi `formatToolInputForPrompt` (`index.ts:549-568`): dispatch on `tool_name` to the per-tool
+/// structured summary (`edit`/`write`/`read`/`find`/`grep`/`ls`), else a structured-edit summary for
+/// a non-builtin tool that still carries an `edits`/`oldText`+`newText` payload, else the generic
+/// JSON preview.
+fn format_tool_input_for_prompt(tool_name: &str, input: &Value) -> String {
+    let record = to_record(input);
+    match tool_name {
+        "edit" => format_edit_input_for_prompt(record),
+        "write" => format_write_input_for_prompt(record),
+        "read" => format_read_input_for_prompt(record),
+        "find" | "grep" | "ls" => format_search_input_for_prompt(tool_name, record),
+        _ => format_structured_edit_input_for_prompt(record, None)
+            .unwrap_or_else(|| format_json_input_for_prompt(input)),
     }
 }
 
 /// pi `formatAskPrompt` (`index.ts:570-590`): the human-facing **prompt** message shown in the live
 /// dialog (distinct from [`format_ask_unavailable_reason`], the headless block reason). Ports the
-/// `bash` / `mcp` / generic branches; the detailed per-tool input previews (edit/write/read/find/
-/// grep/ls, `formatToolInputForPrompt`) are DEFERRED to a follow-up — cosmetic (they only shape the
-/// dialog display string + the dedup fingerprint, never the enforcement decision) — the generic
-/// branch falls back to the compact JSON preview pi uses for every unrecognized tool.
+/// `bash` / `mcp` branches verbatim, and the generic branch dispatches through
+/// [`format_tool_input_for_prompt`] for the per-tool structured input preview (edit/write/read/find/
+/// grep/ls), falling back to the compact JSON preview for every other tool.
 #[must_use]
 pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str>, input: &Value) -> String {
     let subject = match agent_name {
@@ -268,8 +547,8 @@ pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str
     {
         return format!("{subject} requested MCP target '{target}'{pattern_info}. Allow this call?");
     }
-    let preview = serialize_tool_input_preview(input);
-    let input_suffix = if preview.is_empty() { String::new() } else { format!(" with input {preview}") };
+    let input_preview = format_tool_input_for_prompt(&result.tool_name, input);
+    let input_suffix = if input_preview.is_empty() { String::new() } else { format!(" {input_preview}") };
     format!(
         "{subject} requested tool '{}'{pattern_info}{input_suffix}. Allow this call?",
         result.tool_name
@@ -497,5 +776,90 @@ mod tests {
             &[],
         );
         assert_eq!(out.state, PermissionState::Deny);
+    }
+
+    fn ask_result(tool_name: &str) -> PermissionCheckResult {
+        PermissionCheckResult {
+            tool_name: tool_name.into(),
+            state: PermissionState::Ask,
+            matched_pattern: None,
+            command: None,
+            target: None,
+            source: CheckSource::Special,
+        }
+    }
+
+    /// pi `formatEditInputForPrompt` via `formatToolInputForPrompt` (`index.ts:491-493,552-554`):
+    /// the ask dialog shows a structured "(N edits: ...)" summary, not raw JSON. Fails against the
+    /// pre-fix generic-JSON fallback (which would render `with input {"path":...,"edits":[...]}`).
+    #[test]
+    fn ask_prompt_edit_uses_structured_summary_not_raw_json() {
+        let input = serde_json::json!({
+            "path": "src/lib.rs",
+            "edits": [{ "op": "replace_text", "oldText": "a\nb", "newText": "x\ny\nz" }],
+        });
+        let prompt = format_ask_prompt(&ask_result("edit"), None, &input);
+        assert!(
+            prompt.contains("for 'src/lib.rs' (1 edit: edit #1 replaces 2 lines with 3 lines)"),
+            "prompt was: {prompt}"
+        );
+        assert!(!prompt.contains("oldText"), "prompt leaked raw JSON: {prompt}");
+    }
+
+    /// pi `formatWriteInputForPrompt` (`index.ts:495-500`): shows path + line/char counts.
+    #[test]
+    fn ask_prompt_write_uses_structured_summary_not_raw_json() {
+        let input = serde_json::json!({ "path": "notes.txt", "content": "hello\nworld" });
+        let prompt = format_ask_prompt(&ask_result("write"), None, &input);
+        assert!(
+            prompt.contains("for 'notes.txt' (2 lines, 11 characters)"),
+            "prompt was: {prompt}"
+        );
+        assert!(!prompt.contains("\"content\""), "prompt leaked raw JSON: {prompt}");
+    }
+
+    /// pi `formatReadInputForPrompt` (`index.ts:502-512`): shows path/offset/limit.
+    #[test]
+    fn ask_prompt_read_uses_structured_summary_not_raw_json() {
+        let input = serde_json::json!({ "path": "notes.txt", "offset": 10, "limit": 50 });
+        let prompt = format_ask_prompt(&ask_result("read"), None, &input);
+        assert!(
+            prompt.contains("for path 'notes.txt', offset 10, limit 50"),
+            "prompt was: {prompt}"
+        );
+    }
+
+    /// pi `formatSearchInputForPrompt` (`index.ts:514-533`): grep with no path falls back to "current
+    /// working directory".
+    #[test]
+    fn ask_prompt_grep_without_path_shows_cwd_fallback() {
+        let input = serde_json::json!({ "pattern": "TODO" });
+        let prompt = format_ask_prompt(&ask_result("grep"), None, &input);
+        assert!(
+            prompt.contains("for pattern 'TODO', current working directory"),
+            "prompt was: {prompt}"
+        );
+    }
+
+    /// pi `formatToolInputForPrompt` default branch (`index.ts:563-566`): an unrecognized tool with a
+    /// structured `oldText`/`newText` payload still gets the structured summary, not raw JSON.
+    #[test]
+    fn ask_prompt_unknown_tool_with_edit_payload_uses_structured_summary() {
+        let input = serde_json::json!({ "oldText": "a", "newText": "b\nc" });
+        let prompt = format_ask_prompt(&ask_result("custom_patch"), None, &input);
+        assert!(
+            prompt.contains("(1 edit: edit #1 replaces 1 line with 2 lines)"),
+            "prompt was: {prompt}"
+        );
+    }
+
+    /// pi `formatToolInputForPrompt` default branch falling through to `formatJsonInputForPrompt`
+    /// (`index.ts:565`): a genuinely unrecognized tool still gets the generic JSON preview.
+    #[test]
+    fn ask_prompt_unknown_tool_without_edit_payload_falls_back_to_json() {
+        let input = serde_json::json!({ "foo": "bar" });
+        let prompt = format_ask_prompt(&ask_result("some_other_tool"), None, &input);
+        assert!(prompt.contains("with input"), "prompt was: {prompt}");
+        assert!(prompt.contains("\"foo\":\"bar\""), "prompt was: {prompt}");
     }
 }

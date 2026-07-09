@@ -106,8 +106,10 @@ pub struct PermissionSystemExtension {
     dedup: Mutex<DedupCache>,
     /// The extension `config.json` snapshot. `yolo_mode` is read on the live `ask` path (below);
     /// `debug`/`forwarded_prompt_timeout_seconds` are consumed by later phases (logging / forwarding
-    /// P-4) — the public fields carry them without any callerless primitive.
-    config: ExtensionConfig,
+    /// P-4) — the public fields carry them without any callerless primitive. `Mutex`-wrapped because
+    /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
+    /// `resources_discover` reload (pi `refreshExtensionConfig`, `index.ts:1600-1608`).
+    config: Mutex<ExtensionConfig>,
     /// The fail-closed FALLBACK ask channel ([`NoOpAskChannel`] in production; a scripted channel in
     /// unit tests via [`Self::from_parts`]). Used when no live UI is reachable — the live in-session
     /// dialog goes through [`LocalAskChannel`] over [`Self::host_services`] instead.
@@ -200,11 +202,13 @@ impl PermissionSystemExtension {
         Self::from_parts_full(paths, permanent_path, config, channel, agent_dir, false, host_services)
     }
 
-    /// Derive the [`ManagerPaths`] + permanent-store path + extension config from `agent_dir` + `cwd`
-    /// (shared by every constructor).
-    fn derive_parts(agent_dir: &Path, cwd: PathBuf) -> (ManagerPaths, PathBuf, ExtensionConfig) {
-        let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd, |acc, seg| acc.join(seg));
-        let paths = ManagerPaths {
+    /// Derive the [`ManagerPaths`] for `agent_dir` + `cwd` (pi `createPermissionManagerForCwd`'s path
+    /// derivation, `index.ts:1536-1573`) — shared by every constructor AND by
+    /// [`Self::refresh_config_and_manager`] (a `session_start` / `resources_discover` reload rebuilds
+    /// this from the CURRENT cwd, not just the process's original one).
+    fn manager_paths_for(agent_dir: &Path, cwd: &Path) -> ManagerPaths {
+        let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
+        ManagerPaths {
             global_config_path: agent_dir.join(POLICY_FILE),
             agents_dir: agent_dir.join("agents"),
             project_global_config_path: Some(project_dir.join(POLICY_FILE)),
@@ -212,10 +216,34 @@ impl PermissionSystemExtension {
             legacy_global_settings_path: agent_dir.join("settings.json"),
             global_mcp_config_path: agent_dir.join("mcp.json"),
             mcp_server_names_override: None,
-        };
+        }
+    }
+
+    /// The extension `config.json` path for `agent_dir` (pi `getPermissionSystemConfigPath`,
+    /// `extension-config.ts:43-46`).
+    fn config_path_for(agent_dir: &Path) -> PathBuf {
+        agent_dir.join(CONFIG_DIR).join(CONFIG_FILE)
+    }
+
+    /// Derive the [`ManagerPaths`] + permanent-store path + extension config from `agent_dir` + `cwd`
+    /// (shared by every constructor).
+    fn derive_parts(agent_dir: &Path, cwd: PathBuf) -> (ManagerPaths, PathBuf, ExtensionConfig) {
+        let paths = Self::manager_paths_for(agent_dir, &cwd);
         let permanent_path = agent_dir.join(PERMANENT_APPROVALS_FILE);
-        let config = ExtensionConfig::load(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE));
+        let config = ExtensionConfig::load(&Self::config_path_for(agent_dir));
         (paths, permanent_path, config)
+    }
+
+    /// pi `refreshSessionRuntimeState` (`index.ts:2077-2085`) + the `resources_discover` "reload"
+    /// branch (`index.ts:2103-2118`): re-read `config.json` from disk into `self.config`, rebuild
+    /// `self.manager`'s policy paths from the CURRENT `cwd` (not the process's original one), and
+    /// invalidate the agent-start cache (`invalidateAgentStartCache`, `:1575-1581`) by clearing the
+    /// cached active-skill enforcement entries. Shared by both the `session_start` handler and a
+    /// `resources_discover` reload.
+    fn refresh_config_and_manager(&self, cwd: &Path) {
+        *guard(&self.manager) = PermissionManager::new(Self::manager_paths_for(&self.agent_dir, cwd));
+        *guard(&self.config) = ExtensionConfig::load(&Self::config_path_for(&self.agent_dir));
+        guard(&self.active_skill_entries).clear();
     }
 
     /// Assemble from explicit parts (used by tests that point the global policy path at a fixture file
@@ -260,7 +288,7 @@ impl PermissionSystemExtension {
             session_approvals: Mutex::new(SessionApprovalStore::new()),
             permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
-            config,
+            config: Mutex::new(config),
             ask_channel,
             host_services,
             agent_dir,
@@ -291,14 +319,17 @@ impl PermissionSystemExtension {
         }
         let agent_name = self.agent_name.as_deref();
 
-        // (2) REGISTRY / unknown-tool gate (pi `index.ts:2218-2228`): a tool not in the full registry
-        // (`getAllTools`) is blocked BEFORE any permission check. Enforced only when the live backend
-        // can enumerate the registry (`all_tool_names`); with no live backend it returns `None` and the
-        // gate is skipped — the gate cannot false-block when it cannot see the tool set (pi always has
-        // `getAllTools`; the default host does not).
-        if let Some(registered) = self.registered_tool_names()
-            && let Some(reason) = gate::check_requested_tool_registration(normalized, &registered)
-        {
+        // (2) REGISTRY / unknown-tool gate (pi `index.ts:2218-2228`): ALWAYS runs, unconditionally,
+        // against the full registry BEFORE any permission check — pi has no skip path
+        // (`checkRequestedToolRegistration(toolName, pi.getAllTools())` is called every time, and
+        // `pi.getAllTools()` never returns `undefined`). When the live backend cannot enumerate the
+        // registry (`all_tool_names` returns `None` — no backend attached, or a wiring gap on an
+        // attached one) this fails CLOSED against an EMPTY registry rather than skipping the gate:
+        // exactly what pi would do if its tool registry were ever empty (nothing matches ⇒ every tool
+        // is "unregistered"). An unattached/misconfigured host can no longer silently bypass the
+        // unknown-tool allowlist.
+        let registered = self.registered_tool_names().unwrap_or_default();
+        if let Some(reason) = gate::check_requested_tool_registration(normalized, &registered) {
             return HookOutcome::Block { reason: Some(reason) };
         }
 
@@ -495,12 +526,20 @@ impl PermissionSystemExtension {
     }
 
     /// Prompt the human for a bespoke `message` (the skill-read + external-dir asks, which manage their
-    /// own persistence — no dedup/`Always` tail): yolo auto-approve (pi `shouldAutoApprovePermissionState`),
-    /// then the C3 human-interaction lock, the live-vs-fallback channel selection, and the P-3 dispatch-
-    /// budget-forgiveness guard held across the BLOCKING dialog — the SAME machinery [`Self::resolve_ask`]
-    /// uses. `AskOutcome::NoLiveChannel` = fail-CLOSED (no reachable human).
+    /// own persistence — no dedup/`Always` tail): the pi `canResolveAskPermissionRequest` fail-fast
+    /// pre-check (`yolo-mode.ts:21-23`, consulted via `canRequestPermissionConfirmation` BEFORE any
+    /// prompt/lock work at `index.ts:2263,2351,2452`) — `hasUI || isSubagent || yoloMode` — then yolo
+    /// auto-approve (pi `shouldAutoApprovePermissionState`), the C3 human-interaction lock, the
+    /// live-vs-fallback channel selection, and the P-3 dispatch-budget-forgiveness guard held across
+    /// the BLOCKING dialog — the SAME machinery [`Self::resolve_ask`] uses. `AskOutcome::NoLiveChannel`
+    /// = fail-CLOSED (no reachable human), returned IMMEDIATELY by the pre-check when none of the three
+    /// conditions hold — zero lock/dialog work touched, exactly like pi's early return.
     async fn prompt_decision(&self, message: &str, ctx: &HostCtx) -> AskOutcome {
-        if self.config.yolo_mode {
+        let yolo_mode = guard(&self.config).yolo_mode;
+        if !(ctx.has_ui || is_subagent_child() || yolo_mode) {
+            return AskOutcome::NoLiveChannel;
+        }
+        if yolo_mode {
             return AskOutcome::Decided(PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Approved,
@@ -639,7 +678,7 @@ impl PermissionSystemExtension {
 
         // pi `syncPermissionSystemStatus` (`:2136`): reflect yolo on the live status bar.
         if let Some(s) = services {
-            status::sync_status(s, &self.config);
+            status::sync_status(s, &guard(&self.config));
         }
 
         // Return the sanitized prompt as a [mutate] ONLY when it differs from the original (pi
@@ -708,7 +747,7 @@ impl PermissionSystemExtension {
         *slot = Some(forwarding::spawn_forwarding_watcher(
             self.agent_dir.clone(),
             services.clone(),
-            self.config.clone(),
+            guard(&self.config).clone(),
         ));
     }
 
@@ -798,14 +837,18 @@ impl NativeExtension for PermissionSystemExtension {
         // guideline bullets, and hides ask/deny skills while caching the skill-read enforcement entries,
         // pi `:2174-2176`), and syncs the yolo pill — returning the sanitized prompt as a `[mutate]`.
         // Input captures `/skill:<name>` explicit requests (pi `:2192-2206`). Session{Start,Shutdown}
-        // clear the in-session store + dedup + skill state (and set/clear the status pill). No
-        // LLM-visible tool/command is registered — the gate is invisible to the model (pi none).
+        // clear the in-session store + dedup + skill state (and set/clear the status pill).
+        // ResourcesDiscover runs pi's `resources_discover` reload branch (`index.ts:2103-2118`):
+        // re-reads `config.json`, rebuilds the `PermissionManager` from the current cwd, and
+        // invalidates the agent-start cache. No LLM-visible tool/command is registered — the gate is
+        // invisible to the model (pi none).
         api.subscribe(&[
             EventKind::ToolCall,
             EventKind::BeforeAgentStart,
             EventKind::Input,
             EventKind::SessionStart,
             EventKind::SessionShutdown,
+            EventKind::ResourcesDiscover,
         ]);
         Ok(())
     }
@@ -836,7 +879,13 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.session_approvals).clear();
                 guard(&self.dedup).clear();
                 guard(&self.explicitly_requested_skill_names).clear();
-                guard(&self.active_skill_entries).clear();
+                // pi `refreshSessionRuntimeState` (`index.ts:2077-2085`, called unconditionally from
+                // every `session_start`): re-read `config.json` from disk and rebuild the
+                // `PermissionManager`'s policy paths from the CURRENT session `ctx.cwd` (not just the
+                // process's original cwd) — a session can start in a different working directory than
+                // the one the extension was constructed with. Also invalidates the agent-start cache
+                // (clears `active_skill_entries`), superseding the plain clear this arm did before.
+                self.refresh_config_and_manager(&ctx.cwd);
                 // pi `startForwardedPermissionPolling` (`index.ts:1904-2031`): in the PARENT role, on a
                 // session WITH a UI, spawn the forwarding watcher (a detached tokio task, OUTSIDE the 5s
                 // dispatch budget) that services subagent children's forwarded asks.
@@ -844,8 +893,18 @@ impl NativeExtension for PermissionSystemExtension {
                 // pi `syncPermissionSystemStatus` (`index.ts:2091` via `refreshSessionRuntimeState`):
                 // reflect the yolo pill on the live status bar at session start.
                 if let Some(s) = self.host_services.get() {
-                    status::sync_status(s, &self.config);
+                    status::sync_status(s, &guard(&self.config));
                 }
+                HookOutcome::Noop
+            }
+            HostEvent::ResourcesDiscover => {
+                // pi `pi.on("resources_discover", ...)` reload branch (`index.ts:2103-2118`): reset the
+                // dedup cache, re-read `config.json`, rebuild the `PermissionManager` from the current
+                // cwd, and invalidate the agent-start cache. Cyrup's `HostEvent::ResourcesDiscover`
+                // carries no `reason` field (unlike pi's event), so every dispatch is treated as the
+                // "reload" case — the only variant this host event exposes.
+                guard(&self.dedup).clear();
+                self.refresh_config_and_manager(&ctx.cwd);
                 HookOutcome::Noop
             }
             HostEvent::SessionShutdown { .. } => {
@@ -938,8 +997,27 @@ mod tests {
     #[test]
     fn not_installed_without_policy_or_env_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        // No policy file, env not set → DI-5 zero gating.
+        // No policy file, env not set → DI-5 zero gating. Explicitly sandbox (save/clear/restore)
+        // `INSTALL_ENV_VAR` for this assertion: it is the same opt-in env var
+        // `permission_extension_for_env` reads in production, and a developer/CI shell that has
+        // genuinely opted in workspace-wide (exactly as this crate's own module doc documents,
+        // "opt-in per DI-5") would otherwise make this "no opt-in" case flake on ambient state
+        // that has nothing to do with the code path under test. No other test in this crate reads
+        // or writes `INSTALL_ENV_VAR`, so this scoped mutation cannot race a sibling test.
+        let previous = std::env::var(INSTALL_ENV_VAR).ok();
+        // SAFETY: scoped to this test; restored immediately below before any other assertion runs.
+        unsafe {
+            std::env::remove_var(INSTALL_ENV_VAR);
+        }
         assert!(!is_installed(dir.path(), dir.path()));
+        // SAFETY: restores whatever the ambient shell had (or leaves it unset), symmetric with the
+        // removal above.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(INSTALL_ENV_VAR, v),
+                None => std::env::remove_var(INSTALL_ENV_VAR),
+            }
+        }
     }
 
     #[test]
@@ -947,5 +1025,166 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(POLICY_FILE), "{}").unwrap();
         assert!(is_installed(dir.path(), dir.path()));
+    }
+
+    // ============================================================================================
+    // Wave1b pi-parity regression tests (dossier: cyrup-permission-system/src/extension.rs).
+    // ============================================================================================
+
+    /// A scripted [`HostServices`] whose ONLY override is `all_tool_names` — the full registry the
+    /// registry / unknown-tool gate checks against (pi `pi.getAllTools()`). Mirrors the identical
+    /// helper in `tests/layers_wired.rs`.
+    struct FakeRegistry {
+        names: Vec<String>,
+    }
+    impl HostServices for FakeRegistry {
+        fn all_tool_names(&self) -> Option<Vec<String>> {
+            Some(self.names.clone())
+        }
+    }
+
+    fn write_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn event_ctx(cwd: PathBuf) -> HostCtx {
+        HostCtx::event(cyrup_ext::ExtMode::Print, false, cwd)
+    }
+
+    async fn init_ext(ext: &PermissionSystemExtension) {
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+    }
+
+    fn bash_call(call_id: &str) -> HostEvent {
+        HostEvent::ToolCall {
+            call_id: cyrup_core::ToolCallId::from(call_id),
+            name: "bash".to_string(),
+            input: json!({ "command": "echo hi" }),
+        }
+    }
+
+    /// pi `resources_discover` reload branch (`index.ts:2103-2118`): re-reads `config.json` and
+    /// invalidates the agent-start cache. BEFORE this fix, `EventKind::ResourcesDiscover` was never
+    /// subscribed and `on_event` fell through to its catch-all `Noop` arm, so neither the config nor
+    /// the cached skill-enforcement entries ever refreshed — this test fails against that behavior.
+    #[tokio::test]
+    async fn resources_discover_reloads_config_and_invalidates_skill_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+
+        // The constructor auto-materializes the default config (yolo_mode: false).
+        assert!(!guard(&ext.config).yolo_mode, "default config starts with yolo off");
+
+        // Seed the agent-start skill cache as `before_agent_start` would.
+        *guard(&ext.active_skill_entries) = vec![SkillPromptEntry {
+            name: "demo".into(),
+            state: PermissionState::Ask,
+            normalized_location: "/skills/demo".into(),
+            normalized_base_dir: "/skills".into(),
+        }];
+
+        // Flip yoloMode on disk directly (simulating an external edit to config.json betwen the
+        // extension's construction and a later `resources_discover` reload).
+        write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{ "yoloMode": true }"#);
+
+        let outcome = ext.on_event(&HostEvent::ResourcesDiscover, &event_ctx(agent_dir)).await;
+        assert!(matches!(outcome, HookOutcome::Noop));
+
+        assert!(guard(&ext.config).yolo_mode, "resources_discover reload must re-read config.json");
+        assert!(
+            guard(&ext.active_skill_entries).is_empty(),
+            "resources_discover reload must invalidate the agent-start skill cache"
+        );
+    }
+
+    /// pi `refreshSessionRuntimeState` (`index.ts:2077-2085`): every `session_start` unconditionally
+    /// re-derives `permissionManager`'s policy paths from the CURRENT session `ctx.cwd`. BEFORE this
+    /// fix `self.manager` was frozen at construction time and never re-derived on `session_start`, so
+    /// a session starting under a DIFFERENT project directory never picked up that project's policy
+    /// override — this test fails against that behavior.
+    #[tokio::test]
+    async fn session_start_rebuilds_manager_from_current_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        // Global policy: bash is allowed everywhere by default.
+        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "allow" } }"#);
+
+        // The extension is CONSTRUCTED against `cwd1`, which has no project-level override.
+        let cwd1 = dir.path().join("cwd1");
+        std::fs::create_dir_all(&cwd1).unwrap();
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), cwd1);
+        init_ext(&ext).await;
+        ext.set_host_services(Arc::new(FakeRegistry { names: vec!["bash".to_string()] }));
+
+        // A NEW session starts under `cwd2`, which HAS a project-scoped override denying bash.
+        let cwd2 = dir.path().join("cwd2");
+        std::fs::create_dir_all(&cwd2).unwrap();
+        write_file(
+            &PROJECT_AGENT_SUBDIR.iter().fold(cwd2.clone(), |acc, seg| acc.join(seg)).join(POLICY_FILE),
+            r#"{ "bash": { "*": "deny" } }"#,
+        );
+
+        let start_ctx = event_ctx(cwd2);
+        let start_outcome =
+            ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &start_ctx).await;
+        assert!(matches!(start_outcome, HookOutcome::Noop));
+
+        // A bash call now, under `cwd2`, must be DENIED by the project override the rebuilt manager
+        // picked up — proving the manager was rebuilt against the CURRENT session cwd, not left
+        // stale against `cwd1`.
+        let outcome = ext.on_event(&bash_call("call-1"), &start_ctx).await;
+        assert!(
+            matches!(outcome, HookOutcome::Block { .. }),
+            "the cwd2 project-scoped deny must enforce once session_start rebuilds the manager"
+        );
+    }
+
+    /// pi `checkRequestedToolRegistration(toolName, pi.getAllTools())` (`index.ts:2218-2228`) runs
+    /// UNCONDITIONALLY — pi has no skip path. BEFORE this fix, when the live registry could not be
+    /// enumerated (no `HostServices` attached), cyrup silently SKIPPED the registry gate entirely,
+    /// letting ANY tool name through the allowlist with zero enforcement — this test fails against
+    /// that fail-open behavior.
+    #[tokio::test]
+    async fn registry_gate_fails_closed_with_no_attached_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        // Global policy allows bash everywhere — a fail-OPEN gate would let this proceed (Noop).
+        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "allow" } }"#);
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+        // Deliberately never call `set_host_services` — the registry cannot be enumerated.
+
+        let outcome = ext.on_event(&bash_call("call-1"), &event_ctx(agent_dir)).await;
+        assert!(
+            matches!(outcome, HookOutcome::Block { .. }),
+            "an unenumerable registry must fail CLOSED, never silently let the tool through"
+        );
+    }
+
+    /// pi `canResolveAskPermissionRequest` (`yolo-mode.ts:21-23`), consulted via
+    /// `canRequestPermissionConfirmation` BEFORE any prompt/lock work (`index.ts:2263,2351,2452`):
+    /// `hasUI || isSubagent || yoloMode`. BEFORE this fix `prompt_decision` always attempted the
+    /// human-interaction lock + channel selection whenever a live backend was attached, even when
+    /// none of the three conditions held — this test fails against that behavior (it would hang/lock
+    /// against a live backend instead of failing closed immediately).
+    #[tokio::test]
+    async fn ask_fails_fast_without_ui_subagent_or_yolo() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "ask" } }"#);
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+        ext.set_host_services(Arc::new(FakeRegistry { names: vec!["bash".to_string()] }));
+
+        // has_ui=false, no `CYRUP_SUBAGENT_CHILD` env, config.yolo_mode default false ⇒ the
+        // pre-check must fail CLOSED immediately, never touching the lock/dialog machinery.
+        let outcome = ext.on_event(&bash_call("call-1"), &event_ctx(agent_dir)).await;
+        assert!(matches!(outcome, HookOutcome::Block { .. }));
     }
 }

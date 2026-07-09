@@ -72,7 +72,7 @@ pub(crate) fn lexical_normalize(input: &str) -> String {
 /// unix scope).
 #[must_use]
 pub fn normalize_path_for_comparison(path_value: &str, cwd: &str) -> String {
-    let trimmed = strip_surrounding_quotes(path_value.trim());
+    let trimmed = strip_edge_quotes(path_value.trim());
     if trimmed.is_empty() {
         return String::new();
     }
@@ -163,7 +163,7 @@ pub fn parse_simple_yaml_map(input: &str) -> OrderedValue {
         if sep == 0 {
             continue;
         }
-        let key = strip_surrounding_quotes(line.get(..sep).unwrap_or("").trim()).to_string();
+        let key = strip_edge_quotes(line.get(..sep).unwrap_or("").trim()).to_string();
         let raw_value = line.get(sep + 1..).unwrap_or("").trim().to_string();
 
         while stack.len() > 1 && stack.last().map(|(i, _)| indent <= *i).unwrap_or(false) {
@@ -223,8 +223,9 @@ fn insert_ordered_at_path(
     }
 }
 
-/// Strip a single pair of matching surrounding single/double quotes (pi
-/// `.replace(/^["']|["']$/g, "")` / the YAML scalar unquote).
+/// Strip a single pair of matching surrounding single/double quotes (pi `common.ts:115-117`'s
+/// scalar-value unquote: `startsWith('"') && endsWith('"')`, or the same for `'`). Strict/paired —
+/// used only for the YAML scalar VALUE, which pi genuinely requires to match on both ends.
 fn strip_surrounding_quotes(value: &str) -> &str {
     let bytes = value.as_bytes();
     if bytes.len() >= 2 {
@@ -237,6 +238,21 @@ fn strip_surrounding_quotes(value: &str) -> &str {
         }
     }
     value
+}
+
+/// Strip a leading quote char and/or a trailing quote char INDEPENDENTLY (pi's
+/// `.replace(/^["']|["']$/g, "")`, used for `normalizePathForComparison` (`common.ts:28`) and the
+/// YAML map key (`common.ts:98`)). Unlike [`strip_surrounding_quotes`], the two ends need not be
+/// present together nor match each other: `"abc` → `abc`, `abc'` → `abc`, `'abc"` → `abc`.
+fn strip_edge_quotes(value: &str) -> &str {
+    let mut s = value;
+    if let Some(rest) = s.strip_prefix('"').or_else(|| s.strip_prefix('\'')) {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_suffix('"').or_else(|| s.strip_suffix('\'')) {
+        s = rest;
+    }
+    s
 }
 
 /// Join two path fragments with a single `/` (node `path.join`, minimal: no `..` collapsing here —
@@ -276,6 +292,43 @@ mod tests {
     fn resource_strips_at_and_quotes() {
         let r = normalize_path_resource_for_permission("\"@/abs/path\"", "/work");
         assert_eq!(r, "/abs/path");
+    }
+
+    #[test]
+    fn path_quote_stripping_is_independent_per_side_not_paired() {
+        // pi: `pathValue.trim().replace(/^["']|["']$/g, "")` strips a leading and/or trailing
+        // quote independently — no requirement that both be present or match. A strict
+        // matched-pair implementation would leave the stray quote character behind, producing a
+        // resource string that never matches a rule written for the unquoted path.
+        assert_eq!(
+            normalize_path_resource_for_permission("\"@/abs/path", "/work"),
+            "/abs/path",
+            "leading quote only (no closing quote) must still be stripped"
+        );
+        assert_eq!(
+            normalize_path_resource_for_permission("@/abs/path'", "/work"),
+            "/abs/path",
+            "trailing quote only (no leading quote) must still be stripped"
+        );
+        assert_eq!(
+            normalize_path_resource_for_permission("'@/abs/path\"", "/work"),
+            "/abs/path",
+            "mismatched quote types on each end must still both be stripped"
+        );
+    }
+
+    #[test]
+    fn yaml_key_quote_stripping_is_independent_per_side_not_paired() {
+        // pi: `line.slice(0, separatorIndex).trim().replace(/^['"]|['"]$/g, "")` — same
+        // independent-per-side stripping as the path case, applied to the YAML map key.
+        let parsed = parse_simple_yaml_map("\"git *: allow");
+        assert_eq!(parsed.get("git *").and_then(|v| v.as_str()), Some("allow"));
+
+        let parsed = parse_simple_yaml_map("git *': allow");
+        assert_eq!(parsed.get("git *").and_then(|v| v.as_str()), Some("allow"));
+
+        let parsed = parse_simple_yaml_map("'git *\": allow");
+        assert_eq!(parsed.get("git *").and_then(|v| v.as_str()), Some("allow"));
     }
 
     #[test]

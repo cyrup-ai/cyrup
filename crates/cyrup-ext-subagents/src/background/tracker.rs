@@ -275,6 +275,29 @@ impl JobTracker {
             .remove(run_id);
     }
 
+    /// Session-teardown stop (pi `session_shutdown`: `clearInterval(state.poller); state.poller =
+    /// null` plus `state.asyncJobs.clear()`, `extension/index.ts:657-664`): immediately abort the
+    /// poll-loop task, if one is running, and clear every tracked-job entry from this process's
+    /// in-memory view. This ONLY tears down this extension's own in-process polling/bookkeeping —
+    /// the detached child OS processes backing any still-running job are untouched and continue to
+    /// completion on disk (R-SA-071/DI-SA-8), exactly like pi's own shutdown, which never sends any
+    /// signal to a background run. A fresh `SessionStart` on this same process re-discovers any
+    /// still-live runs from disk via `resume_tracking`, so no run is permanently "lost" by this
+    /// clear — only this process's own live poll view of it is reset.
+    pub async fn stop_and_clear(&self) {
+        let handle = {
+            let mut guard = self.poller.lock().await;
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// `true` if the shared poll-loop task is currently running. Exposed primarily for tests
     /// asserting the self-starting/self-stopping contract (R-SA-093/145); a caller with no such
     /// need has no reason to consult this.

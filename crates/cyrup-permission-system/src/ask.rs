@@ -54,6 +54,13 @@ pub struct PermissionPromptDecision {
 #[derive(Debug, Clone, Default)]
 pub struct PromptOpts {
     pub timeout: Option<std::time::Duration>,
+    /// pi `PermissionDecisionRequestOptions.timeoutDenialReason` (`permission-dialog.ts:19`): the
+    /// denial reason attached to the decision when the dialog resolves via the fallback branch —
+    /// plain "Reject", ESC/`None`, or an actual timeout (`permission-dialog.ts:155-158`) — NOT just a
+    /// literal timeout, despite the field's name. `None` reproduces pi's plain
+    /// `{approved:false,state:"reject"}` (no `denialReason`) when the caller configured no reason
+    /// (e.g. a bare local ask, not a forwarded prompt with `forwardedPromptTimeoutSeconds` set).
+    pub timeout_denial_reason: Option<String>,
 }
 
 /// The outcome of an [`AskChannel::confirm`] round-trip.
@@ -163,11 +170,13 @@ impl AskChannel for LocalAskChannel {
                     denial_reason: reason,
                 }
             }
-            // Plain "Reject", ESC/`None`, or a timeout → reject (pi `permission-dialog.ts:155-158`).
+            // Plain "Reject", ESC/`None`, or a timeout → reject (pi `permission-dialog.ts:155-158`),
+            // carrying the caller's configured `timeoutDenialReason` (if any) onto the decision — pi
+            // attaches it on EVERY fallback outcome, not just a literal timeout.
             _ => PermissionPromptDecision {
                 approved: false,
                 state: PermissionDecisionState::Reject,
-                denial_reason: None,
+                denial_reason: opts.timeout_denial_reason.clone(),
             },
         };
         AskOutcome::Decided(decision)
@@ -325,6 +334,57 @@ mod tests {
         let ch = NoOpAskChannel;
         let out = ch.confirm("t", "m", PromptOpts::default()).await;
         assert!(matches!(out, AskOutcome::NoLiveChannel));
+    }
+
+    /// A fake [`HostServices`] whose `select` always returns `None` (as if ESC/timeout fired),
+    /// so `LocalAskChannel::confirm` always falls through to the catch-all branch
+    /// (`permission-dialog.ts:155-158`).
+    struct EscHostServices;
+
+    impl HostServices for EscHostServices {
+        fn select(&self, _title: &str, _options: &serde_json::Value, _opts: &DialogOptions) -> Option<String> {
+            None
+        }
+        fn input(&self, _title: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn local_channel_carries_timeout_denial_reason_on_fallback() {
+        // pi `requestPermissionDecisionFromUi`'s fallback branch (`permission-dialog.ts:155-158`)
+        // attaches `options.timeoutDenialReason` to the decision for ANY non-allow, non-reject-with-
+        // reason outcome (plain Reject, ESC, or a real timeout) — not just a literal timeout. Before
+        // the fix, `LocalAskChannel::confirm`'s catch-all hardcoded `denial_reason: None`, so this
+        // would fail (`d.denial_reason` would be `None` instead of `Some(reason)`).
+        let ch = LocalAskChannel::new(Arc::new(EscHostServices));
+        let reason = "permission_timeout: forwarded permission prompt was not answered within 30 seconds.";
+        let opts = PromptOpts { timeout: None, timeout_denial_reason: Some(reason.to_string()) };
+        let out = ch.confirm("Permission Required (Subagent)", "run bash 'rm -rf /'?", opts).await;
+        match out {
+            AskOutcome::Decided(d) => {
+                assert!(!d.approved);
+                assert_eq!(d.state, PermissionDecisionState::Reject);
+                assert_eq!(d.denial_reason.as_deref(), Some(reason));
+            }
+            AskOutcome::NoLiveChannel => panic!("LocalAskChannel always resolves to a decision"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_channel_fallback_omits_reason_when_none_configured() {
+        // The complementary case: no `timeout_denial_reason` configured (e.g. a bare local ask) ⇒
+        // pi's plain `{approved:false,state:"reject"}` with no `denialReason` at all.
+        let ch = LocalAskChannel::new(Arc::new(EscHostServices));
+        let out = ch.confirm("Permission Required", "run bash 'rm -rf /'?", PromptOpts::default()).await;
+        match out {
+            AskOutcome::Decided(d) => {
+                assert!(!d.approved);
+                assert_eq!(d.state, PermissionDecisionState::Reject);
+                assert_eq!(d.denial_reason, None);
+            }
+            AskOutcome::NoLiveChannel => panic!("LocalAskChannel always resolves to a decision"),
+        }
     }
 
     #[tokio::test]

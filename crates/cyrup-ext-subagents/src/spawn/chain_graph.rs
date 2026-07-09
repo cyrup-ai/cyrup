@@ -731,6 +731,166 @@ fn register_single_output(registry: &mut OutputRegistry, name: Option<&str>, res
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// Upfront output-binding validation (R-SA-053, pi `chain-outputs.ts::validateChainOutputBindings`,
+// called once at the very top of `executeChain`, `chain-execution.ts:499-510`, BEFORE any step is
+// dispatched)
+// -------------------------------------------------------------------------------------------
+
+/// The named output(s) `step` registers once it completes (pi
+/// `chain-outputs.ts::outputNamesForStep`): a sequential step's `as`, EVERY parallel task's own
+/// `as` (a static group can register more than one name, one per task), or a dynamic group's single
+/// `collect.as`. Empty/absent names are omitted, mirroring pi's own empty-string filter.
+fn output_names_for_runner_step(step: &RunnerStep) -> Vec<String> {
+    match step {
+        RunnerStep::SingleStep(spec) => spec
+            .output
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default(),
+        RunnerStep::ParallelGroup(group) => group
+            .steps
+            .iter()
+            .filter_map(|task| task.output.as_deref())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect(),
+        RunnerStep::DynamicGroup(spec) => {
+            if spec.collect.is_empty() {
+                Vec::new()
+            } else {
+                vec![spec.collect.clone()]
+            }
+        }
+        RunnerStep::ImportAsyncRoot(spec) => spec
+            .output
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+/// The task-template string(s) `step`'s `{outputs.name}` references are scanned in (pi
+/// `chain-outputs.ts::taskTemplatesForStep`): every parallel task's own `task`, a dynamic group
+/// template's `task`, or a sequential step's `task`.
+fn task_templates_for_runner_step(step: &RunnerStep) -> Vec<String> {
+    match step {
+        RunnerStep::SingleStep(spec) => vec![spec.task.clone()],
+        RunnerStep::ParallelGroup(group) => {
+            group.steps.iter().map(|task| task.task.clone()).collect()
+        }
+        RunnerStep::DynamicGroup(spec) => vec![spec.template.task.clone()],
+        RunnerStep::ImportAsyncRoot(_) => Vec::new(),
+    }
+}
+
+/// Extract every `{outputs.<name>}` reference from a template (pi's `\{outputs\.([^}]*)\}`),
+/// returning each `(raw_match, name)` pair — a direct port of `chain-outputs.ts::extractOutputRefs`.
+fn extract_output_refs(template: &str) -> Vec<(String, String)> {
+    const PREFIX: &str = "{outputs.";
+    let mut refs = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(PREFIX) {
+        let after = rest.get(start + PREFIX.len()..).unwrap_or("");
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let name = after.get(..end).unwrap_or("");
+        refs.push((format!("{{outputs.{name}}}"), name.to_string()));
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    refs
+}
+
+/// The `expand.from.output` source-output name a [`DynamicGroupSpec::expand`] pointer
+/// (`"outputs.<name><path>"`, see [`OutputRegistry::resolve_pointer`]) was built from — the SAME
+/// parse [`OutputRegistry::resolve_pointer`] applies (strip the `"outputs."` prefix, split at the
+/// first `/`), used here only to name-check the source against strictly-earlier registered outputs
+/// before any step runs.
+fn dynamic_expand_source_output(expand: &str) -> &str {
+    let rest = expand.strip_prefix("outputs.").unwrap_or(expand);
+    rest.split_once('/').map_or(rest, |(name, _)| name)
+}
+
+/// Faithful port of `chain-outputs.ts::validateChainOutputBindings` (pi's empty-context call from
+/// `chain-execution.ts:499-510`, run ONCE at the very top of `executeChain` before any step is
+/// dispatched), operating directly over the already-typed [`RunnerStep`] graph — the structural
+/// analogue of [`crate::discovery::chains`]'s identically-named raw-JSON port that saved-chain-file
+/// parsing already applies. Checks, in chain order:
+///
+/// - Every named output (`as`/`collect.as`) is a safe identifier and, chain-wide, UNIQUE — a
+///   second step registering an already-used name errors here instead of silently overwriting the
+///   earlier registration in [`OutputRegistry`] at run time.
+/// - A [`RunnerStep::DynamicGroup`]'s `expand` source names a STRICTLY EARLIER step's output.
+/// - Every `{outputs.name}` reference in a step's own task template(s) is a safe identifier naming
+///   a STRICTLY EARLIER step's output — before this validation, an unknown/malformed reference was
+///   only caught when [`walk_chain`] actually reached that step (`resolve_step_task`), after every
+///   earlier step had already run (and spent real tokens/spawned real children).
+///
+/// # Errors
+///
+/// Returns pi's exact user/LLM-facing message text (`Duplicate chain output name '…'…`, `Invalid
+/// chain output name/reference '…'…`, `Unknown chain output reference '…'…`, `Dynamic chain step N
+/// references unknown output '…'…`) the first time any check fails; the whole graph passes silently
+/// (`Ok(())`) when every step's bindings are well-formed.
+pub fn validate_runner_step_output_bindings(graph: &[RunnerStep]) -> Result<(), String> {
+    let mut available: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (step_index, step) in graph.iter().enumerate() {
+        let display = step_index + 1;
+
+        if let RunnerStep::DynamicGroup(spec) = step {
+            let source_output = dynamic_expand_source_output(&spec.expand);
+            if !available.contains(source_output) {
+                return Err(format!(
+                    "Dynamic chain step {display} references unknown output '{source_output}'. \
+                     Named outputs are only available after producing step/group completes."
+                ));
+            }
+        }
+
+        for name in output_names_for_runner_step(step) {
+            if !is_safe_output_name(&name) {
+                return Err(format!(
+                    "Invalid chain output name '{name}' at step {display}. Use \
+                     /^[A-Za-z_][A-Za-z0-9_]*$/."
+                ));
+            }
+            if seen.contains(&name) {
+                return Err(format!(
+                    "Duplicate chain output name '{name}'. Each as name must be unique."
+                ));
+            }
+            seen.insert(name);
+        }
+
+        for template in task_templates_for_runner_step(step) {
+            for (raw_reference, name) in extract_output_refs(&template) {
+                if !is_safe_output_name(&name) {
+                    return Err(format!(
+                        "Invalid chain output reference '{raw_reference}' at step {display}. Use \
+                         {{outputs.name}} with /^[A-Za-z_][A-Za-z0-9_]*$/ names."
+                    ));
+                }
+                if !available.contains(&name) {
+                    return Err(format!(
+                        "Unknown chain output reference '{raw_reference}' at step {display}. \
+                         Named outputs are only available after producing step/group completes."
+                    ));
+                }
+            }
+        }
+
+        for name in output_names_for_runner_step(step) {
+            available.insert(name);
+        }
+    }
+    Ok(())
+}
+
 /// Aggregate a completed group's per-child text outputs into the `{previous}` text a following
 /// sequential step sees (pi's `prev = aggregateParallelOutputs(taskResults)`,
 /// `chain-execution.ts:773` / `parallel-utils.ts:166-192`). [`walk_chain`] calls this only for a
@@ -848,6 +1008,14 @@ pub struct ChainRunContext {
     /// The chain-wide deadline (R-SA-035: monotonically shrinking, computed once, passed through
     /// unmodified to every step — never reset per step).
     pub deadline_at: Option<Instant>,
+    /// The chain-wide nominal timeout budget in milliseconds (pi `chain-execution.ts:606`:
+    /// `deadlineAt = params.deadlineAt ?? Date.now() + timeoutMs`, with `timeoutMs` ALSO passed
+    /// verbatim to every `runSync` call alongside `deadlineAt`). Distinct from [`Self::deadline_at`]
+    /// (the actual wall-clock instant raced against): this is only the nominal figure
+    /// [`crate::exec::format_timeout_message`] renders into a step's timed-out error text — the
+    /// SAME `timeout_ms` every step in the chain reports, never a shrinking "time remaining" value.
+    /// `None` when the chain run carries no timeout at all.
+    pub timeout_ms: Option<u64>,
     /// The run-wide cancellation signal, raced against every dispatched step/group.
     pub cancel: CancelToken,
     /// The run-wide global concurrency ceiling (R-SA-050), shared across every
@@ -1416,6 +1584,7 @@ mod tests {
         ChainRunContext {
             cwd: std::env::temp_dir(),
             deadline_at: None,
+            timeout_ms: None,
             cancel,
             global_limit: GlobalConcurrencyLimit::default_limit(),
             worktree_base_dir: None,
@@ -2317,6 +2486,49 @@ mod tests {
         assert!(
             executor.calls.lock().expect("lock").is_empty(),
             "no child may be dispatched once the maxItems cap is exceeded"
+        );
+    }
+
+    /// C16 fallback (pi `config.chain.dynamicFanout.maxItems`): a step whose own `expand.maxItems`
+    /// is absent must fall back to [`ChainRunContext::dynamic_fanout_max_items`] — the run-wide cap
+    /// the orchestrator resolved from config and threaded in via `RunnerConfig`/
+    /// `run_chain_foreground`. Regression proof for the `ChainRunContext`/`RunnerConfig` struct-
+    /// literal wiring: if either caller ever again constructs the context without populating this
+    /// field (e.g. reverting to a hardcoded `None`, as a careless fix of a missing-field compile
+    /// error could do), this test fails with "requires an effective maxItems" instead of the
+    /// expected "exceeding maxItems 1" — proving the run-wide cap actually reached the walker
+    /// rather than silently defaulting to "no cap configured".
+    #[tokio::test]
+    async fn dynamic_group_falls_back_to_ctx_wide_max_items_when_step_omits_it() {
+        let dynamic = dynamic_group_full(
+            "outputs.targets",
+            single_step("reviewer", "Review {t.path}"),
+            "reviews",
+            Some("t"),
+            Some("/path"),
+            None, // step itself sets no maxItems — must fall back to ctx
+            OnEmpty::Skip,
+        );
+        let graph: ChainGraph = vec![RunnerStep::DynamicGroup(dynamic)];
+        let executor = Arc::new(RecordingExecutor::default());
+        let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
+        let ctx = ChainRunContext {
+            dynamic_fanout_max_items: Some(1), // run-wide cap below the 2-element array
+            ..run_ctx(CancelToken::new())
+        };
+        let mut registry = OutputRegistry::new();
+        registry.register("targets", serde_json::json!([{ "path": "a" }, { "path": "b" }]));
+
+        let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
+            .await
+            .expect_err("the ctx-wide cap must be applied when the step omits its own maxItems");
+        assert!(
+            matches!(&err, SubagentError::StructuredOutputInvalid(m) if m.contains("exceeding maxItems")),
+            "expected the ctx-wide cap (1) to reject the 2-element array, got: {err:?}"
+        );
+        assert!(
+            executor.calls.lock().expect("lock").is_empty(),
+            "no child may be dispatched once the ctx-wide maxItems cap is exceeded"
         );
     }
 

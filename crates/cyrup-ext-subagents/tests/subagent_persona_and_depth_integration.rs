@@ -30,14 +30,17 @@ use tokio::sync::Mutex;
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
-use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus};
+use cyrup_ext_subagents::background::{
+    ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, run_artifact_roots,
+};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode, ToolRef};
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, ResolvedAgentPersona, RunOptions};
-use cyrup_ext_subagents::extension::SubagentExecutor;
+use cyrup_ext_subagents::extension::{BackgroundStepsSpec, SubagentExecutor, SubagentsExtension};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::registration::{DynamicFanoutConfig, ExtensionChainConfig, SubagentExtensionConfig};
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
@@ -186,7 +189,10 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
@@ -318,7 +324,10 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
@@ -572,7 +581,10 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
@@ -694,6 +706,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
             resolved_agents,
             String::new(),
             None,
+            CancelToken::new(),
+            None,
         )
         .await;
 
@@ -734,5 +748,221 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     assert!(
         delivered.contains(REPORT_BODY),
         "inline mode keeps the body before the reference message: {delivered}"
+    );
+}
+
+// =============================================================================================
+// Regression: the chain-wide `timeoutMs` (pi `chain-execution.ts:606`: `deadlineAt =
+// params.deadlineAt ?? Date.now() + timeoutMs`, threaded into EVERY step's `runSync` call) must
+// actually reach the real spawned child's `RunOptions::deadline_at`/`timeout_ms` via
+// `SubagentExecutor::run_chain_foreground` -> `ChainRunContext` -> `ExecSingleStepExecutor::
+// run_single`. Pre-fix, `run_chain_foreground` hardcoded `ChainRunContext::deadline_at: None`
+// (and `route_chain_mode` never even resolved a `timeout_ms` from the tool's `timeoutMs`/
+// `maxRuntimeMs` params in the first place), so a chain step's real child ran to completion no
+// matter how large its task — chain timeouts did nothing. This test's fixture child sleeps a real
+// 30 real seconds; if the deadline never reaches it, the outer 5s `tokio::time::timeout` below
+// fires first and this test fails, exactly reproducing the pre-fix hang.
+// =============================================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "sleep_ms", "ms": 30_000}
+        ],
+        "ignore_sigint": true,
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let reporter = ResolvedAgentPersona {
+        name: "reporter".to_string(),
+        model: Some(ModelId::from("fixture-model")),
+        fallback_models: Vec::new(),
+        thinking: None,
+        system_prompt_mode: SystemPromptMode::Replace,
+        system_prompt_body: String::new(),
+        tools: None,
+        extensions: None,
+        subagent_only_extensions: Vec::new(),
+        output: None,
+        inherit_project_context: false,
+        inherit_skills: true,
+        skills: Vec::new(),
+        completion_guard: Some(false),
+        max_subagent_depth: None,
+        default_context: None,
+    };
+    let mut resolved_agents = BTreeMap::new();
+    resolved_agents.insert("reporter".to_string(), reporter);
+
+    let step = SingleStepSpec {
+        agent: "reporter".to_string(),
+        task: "Summarize the analysis.".to_string(),
+        cwd: None,
+        model: None,
+        tools: None,
+        extensions: None,
+        session_file: None,
+        max_depth_override: None,
+        structured_output_schema: None,
+        output: None,
+        output_path: None,
+        output_mode: None,
+        reads: None,
+        acceptance: None,
+        context: None,
+        agent_scope: None,
+    };
+
+    let executor = SubagentExecutor::new();
+    // The chain-wide `timeout_ms = Some(300)` here is the SAME value `route_chain_mode` resolves
+    // from the tool's `timeoutMs`/`maxRuntimeMs` params and threads through
+    // `run_or_background_graph` -> `run_chain_foreground` post-fix.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        executor.run_chain_foreground(
+            dir.path(),
+            vec![RunnerStep::SingleStep(step)],
+            resolved_agents,
+            String::new(),
+            None,
+            CancelToken::new(),
+            Some(300),
+        ),
+    )
+    .await;
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+
+    let (results, _groups) = outcome
+        .expect(
+            "the chain-wide timeout_ms must reach the real child's RunOptions::deadline_at and \
+             terminate it well within 5s of wall-clock time — a hang here reproduces the pre-fix \
+             bug (ChainRunContext::deadline_at always None)",
+        )
+        .expect("run_chain_foreground itself returns Ok even for a step that times out");
+
+    assert_eq!(results.len(), 1, "one step, one result");
+    assert!(
+        !results[0].success,
+        "a timed-out step must be reported as a chain-step failure: {:?}",
+        results[0]
+    );
+}
+
+// =============================================================================================
+// Regression: `chain.dynamicFanout.maxItems` (pi `config.chain.dynamicFanout.maxItems`) must reach
+// the detached background runner's own `ChainRunContext::dynamic_fanout_max_items` via the
+// one-shot `RunnerConfig` handoff file — `SubagentExecutor::spawn_background_steps` resolves the
+// live config ONCE at plan time and bakes it into `RunnerConfig`. Pre-fix, this field was always
+// hardcoded to `None` regardless of the live config, so a background dynamic-fanout step relying
+// on the config-level cap (rather than its own `expand.maxItems`) would always fail
+// materialization. Proven by reading back the REAL `runner-config.json` this call writes to disk
+// (the fixture binary substituted for the detached hop-2 runner just exits immediately, per its
+// default empty script, never itself touching the file) rather than by running a dynamic step to
+// completion end to end (the scripted fixture has no structured-output capability).
+// =============================================================================================
+
+#[tokio::test]
+async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_into_runner_config() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // No script file set: the fixture's own env-fallback default (no steps, immediate exit 0) is
+    // enough — this test only needs the detached "runner" process to start and exit quickly
+    // WITHOUT ever reading `runner-config.json` itself, so the file survives for read-back.
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+    }
+
+    let cfg = SubagentExtensionConfig {
+        chain: Some(ExtensionChainConfig {
+            dynamic_fanout: Some(DynamicFanoutConfig { max_items: Some(7) }),
+        }),
+        ..SubagentExtensionConfig::default()
+    };
+    let ext = SubagentsExtension::with_config_and_cwd(cfg, dir.path().to_path_buf());
+    let executor = ext.executor();
+
+    let step = SingleStepSpec {
+        agent: "worker".to_string(),
+        task: "do something".to_string(),
+        cwd: None,
+        model: None,
+        tools: None,
+        extensions: None,
+        session_file: None,
+        max_depth_override: None,
+        structured_output_schema: None,
+        output: None,
+        output_path: None,
+        output_mode: None,
+        reads: None,
+        acceptance: None,
+        context: None,
+        agent_scope: None,
+    };
+
+    let run_id = executor
+        .spawn_background_steps(
+            dir.path(),
+            BackgroundStepsSpec {
+                steps: vec![RunnerStep::SingleStep(step)],
+                mode: RunMode::Chain,
+                session_file: None,
+                resolved_agents: BTreeMap::new(),
+                original_task: String::new(),
+                chain_dir: None,
+            },
+        )
+        .await
+        .expect("spawn_background_steps confirms the detached hop-1 spawn");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+    }
+
+    // Reconstruct the SAME run-dir path `spawn_background_steps` wrote `runner-config.json` under
+    // (C7 shared roots — no inherited nested-route env is set in this test process, so this is the
+    // plain per-cwd derivation `resolve_background_storage_roots` itself falls back to).
+    let roots = run_artifact_roots(dir.path());
+    let run_paths = RunPaths::for_run(&roots.async_root, &roots.results_dir, &run_id);
+    let cfg_path = run_paths.run_dir.join("runner-config.json");
+
+    // Give the substituted "detached runner" (the fixture, which never touches this file) a brief
+    // moment to finish starting; the file itself is written synchronously by `spawn_background_steps`
+    // BEFORE the detached spawn even happens, so this is purely to let the fixture's own process
+    // exit cleanly before the test process tears down its tempdir.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let raw = tokio::fs::read(&cfg_path)
+        .await
+        .expect("runner-config.json must still exist — the fixture substitute never reads it");
+    let written: RunnerConfig =
+        serde_json::from_slice(&raw).expect("parse the real written RunnerConfig");
+
+    assert_eq!(
+        written.dynamic_fanout_max_items,
+        Some(7),
+        "the live config's chain.dynamicFanout.maxItems (7) must be baked into RunnerConfig \
+         verbatim — pre-fix this was always None regardless of the live config"
     );
 }

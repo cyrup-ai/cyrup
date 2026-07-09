@@ -323,8 +323,11 @@ pub struct NestedRegistry {
 }
 
 /// The resolved ancestry address of the immediate parent (pi
-/// `resolveNestedParentAddressFromEnv`'s return).
-#[derive(Debug, Clone, PartialEq)]
+/// `resolveNestedParentAddressFromEnv`'s return). Serializable so it can be carried verbatim through
+/// [`crate::background::runner_main::RunnerConfig`]'s one-shot handoff file (the orchestrator resolves
+/// it once from its own inherited env, the detached runner never re-resolves it).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NestedParentAddress {
     pub parent_run_id: String,
     pub parent_step_index: Option<i64>,
@@ -1572,6 +1575,33 @@ pub fn nested_results_path(root_run_id: &str, id: &str) -> Result<PathBuf, Subag
     assert_safe_id("rootRunId", root_run_id)?;
     assert_safe_id("id", id)?;
     Ok(results_dir().join("nested").join(root_run_id).join(format!("{id}.json")))
+}
+
+/// The results-DIRECTORY a nested run's terminal result file (via [`nested_results_path`]) lives
+/// under, for the SAME root — i.e. `nested_results_path(root, id)`'s parent, one call before `id` is
+/// known (a background spawn needs the directory to hand to [`crate::background::RunPaths::for_run`]
+/// as its own `results_dir`, not the final per-run file path).
+///
+/// # Errors
+///
+/// Returns [`SubagentError`] if `root_run_id` is unsafe.
+pub fn nested_results_dir(root_run_id: &str) -> Result<PathBuf, SubagentError> {
+    assert_safe_id("rootRunId", root_run_id)?;
+    Ok(results_dir().join("nested").join(root_run_id))
+}
+
+/// pi's `path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId)` (`async-execution.ts:587-589,
+/// 828-830`) — the async-ROOT (not one run's own dir) a nested run's `RunPaths` are derived under,
+/// for the given root run id. A background spawn resolves this ONCE per inherited route and hands it
+/// to [`crate::background::RunPaths::for_run`] as `async_root`, so `RunDir::new` derives the SAME
+/// `<TEMP_ROOT>/nested-subagent-runs/<rootRunId>/<id>` pi's own `asyncDir` resolves to.
+///
+/// # Errors
+///
+/// Returns [`SubagentError`] if `root_run_id` is unsafe.
+pub fn nested_async_root(root_run_id: &str) -> Result<PathBuf, SubagentError> {
+    assert_safe_id("rootRunId", root_run_id)?;
+    Ok(nested_runs_dir().join(root_run_id))
 }
 
 /// pi `isTopLevelAsyncDir`: contained in the async root but not under the nested-runs root.

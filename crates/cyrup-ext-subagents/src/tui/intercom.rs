@@ -92,6 +92,150 @@ pub struct IntercomPayload {
     /// Total additive token usage across the run (a plain numeric summary — not a capability, not
     /// a route).
     pub total_tokens: u64,
+    /// pi's grouped `SubagentResultIntercomPayload.status` (`result-intercom.ts:56-63
+    /// resolveGroupedStatus`): the 4-state precedence verdict over [`Self::child_statuses`] —
+    /// any-failed wins, else any-paused, else any-completed, else any-detached, else `Failed` (pi's
+    /// own explicit default for an empty child set). A closed enum, not a capability-bearing value,
+    /// so it is safe to include in this otherwise-narrow allowlist.
+    pub status: SubagentResultStatus,
+    /// pi's grouped `SubagentResultIntercomPayload.summary` (`result-intercom.ts:46-54
+    /// formatStatusCounts`): "N completed, N failed, N paused, N detached" (only the non-zero
+    /// buckets, in that fixed order), or `"0 results"` when [`Self::child_statuses`] is empty.
+    pub summary: String,
+    /// The per-child [`SubagentResultStatus`], in the same fixed order as [`Self::outputs`] (pi's
+    /// `children[].status`, `result-intercom.ts:33-44 countStatuses`'s input) — a second parallel
+    /// array alongside `outputs`, following this struct's existing "parallel array, never an
+    /// embedded per-child object" allowlist discipline, so [`Self::status`]/[`Self::summary`] (and
+    /// [`format_subagent_result_receipt`]'s own "Children: …" line) can be recomputed from real
+    /// per-child data rather than only ever seeing the pre-collapsed aggregate.
+    pub child_statuses: Vec<SubagentResultStatus>,
+}
+
+/// pi `SubagentResultStatus` (`../shared/types.ts`, consumed by `result-intercom.ts:17-63`): the
+/// four terminal states a single grouped child (or a whole grouped run, via
+/// [`resolve_grouped_status`]) can resolve to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentResultStatus {
+    Completed,
+    Failed,
+    Paused,
+    Detached,
+}
+
+/// pi `countStatuses` (`result-intercom.ts:33-44`): tally `statuses` into the fixed
+/// completed/failed/paused/detached bucket order (index 0..3, matching [`SubagentResultStatus`]'s
+/// declaration order so `as usize` indexes this array directly).
+fn count_statuses(statuses: &[SubagentResultStatus]) -> [u32; 4] {
+    let mut counts = [0u32; 4];
+    for s in statuses {
+        if let Some(count) = counts.get_mut(*s as usize) {
+            *count += 1;
+        }
+    }
+    counts
+}
+
+/// pi `formatStatusCounts` (`result-intercom.ts:46-54`): "N completed, N failed, N paused, N
+/// detached" (only the non-zero buckets, joined with `", "`, in that fixed order), or the literal
+/// `"0 results"` when `statuses` is empty (pi's own explicit fallback for `parts.length === 0`).
+#[must_use]
+pub fn format_status_counts(statuses: &[SubagentResultStatus]) -> String {
+    let counts = count_statuses(statuses);
+    const LABELS: [&str; 4] = ["completed", "failed", "paused", "detached"];
+    let parts: Vec<String> = counts
+        .iter()
+        .zip(LABELS.iter())
+        .filter(|(n, _)| **n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+    if parts.is_empty() {
+        "0 results".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// pi `resolveGroupedStatus` (`result-intercom.ts:56-63`), ported verbatim: any-failed → `Failed`;
+/// else any-paused → `Paused`; else any-completed → `Completed`; else any-detached → `Detached`;
+/// else (no children at all) → `Failed` (pi's own explicit default, matched exactly — not
+/// `Completed` or any other "optimistic" fallback).
+#[must_use]
+pub fn resolve_grouped_status(statuses: &[SubagentResultStatus]) -> SubagentResultStatus {
+    let counts = count_statuses(statuses);
+    if counts[1] > 0 {
+        return SubagentResultStatus::Failed;
+    }
+    if counts[2] > 0 {
+        return SubagentResultStatus::Paused;
+    }
+    if counts[0] > 0 {
+        return SubagentResultStatus::Completed;
+    }
+    if counts[3] > 0 {
+        return SubagentResultStatus::Detached;
+    }
+    SubagentResultStatus::Failed
+}
+
+/// pi `resolveSubagentResultStatus` (`result-intercom.ts:17-31`), specialized to the fields a
+/// background [`crate::exec::SingleResult`]-shaped child actually carries: `detached` takes
+/// precedence, then a soft interrupt (pi's `interrupted || state === "paused"`), then the exit code
+/// (pi's final `exitCode === 0 ? "completed" : "failed"` fallback — this crate's per-child record has
+/// no separate `success`/`state` field to consult first, only `exit_code`, so pi's two middle
+/// branches collapse into this one exit-code check here).
+fn resolve_single_result_status(detached: bool, interrupted: bool, exit_code: i32) -> SubagentResultStatus {
+    if detached {
+        return SubagentResultStatus::Detached;
+    }
+    if interrupted {
+        return SubagentResultStatus::Paused;
+    }
+    if exit_code == 0 {
+        SubagentResultStatus::Completed
+    } else {
+        SubagentResultStatus::Failed
+    }
+}
+
+/// The chain-graph-local analogue of [`resolve_single_result_status`] for a foreground grouped
+/// child ([`crate::spawn::chain_graph::StepResult`]): no `detached`/`exitCode` field exists at this
+/// granularity, so this only distinguishes paused (interrupted) / completed / failed. A `None` child
+/// (a skipped/absent step) resolves to pi's ultimate `"failed"` default (no completion status is
+/// knowable for a step that never ran).
+fn resolve_step_result_status(step: Option<&crate::spawn::chain_graph::StepResult>) -> SubagentResultStatus {
+    match step {
+        None => SubagentResultStatus::Failed,
+        Some(r) if r.interrupted => SubagentResultStatus::Paused,
+        Some(r) if r.success => SubagentResultStatus::Completed,
+        Some(_) => SubagentResultStatus::Failed,
+    }
+}
+
+/// pi `formatSubagentResultReceipt` (`result-intercom.ts:334-377`), ported for the mode label +
+/// "Run: …" + "Children: …" + closing-line structure this crate has real data for today. pi's three
+/// conditional sections (`Artifacts:` / `Run intercom targets (may be inactive after completion):` /
+/// `Sessions:`) each only render when at least one delivered child carries an `artifactPath` /
+/// `intercomTarget` / `sessionPath` respectively (`.filter(...)`, `result-intercom.ts:351-373`) — no
+/// per-grouped-child artifact path, session path, or intercom target is tracked anywhere in this
+/// crate's pipeline yet, so those three sections correctly evaluate to "no matching children" and are
+/// omitted here exactly as pi's own filters would do given the identical absence of data; the moment
+/// a later phase threads that per-child metadata through, this function starts rendering those
+/// sections with zero further changes to its own logic.
+#[must_use]
+pub fn format_subagent_result_receipt(mode: &str, run_id: &RunId, child_statuses: &[SubagentResultStatus]) -> String {
+    let mode_label = match mode {
+        "single" => "single subagent result",
+        "chain" => "chain subagent results",
+        _ => "parallel subagent results",
+    };
+    let lines = [
+        format!("Delivered {mode_label} via intercom."),
+        format!("Run: {}", run_id.as_str()),
+        format!("Children: {}", format_status_counts(child_statuses)),
+        "Full grouped output was sent over intercom.".to_string(),
+    ];
+    lines.join("\n")
 }
 
 impl IntercomPayload {
@@ -109,6 +253,13 @@ impl IntercomPayload {
             .iter()
             .map(|r| r.usage.total_tokens)
             .fold(0u64, u64::saturating_add);
+        let child_statuses: Vec<SubagentResultStatus> = result
+            .results
+            .iter()
+            .map(|r| resolve_single_result_status(r.detached, r.interrupted, r.exit_code))
+            .collect();
+        let status = resolve_grouped_status(&child_statuses);
+        let summary = format_status_counts(&child_statuses);
         Self {
             run_id: result.run_id.clone(),
             agent: result.agent.clone(),
@@ -119,6 +270,9 @@ impl IntercomPayload {
                 .map(|r| r.final_output.clone().unwrap_or_default())
                 .collect(),
             total_tokens,
+            status,
+            summary,
+            child_statuses,
         }
     }
 
@@ -138,6 +292,10 @@ impl IntercomPayload {
         success: bool,
         children: &[Option<crate::spawn::chain_graph::StepResult>],
     ) -> Self {
+        let child_statuses: Vec<SubagentResultStatus> =
+            children.iter().map(|c| resolve_step_result_status(c.as_ref())).collect();
+        let status = resolve_grouped_status(&child_statuses);
+        let summary = format_status_counts(&child_statuses);
         Self {
             run_id,
             agent,
@@ -147,6 +305,9 @@ impl IntercomPayload {
                 .map(|c| c.as_ref().and_then(|r| r.final_output.clone()).unwrap_or_default())
                 .collect(),
             total_tokens: 0,
+            status,
+            summary,
+            child_statuses,
         }
     }
 }
@@ -209,6 +370,16 @@ pub trait SteerChannel: Send + Sync {
     /// but no registered receiver at `target` (the genuine "not registered" fallback); `Err` = the
     /// transport itself failed. Never panics or blocks past its own I/O.
     fn steer(&self, target: String, text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+
+    /// Whether a real intercom bridge is wired (pi `intercomBridge.active`): callers that only want
+    /// to know whether it is worth SHOWING a resolved intercom-target line (e.g. the revive
+    /// confirmation, `subagent-executor.ts:1019-1027`) — as opposed to attempting delivery — consult
+    /// this instead of probing with a real `steer` call. Defaults to `true` so existing
+    /// broker-backed implementors (which ARE a real bridge) need no change; only
+    /// [`NoTransportSteerChannel`] overrides this to `false`.
+    fn is_active(&self) -> bool {
+        true
+    }
 }
 
 /// The default steer channel: no transport wired (headless / SDK-embedder / no intercom this
@@ -225,6 +396,10 @@ impl SteerChannel for NoTransportSteerChannel {
     fn steer(&self, _target: String, _text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async { Ok(false) })
     }
+
+    fn is_active(&self) -> bool {
+        false
+    }
 }
 
 /// The default bounded wait for an out-of-band delivery attempt before giving up and degrading
@@ -232,6 +407,34 @@ impl SteerChannel for NoTransportSteerChannel {
 /// 26's framing for the sibling `1000ms` debounce constant) — chosen short enough that a missing
 /// receiver never perceptibly stalls the orchestrator's own turn.
 pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:283-288`) —
+/// the SAME 500ms bound applies to EVERY caller of that function, including the live-child follow-up
+/// steer at `subagent-executor.ts:860` ([`SubagentExecutor::control_resume`]'s `SteerRunning` arm).
+/// Distinct from [`DEFAULT_DELIVERY_TIMEOUT`] (750ms), which only bounds the grouped-result
+/// [`DeliveryChannel`] path — pi's own two call sites use two different literals, so this module
+/// keeps them as two separate constants rather than collapsing them into one.
+pub const DEFAULT_STEER_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Attempt one steer delivery through `channel`, racing it against `timeout` — the [`SteerChannel`]
+/// analogue of [`deliver`]'s race, applied to the distinct steer seam. Resolves to `true` only if the
+/// channel confirms `Ok(true)` before `timeout` elapses; any other outcome (`Ok(false)`, `Err`, or the
+/// timeout branch firing first) resolves to `false`, matching pi's `deliverSubagentIntercomMessageEvent`
+/// contract that the caller's turn is never blocked longer than `timeoutMs` (`result-intercom.ts:283-316`).
+pub async fn steer_with_timeout(channel: &dyn SteerChannel, target: String, text: String, timeout: Duration) -> bool {
+    let attempt = channel.steer(target, text);
+    tokio::select! {
+        biased;
+        result = attempt => result.unwrap_or(false),
+        () = tokio::time::sleep(timeout) => false,
+    }
+}
+
+/// Convenience wrapper over [`steer_with_timeout`] using [`DEFAULT_STEER_TIMEOUT`] (pi's `timeoutMs
+/// = 500` default, applied uniformly to every caller per `result-intercom.ts:283-288`).
+pub async fn steer_with_default_timeout(channel: &dyn SteerChannel, target: String, text: String) -> bool {
+    steer_with_timeout(channel, target, text, DEFAULT_STEER_TIMEOUT).await
+}
 
 /// The result of one [`deliver`] attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -522,17 +725,24 @@ mod tests {
             success: true,
             outputs: vec!["done".to_string()],
             total_tokens: 42,
+            status: SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![SubagentResultStatus::Completed],
         };
 
         // Exhaustive destructure: the `let IntercomPayload { .. } = payload;` form below would
         // still compile if a field were added (the `..` pattern), so instead we name every field
         // explicitly with no `..` — this is what makes the assertion compile-time-exhaustive.
-        let IntercomPayload { run_id, agent, success, outputs, total_tokens } = payload;
+        let IntercomPayload { run_id, agent, success, outputs, total_tokens, status, summary, child_statuses } =
+            payload;
         assert_eq!(run_id.as_str(), "deadbeefcafef00d");
         assert_eq!(agent, "researcher");
         assert!(success);
         assert_eq!(outputs, vec!["done".to_string()]);
         assert_eq!(total_tokens, 42);
+        assert_eq!(status, SubagentResultStatus::Completed);
+        assert_eq!(summary, "1 completed");
+        assert_eq!(child_statuses, vec![SubagentResultStatus::Completed]);
     }
 
     /// The allowlist is enforced by the projection function itself never having access to
@@ -767,6 +977,9 @@ mod tests {
                 "second step output, in full, unabridged".to_string(),
             ],
             total_tokens: 999,
+            status: SubagentResultStatus::Completed,
+            summary: "2 completed".to_string(),
+            child_statuses: vec![SubagentResultStatus::Completed, SubagentResultStatus::Completed],
         }
     }
 

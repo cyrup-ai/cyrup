@@ -607,8 +607,18 @@ async fn resolve_forwarded_decision(
 
     // pi optional auto-deny timeout (`index.ts:1443-1452`): `forwardedPromptTimeoutSeconds` > 0 → the
     // select auto-rejects after that long; else it waits indefinitely.
-    let timeout = config.forwarded_prompt_timeout_seconds.filter(|s| *s > 0).map(Duration::from_secs);
-    let prompt_message = match config.forwarded_prompt_timeout_seconds.filter(|s| *s > 0) {
+    let positive_timeout_secs = config.forwarded_prompt_timeout_seconds.filter(|s| *s > 0);
+    let timeout = positive_timeout_secs.map(Duration::from_secs);
+    // pi `timeoutDenialReason` (`index.ts:1447-1449`): only set when a positive timeout is configured;
+    // `requestPermissionDecisionFromUi` only reaches the reason-attaching fallback branch when the
+    // caller passed a `timeoutDenialReason` at all (`permission-dialog.ts:155-158`), so `None` here
+    // reproduces pi's plain (no `denialReason`) result for the "wait indefinitely" case.
+    let timeout_denial_reason = positive_timeout_secs.map(|secs| {
+        format!(
+            "permission_timeout: forwarded permission prompt was not answered within {secs} seconds."
+        )
+    });
+    let prompt_message = match positive_timeout_secs {
         Some(secs) => format!("This forwarded prompt auto-denies after {secs} seconds if unanswered."),
         None => "This forwarded prompt will wait indefinitely until answered.".to_string(),
     };
@@ -622,7 +632,14 @@ async fn resolve_forwarded_decision(
         None => None,
     };
     let channel = LocalAskChannel::new(services.clone());
-    match channel.confirm("Permission Required (Subagent)", &body, PromptOpts { timeout }).await {
+    match channel
+        .confirm(
+            "Permission Required (Subagent)",
+            &body,
+            PromptOpts { timeout, timeout_denial_reason },
+        )
+        .await
+    {
         AskOutcome::Decided(decision) => decision,
         // No live dialog reachable ⇒ fail-CLOSED deny (a headless parent cannot surface it).
         AskOutcome::NoLiveChannel => denied(),

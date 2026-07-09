@@ -26,6 +26,36 @@ pub fn parse_ordered(input: &str) -> Result<OrderedValue, String> {
     serde_json::from_str(&cleaned).map_err(|e| e.to_string())
 }
 
+/// Parse a JSONC document exactly like pi's `parseJsoncConfig(input, filePath, subject)`
+/// (`jsonc-config.ts:26-35`): on parse failure the error is formatted as
+/// `Failed to parse {subject} at '{file_path}' (...)`, matching pi's
+/// `Failed to parse ${subject} at '${filePath}' (${formatJsoncParseSummary(...)})` wording. The
+/// parenthesized detail comes from `serde_json`'s own error text (which already includes its own
+/// line/column) rather than pi's `printParseErrorCode` + line/column computed from
+/// `jsonc-parser`'s error array — an approved, explicit deviation: `serde_json` surfaces a single
+/// error with its own error taxonomy, unlike `jsonc-parser`, so pi's "N more parse errors" suffix
+/// and exact error-code text cannot be reproduced. Use this (or [`parse_ordered_config`]) instead
+/// of bare [`parse`]/[`parse_ordered`] wherever the caller can surface the error to a user, so the
+/// warning text mirrors pi's.
+pub fn parse_config(input: &str, file_path: &str, subject: &str) -> Result<Value, String> {
+    parse(input).map_err(|err| format_parse_error(subject, file_path, &err))
+}
+
+/// Order-preserving counterpart of [`parse_config`]; see its docs for the error-format contract.
+pub fn parse_ordered_config(
+    input: &str,
+    file_path: &str,
+    subject: &str,
+) -> Result<OrderedValue, String> {
+    parse_ordered(input).map_err(|err| format_parse_error(subject, file_path, &err))
+}
+
+/// Format a parse failure exactly like pi's `Failed to parse ${subject} at '${filePath}' (...)`
+/// (`jsonc-config.ts:31`).
+fn format_parse_error(subject: &str, file_path: &str, err: &str) -> String {
+    format!("Failed to parse {subject} at '{file_path}' ({err})")
+}
+
 /// Remove `//`/`/* */` comments and trailing commas while preserving string-literal contents
 /// exactly (a `//` or `,` inside a `"..."` is data, not syntax). Single-pass, byte-accurate for
 /// UTF-8 because all structural characters handled here are ASCII. Uses `slice::get` throughout so a
@@ -166,5 +196,36 @@ mod tests {
     #[test]
     fn malformed_is_err() {
         assert!(parse("{not json").is_err());
+    }
+
+    // Regression test for the missing pi `parseJsoncConfig` error format
+    // (jsonc-config.ts:26-35): pre-fix, `parse`/`parse_ordered` returned the bare
+    // `serde_json` error string with no subject or file path, so a malformed permission
+    // config produced a warning indistinguishable from any other error and gave the user
+    // no path to look at. `parse_config`/`parse_ordered_config` must reproduce pi's
+    // `Failed to parse {subject} at '{file_path}' (...)` wrapper.
+    #[test]
+    fn parse_config_formats_error_like_pi_parse_jsonc_config() {
+        let err = parse_config("{not json", "/tmp/pi-permissions.jsonc", "permission config")
+            .expect_err("malformed JSONC must fail to parse");
+        assert!(
+            err.starts_with("Failed to parse permission config at '/tmp/pi-permissions.jsonc' ("),
+            "unexpected error format: {err}"
+        );
+        assert!(err.ends_with(')'), "unexpected error format: {err}");
+    }
+
+    #[test]
+    fn parse_ordered_config_formats_error_like_pi_parse_jsonc_config() {
+        let err = parse_ordered_config(
+            "{not json",
+            "/tmp/config.json",
+            "permission-system config",
+        )
+        .expect_err("malformed JSONC must fail to parse");
+        assert!(
+            err.starts_with("Failed to parse permission-system config at '/tmp/config.json' ("),
+            "unexpected error format: {err}"
+        );
     }
 }

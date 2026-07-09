@@ -367,6 +367,9 @@ mod tests {
             agent: "researcher".to_string(),
             success: true,
             outputs: vec!["done".to_string()],
+            status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
             total_tokens: 10,
         };
         // No supervisor + no host services → Ok(false) (degrade, keep full inline).
@@ -419,6 +422,9 @@ mod tests {
             success: true,
             outputs: vec!["the answer".to_string()],
             total_tokens: 42,
+            status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
         };
         assert_eq!(channel.send(payload).await, Ok(true));
 

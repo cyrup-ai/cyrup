@@ -137,9 +137,14 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
     // `std::env::set_var`/`remove_var`; this file is a separate compilation unit from this crate's
     // own `#![forbid(unsafe_code)]` `lib.rs`, exactly like every sibling `tests/*_integration.rs`
     // file).
+    // `SubagentsExtension::init` (`RegistrationMode::Full`) now runs its T6 startup housekeeping
+    // (async/results root creation) at `init()` time — sandbox `CYRUP_HOME` to a tempdir so this
+    // real end-to-end session build never touches the real developer/CI machine's `~/.cyrup`.
+    let home = tempfile::tempdir().expect("home tempdir");
     unsafe {
         std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
         std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+        std::env::set_var("CYRUP_HOME", home.path());
     }
 
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
@@ -173,6 +178,7 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
     unsafe {
         std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
         std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+        std::env::remove_var("CYRUP_HOME");
     }
 
     let events = events.expect("the turn completes without a transport/session-level error");
@@ -249,6 +255,17 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
 /// passing at all under `cargo test`'s default no-network/no-subprocess-by-accident posture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess_spawn() {
+    // `SubagentsExtension::init` (`RegistrationMode::Full`) now runs its T6 startup housekeeping at
+    // `init()` time — sandbox `CYRUP_HOME` (see `ENV_MUTATION_LOCK`'s own doc), even though this
+    // particular test sets no fixture-binary env itself.
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let home = tempfile::tempdir().expect("home tempdir");
+    // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test, mirroring
+    // this file's sibling tests.
+    unsafe {
+        std::env::set_var("CYRUP_HOME", home.path());
+    }
+
     let work_dir = tempfile::tempdir().expect("real tempdir");
     // Deliberately no fixture persona written — "ghost" resolves to nothing.
 
@@ -288,6 +305,11 @@ async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess
     assert_eq!(tool_ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
     let (is_error, result) = tool_ends[0];
     assert!(is_error, "an unresolvable agent name must surface as a tool error, got: {result:#?}");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var("CYRUP_HOME");
+    }
 }
 
 /// T3 group C — a FAILED single run surfaces as a tool ERROR whose content carries the failure
@@ -315,10 +337,14 @@ async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_erro
     std::fs::write(&script_path, script.to_string()).expect("write fixture script");
 
     let fixture = fixture_binary_path();
+    // `SubagentsExtension::init` (`RegistrationMode::Full`) now runs its T6 startup housekeeping at
+    // `init()` time — sandbox `CYRUP_HOME` too (see `ENV_MUTATION_LOCK`'s own doc).
+    let home = tempfile::tempdir().expect("home tempdir");
     // SAFETY: scoped, mutex-serialized env mutation for the duration of this one test.
     unsafe {
         std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
         std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+        std::env::set_var("CYRUP_HOME", home.path());
     }
 
     let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
@@ -346,6 +372,7 @@ async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_erro
     unsafe {
         std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
         std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+        std::env::remove_var("CYRUP_HOME");
     }
 
     let events = events.expect("the turn completes even though the tool call itself fails");

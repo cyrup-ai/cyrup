@@ -1,22 +1,35 @@
-//! Integration test: closing gap R-SA-130 for the 5 registration-surface slash commands that need
-//! no real child-OS-subprocess spawn — `/subagents-models`, `/subagents-refresh-provider-models`,
-//! `/subagents-generate-profiles`, `/subagents-check-profile`, `/subagents-companions` — proving
-//! each now routes through REAL execution (the static seed catalog in `cyrup_provider::catalog`,
-//! and `registration::profiles`' real on-disk profile read/write primitives) rather than the
-//! "recognized, not yet executing" stub arm `extension.rs::dispatch_slash` used to fall into.
+//! Integration test: closing gap R-SA-130 for the 5 registration-surface slash commands —
+//! `/subagents-models`, `/subagents-refresh-provider-models`, `/subagents-generate-profiles`,
+//! `/subagents-check-profile`, `/subagents-companions` — proving each now routes through REAL
+//! execution (the static seed catalog in `cyrup_provider::catalog`, and `registration::profiles`'
+//! real on-disk profile read/write primitives) rather than the "recognized, not yet executing"
+//! stub arm `extension.rs::dispatch_slash` used to fall into.
+//!
+//! `/subagents-refresh-provider-models` and `/subagents-generate-profiles` (and, transitively,
+//! `/subagents-check-profile`'s report) DO spawn a real child OS subprocess per candidate model —
+//! `extension.rs::probe_model` (pi `probeModel`, profiles.ts:318-335), always invoked (this port
+//! never exposes a `--no-probe` flag, matching every real pi call site). Gated on the
+//! `test-fixtures` Cargo feature (matching every other fixture-dependent integration test in this
+//! crate) so those probes resolve to the deterministic, network-free `cyrup-subagent-fixture`
+//! test-double via `CYRUP_SUBAGENT_BINARY` (R-SA-045 tier 1) instead of self-reexecing this very
+//! test binary (which — lacking any CLI-arg parsing of its own — degrades every probe to a
+//! spurious `error`, exactly pi's own test suite's reason for stubbing `pi.exec` with a canned
+//! `{code: 0, stdout: "OK"}` result rather than letting `probeModel` hit a real network call).
 //!
 //! Lives in `tests/` (a separate compilation unit from this crate's own `lib.rs`) for the same
 //! reason every other fixture-based integration test in this crate does: these tests need to
-//! mutate `CYRUP_HOME` (process-global state) via `std::env::set_var`/`remove_var`, which Rust
-//! 2024 requires `unsafe` for — a `#[cfg(test)]` module inside `src/` cannot do this because this
-//! crate's own `#![forbid(unsafe_code)]` (`src/lib.rs`) applies even to its own test code (a HARD
-//! forbid, unlike `deny`, cannot be locally `#[allow(...)]`-ed away).
+//! mutate `CYRUP_HOME`/`CYRUP_SUBAGENT_BINARY` (process-global state) via
+//! `std::env::set_var`/`remove_var`, which Rust 2024 requires `unsafe` for — a `#[cfg(test)]`
+//! module inside `src/` cannot do this because this crate's own `#![forbid(unsafe_code)]`
+//! (`src/lib.rs`) applies even to its own test code (a HARD forbid, unlike `deny`, cannot be
+//! locally `#[allow(...)]`-ed away).
 //!
 //! No mocking: every dispatch below drives the REAL `SubagentsExtension::execute_command` (the
 //! `cyrup_ext::native::NativeExtension` trait method), which reads the REAL, already-built
 //! `cyrup_provider::catalog::seed_catalog()` static catalog and writes/reads REAL files under a
 //! temporary `CYRUP_HOME`.
 
+#![cfg(feature = "test-fixtures")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
@@ -28,11 +41,13 @@ use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::profiles::{load_profile, NamedProfile};
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
-/// Serializes every test in this file that mutates `CYRUP_HOME` (process-global state) — mirrors
-/// every fixture-based integration test in this crate's identical `ENV_MUTATION_LOCK` convention.
+/// Serializes every test in this file that mutates `CYRUP_HOME`/`CYRUP_SUBAGENT_BINARY`
+/// (process-global state) — mirrors every fixture-based integration test in this crate's
+/// identical `ENV_MUTATION_LOCK` convention.
 static ENV_MUTATION_LOCK: Mutex<()> = Mutex::const_new(());
 
 const CYRUP_HOME_ENV_VAR: &str = "CYRUP_HOME";
+const SUBAGENT_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 
 /// RAII guard installing `CYRUP_HOME` at a temp dir for the life of one test.
 struct CyrupHomeGuard {
@@ -57,6 +72,36 @@ impl Drop for CyrupHomeGuard {
         // SAFETY: see `install`'s own safety comment.
         unsafe {
             std::env::remove_var(CYRUP_HOME_ENV_VAR);
+        }
+    }
+}
+
+/// RAII guard pointing `resolve_spawn_command`'s tier-1 `CYRUP_SUBAGENT_BINARY` override
+/// (R-SA-045) at the scripted-NDJSON `cyrup-subagent-fixture` test-double (arch-SA §11) for the
+/// life of one test, so every `probe_model` call this test's `execute_command` dispatch triggers
+/// spawns that deterministic, network-free real child process — with NO
+/// `CYRUP_SUBAGENT_FIXTURE_SCRIPT` set, the fixture degrades to its documented no-script default
+/// (emit nothing, exit 0 immediately), which `probe_model_with` classifies as `ProbeStatus::Ok`
+/// ("Probe succeeded.") exactly like pi's own test suite's canned `{code: 0, stdout: "OK"}` stub
+/// exec result (`profiles.test.ts`).
+struct FixtureBinaryGuard;
+
+impl FixtureBinaryGuard {
+    fn install() -> Self {
+        let fixture = PathBuf::from(env!("CARGO_BIN_EXE_cyrup-subagent-fixture"));
+        // SAFETY: see `CyrupHomeGuard::install`'s identical safety comment.
+        unsafe {
+            std::env::set_var(SUBAGENT_BINARY_ENV_VAR, &fixture);
+        }
+        Self
+    }
+}
+
+impl Drop for FixtureBinaryGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `CyrupHomeGuard::install`'s identical safety comment.
+        unsafe {
+            std::env::remove_var(SUBAGENT_BINARY_ENV_VAR);
         }
     }
 }
@@ -135,6 +180,7 @@ async fn subagents_models_command_rejects_more_than_one_positional_token() {
 async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let (_home_guard, home) = CyrupHomeGuard::install();
+    let _fixture_guard = FixtureBinaryGuard::install();
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
@@ -193,6 +239,7 @@ async fn subagents_refresh_provider_models_rejects_unsafe_provider_names() {
 async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let (_home_guard, home) = CyrupHomeGuard::install();
+    let _fixture_guard = FixtureBinaryGuard::install();
 
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
@@ -230,16 +277,30 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
 async fn subagents_check_profile_cross_references_the_real_static_seed_catalog() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let (_home_guard, home) = CyrupHomeGuard::install();
+    let _fixture_guard = FixtureBinaryGuard::install();
 
     let profiles_dir = home.join(".cyrup").join("subagents").join("profiles");
     tokio::fs::create_dir_all(&profiles_dir).await.expect("mkdir profiles dir");
     let catalog = cyrup_provider::catalog::seed_catalog();
     let known_model = catalog.first().expect("non-empty catalog").id.as_str().to_string();
 
+    // pi `checkSubagentProfile`'s `entries` (profiles.ts:615-617) walks ONLY
+    // `subagents.agentOverrides`, never `defaultModel` (this crate's own `render_profile_check_
+    // report` doc comment says the same) — so a profile needs a real `overrides.<agent>.model`
+    // entry to have anything to check at all; a `defaultModel`-only profile always renders "no
+    // model references declared" (pi-faithful, not a bug).
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert(
+        "researcher".to_string(),
+        cyrup_ext_subagents::discovery::types::AgentOverrideConfig {
+            model: cyrup_ext_subagents::discovery::types::OverrideField::Value(known_model.clone()),
+            ..Default::default()
+        },
+    );
     let profile = NamedProfile {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
-            overrides: std::collections::BTreeMap::new(),
-            default_model: Some(known_model.clone()),
+            overrides,
+            default_model: None,
             disable_builtins: None,
             disable_thinking: None,
         },
@@ -248,10 +309,20 @@ async fn subagents_check_profile_cross_references_the_real_static_seed_catalog()
         .await
         .expect("write profile");
 
+    let mut bogus_overrides = std::collections::BTreeMap::new();
+    bogus_overrides.insert(
+        "researcher".to_string(),
+        cyrup_ext_subagents::discovery::types::AgentOverrideConfig {
+            model: cyrup_ext_subagents::discovery::types::OverrideField::Value(
+                "definitely-not-a-real-model-id".to_string(),
+            ),
+            ..Default::default()
+        },
+    );
     let bogus_profile = NamedProfile {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
-            overrides: std::collections::BTreeMap::new(),
-            default_model: Some("definitely-not-a-real-model-id".to_string()),
+            overrides: bogus_overrides,
+            default_model: None,
             disable_builtins: None,
             disable_thinking: None,
         },
@@ -275,15 +346,24 @@ async fn subagents_check_profile_cross_references_the_real_static_seed_catalog()
         .await
         .expect("execute_command does not error")
         .expect("check produces textual output");
+    // pi's real rendering (slash-commands.ts:1267-1274): "<agent> -> <model> — registry
+    // ok|missing; probe <status>(...)" — never the literal "OK"/"UNKNOWN" this test used to
+    // assert on (pi's own real output never emits those uppercase tokens anywhere).
     assert!(ok_output.contains(&known_model), "got: {ok_output}");
-    assert!(ok_output.contains("OK"), "got: {ok_output}");
+    assert!(
+        ok_output.contains("registry ok"),
+        "a model resolvable against the seed catalog must report `inRegistry: true`: {ok_output}"
+    );
 
     let bogus_output = ext
         .execute_command("subagents-check-profile", "bogus", &ctx)
         .await
         .expect("execute_command does not error")
         .expect("check produces textual output even for an unresolvable model reference");
-    assert!(bogus_output.contains("UNKNOWN"), "got: {bogus_output}");
+    assert!(
+        bogus_output.contains("registry missing"),
+        "an unresolvable model reference must report `inRegistry: false`, never a fabricated match: {bogus_output}"
+    );
 }
 
 #[tokio::test]
@@ -313,9 +393,19 @@ async fn subagents_check_profile_errors_for_a_nonexistent_profile() {
 // /subagents-companions
 // =====================================================================================================
 
+/// pi `buildCompanionCommandStatus`/`buildCompanionDoctorLines` (`companion-suggestions.ts:229-242,
+/// 324-326`): `status` renders the real per-package doctor report — "Companion packages" followed
+/// by an `- <pkg>: active|inactive` line (plus install/benefit/status-source/reason) for BOTH
+/// `pi-intercom` and `pi-prompt-template-model` — never the old fixed "no companion extensions ...
+/// nothing to report" string this test used to assert on.
 #[tokio::test]
-async fn subagents_companions_status_reports_no_companions_honestly() {
+async fn subagents_companions_status_reports_the_per_package_doctor_report() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
+    // `status` now reads `<agent dir>/intercom/config.json` and checks for a `pi-intercom`
+    // extension directory under the agent dir (pi `readPiIntercomConfigStatus`/
+    // `diagnoseIntercomBridge`) — sandbox `CYRUP_HOME` so this never touches the real developer/CI
+    // machine's `~/.cyrup`.
+    let (_home_guard, _home) = CyrupHomeGuard::install();
     let work_dir = tempfile::tempdir().expect("real tempdir");
     let ext = SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),
@@ -329,11 +419,19 @@ async fn subagents_companions_status_reports_no_companions_honestly() {
         .expect("execute_command does not error")
         .expect("status produces textual output");
     assert!(!output.contains("recognized by the subagents extension"), "got: {output}");
-    assert!(output.contains("no companion extensions"), "got: {output}");
+    assert!(!output.contains("nothing to report"), "got: {output}");
+    assert!(output.starts_with("Companion packages"), "got: {output}");
+    assert!(output.contains("- pi-intercom: inactive"), "got: {output}");
+    assert!(output.contains("- pi-prompt-template-model: inactive"), "got: {output}");
 }
 
+/// pi `updateCompanionDismissal`/`isDismissed` (`companion-suggestions.ts:130-133, 290-322`): `hide`
+/// must persist into the extension config's `companionSuggestions.packages[<pkg>].dismissed`
+/// structure `status`'s own dismissed-detection reads back — proving the mutation has genuine,
+/// observable effect on the SAME store, not an unkeyed side-marker file nothing else consults. Then
+/// `show` clears it again, and pi's exact fixed reply text is used for both directions.
 #[tokio::test]
-async fn subagents_companions_hide_then_show_round_trips_through_real_disk_state() {
+async fn subagents_companions_hide_then_show_round_trips_through_the_shared_config_store() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let (_home_guard, home) = CyrupHomeGuard::install();
 
@@ -349,16 +447,25 @@ async fn subagents_companions_hide_then_show_round_trips_through_real_disk_state
         .await
         .expect("execute_command does not error")
         .expect("hide produces textual output");
-    assert!(hide_output.contains("recorded"), "got: {hide_output}");
+    assert_eq!(hide_output, "Hid pi-intercom recommendations for this workspace.");
 
-    let marker = home
-        .join(".cyrup")
-        .join("subagents")
-        .join("companions")
-        .join("pi-intercom.workspace.hidden.json");
+    // The dismissal lands in the SAME `config.json` `status`'s gating reads back (pi's
+    // `updateConfig`/`isDismissed` share one file) — not an unkeyed marker file nothing reads.
+    let config_path = home.join(".cyrup").join("subagents").join("config.json");
+    let on_disk = tokio::fs::read_to_string(&config_path)
+        .await
+        .expect("hide must write the shared config.json");
+    assert!(on_disk.contains("companionSuggestions"), "got: {on_disk}");
+    assert!(on_disk.contains("workspaces"), "got: {on_disk}");
+
+    let status_after_hide = ext
+        .execute_command("subagents-companions", "status", &ctx)
+        .await
+        .expect("execute_command does not error")
+        .expect("status produces textual output");
     assert!(
-        tokio::fs::try_exists(&marker).await.unwrap_or(false),
-        "the hide command must genuinely write a dismissal marker file to disk"
+        status_after_hide.contains("- pi-intercom: inactive recommendation hidden by config"),
+        "a same-process status call must observe the hide immediately: {status_after_hide}"
     );
 
     let show_output = ext
@@ -366,10 +473,17 @@ async fn subagents_companions_hide_then_show_round_trips_through_real_disk_state
         .await
         .expect("execute_command does not error")
         .expect("show produces textual output");
-    assert!(show_output.contains("cleared"), "got: {show_output}");
+    assert_eq!(show_output, "Showing pi-intercom recommendations for this workspace again.");
+
+    let status_after_show = ext
+        .execute_command("subagents-companions", "status", &ctx)
+        .await
+        .expect("execute_command does not error")
+        .expect("status produces textual output");
     assert!(
-        !tokio::fs::try_exists(&marker).await.unwrap_or(false),
-        "the show command must genuinely remove the dismissal marker file from disk"
+        status_after_show.contains("- pi-intercom: inactive")
+            && !status_after_show.contains("hidden by config"),
+        "show must clear the dismissal the earlier hide recorded: {status_after_show}"
     );
 }
 

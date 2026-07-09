@@ -179,7 +179,10 @@ impl SharedIntercomState {
         tokio::select! {
             reply = rx => {
                 match reply {
-                    Ok(message) => Ok(message.content.text),
+                    // Inline the reply's attachments into the visible body, exactly as pi does
+                    // (`replyText + formatAttachments(replyMessage.content.attachments)`,
+                    // `index.ts:1646-1649,1354-1357`) — never silently drop them.
+                    Ok(message) => Ok(inline_reply_attachments(message.content.text, message.content.attachments.as_deref())),
                     Err(_) => {
                         // The slot's sender was dropped (cleared elsewhere).
                         self.waiter.clear_matching(&question_id);
@@ -203,6 +206,17 @@ impl SharedIntercomState {
             }
         }
     }
+}
+
+/// Inline a reply's attachments into its visible text (pi `replyText + formatAttachments(...)`,
+/// `index.ts:1646-1649` (ask) and `index.ts:1354-1357` (contact_supervisor)) — attachments the
+/// replying session sent back must never be silently dropped.
+fn inline_reply_attachments(text: String, attachments: Option<&[crate::transport::protocol::Attachment]>) -> String {
+    let attachment_text = attachments
+        .filter(|a| !a.is_empty())
+        .map(crate::inbound::format_attachments)
+        .unwrap_or_default();
+    format!("{text}{attachment_text}")
 }
 
 /// `askTimeoutMs % 60000 === 0 ? "N minutes" : "Nms"` (`index.ts:471`).
@@ -231,5 +245,33 @@ mod tests {
         let state = SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w"));
         assert!(state.client().is_none());
         assert!(state.self_session_id().is_none());
+    }
+
+    /// Regression proof for the "ask/contact_supervisor replies drop attachments" divergence
+    /// (pi `index.ts:1646-1649,1354-1357`): before the fix, `ask_and_wait` returned
+    /// `message.content.text` verbatim, discarding `content.attachments` entirely. The reply text
+    /// must now carry the same `📎 name\n content` block pi's `formatAttachments` inlines.
+    #[test]
+    fn inline_reply_attachments_appends_pi_formatted_block() {
+        use crate::transport::protocol::{Attachment, AttachmentKind};
+
+        let text = inline_reply_attachments(
+            "Looks good".to_string(),
+            Some(&[Attachment {
+                kind: AttachmentKind::Snippet,
+                name: "patch.diff".to_string(),
+                content: "+1 line".to_string(),
+                language: Some("diff".to_string()),
+            }]),
+        );
+        assert_eq!(text, "Looks good\n\n---\n📎 patch.diff\n~~~diff\n+1 line\n~~~");
+    }
+
+    /// No attachments ⇒ the reply text passes through unchanged (pi: `replyAttachments = ""` when
+    /// `replyMessage.content.attachments?.length` is falsy).
+    #[test]
+    fn inline_reply_attachments_passes_through_when_none() {
+        assert_eq!(inline_reply_attachments("no attachments here".to_string(), None), "no attachments here");
+        assert_eq!(inline_reply_attachments("empty vec".to_string(), Some(&[])), "empty vec");
     }
 }

@@ -812,8 +812,11 @@ pub struct DoctorReportInput<'a> {
     /// `Filesystem` block: the chain-runs directory (pi `CHAIN_RUNS_DIR`).
     pub chain_runs_dir: PathBuf,
     /// The full re-scan-per-call discovery result (pi `discoverAgentsAll(cwd)`), from which the
-    /// `Discovery` block derives per-source agent/chain counts and the skills inventory.
-    pub discovered: &'a AgentDiscoveryResult,
+    /// `Discovery` block derives per-source agent/chain counts and the skills inventory. `Err(msg)`
+    /// (pi `lineFromCheck("agents/chains", ...)`, doctor.ts:64-70,131-153: a discovery throw — e.g.
+    /// R-SA-009's malformed-settings abort — renders `- agents/chains: failed — <msg>` instead of a
+    /// fabricated zero-count success.
+    pub discovered: Result<&'a AgentDiscoveryResult, &'a str>,
 }
 
 /// Per-`AgentSource` tallies for one population (agents or chains), rendered as pi's
@@ -875,7 +878,23 @@ fn format_existing_directory(label: &str, dir_path: &Path) -> String {
 /// skill *pointers* declared across discovered agents (real data available today) and names the
 /// deferral, rather than fabricating a source-tiered available-skills inventory that no code
 /// produces yet.
-fn format_discovery(discovered: &AgentDiscoveryResult) -> Vec<String> {
+///
+/// A discovery failure (`Err`) renders pi's `lineFromCheck` failure shape instead — `- agents/chains:
+/// failed — <err>` and `- skills: failed — <err>` — never the fabricated `total 0` success a silent
+/// `unwrap_or_default()` would otherwise produce (doctor.ts:64-70,131-153). Since this crate derives
+/// its skills line from the SAME discovery pass (no separate `discoverAvailableSkills` call exists
+/// yet), a discovery error necessarily fails both lines, not just the agents/chains one.
+fn format_discovery(discovered: Result<&AgentDiscoveryResult, &str>) -> Vec<String> {
+    let discovered = match discovered {
+        Ok(discovered) => discovered,
+        Err(err) => {
+            return vec![
+                format!("- agents/chains: failed — {err}"),
+                format!("- skills: failed — {err}"),
+            ];
+        }
+    };
+
     let mut agent_counts = SourceCounts::default();
     for agent in &discovered.agents {
         agent_counts.record(agent.source);
@@ -1650,7 +1669,7 @@ mod tests {
             async_runs_dir: async_runs.clone(),
             results_dir: results.clone(),
             chain_runs_dir: chain_runs.clone(),
-            discovered: &discovered,
+            discovered: Ok(&discovered),
         };
 
         let report = build_doctor_report(&input);
@@ -1717,7 +1736,7 @@ mod tests {
             async_runs_dir: PathBuf::from("/tmp/subagents/async"),
             results_dir: PathBuf::from("/tmp/subagents/results"),
             chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
-            discovered: &discovered,
+            discovered: Ok(&discovered),
         };
 
         let report = build_doctor_report(&input);
@@ -1728,6 +1747,49 @@ mod tests {
         assert!(
             report.contains("- agents: total 0 (builtin 0, package 0, user 0, project 0)"),
             "{report}"
+        );
+    }
+
+    /// Regression for the divergence where a discovery `Err` (e.g. R-SA-009's malformed-settings
+    /// abort) was silently mapped to `AgentDiscoveryResult::default()`, rendering a healthy-looking
+    /// `- agents: total 0 (builtin 0, package 0, user 0, project 0)` with no failure indication —
+    /// exactly what pi's `lineFromCheck` wrapping prevents (doctor.ts:64-70,131-153: a discovery
+    /// throw renders `- agents/chains: failed — <err>` instead). This test fails against the
+    /// pre-fix behavior, which fed `Ok(&discovered)`/`.unwrap_or_default()` unconditionally and
+    /// could never produce a "failed" Discovery line at all.
+    #[test]
+    fn build_doctor_report_renders_failed_discovery_line_on_error_not_a_fabricated_zero_count() {
+        let input = DoctorReportInput {
+            cwd: Path::new("/tmp/proj"),
+            async_available: true,
+            configured_session_dir: "not configured".to_string(),
+            current_session_file: None,
+            current_session_id: None,
+            session_error: None,
+            temp_root_dir: PathBuf::from("/tmp/subagents/temp"),
+            async_runs_dir: PathBuf::from("/tmp/subagents/async"),
+            results_dir: PathBuf::from("/tmp/subagents/results"),
+            chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
+            discovered: Err("malformed subagents settings: agentOverrides must be an object"),
+        };
+
+        let report = build_doctor_report(&input);
+        assert!(
+            report.contains(
+                "- agents/chains: failed — malformed subagents settings: agentOverrides must be \
+                 an object"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "- skills: failed — malformed subagents settings: agentOverrides must be an object"
+            ),
+            "{report}"
+        );
+        assert!(
+            !report.contains("- agents: total"),
+            "a discovery failure must never render a fabricated total-count success line: {report}"
         );
     }
 }

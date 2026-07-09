@@ -18,11 +18,14 @@
 //! `InitApi` hooks (a small arch-08 addition). This is DOCUMENTED, not silently dead: the render/send
 //! paths ARE wired via the command + inbound surface above.
 //!
-//! All width math assumes NO embedded ANSI (cyrup degrades to [`PlainTheme`], and the surfaced entry
-//! is plain text), so [`visible_width`] is a straight display-column count — pi's `visibleWidth`
-//! strips ANSI first, which is a no-op on plain input.
+//! [`visible_width`]/[`truncate_to_width`] port pi's `visibleWidth`/`truncateToWidth`
+//! (`packages/tui/src/utils.ts`) width semantics exactly: ANSI/OSC/APC escape sequences are stripped
+//! before measuring (a no-op today since cyrup only ever wires the ANSI-free [`PlainTheme`], but load-
+//! bearing the moment a live/colored `Theme` is wired), tabs count 3 columns, and multi-codepoint
+//! grapheme clusters (ZWJ emoji sequences, skin-tone modifiers, variation selectors, regional-
+//! indicator flag pairs) are measured as one 2-column unit rather than summed per codepoint.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 pub mod compose;
 pub mod inline_message;
@@ -99,28 +102,189 @@ pub fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-/// Display-column width of `s` (pi `visibleWidth`, ANSI-free input).
+/// Whether `c` is a Unicode regional-indicator symbol (`U+1F1E6..=U+1F1FF`, the "flag" halves).
+/// Pi's `graphemeWidth` (`packages/tui/src/utils.ts:189-194`) forces these to 2 columns
+/// unconditionally — even a lone, unpaired half — "to avoid terminal auto-wrap drift artifacts"
+/// when a flag pair is split across a stream boundary.
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+/// Whether `c` is an emoji skin-tone modifier (`U+1F3FB..=U+1F3FF`), which attaches to a preceding
+/// emoji base and does not add its own column width (pi treats the whole modified-emoji grapheme
+/// cluster as one 2-column unit).
+fn is_skin_tone_modifier(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+/// Extract the length (in `chars`) of the ANSI/OSC/APC escape sequence starting at `chars[pos]`, or
+/// `None` if `chars[pos]` is not `ESC` or the sequence never terminates. A 1:1 port of pi's
+/// `extractAnsiCode` (`packages/tui/src/utils.ts:290-328`): CSI (`ESC [ ... ` up to the first of
+/// `m`/`G`/`K`/`H`/`J`), OSC (`ESC ] ...` up to `BEL` or `ESC \`), and APC (`ESC _ ...` up to `BEL` or
+/// `ESC \`) — same guards, same order, same "unterminated sequence is not consumed" fallback.
+fn extract_ansi_code_len(chars: &[char], pos: usize) -> Option<usize> {
+    if chars.get(pos) != Some(&'\x1b') {
+        return None;
+    }
+    match chars.get(pos + 1) {
+        Some('[') => {
+            let mut j = pos + 2;
+            while chars.get(j).is_some_and(|c| !matches!(c, 'm' | 'G' | 'K' | 'H' | 'J')) {
+                j += 1;
+            }
+            if j < chars.len() { Some(j + 1 - pos) } else { None }
+        }
+        Some(']') | Some('_') => {
+            let mut j = pos + 2;
+            while let Some(&c) = chars.get(j) {
+                if c == '\x07' {
+                    return Some(j + 1 - pos);
+                }
+                if c == '\x1b' && chars.get(j + 1) == Some(&'\\') {
+                    return Some(j + 2 - pos);
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Strip ANSI/OSC/APC escape sequences from `s` (pi `visibleWidth`'s escape-stripping pass,
+/// `packages/tui/src/utils.ts:237-253`). A no-op when `s` has no `ESC` byte (the only case cyrup's
+/// current ANSI-free [`PlainTheme`] ever produces), but load-bearing once a real ANSI-emitting
+/// `Theme` is wired.
+fn strip_ansi_sequences(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        if let Some(len) = extract_ansi_code_len(&chars, i) {
+            i += len;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Parse the single grapheme cluster starting at `chars[start]` (mirrors pi's
+/// `graphemeWidth`-over-`Intl.Segmenter` pass, `packages/tui/src/utils.ts:167-210, 257-258`, for the
+/// cases that matter without a full Unicode grapheme-break table): a tab is its own 3-column cluster;
+/// a regional-indicator half (optionally paired with a second half into a flag) is a 2-column
+/// cluster; and a base codepoint followed by a variation selector (`U+FE0F`), skin-tone modifier, or
+/// a `ZWJ`-joined continuation (family/couple emoji sequences) collapses into one 2-column cluster
+/// rather than summing each codepoint's own width. Returns the cluster text, its display width, and
+/// the index immediately following it. `start` must be `< chars.len()`; out-of-range yields an empty
+/// cluster of width 0 at `start`.
+fn next_grapheme_cluster(chars: &[char], start: usize) -> (String, usize, usize) {
+    let Some(&base) = chars.get(start) else {
+        return (String::new(), 0, start);
+    };
+    if base == '\t' {
+        return ("\t".to_string(), 3, start + 1);
+    }
+    let mut i = start + 1;
+    let mut forced_wide = is_regional_indicator(base);
+    if forced_wide && chars.get(i).is_some_and(|&next| is_regional_indicator(next)) {
+        i += 1; // Consume the flag's second half.
+    }
+    loop {
+        match chars.get(i) {
+            Some('\u{fe0f}') => {
+                forced_wide = true;
+                i += 1;
+            }
+            Some('\u{fe0e}') => {
+                // VS15 (explicit text presentation): attaches without forcing emoji width.
+                i += 1;
+            }
+            Some(c) if is_skin_tone_modifier(*c) => {
+                forced_wide = true;
+                i += 1;
+            }
+            Some('\u{200d}') => {
+                // ZWJ: joins the current cluster to whatever follows (family/couple emoji).
+                forced_wide = true;
+                i += 1;
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    let width = if forced_wide { 2 } else { char_width(base) };
+    let cluster = chars.get(start..i).map_or_else(String::new, |slice| slice.iter().collect());
+    (cluster, width, i)
+}
+
+/// Segment ANSI-free `text` into grapheme clusters paired with their display width — see
+/// [`next_grapheme_cluster`].
+fn grapheme_clusters(text: &str) -> Vec<(String, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (cluster, width, next_i) = next_grapheme_cluster(&chars, i);
+        out.push((cluster, width));
+        i = next_i;
+    }
+    out
+}
+
+/// Display-column width of `s` (pi `visibleWidth`). Strips ANSI/OSC/APC escapes before measuring and
+/// sums per grapheme cluster rather than per codepoint — see [`grapheme_clusters`].
 #[must_use]
 pub fn visible_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    let clean = strip_ansi_sequences(s);
+    grapheme_clusters(&clean).into_iter().map(|(_, w)| w).sum()
 }
 
 /// The longest prefix of `text` whose display width is `<= max_width` (pi `truncateToWidth(text,
-/// max_width, "")` — no ellipsis). Never splits below a char boundary.
+/// max_width, "")` — no ellipsis, `packages/tui/src/utils.ts:915-1051`). Never splits a grapheme
+/// cluster (never splits a flag/ZWJ/skin-tone emoji sequence in half, matching pi's
+/// segment-then-measure truncation loop). ANSI/OSC/APC escape codes never count toward width, but —
+/// matching pi's `pendingAnsi` accumulate-then-flush exactly — they are NOT stripped from the kept
+/// output: a code is buffered and only emitted once immediately followed by a grapheme cluster that
+/// still fits; codes preceding the first cluster that overflows are dropped along with it.
 #[must_use]
 pub fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     if visible_width(text) <= max_width {
         return text.to_string();
     }
+    let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
-    let mut width = 0usize;
-    for c in text.chars() {
-        let cw = char_width(c);
-        if width + cw > max_width {
+    let mut pending_ansi = String::new();
+    let mut kept_width = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if let Some(len) = extract_ansi_code_len(&chars, i) {
+            if let Some(code) = chars.get(i..i + len) {
+                pending_ansi.extend(code);
+            }
+            i += len;
+            continue;
+        }
+        let (cluster, cw, next_i) = next_grapheme_cluster(&chars, i);
+        if kept_width + cw > max_width {
             break;
         }
-        out.push(c);
-        width += cw;
+        if !pending_ansi.is_empty() {
+            out.push_str(&pending_ansi);
+            pending_ansi.clear();
+        }
+        out.push_str(&cluster);
+        kept_width += cw;
+        i = next_i;
     }
     out
 }
@@ -252,6 +416,39 @@ mod tests {
         let out = middle_truncate("/Users/envvar/.config/ghostty", 15);
         assert!(visible_width(&out) <= 15);
         assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn visible_width_strips_ansi_escapes() {
+        // pi's `visibleWidth` strips SGR/CSI codes before measuring (utils.ts:237-253); a naive
+        // `UnicodeWidthStr::width` over the raw string would count the escape bytes and report 9
+        // instead of 3. This is a regression proof for the moment cyrup wires a real ANSI-emitting
+        // `Theme` (today's `PlainTheme` never emits these, so this exercises the escape path directly).
+        let colored = "\x1b[1;31mfoo\x1b[0m";
+        assert_eq!(visible_width(colored), 3);
+        assert_eq!(truncate_to_width(colored, 2), "\x1b[1;31mfo");
+    }
+
+    #[test]
+    fn visible_width_collapses_zwj_emoji_sequence_to_one_cluster() {
+        // A ZWJ family emoji (man + ZWJ + woman + ZWJ + girl) is ONE grapheme cluster in pi's
+        // `Intl.Segmenter`-based `visibleWidth`, measured as 2 columns total (graphemeWidth's RGI
+        // emoji check, utils.ts:178). Summing each codepoint's own `unicode_width` (2+0+2+0+2)
+        // instead gives 6 — the pre-fix behavior this test would fail against.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(visible_width(family), 2);
+        // Truncating to width 1 must drop the whole cluster, never split it mid-sequence.
+        assert_eq!(truncate_to_width(family, 1), "");
+        assert_eq!(truncate_to_width(family, 2), family);
+    }
+
+    #[test]
+    fn visible_width_forces_two_columns_for_isolated_regional_indicator() {
+        // pi forces a lone (unpaired) regional-indicator half to 2 columns unconditionally
+        // (utils.ts:189-194, "even when isolated during streaming"). This crate's `unicode-width`
+        // dependency happens to assign width 1 to a standalone RI codepoint, so without the explicit
+        // pi guard this would measure 1, not 2.
+        assert_eq!(visible_width("\u{1F1FA}"), 2);
     }
 
     #[test]

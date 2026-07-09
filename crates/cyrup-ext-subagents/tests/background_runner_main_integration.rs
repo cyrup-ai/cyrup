@@ -230,7 +230,10 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
 
@@ -319,7 +322,10 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = orchestrator_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config)
         .await
@@ -448,7 +454,10 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
@@ -552,7 +561,10 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
 
@@ -657,7 +669,10 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -769,7 +784,10 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -898,7 +916,10 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
@@ -1010,7 +1031,10 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
 
@@ -1108,7 +1132,10 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    };
+    nested_route: None,
+    nested_self: None,
+    dynamic_fanout_max_items: None,
+};
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
 

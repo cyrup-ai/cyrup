@@ -5,6 +5,13 @@
 //! fire-and-forget. The reader ([`FrameReader`]) reassembles across arbitrary chunk boundaries,
 //! rejects an over-cap length as a hard error (drop the connection), and yields every complete
 //! frame available in one chunk (`framing.ts:49-86`).
+//!
+//! pi's `createMessageReader` (`framing.ts:49-86`) calls `onMessage` synchronously, in a loop,
+//! for every complete frame it finds — including any frames found *before* it later discovers an
+//! over-cap length later in the same `data` chunk (`framing.ts:62-67,80-84`). [`FrameReader::push`]
+//! mirrors that: even on the `Err` path, [`FrameReadError::frames`] carries every frame that was
+//! fully reassembled earlier in the same call, so the caller can dispatch them before tearing down
+//! the connection, exactly as pi already fired `onMessage` for them before `onError`.
 
 use bytes::{Buf, BytesMut};
 
@@ -39,15 +46,49 @@ pub struct FrameReader {
     buffer: BytesMut,
 }
 
-/// The single fatal framing error: a declared payload length exceeding [`MAX_FRAME_BYTES`]
-/// (`framing.ts:63-66`).
+/// The framing-layer error cases pi's `reportMessage`/`createMessageReader` can report via
+/// `onError` (`framing.ts:29-47,63-66`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("intercom frame length {length} exceeds maximum {max} bytes")]
-pub struct FrameError {
-    /// The declared (rejected) length.
-    pub length: usize,
-    /// The cap that was exceeded.
-    pub max: usize,
+pub enum FrameError {
+    /// A declared payload length exceeds [`MAX_FRAME_BYTES`] (`framing.ts:63-66`).
+    #[error("Intercom frame length {length} exceeds maximum {max} bytes")]
+    Oversize {
+        /// The declared (rejected) length.
+        length: usize,
+        /// The cap that was exceeded.
+        max: usize,
+    },
+    /// A frame's JSON payload failed to parse (`reportMessage`'s `JSON.parse` catch,
+    /// `framing.ts:29-37`). Callers should construct this from the decode error's message when
+    /// wiring up their own JSON-decode step, matching pi's `Failed to parse intercom message: `
+    /// wording exactly.
+    #[error("Failed to parse intercom message: {message}")]
+    Parse {
+        /// The underlying parse error's message.
+        message: String,
+    },
+    /// The message handler itself failed while processing an otherwise well-formed frame
+    /// (`reportMessage`'s `onMessage` catch, `framing.ts:39-46`). Callers should construct this
+    /// from the handler error's message, matching pi's `Failed to handle intercom message: `
+    /// wording exactly.
+    #[error("Failed to handle intercom message: {message}")]
+    Handler {
+        /// The underlying handler error's message.
+        message: String,
+    },
+}
+
+/// A fatal [`FrameReader::push`] failure, paired with every frame that was already fully
+/// reassembled earlier in the *same* `push` call (`framing.ts:52-84` — pi delivers those to
+/// `onMessage` synchronously, before it ever detects the later oversize length). Callers MUST
+/// dispatch [`Self::frames`] before acting on [`Self::error`] and tearing down the connection.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{error}")]
+pub struct FrameReadError {
+    /// Frames fully reassembled before the fatal error was encountered; still deliverable.
+    pub frames: Vec<Vec<u8>>,
+    /// The fatal framing error itself.
+    pub error: FrameError,
 }
 
 impl FrameReader {
@@ -59,8 +100,11 @@ impl FrameReader {
 
     /// Feed one raw chunk; return every complete payload now available (`framing.ts:49-86`). A
     /// partial header/payload is retained for the next call. An over-cap length is returned as an
-    /// `Err` after clearing the buffer, exactly as pi resets `buffer` then reports the error.
-    pub fn push(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
+    /// `Err` after clearing the buffer, exactly as pi resets `buffer` then reports the error —
+    /// but any frames already reassembled earlier in this same call are carried on
+    /// [`FrameReadError::frames`] rather than discarded, matching pi's synchronous
+    /// deliver-then-error ordering (`framing.ts:52-84`).
+    pub fn push(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, FrameReadError> {
         self.buffer.extend_from_slice(data);
         let mut out = Vec::new();
         loop {
@@ -73,7 +117,10 @@ impl FrameReader {
             let length = u32::from_be_bytes(*header) as usize;
             if length > MAX_FRAME_BYTES {
                 self.buffer.clear();
-                return Err(FrameError { length, max: MAX_FRAME_BYTES });
+                return Err(FrameReadError {
+                    frames: out,
+                    error: FrameError::Oversize { length, max: MAX_FRAME_BYTES },
+                });
             }
             if self.buffer.len() < 4 + length {
                 return Ok(out);
@@ -132,8 +179,55 @@ mod tests {
         oversize.extend_from_slice(&bad_len.to_be_bytes());
         let mut reader = FrameReader::new();
         let err = reader.push(&oversize).expect_err("must reject over-cap length");
-        assert_eq!(err.length, MAX_FRAME_BYTES + 1);
-        assert_eq!(err.max, MAX_FRAME_BYTES);
+        assert!(err.frames.is_empty(), "no frames were reassembled before the oversize header");
+        assert_eq!(
+            err.error,
+            FrameError::Oversize { length: MAX_FRAME_BYTES + 1, max: MAX_FRAME_BYTES }
+        );
+    }
+
+    // framing.ts:52-84 — pi's reader delivers every complete frame found earlier in the same
+    // `data` chunk to `onMessage` synchronously, in order, and only *afterward* discovers and
+    // reports a later oversize frame. Regression proof: against the pre-fix cyrup behavior (which
+    // collected reassembled frames into a local `out` and discarded it entirely by returning a
+    // bare `Err` on the oversize branch) this test would fail because `err.frames` would be empty
+    // instead of containing the two good frames.
+    #[test]
+    fn preserves_already_reassembled_frames_when_a_later_frame_in_the_same_chunk_is_oversize() {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&frame(b"first"));
+        chunk.extend_from_slice(&frame(b"second"));
+        // A third, bogus frame header declaring an over-cap length, appended in the SAME push().
+        let bad_len = (MAX_FRAME_BYTES as u32) + 1;
+        chunk.extend_from_slice(&bad_len.to_be_bytes());
+
+        let mut reader = FrameReader::new();
+        let err = reader.push(&chunk).expect_err("must reject the oversize third frame");
+
+        // The two frames reassembled before the oversize header must NOT be discarded.
+        assert_eq!(err.frames, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(
+            err.error,
+            FrameError::Oversize { length: MAX_FRAME_BYTES + 1, max: MAX_FRAME_BYTES }
+        );
+    }
+
+    // framing.ts:29-47 — reportMessage wraps a JSON.parse failure as
+    // "Failed to parse intercom message: {message}" and a handler failure as
+    // "Failed to handle intercom message: {message}". FrameReader::push itself only reassembles
+    // bytes (JSON decoding/dispatch happens in the transport-layer callers), but the descriptive
+    // error text those callers must produce is defined once here so the wording stays byte-for-
+    // byte faithful to pi wherever it's used.
+    #[test]
+    fn parse_and_handler_error_messages_match_pi_wording_exactly() {
+        let parse_err = FrameError::Parse { message: "Unexpected token o in JSON".to_string() };
+        assert_eq!(
+            parse_err.to_string(),
+            "Failed to parse intercom message: Unexpected token o in JSON"
+        );
+
+        let handler_err = FrameError::Handler { message: "boom".to_string() };
+        assert_eq!(handler_err.to_string(), "Failed to handle intercom message: boom");
     }
 
     #[test]

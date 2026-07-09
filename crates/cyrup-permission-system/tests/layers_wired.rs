@@ -85,6 +85,7 @@ async fn agent_scoped_rule_enforces_for_named_agent_only() {
     // Named persona `coder`: the agent-layer deny ENFORCES.
     let coder = ext_with_global(agent_dir, r#"{ "bash": { "*": "allow" } }"#)
         .with_agent_name(Some("coder".to_string()));
+    coder.set_host_services(Arc::new(RegistryServices { names: vec!["bash".into()] }));
     init(&coder).await;
     let coder_out = coder.on_event(&ev, &ctx(cwd.clone())).await;
     assert!(
@@ -96,6 +97,7 @@ async fn agent_scoped_rule_enforces_for_named_agent_only() {
     // A DIFFERENT persona `writer` (no `writer.md`): the agent layer is empty → global allow wins.
     let writer = ext_with_global(agent_dir, r#"{ "bash": { "*": "allow" } }"#)
         .with_agent_name(Some("writer".to_string()));
+    writer.set_host_services(Arc::new(RegistryServices { names: vec!["bash".into()] }));
     init(&writer).await;
     let writer_out = writer.on_event(&ev, &ctx(cwd)).await;
     assert!(
@@ -147,6 +149,7 @@ async fn allowed_skill_read_bypasses_read_tool_deny() {
         agent_dir,
         r#"{ "tools": { "read": "deny" }, "skills": { "deploy": "allow" } }"#,
     );
+    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read".into()] }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
     let cwd_str = cwd.to_string_lossy().into_owned();
@@ -192,6 +195,7 @@ async fn read_outside_working_directory_is_guarded() {
     let agent_dir = cwd_dir.path();
     // `read` is allowed generally, but external-directory access is denied.
     let ext = ext_with_global(agent_dir, r#"{ "read": "allow", "external_directory": "deny" }"#);
+    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read".into()] }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
 
@@ -223,6 +227,7 @@ async fn non_builtin_filesystem_tool_outside_working_directory_is_guarded() {
     let outside_dir = tempfile::tempdir().unwrap();
     let agent_dir = cwd_dir.path();
     let ext = ext_with_global(agent_dir, r#"{ "read_file": "allow", "external_directory": "deny" }"#);
+    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read_file".into()] }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
 

@@ -34,6 +34,23 @@ use cyrup_ext::{
 use cyrup_permission_system::{permission_extension_for_env, spawn_forwarding_watcher, ExtensionConfig};
 use serde_json::Value;
 
+/// A scripted [`HostServices`] whose ONLY override is [`HostServices::all_tool_names`] — the full
+/// registry the registry / unknown-tool gate checks against (pi `pi.getAllTools()`). Mirrors the
+/// identical helper in `tests/layers_wired.rs` / `src/extension.rs`'s own unit tests: the REAL
+/// `AgentSession::build` (`cyrup-session-svc/src/builder.rs`) calls
+/// `NativeExtension::set_host_services` on every native extension (via `load_native_with_services`)
+/// BEFORE `init`/`on_event` ever run — for every role, including a re-exec'd subagent child. Without
+/// this, `decide()`'s registry gate (`registered_tool_names()` -> `None` -> empty registry) blocks
+/// EVERY tool as "unregistered" before the ask-forwarding logic is ever reached.
+struct ChildRegistryServices {
+    names: Vec<String>,
+}
+impl HostServices for ChildRegistryServices {
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        Some(self.names.clone())
+    }
+}
+
 // ---- env contract between the parent test and the re-exec'd child role ----
 const CHILD_ROLE_ENV: &str = "PERM_FWD_CHILD_ROLE";
 const CHILD_AGENT_DIR_ENV: &str = "PERM_FWD_AGENT_DIR";
@@ -84,6 +101,12 @@ fn forwarding_child_role_entry() {
         if ext.init(&mut api).await.is_err() {
             return EXIT_UNEXPECTED;
         }
+        // Production parity: `AgentSession::build` (`cyrup-session-svc/src/builder.rs`,
+        // `load_native_with_services`) calls `set_host_services` on every native extension BEFORE
+        // any event reaches it — for every role, including this re-exec'd subagent child. Without
+        // this the registry gate treats "bash" as unregistered and blocks it immediately, before the
+        // ask-forwarding logic under test ever runs.
+        ext.set_host_services(Arc::new(ChildRegistryServices { names: vec!["bash".to_string()] }));
         // A headless child ctx (has_ui=false) — the exact shape a re-exec'd subagent runs under.
         let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.clone());
         let event = HostEvent::ToolCall {

@@ -143,6 +143,17 @@ impl BrokerState {
     /// (`armRegistrationTimeout` → `evictOldestUnregisteredConnections`, `broker.ts:189-268`).
     fn add_connection(&mut self, conn_id: u64, close: Arc<Notify>) {
         self.connections.insert(conn_id, ConnHandle { close });
+        self.mark_unregistered(conn_id);
+    }
+
+    /// Insert (or move to newest) `conn_id` into the unregistered set and evict the oldest
+    /// unregistered connections past the cap. Mirrors pi's `armRegistrationTimeout` — which does
+    /// `this.unregisteredConnections.delete(socket); .add(socket); this.evictOldestUnregisteredConnections(socket)`
+    /// (`broker.ts:193-195`) — and which pi runs on **every** transition into the unregistered
+    /// state: both a fresh connection (`broker.ts:210`) and an explicit `unregister`
+    /// (`setId(null)` → `armRegistrationTimeout`, `broker.ts:223-230,399`).
+    fn mark_unregistered(&mut self, conn_id: u64) {
+        self.unregistered.retain(|&c| c != conn_id);
         self.unregistered.push(conn_id);
         while self.unregistered.len() > MAX_UNREGISTERED_CONNECTIONS {
             // Oldest is at the front; never evict the just-added current if it is the only one.
@@ -346,8 +357,10 @@ impl BrokerState {
         }
         *session_id = None;
         // Re-arm the registration timeout for the now-unregistered-but-open socket (broker.ts:228):
-        // the reader re-arms its 1 s deadline; track the connection as unregistered again.
-        self.unregistered.push(conn_id);
+        // the reader re-arms its 1 s deadline; track the connection as unregistered again and run
+        // the same oldest-eviction pass pi's `armRegistrationTimeout` runs on this transition
+        // (`broker.ts:189-195,223-230,399`).
+        self.mark_unregistered(conn_id);
         FrameResult { outcome: FrameOutcome::Continue, schedule_shutdown: schedule, rearmed_registration: true }
     }
 
@@ -597,6 +610,58 @@ async fn writer_task(mut write_half: OwnedWriteHalf, mut rx: mpsc::UnboundedRece
     let _ = write_half.shutdown().await;
 }
 
+/// The outcome of [`process_frame_payload`]: whether the connection should keep reading, and
+/// whether the registration timeout must be re-armed (`was_registered && session_id.is_none()` on a
+/// frame `handle_frame` flagged `rearmed_registration` for — an `unregister`, `broker.ts:223-230`).
+struct PayloadOutcome {
+    keep_going: bool,
+    rearm_registration: bool,
+}
+
+/// Process one fully-reassembled frame payload: rate-limit, JSON-decode, dispatch to
+/// [`BrokerState::handle_frame`], and apply its result — pi's per-message `onMessage` callback
+/// (`framing.ts:29-47`, `broker.ts:217-230`). `keep_going = false` means tear the connection down,
+/// mirroring `onError`'s `socket.destroy(error)` / a fatal [`FrameOutcome`].
+fn process_frame_payload(
+    payload: &[u8],
+    conn_id: u64,
+    self_tx: &UnboundedSender<Vec<u8>>,
+    state: &Arc<Mutex<BrokerState>>,
+    bucket: &mut TokenBucket,
+    session_id: &mut Option<String>,
+) -> PayloadOutcome {
+    // Rate limit BEFORE handling (broker.ts:218-222).
+    if !bucket.consume(now_ms()) {
+        send_msg(self_tx, &BrokerMessage::Error {
+            error: "Intercom broker rate limit exceeded".to_string(),
+        });
+        return PayloadOutcome { keep_going: false, rearm_registration: false };
+    }
+    let value: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            // `reportMessage`'s `JSON.parse` catch (`framing.ts:29-37`): a descriptive diagnostic,
+            // then destroy the connection (`onError` -> `socket.destroy(error)`, `broker.ts:231-233`).
+            tracing::warn!(
+                error = %crate::transport::framing::FrameError::Parse { message: e.to_string() },
+                "intercom broker: dropping connection"
+            );
+            return PayloadOutcome { keep_going: false, rearm_registration: false };
+        }
+    };
+    let was_registered = session_id.is_some();
+    let now = now_ms();
+    let result = {
+        let mut g = lock(state);
+        g.handle_frame(conn_id, self_tx, &value, session_id, now)
+    };
+    if result.schedule_shutdown {
+        schedule_shutdown_check(state);
+    }
+    let rearm = result.rearmed_registration && was_registered && session_id.is_none();
+    PayloadOutcome { keep_going: matches!(result.outcome, FrameOutcome::Continue), rearm_registration: rearm }
+}
+
 /// The per-connection reader task: read chunks, reassemble frames, rate-limit, and dispatch each to
 /// [`BrokerState::handle_frame`], honoring the 1 s registration timeout.
 async fn reader_task(
@@ -630,37 +695,35 @@ async fn reader_task(
                 let chunk = buf.get(..n).unwrap_or(&[]);
                 let frames = match reader.push(chunk) {
                     Ok(frames) => frames,
-                    Err(_) => break, // oversize → drop the connection (framing.ts:63-66)
+                    Err(e) => {
+                        // pi's reader delivers every frame reassembled earlier in this SAME chunk to
+                        // `onMessage` synchronously, in order, and only afterward discovers/reports the
+                        // oversize length (`framing.ts:52-84`) — dispatch `e.frames` before tearing the
+                        // connection down, rather than discarding them.
+                        for payload in &e.frames {
+                            let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_id);
+                            if outcome.rearm_registration {
+                                reg_deadline
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + Duration::from_millis(REGISTRATION_TIMEOUT_MS));
+                            }
+                            if !outcome.keep_going {
+                                break;
+                            }
+                        }
+                        tracing::warn!(error = %e.error, "intercom broker: dropping connection");
+                        break; // oversize → drop the connection (framing.ts:63-66)
+                    }
                 };
-                for payload in frames {
-                    // Rate limit BEFORE handling (broker.ts:218-222).
-                    if !bucket.consume(now_ms()) {
-                        send_msg(&self_tx, &BrokerMessage::Error {
-                            error: "Intercom broker rate limit exceeded".to_string(),
-                        });
-                        break 'outer;
-                    }
-                    let value: serde_json::Value = match serde_json::from_slice(&payload) {
-                        Ok(v) => v,
-                        Err(_) => break 'outer, // parse failure → destroy (framing.ts:33-36)
-                    };
-                    let was_registered = session_id.is_some();
-                    let now = now_ms();
-                    let result = {
-                        let mut g = lock(&state);
-                        g.handle_frame(conn_id, &self_tx, &value, &mut session_id, now)
-                    };
-                    if result.schedule_shutdown {
-                        schedule_shutdown_check(&state);
-                    }
-                    if result.rearmed_registration && was_registered && session_id.is_none() {
+                for payload in &frames {
+                    let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_id);
+                    if outcome.rearm_registration {
                         reg_deadline
                             .as_mut()
                             .reset(tokio::time::Instant::now() + Duration::from_millis(REGISTRATION_TIMEOUT_MS));
                     }
-                    match result.outcome {
-                        FrameOutcome::Continue => {}
-                        FrameOutcome::CloseSelf | FrameOutcome::ProtocolError => break 'outer,
+                    if !outcome.keep_going {
+                        break 'outer;
                     }
                 }
             }
@@ -719,6 +782,15 @@ fn shutdown_broker(state: &Arc<Mutex<BrokerState>>, socket_path: &std::path::Pat
 /// # Errors
 /// Returns an I/O error if the intercom dir cannot be created or the socket cannot be bound.
 pub async fn run() -> std::io::Result<()> {
+    // `ask_timeout_ms` hard-errors on an invalid env value, matching pi's uncaught throw
+    // (`config.ts:14-16`) that crashes `new IntercomBroker()` — a class-field initializer that runs
+    // INSIDE the constructor, i.e. before `.start()` ever binds the listener or writes any file
+    // (`broker.ts:139`). Resolved here FIRST, before any startup side effect (dir/socket/pid), so an
+    // invalid env value fails the whole process before anything is created — never a socket/pid file
+    // left behind for an external caller to observe as a falsely "started" broker.
+    let ask_timeout = config::ask_timeout_ms()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
     let agent_dir = paths::agent_dir_path();
     let intercom_dir = paths::intercom_dir_path(&agent_dir);
     paths::ensure_intercom_runtime_dir(&intercom_dir)?;
@@ -728,12 +800,11 @@ pub async fn run() -> std::io::Result<()> {
     // Unlink a stale socket left by a crashed broker (broker.ts:143-148).
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
-    paths::restrict_intercom_runtime_file(&socket_path);
+    let _ = paths::restrict_intercom_runtime_file(&socket_path);
     std::fs::write(&pid_path, std::process::id().to_string())?;
-    paths::restrict_intercom_runtime_file(&pid_path);
+    let _ = paths::restrict_intercom_runtime_file(&pid_path);
     tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "intercom broker started");
 
-    let ask_timeout = config::ask_timeout_ms();
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(Mutex::new(BrokerState::new(ask_timeout, shutdown.clone())));
     let mut next_conn_id: u64 = 0;
@@ -763,4 +834,131 @@ pub async fn run() -> std::io::Result<()> {
     tracing::info!("intercom broker shutting down");
     shutdown_broker(&state, &socket_path, &pid_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use serde_json::json;
+
+    fn make_state() -> BrokerState {
+        BrokerState::new(30_000, Arc::new(Notify::new()))
+    }
+
+    fn make_tx() -> UnboundedSender<Vec<u8>> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tx
+    }
+
+    fn register(state: &mut BrokerState, conn_id: u64, session_id: &mut Option<String>, id: &str) {
+        let tx = make_tx();
+        let value = json!({
+            "type": "register",
+            "sessionId": id,
+            "session": {
+                "cwd": "/tmp",
+                "model": "test-model",
+                "pid": 1,
+                "startedAt": 0,
+                "lastActivity": 0,
+            }
+        });
+        let result = state.handle_register(conn_id, &tx, &value, session_id, 0);
+        assert!(matches!(result.outcome, FrameOutcome::Continue));
+    }
+
+    /// Regression test: pi's `armRegistrationTimeout` re-runs `evictOldestUnregisteredConnections`
+    /// on **every** transition into the unregistered state — both a brand-new connection
+    /// (`broker.ts:210`) and an explicit `unregister` (`setId(null)` → `armRegistrationTimeout`,
+    /// `broker.ts:223-230,399`). Before the fix, `handle_unregister` pushed the connection id onto
+    /// `self.unregistered` with no eviction call, so churn of register/unregister on already-live
+    /// connections could grow the unregistered set past `MAX_UNREGISTERED_CONNECTIONS` and it would
+    /// stay oversized until a brand-new connection happened to arrive and trigger `add_connection`'s
+    /// eviction. This test fails against that pre-fix behavior (final len would be 42, not 32).
+    #[test]
+    fn handle_unregister_evicts_oldest_unregistered_past_cap() {
+        let mut state = make_state();
+
+        // Fill the unregistered set to exactly the cap.
+        for conn_id in 0..MAX_UNREGISTERED_CONNECTIONS as u64 {
+            state.add_connection(conn_id, Arc::new(Notify::new()));
+        }
+        assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS);
+
+        // Register 10 of those connections, removing them from the unregistered set.
+        let mut session_ids: Vec<Option<String>> = Vec::new();
+        for conn_id in 0..10u64 {
+            let mut sid = None;
+            register(&mut state, conn_id, &mut sid, &format!("session-{conn_id}"));
+            session_ids.push(sid);
+        }
+        assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS - 10);
+
+        // 10 brand-new connections arrive, filling the unregistered set back up to the cap (no
+        // eviction needed yet: 22 + 10 == 32).
+        for conn_id in 100..110u64 {
+            state.add_connection(conn_id, Arc::new(Notify::new()));
+        }
+        assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS);
+
+        // Now the 10 registered sessions unregister. Each must re-arm + evict, exactly like pi's
+        // `armRegistrationTimeout`; the unregistered set must never exceed the cap.
+        for (conn_id, sid) in session_ids.iter_mut().enumerate() {
+            let tx = make_tx();
+            let result = state.handle_unregister(conn_id as u64, &tx, sid);
+            assert!(matches!(result.outcome, FrameOutcome::Continue));
+            assert!(
+                state.unregistered.len() <= MAX_UNREGISTERED_CONNECTIONS,
+                "unregistered set exceeded the cap after unregister #{conn_id}: {}",
+                state.unregistered.len()
+            );
+        }
+        assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS);
+    }
+
+    /// Regression test for the framing.rs dossier item ("frames already reassembled before an
+    /// oversize frame in the same `push()` call are discarded"): pi's reader delivers every complete
+    /// frame found earlier in the same `data` chunk to `onMessage` synchronously, in order, BEFORE it
+    /// discovers a later oversize length (`framing.ts:52-84`). Before this fix, `reader_task`'s
+    /// `Err(_) => break` on `reader.push` discarded `FrameReadError::frames` entirely — a `register`
+    /// frame reassembled earlier in the very same chunk as a trailing oversize header would never
+    /// reach `handle_frame`, silently dropping a connection's registration. This test fails against
+    /// that pre-fix behavior: `session_id` would stay `None` instead of becoming `Some("s1")`.
+    #[test]
+    fn oversize_chunk_still_dispatches_frames_reassembled_earlier_in_the_same_chunk() {
+        let state: Arc<Mutex<BrokerState>> = Arc::new(Mutex::new(make_state()));
+        let mut session_id: Option<String> = None;
+        let mut bucket = TokenBucket::new(now_ms());
+        let self_tx = make_tx();
+
+        let register_payload = json!({
+            "type": "register",
+            "sessionId": "s1",
+            "session": {"cwd": "/tmp", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0}
+        });
+        let register_bytes = serde_json::to_vec(&register_payload).unwrap();
+        let mut chunk = crate::transport::framing::encode_frame(&register_bytes);
+        // Append a bogus trailing frame header declaring an over-cap length, in the SAME chunk.
+        let bad_len = (crate::transport::framing::MAX_FRAME_BYTES as u32) + 1;
+        chunk.extend_from_slice(&bad_len.to_be_bytes());
+
+        let mut reader = FrameReader::new();
+        let err = reader.push(&chunk).expect_err("oversize declared length must error");
+        assert_eq!(
+            err.frames.len(),
+            1,
+            "the register frame reassembled before the oversize header must be preserved, not discarded"
+        );
+
+        for payload in &err.frames {
+            let outcome = process_frame_payload(payload, 1, &self_tx, &state, &mut bucket, &mut session_id);
+            assert!(outcome.keep_going, "a valid register frame must not itself trip a teardown");
+        }
+        assert_eq!(
+            session_id.as_deref(),
+            Some("s1"),
+            "the preserved register frame must actually be dispatched to handle_frame, not discarded"
+        );
+    }
 }

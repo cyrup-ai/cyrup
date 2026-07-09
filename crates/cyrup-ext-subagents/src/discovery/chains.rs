@@ -1140,7 +1140,7 @@ fn is_safe_output_name(name: &str) -> bool {
 /// delegated to [`crate::spawn::dynamic_fanout::assert_no_unresolved_item_references`] (C16) so a
 /// malformed item reference is rejected at chain-parse time, exactly as pi's
 /// `validateChainOutputBindings` does.
-fn validate_dynamic_step_shape(
+pub(crate) fn validate_dynamic_step_shape(
     step: &Value,
     display: usize,
     config_max_items: u64,

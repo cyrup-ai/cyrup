@@ -35,6 +35,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     use cyrup_ext_subagents::background::RunId;
+    use cyrup_ext_subagents::tui::intercom::SubagentResultStatus;
 
     #[test]
     fn formats_allowlisted_fields_only() {
@@ -44,6 +45,9 @@ mod tests {
             success: true,
             outputs: vec!["found the answer".to_string()],
             total_tokens: 1234,
+            status: SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![SubagentResultStatus::Completed],
         };
         let text = format_result_relay(&payload);
         assert!(text.contains("run00000000000001"));
@@ -61,6 +65,9 @@ mod tests {
             success: false,
             outputs: vec![],
             total_tokens: 0,
+            status: SubagentResultStatus::Failed,
+            summary: "1 failed".to_string(),
+            child_statuses: vec![SubagentResultStatus::Failed],
         };
         assert!(format_result_relay(&payload).contains("failed"));
     }

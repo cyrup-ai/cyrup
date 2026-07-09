@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use cyrup_core::{ToolUpdate, ToolUpdateSink};
+use cyrup_core::{CancelToken, ToolUpdate, ToolUpdateSink};
 use cyrup_ext_subagents::background::RunMode;
 use cyrup_ext_subagents::extension::{ForegroundRunRequest, SubagentExecutor};
 use cyrup_ext_subagents::tui::events::{LiveProgressStatus, SubagentUpdatePayload};
@@ -126,6 +126,7 @@ async fn foreground_run_streams_live_progress_through_on_update() {
                 context: None,
                 model_override: None,
                 timeout_ms: None,
+                cancel: CancelToken::new(),
             },
             on_update,
         ),
@@ -201,5 +202,103 @@ async fn foreground_run_streams_live_progress_through_on_update() {
             p.progress.iter().any(|pr| pr.status == LiveProgressStatus::Complete) && !p.results.is_empty()
         }),
         "a terminal settle update must carry status=complete + the settled result: {payloads:?}"
+    );
+}
+
+/// Regression proof for the pi-parity fix threading [`ForegroundRunRequest::cancel`] into
+/// [`cyrup_ext_subagents::exec::RunOptions::cancel`] (pi `execute(id, params, signal, ...)`,
+/// `extension/index.ts:498-500` -> `executeSubagentCollapsed:378-381` -> `executor.execute`):
+/// aborting the host tool call must drive the running child through the REAL cancellation race
+/// (`drive_attempt`'s `cancel.cancelled()` arm), not be silently dropped in favor of a fresh,
+/// never-cancelled token.
+///
+/// Before the fix, `run_foreground_impl` minted `cancel: CancelToken::new()` itself and had no
+/// field on [`ForegroundRunRequest`] to receive a caller-supplied token at all — an ALREADY
+/// CANCELLED token passed in here would have been silently ignored and the fixture's scripted
+/// 10-second sleep would run to completion, so this test's wall-clock assertion below would fail
+/// (or the 15s outer timeout would trip) against the pre-fix code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_run_honors_an_already_cancelled_host_token() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+
+    let agents_dir = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+    std::fs::write(
+        agents_dir.join("canceltest.md"),
+        "---\nname: canceltest\ndescription: fixture cancellation persona\nmodel: fixture-model\n\
+         systemPromptMode: replace\ntools: read\n---\nYou are a fixture agent.\n",
+    )
+    .expect("write persona");
+
+    // A script that sleeps far longer than any sane cancellation reaction time before ever
+    // emitting `agent_end` — if the host cancel token is honored, the run settles in well under a
+    // second; if it is dropped (pre-fix), the run instead blocks for the full 10 seconds.
+    let script = serde_json::json!({
+        "steps": [
+            { "kind": "emit", "line": "{\"type\":\"agent_start\"}" },
+            { "kind": "sleep_ms", "ms": 10_000 },
+            { "kind": "emit", "line": "{\"type\":\"agent_end\"}" },
+        ],
+        "exit_code": 0
+    });
+    let script_path = dir.path().join("script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write script");
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's `ENV_MUTATION_LOCK` doc.
+    unsafe {
+        std::env::set_var("CYRUP_SUBAGENT_BINARY", &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+        std::env::set_var("CYRUP_HOME", home.path());
+    }
+
+    let on_update: ToolUpdateSink = Box::new(|_u: ToolUpdate| {});
+
+    // The host's own cancellation token, ALREADY cancelled before the run even starts — modeling a
+    // turn-abort that raced ahead of the tool call reaching the executor.
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    let executor = SubagentExecutor::new();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        executor.run_foreground_streaming(
+            ForegroundRunRequest {
+                cwd: dir.path(),
+                agent_name: "canceltest",
+                task: "Research the topic",
+                context: None,
+                model_override: None,
+                timeout_ms: None,
+                cancel,
+            },
+            on_update,
+        ),
+    )
+    .await
+    .expect("an honored cancel must settle the run long before the 15s outer timeout")
+    .expect("a cancelled run still resolves to a terminal SingleResult, not an Err");
+    let elapsed = started.elapsed();
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var("CYRUP_SUBAGENT_BINARY");
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+        std::env::remove_var("CYRUP_HOME");
+    }
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "an already-cancelled host token must abort the child almost immediately, well before \
+         the fixture's scripted 10s sleep would otherwise elapse; took {elapsed:?} instead \
+         (result: {result:?})"
+    );
+    assert_ne!(
+        result.exit_code, 0,
+        "a cancelled run must NOT report the fixture's scripted clean exit_code=0, since the \
+         child was terminated mid-sleep rather than allowed to run its `agent_end` step: {result:?}"
     );
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_ext_subagents::background::RunId;
-use cyrup_ext_subagents::tui::intercom::{DeliveryChannel, IntercomPayload};
+use cyrup_ext_subagents::tui::intercom::{DeliveryChannel, IntercomPayload, SubagentResultStatus};
 use cyrup_intercom::config::IntercomConfig;
 use cyrup_intercom::seams::IntercomDeliveryChannel;
 use cyrup_intercom::session_state::SharedIntercomState;
@@ -183,6 +183,9 @@ async fn delivery_channel_relays_a_grouped_result_to_the_supervisor_over_the_bro
         success: true,
         outputs: vec!["the grouped result output".to_string()],
         total_tokens: 4242,
+        status: SubagentResultStatus::Completed,
+        summary: "1 completed".to_string(),
+        child_statuses: vec![SubagentResultStatus::Completed],
     };
     let delivered = delivery.send(payload).await.expect("delivery returns a verdict");
     assert!(delivered, "the delivery channel relayed the result to the supervisor over the broker");

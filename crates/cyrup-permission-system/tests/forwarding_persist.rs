@@ -17,11 +17,23 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, NativeExtension};
+use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, NativeExtension};
 use cyrup_permission_system::{
     AskChannel, AskOutcome, ExtensionConfig, ManagerPaths, PermissionDecisionState,
     PermissionPromptDecision, PermissionSystemExtension, PromptOpts,
 };
+
+/// A scripted [`HostServices`] whose ONLY override is [`HostServices::all_tool_names`] — the full
+/// registry the registry / unknown-tool gate (`gate::check_requested_tool_registration`, pi
+/// `index.ts:2218-2228`) checks BEFORE any permission check. Without this attached, `bash` reads as
+/// unregistered against the default empty registry and the gate blocks before ever reaching the
+/// scripted [`AlwaysChannel`] below (mirrors `tests/layers_wired.rs`'s identical stand-in).
+struct RegistryServices;
+impl HostServices for RegistryServices {
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        Some(vec!["bash".to_string()])
+    }
+}
 
 /// A scripted channel: returns an "Allow Always" decision (the shape a `ForwardingAskChannel` returns
 /// when the parent human picks "Allow Always") and counts how many forwards it serviced.
@@ -73,9 +85,17 @@ async fn forwarded_allow_always_persists_a_child_session_rule() {
         ExtensionConfig::default(),
         Arc::new(AlwaysChannel { invocations: invocations.clone() }),
     );
+    ext.set_host_services(Arc::new(RegistryServices));
 
-    // A headless child ctx (has_ui=false) ⇒ the gate routes the `ask` through `self.ask_channel` (the
-    // scripted forwarding stand-in), not a live dialog.
+    // A headless child ctx (has_ui=false) ⇒ `prompt_decision`'s live-vs-fail-closed gate
+    // (`ctx.has_ui || is_subagent_child() || yolo_mode`, pi `confirmPermission`'s `hasUI` vs
+    // `isSubagentExecutionContext` split, `index.ts:1506-1519`) only reaches `self.ask_channel` (the
+    // scripted forwarding stand-in) when this process is CHILD-shaped — this is the one test binary in
+    // this file, so mutating process env here is race-free.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("CYRUP_SUBAGENT_CHILD", "1");
+    }
     let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.path().to_path_buf());
 
     // FIRST identical bash call: forwards (channel invoked once) and persists an always session rule.
@@ -92,4 +112,9 @@ async fn forwarded_allow_always_persists_a_child_session_rule() {
         1,
         "the always-decision persisted a child session rule ⇒ the second call did NOT forward again"
     );
+
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var("CYRUP_SUBAGENT_CHILD");
+    }
 }

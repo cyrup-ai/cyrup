@@ -324,7 +324,8 @@ async fn run() -> anyhow::Result<i32> {
         let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
             dirs.agent_dir.clone(),
             session_cwd.clone(),
-        );
+        )
+        .map_err(|e| anyhow::anyhow!("building intercom extension: {e}"))?;
         // SubAgents opt-in gate composed with the T6 child-mode gate (see above): a plain top-level
         // session attaches only when opted in (`is_installed`); a plain child registers nothing; a
         // fanout-authorized child gets the restricted tool regardless. When intercom is attached this
@@ -418,7 +419,8 @@ async fn run() -> anyhow::Result<i32> {
             let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
                 dirs.agent_dir.clone(),
                 session_cwd.clone(),
-            );
+            )
+            .map_err(|e| anyhow::anyhow!("building intercom extension: {e}"))?;
             // SubAgents opt-in gate + T6 child-mode gate (see the interactive arm above): a plain
             // top-level session attaches only when opted in (`is_installed`); a plain subagent child
             // registers nothing; a fanout-authorized child gets the restricted tool regardless. Thread
@@ -488,7 +490,8 @@ async fn run() -> anyhow::Result<i32> {
             let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
                 dirs.agent_dir.clone(),
                 session_cwd.clone(),
-            );
+            )
+            .map_err(|e| anyhow::anyhow!("building intercom extension: {e}"))?;
             // SubAgents opt-in gate + T6 child-mode gate (see the interactive arm above): a plain
             // top-level session attaches only when opted in (`is_installed`); a plain subagent child
             // registers nothing; a fanout-authorized child gets the restricted tool regardless. Thread

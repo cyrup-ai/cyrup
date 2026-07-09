@@ -11,7 +11,17 @@
 use std::path::PathBuf;
 
 use crate::error::PermissionError;
+use crate::evaluate::Evaluation;
 use crate::types::{PatternRule, PermissionState};
+
+/// The result of [`SessionApprovalStore::evaluate`] — pi's `{state, matchedPattern}`
+/// (`session-approval-store.ts:28-33`). `matchedPattern` is dropped (set to `None`) whenever the
+/// state isn't `allow`, exactly as pi's ternary does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvaluation {
+    pub state: PermissionState,
+    pub matched_pattern: Option<String>,
+}
 
 /// pi `SessionApprovalStore` — in-memory, allow-only.
 #[derive(Debug, Default)]
@@ -49,6 +59,26 @@ impl SessionApprovalStore {
     /// Clear all rules (pi `clear`; called on session_start + session_shutdown, `index.ts:2089,2123`).
     pub fn clear(&mut self) {
         self.rules.clear();
+    }
+
+    /// pi `evaluate` (`session-approval-store.ts:28-33`): evaluate `tool`/`command` against ONLY this
+    /// store's own rules. `allow` keeps `matchedPattern`; anything else collapses to `ask` with
+    /// `matchedPattern` dropped.
+    #[must_use]
+    pub fn evaluate(&self, tool: &str, command: &str) -> SessionEvaluation {
+        let result = crate::evaluate::evaluate(tool, command, &[&self.rules]);
+        if result.action == PermissionState::Allow {
+            SessionEvaluation { state: PermissionState::Allow, matched_pattern: result.matched_pattern }
+        } else {
+            SessionEvaluation { state: PermissionState::Ask, matched_pattern: None }
+        }
+    }
+
+    /// pi `hasSessionApproval` (`session-approval-store.ts:24-26`): `true` iff this store's own
+    /// rules resolve `tool`/`command` to `allow`.
+    #[must_use]
+    pub fn has_session_approval(&self, tool: &str, command: &str) -> bool {
+        self.evaluate(tool, command).state == PermissionState::Allow
     }
 }
 
@@ -103,6 +133,16 @@ impl PermanentApprovalStore {
     pub fn get_rules(&mut self) -> Vec<PatternRule> {
         self.ensure_loaded();
         self.rules.clone().unwrap_or_default()
+    }
+
+    /// pi `evaluate` (`permanent-approval-store.ts:54-61`): lazily loads, then evaluates
+    /// `tool`/`command` against ONLY this store's own rules (tri-state — unlike the session store's
+    /// `evaluate`, `matchedPattern` is kept regardless of the resolved state).
+    #[must_use]
+    pub fn evaluate(&mut self, tool: &str, command: &str) -> Evaluation {
+        self.ensure_loaded();
+        let rules = self.rules.as_deref().unwrap_or(&[]);
+        crate::evaluate::evaluate(tool, command, &[rules])
     }
 
     /// pi `approveAlways` + `saveRules` (`permanent-approval-store.ts:37-52,87-92`): atomic
@@ -190,6 +230,57 @@ mod tests {
         std::fs::write(&bad, "not json").unwrap();
         let mut malformed = PermanentApprovalStore::new(bad);
         assert!(malformed.get_rules().is_empty());
+    }
+
+    #[test]
+    fn session_store_evaluate_and_has_session_approval() {
+        let mut s = SessionApprovalStore::new();
+        // No rules yet: evaluate() must resolve to Ask with no matched pattern, and
+        // has_session_approval() must be false.
+        let ask = s.evaluate("bash", "git push");
+        assert_eq!(ask.state, PermissionState::Ask);
+        assert_eq!(ask.matched_pattern, None);
+        assert!(!s.has_session_approval("bash", "git push"));
+
+        s.approve_always("bash", "git *");
+        let allow = s.evaluate("bash", "git push");
+        assert_eq!(allow.state, PermissionState::Allow);
+        assert_eq!(allow.matched_pattern.as_deref(), Some("git *"));
+        assert!(s.has_session_approval("bash", "git push"));
+
+        // A non-matching command still resolves to Ask with no matched pattern.
+        let no_match = s.evaluate("bash", "rm -rf /");
+        assert_eq!(no_match.state, PermissionState::Ask);
+        assert_eq!(no_match.matched_pattern, None);
+        assert!(!s.has_session_approval("bash", "rm -rf /"));
+    }
+
+    #[test]
+    fn permanent_store_evaluate_scoped_to_own_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"tool":"bash","pattern":"git *","action":"allow"},
+                {"tool":"bash","pattern":"rm *","action":"deny"}
+            ]"#,
+        )
+        .unwrap();
+        let mut store = PermanentApprovalStore::new(path);
+
+        let allow = store.evaluate("bash", "git push");
+        assert_eq!(allow.action, PermissionState::Allow);
+        assert_eq!(allow.matched_pattern.as_deref(), Some("git *"));
+
+        let deny = store.evaluate("bash", "rm -rf /");
+        assert_eq!(deny.action, PermissionState::Deny);
+        assert_eq!(deny.matched_pattern.as_deref(), Some("rm *"));
+
+        // No match at all -> Ask, no matched pattern.
+        let ask = store.evaluate("bash", "ls");
+        assert_eq!(ask.action, PermissionState::Ask);
+        assert_eq!(ask.matched_pattern, None);
     }
 
     #[test]

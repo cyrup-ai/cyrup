@@ -73,20 +73,26 @@ pub struct IntercomExtension {
 
 impl IntercomExtension {
     /// Build the extension over a resolved config + optional child metadata + this session's cwd.
-    #[must_use]
+    ///
+    /// # Errors
+    /// pi `getAskTimeoutMs` throws (uncaught) when `PI_INTERCOM_ASK_TIMEOUT_MS`/
+    /// `CYRUP_INTERCOM_ASK_TIMEOUT_MS` is set but is not a positive integer number of milliseconds
+    /// (`config.ts:14-16`), which crashes the whole `piIntercomExtension(pi)` construction
+    /// (`index.ts:433`). This mirrors that: an invalid env value is a hard `Err`, never a silent
+    /// default.
     pub fn new(
         agent_dir: PathBuf,
         cwd: PathBuf,
         config: IntercomConfig,
         metadata: Option<ChildOrchestratorMetadata>,
-    ) -> Self {
-        let ask_timeout = ask_timeout_ms();
+    ) -> Result<Self, String> {
+        let ask_timeout = ask_timeout_ms()?;
         let state = Arc::new(SharedIntercomState::new(config, ask_timeout, cwd));
         let supervisor_target = metadata.as_ref().map(preferred_supervisor_target);
         let clarify = Arc::new(IntercomClarifyChannel::new(state.clone()));
         let delivery = Arc::new(IntercomDeliveryChannel::new(state.clone(), supervisor_target));
         let steer = Arc::new(IntercomSteerChannel::new(state.clone()));
-        Self {
+        Ok(Self {
             id: ExtensionId::from(EXTENSION_ID),
             state,
             agent_dir,
@@ -94,7 +100,7 @@ impl IntercomExtension {
             clarify,
             delivery,
             steer,
-        }
+        })
     }
 
     /// The broker-backed [`ClarifyChannel`] this extension owns. HANDED (WIRED) into
@@ -264,6 +270,11 @@ impl NativeExtension for IntercomExtension {
             EventKind::AgentEnd,
             EventKind::ToolExecStart,
             EventKind::ToolExecEnd,
+            // `pi.on("turn_start"/"turn_end")` (index.ts:1112-1127,1074-1080) drives
+            // `replyTracker.beginTurn()`/`endTurn()` so `resolveReplyTarget`'s `currentTurnContext`
+            // priority branch (reply_tracker.rs) is ever reachable in production.
+            EventKind::TurnStart,
+            EventKind::TurnEnd,
         ]);
         Ok(())
     }
@@ -351,6 +362,18 @@ impl NativeExtension for IntercomExtension {
                 self.sync_presence("thinking");
                 HookOutcome::Noop
             }
+            HostEvent::TurnStart { .. } => {
+                // `pi.on("turn_start") -> replyTracker.beginTurn()` (index.ts:1112-1127): prune expired
+                // pending asks, then adopt the oldest queued turn context (queued by
+                // `trigger_turn_over_inbound` right before this turn started) as `current_turn_context`.
+                self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).begin_turn(now_ms());
+                HookOutcome::Noop
+            }
+            HostEvent::TurnEnd { .. } => {
+                // `pi.on("turn_end") -> replyTracker.endTurn()` (index.ts:1074-1080).
+                self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).end_turn();
+                HookOutcome::Noop
+            }
             _ => HookOutcome::Noop,
         }
     }
@@ -379,9 +402,15 @@ pub fn is_installed(intercom_dir: &std::path::Path) -> bool {
 ///
 /// A subagent child (child-orchestrator metadata present) always attaches so `contact_supervisor` is
 /// registered; a plain session attaches only when opted in (`is_installed`).
-#[must_use]
-pub fn intercom_extension_for_env(agent_dir: PathBuf, cwd: PathBuf) -> Option<Arc<dyn NativeExtension>> {
-    intercom_extension_for_env_concrete(agent_dir, cwd).map(|ext| ext as Arc<dyn NativeExtension>)
+///
+/// # Errors
+/// See [`IntercomExtension::new`] — propagates a hard error when the ask-timeout env var is set but
+/// invalid, matching pi's uncaught throw (`config.ts:14-16`).
+pub fn intercom_extension_for_env(
+    agent_dir: PathBuf,
+    cwd: PathBuf,
+) -> Result<Option<Arc<dyn NativeExtension>>, String> {
+    Ok(intercom_extension_for_env_concrete(agent_dir, cwd)?.map(|ext| ext as Arc<dyn NativeExtension>))
 }
 
 /// As [`intercom_extension_for_env`], but returns the CONCRETE [`IntercomExtension`] so the caller
@@ -391,18 +420,23 @@ pub fn intercom_extension_for_env(agent_dir: PathBuf, cwd: PathBuf) -> Option<Ar
 /// 119/120/123/124/125) BEFORE attaching this same extension via `.with_native_extension(..)`. The
 /// two seam channels reference the one `SharedIntercomState` this extension owns, so handing them
 /// out and then attaching the extension wires BOTH ends to the same live broker client.
-#[must_use]
-pub fn intercom_extension_for_env_concrete(agent_dir: PathBuf, cwd: PathBuf) -> Option<Arc<IntercomExtension>> {
+///
+/// # Errors
+/// See [`IntercomExtension::new`].
+pub fn intercom_extension_for_env_concrete(
+    agent_dir: PathBuf,
+    cwd: PathBuf,
+) -> Result<Option<Arc<IntercomExtension>>, String> {
     let intercom_dir = intercom_dir_path(&agent_dir);
     let config = load_config(&intercom_dir);
     if !config.enabled {
-        return None;
+        return Ok(None);
     }
     let metadata = read_child_orchestrator_metadata();
     if metadata.is_none() && !is_installed(&intercom_dir) {
-        return None;
+        return Ok(None);
     }
-    Some(Arc::new(IntercomExtension::new(agent_dir, cwd, config, metadata)))
+    Ok(Some(Arc::new(IntercomExtension::new(agent_dir, cwd, config, metadata)?)))
 }
 
 /// The default agent dir (`~/.cyrup` or `$CYRUP_CODING_AGENT_DIR`) — a convenience for a caller that
@@ -424,15 +458,27 @@ mod tests {
         std::fs::create_dir_all(&intercom_dir).unwrap();
         std::fs::write(config_path(&intercom_dir), r#"{"enabled":false}"#).unwrap();
         // enabled:false → None regardless of install/child state.
-        assert!(intercom_extension_for_env(dir.path().to_path_buf(), dir.path().to_path_buf()).is_none());
+        assert!(
+            intercom_extension_for_env(dir.path().to_path_buf(), dir.path().to_path_buf())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn plain_session_without_optin_attaches_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        // No config.json, no CYRUP_INTERCOM, no child metadata (env not set in this test process) →
-        // a plain session attaches nothing (zero overhead, no broker spawned).
-        assert!(!is_installed(&intercom_dir_path(dir.path())));
+        // No config.json, no child metadata. `is_installed` ORs the `CYRUP_INTERCOM` env signal with
+        // the config-file signal, so account for whatever this process's ambient env already is
+        // (e.g. a developer/CI shell with `CYRUP_INTERCOM=1` set workspace-wide) rather than assuming
+        // it is unset — this crate is `#![forbid(unsafe_code)]`, so a `src/` test cannot sandbox the
+        // process env via `set_var`/`remove_var` to force the "no env" case.
+        let env_opted_in = env_truthy(INSTALL_ENV_VAR);
+        assert_eq!(
+            is_installed(&intercom_dir_path(dir.path())),
+            env_opted_in,
+            "with no config.json, installed iff the ambient env already opted in"
+        );
     }
 
     #[test]
@@ -442,7 +488,11 @@ mod tests {
         std::fs::create_dir_all(&intercom_dir).unwrap();
         std::fs::write(config_path(&intercom_dir), "{}").unwrap();
         assert!(is_installed(&intercom_dir));
-        assert!(intercom_extension_for_env(dir.path().to_path_buf(), dir.path().to_path_buf()).is_some());
+        assert!(
+            intercom_extension_for_env(dir.path().to_path_buf(), dir.path().to_path_buf())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -453,10 +503,128 @@ mod tests {
             dir.path().to_path_buf(),
             IntercomConfig::default(),
             None,
-        );
+        )
+        .unwrap();
         // All three channels are constructed + reachable (handed to SubagentsExtension::with_channels).
         let _c = ext.clarify_channel();
         let _d = ext.delivery_channel();
         let _s = ext.steer_channel();
+    }
+
+    /// Regression proof: pre-fix, `HostEvent::TurnStart`/`TurnEnd` had no arm in `on_event` (the match
+    /// fell through to `_ => HookOutcome::Noop`) and neither was subscribed, so `ReplyTracker::begin_turn`
+    /// was never invoked in production — a context queued by `inbound.rs::trigger_turn_over_inbound`
+    /// would sit in `pending_turn_contexts` forever and `resolve_reply_target`'s `current_turn_context`
+    /// priority branch (reply-tracker.ts:37-40,66-68; pi `pi.on("turn_start")`, index.ts:1112-1127) was
+    /// permanently dead code. This test fails against that pre-fix behavior: it queues a turn context
+    /// directly (mirroring what `trigger_turn_over_inbound` now does), dispatches a real `TurnStart`
+    /// event through `on_event`, and asserts a bare `resolve_reply_target(None, None, ..)` (no `to`)
+    /// resolves to that queued context even though a SECOND, unrelated pending ask also exists — the
+    /// exact "two pending asks, bare reply resolves to the one that triggered this turn" scenario the
+    /// dossier describes.
+    #[tokio::test]
+    async fn turn_start_event_adopts_the_queued_context_as_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = IntercomExtension::new(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            IntercomConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let triggering = crate::reply_tracker::IntercomContext {
+            from: SessionInfo {
+                id: "s-trigger".to_string(),
+                name: Some("trigger-sender".to_string()),
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1,
+                started_at: 0,
+                last_activity: 0,
+                status: None,
+                peer_uid: None,
+                trusted_local: None,
+            },
+            message: crate::transport::protocol::Message {
+                id: "q-trigger".to_string(),
+                timestamp: 0,
+                reply_to: None,
+                expects_reply: Some(true),
+                content: crate::transport::protocol::MessageContent {
+                    text: "the message that triggered this turn".to_string(),
+                    attachments: None,
+                },
+            },
+            received_at: now_ms(),
+        };
+        {
+            let mut tracker = ext.state().tracker.lock().unwrap();
+            // The turn-triggering context, queued by `trigger_turn_over_inbound` before this turn began.
+            tracker.queue_turn_context(triggering.clone());
+            // An unrelated, older pending ask (e.g. from a different session) that must NOT win.
+            tracker.record_incoming_message(
+                SessionInfo {
+                    id: "s-other".to_string(),
+                    name: Some("other-sender".to_string()),
+                    cwd: "/w".to_string(),
+                    model: "m".to_string(),
+                    pid: 2,
+                    started_at: 0,
+                    last_activity: 0,
+                    status: None,
+                    peer_uid: None,
+                    trusted_local: None,
+                },
+                crate::transport::protocol::Message {
+                    id: "q-other".to_string(),
+                    timestamp: 0,
+                    reply_to: None,
+                    expects_reply: Some(true),
+                    content: crate::transport::protocol::MessageContent {
+                        text: "unrelated older ask".to_string(),
+                        attachments: None,
+                    },
+                },
+                now_ms(),
+            );
+        }
+
+        let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, dir.path().to_path_buf());
+        let ev = HostEvent::TurnStart { turn_index: 0, timestamp: now_ms() };
+        let _ = ext.on_event(&ev, &ctx).await;
+
+        let resolved = ext
+            .state()
+            .tracker
+            .lock()
+            .unwrap()
+            .resolve_reply_target(None, None, now_ms())
+            .expect("current_turn_context resolves a bare reply with no `to`, despite 2 pending asks");
+        assert_eq!(resolved.message.id, triggering.message.id);
+    }
+
+    /// Regression proof for the `IntercomExtension::new` fallibility change (pi `getAskTimeoutMs`
+    /// throws uncaught on an invalid `PI_INTERCOM_ASK_TIMEOUT_MS`/`CYRUP_INTERCOM_ASK_TIMEOUT_MS`,
+    /// `config.ts:14-16`, crashing `piIntercomExtension(pi)` construction, `index.ts:433`). This crate
+    /// `#![forbid(unsafe_code)]`, so this test cannot mutate the real process env (`set_var`/
+    /// `remove_var` are `unsafe`) to drive `new` through its env-sourced `ask_timeout_ms()` — the
+    /// injectable core of that validation (never-default-on-invalid-input) is proven directly by
+    /// `config::tests::ask_timeout_invalid_value_is_a_hard_error_not_a_silent_default` instead. What
+    /// THIS test proves is
+    /// the wiring half of the same fix: `new` returns a plain `Self` in `extension.rs:84`'s pre-fix
+    /// signature (`SharedIntercomState::new(config, ask_timeout, cwd)` fed a bare `u64`) would not
+    /// typecheck against today's `Result<Self, String>` — `.unwrap()` below only compiles because `new`
+    /// actually returns a `Result` that must be unwrapped, never a bare `Self`.
+    #[test]
+    fn new_returns_result_that_must_be_unwrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext: Result<IntercomExtension, String> = IntercomExtension::new(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            IntercomConfig::default(),
+            None,
+        );
+        assert!(ext.unwrap().state().ask_timeout_ms > 0);
     }
 }

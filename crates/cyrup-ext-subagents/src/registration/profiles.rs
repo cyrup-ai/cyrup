@@ -647,16 +647,28 @@ pub fn provider_models_path(
     Ok(provider_models_dir(profiles_dir).join(format!("{provider}.models.json")))
 }
 
-/// One model entry in a per-provider catalog file. The full live-probe `observed`/`derived`
-/// classification block (pi `ProviderModelCatalogModel`, profiles.ts:31-64) is a sanctioned
-/// deferral (func-SA §9 item 31); this ported subset carries the two fields every downstream
-/// consumer (profile generation, `/subagents-check-profile`) actually reads: the bare `id` and the
-/// fully-qualified `fullId` (`provider/id`).
+/// One model entry in a per-provider catalog file (pi `ProviderModelCatalogModel`,
+/// profiles.ts:31-64). Carries the bare `id`, the fully-qualified `fullId` (`provider/id`), plus
+/// the two fields every ranking/filtering decision downstream (profile generation,
+/// `/subagents-check-profile`) actually needs: `profile_rank` (pi `derived.profileRank`,
+/// profiles.ts:54 — `extension.rs`'s `classify_model` computes this from the seed catalog's own
+/// cost/context/reasoning metadata) and `probe_status` (pi `observed.probe.status`,
+/// profiles.ts:47-51 — `extension.rs`'s `probe_model` real subprocess probe result). The full
+/// nested `observed`/`derived` metadata block pi's shape also carries (per-tier cost/quality/
+/// latency classification, `recommendedAgents`, `classificationSources`, warnings) is NOT
+/// replicated field-for-field here; only the two fields that actually drive a filtering/ordering
+/// decision are persisted. `#[serde(default)]` on both new fields keeps a catalog file written
+/// before they existed still readable (an empty `probe_status` sorts as "not yet probed", which
+/// [`crate::extension`]'s usability filter treats as unusable rather than silently privileged).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCatalogModel {
     pub id: String,
     pub full_id: String,
+    #[serde(default)]
+    pub profile_rank: i64,
+    #[serde(default)]
+    pub probe_status: String,
 }
 
 /// A per-provider model catalog file (pi `ProviderModelCatalogFile`, profiles.ts:66-72), the
@@ -1532,6 +1544,8 @@ mod tests {
             models: vec![ProviderCatalogModel {
                 id: "gpt-4o".to_string(),
                 full_id: "openai/gpt-4o".to_string(),
+                profile_rank: 42,
+                probe_status: "ok".to_string(),
             }],
         };
         let path = write_provider_catalog(tmp.path(), &catalog).expect("write catalog");
