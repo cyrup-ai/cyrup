@@ -22,6 +22,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use cyrup_core::{CancelToken, ToolUpdate, ToolUpdateSink};
 use cyrup_ext_subagents::background::RunMode;
+use cyrup_ext_subagents::discovery::types::AgentReadScope;
 use cyrup_ext_subagents::extension::{ForegroundRunRequest, SubagentExecutor};
 use cyrup_ext_subagents::tui::events::{LiveProgressStatus, SubagentUpdatePayload};
 
@@ -116,13 +117,14 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     });
 
     let executor = SubagentExecutor::new();
-    let result = tokio::time::timeout(
+    let (result, _run_id) = tokio::time::timeout(
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
                 cwd: dir.path(),
                 agent_name: "streamtest",
                 task: "Research the topic",
+                agent_scope: AgentReadScope::Both,
                 context: None,
                 model_override: None,
                 timeout_ms: None,
@@ -263,13 +265,14 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
 
     let executor = SubagentExecutor::new();
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
+    let (result, _run_id) = tokio::time::timeout(
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
                 cwd: dir.path(),
                 agent_name: "canceltest",
                 task: "Research the topic",
+                agent_scope: AgentReadScope::Both,
                 context: None,
                 model_override: None,
                 timeout_ms: None,

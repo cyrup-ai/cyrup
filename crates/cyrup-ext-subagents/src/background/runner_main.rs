@@ -1930,6 +1930,13 @@ async fn finish_run(
     status.state = terminal_state;
     status.last_update = now;
     status.ended_at = Some(now);
+    // pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    // terminal `status.json` write carries the SAME `cwd`/`sessionFile` the terminal `ResultFile`
+    // below does, so `resume`'s terminal-revival branch (R-SA-085) can read `status.cwd ??
+    // result.cwd` (`background/async-resume.ts:323,345,373`) straight off the reconciled status
+    // without needing a second, separate ResultFile read.
+    status.cwd = Some(cwd.clone());
+    status.session_file = session_file.clone();
 
     if !error.is_empty() && results.is_empty() {
         results.push(SingleResult {
@@ -2463,6 +2470,54 @@ mod tests {
         .expect("valid JSON");
         assert_eq!(result.state, RunState::Failed);
         assert!(!result.success);
+    }
+
+    /// pi `statusPayload.cwd`/`statusPayload.sessionFile` (`subagent-runner.ts:1167,2411`): the
+    /// terminal `status.json` write must carry the SAME `cwd`/`sessionFile` the terminal
+    /// `ResultFile` does, so `resume`'s terminal-revival branch (R-SA-085,
+    /// `background/async-resume.ts:323,345,373`) can read `status.cwd ?? result.cwd` straight off
+    /// the reconciled status. Pre-fix, `finish_run` stamped `cwd`/`session_file` only onto the
+    /// `ResultFile`, leaving `status.json`'s own (newly added) fields permanently `None`.
+    #[tokio::test]
+    async fn finish_run_stamps_cwd_and_session_file_onto_the_terminal_status_too() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_id = RunId::from_token("run-cwd-stamp");
+        let run_paths = run_paths_in(dir.path(), &run_id);
+        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.path().join("results"))
+            .await
+            .expect("mkdir results_dir");
+
+        let status = RunStatus::queued(run_id, RunMode::Single, Some(1));
+        let run_cwd = dir.path().join("the-actual-run-cwd");
+        let session_file = dir.path().join("session.jsonl");
+
+        finish_run(
+            &run_paths,
+            status,
+            RunState::Complete,
+            Vec::new(),
+            run_cwd.clone(),
+            Some(session_file.clone()),
+            String::new(),
+        )
+        .await;
+
+        let written_status: RunStatus = serde_json::from_slice(
+            &tokio::fs::read(&run_paths.status).await.expect("read status"),
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            written_status.cwd,
+            Some(run_cwd),
+            "the terminal status.json write must carry the run's own cwd, matching the ResultFile"
+        );
+        assert_eq!(
+            written_status.session_file,
+            Some(session_file),
+            "the terminal status.json write must carry the run's own session_file, matching the \
+             ResultFile"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

@@ -764,6 +764,23 @@ pub struct RunStatus {
     /// `background/reconcile.rs`, which may synthesize a status for a run whose pid was never
     /// successfully recorded).
     pub pid: Option<u32>,
+    /// The working directory this run's steps actually execute in (pi `AsyncStatus.cwd`,
+    /// `shared/types.ts:592`), set once by the detached runner at its very first status write and
+    /// never changed thereafter (a run's cwd is fixed for its whole lifetime). `resume`'s
+    /// terminal-revival branch (R-SA-085, `Self::revive_from_transcript`) reads this back so a
+    /// revived child spawns in the SAME directory the original run did, rather than whatever cwd
+    /// happens to be current at resume time (pi `target.cwd ?? requestCwd`,
+    /// `background/async-resume.ts:323,345,373` + `subagent-executor.ts:890`). `None` only for a
+    /// synthesized/repaired status that never had a chance to observe the real value (mirrors
+    /// `pid`'s own `None` carve-out immediately above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// The run-wide persisted session-transcript path, once known (pi `AsyncStatus.sessionFile`,
+    /// `shared/types.ts:636`, populated at `subagent-runner.ts:2411` once the run's effective
+    /// session file is resolved). Read back by the SAME terminal-revival branch as
+    /// [`Self::cwd`] as the run-level fallback beneath a resolved step's own `sessionFile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
     /// Wall-clock spawn-confirmed time (epoch milliseconds).
     pub started_at: i64,
     /// Wall-clock terminal time (epoch milliseconds), set once `state` becomes `Complete`/
@@ -805,6 +822,8 @@ impl RunStatus {
             mode,
             state: RunState::Queued,
             pid,
+            cwd: None,
+            session_file: None,
             started_at: now,
             ended_at: None,
             last_update: now,

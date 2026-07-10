@@ -49,7 +49,7 @@
 //! (`ForkRequiresLeaf`/`ForkRequiresPersistedParent`) rather than silently downgrading to
 //! `Fresh` — preserving DI-SA-2 exactly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -66,7 +66,8 @@ use crate::background::spawn_detached::spawn_detached_runner;
 use crate::background::tracker::JobTracker;
 use crate::background::{run_status, RunId, RunMode, RunPaths, RunState};
 use crate::discovery::types::{
-    AgentDefinition, AgentModelSourceInfo, AgentSource, ChainStepConfig, OverrideScope,
+    AgentDefinition, AgentModelSourceInfo, AgentReadScope, AgentSource, ChainStepConfig,
+    LayeredOverrideSettings, OverrideScope,
 };
 use crate::discovery::{discover_agents, AgentDiscoveryConfig};
 use crate::error::SubagentError;
@@ -161,6 +162,32 @@ pub struct SubagentExecutor {
     /// broker-backed `ClarifyChannel` is threaded in via [`SubagentsExtension::with_channels`]. Consumed
     /// by the exec detach-trigger arm (R-SA-037) when a child's `contact_supervisor` blocking ask fires.
     clarify: Arc<crate::tui::intercom::AskLock>,
+    /// Live foreground-run control registry (pi `state.foregroundControls`, `shared/types.ts`):
+    /// `targetRunId -> {interrupt, currentAgent, currentIndex}` for every foreground single run this
+    /// executor currently has in flight. Populated by [`Self::run_foreground_impl`] just before
+    /// driving the run and removed right after it settles, so a lookup miss means "not active" —
+    /// exactly pi's "run is not active in this fanout child" guard. Consumed by
+    /// [`Self::resolve_nested_control_request`] (the fanout child's nested-control inbox listener,
+    /// pi `fanout-child.ts:53-128`) to service an interrupt/resume request a grandparent orchestrator
+    /// addressed at a run nested inside THIS process.
+    foreground_controls: Arc<std::sync::Mutex<HashMap<String, ForegroundControlEntry>>>,
+}
+
+/// One live foreground run's control surface (pi `SubagentState.foregroundControls`'s per-entry
+/// shape, `shared/types.ts`): the soft-interrupt token for its current attempt, plus the live
+/// message-route coordinates (`currentAgent`/`currentIndex`) a nested-control "resume" request
+/// resolves to the SAME [`crate::spawn::intercom_target::resolve_subagent_intercom_target`] string
+/// the child registered its broker presence under at spawn.
+#[derive(Clone)]
+struct ForegroundControlEntry {
+    /// Fires this run's soft interrupt (pi `control.interrupt?.()`); shared with the live
+    /// [`RunOptions::interrupt`] token the running child's own attempt loop races against.
+    interrupt: CancelToken,
+    /// The run's current step agent name (pi `control.currentAgent`); `None` means no live message
+    /// route exists yet (pi's "has no active child message route" guard).
+    current_agent: Option<String>,
+    /// The run's current step's flat child index (pi `control.currentIndex ?? 0`).
+    current_index: Option<usize>,
 }
 
 /// The structured result of [`SubagentExecutor::run_or_background_graph`]: either a detached
@@ -203,6 +230,9 @@ pub struct ForegroundRunRequest<'a> {
     pub agent_name: &'a str,
     /// The task text handed to the child (pi's `Task: <task>` child prompt).
     pub task: &'a str,
+    /// The resolved execution-time agent-discovery scope (pi `resolveExecutionAgentScope`,
+    /// `subagent-executor.ts:2973`): narrows the User-vs-Project axis when resolving `agent_name`.
+    pub agent_scope: AgentReadScope,
     /// Call-site fork/fresh context; `None` defers to the persona's own `default_context`.
     pub context: Option<ContextMode>,
     /// Per-call model override (added to the availability set, R-SA-038); `None` inherits.
@@ -257,6 +287,7 @@ impl SubagentExecutor {
             steer: Arc::new(crate::tui::intercom::NoTransportSteerChannel),
             delivery: Arc::new(crate::tui::intercom::NoTransportChannel),
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
+            foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -598,9 +629,14 @@ impl SubagentExecutor {
     /// Returns [`SubagentError::AgentNotFound`] if no delegation-visible agent matches `name`
     /// exactly, or propagates a discovery-time [`SubagentError`] (R-SA-009's malformed-settings
     /// abort).
-    pub fn resolve_agent(&self, cwd: &Path, name: &str) -> Result<AgentDefinition, SubagentError> {
+    pub fn resolve_agent(
+        &self,
+        cwd: &Path,
+        name: &str,
+        scope: AgentReadScope,
+    ) -> Result<AgentDefinition, SubagentError> {
         let cfg = Self::discovery_config(cwd)?;
-        let result = discover_agents(&cfg, None)?;
+        let result = discover_agents(&cfg, Some(scope))?;
         result
             .agents
             .into_iter()
@@ -636,13 +672,14 @@ impl SubagentExecutor {
         &self,
         cwd: &Path,
         agent_names: impl IntoIterator<Item = String>,
+        scope: AgentReadScope,
     ) -> Result<BTreeMap<String, ResolvedAgentPersona>, SubagentError> {
         let mut personas: BTreeMap<String, ResolvedAgentPersona> = BTreeMap::new();
         for name in agent_names {
             if personas.contains_key(&name) {
                 continue;
             }
-            let agent = self.resolve_agent(cwd, &name)?;
+            let agent = self.resolve_agent(cwd, &name, scope)?;
             personas.insert(name, crate::exec::resolve_step_agent_config(&agent));
         }
         Ok(personas)
@@ -770,6 +807,12 @@ impl SubagentExecutor {
                 cwd,
                 agent_name,
                 task,
+                // pi's slash-command surfaces (`/run`, `/chain`, `/parallel`, `/run-chain`)
+                // explicitly set `agentScope: "both"` on every dispatch they build
+                // (`slash-commands.ts:997,1015,1045,1069`) — this flat entry point has no caller
+                // that ever narrows the scope, so `Both` here is not a default guess but pi's own
+                // explicit, always-supplied value for this exact call shape.
+                agent_scope: AgentReadScope::Both,
                 context,
                 model_override,
                 timeout_ms,
@@ -822,6 +865,7 @@ impl SubagentExecutor {
             cwd,
             agent_name,
             task,
+            agent_scope,
             context,
             model_override,
             timeout_ms,
@@ -836,7 +880,7 @@ impl SubagentExecutor {
             });
         }
 
-        let agent = self.resolve_agent(cwd, agent_name)?;
+        let agent = self.resolve_agent(cwd, agent_name, agent_scope)?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
         // `context` (`None`) falls back to THIS agent's own `default_context` rather than being forced
         // to `Fresh`; an explicit call-site value still wins (`resolve_effective_context`).
@@ -945,6 +989,28 @@ impl SubagentExecutor {
             child_index: Some(0),
         };
 
+        // pi `state.foregroundControls.set(runId, {interrupt, currentAgent, currentIndex})`
+        // (`shared/types.ts` + `runs/foreground/execution.ts`): register this run's live control
+        // surface BEFORE driving it, so a nested-control inbox listener polling in the SAME process
+        // (a fanout child's own `foreground_controls`, `fanout-child.ts:53-128`) can resolve an
+        // interrupt/resume request targeting this run's id while it is in flight. Shares the SAME
+        // token `run_options.interrupt` races the running child's attempt loop against, so firing it
+        // here genuinely soft-interrupts the live run rather than a disconnected flag.
+        {
+            let mut controls = self
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.insert(
+                run_id.as_str().to_string(),
+                ForegroundControlEntry {
+                    interrupt: run_options.interrupt.clone(),
+                    current_agent: Some(agent.name.clone()),
+                    current_index: Some(0),
+                },
+            );
+        }
+
         // T6 artifact quadruple (pi `runs/foreground/execution.ts:960-1074`): record this run's input
         // BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
         // the run settles. Written into the scoped-temp artifacts root for `cwd` (the Rust analog of
@@ -974,6 +1040,17 @@ impl SubagentExecutor {
             on_update,
         )
         .await;
+
+        // The run has settled (success, failure, or interrupted-terminal) — pi's foregroundControls
+        // entry only exists while a run is live, so a nested-control request arriving after this
+        // point must see a lookup miss ("is not active in this fanout child"), never a stale entry.
+        {
+            let mut controls = self
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.remove(run_id.as_str());
+        }
 
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
 
@@ -1025,6 +1102,7 @@ impl SubagentExecutor {
         task: &str,
         context: Option<ContextMode>,
         model_override: Option<ModelId>,
+        agent_scope: AgentReadScope,
     ) -> Result<RunId, SubagentError> {
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -1042,7 +1120,7 @@ impl SubagentExecutor {
         // R-SA-055: resolve the agent (and therefore validate it exists) before any spawn.
         // T0.1/C13: the SAME resolved definition is projected into the plan-time persona map handed
         // to the runner, so hop 2 dispatches this agent's REAL persona rather than a placeholder.
-        let agent = self.resolve_agent(cwd, agent_name)?;
+        let agent = self.resolve_agent(cwd, agent_name, agent_scope)?;
         let resolved_agents: BTreeMap<String, ResolvedAgentPersona> =
             BTreeMap::from([(agent_name.to_string(), crate::exec::resolve_step_agent_config(&agent))]);
         // Fork default-mode (Tier-2): an OMITTED call-site `context` falls back to THIS agent's own
@@ -1510,7 +1588,8 @@ impl SubagentExecutor {
         // T0.1/C13: resolve every named persona up front (also the upfront agent-name validation —
         // an unresolvable agent fails here, before any child is spawned, matching pi's `/chain`//
         // `/parallel` name check).
-        let resolved_agents = self.resolve_plan_personas(cwd, plan_step_agent_names(&graph))?;
+        let resolved_agents =
+            self.resolve_plan_personas(cwd, plan_step_agent_names(&graph), AgentReadScope::Both)?;
         // Fork default-mode + per-index branch (Tier-2, R-SA-137/R-SA-138, pi
         // `resolveAgentDefaultContextPolicy` + `preflightForkSessionsForStaticTasks`): resolve EACH
         // step's effective context independently (an omitted call-site `context` defers to THAT
@@ -1755,45 +1834,81 @@ impl SubagentExecutor {
         // to "(unavailable)" exactly as before this seam existed.
         let current_model = self.inherited_session_model().map(|m| m.as_str().to_string());
         let current_model = current_model.as_deref();
+        // pi `ctx.model?.provider` (agent-management.ts:588) / the `ParentModel` a `model: undefined`
+        // (or the `"inherit"` sentinel) resolves to (`resolveSubagentModelOverride`,
+        // model-fallback.ts:47-59): both split off the SAME live `provider/id` string.
+        let preferred_provider = current_model
+            .and_then(|m| m.split_once('/'))
+            .map(|(provider, _)| provider);
+        let parent_model = current_model.and_then(|m| m.split_once('/'));
+        let available_models = seed_catalog_available_models();
+
         let cfg = Self::discovery_config(cwd).unwrap_or_else(|_| Self::discovery_dirs_config(cwd));
+        let default_model_scope = resolve_default_model_scope(&cfg.override_settings);
         let discovered = match crate::discovery::discover_agents_all(&cfg) {
             Ok(discovered) => discovered,
             Err(err) => return format!("subagents-models: discovery failed: {err}"),
         };
 
-        let mut builtins: Vec<&AgentDefinition> = discovered
+        let builtin_by_name: std::collections::HashMap<&str, &AgentDefinition> = discovered
             .agents
             .iter()
             .filter(|agent| agent.source == AgentSource::Builtin)
+            .map(|agent| (agent.name.as_str(), agent))
             .collect();
-        builtins.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // pi `params.agent?.trim()` (agent-management.ts:581): a whitespace-only/empty `agent`
+        // string is JS-falsy and treated as "no agent requested" — it falls through to the
+        // all-agents view below, it is NOT looked up as a builtin named "".
+        let requested_agent = requested_agent.map(str::trim).filter(|s| !s.is_empty());
 
         if let Some(requested) = requested_agent {
-            let requested = requested.trim();
-            let Some(agent) = builtins.iter().find(|agent| agent.name == requested) else {
-                let available = if builtins.is_empty() {
-                    "none".to_string()
-                } else {
-                    builtins
-                        .iter()
-                        .map(|agent| agent.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                return format!("Builtin agent '{requested}' not found. Available: {available}.");
+            // pi's first gate (agent-management.ts:581-583) checks the STATIC `BUILTIN_AGENT_NAMES`
+            // list, not whatever discovery happened to find.
+            if !BUILTIN_AGENT_NAMES.contains(&requested) {
+                return format!(
+                    "Builtin agent '{requested}' not found. Available: {}.",
+                    BUILTIN_AGENT_NAMES.join(", ")
+                );
+            }
+            // pi's second gate (agent-management.ts:589-590): the name is a real builtin name, but
+            // discovery didn't resolve it (a broken/incomplete build) — a DIFFERENT message with no
+            // "Available" suffix, since the name was already validated above.
+            let Some(agent) = builtin_by_name.get(requested).copied() else {
+                return format!("Builtin agent '{requested}' not found.");
             };
 
+            let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let resolved_model = resolve_subagent_model_override(
+                requested_model_str,
+                parent_model,
+                &available_models,
+                preferred_provider,
+            );
             let mut lines = vec![
                 "Builtin subagent model".to_string(),
                 String::new(),
                 format!("Agent: {requested}"),
                 "Effective model:".to_string(),
-                format!("  {}", resolved_builtin_model(agent, current_model)),
-                format!("Source: {}", format_model_source(agent, current_model)),
+                format!("  {}", resolved_model.as_deref().unwrap_or("(unresolved)")),
+                format!(
+                    "Source: {}",
+                    format_model_source(agent, current_model, default_model_scope)
+                ),
             ];
             if let Some(override_info) = &agent.override_info {
                 lines.push("Override file:".to_string());
                 lines.push(format!("  {}", override_info.settings_path.display()));
+            }
+            // pi `agent.model && resolvedModel && agent.model !== resolvedModel`
+            // (agent-management.ts:596-599): only shown when the persona declared a raw setting AND
+            // it differs from the resolved model (e.g. a bare id resolved to its full `provider/id`,
+            // or an explicit override that isn't the resolved value).
+            if let (Some(raw), Some(resolved)) = (requested_model_str, resolved_model.as_deref())
+                && raw != resolved
+            {
+                lines.push("Requested model setting:".to_string());
+                lines.push(format!("  {raw}"));
             }
             if agent.disabled == Some(true) {
                 lines.push("Disabled: true".to_string());
@@ -1810,19 +1925,40 @@ impl SubagentExecutor {
             format!("  {}", current_model.unwrap_or("(unavailable)")),
             String::new(),
         ];
-        if builtins.is_empty() {
-            lines.push("(no builtin subagents discovered in this build)".to_string());
-        }
-        for agent in &builtins {
+        // pi's all-agents view walks the fixed `BUILTIN_AGENT_NAMES` list (agent-management.ts:608),
+        // not whatever discovery happened to find — a name discovery didn't resolve gets its own
+        // "missing" row rather than silently shrinking the report.
+        for name in BUILTIN_AGENT_NAMES {
+            let Some(agent) = builtin_by_name.get(name).copied() else {
+                lines.push(name.to_string());
+                lines.push("  model:".to_string());
+                lines.push("    (builtin definition not found)".to_string());
+                lines.push("  source: missing".to_string());
+                lines.push(String::new());
+                continue;
+            };
+            let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let resolved_model = resolve_subagent_model_override(
+                requested_model_str,
+                parent_model,
+                &available_models,
+                preferred_provider,
+            );
             let disabled_suffix = if agent.disabled == Some(true) {
                 "; disabled"
             } else {
                 ""
             };
-            lines.push(agent.name.clone());
+            lines.push(name.to_string());
             lines.push("  model:".to_string());
-            lines.push(format!("    {}", resolved_builtin_model(agent, current_model)));
-            lines.push(format!("  source: {}{disabled_suffix}", format_model_source(agent, current_model)));
+            lines.push(format!(
+                "    {}",
+                resolved_model.as_deref().unwrap_or("(unresolved)")
+            ));
+            lines.push(format!(
+                "  source: {}{disabled_suffix}",
+                format_model_source(agent, current_model, default_model_scope)
+            ));
             lines.push(String::new());
         }
         lines.join("\n")
@@ -1831,14 +1967,43 @@ impl SubagentExecutor {
     /// Resume background-run tracking from disk (R-SA-093's "resume on session start" note in
     /// `on_event`'s own doc): re-discover any run directories still present under this cwd's
     /// `AsyncRoot` from a prior process and re-track them, so a restarted orchestrator does not
-    /// lose visibility into still-running or recently-terminated detached runs.
+    /// lose visibility into still-running detached runs.
+    ///
+    /// Mirrors pi's `restoreActiveJobs` (`async-job-tracker.ts:405-420`) exactly: only runs whose
+    /// RECONCILED state is `queued` or `running` are re-tracked — a run that has already reached a
+    /// terminal state (`complete`/`failed`/`paused`) by the time this process restarts is NOT
+    /// re-tracked (pi's own `listAsyncRuns({ states: ["queued", "running"] })` filter), and each
+    /// restored job's `events.jsonl` byte cursor is seeded from the file's CURRENT size (pi's
+    /// `restoredControlEventCursor`, ENOENT → 0) so historical control events already written before
+    /// this process existed are never re-tailed. A `read_dir` failure on the `AsyncRoot` itself is
+    /// logged (pi's `console.error` in the listing `catch`) rather than silently swallowed.
     pub async fn resume_tracking(&self, cwd: &Path) {
         let async_root = default_async_root(cwd);
         let results_dir = default_results_dir(cwd);
-        let Ok(mut entries) = tokio::fs::read_dir(&async_root).await else {
-            return;
+        let mut entries = match tokio::fs::read_dir(&async_root).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    async_root = %async_root.display(),
+                    "failed to restore active async jobs: could not list AsyncRoot"
+                );
+                return;
+            }
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        async_root = %async_root.display(),
+                        "failed to restore active async jobs: error reading AsyncRoot entry"
+                    );
+                    break;
+                }
+            };
             let Ok(file_type) = entry.file_type().await else {
                 continue;
             };
@@ -1850,10 +2015,36 @@ impl SubagentExecutor {
             };
             let run_id = RunId::from_token(name);
             let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-            // A terminal run (ResultFile already present) is still worth tracking briefly so the
-            // R-SA-105 retention window can surface its completion once more to a fresh session;
-            // `track` itself is cheap and idempotent, so no pre-filtering is needed here.
-            self.tracker.track(run_id, paths, None).await;
+
+            // Only queued/running runs are restored (pi: `listAsyncRuns({ states: ["queued",
+            // "running"] })`) — reconcile first so a run that is claimed-Running-but-actually-dead
+            // is correctly classified as terminal (Failed) rather than spuriously re-tracked.
+            let Ok(outcome) = crate::background::reconcile::reconcile_now(&paths, None).await
+            else {
+                continue;
+            };
+            if !matches!(outcome.status.state, RunState::Queued | RunState::Running) {
+                continue;
+            }
+
+            // Seed the events cursor at the file's CURRENT size (pi: `restoredControlEventCursor`)
+            // so this process never re-tails control events a prior process already consumed.
+            let events_cursor = match tokio::fs::metadata(&paths.events).await {
+                Ok(metadata) => metadata.len(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        events_path = %paths.events.display(),
+                        "failed to stat events.jsonl while restoring async job; seeding cursor at 0"
+                    );
+                    0
+                }
+            };
+
+            self.tracker
+                .track_restored(run_id, paths, events_cursor)
+                .await;
         }
     }
 
@@ -1880,6 +2071,7 @@ impl SubagentExecutor {
         cwd: &Path,
         id: Option<&str>,
         dir: Option<&str>,
+        child_safe: bool,
     ) -> Result<String, String> {
         let async_root = default_async_root(cwd);
         let results_dir = default_results_dir(cwd);
@@ -1895,6 +2087,17 @@ impl SubagentExecutor {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Async run not found. Provide id or dir.".to_string()),
             (None, None) => {
+                // pi `run-status.ts:104-110`: the child-safe fanout tool (`deps.nested` truthy,
+                // which pi sets whenever `allowMutatingManagementActions === false`) never lists
+                // the cwd's active runs on a no-id status call — it hard-errors, since a fanout
+                // child has no business enumerating its parent's whole async root.
+                if child_safe {
+                    return Err(
+                        "Child-safe subagent status requires an id when no foreground run is \
+                         active."
+                            .to_string(),
+                    );
+                }
                 let runs = run_status::list_active_runs(&async_root, &results_dir)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -1990,28 +2193,42 @@ impl SubagentExecutor {
                 // REAL agent + its flat index reproduce the SAME
                 // `resolve_subagent_intercom_target(run_id, agent, index)` string the child
                 // registered its broker presence under at spawn.
-                let (child_target, child_agent) = {
-                    let source_paths = RunPaths::for_run(
-                        &async_root,
-                        &results_dir,
-                        &RunId::from_token(run_id.to_string()),
-                    );
-                    match control::reconcile_before_control_op(&source_paths).await {
-                        Ok(status) => match status.steps.get(step_index) {
-                            Some(step) => (
-                                Some(
-                                    crate::spawn::intercom_target::resolve_subagent_intercom_target(
-                                        run_id,
-                                        &step.agent,
-                                        step_index,
-                                    ),
-                                ),
-                                Some(step.agent.clone()),
-                            ),
-                            None => (None, None),
-                        },
-                        Err(_) => (None, None),
+                let source_paths = RunPaths::for_run(
+                    &async_root,
+                    &results_dir,
+                    &RunId::from_token(run_id.to_string()),
+                );
+                // pi `interruptLiveAsyncResumeTarget` (`background/async-resume.ts:53-56`):
+                // re-reconcile and REQUIRE `status.state === "running"` with a numeric pid before
+                // even attempting to interrupt — a reconciliation failure, a run that is no longer
+                // Running, or a Running status with no known runner pid all abort the WHOLE resume
+                // with this exact diagnostic, rather than silently falling through to steer a child
+                // that was never confirmed interruptible.
+                let status = match control::reconcile_before_control_op(&source_paths).await {
+                    Ok(status) if status.state == RunState::Running && status.pid.is_some() => {
+                        status
                     }
+                    _ => {
+                        return Err(format!(
+                            "Async run {run_id} is live but no interrupt-capable runner pid was \
+                             found."
+                        ));
+                    }
+                };
+                // Recover the child's deterministic target from the reconciled run status — the
+                // resumed step's REAL agent + its flat index reproduce the SAME
+                // `resolve_subagent_intercom_target(run_id, agent, index)` string the child
+                // registered its broker presence under at spawn.
+                let (child_target, child_agent) = match status.steps.get(step_index) {
+                    Some(step) => (
+                        Some(crate::spawn::intercom_target::resolve_subagent_intercom_target(
+                            run_id,
+                            &step.agent,
+                            step_index,
+                        )),
+                        Some(step.agent.clone()),
+                    ),
+                    None => (None, None),
                 };
                 // Interrupt the live child (genuine), matching pi's interrupt-then-deliver order
                 // (`subagent-executor.ts:846-859`): a FAILED interrupt is returned as the error
@@ -2107,7 +2324,16 @@ impl SubagentExecutor {
             .ok_or_else(|| {
                 SubagentError::AgentNotFound(format!("no step at index {step_index} to revive"))
             })?;
-        let resolved_agents = self.resolve_plan_personas(cwd, [agent.clone()])?;
+        // pi `effectiveCwd = target.cwd ?? requestCwd` (`subagent-executor.ts:890`, fed by
+        // `target.cwd` = `status.cwd ?? result.cwd`, `background/async-resume.ts:373`): the revived
+        // child's persona discovery AND its actual spawn cwd prefer the ORIGINAL run's own working
+        // directory (persisted onto the reconciled status by `finish_run`,
+        // `background/runner_main.rs`) over whatever cwd happens to be current at resume time —
+        // never silently reroute a revived agent into a different directory than the one it was
+        // originally invoked from.
+        let effective_cwd = status.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+        let resolved_agents =
+            self.resolve_plan_personas(&effective_cwd, [agent.clone()], AgentReadScope::Both)?;
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
         let step = SingleStepSpec {
@@ -2130,7 +2356,7 @@ impl SubagentExecutor {
         };
         let new_id = self
             .spawn_background_steps(
-                cwd,
+                &effective_cwd,
                 BackgroundStepsSpec {
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
@@ -2233,7 +2459,7 @@ impl SubagentExecutor {
             .map(str::to_string);
         // pi validates every appended agent exists before enqueuing (`buildAsyncRunnerSteps` errors
         // on an unknown agent name); resolve it via real discovery for the same fail-fast behavior.
-        self.resolve_agent(cwd, agent)
+        self.resolve_agent(cwd, agent, AgentReadScope::Both)
             .map_err(|e| format!("Cannot append step to run '{run_id}': {e}"))?;
         let step = SingleStepSpec {
             agent: agent.to_string(),
@@ -2279,6 +2505,177 @@ impl SubagentExecutor {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Nested-control inbox listener (T6, pi `fanout-child.ts:53-128`): serviced ONLY by a
+    // `RegistrationMode::ChildSafe` process that inherited a nested route from its own parent's
+    // env — a grandparent orchestrator's interrupt/resume request targeting a run nested two (or
+    // more) levels deep is routed here rather than lost.
+    // ---------------------------------------------------------------------------------------
+
+    /// Start the listener (pi `startNestedControlInboxListener`, `fanout-child.ts:53-63,125-128`):
+    /// resolve the inherited nested route from the process env — a resolution error is swallowed
+    /// (no listener), as is the "no inherited route" case (`Ok(None)`) — and, only when a real route
+    /// was found, spawn the 200ms poll loop as a detached background task. Called once from
+    /// [`RegistrationMode::ChildSafe`] `init()`.
+    pub(crate) fn start_nested_control_inbox_listener(self: &Arc<Self>) {
+        let route = match crate::spawn::nested_events::resolve_nested_route_from_env(|key| {
+            std::env::var(key).ok()
+        }) {
+            Ok(Some(route)) => route,
+            Ok(None) | Err(_) => return,
+        };
+        let executor = Arc::clone(self);
+        tokio::spawn(async move { executor.run_nested_control_inbox_listener(route).await });
+    }
+
+    /// The 200ms poll loop body (pi's `setInterval(..., 200)`, `fanout-child.ts:64-125`; `.unref()`
+    /// has no analog — this crate has no process-exit-blocking-task concern here since the listener
+    /// only ever runs inside a fanout child's own detached OS process). Runs for the lifetime of the
+    /// process; a poll-tick error is logged and the loop continues, exactly as pi's per-tick
+    /// `try`/`catch` around the whole poll body.
+    async fn run_nested_control_inbox_listener(
+        self: Arc<Self>,
+        route: crate::spawn::nested_events::NestedRoute,
+    ) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut pending_results: HashMap<String, crate::spawn::nested_events::NestedControlResultInput> =
+            HashMap::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+        loop {
+            ticker.tick().await;
+            self.poll_nested_control_inbox_once(&route, &mut seen, &mut pending_results)
+                .await;
+        }
+    }
+
+    /// One poll tick: read every pending request, skip already-`seen` ones (pi's `seen`/`inFlight`
+    /// dedup — this loop processes one tick to completion before the next ever ticks, so no request
+    /// can be revisited mid-flight the way pi's concurrently-spawned per-request IIFEs could), resolve
+    /// each new one, and write back its result — pi `fanout-child.ts:66-121`.
+    async fn poll_nested_control_inbox_once(
+        &self,
+        route: &crate::spawn::nested_events::NestedRoute,
+        seen: &mut HashSet<String>,
+        pending_results: &mut HashMap<String, crate::spawn::nested_events::NestedControlResultInput>,
+    ) {
+        let requests = match crate::spawn::nested_events::read_nested_control_requests(route) {
+            Ok(requests) => requests,
+            Err(err) => {
+                // pi `console.error("Failed to poll nested control inbox '...' for root '...':", error)`
+                // (`fanout-child.ts:122-124`): logged, never fatal — the next tick tries again.
+                eprintln!(
+                    "Failed to poll nested control inbox '{}' for root '{}': {err}",
+                    route.control_inbox.display(),
+                    route.root_run_id
+                );
+                return;
+            }
+        };
+        for (request, file_path) in requests {
+            if seen.contains(&request.request_id) {
+                continue;
+            }
+            let result = match pending_results.remove(&request.request_id) {
+                // A prior tick already resolved this request but failed to WRITE the result — pi
+                // retries the write with the SAME cached result rather than re-resolving it
+                // (`fanout-child.ts:71-72`).
+                Some(cached) => cached,
+                None => {
+                    let (ok, message) = self.resolve_nested_control_request(&request).await;
+                    crate::spawn::nested_events::NestedControlResultInput {
+                        ts: crate::spawn::nested_events::now_ms(),
+                        request_id: request.request_id.clone(),
+                        target_run_id: request.target_run_id.clone(),
+                        ok,
+                        message,
+                    }
+                }
+            };
+            match crate::spawn::nested_events::write_nested_control_result(route, &result) {
+                Ok(()) => {
+                    // pi: mark `seen`, drop the pending cache, unlink the request file (unlink errors
+                    // swallowed) — `fanout-child.ts:114-116`.
+                    seen.insert(request.request_id.clone());
+                    let _ = std::fs::remove_file(&file_path);
+                }
+                Err(err) => {
+                    // pi: cache the resolved result for retry and KEEP the request file —
+                    // `fanout-child.ts:109-113`.
+                    eprintln!(
+                        "Failed to write nested control result for request '{}' targeting '{}' via \
+                         inbox '{}'; keeping request for retry: {err}",
+                        request.request_id,
+                        request.target_run_id,
+                        route.control_inbox.display()
+                    );
+                    pending_results.insert(request.request_id.clone(), result);
+                }
+            }
+        }
+    }
+
+    /// Resolve one nested control request against this executor's live `foreground_controls`
+    /// registry — pi's per-request body inside `startNestedControlInboxListener`
+    /// (`fanout-child.ts:73-104`). Guard order (exact): target-not-active -> `interrupt` action ->
+    /// blank message -> no current agent -> intercom delivery. Returns `(ok, message)`, the exact
+    /// pair `writeNestedControlResult`'s `{ok, message}` carries.
+    async fn resolve_nested_control_request(
+        &self,
+        request: &crate::spawn::nested_events::NestedControlRequestRecord,
+    ) -> (bool, String) {
+        let target = request.target_run_id.as_str();
+        let control = {
+            let controls = self
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.get(target).cloned()
+        };
+        let Some(control) = control else {
+            return (
+                false,
+                format!("Nested run {target} is not active in this fanout child."),
+            );
+        };
+        if request.action == "interrupt" {
+            // pi `ok = control.interrupt?.() === true`: a token not yet cancelled has an active step
+            // to interrupt (fire it, report success); an already-cancelled token has none left.
+            let ok = !control.interrupt.is_cancelled();
+            control.interrupt.cancel();
+            let message = if ok {
+                format!("Interrupt requested for nested run {target}.")
+            } else {
+                format!("Nested run {target} has no active child step to interrupt.")
+            };
+            return (ok, message);
+        }
+        let trimmed = request.message.as_deref().map(str::trim).unwrap_or("");
+        if trimmed.is_empty() {
+            return (false, "Nested resume requires message.".to_string());
+        }
+        let Some(agent) = control.current_agent.clone() else {
+            return (
+                false,
+                format!("Nested run {target} has no active child message route."),
+            );
+        };
+        let index = control.current_index.unwrap_or(0);
+        let intercom_target =
+            crate::spawn::intercom_target::resolve_subagent_intercom_target(target, &agent, index);
+        let ok = crate::tui::intercom::steer_with_default_timeout(
+            self.steer.as_ref(),
+            intercom_target.clone(),
+            format!("Follow-up for nested run {target} ({agent}):\n\n{trimmed}"),
+        )
+        .await;
+        let message = if ok {
+            format!("Delivered follow-up to live nested run {target}.")
+        } else {
+            format!("Nested child intercom target is not registered: {intercom_target}")
+        };
+        (ok, message)
     }
 }
 
@@ -2761,6 +3158,12 @@ CONTROL:
 DIAGNOSTICS:
 • { action: "doctor" } - read-only report for runtime paths, discovery, sessions, and intercom"#;
 
+/// The fanout-child's restricted tool description — pi's exact 3-line text
+/// (`fanout-child.ts:159-163`, joined with `\n`): tells the model up front which management/control
+/// actions remain available and which mutation actions are blocked in this mode, rather than only
+/// discovering the block via a runtime [`ToolError`] from [`SubagentTool::route_management_action`].
+const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, append-step, doctor.\nAgent config mutation actions create, update, and delete are blocked in this mode.";
+
 /// The `subagent` tool's full discriminated-union parameter surface (R-SA-128, C8) — the Rust parse
 /// target for pi's `SubagentParamsSchema` (`src/extension/schemas.ts:195-265`). Every top-level pi
 /// field is represented so the tool can drive SINGLE (`agent`/`task`), PARALLEL (`tasks`/
@@ -2832,6 +3235,20 @@ fn resolve_foreground_timeout(p: &SubagentToolParams) -> Result<Option<u64>, Str
         );
     }
     Ok(p.timeout_ms.or(p.max_runtime_ms))
+}
+
+/// pi `resolveExecutionAgentScope` (`pi-subagents/src/agents/agent-scope.ts:3-6`): `"user"`/
+/// `"project"`/`"both"` pass through verbatim; anything else (absent, or any other garbage
+/// string) coerces to `Both` with no error. Every execution entry point (single/parallel/chain
+/// dispatch, resume, append-step) calls this on the raw `agentScope` tool param before threading
+/// the result into agent discovery, so an unrecognized value is never rejected — it silently
+/// yields the unnarrowed (both user- and project-scope) view, exactly like an absent value.
+fn resolve_execution_agent_scope(raw: Option<&str>) -> AgentReadScope {
+    match raw {
+        Some("user") => AgentReadScope::User,
+        Some("project") => AgentReadScope::Project,
+        _ => AgentReadScope::Both,
+    }
 }
 
 /// pi `formatFailedSingleRunOutput` (`subagent-executor.ts:1041-1052`): the delivered content for a
@@ -3599,6 +4016,12 @@ pub struct SubagentTool {
     executor: Arc<SubagentExecutor>,
     cwd: PathBuf,
     parameters: serde_json::Value,
+    /// The mode-specific tool description (T6, pi `fanout-child.ts:159-163`): the root orchestrator
+    /// advertises [`SUBAGENT_TOOL_DESCRIPTION`]; a fanout child advertises
+    /// [`CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION`] instead, so the model inside a restricted child is
+    /// told up front which management actions are blocked rather than only discovering the block via
+    /// a runtime [`ToolError`].
+    description: &'static str,
     /// Whether the mutating management actions (`create`/`update`/`delete`) are permitted (T6). The
     /// root orchestrator tool sets this `true`; a fanout-child's restricted tool sets it `false`, so
     /// a child can list/get/delegate but cannot rewrite the parent's agent config on disk (pi
@@ -3620,17 +4043,21 @@ impl SubagentTool {
             executor,
             cwd,
             parameters: subagent_tool_parameters(),
+            description: SUBAGENT_TOOL_DESCRIPTION,
             allow_mutating_management: true,
             dispatch_guard: DispatchGuard::new(),
         }
     }
 
     /// The restricted child-safe tool (T6, pi `fanout-child.ts`): identical to [`SubagentTool::new`]
-    /// except the agent-config mutation actions (`create`/`update`/`delete`) are blocked.
+    /// except the agent-config mutation actions (`create`/`update`/`delete`) are blocked, and the
+    /// advertised description is pi's exact 3-line child-safe text (`fanout-child.ts:159-163`)
+    /// instead of the full orchestrator prompt.
     #[must_use]
     fn new_child_safe(executor: Arc<SubagentExecutor>, cwd: PathBuf) -> Self {
         Self {
             allow_mutating_management: false,
+            description: CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION,
             ..Self::new(executor, cwd)
         }
     }
@@ -3737,7 +4164,14 @@ impl SubagentTool {
             }
             let run_id = self
                 .executor
-                .spawn_background(cwd, agent, &task, context, model.clone())
+                .spawn_background(
+                    cwd,
+                    agent,
+                    &task,
+                    context,
+                    model.clone(),
+                    resolve_execution_agent_scope(p.agent_scope.as_deref()),
+                )
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
             // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
@@ -3769,6 +4203,7 @@ impl SubagentTool {
                     cwd,
                     agent_name: agent,
                     task: &task,
+                    agent_scope: resolve_execution_agent_scope(p.agent_scope.as_deref()),
                     context,
                     model_override: model,
                     timeout_ms,
@@ -3995,7 +4430,9 @@ impl SubagentTool {
                 // but a caller using `runId` alone must still resolve to that run's report instead of
                 // falling through to the no-id "list active runs" view.
                 let target = p.id.as_deref().or(p.run_id.as_deref());
-                self.executor.control_status(cwd, target, p.dir.as_deref()).await
+                self.executor
+                    .control_status(cwd, target, p.dir.as_deref(), !self.allow_mutating_management)
+                    .await
             }
             "interrupt" => {
                 // pi interrupt prefers `runId` over `id` (`subagent-executor.ts:2872`).
@@ -4330,7 +4767,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        SUBAGENT_TOOL_DESCRIPTION
+        self.description
     }
 
     async fn execute(
@@ -4781,6 +5218,12 @@ impl NativeExtension for SubagentsExtension {
                 // A fanout-authorized child also runs none of the Full arm's startup housekeeping
                 // below — pi's own `fanout-child.ts` entry point likewise never calls
                 // `ensureAccessibleDir`/the cleanup sweeps at all.
+                //
+                // pi `startNestedControlInboxListener(pi, state)` (`fanout-child.ts:171`): started
+                // AFTER the restricted tool registers, so a grandparent orchestrator's interrupt/
+                // resume request targeting a run nested inside THIS child is serviced rather than
+                // rotting unread in the controls inbox.
+                self.executor.start_nested_control_inbox_listener();
             }
             RegistrationMode::Full => {
                 // T6 startup housekeeping (pi `extension/index.ts:257-264`), run ONCE here at
@@ -4971,7 +5414,14 @@ impl SubagentsExtension {
                 if parsed.flags.background {
                     let run_id = self
                         .executor
-                        .spawn_background(cwd, &parsed.agent, &parsed.task, context, model)
+                        .spawn_background(
+                            cwd,
+                            &parsed.agent,
+                            &parsed.task,
+                            context,
+                            model,
+                            AgentReadScope::Both,
+                        )
                         .await?;
                     Ok(format!("Background subagent run started: {run_id}"))
                 } else {
@@ -5962,49 +6412,168 @@ fn render_chain_results(results: &[StepResult], is_group: &[bool], groups: &[Gro
     out
 }
 
-/// The effective model a discovered builtin persona resolves to for `/subagents-models` (pi
-/// `resolveSubagentModelOverride`'s cyrup-observable result): the persona's own configured `model`
-/// if it declares one, else — matching pi's `parentModel` inherit branch — the live
-/// `current_session_model` (`HostServices::current_model`, `provider/id`) when a session is bound,
-/// and only the "(inherits current session model)" placeholder when there is genuinely no live
-/// session model to resolve it against (see [`SubagentExecutor::run_models_report`]'s doc).
-fn resolved_builtin_model(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
-    agent
-        .model
-        .as_ref()
-        .map(|model| model.as_str().to_string())
-        .or_else(|| current_session_model.map(str::to_string))
-        .unwrap_or_else(|| "(inherits current session model)".to_string())
+/// pi `BUILTIN_AGENT_NAMES` (`agents.ts:25-33`): the fixed 8 shipped builtin personas, in pi's
+/// declared order. `/subagents-models`' all-agents view (and the single-agent name gate) walks
+/// EXACTLY this static list — not whatever discovery happened to find — so a name discovery didn't
+/// resolve renders its own "missing"/"not found" row rather than silently shrinking the report.
+const BUILTIN_AGENT_NAMES: [&str; 8] = [
+    "context-builder",
+    "delegate",
+    "oracle",
+    "planner",
+    "researcher",
+    "reviewer",
+    "scout",
+    "worker",
+];
+
+/// pi's `INHERIT_MODEL` sentinel (`runs/shared/model-fallback.ts:22`): a persona's `model` set to
+/// the literal string `"inherit"` requests the parent session's model exactly as if `model` were
+/// unset — it is NOT a real model id to resolve against the catalog or print verbatim.
+const INHERIT_MODEL_SENTINEL: &str = "inherit";
+
+/// pi `splitThinkingSuffix` (`runs/shared/model-fallback.ts:13-19`): split a model string on its
+/// LAST `:`, isolating a trailing thinking-level suffix (`:high`, `:off`, ...) from the base model
+/// id. No suffix present -> empty suffix, base = the whole string.
+fn split_thinking_suffix(model: &str) -> (&str, &str) {
+    match model.rfind(':') {
+        Some(idx) => (model.get(..idx).unwrap_or(model), model.get(idx..).unwrap_or("")),
+        None => (model, ""),
+    }
+}
+
+/// One entry of pi's `ctx.modelRegistry.getAvailable()` (`shared/model-info.ts`'s `ModelInfo`),
+/// reduced to the three fields `resolve_model_candidate` consults.
+struct AvailableModelEntry {
+    provider: String,
+    id: String,
+    full_id: String,
+}
+
+/// This crate's established live-model-registry stand-in (see `render_profile_check_report`'s
+/// identical use of `cyrup_provider::catalog::seed_catalog()`): pi reads
+/// `ctx.modelRegistry.getAvailable()`, a live list of models actually configured/available to the
+/// user; this crate has no such live registry (a documented P-1 gap), so the full seed catalog
+/// serves as the stand-in.
+fn seed_catalog_available_models() -> Vec<AvailableModelEntry> {
+    cyrup_provider::catalog::seed_catalog()
+        .into_iter()
+        .map(|m| AvailableModelEntry {
+            provider: m.provider.as_str().to_string(),
+            id: m.id.as_str().to_string(),
+            full_id: format!("{}/{}", m.provider.as_str(), m.id.as_str()),
+        })
+        .collect()
+}
+
+/// pi `resolveModelCandidate` (`runs/shared/model-fallback.ts:60-76`): resolve a bare or
+/// fully-qualified model string against the available-model list. A `provider/id` string passes
+/// through unchanged; a bare id resolves to its `fullId` when exactly one available model matches
+/// (or, when multiple providers offer the same bare id, the `preferred_provider`'s match wins); an
+/// unmatched bare id (no available models, or an ambiguous match with no preferred-provider hit)
+/// passes through unchanged — pi's fallback `return model`.
+fn resolve_model_candidate(
+    model: Option<&str>,
+    available: &[AvailableModelEntry],
+    preferred_provider: Option<&str>,
+) -> Option<String> {
+    let model = model?;
+    if model.is_empty() {
+        return None;
+    }
+    if model.contains('/') {
+        return Some(model.to_string());
+    }
+    if available.is_empty() {
+        return Some(model.to_string());
+    }
+    let (base_model, thinking_suffix) = split_thinking_suffix(model);
+    let matches: Vec<&AvailableModelEntry> =
+        available.iter().filter(|entry| entry.id == base_model).collect();
+    if let Some(preferred) = preferred_provider
+        && let Some(m) = matches.iter().find(|entry| entry.provider == preferred)
+    {
+        return Some(format!("{}{thinking_suffix}", m.full_id));
+    }
+    if matches.len() != 1 {
+        return Some(model.to_string());
+    }
+    let only = matches.into_iter().next()?;
+    Some(format!("{}{thinking_suffix}", only.full_id))
+}
+
+/// pi `resolveSubagentModelOverride` (`runs/shared/model-fallback.ts:47-59`): the effective model a
+/// discovered builtin persona resolves to. `requested_model` unset, empty, or the `"inherit"`
+/// sentinel all resolve to the live parent session model (`provider/id`) when one is bound, else
+/// `None` (pi's "(unresolved)" case); any other explicit value is resolved via
+/// [`resolve_model_candidate`].
+fn resolve_subagent_model_override(
+    requested_model: Option<&str>,
+    parent_model: Option<(&str, &str)>,
+    available: &[AvailableModelEntry],
+    preferred_provider: Option<&str>,
+) -> Option<String> {
+    let trimmed = requested_model.map(str::trim).unwrap_or("");
+    let explicit = (!trimmed.is_empty() && trimmed != INHERIT_MODEL_SENTINEL).then_some(trimmed);
+    match explicit {
+        None => parent_model.map(|(provider, id)| format!("{provider}/{id}")),
+        Some(explicit) => resolve_model_candidate(Some(explicit), available, preferred_provider),
+    }
+}
+
+/// pi `resolveSubagentDefaultModel` (`agents.ts:716-728`): which scope's `subagents.defaultModel`
+/// wins (project beats user when the project scope exists and declares one). `merge.rs`'s
+/// `apply_default_model` already guarantees that whenever an agent's `model_source` is still
+/// [`AgentModelSourceInfo::SettingsDefault`], `model` equals exactly the value this same
+/// precedence resolves to (any override that changes `model` also resets `model_source` away from
+/// `SettingsDefault`) — so [`format_model_source`] only needs the WINNING SCOPE from here, not the
+/// value itself, to render pi's scope-qualified `"{scope} defaultModel"` provenance.
+fn resolve_default_model_scope(settings: &LayeredOverrideSettings) -> Option<&'static str> {
+    if settings.project_settings_path.is_some() && settings.project.default_model.is_some() {
+        return Some("project");
+    }
+    if settings.user.default_model.is_some() {
+        return Some("user");
+    }
+    None
 }
 
 /// Provenance of a builtin persona's resolved model (pi `formatModelSource`,
-/// agent-management.ts:565-578), derived from discovery's own `override_info`/`model_source`
-/// provenance rather than re-deriving the config-layering walk. When the persona declares no
-/// `model` but a live `current_session_model` is bound, the inherit branch reports "inherits
-/// current session model" (pi `formatModelSource`, agent-management.ts:576) rather than the
-/// no-live-session degrade.
-fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
-    if let Some(override_info) = &agent.override_info {
+/// agent-management.ts:565-578). `default_model_scope` is [`resolve_default_model_scope`]'s
+/// result for the current discovery run.
+fn format_model_source(
+    agent: &AgentDefinition,
+    current_session_model: Option<&str>,
+    default_model_scope: Option<&str>,
+) -> String {
+    // pi `agent.override && agent.model !== agent.override.base.model` (agent-management.ts:566-568):
+    // the override branch fires only when the override actually changed the resolved model, not
+    // merely because an override happens to be recorded (e.g. it only touched `disabled`/`tools`).
+    if let Some(override_info) = &agent.override_info
+        && agent.model != override_info.base_snapshot.model
+    {
         let scope = match override_info.scope {
             OverrideScope::User => "user",
             OverrideScope::Project => "project",
         };
         return format!("{scope} override");
     }
-    match agent.model_source {
-        Some(AgentModelSourceInfo::SettingsDefault) => "settings defaultModel".to_string(),
-        Some(AgentModelSourceInfo::SettingsOverride) => "settings override".to_string(),
-        Some(AgentModelSourceInfo::Frontmatter) => "builtin agent config".to_string(),
-        Some(AgentModelSourceInfo::Unresolved) | None => {
-            if agent.model.is_some() {
-                "builtin agent config".to_string()
-            } else if current_session_model.is_some() {
-                "inherits current session model".to_string()
-            } else {
-                "inherit requested, but no current session model is available".to_string()
-            }
-        }
+    // pi `agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model`
+    // (agent-management.ts:569-571): scope-qualified provenance, gated on the model still matching
+    // what the default actually supplied (see this function's doc for why the value check is
+    // redundant here and the scope alone suffices).
+    if agent.model_source == Some(AgentModelSourceInfo::SettingsDefault)
+        && let Some(scope) = default_model_scope
+    {
+        return format!("{scope} defaultModel");
     }
+    if agent.model.is_some() {
+        return "builtin agent config".to_string();
+    }
+    if current_session_model.is_some() {
+        return "inherits current session model".to_string();
+    }
+    "inherit requested, but no current session model is available".to_string()
 }
 
 // =================================================================================================
@@ -7245,6 +7814,164 @@ mod tests {
         );
     }
 
+    /// T6 parity regression (pi `fanout-child.ts:156-168`): the fanout child's restricted tool must
+    /// advertise pi's exact 3-line child-safe description — NOT the full orchestrator prompt — so
+    /// the model inside a fanout child is told up front which actions are blocked. Pre-fix,
+    /// `SubagentTool::description()` returned `SUBAGENT_TOOL_DESCRIPTION` unconditionally regardless
+    /// of mode, so this assertion fails against the pre-fix behavior.
+    #[test]
+    fn child_safe_tool_advertises_pis_restricted_three_line_description() {
+        let executor = Arc::new(SubagentExecutor::new());
+        let full = SubagentTool::new(executor.clone(), PathBuf::from("/tmp"));
+        let child_safe = SubagentTool::new_child_safe(executor, PathBuf::from("/tmp"));
+
+        assert_eq!(
+            Tool::description(&full),
+            SUBAGENT_TOOL_DESCRIPTION,
+            "the root orchestrator tool keeps the full description"
+        );
+        assert_eq!(
+            Tool::description(&child_safe),
+            "Delegate to subagents from child-safe fanout mode.\n\
+             Allowed management/control actions: list, get, status, interrupt, resume, append-step, doctor.\n\
+             Agent config mutation actions create, update, and delete are blocked in this mode.",
+            "the child-safe tool must advertise pi's exact fanout-child.ts:159-163 text"
+        );
+        assert_ne!(
+            Tool::description(&child_safe),
+            Tool::description(&full),
+            "a fanout child must NOT advertise the full orchestrator description"
+        );
+    }
+
+    /// T6 parity regression (pi `fanout-child.ts:53-128`): a nested-control "interrupt" request
+    /// targeting a run this executor has registered in `foreground_controls` must fire that run's
+    /// interrupt token and report success; targeting an unregistered run id must report pi's exact
+    /// "is not active in this fanout child" notice rather than silently doing nothing. Pre-fix, no
+    /// `foreground_controls` registry existed at all (`resolve_nested_control_request` did not
+    /// compile against the pre-fix `SubagentExecutor`), so this is a direct regression proof for the
+    /// previously entirely-absent nested-control inbox listener.
+    #[tokio::test]
+    async fn resolve_nested_control_request_interrupts_a_registered_run_and_rejects_unknown_ones() {
+        let executor = SubagentExecutor::new();
+        let token = CancelToken::new();
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.insert(
+                "run-nested-1".to_string(),
+                ForegroundControlEntry {
+                    interrupt: token.clone(),
+                    current_agent: Some("reviewer".to_string()),
+                    current_index: Some(0),
+                },
+            );
+        }
+
+        // Unknown target: pi's exact "not active in this fanout child" notice, `ok: false`.
+        let unknown_request = crate::spawn::nested_events::NestedControlRequestRecord {
+            event_type: "subagent.nested.control-request".to_string(),
+            ts: 0,
+            root_run_id: "root".to_string(),
+            capability_token: "token".to_string(),
+            request_id: "req-unknown".to_string(),
+            target_run_id: "run-does-not-exist".to_string(),
+            action: "interrupt".to_string(),
+            message: None,
+        };
+        let (ok, message) = executor.resolve_nested_control_request(&unknown_request).await;
+        assert!(!ok);
+        assert_eq!(
+            message,
+            "Nested run run-does-not-exist is not active in this fanout child."
+        );
+
+        // Registered target, action=interrupt: fires the SAME token the live run races against.
+        assert!(!token.is_cancelled());
+        let interrupt_request = crate::spawn::nested_events::NestedControlRequestRecord {
+            event_type: "subagent.nested.control-request".to_string(),
+            ts: 0,
+            root_run_id: "root".to_string(),
+            capability_token: "token".to_string(),
+            request_id: "req-interrupt".to_string(),
+            target_run_id: "run-nested-1".to_string(),
+            action: "interrupt".to_string(),
+            message: None,
+        };
+        let (ok, message) = executor.resolve_nested_control_request(&interrupt_request).await;
+        assert!(ok, "the first interrupt on a live token must succeed");
+        assert_eq!(message, "Interrupt requested for nested run run-nested-1.");
+        assert!(token.is_cancelled(), "the run's real interrupt token must now be cancelled");
+
+        // A second interrupt on the now-already-cancelled token has nothing left to interrupt.
+        let (ok, message) = executor.resolve_nested_control_request(&interrupt_request).await;
+        assert!(!ok);
+        assert_eq!(
+            message,
+            "Nested run run-nested-1 has no active child step to interrupt."
+        );
+    }
+
+    /// T6 parity regression: `action="resume"` with a blank/whitespace-only message must report
+    /// pi's exact "Nested resume requires message." notice (`fanout-child.ts:84-85`) BEFORE ever
+    /// consulting `currentAgent`/attempting intercom delivery.
+    #[tokio::test]
+    async fn resolve_nested_control_request_resume_requires_a_non_blank_message() {
+        let executor = SubagentExecutor::new();
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.insert(
+                "run-nested-2".to_string(),
+                ForegroundControlEntry {
+                    interrupt: CancelToken::new(),
+                    current_agent: Some("reviewer".to_string()),
+                    current_index: Some(0),
+                },
+            );
+        }
+        let blank_message_request = crate::spawn::nested_events::NestedControlRequestRecord {
+            event_type: "subagent.nested.control-request".to_string(),
+            ts: 0,
+            root_run_id: "root".to_string(),
+            capability_token: "token".to_string(),
+            request_id: "req-resume".to_string(),
+            target_run_id: "run-nested-2".to_string(),
+            action: "resume".to_string(),
+            message: Some("   ".to_string()),
+        };
+        let (ok, message) = executor.resolve_nested_control_request(&blank_message_request).await;
+        assert!(!ok);
+        assert_eq!(message, "Nested resume requires message.");
+    }
+
+    /// T6 parity regression (pi `subagent-executor.ts:2968` + `fanout-child.ts:148`): an OMITTED
+    /// `async` on a foreground-dispatched call must default to the extension config's
+    /// `asyncByDefault`, exactly as the fanout child threads `config.asyncByDefault` into its
+    /// executor. Also re-pins that `SubagentExtensionConfig` deserializes the config-file
+    /// `asyncByDefault` camelCase key into `async_by_default`, so a real `config.json` value
+    /// actually reaches `is_background` rather than staying stuck at the hardcoded default.
+    #[test]
+    fn async_by_default_config_key_deserializes_and_is_honored_by_is_background() {
+        let cfg: SubagentExtensionConfig =
+            serde_json::from_value(serde_json::json!({ "asyncByDefault": true })).unwrap_or_else(|e| {
+                panic!("asyncByDefault must deserialize into SubagentExtensionConfig: {e}")
+            });
+        assert!(cfg.async_by_default);
+
+        let omitted: SubagentToolParams =
+            serde_json::from_value(serde_json::json!({ "agent": "worker", "task": "do it" }))
+                .expect("single shape parses");
+        assert!(
+            omitted.is_background(&cfg, 0),
+            "an omitted `async` must honor a config-file-sourced asyncByDefault: true"
+        );
+    }
+
     /// C8 permissive parsing (DI-SA-11): the full pi-union parse target accepts the SINGLE,
     /// PARALLEL, CHAIN, management, and control shapes, ignores unknown keys, and reports which keys
     /// were supplied — the routing dimension every `execute` dispatch arm branches on.
@@ -7580,6 +8307,30 @@ mod tests {
         );
     }
 
+    /// pi `run-status.ts:104-110`: the child-safe fanout tool's `{ action: "status" }` call with no
+    /// id/runId/dir must hard-error with pi's exact message rather than listing the cwd's active
+    /// runs. Pre-fix, `SubagentTool::new_child_safe` had no way to signal this to `control_status`,
+    /// so this dispatch would have returned `Ok` with the "No active async runs." list instead of
+    /// this `Err`.
+    #[tokio::test]
+    async fn child_safe_tool_status_with_no_id_hard_errors_instead_of_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new_child_safe(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let err = tool
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "action": "status" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("child-safe no-id status must hard-error");
+        assert_eq!(
+            err.to_string(),
+            "Child-safe subagent status requires an id when no foreground run is active."
+        );
+    }
+
     /// pi `resolveRequestedCwd` (`subagent-executor.ts:193-195,2801-2802`): an explicit `cwd` param
     /// must be resolved and threaded into the dispatch's own discovery, not silently ignored in
     /// favor of the tool's construction-time cwd. Proven end-to-end with the read-only `get`
@@ -7653,7 +8404,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .resolve_agent(dir.path(), "no-such-agent")
+            .resolve_agent(dir.path(), "no-such-agent", AgentReadScope::Both)
             .expect_err("unknown agent must error");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
     }
@@ -7717,7 +8468,14 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .spawn_background(dir.path(), "ghost", "do something", Some(ContextMode::Fresh), None)
+            .spawn_background(
+                dir.path(),
+                "ghost",
+                "do something",
+                Some(ContextMode::Fresh),
+                None,
+                AgentReadScope::Both,
+            )
             .await
             .expect_err("a blocked depth ceiling must reject before discovery or any spawn setup");
         assert!(
@@ -7756,6 +8514,7 @@ mod tests {
                 "do something",
                 Some(ContextMode::Fresh),
                 Some(ModelId::from("anthropic/claude-override-test")),
+                AgentReadScope::Both,
             )
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -7776,6 +8535,81 @@ mod tests {
             Some("anthropic/claude-override-test"),
             "the per-call model override must reach the background single run's step, not be \
              silently dropped in favor of the persona's own model"
+        );
+    }
+
+    /// Regression (pi `restoreActiveJobs`, `async-job-tracker.ts:405-420`): resuming tracking from
+    /// disk must (a) skip any run whose RECONCILED state is already terminal (`complete`/`failed`/
+    /// `paused`) — pi's own `listAsyncRuns({ states: ["queued", "running"] })` filter — and (b) seed
+    /// each restored run's `events.jsonl` byte cursor at the file's CURRENT size (pi's
+    /// `restoredControlEventCursor`), not `0`. Pre-fix, `resume_tracking` re-tracked EVERY
+    /// subdirectory unconditionally (including an already-`Complete` run) and always seeded the
+    /// cursor at `0`, which would cause a restored job's entire historical `events.jsonl` to be
+    /// re-tailed the next poll tick.
+    #[tokio::test]
+    async fn resume_tracking_skips_terminal_runs_and_seeds_the_events_cursor_at_eof() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = default_async_root(dir.path());
+        let results_dir = default_results_dir(dir.path());
+
+        // A still-running run: real live pid (this test process itself) so reconciliation leaves
+        // it Running, plus a non-empty events.jsonl whose EXISTING bytes must never be re-tailed.
+        let running_run_id = RunId::from_token("run-running");
+        let running_paths = RunPaths::for_run(&async_root, &results_dir, &running_run_id);
+        tokio::fs::create_dir_all(&running_paths.run_dir)
+            .await
+            .expect("mkdir running run_dir");
+        let mut running_status = crate::background::RunStatus::queued(
+            running_run_id.clone(),
+            RunMode::Single,
+            Some(std::process::id()),
+        );
+        running_status.advance_state(RunState::Running).expect("Queued -> Running");
+        write_atomic_json(&running_paths.status, &running_status)
+            .await
+            .expect("write running status fixture");
+        let events_content = b"{\"kind\":\"a\"}\n{\"kind\":\"b\"}\n";
+        tokio::fs::write(&running_paths.events, events_content)
+            .await
+            .expect("seed events.jsonl for the running run");
+
+        // A run that already finished before this process started: must NOT be re-tracked at all.
+        let complete_run_id = RunId::from_token("run-complete");
+        let complete_paths = RunPaths::for_run(&async_root, &results_dir, &complete_run_id);
+        tokio::fs::create_dir_all(&complete_paths.run_dir)
+            .await
+            .expect("mkdir complete run_dir");
+        let mut complete_status = crate::background::RunStatus::queued(
+            complete_run_id.clone(),
+            RunMode::Single,
+            Some(1),
+        );
+        complete_status.state = RunState::Complete;
+        write_atomic_json(&complete_paths.status, &complete_status)
+            .await
+            .expect("write complete status fixture");
+
+        executor.resume_tracking(dir.path()).await;
+
+        assert_eq!(
+            executor.tracker().tracked_count(),
+            1,
+            "only the queued/running run may be restored — a terminal run must be skipped entirely"
+        );
+        assert!(
+            executor.tracker().get(&complete_run_id).is_none(),
+            "an already-terminal run must never be re-tracked by resume_tracking"
+        );
+        let restored = executor
+            .tracker()
+            .get(&running_run_id)
+            .expect("the still-running run must be restored");
+        assert_eq!(
+            restored.events_cursor,
+            events_content.len() as u64,
+            "the restored job's events cursor must be seeded at the file's CURRENT size (EOF), \
+             never 0, so historical control events are never re-tailed"
         );
     }
 
@@ -8215,6 +9049,122 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // pi-parity regressions (agent-management.ts `handleModels`/`formatModelSource`): the
+    // "(unresolved)" placeholder (not a bespoke "inherits current session model" string), the
+    // `"inherit"` sentinel resolving through the parent model instead of printing verbatim, the
+    // "Requested model setting" block, and `formatModelSource`'s model-equality / scope gates.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn run_models_report_uses_pi_unresolved_placeholder_not_inherits_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        // No host bound (no live session model) and `delegate.md` declares no `model:` of its own,
+        // so pi's `resolveSubagentModelOverride` has nothing to resolve to and `handleModels`
+        // renders its exact `"(unresolved)"` placeholder (agent-management.ts:591) — pre-fix this
+        // crate rendered the bespoke, non-pi "(inherits current session model)" text instead.
+        let report = executor.run_models_report(dir.path(), Some("delegate"));
+        assert!(
+            report.contains("Effective model:\n  (unresolved)"),
+            "must render pi's exact '(unresolved)' placeholder when nothing can be resolved: {report}"
+        );
+        assert!(
+            !report.contains("inherits current session model"),
+            "must not render the bespoke non-pi placeholder text: {report}"
+        );
+    }
+
+    #[test]
+    fn run_models_report_resolves_inherit_sentinel_to_parent_model_not_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
+        // A settings override that explicitly requests pi's `"inherit"` sentinel — same request as
+        // leaving `model` unset, per `resolveSubagentModelOverride` (model-fallback.ts:47-59).
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"subagents":{"agentOverrides":{"delegate":{"model":"inherit"}}}}"#,
+        )
+        .expect("write settings.json");
+
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedModelHost(Some(
+            "openai/gpt-5-test".to_string(),
+        ))));
+
+        let report = executor.run_models_report(dir.path(), Some("delegate"));
+        assert!(
+            report.contains("Effective model:\n  openai/gpt-5-test"),
+            "a literal 'inherit' model setting must resolve through the live parent session \
+             model, not print verbatim: {report}"
+        );
+        assert!(
+            !report.contains("Effective model:\n  inherit"),
+            "must not render the raw 'inherit' sentinel literally: {report}"
+        );
+        assert!(
+            report.contains("Requested model setting:\n  inherit"),
+            "the raw declared setting must still be surfaced once it differs from the resolved \
+             model (agent-management.ts:596-599): {report}"
+        );
+    }
+
+    #[test]
+    fn run_models_report_gates_override_provenance_on_actual_model_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
+        // This override only ever touches `disabled` — it never applies to `model` — so the
+        // resolved model provenance must NOT claim an "override" changed it (pi
+        // `agent.override && agent.model !== agent.override.base.model`, agent-management.ts:566-568).
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"subagents":{"agentOverrides":{"scout":{"disabled":true}}}}"#,
+        )
+        .expect("write settings.json");
+
+        let executor = SubagentExecutor::new();
+        let report = executor.run_models_report(dir.path(), Some("scout"));
+        assert!(
+            !report.contains("Source: project override"),
+            "an override that never touched `model` must not claim '{{scope}} override' \
+             provenance for the model: {report}"
+        );
+        assert!(
+            report.contains("Source: inherit requested, but no current session model is available"),
+            "with no model configured anywhere and no live session model, pi's unresolved-\
+             fallback text must still apply: {report}"
+        );
+    }
+
+    #[test]
+    fn run_models_report_scopes_default_model_provenance_by_settings_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"subagents":{"defaultModel":"acme/shared-default"}}"#,
+        )
+        .expect("write settings.json");
+
+        let executor = SubagentExecutor::new();
+        let report = executor.run_models_report(dir.path(), Some("scout"));
+        // pi `agent.modelSource.type === "subagents.defaultModel"` renders `${scope} defaultModel`
+        // (agent-management.ts:569-571); the pre-fix text hardcoded the unscoped "settings
+        // defaultModel" regardless of which settings scope actually supplied the default.
+        assert!(
+            report.contains("Source: project defaultModel"),
+            "a project-scope subagents.defaultModel must render scope-qualified provenance, not \
+             the bespoke unscoped 'settings defaultModel' text: {report}"
+        );
+        assert!(
+            !report.contains("settings defaultModel"),
+            "must not render the bespoke unscoped provenance text: {report}"
+        );
+    }
+
     // NOTE: `teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor` (and its
     // `FixedSessionHost` double) moved to `tests/cyrup_home_env_sandboxed_tests.rs` — see that
     // file's module doc; it needs the `CYRUP_HOME` env-var sandbox that requires `unsafe`, which
@@ -8384,7 +9334,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         let text = executor
-            .control_status(dir.path(), None, None)
+            .control_status(dir.path(), None, None, false)
             .await
             .expect("status list is Ok even with no runs");
         assert_eq!(text, "No active async runs.");
@@ -8395,10 +9345,29 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         let err = executor
-            .control_status(dir.path(), Some("deadbeef0000"), None)
+            .control_status(dir.path(), Some("deadbeef0000"), None, false)
             .await
             .expect_err("an unknown id is a not-found error");
         assert_eq!(err, "Async run not found. Provide id or dir.");
+    }
+
+    /// pi `run-status.ts:104-110`: the child-safe fanout tool (`deps.nested` truthy) hard-errors on
+    /// a no-id status call instead of listing the cwd's active runs — a fanout child has no
+    /// business enumerating its parent's whole async root. Regression proof: pre-fix,
+    /// `control_status` had no `child_safe` parameter at all and always fell through to
+    /// `list_active_runs`, which would have made this assert `Ok("No active async runs.")` instead.
+    #[tokio::test]
+    async fn control_status_child_safe_no_id_hard_errors_instead_of_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        let err = executor
+            .control_status(dir.path(), None, None, true)
+            .await
+            .expect_err("child-safe no-id status must hard-error, not list runs");
+        assert_eq!(
+            err,
+            "Child-safe subagent status requires an id when no foreground run is active."
+        );
     }
 
     #[tokio::test]
@@ -8457,7 +9426,14 @@ mod tests {
         let run_id = RunId::from_token("run00042");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
-        let mut status = crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, None);
+        // A genuinely live run always carries a real runner pid (`RunStatus::pid`'s own doc: "in
+        // practice this is `Some` from the very first write") — the SteerRunning arm's own
+        // interrupt-precondition check (pi `interruptLiveAsyncResumeTarget`,
+        // `background/async-resume.ts:53-56`) now requires exactly that before it will even
+        // attempt to interrupt, so this fixture must supply one to exercise the delivery path
+        // rather than the "no interrupt-capable runner pid was found" abort.
+        let mut status =
+            crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
         status.advance_state(RunState::Running).expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("researcher");
         step.status = crate::background::StepState::Running;
@@ -8521,7 +9497,14 @@ mod tests {
         let run_id = RunId::from_token("run00099");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
-        let mut status = crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, None);
+        // A genuinely live run always carries a real runner pid (`RunStatus::pid`'s own doc: "in
+        // practice this is `Some` from the very first write") — the SteerRunning arm's own
+        // interrupt-precondition check (pi `interruptLiveAsyncResumeTarget`,
+        // `background/async-resume.ts:53-56`) now requires exactly that before it will even
+        // attempt to interrupt, so this fixture must supply one to exercise the delivery path
+        // rather than the "no interrupt-capable runner pid was found" abort.
+        let mut status =
+            crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
         status.advance_state(RunState::Running).expect("Queued -> Running");
         let mut step = crate::background::StepStatus::pending("researcher");
         step.status = crate::background::StepState::Running;
@@ -8566,6 +9549,72 @@ mod tests {
         );
     }
 
+    /// pi `interruptLiveAsyncResumeTarget` (`background/async-resume.ts:53-56`): before EVER
+    /// attempting to interrupt (or delivering any follow-up), `resume`'s live-steer arm must
+    /// re-reconcile and REQUIRE `status.state === "running"` with a numeric pid — a run whose
+    /// overall state claims `Running` but carries no known runner pid must abort the WHOLE resume
+    /// with pi's exact diagnostic, never silently fall through to "steering" a child that was never
+    /// confirmed interruptible. Pre-fix, `control_resume`'s `SteerRunning` arm discarded
+    /// `control::interrupt`'s own `Ok(NotRunning)`-shaped outcomes (and, indirectly, a pid-less
+    /// status) and proceeded straight to an intercom-delivery attempt regardless.
+    #[tokio::test]
+    async fn control_resume_steer_running_requires_a_running_status_with_a_known_pid() {
+        struct RecordingSteerChannel {
+            received: std::sync::Mutex<Vec<(String, String)>>,
+        }
+        impl crate::tui::intercom::SteerChannel for RecordingSteerChannel {
+            fn steer(
+                &self,
+                target: String,
+                text: String,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
+            {
+                self.received.lock().expect("lock").push((target, text));
+                Box::pin(async { Ok(true) })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = default_async_root(dir.path());
+        let results_dir = default_results_dir(dir.path());
+        let run_id = RunId::from_token("run0nopid");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+        // `Running` overall state, but NO known runner pid (`pid: None`) — pi's guard treats this
+        // identically to "no interrupt-capable runner pid was found", never as a steerable child.
+        let mut status = crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, None);
+        status.advance_state(RunState::Running).expect("Queued -> Running");
+        let mut step = crate::background::StepStatus::pending("researcher");
+        step.status = crate::background::StepState::Running;
+        status.steps = vec![step];
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write pid-less running status fixture");
+
+        let steer = Arc::new(RecordingSteerChannel {
+            received: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = SubagentExecutor::new().with_channels(
+            Arc::new(crate::tui::intercom::NoTransportChannel),
+            Arc::new(crate::tui::intercom::NoOpClarifyChannel),
+            steer.clone(),
+        );
+
+        let err = executor
+            .control_resume(dir.path(), Some("run0nopid"), Some("carry on"), None, None)
+            .await
+            .expect_err("a Running status with no known pid must abort the resume outright");
+        assert_eq!(
+            err,
+            "Async run run0nopid is live but no interrupt-capable runner pid was found."
+        );
+        assert!(
+            steer.received.lock().expect("lock").is_empty(),
+            "no follow-up may ever be delivered when the interrupt precondition itself was never \
+             satisfied"
+        );
+    }
+
     /// pi `buildRevivedAsyncTask` (`background/async-resume.ts:378-391`): a revived child's `{task}`
     /// must be the follow-up WRAPPED in the revival framing (source run/agent/session-file context
     /// plus an explicit "you are reviving..." preamble), never the orchestrator's raw follow-up text
@@ -8596,6 +9645,87 @@ mod tests {
         assert_ne!(
             task, "please continue",
             "the revived task must NOT be the raw follow-up passed through verbatim"
+        );
+    }
+
+    /// pi `target.cwd ?? requestCwd` (`subagent-executor.ts:890`, fed by `status.cwd ?? result.cwd`
+    /// at `background/async-resume.ts:373`): a terminal-revival `resume` must resolve the revived
+    /// child's persona against the ORIGINAL run's own cwd (persisted onto `status.json` by
+    /// `finish_run`), not whatever cwd happens to be current at resume time. Proven with a custom
+    /// agent defined ONLY under the original run's cwd: pre-fix, `revive_from_transcript` always
+    /// discovered against the REQUEST cwd, so this agent would never be found and the call would
+    /// fail with `agent not found: orig-only-agent` before ever reaching the (deliberately, via
+    /// `max_subagent_depth = 0`) blocked spawn step; post-fix it must resolve the persona
+    /// successfully and fail one step later, at the depth ceiling instead — proving the ORIGINAL
+    /// cwd was searched. The depth block keeps this test from ever reaching a real detached process
+    /// spawn.
+    #[tokio::test]
+    async fn control_resume_revive_prefers_the_original_runs_cwd_over_the_request_cwd() {
+        let orig_dir = tempfile::tempdir().expect("orig tempdir");
+        let request_dir = tempfile::tempdir().expect("request tempdir");
+
+        let agents_dir = orig_dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir orig agents dir");
+        std::fs::write(
+            agents_dir.join("orig-only-agent.md"),
+            "---\nname: orig-only-agent\ndescription: Only discoverable under orig_dir\n---\nBody.\n",
+        )
+        .expect("write orig-only-agent fixture");
+
+        let session_file = orig_dir.path().join("session.jsonl");
+        std::fs::write(&session_file, "").expect("write dummy session file");
+
+        // The source run's storage lives under `request_dir`'s own async root (resume looks it up
+        // via the REQUEST cwd, matching pi's fixed-but-here-cwd-scoped async/results roots) — only
+        // the run's OWN recorded `cwd` field (set by `finish_run`) points back at `orig_dir`.
+        let async_root = default_async_root(request_dir.path());
+        let results_dir = default_results_dir(request_dir.path());
+        let run_id = RunId::from_token("run0revive");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir run_dir");
+
+        let mut status =
+            crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242));
+        status.advance_state(RunState::Running).expect("Queued -> Running");
+        let mut step = crate::background::StepStatus::pending("orig-only-agent");
+        step.status = crate::background::StepState::Complete;
+        step.session_file = Some(session_file.clone());
+        status.steps = vec![step];
+        status.advance_state(RunState::Complete).expect("Running -> Complete");
+        status.cwd = Some(orig_dir.path().to_path_buf());
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status fixture");
+
+        let executor = SubagentExecutor::new();
+        {
+            // Block the spawn AFTER persona resolution succeeds, so a correct fix observably fails
+            // at the depth ceiling instead of ever launching a real detached subprocess.
+            let mut cfg = executor.config.lock().await;
+            cfg.max_subagent_depth = 0;
+        }
+
+        let err = executor
+            .control_resume(
+                request_dir.path(),
+                Some("run0revive"),
+                Some("please continue"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the blocked depth ceiling must still reject this revive");
+
+        assert!(
+            err.contains("depth limit exceeded"),
+            "the revived persona must resolve against the ORIGINAL run's cwd (orig_dir), reaching \
+             the depth ceiling, not fail with an agent-not-found error from searching the request \
+             cwd instead; got: {err}"
+        );
+        assert!(
+            !err.contains("agent not found"),
+            "pre-fix regression: revive_from_transcript searched the REQUEST cwd (which has no \
+             'orig-only-agent') instead of the original run's own cwd; got: {err}"
         );
     }
 

@@ -238,6 +238,13 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         mode: result.mode,
         state: result.state,
         pid,
+        // Carry the authoritative ResultFile's own `cwd`/`sessionFile` through the repair (pi's
+        // `status.cwd ?? result.cwd` fallback, `background/async-resume.ts:323,345,373`, has
+        // nothing to fall back FROM here otherwise — this is the terminal-repair path where
+        // `status.json` itself could not legally advance, so the ResultFile is the only surviving
+        // source of truth for either field).
+        cwd: Some(result.cwd.clone()),
+        session_file: result.session_file.clone(),
         started_at: now,
         ended_at: Some(now),
         last_update: now,

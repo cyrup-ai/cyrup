@@ -432,11 +432,14 @@ async fn grouped_result_is_delivered_out_of_band_and_the_inline_receipt_is_reduc
         got[0].outputs,
     );
 
-    // R-SA-123: the inline receipt is REDUCED — the heavy per-task output is dropped, replaced by a
-    // compact "delivered out-of-band" receipt.
+    // R-SA-123: the inline receipt is REDUCED — the heavy per-task output is dropped, replaced by
+    // pi's exact `formatSubagentResultReceipt` wording (result-intercom.ts:334-364): "Delivered
+    // <mode> subagent results via intercom." + a real "Run: <id>" (never a throwaway) + a child
+    // status count line.
     assert!(
-        text.contains("2/2 succeeded") && text.contains("delivered out-of-band"),
-        "the inline receipt must be the reduced out-of-band receipt: {text}",
+        text.contains("Delivered parallel subagent results via intercom.")
+            && text.contains("Children: 2 completed"),
+        "the inline receipt must be the reduced, pi-format out-of-band receipt: {text}",
     );
     assert!(
         !text.contains("HEAVY_TASK_OUTPUT_marker_zzz"),

@@ -263,6 +263,27 @@ impl JobTracker {
         self.ensure_poller_started();
     }
 
+    /// Starts tracking `run_id` the way [`JobTracker::track`] does, except the per-run
+    /// `events.jsonl` byte cursor is seeded at `events_cursor` rather than `0`. Used exclusively by
+    /// [`crate::extension::SubagentsExtension::resume_tracking`] (pi `restoreActiveJobs`'s
+    /// `restoredControlEventCursor`, `async-job-tracker.ts:48-55,93`) to re-track a run discovered
+    /// from a prior process's `AsyncRoot` without re-tailing control events that process already
+    /// consumed. `spawn_confirmed_at` is always `None` for a restored job — this tracker has no
+    /// record of when hop-1 confirmed the spawn for a run it only learned about after the fact,
+    /// exactly like a fresh [`JobTracker::track`] call with no such reference.
+    pub async fn track_restored(self: &Arc<Self>, run_id: RunId, paths: RunPaths, events_cursor: u64) {
+        {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut job = TrackedJob::new(run_id.clone(), paths, None);
+            job.events_cursor = events_cursor;
+            jobs.insert(run_id, job);
+        }
+        self.ensure_poller_started();
+    }
+
     /// Explicitly stops tracking `run_id` before it would otherwise reach the R-SA-105 retention
     /// deadline — e.g. an orchestrator that no longer cares about a run's completion (the caller
     /// process is exiting, or the run was disowned). The poll loop self-stops on its own next tick

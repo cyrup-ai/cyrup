@@ -876,7 +876,7 @@ pub fn parse_nested_event_records(content: &str, route: &NestedRoute) -> Vec<Nes
         .collect()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
