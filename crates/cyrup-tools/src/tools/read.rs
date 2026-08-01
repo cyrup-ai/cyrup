@@ -4,7 +4,7 @@ use crate::config::ReadOpts;
 use crate::details::ReadDetails;
 use crate::ops::FsOps;
 use crate::truncate::{format_size, truncate_head, TruncOpts, DEFAULT_MAX_BYTES};
-use crate::{error, path, ToolMeta};
+use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +50,20 @@ impl Tool for ReadTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    // Verbatim from Pi (read.ts:212-214). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
+    fn description(&self) -> &str {
+        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
+         Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB \
+         (whichever is hit first). Use offset/limit for large files. When you need the full file, \
+         continue with offset until complete."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Read file contents")
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &["Use read to examine files instead of cat or sed."]
     }
 
     async fn execute(
@@ -508,20 +522,4 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
-}
-
-impl ToolMeta for ReadTool {
-    // Verbatim from Pi (read.ts:212-214). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
-    fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
-         Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB \
-         (whichever is hit first). Use offset/limit for large files. When you need the full file, \
-         continue with offset until complete."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Read file contents")
-    }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use read to examine files instead of cat or sed."]
-    }
 }

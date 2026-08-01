@@ -1,4 +1,5 @@
-//! The seven built-in tools (DI-1). Each implements `cyrup_core::Tool` and `crate::ToolMeta`.
+//! The seven built-in tools (DI-1). Each implements `cyrup_core::Tool`, including its model-facing
+//! metadata (`description`/`prompt_snippet`/`prompt_guidelines`) verbatim from Pi.
 
 pub mod bash;
 pub mod edit;

@@ -143,21 +143,72 @@ async fn tool_selection_allowlist_and_excludelist() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
 
+    // The snippets are the tools' OWN Pi-verbatim `promptSnippet` (read.ts:213, bash.ts:328),
+    // read off the `Tool` vtable — not a session-svc paraphrase table (gap 04, TOOL-003).
+    const READ_SNIPPET: &str = "- read: Read file contents";
+    const BASH_SNIPPET: &str = "- bash: Execute bash commands (ls, grep, find, etc.)";
+
     // Allowlist: only `read` is active → the system prompt advertises read, not bash.
     let mut allow = base_config(&fx);
     allow.tools = Some(vec!["read".to_string()]);
     let s_allow = SessionBuilder::new(faux.clone(), allow).build().await.unwrap();
     let p = s_allow.system_prompt();
-    assert!(p.contains("Read a file"), "read tool should be active:\n{p}");
-    assert!(!p.contains("Run a shell command"), "bash should be excluded by the allowlist");
+    assert!(p.contains(READ_SNIPPET), "read tool should be active:\n{p}");
+    assert!(!p.contains(BASH_SNIPPET), "bash should be excluded by the allowlist");
 
     // Denylist: exclude `bash` → its snippet disappears while others remain.
     let mut deny = base_config(&fx);
     deny.exclude_tools = vec!["bash".to_string()];
     let s_deny = SessionBuilder::new(faux, deny).build().await.unwrap();
     let pd = s_deny.system_prompt();
-    assert!(pd.contains("Read a file"), "read should still be active");
-    assert!(!pd.contains("Run a shell command"), "bash should be excluded by the denylist");
+    assert!(pd.contains(READ_SNIPPET), "read should still be active");
+    assert!(!pd.contains(BASH_SNIPPET), "bash should be excluded by the denylist");
+}
+
+/// TOOL-003: the built-ins' OWN `promptSnippet`/`promptGuidelines` reach the assembled system
+/// prompt. Pre-fix `builder.rs` substituted a hardcoded name→paraphrase table and emitted ZERO
+/// tool guidelines, so every assertion below failed.
+#[tokio::test]
+async fn builtin_prompt_snippets_and_guidelines_reach_the_system_prompt() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let p = session.system_prompt().to_string();
+
+    // (a) "Available tools" carries Pi's verbatim snippets, not the old paraphrases.
+    for want in [
+        "- read: Read file contents",
+        "- write: Create or overwrite files",
+        "- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+        "- bash: Execute bash commands (ls, grep, find, etc.)",
+        "- grep: Search file contents for patterns (respects .gitignore)",
+        "- find: Find files by glob pattern (respects .gitignore)",
+        "- ls: List directory contents",
+    ] {
+        assert!(p.contains(want), "missing snippet {want:?} in system prompt:\n{p}");
+    }
+    for gone in [
+        "Read a file from the workspace",
+        "Write a file to the workspace",
+        "Edit a file with a find/replace",
+        "Run a shell command",
+        "Find files by glob\n",
+        "List a directory",
+    ] {
+        assert!(!p.contains(gone), "stale session-svc paraphrase {gone:?} still in prompt:\n{p}");
+    }
+
+    // (b) "Guidelines" carries the six Pi tool guidelines (read 1, write 1, edit 4).
+    for want in [
+        "- Use read to examine files instead of cat or sed.",
+        "- Use write only for new files or complete rewrites.",
+        "- Use edit for precise changes (edits[].oldText must match exactly)",
+        "- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+        "- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+        "- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+    ] {
+        assert!(p.contains(want), "missing guideline {want:?} in system prompt:\n{p}");
+    }
 }
 
 // ----------------------------------------------------------------------- compaction flow ----

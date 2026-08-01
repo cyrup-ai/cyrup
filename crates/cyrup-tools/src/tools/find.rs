@@ -6,7 +6,7 @@ use crate::details::FindDetails;
 use crate::ops::{FsOps, WalkOpts};
 use crate::tools::globmatch::{to_posix, PatternMatcher};
 use crate::truncate::{format_size, truncate_head, TruncOpts};
-use crate::{error, path, ToolMeta};
+use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
 use std::path::PathBuf;
@@ -70,6 +70,17 @@ impl Tool for FindTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    // Verbatim from Pi (find.ts:117-118). DEFAULT_LIMIT=1000, DEFAULT_MAX_BYTES/1024=50. Pi defines
+    // no promptGuidelines for find.
+    fn description(&self) -> &str {
+        "Search for files by glob pattern. Returns matching file paths relative to the search \
+         directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is \
+         hit first)."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Find files by glob pattern (respects .gitignore)")
     }
 
     async fn execute(
@@ -181,18 +192,5 @@ impl Tool for FindTool {
             details,
             terminate: false,
         })
-    }
-}
-
-impl ToolMeta for FindTool {
-    // Verbatim from Pi (find.ts:117-118). DEFAULT_LIMIT=1000, DEFAULT_MAX_BYTES/1024=50. Pi defines
-    // no promptGuidelines for find.
-    fn description(&self) -> &str {
-        "Search for files by glob pattern. Returns matching file paths relative to the search \
-         directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is \
-         hit first)."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Find files by glob pattern (respects .gitignore)")
     }
 }

@@ -3,7 +3,7 @@
 use crate::config::WriteOpts;
 use crate::lock::FileMutationLocks;
 use crate::ops::FsOps;
-use crate::{error, path, ToolMeta};
+use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,6 +57,18 @@ impl Tool for WriteTool {
         cyrup_core::ExecMode::Sequential
     }
 
+    // Verbatim from Pi (write.ts:189-192).
+    fn description(&self) -> &str {
+        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. \
+         Automatically creates parent directories."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Create or overwrite files")
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &["Use write only for new files or complete rewrites."]
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -89,19 +101,5 @@ impl Tool for WriteTool {
             details: None,
             terminate: false,
         })
-    }
-}
-
-impl ToolMeta for WriteTool {
-    // Verbatim from Pi (write.ts:189-192).
-    fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. \
-         Automatically creates parent directories."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Create or overwrite files")
-    }
-    fn prompt_guidelines(&self) -> &[&str] {
-        &["Use write only for new files or complete rewrites."]
     }
 }

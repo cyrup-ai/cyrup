@@ -6,7 +6,7 @@ use crate::config::GrepOpts;
 use crate::ops::{FsOps, WalkOpts};
 use crate::tools::globmatch::{to_posix, PatternMatcher};
 use crate::truncate::{format_size, truncate_head, truncate_line, GREP_MAX_LINE_LENGTH, TruncOpts};
-use crate::{error, path, ToolMeta};
+use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
 use grep_regex::RegexMatcherBuilder;
@@ -82,6 +82,17 @@ impl Tool for GrepTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    // Verbatim from Pi (grep.ts:131-132). DEFAULT_LIMIT=100, DEFAULT_MAX_BYTES/1024=50,
+    // GREP_MAX_LINE_LENGTH=500. Pi defines no promptGuidelines for grep.
+    fn description(&self) -> &str {
+        "Search file contents for a pattern. Returns matching lines with file paths and line \
+         numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is \
+         hit first). Long lines are truncated to 500 chars."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Search file contents for patterns (respects .gitignore)")
     }
 
     async fn execute(
@@ -285,18 +296,5 @@ impl Tool for GrepTool {
             details,
             terminate: false,
         })
-    }
-}
-
-impl ToolMeta for GrepTool {
-    // Verbatim from Pi (grep.ts:131-132). DEFAULT_LIMIT=100, DEFAULT_MAX_BYTES/1024=50,
-    // GREP_MAX_LINE_LENGTH=500. Pi defines no promptGuidelines for grep.
-    fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line \
-         numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is \
-         hit first). Long lines are truncated to 500 chars."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Search file contents for patterns (respects .gitignore)")
     }
 }

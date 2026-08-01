@@ -809,7 +809,7 @@ impl SessionBuilder {
         let selected_tools: Vec<Arc<str>> =
             base_tools.iter().map(|t| Arc::from(t.name())).collect();
         let tool_contributions: Vec<ToolPromptContribution> =
-            base_tools.iter().map(|t| tool_contribution(t.name())).collect();
+            base_tools.iter().map(tool_contribution).collect();
 
         let prompt_inputs = PromptInputs {
             custom_prompt: cfg.system_prompt.clone().map(Arc::from),
@@ -845,7 +845,7 @@ impl SessionBuilder {
         registry_tools.extend(active_tools.iter().cloned());
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools
             .iter()
-            .map(|t| (t.name().to_string(), tool_contribution(t.name())))
+            .map(|t| (t.name().to_string(), tool_contribution(t)))
             .collect();
         // The rebuilder base = the prompt inputs with the per-run tool fields cleared (re-derived
         // from the active set on each `setActiveToolsByName`).
@@ -1273,20 +1273,17 @@ fn fallback_model(
     Some((model, level))
 }
 
-/// Synthesize a one-line prompt snippet for a built-in tool so the "Available tools" section is
-/// populated (arch-06 R-06-012). Mirrors the built-ins' own `prompt_snippet` intent.
-fn tool_contribution(name: &str) -> ToolPromptContribution {
-    let snippet = match name {
-        "read" => "Read a file from the workspace",
-        "write" => "Write a file to the workspace",
-        "edit" => "Edit a file with a find/replace",
-        "bash" => "Run a shell command",
-        "grep" => "Search file contents",
-        "find" => "Find files by glob",
-        "ls" => "List a directory",
-        _ => "Tool",
-    };
-    ToolPromptContribution::snippet(Arc::<str>::from(name), Arc::<str>::from(snippet))
+/// Project a tool's OWN prompt contribution off its `Tool` vtable (arch-06 R-06-012/013). Pi reads
+/// `definition.promptSnippet`/`definition.promptGuidelines` straight off the tool definition
+/// (agent-session.ts:2490-2504) — never a name-keyed table — so a tool that declares no snippet is
+/// simply absent from the "Available tools" section (system-prompt.ts:79-80: `tools.filter(name =>
+/// !!toolSnippets?.[name])`), and one that declares guidelines contributes them as bullets.
+fn tool_contribution(tool: &Arc<dyn cyrup_core::Tool>) -> ToolPromptContribution {
+    ToolPromptContribution {
+        tool: Arc::<str>::from(tool.name()),
+        snippet: tool.prompt_snippet().map(Arc::<str>::from),
+        guidelines: tool.prompt_guidelines().iter().copied().map(Arc::<str>::from).collect(),
+    }
 }
 
 /// Build the extension discovery roots from the config (Pi `resourceLoaderOptions`

@@ -9,6 +9,8 @@
 //! and availability controls.
 //!
 //! The `Tool` trait and `ToolError` are reused from `cyrup-core` (arch-00 §3.4) — never redefined.
+//! The model-facing metadata surface (`description`/`prompt_snippet`/`prompt_guidelines`, R-03-039)
+//! lives on that same trait, so the `Arc<dyn Tool>` vtable the registry hands out carries it.
 //! Failure is signaled by `Err`, mapped to `isError:true` by the runtime (R-03-038). The only
 //! `unsafe` in the crate is the isolated unix process-group code in [`ops::local`].
 #![deny(unsafe_code)]
@@ -46,23 +48,3 @@ pub use registry::{
     all_tools, coding_tools, read_only_tools, Availability, ToolRegistry, BUILTIN_NAMES,
 };
 pub use truncate::{Truncated, Truncation, TruncatedBy};
-
-/// Optional metadata surface for tools (R-03-039). Built-ins implement it; the `prompt_guidelines`
-/// MUST name the tool. Distinct from the runtime-facing `cyrup_core::Tool` trait.
-pub trait ToolMeta {
-    fn label(&self) -> &str
-    where
-        Self: cyrup_core::Tool,
-    {
-        self.name()
-    }
-    fn description(&self) -> &str;
-    /// One-line snippet injected into the system prompt (arch-06).
-    fn prompt_snippet(&self) -> Option<&str> {
-        None
-    }
-    /// Tool-specific guidelines (each MUST name the tool).
-    fn prompt_guidelines(&self) -> &[&str] {
-        &[]
-    }
-}

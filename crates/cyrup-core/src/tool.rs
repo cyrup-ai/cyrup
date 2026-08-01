@@ -96,6 +96,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Tool-specific guideline bullets for the "Guidelines" section of the default system prompt
+    /// (Pi `ToolDefinition.promptGuidelines`, extensions/types.ts:444-446). Per func-03 R-03-039
+    /// each string MUST name its tool so it stays meaningful once the tool is disabled. Default
+    /// `&[]` contributes nothing (today's behavior).
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[]
+    }
+
     /// Whether the runtime draws the standard tool shell or the tool renders its own framing (Pi
     /// `ToolDefinition.renderShell`, extensions/types.ts:448-449). Defaulted to
     /// [`ToolRenderKind::Default`] (today's behavior).
@@ -169,6 +177,7 @@ mod tests {
         assert_eq!(t.description(), "");
         assert_eq!(t.label(), None);
         assert_eq!(t.prompt_snippet(), None);
+        assert!(t.prompt_guidelines().is_empty());
         assert_eq!(t.render_kind(), ToolRenderKind::Default);
         assert_eq!(t.render_call(&serde_json::json!({"a": 1})), None);
         assert_eq!(t.render_result(&ToolResult::default()), None);

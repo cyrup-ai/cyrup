@@ -4,7 +4,7 @@ use crate::config::LsOpts;
 use crate::details::LsDetails;
 use crate::ops::FsOps;
 use crate::truncate::{format_size, truncate_head, TruncOpts};
-use crate::{error, path, ToolMeta};
+use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +46,17 @@ impl Tool for LsTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    // Verbatim from Pi (ls.ts:103-104). DEFAULT_LIMIT=500, DEFAULT_MAX_BYTES/1024=50. Pi defines no
+    // promptGuidelines for ls.
+    fn description(&self) -> &str {
+        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for \
+         directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is \
+         hit first)."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("List directory contents")
     }
 
     async fn execute(
@@ -152,19 +163,6 @@ impl Tool for LsTool {
             details,
             terminate: false,
         })
-    }
-}
-
-impl ToolMeta for LsTool {
-    // Verbatim from Pi (ls.ts:103-104). DEFAULT_LIMIT=500, DEFAULT_MAX_BYTES/1024=50. Pi defines no
-    // promptGuidelines for ls.
-    fn description(&self) -> &str {
-        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for \
-         directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is \
-         hit first)."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("List directory contents")
     }
 }
 

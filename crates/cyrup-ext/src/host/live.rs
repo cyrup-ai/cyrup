@@ -1314,6 +1314,13 @@ impl Tool for WasmTool {
     fn description(&self) -> &str {
         &self.descriptor.description
     }
+    /// The guest's declared `promptSnippet` (Pi `ToolDefinition.promptSnippet`,
+    /// extensions/types.ts:442-443). `None` when the descriptor omits it, which keeps the tool out
+    /// of the system prompt's "Available tools" section exactly as Pi's
+    /// `tools.filter(name => !!toolSnippets?.[name])` does (system-prompt.ts:79-80).
+    fn prompt_snippet(&self) -> Option<&str> {
+        self.descriptor.prompt_snippet.as_deref()
+    }
     async fn execute(
         &self,
         call_id: ToolCallId,

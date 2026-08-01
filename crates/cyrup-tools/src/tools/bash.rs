@@ -4,10 +4,10 @@
 
 use crate::config::{BashOpts, BashSpawnContext};
 use crate::details::BashDetails;
+use crate::error;
 use crate::ops::{shell_env, ExecSpec, ExitStatus, ProcOps, ShellConfig};
 use crate::output::OutputAccumulator;
 use crate::truncate::{format_size, truncate_tail, TruncOpts, Truncation, TruncatedBy};
-use crate::{error, ToolMeta};
 use cyrup_core::{
     CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
@@ -77,6 +77,17 @@ impl Tool for BashTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    // Verbatim from Pi (bash.ts:284-285). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50. Pi
+    // defines no promptGuidelines for bash, so the trait default (`&[]`) is used.
+    fn description(&self) -> &str {
+        "Execute a bash command in the current working directory. Returns stdout and stderr. \
+         Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, \
+         full output is saved to a temp file. Optionally provide a timeout in seconds."
+    }
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Execute bash commands (ls, grep, find, etc.)")
     }
 
     async fn execute(
@@ -410,17 +421,4 @@ fn flush_update(
     *dirty = false;
     *last_emit = Some(tokio::time::Instant::now());
     sink(build_stream_update(acc, max_lines, max_bytes));
-}
-
-impl ToolMeta for BashTool {
-    // Verbatim from Pi (bash.ts:284-285). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50. Pi
-    // defines no promptGuidelines for bash, so the trait default (`&[]`) is used.
-    fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. \
-         Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, \
-         full output is saved to a temp file. Optionally provide a timeout in seconds."
-    }
-    fn prompt_snippet(&self) -> Option<&str> {
-        Some("Execute bash commands (ls, grep, find, etc.)")
-    }
 }
