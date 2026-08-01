@@ -83,9 +83,16 @@ pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<us
     }
 }
 
-/// Walk backward from `end` accumulating per-message estimates until `keep_recent_tokens` is reached,
-/// snap to the nearest valid cut point at or after that entry, then fold leading non-message entries
-/// into the kept region. Mirrors Pi `findCutPoint` (`compaction.ts:392-454`).
+/// Walk backward from `end` accumulating each entry's RAW-CONTEXT estimate until
+/// `keep_recent_tokens` is reached, snap to the nearest valid cut point at or after that entry, then
+/// fold leading context-invisible entries into the kept region. Mirrors Pi `findCutPoint`
+/// (`coding-agent/src/core/compaction/compaction.ts:403-461`).
+///
+/// Both the accumulation and the back-scan key off the SAME "is this entry context-visible?"
+/// predicate (`sessionEntryToContextMessages(entry).length > 0`), so `custom_message` and non-empty
+/// `branch_summary` entries both consume budget and stop the back-scan (SESS-002). The older harness
+/// fork (`agent/src/harness/compaction/compaction.ts:412`) special-cased `entry.type === "message"`
+/// at both sites instead; that is the behavior this replaces.
 pub fn find_cut_point(
     entries: &[Entry],
     cache: &TokenCache,
@@ -98,8 +105,17 @@ pub fn find_cut_point(
         return CutPoint { first_kept_index: start, turn_start_index: None, is_split_turn: false };
     }
 
-    // Walk backward, summing per-MESSAGE estimates (Pi `continue`s past non-message entries) until
-    // we cross the keep-recent budget.
+    // Walk backward, summing the RAW-CONTEXT estimate of every entry — Pi:
+    //   const messageTokens = sessionEntryToContextMessages(entry)
+    //       .reduce((sum, message) => sum + estimateTokens(message), 0);
+    //   if (messageTokens === 0) continue;
+    //   accumulatedTokens += messageTokens;
+    // (`coding-agent/src/core/compaction/compaction.ts:418-427`) — until we cross the keep-recent
+    // budget. Entries the context skips (model/thinking change, label, session_info, plain custom,
+    // unknown) estimate 0 and are skipped, but a `custom_message`, a non-empty `branch_summary` or a
+    // prior `compaction`'s summary DOES count: those are context-visible and can be arbitrarily
+    // large. (`boundary_start` is the PREVIOUS compaction's first-kept index, so that compaction
+    // entry itself falls inside `[start, end)` — Pi counts it too.)
     let mut acc: u32 = 0;
     // Default: keep from the first valid message (Pi `cutPoints[0]`).
     let mut cut_idx = valid.first().copied().unwrap_or(start);
@@ -107,10 +123,11 @@ pub fn find_cut_point(
     while i > start {
         i -= 1;
         let Some(e) = entries.get(i) else { continue };
-        if !matches!(e, Entry::Known(KnownEntry::Message { .. })) {
+        let est = cache.estimate_raw_entry(e);
+        if est == 0 {
             continue;
         }
-        acc = acc.saturating_add(cache.estimate_message_entry(e));
+        acc = acc.saturating_add(est);
         if acc >= keep_recent_tokens {
             // Snap to the closest valid cut point at or after this entry.
             if let Some(&v) = valid.iter().find(|&&v| v >= i) {
@@ -120,15 +137,25 @@ pub fn find_cut_point(
         }
     }
 
-    // Back-scan: fold any leading non-message entries (model/thinking change, custom_message,
-    // branch_summary, …) into the kept region, stopping at a compaction or a message
-    // (Pi `compaction.ts:429-442`).
+    // Back-scan: fold leading entries that do NOT affect context (model/thinking change, label,
+    // session_info, plain custom, unknown) into the kept region, stopping at a compaction boundary
+    // or at any CONTEXT-VISIBLE entry — Pi:
+    //   if (prevEntry.type === "compaction" || sessionEntryToContextMessages(prevEntry).length > 0)
+    //       break;
+    // (`coding-agent/src/core/compaction/compaction.ts:439-446`). `custom_message` and non-empty
+    // `branch_summary` are context-visible, so they stop the scan rather than being folded in — the
+    // same predicate the accumulation loop above uses, which is why both sites had to move together
+    // (SESS-002): folding a context-visible entry back in would re-inflate the very tail the budget
+    // walk just measured.
     while cut_idx > start {
         match entries.get(cut_idx - 1) {
-            Some(Entry::Known(KnownEntry::Compaction { .. }))
-            | Some(Entry::Known(KnownEntry::Message { .. })) => break,
-            Some(_) => cut_idx -= 1,
-            None => break,
+            Some(Entry::Known(KnownEntry::Compaction { .. })) | None => break,
+            Some(prev) => {
+                if !crate::context::raw_context_messages(prev).is_empty() {
+                    break;
+                }
+                cut_idx -= 1;
+            }
         }
     }
 

@@ -29,7 +29,13 @@ fn skill(name: &str, desc: &str, path: &str) -> SkillPointer {
         name: name.to_string(),
         description: Some(desc.to_string()),
         path: PathBuf::from(path),
+        disable_model_invocation: false,
     }
+}
+
+/// Same as [`skill`] but with `disable-model-invocation: true` frontmatter.
+fn disabled_skill(name: &str, desc: &str, path: &str) -> SkillPointer {
+    SkillPointer { disable_model_invocation: true, ..skill(name, desc, path) }
 }
 
 fn base_inputs() -> PromptInputs {
@@ -211,6 +217,48 @@ fn a06_6_read_gates_skills() {
         ..base_inputs()
     };
     assert!(!SystemPromptBuilder::new().build(&inp_no_skills).contains("<available_skills>"));
+}
+
+// ── SESS-003: `disable-model-invocation` skills are excluded from `<available_skills>` ───────────
+// Pi `formatSkillsForPrompt` (skills.ts:334-339): `skills.filter((s) => !s.disableModelInvocation)`
+// and an empty visible set returns "" (no section at all).
+#[test]
+fn sess003_disabled_skills_are_not_advertised_to_the_model() {
+    // Mixed set: only the enabled skill reaches the prompt.
+    let inp = PromptInputs {
+        selected_tools: vec![arc("read")],
+        skills: Arc::from(vec![
+            skill("visible-skill", "the model may use this", "/s/visible/SKILL.md"),
+            disabled_skill("hidden-skill", "explicit invocation only", "/s/hidden/SKILL.md"),
+        ]),
+        ..base_inputs()
+    };
+    let out = SystemPromptBuilder::new().build(&inp);
+    assert!(out.contains("<available_skills>"), "section emitted for the enabled skill");
+    assert!(out.contains("<name>visible-skill</name>"), "enabled skill advertised");
+    assert!(
+        !out.contains("hidden-skill"),
+        "disable-model-invocation skill must not appear in the prompt; got:\n{out}"
+    );
+    assert!(
+        !out.contains("/s/hidden/SKILL.md"),
+        "disabled skill's location must not leak either; got:\n{out}"
+    );
+
+    // Only-disabled set: no section at all (not an empty one).
+    let inp_all_disabled = PromptInputs {
+        selected_tools: vec![arc("read")],
+        skills: Arc::from(vec![
+            disabled_skill("hidden-a", "explicit only", "/s/a/SKILL.md"),
+            disabled_skill("hidden-b", "explicit only", "/s/b/SKILL.md"),
+        ]),
+        ..base_inputs()
+    };
+    let out_all = SystemPromptBuilder::new().build(&inp_all_disabled);
+    assert!(
+        !out_all.contains("<available_skills>"),
+        "an all-disabled set emits no skills section; got:\n{out_all}"
+    );
 }
 
 // ── A-06-7: dynamic tool snippet/guideline appears then disappears; fingerprint changes ──────────

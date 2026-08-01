@@ -894,3 +894,152 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
     // The abandoned branch is never deleted (R-05-017).
     assert!(m.entry(&abandoned).is_some());
 }
+
+// ----------------------------------------------------------------- SESS-002 -------------------
+
+fn custom_message_entry(id: &str, parent: Option<&str>, content: &str) -> Entry {
+    Entry::known(KnownEntry::CustomMessage {
+        base: EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent.map(EntryId::from),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        },
+        custom_type: "ext.injected".to_string(),
+        content: json!(content),
+        display: true,
+        details: None,
+    })
+}
+
+fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str) -> Entry {
+    Entry::known(KnownEntry::BranchSummary {
+        base: EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent.map(EntryId::from),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        },
+        summary: summary.to_string(),
+        from_id: EntryId::from("from"),
+        details: None,
+        from_hook: None,
+    })
+}
+
+#[test]
+fn sess002_custom_message_tokens_count_toward_the_keep_recent_budget() {
+    // Pi's live `findCutPoint` accumulates `sessionEntryToContextMessages(entry)` for EVERY entry
+    // (`coding-agent/src/core/compaction/compaction.ts:418-427`), so a context-visible
+    // `custom_message` counts against `keepRecentTokens`. cyrup ported the harness fork, which
+    // `continue`d past every non-`message` entry, so a 40k-char extension-injected custom_message
+    // contributed 0 and the walk ran off the front of the history, keeping everything.
+    let injected = "x".repeat(40_000); // 40_000 chars ⇒ 10_000 estimated tokens
+    let entries = vec![
+        msg_entry("e0", None, user("older turn one")),
+        msg_entry("e1", Some("e0"), assistant("older answer one")),
+        custom_message_entry("e2", Some("e1"), &injected),
+        msg_entry("e3", Some("e2"), user("recent turn two")),
+        msg_entry("e4", Some("e3"), assistant("recent answer two")),
+    ];
+    let cache = TokenCache::default();
+    assert_eq!(cache.estimate_raw_entry(&entries[2]), 10_000, "the injected entry is not free");
+
+    let keep_recent_tokens = 2_000;
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), keep_recent_tokens);
+
+    assert_eq!(
+        cut.first_kept_index, 2,
+        "the budget must be exhausted BY the custom_message, cutting there — got {cut:?}"
+    );
+    assert!(
+        cut.first_kept_index >= 2,
+        "the two older turns must fall into the summarized history, not the kept tail"
+    );
+}
+
+#[test]
+fn sess002_branch_summary_tokens_count_toward_the_keep_recent_budget() {
+    // Same rule for a `branch_summary` entry: `sessionEntryToContextMessages` projects a non-empty
+    // summary into the context, so it is not free either.
+    let summary = "s".repeat(40_000);
+    let entries = vec![
+        msg_entry("e0", None, user("older turn one")),
+        msg_entry("e1", Some("e0"), assistant("older answer one")),
+        branch_summary_entry("e2", Some("e1"), &summary),
+        msg_entry("e3", Some("e2"), user("recent turn two")),
+        msg_entry("e4", Some("e3"), assistant("recent answer two")),
+    ];
+    let cache = TokenCache::default();
+    assert_eq!(cache.estimate_raw_entry(&entries[2]), 10_000);
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), 2_000);
+    assert_eq!(cut.first_kept_index, 2, "cut lands at the branch_summary, got {cut:?}");
+}
+
+#[test]
+fn sess002_back_scan_stops_at_a_context_visible_entry() {
+    // Pi's back-scan breaks on `sessionEntryToContextMessages(prevEntry).length > 0`
+    // (`compaction.ts:439-446`), so a preceding `custom_message` is NOT folded into the kept region
+    // — folding it back in would re-inflate the very tail the budget walk just measured. cyrup's
+    // ported fork broke only on `compaction`/`message`, so it swallowed the custom_message.
+    let entries = vec![
+        msg_entry("e0", None, user("history that is being summarized away")),
+        custom_message_entry("e1", Some("e0"), "a note the extension injected"),
+        msg_entry("e2", Some("e1"), user("recent enough words here to matter")),
+    ];
+    let cache = TokenCache::default();
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), 5);
+    assert_eq!(
+        cut.first_kept_index, 2,
+        "back-scan must stop at the context-visible custom_message, got {cut:?}"
+    );
+
+    // A NON-context-visible entry in the same position is still folded in (unchanged behavior).
+    let entries2 = vec![
+        msg_entry("e0", None, user("history that is being summarized away")),
+        Entry::known(KnownEntry::ModelChange {
+            base: EntryBase {
+                id: EntryId::from("e1"),
+                parent_id: Some(EntryId::from("e0")),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            provider: "p".into(),
+            model_id: "m".into(),
+        }),
+        msg_entry("e2", Some("e1"), user("recent enough words here to matter")),
+    ];
+    let cut2 = find_cut_point(&entries2, &TokenCache::default(), 0, entries2.len(), 5);
+    assert_eq!(cut2.first_kept_index, 1, "a model_change is still folded into the kept region");
+}
+
+#[test]
+fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
+    // `boundaryStart` is the PREVIOUS compaction's first-kept index, so that compaction entry sits
+    // inside the walked range and Pi's `sessionEntryToContextMessages` projects its summary
+    // (`session-manager.ts:398-400`) — it is context-visible and consumes budget. cyrup's ported
+    // fork skipped it along with every other non-`message` entry.
+    let prior_summary = "z".repeat(40_000); // ⇒ 10_000 estimated tokens
+    let entries = vec![
+        msg_entry("e0", None, user("kept across the previous compaction")),
+        Entry::known(KnownEntry::Compaction {
+            base: EntryBase {
+                id: EntryId::from("e1"),
+                parent_id: Some(EntryId::from("e0")),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            summary: prior_summary,
+            first_kept_entry_id: EntryId::from("e0"),
+            tokens_before: 99_999,
+            details: None,
+            from_hook: None,
+        }),
+        msg_entry("e2", Some("e1"), user("recent turn")),
+        msg_entry("e3", Some("e2"), assistant("recent answer")),
+    ];
+    let cache = TokenCache::default();
+    assert_eq!(cache.estimate_raw_entry(&entries[1]), 10_000, "a compaction summary is not free");
+
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), 2_000);
+    assert_eq!(
+        cut.first_kept_index, 2,
+        "the budget is exhausted by the prior summary, so e0 is re-summarized — got {cut:?}"
+    );
+}

@@ -326,7 +326,7 @@ pub struct Cost {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
-    #[serde(deserialize_with = "de_assistant_content")]
+    #[serde(default, deserialize_with = "de_assistant_content")]
     pub content: Vec<Content>,
     pub provider: ProviderId,
     pub model: String,
@@ -463,7 +463,7 @@ pub enum Message {
         /// `agent-session.ts:1117`) and Pi's session write path (`session-manager.ts:940,952,959`)
         /// is a pure `JSON.stringify(entry)` with no shape transform, so Pi never collapses a
         /// single-text user turn to the bare-string shorthand on write. cyrup matches those bytes.
-        #[serde(deserialize_with = "de_user_content")]
+        #[serde(default, deserialize_with = "de_user_content")]
         content: Vec<Content>,
         timestamp: i64,
     },
@@ -473,7 +473,7 @@ pub enum Message {
         tool_name: String,
         /// Pi `ToolResultMessage.content: (TextContent | ImageContent)[]` (types.ts:402): validated
         /// to `Text|Image` only on deserialize (gap 9).
-        #[serde(deserialize_with = "de_tool_result_content")]
+        #[serde(default, deserialize_with = "de_tool_result_content")]
         content: Vec<Content>,
         #[serde(default)]
         is_error: bool,
@@ -542,10 +542,12 @@ where
         Arr(Vec<Content>),
     }
     // Pi runtime read-tolerance (see `de_assistant_content`): accept the bare-string shorthand or
-    // the content array, with no role-union rejection.
-    Ok(match StringOrArray::deserialize(deserializer)? {
-        StringOrArray::Str(s) => vec![Content::text(s)],
-        StringOrArray::Arr(v) => v,
+    // the content array, with no role-union rejection. A JSON `null` (or an absent key, via
+    // `#[serde(default)]`) normalizes to `[]` — see `de_assistant_content` for the Pi citation.
+    Ok(match Option::<StringOrArray>::deserialize(deserializer)? {
+        Some(StringOrArray::Str(s)) => vec![Content::text(s)],
+        Some(StringOrArray::Arr(v)) => v,
+        None => Vec::new(),
     })
 }
 
@@ -556,8 +558,9 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
-    // Pi runtime read-tolerance (see `de_assistant_content`): no role-union rejection.
-    Vec::<Content>::deserialize(deserializer)
+    // Pi runtime read-tolerance (see `de_assistant_content`): no role-union rejection, and a
+    // `null`/absent `content` normalizes to `[]`.
+    Ok(Option::<Vec<Content>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Deserialize `AssistantMessage.content`, validating to `Text|Thinking|ToolCall` only (Pi
@@ -571,7 +574,18 @@ where
     // Pi's per-role content unions are COMPILE-TIME TS only; its runtime `JSON.parse` accepts any
     // block regardless of role (no schema validation, `ai/src/types.ts:385`). cyrup matches that
     // read tolerance 1:1 — no role-union rejection — so any session JSONL Pi loads, cyrup loads.
-    Vec::<Content>::deserialize(deserializer)
+    //
+    // That tolerance extends to a MISSING or `null` `content`: Pi normalizes it to `[]` rather than
+    // dropping the message — `sessionEntryToContextMessages` (`session-manager.ts:383-395`):
+    // "Session files are parsed without validation; old versions, forks, or hand-edited files can
+    // contain messages with null/missing content", then
+    // `if ((role === "user" || role === "assistant" || role === "toolResult") && content == null)
+    //  return [{ ...message, content: [] }];` (`==` also catches `undefined`, i.e. an absent key —
+    // hence `#[serde(default)]` on the three `content` fields). Without this, cyrup's strict
+    // deserializer fails the whole `Message`, the session entry demotes to `Entry::Unknown`, and the
+    // turn silently vanishes from LLM context, compaction input and token accounting. The
+    // SERIALIZER is unchanged: cyrup, like Pi, always writes the array form back.
+    Ok(Option::<Vec<Content>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[cfg(test)]

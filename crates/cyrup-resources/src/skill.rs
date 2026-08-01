@@ -121,6 +121,12 @@ pub struct SkillPointer {
     pub description: Option<String>,
     /// The agent opens this with the `read` tool on demand (DI-4).
     pub path: PathBuf,
+    /// Mirror of [`Skill::disable_model_invocation`] (`disable-model-invocation`, skills.ts:316).
+    /// When true the skill is EXCLUDED from the `<available_skills>` prompt section
+    /// (`formatSkillsForPrompt`, skills.ts:335-336) but stays in the pointer set so its explicit
+    /// `/skill:name` command is still registered.
+    #[serde(default)]
+    pub disable_model_invocation: bool,
 }
 
 impl Skill {
@@ -130,6 +136,7 @@ impl Skill {
             name: self.name.clone(),
             description: self.front.description.clone(),
             path: self.skill_md.clone(),
+            disable_model_invocation: self.disable_model_invocation,
         }
     }
 

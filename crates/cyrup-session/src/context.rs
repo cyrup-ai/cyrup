@@ -172,6 +172,27 @@ fn push_as_raw(out: &mut Vec<RawContextMessage>, e: &Entry) {
     }
 }
 
+/// The raw-context projection of ONE entry — Pi `sessionEntryToContextMessages(entry)`
+/// (`session-manager.ts:381-403`): `message` → its raw `AgentMessage`, `custom_message` → its
+/// content, a NON-EMPTY `branch_summary` → its summary, `compaction` → its summary, everything else
+/// → nothing.
+///
+/// An entry is "context-visible" iff this is non-empty — the predicate Pi's live `findCutPoint`
+/// uses both for its token accumulation and for its back-scan (`compaction.ts:418-446`).
+///
+/// The `compaction` arm exists HERE but deliberately not in [`push_as_raw`]: the path builders
+/// prepend a compaction's summary themselves (Pi folds the same summary in via
+/// `buildContextEntries`, which keeps the compaction entry at the head of the context list), so
+/// projecting it a second time inside the per-entry loop would double-count it.
+pub fn raw_context_messages(e: &Entry) -> Vec<RawContextMessage> {
+    if let Entry::Known(KnownEntry::Compaction { summary, .. }) = e {
+        return vec![RawContextMessage::CompactionSummary(summary.clone())];
+    }
+    let mut out = Vec::new();
+    push_as_raw(&mut out, e);
+    out
+}
+
 /// Build the active-path **raw `AgentMessage`** context exactly as Pi `buildSessionContext` does
 /// (`session-manager.ts:382-430`), but returning [`RawContextMessage`]s for token estimation only.
 /// Handles the compaction boundary identically to [`build_context_messages`]: emit the compaction

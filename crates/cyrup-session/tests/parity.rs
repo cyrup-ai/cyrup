@@ -18,7 +18,7 @@ use cyrup_session::{
     serialize_conversation, Entry, EntryBase, KnownEntry, NewSessionOpts, SessionHeader,
     SessionLayout, SessionManager,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn user(s: &str) -> Message {
     Message::User { content: vec![Content::text(s)], timestamp: 0 }
@@ -1073,4 +1073,91 @@ fn f2_open_nonexistent_path_creates_a_fresh_session() {
     assert!(m.entries().is_empty(), "a fresh session starts empty");
     // Fresh + no assistant yet ⇒ deferred flush, exactly like `newSession` (no file written yet).
     assert!(!path.exists(), "the file is deferred until the first assistant message (Pi parity)");
+}
+
+// ---------------------------------------------------------------- SESS-001 ---------------------
+
+#[test]
+fn sess001_null_or_missing_content_is_normalized_to_empty_not_dropped() {
+    // Pi `sessionEntryToContextMessages` (`session-manager.ts:382-395`): "Session files are parsed
+    // without validation; old versions, forks, or hand-edited files can contain messages with
+    // null/missing content", then
+    //   if ((role === "user" || role === "assistant" || role === "toolResult") && content == null)
+    //       return [{ ...message, content: [] }];
+    // `== null` also matches `undefined`, so an ABSENT `content` key normalizes the same way. cyrup
+    // must keep the turn (as a typed entry with empty content), not demote it to `Entry::Unknown`
+    // and silently drop it from LLM context, compaction input and token accounting.
+    let mut asst_null = serde_json::to_value(assistant_text("ignored")).unwrap();
+    asst_null["content"] = Value::Null;
+    let mut asst_missing = serde_json::to_value(assistant_text("ignored")).unwrap();
+    asst_missing.as_object_mut().unwrap().remove("content");
+
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("user/null", json!({ "role": "user", "content": null, "timestamp": 0 })),
+        ("user/missing", json!({ "role": "user", "timestamp": 0 })),
+        ("assistant/null", asst_null),
+        ("assistant/missing", asst_missing),
+        (
+            "toolResult/null",
+            json!({
+                "role": "toolResult",
+                "toolCallId": "tc-1",
+                "toolName": "read",
+                "content": null,
+                "timestamp": 0,
+            }),
+        ),
+        (
+            "toolResult/missing",
+            json!({
+                "role": "toolResult",
+                "toolCallId": "tc-1",
+                "toolName": "read",
+                "timestamp": 0,
+            }),
+        ),
+    ];
+
+    for (label, message) in cases {
+        let entry: Entry = serde_json::from_value(json!({
+            "type": "message",
+            "id": "aaaaaaaa",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": message,
+        }))
+        .unwrap();
+        assert!(
+            matches!(entry, Entry::Known(KnownEntry::Message { .. })),
+            "{label}: must parse as a typed message entry, got {entry:?}"
+        );
+
+        // Observable effect: the turn reaches the LLM context with an EMPTY content array.
+        let path = [&entry];
+        let msgs = build_context_messages(&path);
+        assert_eq!(msgs.len(), 1, "{label}: the turn must not vanish from context");
+        let content = match &msgs[0] {
+            Message::User { content, .. } | Message::ToolResult { content, .. } => content.clone(),
+            Message::Assistant(a) => a.content.clone(),
+        };
+        assert!(content.is_empty(), "{label}: content normalizes to [], got {content:?}");
+    }
+}
+
+#[test]
+fn sess001_normalized_empty_content_still_counts_as_a_cut_point_and_round_trips() {
+    // The normalization must produce a REAL entry, not a special case: it participates in the
+    // cut-point walk (Pi's `findValidCutPoints` sees a `message` entry whose role is not
+    // toolResult) and re-serializes as the array form Pi always writes back.
+    let entry: Entry = serde_json::from_value(json!({
+        "type": "message",
+        "id": "bbbbbbbb",
+        "parentId": null,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "message": { "role": "user", "content": null, "timestamp": 0 },
+    }))
+    .unwrap();
+    assert_eq!(find_valid_cut_points(std::slice::from_ref(&entry), 0, 1), vec![0]);
+    let line = entry.to_line().unwrap();
+    assert!(line.contains("\"content\":[]"), "writes the array form back, got {line}");
 }

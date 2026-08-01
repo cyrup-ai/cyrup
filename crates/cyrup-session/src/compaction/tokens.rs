@@ -9,7 +9,7 @@ use cyrup_core::{Content, EntryId, Message, StopReason, Usage};
 
 use crate::agent_message::AgentMessage;
 use crate::context::{push_as_message, RawContextMessage};
-use crate::entry::{Entry, KnownEntry};
+use crate::entry::Entry;
 
 /// Images count as this many chars before the `/4` division (Pi parity).
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
@@ -200,55 +200,76 @@ pub fn estimate_context_tokens_raw(messages: &[RawContextMessage]) -> ContextUsa
     }
 }
 
-/// Per-entry token-estimate cache keyed by `EntryId` so the trigger check and cut-point walk do
-/// NOT re-tokenize the whole history each turn (R-05-024). Entries are immutable once appended ⇒
-/// estimates never invalidate.
+/// Which projection of an entry a cached estimate was computed over. The two projections give
+/// DIFFERENT numbers for the same entry (`Rendered` measures the `convertToLlm` text, wrapper
+/// prefixes and all; `Raw` measures Pi's raw per-role basis), so they must not share a cache slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EstimateKind {
+    /// [`push_as_message`] + [`estimate_tokens`] — the LLM-rendered projection.
+    Rendered,
+    /// [`crate::context::raw_context_messages`] + [`estimate_raw_message`] — Pi's raw projection,
+    /// what `findCutPoint` accumulates.
+    Raw,
+}
+
+/// Per-entry token-estimate cache keyed by `(EntryId, EstimateKind)` so the trigger check and
+/// cut-point walk do NOT re-tokenize the whole history each turn (R-05-024). Entries are immutable
+/// once appended ⇒ estimates never invalidate.
 #[derive(Default)]
 pub struct TokenCache {
-    map: Mutex<HashMap<EntryId, u32>>,
+    map: Mutex<HashMap<(EntryId, EstimateKind), u32>>,
 }
 
 impl TokenCache {
-    /// Estimate (chars/4) the messages an entry contributes, memoized by entry id.
-    pub fn estimate_entry(&self, entry: &Entry) -> u32 {
-        let id = entry.id();
+    /// Memoized `compute`, keyed by `(entry id, kind)`.
+    fn cached(&self, entry: &Entry, kind: EstimateKind, compute: impl FnOnce() -> u32) -> u32 {
+        let key = (entry.id(), kind);
         if let Ok(map) = self.map.lock()
-            && let Some(v) = map.get(&id) {
+            && let Some(v) = map.get(&key) {
                 return *v;
             }
-        let mut msgs = Vec::new();
-        push_as_message(&mut msgs, entry);
-        let est = msgs.iter().map(estimate_tokens).fold(0u32, |a, b| a.saturating_add(b));
+        let est = compute();
         if let Ok(mut map) = self.map.lock() {
-            map.insert(id, est);
+            map.insert(key, est);
         }
         est
     }
 
-    /// Estimate (chars/4) a `type:"message"` entry's raw `AgentMessage`, memoized by id; `0` for any
-    /// non-message entry. This mirrors Pi `findCutPoint`'s accumulation, which `continue`s past every
-    /// non-`message` entry and estimates `entry.message` directly (`compaction.ts:408-414`).
-    pub fn estimate_message_entry(&self, entry: &Entry) -> u32 {
-        if let Entry::Known(KnownEntry::Message { message, .. }) = entry {
-            let id = entry.id();
-            if let Ok(map) = self.map.lock()
-                && let Some(v) = map.get(&id) {
-                    return *v;
-                }
-            let est = estimate_agent_message(message);
-            if let Ok(mut map) = self.map.lock() {
-                map.insert(id, est);
-            }
-            est
-        } else {
-            0
-        }
+    /// Estimate (chars/4) the messages an entry contributes, memoized by entry id.
+    pub fn estimate_entry(&self, entry: &Entry) -> u32 {
+        self.cached(entry, EstimateKind::Rendered, || {
+            let mut msgs = Vec::new();
+            push_as_message(&mut msgs, entry);
+            msgs.iter().map(estimate_tokens).fold(0u32, |a, b| a.saturating_add(b))
+        })
     }
 
-    /// Drop a cached estimate (only needed on rare entry mutation).
+    /// Estimate (chars/4) the **raw context projection** of an entry, memoized by id — Pi
+    /// `sessionEntryToContextMessages(entry).reduce((sum, m) => sum + estimateTokens(m), 0)`
+    /// (`compaction.ts:418-422`, live path). Non-zero for `message`, `custom_message`, non-empty
+    /// `branch_summary` and `compaction` entries; `0` for everything the context skips
+    /// (`model_change`, `thinking_level_change`, `label`, `session_info`, `custom`, `Unknown`).
+    ///
+    /// This REPLACES the old `estimate_message_entry`, which returned `0` for every non-`message`
+    /// entry per the HARNESS fork (`agent/src/harness/compaction/compaction.ts:412`,
+    /// `if (entry.type !== "message") continue;`). Under that rule a `custom_message` holding tens
+    /// of thousands of tokens of extension-injected context — or a `branch_summary` — contributed
+    /// nothing to the keep-recent budget, so `find_cut_point` walked past it and kept far more than
+    /// `keep_recent_tokens` (SESS-002).
+    pub fn estimate_raw_entry(&self, entry: &Entry) -> u32 {
+        self.cached(entry, EstimateKind::Raw, || {
+            crate::context::raw_context_messages(entry)
+                .iter()
+                .map(estimate_raw_message)
+                .fold(0u32, |a, b| a.saturating_add(b))
+        })
+    }
+
+    /// Drop every cached estimate for an entry (only needed on rare entry mutation).
     pub fn invalidate(&self, id: &EntryId) {
         if let Ok(mut map) = self.map.lock() {
-            map.remove(id);
+            map.remove(&(id.clone(), EstimateKind::Rendered));
+            map.remove(&(id.clone(), EstimateKind::Raw));
         }
     }
 }
