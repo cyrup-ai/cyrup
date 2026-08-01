@@ -1058,11 +1058,21 @@ pub struct SettingsManager {
     effective: EffectiveSettings,
     project_trusted: bool,
     load_errors: Vec<ScopedError>,
+    /// The LAST load's failure for the global scope, if any (Pi `globalSettingsLoadError`,
+    /// settings-manager.ts:289). Distinct from `load_errors`, which accumulates across reloads and
+    /// is drained once for display: this is the live per-scope latch every writer consults so a
+    /// document cyrup could not read is never rewritten from the degraded in-memory view (CFG-001).
+    global_load_error: Option<String>,
+    /// The LAST load's failure for the project scope (Pi `projectSettingsLoadError`,
+    /// settings-manager.ts:290). Always `None` while the project is untrusted — that scope is not
+    /// read at all, and its writes are already refused with [`ConfigError::Untrusted`].
+    project_load_error: Option<String>,
 }
 
 impl SettingsManager {
     /// Load global unconditionally; load project ONLY if `project_trusted` (R-07-002). A parse
-    /// error degrades that scope to empty and records a `ScopedError` (R-00-009).
+    /// error degrades that scope to empty and records a `ScopedError` (R-00-009) plus the
+    /// per-scope write latch (CFG-001).
     pub fn load(store: Arc<dyn SettingsStore>, cli: Settings, project_trusted: bool) -> Self {
         let mut mgr = Self {
             store,
@@ -1072,9 +1082,26 @@ impl SettingsManager {
             effective: EffectiveSettings::default(),
             project_trusted,
             load_errors: Vec::new(),
+            global_load_error: None,
+            project_load_error: None,
         };
         mgr.reload_internal();
         mgr
+    }
+
+    /// Record this load's failure both in the drainable log and in the per-scope write latch.
+    ///
+    /// Pi latches on ANY failure of `loadFromStorage`, not only a JSON syntax error:
+    /// `tryLoadFromStorage` (settings-manager.ts:373-383) wraps the whole load in one try/catch and
+    /// hands the caught error straight to `globalSettingsLoadError`/`projectSettingsLoadError`. So a
+    /// store READ failure latches here too — an unreadable file is exactly as unsafe to overwrite
+    /// as an unparseable one.
+    fn record_load_error(&mut self, scope: SettingsScope, message: String) {
+        match scope {
+            SettingsScope::Global => self.global_load_error = Some(message.clone()),
+            SettingsScope::Project => self.project_load_error = Some(message.clone()),
+        }
+        self.load_errors.push(ScopedError { scope, message });
     }
 
     fn load_scope(&mut self, scope: SettingsScope) -> Settings {
@@ -1082,25 +1109,24 @@ impl SettingsManager {
             Ok(Some(text)) => match Settings::parse(&text) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.load_errors.push(ScopedError {
-                        scope,
-                        message: format!("parse error: {e}"),
-                    });
+                    self.record_load_error(scope, format!("parse error: {e}"));
                     Settings::default()
                 }
             },
             Ok(None) => Settings::default(),
             Err(e) => {
-                self.load_errors.push(ScopedError {
-                    scope,
-                    message: e.to_string(),
-                });
+                self.record_load_error(scope, e.to_string());
                 Settings::default()
             }
         }
     }
 
     fn reload_internal(&mut self) {
+        // Clear the latches first: they describe the load that is about to happen, so a user who
+        // repairs the file and reloads regains the ability to write (Pi sets both fields from the
+        // fresh `tryLoadFromStorage` result on every reload, settings-manager.ts:477/489-491/503-505).
+        self.global_load_error = None;
+        self.project_load_error = None;
         self.global = self.load_scope(SettingsScope::Global);
         self.project = if self.project_trusted {
             self.load_scope(SettingsScope::Project)
@@ -1170,9 +1196,44 @@ impl SettingsManager {
         }
     }
 
+    /// The load-error latch for `scope`, if the last load of that scope failed (CFG-001).
+    ///
+    /// A front-end can read this before offering an edit UI so it can explain the situation up
+    /// front rather than after a refused write.
+    pub fn load_error(&self, scope: SettingsScope) -> Option<&str> {
+        match scope {
+            SettingsScope::Global => self.global_load_error.as_deref(),
+            SettingsScope::Project => self.project_load_error.as_deref(),
+        }
+    }
+
+    /// Refuse a write into a scope whose last load failed (CFG-001).
+    ///
+    /// Every writer opens with this, mirroring Pi's `save()` / `saveProjectSettings()` guards
+    /// (settings-manager.ts ≈:614-628 / ≈:633-646). Without it a single typo — a trailing comma, an
+    /// unclosed brace — turns the very next `/config` toggle, `/theme`, analytics opt-in, or
+    /// `set_editor_padding_x` into a total rewrite of the file as `{"<key>": <value>}`, silently
+    /// destroying every other setting the user had.
+    fn ensure_scope_writable(&self, scope: SettingsScope) -> Result<(), ConfigError> {
+        match self.load_error(scope) {
+            Some(message) => Err(ConfigError::SettingsWriteRefused {
+                scope,
+                message: message.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Persist a single field via scoped read-modify-write that re-reads the on-disk file and
     /// applies only the modified field (concurrent-edit safe; R-07-004). Project writes require
     /// trust.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::Untrusted`] for a project write in an untrusted folder.
+    /// - [`ConfigError::SettingsWriteRefused`] if that scope's file failed to load, or if it became
+    ///   unparseable between the load and this write — the file is left byte-for-byte unchanged
+    ///   (CFG-001).
     pub fn set<T: serde::Serialize>(
         &mut self,
         scope: SettingsScope,
@@ -1182,16 +1243,29 @@ impl SettingsManager {
         if scope == SettingsScope::Project && !self.project_trusted {
             return Err(ConfigError::Untrusted);
         }
+        self.ensure_scope_writable(scope)?;
         let json = serde_json::to_value(value)?;
         let key_owned = key.to_string();
+        let mut corrupt: Option<String> = None;
         self.store.with_lock(scope, &mut |current| {
             let mut doc = match current.map(Settings::parse) {
                 Some(Ok(s)) => s,
-                _ => Settings::default(),
+                // Absent file: create it. This is the ONLY branch that may start from an empty doc.
+                None => Settings::default(),
+                // Corruption that appeared BETWEEN the load and this locked write. Returning `None`
+                // leaves the file untouched; the message is surfaced below so the caller can tell
+                // the write did not happen (CFG-001).
+                Some(Err(e)) => {
+                    corrupt = Some(format!("parse error: {e}"));
+                    return None;
+                }
             };
             doc.obj.insert(key_owned.clone(), json.clone());
             Some(doc.to_pretty())
         })?;
+        if let Some(message) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        }
         self.reload_internal();
         Ok(())
     }
@@ -1200,6 +1274,11 @@ impl SettingsManager {
     /// intermediate objects and PRESERVING sibling nested keys (Pi `persistScopedSettings` nested
     /// tracking, settings-manager.ts:573-602). Unlike [`Self::set`], this never clobbers the rest of
     /// the parent object. Project writes require trust.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::set`], including the [`ConfigError::SettingsWriteRefused`] refusal that keeps
+    /// an unparseable file intact (CFG-001).
     pub fn set_nested(
         &mut self,
         scope: SettingsScope,
@@ -1212,15 +1291,24 @@ impl SettingsManager {
         if scope == SettingsScope::Project && !self.project_trusted {
             return Err(ConfigError::Untrusted);
         }
+        self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let mut corrupt: Option<String> = None;
         self.store.with_lock(scope, &mut |current| {
             let mut doc = match current.map(Settings::parse) {
                 Some(Ok(s)) => s,
-                _ => Settings::default(),
+                None => Settings::default(),
+                Some(Err(e)) => {
+                    corrupt = Some(format!("parse error: {e}"));
+                    return None;
+                }
             };
             set_value_at_path(&mut doc.obj, &path_owned, value.clone());
             Some(doc.to_pretty())
         })?;
+        if let Some(message) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        }
         self.reload_internal();
         Ok(())
     }
@@ -1231,6 +1319,12 @@ impl SettingsManager {
     /// selector — drives a `/reload` afterward, exactly as Pi's settings selector applies-then-reloads,
     /// settings-manager.ts:573). The change becomes visible in `effective()` after the next
     /// [`Self::reload`]. Project writes still require trust (R-07-004).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::set`], including the [`ConfigError::SettingsWriteRefused`] refusal that keeps
+    /// an unparseable file intact (CFG-001). This is the seam the TUI `/config` selector and the
+    /// `cyrup config` subcommand drive, and both already surface the returned error to the user.
     pub fn persist_nested(
         &self,
         scope: SettingsScope,
@@ -1243,15 +1337,25 @@ impl SettingsManager {
         if scope == SettingsScope::Project && !self.project_trusted {
             return Err(ConfigError::Untrusted);
         }
+        self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let mut corrupt: Option<String> = None;
         self.store.with_lock(scope, &mut |current| {
             let mut doc = match current.map(Settings::parse) {
                 Some(Ok(s)) => s,
-                _ => Settings::default(),
+                None => Settings::default(),
+                Some(Err(e)) => {
+                    corrupt = Some(format!("parse error: {e}"));
+                    return None;
+                }
             };
             set_value_at_path(&mut doc.obj, &path_owned, value.clone());
             Some(doc.to_pretty())
-        })
+        })?;
+        if let Some(message) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        }
+        Ok(())
     }
 
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).
@@ -1301,12 +1405,21 @@ impl SettingsManager {
 
     /// `setEnableAnalytics`: set the opt-in flag and, on first opt-in, generate a `trackingId`
     /// (randomUUID) if absent (Pi settings-manager.ts:943-951). Both fields land in one write.
+    ///
+    /// Does not route through [`Self::set`] (it writes two keys under one lock), so it carries its
+    /// own copy of the CFG-001 guard.
     pub fn set_enable_analytics(&mut self, enabled: bool) -> Result<(), ConfigError> {
+        self.ensure_scope_writable(SettingsScope::Global)?;
+        let mut corrupt: Option<String> = None;
         self.store
             .with_lock(SettingsScope::Global, &mut |current| {
                 let mut doc = match current.map(Settings::parse) {
                     Some(Ok(s)) => s,
-                    _ => Settings::default(),
+                    None => Settings::default(),
+                    Some(Err(e)) => {
+                        corrupt = Some(format!("parse error: {e}"));
+                        return None;
+                    }
                 };
                 doc.obj
                     .insert("enableAnalytics".to_string(), Value::Bool(enabled));
@@ -1321,6 +1434,12 @@ impl SettingsManager {
                 }
                 Some(doc.to_pretty())
             })?;
+        if let Some(message) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused {
+                scope: SettingsScope::Global,
+                message,
+            });
+        }
         self.reload_internal();
         Ok(())
     }
@@ -1974,5 +2093,180 @@ mod tests {
         mgr.set_enable_analytics(false).unwrap();
         mgr.set_enable_analytics(true).unwrap();
         assert_eq!(mgr.effective().tracking_id().unwrap(), id);
+    }
+
+    // -----------------------------------------------------------------------
+    // CFG-001 — a writer must REFUSE a scope whose file it could not parse, never rewrite it.
+    //
+    // Pi guards every writer: `save()` (settings-manager.ts ≈:614-628) opens with
+    // `if (this.globalSettingsLoadError) { return; }` and `saveProjectSettings()` (≈:633-646) has
+    // the mirror. Before this fix cyrup's `set`/`set_nested`/`persist_nested` all did
+    // `match current.map(Settings::parse) { Some(Ok(s)) => s, _ => Settings::default() }`, so a
+    // trailing comma in `~/.cyrup/settings.json` meant the next `/config` toggle rewrote the whole
+    // file as `{"<key>": <value>}` — every other setting gone.
+    //
+    // The assertions are BYTE-level (`assert_eq!(after, MALFORMED)`), not "the key I wrote is
+    // absent": the whole point is that the user's file is left exactly as they left it.
+    // -----------------------------------------------------------------------
+
+    /// A realistic corruption: a trailing comma before `}`, plus settings worth losing.
+    const MALFORMED: &str = "{\n  \"defaultModel\": \"anthropic/claude-opus-4\",\n  \"theme\": \"dark\",\n  \"editorPaddingX\": 2,\n}\n";
+
+    fn malformed_global() -> (Arc<InMemorySettingsStore>, SettingsManager) {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, MALFORMED);
+        let mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        (store, mgr)
+    }
+
+    fn assert_refused(result: Result<(), ConfigError>, expected_scope: SettingsScope) {
+        let described = format!("{result:?}");
+        // The refusal must name the scope it protected AND carry the underlying cause, so a
+        // `/config` toggle can tell the user which file to go fix.
+        let matched = matches!(
+            &result,
+            Err(ConfigError::SettingsWriteRefused { scope, message })
+                if *scope == expected_scope && message.contains("parse error")
+        );
+        assert!(
+            matched,
+            "expected SettingsWriteRefused{{{expected_scope:?}, ..parse error..}}, got {described}"
+        );
+    }
+
+    #[test]
+    fn cfg001_set_refuses_to_clobber_a_malformed_file() {
+        let (store, mut mgr) = malformed_global();
+        // The load recorded the failure (R-00-009) and latched the scope (Pi globalSettingsLoadError).
+        assert!(mgr.load_error(SettingsScope::Global).is_some(), "the scope is latched");
+
+        assert_refused(mgr.set(SettingsScope::Global, "theme", "light"), SettingsScope::Global);
+
+        let after = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+    }
+
+    #[test]
+    fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
+        let (store, mut mgr) = malformed_global();
+
+        assert_refused(
+            mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], false.into()),
+            SettingsScope::Global,
+        );
+
+        let after = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+    }
+
+    #[test]
+    fn cfg001_persist_nested_refuses_to_clobber_a_malformed_file() {
+        let (store, mgr) = malformed_global();
+
+        assert_refused(
+            mgr.persist_nested(SettingsScope::Global, &["outputPad"], 0.into()),
+            SettingsScope::Global,
+        );
+
+        let after = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert_eq!(after, MALFORMED, "the malformed file is byte-for-byte unchanged");
+    }
+
+    #[test]
+    fn cfg001_convenience_setters_refuse_too() {
+        // Every `/config`-reachable convenience setter routes through one of the three writers, so
+        // each inherits the guard — including `set_enable_analytics`, which owns its own `with_lock`.
+        let (store, mut mgr) = malformed_global();
+
+        assert_refused(mgr.set_editor_padding_x(3.0), SettingsScope::Global);
+        assert_refused(mgr.set_show_images(false), SettingsScope::Global);
+        assert_refused(mgr.set_image_width_cells(40.0), SettingsScope::Global);
+        assert_refused(mgr.set_autocomplete_max_visible(9.0), SettingsScope::Global);
+        assert_refused(mgr.set_http_idle_timeout_ms(1000.0), SettingsScope::Global);
+        assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
+
+        let after = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert_eq!(after, MALFORMED, "six refused writes later, still untouched");
+    }
+
+    #[test]
+    fn cfg001_project_scope_is_latched_independently() {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
+        store.seed(SettingsScope::Project, MALFORMED);
+        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), true);
+
+        assert!(mgr.load_error(SettingsScope::Project).is_some());
+        assert!(mgr.load_error(SettingsScope::Global).is_none(), "a healthy scope is not latched");
+
+        assert_refused(
+            mgr.set(SettingsScope::Project, "quietStartup", true),
+            SettingsScope::Project,
+        );
+        assert_eq!(store.read(SettingsScope::Project).unwrap().unwrap(), MALFORMED);
+
+        // The healthy GLOBAL scope still writes — the guard is per-scope, not a global kill switch.
+        mgr.set(SettingsScope::Global, "quietStartup", true).unwrap();
+        assert!(mgr.effective().quiet_startup());
+    }
+
+    #[test]
+    fn cfg001_corruption_between_load_and_write_is_also_refused() {
+        // The second half of the fix: the file loaded FINE (no latch), then something corrupted it
+        // before the locked read-modify-write. The in-closure `Some(Err(_))` arm must abandon the
+        // write and surface the refusal rather than starting from an empty document.
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
+        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        assert!(mgr.load_error(SettingsScope::Global).is_none(), "loaded clean");
+
+        store.seed(SettingsScope::Global, MALFORMED); // corrupted behind our back
+
+        assert_refused(mgr.set(SettingsScope::Global, "theme", "light"), SettingsScope::Global);
+        assert_eq!(store.read(SettingsScope::Global).unwrap().unwrap(), MALFORMED);
+
+        assert_refused(
+            mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], true.into()),
+            SettingsScope::Global,
+        );
+        assert_refused(
+            mgr.persist_nested(SettingsScope::Global, &["outputPad"], 1.into()),
+            SettingsScope::Global,
+        );
+        assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
+        assert_eq!(store.read(SettingsScope::Global).unwrap().unwrap(), MALFORMED);
+    }
+
+    #[test]
+    fn cfg001_repairing_the_file_and_reloading_restores_writability() {
+        let (store, mut mgr) = malformed_global();
+        assert!(mgr.set(SettingsScope::Global, "theme", "light").is_err());
+
+        // The user fixes the trailing comma and cyrup reloads: the latch clears and writes resume.
+        store.seed(SettingsScope::Global, r#"{ "defaultModel": "anthropic/claude-opus-4" }"#);
+        mgr.reload().unwrap();
+        assert!(mgr.load_error(SettingsScope::Global).is_none(), "latch cleared on a clean reload");
+
+        mgr.set(SettingsScope::Global, "theme", "light").unwrap();
+        let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
+        assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
+        assert_eq!(
+            after.get("defaultModel"),
+            Some(&serde_json::json!("anthropic/claude-opus-4")),
+            "and the repaired file's other keys survive"
+        );
+    }
+
+    #[test]
+    fn cfg001_an_absent_file_is_still_created() {
+        // The refusal must not break first-run: `None` (no file) is not a parse failure.
+        let store = Arc::new(InMemorySettingsStore::new());
+        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        assert!(mgr.load_error(SettingsScope::Global).is_none());
+
+        mgr.set(SettingsScope::Global, "theme", "light").unwrap();
+        mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], true.into()).unwrap();
+        let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
+        assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
     }
 }

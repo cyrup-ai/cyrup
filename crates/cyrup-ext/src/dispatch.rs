@@ -2,8 +2,10 @@
 //! chaining. Holds extensions in load order plus an aggregate subscription bitset so an event with
 //! zero subscribers returns in a single branch — no serialization, no boundary crossing
 //! (R-08-034 / R-ARCH-EXT-014). Every guest call is fault-contained (R-08-036): a trap, OOM, epoch
-//! timeout, or panic is logged and the handler is SKIPPED — the chain continues, the host never
-//! crashes.
+//! timeout, or panic is logged and never crashes the host. On most kinds the handler is then
+//! SKIPPED and the chain continues (fail OPEN); on the fail-CLOSED kinds
+//! ([`EventKind::fails_closed`] — `tool_call`, the permission seam) the fault BLOCKS the action
+//! instead, matching Pi's uncaught `emitToolCall` (EXT-001).
 
 use crate::contract::{HandledValue, HookOutcome, Reduced};
 use crate::error::ExtError;
@@ -18,8 +20,9 @@ use std::time::Duration;
 const DEFAULT_INVOKE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A contained extension fault, surfaced to registered error listeners (Pi `ExtensionError`,
-/// types.ts:1609; `extensionPath`/`event`/`error`). The host turns each skipped fault into one of
-/// these for UI surfacing / diagnostics (R-08-036).
+/// types.ts:1609; `extensionPath`/`event`/`error`). The host turns each contained fault into one of
+/// these for UI surfacing / diagnostics (R-08-036) — whether the fault was skipped (fail open) or
+/// blocked the action (fail closed).
 #[derive(Clone, Debug)]
 pub struct ExtensionError {
     pub extension: cyrup_core::ExtensionId,
@@ -35,7 +38,7 @@ pub type ErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
 pub struct Dispatcher {
     inner: RwLock<DispatchInner>,
     budget: Duration,
-    /// Error listeners notified when a guest fault is contained + skipped (Pi `onError`, R-08-036).
+    /// Error listeners notified when a guest fault is contained (Pi `onError`, R-08-036).
     error_listeners: RwLock<Vec<ErrorListener>>,
 }
 
@@ -71,16 +74,31 @@ impl Dispatcher {
     }
 
     /// Register an error listener (Pi `onError`, types.ts:1609): notified with a typed
-    /// [`ExtensionError`] each time a guest fault is contained and the handler skipped (R-08-036).
+    /// [`ExtensionError`] each time a guest fault is contained (R-08-036), on both the fail-open
+    /// (handler skipped) and fail-closed (action blocked) dispositions.
     pub fn add_error_listener(&self, listener: ErrorListener) {
         if let Ok(mut g) = self.error_listeners.write() {
             g.push(listener);
         }
     }
 
-    /// Surface a contained fault to every registered listener + tracing (never propagates).
-    fn report(&self, event: &'static str, id: &cyrup_core::ExtensionId, err: &ExtError) {
-        tracing::warn!(extension = %id, event, error = %err, "extension call contained (skipped)");
+    /// Surface a contained fault to every registered listener + tracing (never propagates). Fires
+    /// for BOTH dispositions — the skipped fail-open case and the blocking fail-closed one — so a
+    /// gate that denied because it faulted is never invisible.
+    fn report(&self, kind: EventKind, id: &cyrup_core::ExtensionId, err: &ExtError) {
+        let event = kind.name();
+        let disposition = if kind.fails_closed() {
+            "blocking the action"
+        } else {
+            "skipping the handler"
+        };
+        tracing::warn!(
+            extension = %id,
+            event,
+            error = %err,
+            disposition,
+            "extension call fault contained"
+        );
         let payload =
             ExtensionError { extension: id.clone(), event, error: err.to_string() };
         if let Ok(g) = self.error_listeners.read() {
@@ -140,7 +158,7 @@ impl Dispatcher {
         for ext in self.subscribers_for(kind) {
             // Fault-contained: an error is reported and skipped (R-08-036).
             if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
-                self.report(kind.name(), ext.id(), &e);
+                self.report(kind, ext.id(), &e);
             }
         }
     }
@@ -164,7 +182,7 @@ impl Dispatcher {
             match self.invoke_contained(&ext, ev, cancel).await {
                 Ok(HookOutcome::Handled(v)) => out.push((ext.id().clone(), v)),
                 Ok(_) => {}
-                Err(e) => self.report(kind.name(), ext.id(), &e),
+                Err(e) => self.report(kind, ext.id(), &e),
             }
         }
         out
@@ -184,10 +202,30 @@ impl Dispatcher {
         for ext in self.subscribers_for(kind) {
             let outcome = match self.invoke_contained(&ext, &ev, cancel).await {
                 Ok(o) => o,
-                // A faulting hook degrades to no-mutation (the action proceeds) + a surfaced
-                // warning (arch-08 §8). Never aborts the chain, never crashes the host.
+                // A contained fault (returned error, guest trap/OOM, epoch or invocation-budget
+                // timeout, native panic, (de)serialization failure, cancelled/unloaded instance) is
+                // always reported (arch-08 §8) and never crashes the host. What happens NEXT is
+                // per-kind (EXT-001):
+                //
+                // * fail CLOSED (`EventKind::fails_closed`, today `tool_call` only) — the fault
+                //   BLOCKS the action, matching Pi: `emitToolCall` (runner.ts:932-953) has no
+                //   try/catch, `agent-session.ts:475-487` re-throws `Extension failed, blocking
+                //   execution: …`, and `agent-loop.ts:616-662` turns that into an immediate error
+                //   result without executing the tool. Failing open here would let a trapped,
+                //   panicking, or timed-out permission gate ALLOW the call it was meant to deny.
+                //   Note this is a FAULT, not a decline: a handler that returns `Noop`/`Mutate`
+                //   (declined to block) still proceeds, exactly as before.
+                //
+                // * fail OPEN (every other kind) — degrades to no-mutation and the chain continues,
+                //   matching the per-handler `catch { continue }` in each of Pi's other emitters.
                 Err(e) => {
-                    self.report(kind.name(), ext.id(), &e);
+                    self.report(kind, ext.id(), &e);
+                    if kind.fails_closed() {
+                        return Reduced::Blocked {
+                            reason: Some(format!("Extension failed, blocking execution: {e}")),
+                            by: ext.id().clone(),
+                        };
+                    }
                     continue;
                 }
             };

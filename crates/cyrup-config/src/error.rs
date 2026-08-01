@@ -19,6 +19,23 @@ pub enum ConfigError {
     Dir(String),
     #[error("project is not trusted; refusing to write project settings")]
     Untrusted,
+    /// A settings write was REFUSED because that scope's file could not be parsed (CFG-001).
+    ///
+    /// Ports Pi's writer guards: `settings-manager.ts` `save()` (≈:614-628) opens with
+    /// `if (this.globalSettingsLoadError) { return; }` and `saveProjectSettings()` (≈:633-646) has
+    /// the mirror `if (this.projectSettingsLoadError) return;`. Rewriting the document from the
+    /// degraded in-memory view would drop every key the user actually has on disk, so the write is
+    /// abandoned and the file is left byte-for-byte intact for the user to repair. Unlike Pi — which
+    /// returns silently — cyrup surfaces this to the caller so a `/config` toggle can say why it
+    /// did not stick.
+    #[error(
+        "refusing to write {scope:?} settings: the file could not be parsed ({message}); \
+         fix or remove it, then retry — the existing file was left unchanged"
+    )]
+    SettingsWriteRefused {
+        scope: SettingsScope,
+        message: String,
+    },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]

@@ -622,7 +622,8 @@ async fn r08_036_panicking_handler_is_contained() {
         tool_call: &tc,
         context: empty_view(),
     };
-    // The panic is caught and skipped; the later gate still blocks. Host alive.
+    // The panic is caught (host alive) and, on the `tool_call` seam, blocks in its own right
+    // (EXT-001) — the chain does not even need to reach the later real gate.
     let out = hooks.before_tool_call(ctx, CancelToken::new()).await.unwrap();
     assert!(matches!(out, BeforeOutcome::Block { .. }));
 }
@@ -644,7 +645,8 @@ async fn error_listener_captures_contained_fault() {
         }
     }));
 
-    // The panicking handler faults; the chain proceeds (no block) and the listener is notified.
+    // The panicking handler faults; the listener is notified AND — because `tool_call` fails CLOSED
+    // (EXT-001, pi's uncaught `emitToolCall`, runner.ts:932-953) — the call is blocked, not passed.
     let reduced = host
         .dispatcher()
         .dispatch_block_mutate(
@@ -652,7 +654,10 @@ async fn error_listener_captures_contained_fault() {
             &CancelToken::new(),
         )
         .await;
-    assert!(matches!(reduced, Reduced::Pass(_)), "fault skipped, action proceeds");
+    assert!(
+        matches!(reduced, Reduced::Blocked { .. }),
+        "fault on the permission seam blocks the action (fail CLOSED), got {reduced:?}"
+    );
 
     let got = captured.lock().unwrap().clone();
     assert_eq!(got.len(), 1, "one fault captured");
@@ -860,7 +865,15 @@ async fn p3_no_human_wait_is_still_budget_contained() {
     let start = std::time::Instant::now();
     let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
     let elapsed = start.elapsed();
-    // The runaway is contained ~at the budget (not its full 400ms wait) and SKIPPED → action passes.
+    // The runaway is contained ~at the budget (not its full 400ms wait). Because this is the
+    // `tool_call` seam, containment fails CLOSED (EXT-001): the undecided gate DENIES rather than
+    // silently allowing the call it was meant to gate.
     assert!(elapsed < Duration::from_millis(300), "budget-contained near 80ms, took {elapsed:?}");
-    assert!(matches!(reduced, Reduced::Pass(_)), "a budget-timed-out handler is skipped (action proceeds)");
+    match reduced {
+        Reduced::Blocked { reason, .. } => assert!(
+            reason.as_deref().unwrap_or_default().contains("Extension failed, blocking execution"),
+            "the budget timeout is reported as pi's blocking fault: {reason:?}"
+        ),
+        other => panic!("a budget-timed-out tool_call handler must Block, got {other:?}"),
+    }
 }

@@ -39,6 +39,14 @@ bytes = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["io"], optional = true }
 
+[dev-dependencies]
+# The END-TO-END fail-closed proof (`tests/ext_fail_closed.rs`, EXT-001): a real `cyrup_agent::Agent`
+# driven by the scripted faux provider, with `ExtensionHost::hooks()` installed as its `Hooks`, so a
+# faulting `tool_call` handler is observed to leave the tool's `execute` UNCALLED — not merely to
+# return a `Blocked` status. Lock-neutral: cyrup-provider is already a dependency and `faux` is a
+# pure-Rust in-crate feature that pulls no new crate.
+cyrup-provider = { workspace = true, features = ["faux"] }
+
 [features]
 # The whole Wasmtime Component Model host is behind `wasm-host` (arch-08 §2) so the
 # native-builtin dispatch foundation (seams, registry, manifest, cache) builds without

@@ -127,6 +127,27 @@ impl EventKind {
         }
     }
 
+    /// Does a contained handler FAULT on this kind block the action (fail CLOSED), or degrade to
+    /// no-mutation and let it proceed (fail OPEN)?
+    ///
+    /// This mirrors exactly which of Pi's runner emitters wrap each handler in a `try/catch`
+    /// (`pi/packages/coding-agent/src/core/extensions/runner.ts`). Every emitter there catches and
+    /// continues — `emit` (:810-819), `emitMessageEnd` (:845-861), `emitToolResult` (:887-907),
+    /// `emitUserBash` (:963-968), `emitContext` (:993-1000), `emitBeforeProviderRequest`
+    /// (:1025-1034), `emitBeforeAgentStart` (:1104-1124), `emitResourcesDiscover` (:1165-1179),
+    /// `emitInput` (:1208-1222) — with ONE deliberate exception: `emitToolCall` (:932-953) has NO
+    /// try/catch, so a throwing `tool_call` handler propagates out of the runner. Pi's
+    /// `agent-session.ts:475-487` re-throws it as `Extension failed, blocking execution: …`, and
+    /// `agent-loop.ts:616-662` turns that into an immediate error tool result — the tool is NEVER
+    /// executed.
+    ///
+    /// `tool_call` is cyrup's permission seam (R-08-010): `cyrup-permission-system` subscribes
+    /// exactly this kind, so a handler that traps, panics, OOMs, or blows the invocation budget must
+    /// DENY rather than silently allow the call it was meant to gate (EXT-001).
+    pub fn fails_closed(&self) -> bool {
+        matches!(self, EventKind::ToolCall)
+    }
+
     /// Map a notify-only `cyrup_agent::AgentEvent` to its kind (mutating kinds come via `Hooks`).
     pub fn from_agent(ev: &AgentEvent) -> Option<EventKind> {
         use EventKind::*;
