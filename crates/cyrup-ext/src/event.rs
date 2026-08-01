@@ -149,6 +149,14 @@ impl EventKind {
     }
 
     /// Map a notify-only `cyrup_agent::AgentEvent` to its kind (mutating kinds come via `Hooks`).
+    ///
+    /// `message_end` is deliberately absent (EXT-002). Like `tool_call`/`tool_result`/`context` it
+    /// is a MUTATING seam: Pi gives it a dedicated emitter and excludes `MessageEndEvent` from the
+    /// generic `emit()` union (`RunnerEmitEvent`, runner.ts:124-137), so
+    /// `ExtensionRunner.emitMessageEnd` (runner.ts:835) — one implementation, one caller
+    /// (agent-session.ts:752) — is the single dispatch point per finalized message. cyrup's
+    /// counterpart is [`crate::ExtensionHost::emit_message_end`], driven by `SvcSubscriber`; routing
+    /// it here as well would invoke every subscribed handler TWICE.
     pub fn from_agent(ev: &AgentEvent) -> Option<EventKind> {
         use EventKind::*;
         Some(match ev {
@@ -156,7 +164,7 @@ impl EventKind {
             AgentEvent::TurnStart => TurnStart,
             AgentEvent::MessageStart { .. } => MessageStart,
             AgentEvent::MessageUpdate { .. } => MessageUpdate,
-            AgentEvent::MessageEnd { .. } => MessageEnd,
+            AgentEvent::MessageEnd { .. } => return None,
             AgentEvent::ToolExecutionStart { .. } => ToolExecStart,
             AgentEvent::ToolExecutionUpdate { .. } => ToolExecUpdate,
             AgentEvent::ToolExecutionEnd { .. } => ToolExecEnd,
@@ -382,7 +390,9 @@ impl HostEvent {
     }
 
     /// Build a notify-only `HostEvent` from an `AgentEvent` (the `ExtSubscriber` seam, arch-08 §5.4).
-    /// Mutating events (`ToolCall`/`ToolResult`/`Context`) are produced by the `Hooks` seam instead.
+    /// Mutating events (`ToolCall`/`ToolResult`/`Context`) are produced by the `Hooks` seam instead,
+    /// and `MessageEnd` by [`crate::ExtensionHost::emit_message_end`] — see
+    /// [`EventKind::from_agent`] (EXT-002).
     pub fn from_agent(ev: &AgentEvent) -> Option<HostEvent> {
         Some(match ev {
             AgentEvent::AgentStart => HostEvent::AgentStart,
@@ -399,9 +409,9 @@ impl HostEvent {
                     delta: serde_json::to_value(assistant_message_event).unwrap_or(Value::Null),
                 }
             }
-            AgentEvent::MessageEnd { message } => {
-                HostEvent::MessageEnd { message: to_llm_message(message)? }
-            }
+            // Mutating seam — dispatched exactly once by `ExtensionHost::emit_message_end`
+            // (EXT-002). Never routed through the notify subscriber.
+            AgentEvent::MessageEnd { .. } => return None,
             AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
                 HostEvent::ToolExecStart {
                     call_id: tool_call_id.clone(),
@@ -441,20 +451,7 @@ pub(crate) fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn to_llm_message(m: &AgentMessage) -> Option<Message> {
-    match m {
-        AgentMessage::User { content, timestamp } => {
-            Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
-        }
-        AgentMessage::Assistant(a) => Some(Message::Assistant(a.clone())),
-        AgentMessage::ToolResult(t) => Some(Message::ToolResult {
-            tool_call_id: t.tool_call_id.clone(),
-            tool_name: t.tool_name.clone(),
-            content: t.content.clone(),
-            is_error: t.is_error,
-            details: t.details.clone(),
-            timestamp: t.timestamp,
-        }),
-        AgentMessage::Custom { .. } => None,
-    }
-}
+// NOTE (EXT-002): the former `to_llm_message` helper lived here solely to build the notify-path
+// `HostEvent::MessageEnd`. That path is gone — `message_end` reaches extensions exactly once, via
+// `ExtensionHost::emit_message_end`, whose `cyrup_core::Message` is converted by
+// `cyrup-session-svc`'s `agent_message_to_core`.

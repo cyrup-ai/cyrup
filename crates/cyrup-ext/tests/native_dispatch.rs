@@ -877,3 +877,84 @@ async fn p3_no_human_wait_is_still_budget_contained() {
         other => panic!("a budget-timed-out tool_call handler must Block, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// EXT-002: `message_end` is dispatched EXACTLY ONCE per finalized message.
+//
+// Pi has a single implementation (`ExtensionRunner.emitMessageEnd`, runner.ts:835) with a single
+// caller (agent-session.ts:752), and `MessageEndEvent` is explicitly excluded from the generic
+// `emit()` union (`RunnerEmitEvent`, runner.ts:124-137) — so a guest's `message_end` handler runs
+// once per finalized message.
+//
+// cyrup wires the SAME agent to two subscribers (`cyrup-session-svc/src/builder.rs`):
+// the notify-only `ExtSubscriber` and `SvcSubscriber`, and the latter re-dispatches the message
+// through the mutating `ExtensionHost::emit_message_end` facade. This test drives both seams for
+// one finalized message — exactly what production does — and asserts the handler saw it once.
+// The `message_start` counter guards the other direction: suppressing the notify path for
+// `message_end` must not silence the notify seam generally, nor the mutating seam itself.
+// ---------------------------------------------------------------------------
+struct MessageEndCounter {
+    id: ExtensionId,
+    ends: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for MessageEndCounter {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[EventKind::MessageEnd, EventKind::MessageStart]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::MessageEnd { .. } => {
+                self.ends.fetch_add(1, Ordering::SeqCst);
+            }
+            HostEvent::MessageStart { .. } => {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        HookOutcome::Noop
+    }
+}
+
+#[tokio::test]
+async fn ext002_message_end_handler_runs_once_per_finalized_message() {
+    let host = ExtensionHost::new(cfg());
+    let ends = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    host.load_native(Arc::new(MessageEndCounter {
+        id: "counter".into(),
+        ends: ends.clone(),
+        starts: starts.clone(),
+    }))
+    .await
+    .unwrap();
+
+    let cancel = CancelToken::new();
+    let sub = host.subscriber(cancel.clone());
+    let agent_msg = AgentMessage::user_text("hello");
+
+    // Seam 1 — the notify subscriber attached at builder.rs (`agent.subscribe(ext_subscriber)`).
+    sub.on_event(&AgentEvent::MessageStart { message: agent_msg.clone() }).await;
+    sub.on_event(&AgentEvent::MessageEnd { message: agent_msg.clone() }).await;
+    // Seam 2 — `SvcSubscriber`'s re-dispatch of the SAME finalized message through the mutating
+    // facade (`cyrup-session-svc/src/subscriber.rs`).
+    let core = cyrup_core::Message::User { content: vec![Content::text("hello")], timestamp: 0 };
+    assert!(
+        host.emit_message_end(core, &cancel).await.is_none(),
+        "a Noop handler leaves the message unmodified"
+    );
+
+    assert_eq!(
+        ends.load(Ordering::SeqCst),
+        1,
+        "message_end must reach a subscribed handler exactly once per finalized message (Pi \
+         emitMessageEnd is the single dispatch point)"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the notify seam still delivers other kinds");
+}
