@@ -285,6 +285,72 @@ async fn edit_legacy_single_and_stringified_shims() {
     assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "BETA\n");
 }
 
+/// Replay of the agent preflight for one tool call, in Pi's order: `prepareArguments` then schema
+/// validation then `execute` (`prepareToolCallArguments` → `validateToolArguments`,
+/// agent-loop.ts:596-598,617-618; cyrup: `cyrup-agent/src/agent.rs` `prepare_arguments` →
+/// `validate_tool_call`). A validation failure short-circuits to an isError tool result and the
+/// tool never runs, which is what this returns as `Err`.
+async fn preflight_execute(
+    tool: &dyn Tool,
+    raw: serde_json::Value,
+) -> Result<ToolResult, String> {
+    let prepared = tool.prepare_arguments(raw).await;
+    let args = cyrup_provider::validate_tool_call(tool.parameters(), prepared)
+        .map_err(|e| e.to_string())?;
+    tool.execute(cid(), args, CancelToken::new(), noop_sink()).await.map_err(|e| e.to_string())
+}
+
+/// TOOL-002 — the legacy-argument shim must run BEFORE schema validation, or `{path, oldText,
+/// newText}` / a stringified `edits` is rejected by `required:["path","edits"]` before `execute`
+/// is ever reached. Pi attaches it as `prepareArguments: prepareEditArguments` (edit.ts:307).
+#[tokio::test]
+async fn edit_legacy_shim_survives_the_preflight_schema_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(cwd.join("b.txt"), "beta\n").unwrap();
+    let edit = edit_tool(cwd.clone());
+
+    // Raw (un-prepared) legacy args are what the schema alone rejects — the reason the shim has to
+    // sit on the `prepare_arguments` seam rather than inside `execute`.
+    let legacy = serde_json::json!({ "path": "a.txt", "oldText": "alpha", "newText": "ALPHA" });
+    assert!(
+        cyrup_provider::validate_tool_call(edit.parameters(), legacy.clone()).is_err(),
+        "edit's schema is expected to reject the legacy shape pre-normalization"
+    );
+
+    // Through the preflight the shim normalizes first, so the call succeeds and the file changes.
+    let r = preflight_execute(&edit, legacy).await.expect("legacy {oldText,newText} must edit");
+    assert!(first_text(&r).contains("replaced 1 block"), "got: {}", first_text(&r));
+    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "ALPHA\n");
+
+    // Same for `edits` sent as a JSON string (Pi: "Some models (Opus 4.6, GLM-5.1) send edits as a
+    // JSON string instead of an array", edit.ts:100).
+    let stringified = serde_json::json!({
+        "path": "b.txt",
+        "edits": "[{\"oldText\":\"beta\",\"newText\":\"BETA\"}]"
+    });
+    assert!(
+        cyrup_provider::validate_tool_call(edit.parameters(), stringified.clone()).is_err(),
+        "edit's schema is expected to reject a stringified `edits` pre-normalization"
+    );
+    preflight_execute(&edit, stringified).await.expect("stringified `edits` must edit");
+    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "BETA\n");
+
+    // The normal shape is unaffected by the shim.
+    std::fs::write(cwd.join("c.txt"), "gamma\n").unwrap();
+    preflight_execute(
+        &edit,
+        serde_json::json!({
+            "path": "c.txt",
+            "edits": [{ "oldText": "gamma", "newText": "GAMMA" }]
+        }),
+    )
+    .await
+    .expect("canonical shape must still edit");
+    assert_eq!(std::fs::read_to_string(cwd.join("c.txt")).unwrap(), "GAMMA\n");
+}
+
 // ---------------------------------------------------------------- A-03-4 write
 
 #[tokio::test]
@@ -509,6 +575,37 @@ async fn grep_format_and_gitignore_and_no_matches() {
         .await
         .unwrap();
     assert_eq!(first_text(&none), "No matches found");
+}
+
+/// TOOL-005 — Pi runs ripgrep with no `--text`, so traversed binary files are cut off at the first
+/// NUL (`BinaryDetection::quit`) and contribute no match lines. Raw bytes must never reach the
+/// model-facing result.
+#[tokio::test]
+async fn grep_skips_binary_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("blob.bin"), b"hello\x00\xff\xfe world hello").unwrap();
+
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
+    let r = grep
+        .execute(cid(), serde_json::json!({ "pattern": "hello" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    assert_eq!(first_text(&r), "No matches found", "binary file must contribute no matches");
+
+    // A NUL after a match line still suppresses that file, and a plain text file alongside it is
+    // unaffected — binary detection must not turn grep into a no-op.
+    std::fs::write(cwd.join("later.bin"), b"hello text line\nmore\n\x00\x01\x02binary\n").unwrap();
+    std::fs::write(cwd.join("plain.txt"), "hello plain\n").unwrap();
+    let r = grep
+        .execute(cid(), serde_json::json!({ "pattern": "hello" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains("plain.txt:1: hello plain"), "text file must still match: {text}");
+    assert!(!text.contains('\u{fffd}'), "no lossy-decoded bytes may reach the result: {text}");
+    assert!(!text.contains("blob.bin"), "got: {text}");
+    assert!(!text.contains("later.bin"), "got: {text}");
 }
 
 #[tokio::test]

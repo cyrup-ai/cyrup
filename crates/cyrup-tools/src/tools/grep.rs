@@ -10,7 +10,7 @@ use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -177,7 +177,25 @@ impl Tool for GrepTool {
         // Pi gathers raw matches first (no context in the searcher), then formats each match as an
         // independent re-read block; mirror that so overlapping windows duplicate shared context
         // lines exactly as Pi does (grep.ts:250-268).
-        let mut searcher: Searcher = SearcherBuilder::new().line_number(true).build();
+        //
+        // Binary detection. Pi spawns real ripgrep with no `--text`/`-a` (grep.ts:215-220), so
+        // ripgrep's default applies: files reached by traversal are searched with
+        // `BinaryDetection::quit(b'\x00')` — a NUL ends that file as if EOF, so a binary file
+        // contributes no `--json` match lines. `grep-searcher`'s own default is
+        // `BinaryDetection::None` ("Data reported by the searcher may contain arbitrary bytes"),
+        // which would dump raw bytes of PNG/wasm/font/sqlite hits into the model-facing result.
+        // On a slice search `quit` scans the first 8 KiB plus every matched line (glue.rs:118-121,
+        // core.rs:215-237) — the same conservative rule ripgrep uses for memory-mapped files.
+        //
+        // [CYRUP-DELTA] ripgrep uses `convert(b'\x00')` instead of `quit` for a path named
+        // EXPLICITLY on the command line (Pi's `path` argument pointing at a single file). cyrup
+        // keeps `quit` there too: `convert` renumbers lines at every NUL, while the output blocks
+        // below are cut from a separate raw re-read of the file that splits on `\n` only, so the
+        // two numberings would disagree and emit the wrong lines.
+        let mut searcher: Searcher = SearcherBuilder::new()
+            .line_number(true)
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
 
         let mut out: Vec<String> = Vec::new();
         let mut count = 0usize;

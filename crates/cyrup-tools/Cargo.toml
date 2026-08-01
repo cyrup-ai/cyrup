@@ -45,6 +45,11 @@ inline-images = ["dep:image"]
 libc = { workspace = true }
 
 [dev-dependencies]
+# Test-only: `validate_tool_call` is the exact schema gate the agent preflight runs between
+# `Tool::prepare_arguments` and `Tool::execute` (cyrup-agent/src/agent.rs). `tests/tools.rs`
+# replays that order to prove edit's legacy-argument shim is reachable. Dev-only, so cyrup-tools
+# still has no runtime dependency beyond cyrup-core.
+cyrup-provider = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "fs", "process", "io-util", "time", "signal", "test-util"] }
 async-trait = { workspace = true }

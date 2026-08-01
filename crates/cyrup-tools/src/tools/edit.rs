@@ -120,6 +120,19 @@ impl Tool for EditTool {
         cyrup_core::ExecMode::Sequential
     }
 
+    /// Pi wires the legacy-shape shim onto the tool DEFINITION as
+    /// `prepareArguments: prepareEditArguments` (edit.ts:307), and the loop runs it BEFORE schema
+    /// validation — `prepareToolCallArguments` then `validateToolArguments`
+    /// (agent-loop.ts:596-598, 617-618). Without this override the identity default in
+    /// `cyrup_core::Tool` applies and `{path, oldText, newText}` (or a stringified `edits`) is
+    /// rejected by the `required:["path","edits"]` / `edits:{type:"array"}` schema in the agent
+    /// preflight (`cyrup-agent/src/agent.rs`), so `normalize_args` inside [`Self::execute`] is
+    /// never reached. `normalize_args` is idempotent, so `execute` may still call it for callers
+    /// that bypass the preflight seam.
+    async fn prepare_arguments(&self, args: serde_json::Value) -> serde_json::Value {
+        normalize_args(args)
+    }
+
     // Verbatim from Pi (edit.ts:296-308).
     fn description(&self) -> &str {
         "Edit a single file using exact text replacement. Every edits[].oldText must match a \
@@ -152,6 +165,9 @@ impl Tool for EditTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // The preflight already applied this via [`Self::prepare_arguments`] (Pi's
+        // `prepareArguments`, edit.ts:307); re-applying is a no-op on already-normalized args and
+        // keeps direct `execute` callers that bypass the preflight seam working.
         let params = normalize_args(params);
         // Pi `validateEditInput` (edit.ts:120-125) runs FIRST and rejects ANY shape where `edits`
         // is not a non-empty array — missing, non-array, or empty — with this exact literal. This
