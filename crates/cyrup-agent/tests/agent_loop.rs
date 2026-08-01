@@ -900,3 +900,127 @@ async fn run_active_guard_and_continue_validation() {
     // tool_execution default is parallel
     assert!(matches!(ToolExecution::default(), ToolExecution::Parallel));
 }
+
+// ----------------------------------------------------------------------------
+// AGENT-001 — a `length` stop reason fails the whole tool batch as truncated
+// instead of executing it (Pi `failToolCallsFromTruncatedMessage`,
+// agent-loop.ts:207-216,374-405).
+// ----------------------------------------------------------------------------
+
+/// A tool that records whether `execute` was ever entered.
+struct TripwireTool {
+    name: String,
+    params: Value,
+    executed: Arc<AtomicBool>,
+}
+
+impl TripwireTool {
+    fn new(name: &str) -> (Arc<Self>, Arc<AtomicBool>) {
+        let executed = Arc::new(AtomicBool::new(false));
+        (
+            Arc::new(Self { name: name.into(), params: obj_schema(), executed: executed.clone() }),
+            executed,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for TripwireTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.executed.store(true, Ordering::SeqCst);
+        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: false })
+    }
+}
+
+#[tokio::test]
+async fn agent_001_length_stop_fails_tool_batch_without_executing() {
+    let (tool, executed) = TripwireTool::new("danger");
+    let (_faux, sf) = faux_stream_fn(vec![
+        // Turn 1: truncated by the output token limit, but still carrying a tool call.
+        faux_assistant_message(
+            vec![faux_tool_call("danger", json!({ "command": "rm -rf /tmp/build" }))],
+            StopReason::Length,
+        ),
+        // Turn 2: the model gets its chance to re-issue; end cleanly.
+        faux_assistant_message(vec![faux_text("re-issued")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
+    let recorder = Arc::new(Recorder::default());
+    agent.subscribe(recorder.clone());
+
+    let handle = agent.prompt("go").await.unwrap();
+    handle.finished().await;
+    agent.wait_for_idle().await;
+
+    // 1. The tool was NEVER executed.
+    assert!(!executed.load(Ordering::SeqCst), "truncated tool call must not be executed");
+
+    let events = recorder.snapshot();
+
+    // 2. Exactly one tool_execution_start / tool_execution_end pair, the end flagged isError.
+    let starts: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+        .collect();
+    assert_eq!(starts.len(), 1, "exactly one tool_execution_start: {:?}", names(&events));
+    let ends: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one tool_execution_end: {:?}", names(&events));
+    match ends[0] {
+        AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+            assert_eq!(tool_name, "danger");
+            assert!(*is_error, "truncated batch end must be isError");
+        }
+        other => panic!("expected tool_execution_end, got {other:?}"),
+    }
+
+    // 3. Pi's event order for the batch: start -> end -> message_start/end for the tool result.
+    let n = names(&events);
+    let si = n.iter().position(|x| x == "tool_execution_start").unwrap();
+    assert_eq!(
+        &n[si..si + 4],
+        &[
+            "tool_execution_start".to_string(),
+            "tool_execution_end".to_string(),
+            "message_start:tool".to_string(),
+            "message_end:tool".to_string(),
+        ],
+        "truncated-batch event order: {n:?}"
+    );
+
+    // 4. The tool-result message carries Pi's exact text, byte for byte.
+    let expected = "Tool call \"danger\" was not executed: the response hit the output token \
+                    limit, so its arguments may be truncated. Re-issue the tool call with \
+                    complete arguments.";
+    let result_msg = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::MessageEnd { message: AgentMessage::ToolResult(m) } => Some(m.clone()),
+            _ => None,
+        })
+        .expect("a tool-result message_end");
+    assert!(result_msg.is_error, "tool result must be isError");
+    let text = match result_msg.content.first() {
+        Some(Content::Text { text, .. }) => text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert_eq!(text, expected, "must match Pi's message byte-for-byte");
+
+    // 5. The batch did NOT terminate — the loop ran a second turn so the model can re-issue.
+    assert_eq!(count_turn_starts(&events), 2, "loop must continue after a truncated batch: {n:?}");
+    assert_eq!(n.last().map(String::as_str), Some("agent_end"));
+}

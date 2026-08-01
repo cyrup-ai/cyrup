@@ -449,7 +449,14 @@ impl RunCtx {
                 let mut tool_results = Vec::new();
                 has_more_tools = false;
                 if !calls.is_empty() {
-                    let batch = self.execute_tool_calls(&asst, &calls).await;
+                    // A `length` stop means the output was cut off by the token limit, so every
+                    // tool call in the message may carry truncated arguments. Fail them all
+                    // instead of executing potentially borked calls (Pi agent-loop.ts:207-216).
+                    let batch = if matches!(asst.stop_reason, StopReason::Length) {
+                        self.fail_truncated_tool_calls(&calls).await
+                    } else {
+                        self.execute_tool_calls(&asst, &calls).await
+                    };
                     tool_results = batch.messages;
                     // `terminate` ends only TOOL-driven continuation (the whole batch must set it,
                     // `shouldTerminateToolBatch`, agent-loop.ts:210,544-546); queued steering /
@@ -779,6 +786,52 @@ impl RunCtx {
         } else {
             self.execute_parallel(assistant, &ctx_messages, calls).await
         }
+    }
+
+    /// Fail every tool call from an assistant message that was truncated by the output token limit
+    /// (Pi `failToolCallsFromTruncatedMessage`, agent-loop.ts:374-405).
+    ///
+    /// Streamed tool-call arguments are finalized with a best-effort JSON salvage parser
+    /// (`cyrup-provider` `parse_streaming_json_object`), so a truncated message can yield tool calls
+    /// whose arguments parse and validate but are silently incomplete. None of them are safe to
+    /// execute; report each as an error so the model can re-issue them. No tool is located, no
+    /// `before_tool_call`/`after_tool_call` hook runs, and the batch never terminates the loop —
+    /// Pi returns `{ messages, terminate: false }` so the model gets its turn to re-issue.
+    ///
+    /// Per call, in source order, the emitted sequence mirrors Pi exactly:
+    /// `tool_execution_start` → `tool_execution_end` (`isError`) → `message_start` / `message_end`.
+    async fn fail_truncated_tool_calls(&self, calls: &[ToolCall]) -> Batch {
+        let mut tool_results = Vec::new();
+        for call in calls {
+            self.emit(AgentEvent::ToolExecutionStart {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                args: Value::Object(call.arguments.clone()),
+            })
+            .await;
+            let fin = self.immediate_error(
+                call,
+                format!(
+                    "Tool call \"{}\" was not executed: the response hit the output token limit, \
+                     so its arguments may be truncated. Re-issue the tool call with complete \
+                     arguments.",
+                    call.name
+                ),
+            );
+            self.emit(AgentEvent::ToolExecutionEnd {
+                tool_call_id: fin.tool_call_id.clone(),
+                tool_name: fin.tool_name.clone(),
+                result: fin.result_value.clone(),
+                is_error: fin.is_error,
+            })
+            .await;
+            let msg = AgentMessage::ToolResult(fin.message.clone());
+            self.emit(AgentEvent::MessageStart { message: msg.clone() }).await;
+            self.emit(AgentEvent::MessageEnd { message: msg }).await;
+            tool_results.push(fin.message);
+        }
+        // Pi `{ messages, terminate: false }` (agent-loop.ts:404).
+        Batch { messages: tool_results, terminate: false }
     }
 
     /// Preflight: locate tool → normalize args (`prepare_arguments`) → validate/coerce → `before_tool_call`.
