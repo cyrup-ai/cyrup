@@ -74,7 +74,8 @@ pub use cyrup_session_svc::{ContextFile, ContextScope, SkillPointer};
 
 // ---- load-bearing seam types, re-exported so embedders depend only on this crate ----
 pub use cyrup_session_svc::{
-    AgentSession, AgentSessionEvent, AgentSessionServices, InputSource, NoTools, PromptAccepted,
+    AgentSession, AgentSessionEvent, AgentSessionServices, CompactionResult, InputSource, NoTools,
+    PromptAccepted,
     ScopedModel, SessionBuilder, SessionConfig, SessionServiceError, SessionTarget,
     StreamingBehavior, UserInput,
 };

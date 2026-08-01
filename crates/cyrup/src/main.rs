@@ -396,7 +396,12 @@ async fn run() -> anyhow::Result<i32> {
         }
         timings.print();
         let inputs = build_inputs(&cli, &dirs.cwd).await?;
-        run_interactive(runtime, session, inputs, cancel).await?;
+        let interactive = run_interactive(runtime.clone(), session, inputs, cancel).await;
+        // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
+        // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
+        // extensions can flush/deregister. Runs even when the TUI loop errored out.
+        runtime.dispose().await;
+        interactive?;
         return Ok(0);
     }
 

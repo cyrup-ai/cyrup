@@ -214,15 +214,16 @@ async fn builtin_prompt_snippets_and_guidelines_reach_the_system_prompt() {
 // ----------------------------------------------------------------------- compaction flow ----
 
 #[tokio::test]
-async fn compact_on_small_session_returns_none_and_emits_events() {
+async fn compact_on_small_session_errors_nothing_to_compact_and_emits_events() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
     let mut sub = session.subscribe();
 
-    // Nothing to compact on a fresh/tiny session: Ok(None), no panic, events still flow.
-    let result = session.compact(None).await.expect("compact must not error");
-    assert!(result.is_none(), "small session has nothing to compact");
+    // Nothing to compact on a fresh/tiny session: an ERROR carrying Pi's reason (Pi throws
+    // "Nothing to compact (session too small)", agent-session.ts:1806), no panic, events still flow.
+    let err = session.compact(None).await.expect_err("small session has nothing to compact");
+    assert_eq!(err.to_string(), "Nothing to compact (session too small)");
 
     let mut saw_start = false;
     let mut saw_end = false;

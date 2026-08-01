@@ -105,8 +105,10 @@ async fn compaction_end_carries_full_pi_payload() {
     session.wait_for_idle().await;
 
     let mut sub = session.subscribe();
-    let result = session.compact(None).await.expect("compact must not error");
-    assert!(result.is_some(), "an aggressive-keep compaction over two turns produces a result");
+    let _result = session
+        .compact(None)
+        .await
+        .expect("an aggressive-keep compaction over two turns produces a result");
 
     // Find the compaction_end on the live stream and assert its serialized shape.
     let mut end: Option<serde_json::Value> = None;
@@ -516,8 +518,10 @@ async fn compaction_before_compact_override_lands_in_entry() {
     let _ = session.prompt("tell me two").await.expect("prompt 2");
     session.wait_for_idle().await;
 
-    let result = session.compact(None).await.expect("compact must not error");
-    let cr = result.expect("an aggressive-keep compaction over two turns produces a result");
+    let cr = session
+        .compact(None)
+        .await
+        .expect("an aggressive-keep compaction over two turns produces a result");
 
     // The extension read a REAL preparation: it carries the Pi `CompactionPreparation` fields.
     let observed = seen.lock().unwrap().clone();

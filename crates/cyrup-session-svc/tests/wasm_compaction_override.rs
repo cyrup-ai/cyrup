@@ -139,7 +139,6 @@ async fn wasm_guest_compaction_override_lands_through_agent_session_compact() {
     let cr = session
         .compact(None)
         .await
-        .expect("compact must not error")
         .expect("an aggressive-keep compaction over two turns produces a result");
 
     // The guest's override summary landed in the CompactionResult, replacing the default model

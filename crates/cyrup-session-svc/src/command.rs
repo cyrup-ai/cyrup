@@ -66,7 +66,9 @@ pub enum SessionCommand {
 pub enum SessionCommandOutput {
     Accepted(PromptAccepted),
     Unit,
-    Compacted(Option<CompactionResult>),
+    /// A produced compaction. A refusal (nothing to compact / already compacted / vetoed) is an
+    /// `Err`, never a `Compacted(None)` — Pi's `compact` throws (agent-session.ts:1801-1825).
+    Compacted(CompactionResult),
     /// The new thinking level after a set/cycle (`None` when the model does not support thinking).
     ThinkingLevel(Option<cyrup_core::ModelThinkingLevel>),
     /// The new model id after a cycle (`None` when there was only one candidate).

@@ -861,8 +861,12 @@ async fn handle(
         // ------------------------------------------------------------------ Model ----
         SessionCommand::SetModel { provider, model_id } => {
             let id = raw_id.clone();
+            // Resolve against the FULL auth-filtered registry, not just the active provider's own
+            // catalog (Pi `session.modelRuntime.getAvailable()`, rpc-mode.ts:468 → model-registry.ts
+            // `getAvailable()` = `getAll().filter(hasConfiguredAuth)`), so an embedder can switch to
+            // a model owned by a DIFFERENT configured provider.
             let found = session
-                .model_catalog()
+                .available_model_catalog()
                 .iter()
                 .find(|m| m.provider.as_str() == provider && m.id.as_str() == model_id)
                 .cloned();
@@ -898,7 +902,10 @@ async fn handle(
             }
         }
         SessionCommand::GetAvailableModels => {
-            let models = serde_json::to_value(session.model_catalog()).unwrap_or(json!([]));
+            // The full auth-filtered registry (Pi `session.modelRuntime.getAvailable()`,
+            // rpc-mode.ts:486), NOT the active provider's own catalog.
+            let models =
+                serde_json::to_value(session.available_model_catalog()).unwrap_or(json!([]));
             RpcResponse::ok(
                 "get_available_models",
                 raw_id.clone(),
@@ -1150,9 +1157,11 @@ fn user_input(text: String, images: Vec<Content>) -> UserInput {
 /// The full `get_state` snapshot (Pi `RpcSessionState`, rpc-types.ts:94-107).
 async fn state_view(session: &AgentSession) -> Value {
     let model_ref = session.model();
-    // The full `Model` from the catalog (Pi `session.model`), else a minimal `{provider, id}`.
+    // The full `Model` (Pi `session.model` is already the resolved `Model` object), resolved out of
+    // the FULL auth-filtered registry so a model owned by a non-active provider still carries its
+    // real metadata; only a genuinely unknown model degrades to a minimal `{provider, id}`.
     let model = session
-        .model_catalog()
+        .available_model_catalog()
         .iter()
         .find(|m| m.provider == model_ref.provider && m.id == model_ref.model)
         .and_then(|m| serde_json::to_value(m).ok())

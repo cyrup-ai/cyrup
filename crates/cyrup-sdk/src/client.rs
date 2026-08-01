@@ -173,6 +173,7 @@ impl CyrupBuilder {
     ///         name: "deploy".into(),
     ///         description: Some("How to ship a release".into()),
     ///         path: "/virtual/deploy/SKILL.md".into(),
+    ///         disable_model_invocation: false,
     ///     });
     ///     skills
     /// });

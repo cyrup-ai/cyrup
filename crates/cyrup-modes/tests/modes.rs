@@ -1311,3 +1311,123 @@ async fn rpc_contained_extension_fault_surfaces_as_extension_error_event() {
     assert!(err_ev["extensionPath"].is_string(), "carries extensionPath: {err_ev}");
     assert!(err_ev["error"].is_string(), "carries the error message: {err_ev}");
 }
+
+// ----------------------------------------------------------------------------------------------
+// SEAM-004 — `set_model` / `get_available_models` / `get_state` must resolve against the FULL
+// auth-filtered model registry, not just the currently-installed provider's own catalog. Pi reads
+// `session.modelRuntime.getAvailable()` (rpc-mode.ts:468 for set_model, :486 for
+// get_available_models), which is `ModelRegistry.getAll().filter(hasConfiguredAuth)` — every
+// configured provider, not one. Pre-fix cyrup called `session.model_catalog()` (the active provider
+// only), so an RPC embedder could neither see nor select a model owned by another configured
+// provider.
+// ----------------------------------------------------------------------------------------------
+
+/// A [`cyrup_session_svc::ProviderResolver`] that hands back an offline faux provider for any id —
+/// stands in for the binary's `select_provider` seam so a cross-provider `set_model` can complete.
+struct AnyFauxResolver;
+
+impl cyrup_session_svc::ProviderResolver for AnyFauxResolver {
+    fn resolve(&self, _provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+        Ok(Arc::new(FauxProvider::new()))
+    }
+}
+
+#[tokio::test]
+async fn rpc_model_commands_span_the_full_auth_filtered_registry() {
+    let fx = fixture();
+    // Give `anthropic` a stored credential so `has_configured_auth` is true for its catalog — the
+    // "second configured provider" the active (faux) provider knows nothing about.
+    std::fs::write(
+        fx.agent_dir.join("auth.json"),
+        r#"{"anthropic":{"type":"api_key","key":"sk-test"}}"#,
+    )
+    .expect("write auth.json");
+
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux;
+    let cfg = base_config(&fx);
+    let target = cfg.target.clone();
+    let factory = Arc::new(
+        SessionFactory::new(provider, cfg)
+            .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>),
+    );
+    let runtime = AgentSessionRuntime::create(factory, target).await.expect("build runtime");
+
+    // Phase 1 — `get_available_models` must list the OTHER configured provider's models.
+    let reader = Cursor::new(
+        concat!(r#"{"type":"get_available_models","id":"a"}"#, "\n").as_bytes().to_vec(),
+    );
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    let lines = parse_lines(&out);
+    let listed = lines
+        .iter()
+        .find(|l| l["command"] == "get_available_models")
+        .expect("get_available_models response");
+    let models = listed["data"]["models"].as_array().expect("models array").clone();
+    let anthropic = models
+        .iter()
+        .find(|m| m["provider"] == "anthropic")
+        .unwrap_or_else(|| {
+            panic!(
+                "get_available_models must span every CONFIGURED provider (Pi \
+                 modelRuntime.getAvailable(), rpc-mode.ts:486), not just the active one; got:\n{models:#?}"
+            )
+        })
+        .clone();
+    let anthropic_id =
+        anthropic["id"].as_str().expect("catalog model carries an id").to_string();
+
+    // Phase 2 — `set_model` onto that non-active provider must succeed, and `get_state` must then
+    // report the FULL model record for it (not the two-field degraded stub).
+    let script = format!(
+        "{{\"type\":\"set_model\",\"id\":\"b\",\"provider\":\"anthropic\",\"modelId\":\"{anthropic_id}\"}}\n\
+         {{\"type\":\"get_state\",\"id\":\"c\"}}\n"
+    );
+    let reader = Cursor::new(script.into_bytes());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    let lines = parse_lines(&out);
+    let set = lines.iter().find(|l| l["command"] == "set_model").expect("set_model response");
+    assert_eq!(
+        set["success"], true,
+        "set_model onto a different CONFIGURED provider must succeed (Pi rpc-mode.ts:468-475): {set}"
+    );
+    let state = lines.iter().find(|l| l["command"] == "get_state").expect("get_state response");
+    assert_eq!(state["data"]["model"]["provider"], "anthropic", "get_state model: {state}");
+    assert_eq!(state["data"]["model"]["id"].as_str(), Some(anthropic_id.as_str()));
+    assert!(
+        state["data"]["model"].get("contextWindow").is_some()
+            || state["data"]["model"].as_object().map(|o| o.len()).unwrap_or(0) > 2,
+        "get_state.model must be the FULL catalog record, not the degraded {{provider,id}} stub: {state}"
+    );
+}
+
+// ----------------------------------------------------------------------------------------------
+// SEAM-007 — a compaction refusal must reach the RPC client as `{success:false, error:"…"}`, not
+// `{success:true, data:null}`. Pi's `compact` throws (agent-session.ts:1801-1808/1823-1825) and the
+// throw propagates through the dispatcher's catch into `error(id, "compact", message)`.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rpc_compact_refusal_is_an_error_response_with_pi_s_reason() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let reader =
+        Cursor::new(concat!(r#"{"type":"compact","id":"c1"}"#, "\n").as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+
+    let lines = parse_lines(&out);
+    let resp = lines.iter().find(|l| l["command"] == "compact").expect("compact response");
+    assert_eq!(
+        resp["success"], false,
+        "nothing-to-compact must be a FAILURE response, not success-with-null: {resp}"
+    );
+    assert_eq!(
+        resp["error"], "Nothing to compact (session too small)",
+        "carries Pi's verbatim reason: {resp}"
+    );
+}

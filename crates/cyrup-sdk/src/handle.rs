@@ -223,19 +223,25 @@ impl Session {
 
     // ----------------------------------------------------------------- compaction ----
 
-    /// Compact the current branch; returns whether a compaction was produced.
+    /// Compact the current branch; returns the produced [`cyrup_session_svc::CompactionResult`].
+    ///
+    /// A refusal is an `Err` carrying the reason (`Nothing to compact (session too small)` /
+    /// `Already compacted` / `Compaction cancelled`), 1:1 with Pi's `compact`, which is typed
+    /// `Promise<CompactionResult>` and `throw`s (agent-session.ts:1801-1825) — never a success value
+    /// an embedder has to reverse-engineer.
     ///
     /// # Examples
     /// ```no_run
     /// # async fn demo(session: &cyrup_sdk::Session) -> cyrup_sdk::SdkResult<()> {
     /// let compacted = session.compact(None).await?;
-    /// let _ = compacted;
+    /// let _ = compacted.summary;
     /// # Ok(()) }
     /// ```
-    pub async fn compact(&self, custom_instructions: Option<String>) -> SdkResult<bool> {
-        // The facade returns the full `CompactionResult` (Pi 1:1); the SDK surface keeps its
-        // "was a compaction produced?" boolean — `Some` ⇒ produced.
-        Ok(self.inner.compact(custom_instructions).await?.is_some())
+    pub async fn compact(
+        &self,
+        custom_instructions: Option<String>,
+    ) -> SdkResult<cyrup_session_svc::CompactionResult> {
+        Ok(self.inner.compact(custom_instructions).await?)
     }
 
     // --------------------------------------------------------------- fork / branch ----

@@ -251,6 +251,7 @@ async fn resource_overrides_appear_in_the_system_prompt() {
                 name: "synthetic-deploy-skill".to_string(),
                 description: Some("Injected by the embedder, not on disk".to_string()),
                 path: PathBuf::from("/virtual/deploy/SKILL.md"),
+                disable_model_invocation: false,
             });
             skills
         })

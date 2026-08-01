@@ -246,3 +246,107 @@ async fn fork_target_copies_history_into_a_new_id() {
         "fork copies the source history"
     );
 }
+
+// ----------------------------------------------------------------------------------------------
+// SEAM-002 — every non-interactive host must tear the session down on a normal exit, emitting
+// `session_shutdown{reason:"quit"}`. Pi reaches `AgentSessionRuntime.dispose()`
+// (agent-session-runtime.ts:397-404) on EVERY exit: print-mode.ts's `finally { await
+// disposeRuntime() }` (:152-157) and rpc-mode.ts's `shutdown()` (:723-739), triggered by stdin EOF
+// (:801-803). Pre-fix cyrup's `dispose()` had zero production callers, so no extension and no
+// subscriber ever observed a shutdown on a normal `cyrup -p …` / `--mode rpc` run.
+//
+// Note the ORDER pi uses — `unsubscribe()` then `dispose()` (rpc-mode.ts:731-733) — so the shutdown
+// is NOT written to the mode's own output sink; it is observed by an independent subscriber (and by
+// extensions), which is exactly what these tests assert.
+// ----------------------------------------------------------------------------------------------
+
+/// Drain `sub` for up to `budget` events and report whether a `session_shutdown` with
+/// `reason == "quit"` came through.
+async fn saw_quit_shutdown(
+    sub: &mut cyrup_sdk::core::EventStream<cyrup_session_svc::AgentSessionEvent>,
+) -> bool {
+    use futures::StreamExt;
+    for _ in 0..200 {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), sub.next()).await {
+            Ok(Some(cyrup_session_svc::AgentSessionEvent::SessionShutdown { reason })) => {
+                assert_eq!(reason, "quit", "Pi disposes with reason `quit`");
+                return true;
+            }
+            Ok(Some(_)) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn print_dispatch_disposes_the_session_on_exit() {
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+    let mut sub = session.subscribe();
+
+    let mut out: Vec<u8> = Vec::new();
+    run_print_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    assert!(
+        saw_quit_shutdown(&mut sub).await,
+        "PRINT dispatch must emit session_shutdown{{reason:\"quit\"}} on exit (Pi print-mode.ts:152-157)"
+    );
+}
+
+#[tokio::test]
+async fn json_dispatch_disposes_the_session_on_exit() {
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+    let mut sub = session.subscribe();
+
+    let mut out: Vec<u8> = Vec::new();
+    run_json_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    assert!(
+        saw_quit_shutdown(&mut sub).await,
+        "JSON dispatch must emit session_shutdown{{reason:\"quit\"}} on exit (Pi print-mode.ts:152-157)"
+    );
+}
+
+/// RPC: reader EOF is Pi's `process.stdin.on("end") → shutdown() → runtimeHost.dispose()`
+/// (rpc-mode.ts:801-803 / :723-739).
+#[tokio::test]
+async fn rpc_dispatch_disposes_the_runtime_at_reader_eof() {
+    use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+    let factory = Arc::new(SessionFactory::new(provider, config));
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+
+    let session = runtime.session().await;
+    let mut sub = session.subscribe();
+
+    // A single command, then EOF.
+    let reader =
+        tokio::io::BufReader::new(std::io::Cursor::new(b"{\"type\":\"get_state\",\"id\":\"s\"}\n".to_vec()));
+    let mut writer: Vec<u8> = Vec::new();
+    cyrup::run::run_rpc_dispatch(&runtime, reader, &mut writer)
+        .await
+        .unwrap();
+
+    assert!(
+        saw_quit_shutdown(&mut sub).await,
+        "RPC dispatch must dispose the runtime at reader EOF (Pi rpc-mode.ts:723-739/:801-803)"
+    );
+}

@@ -57,6 +57,25 @@ pub enum SessionServiceError {
     #[error("the session has no active run to operate on")]
     NoActiveRun,
 
+    /// `prepareCompaction` produced nothing and the branch does NOT already end in a compaction —
+    /// the transcript is too small to summarize (Pi `throw new Error("Nothing to compact (session
+    /// too small)")`, agent-session.ts:1806). The message is verbatim Pi: it is what an RPC client
+    /// and the SDK surface as the failure reason.
+    #[error("Nothing to compact (session too small)")]
+    NothingToCompact,
+
+    /// `prepareCompaction` produced nothing because the last entry on the branch is already a
+    /// `compaction` (Pi `throw new Error("Already compacted")`, agent-session.ts:1804).
+    #[error("Already compacted")]
+    AlreadyCompacted,
+
+    /// A `session_before_compact` handler vetoed, or the compaction was aborted before the entry was
+    /// appended (Pi `throw new Error("Compaction cancelled")`, agent-session.ts:1824 and :1869). The
+    /// exact string is load-bearing upstream — Pi's own catch classifies an abort by comparing
+    /// `message === "Compaction cancelled"` (agent-session.ts:1911).
+    #[error("Compaction cancelled")]
+    CompactionCancelled,
+
     #[error("invalid entry id for forking: {0}")]
     InvalidForkEntry(String),
 

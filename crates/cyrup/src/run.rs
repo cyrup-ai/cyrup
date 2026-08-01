@@ -25,8 +25,14 @@ pub async fn run_print_dispatch<W: Write>(
     let messages =
         std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
     let mut err = std::io::stderr();
-    run_print(session, messages, out, &mut err, PrintOptions::default()).await?;
-    Ok(exit_code(session).await)
+    let ran = run_print(session, messages, out, &mut err, PrintOptions::default()).await;
+    let code = exit_code(session).await;
+    // Teardown on EVERY exit path — Pi's `finally { await disposeRuntime() }` (print-mode.ts:152-157),
+    // which emits `session_shutdown{reason:"quit"}` before releasing the session (see
+    // [`dispose_session`]). The exit code is read FIRST because dispose aborts the run.
+    dispose_session(session).await;
+    ran?;
+    Ok(code)
 }
 
 /// JSON dispatch: run the initial prompt then each follow-up, streaming every event as JSONL to `out`.
@@ -40,11 +46,29 @@ pub async fn run_json_dispatch<W: Write>(
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    run_json(session, initial_input(inputs), out).await?;
-    for follow_up in &inputs.follow_ups {
-        run_json(session, cli_input(follow_up), out).await?;
+    let ran = async {
+        run_json(session, initial_input(inputs), out).await?;
+        for follow_up in &inputs.follow_ups {
+            run_json(session, cli_input(follow_up), out).await?;
+        }
+        Ok::<(), cyrup_modes::ModesError>(())
     }
+    .await;
+    // Same `finally { await disposeRuntime() }` as PRINT (print-mode.ts:152-157 serves both modes).
+    dispose_session(session).await;
+    ran?;
     Ok(0)
+}
+
+/// Emit `session_shutdown{reason:"quit"}` and tear the session down (Pi `AgentSessionRuntime.dispose`
+/// → `session.dispose()`, agent-session-runtime.ts:397-404).
+///
+/// This is the ONE teardown every non-interactive host funnels through. Without it no extension ever
+/// observes `session_shutdown` on a normal exit, so anything that flushes or deregisters on shutdown
+/// (intercom broker deregistration, subagent background-run cleanup, permission-store teardown) never
+/// runs, and an in-flight run is never settled before the process returns.
+pub async fn dispose_session(session: &AgentSession) {
+    session.dispose("quit").await;
 }
 
 /// RPC dispatch: serve the persistent stdio line protocol over `reader`/`writer` (R-11-011…016).
@@ -60,7 +84,11 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-    run_rpc(runtime, reader, writer).await?;
+    let ran = run_rpc(runtime, reader, writer).await;
+    // Reader EOF (Pi's `process.stdin.on("end", …) → shutdown()`, rpc-mode.ts:801-803) tears the
+    // runtime down: `session_shutdown{reason:"quit"}` then `session.dispose()` (rpc-mode.ts:723-739).
+    runtime.dispose().await;
+    ran?;
     Ok(())
 }
 

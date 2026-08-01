@@ -42,7 +42,10 @@ pub use output_guard::{
     emit_stray, emit_stray_line, is_stdout_taken_over, restore_stdout, take_over_stdout,
 };
 pub use provider::{select_provider, unknown_model_warning};
-pub use run::{exit_code, initial_input, run_json_dispatch, run_print_dispatch, run_rpc_dispatch};
+pub use run::{
+    dispose_session, exit_code, initial_input, run_json_dispatch, run_print_dispatch,
+    run_rpc_dispatch,
+};
 pub use session_resolve::{
     MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup, SessionRef,
     format_missing_session_cwd_prompt, match_session_arg, missing_session_cwd_error,

@@ -1107,12 +1107,17 @@ impl AgentSession {
     /// Trigger a compaction of the current branch (R-11-014 `compact`; Pi `compact`,
     /// agent-session.ts:1647-1788). Aborts any active run first, emits
     /// `compaction_start`/`compaction_end`, offers the extension `session_before_compact` veto hook,
-    /// appends a `CompactionEntry`, and notifies `session_compact`. Returns the
-    /// [`CompactionResult`], or `None` when there was nothing to compact or a handler cancelled.
+    /// appends a `CompactionEntry`, and notifies `session_compact`.
+    ///
+    /// Returns the [`crate::state::CompactionResult`] on success. A refusal is an **error**, never a
+    /// success-with-`None` — Pi's `compact` is typed `Promise<CompactionResult>` and `throw`s
+    /// (agent-session.ts:1801-1808/1823-1825), so an RPC client / SDK embedder gets a distinguishable
+    /// reason: [`SessionServiceError::AlreadyCompacted`], [`SessionServiceError::NothingToCompact`]
+    /// or [`SessionServiceError::CompactionCancelled`].
     pub async fn compact(
         &self,
         custom_instructions: Option<String>,
-    ) -> Result<Option<crate::state::CompactionResult>, SessionServiceError> {
+    ) -> Result<crate::state::CompactionResult, SessionServiceError> {
         let reason = CompactionReason::Manual;
         // Disconnect/abort dance: stop the active run before compacting (agent-session.ts:1648-1649).
         self.abort();
@@ -1134,17 +1139,33 @@ impl AgentSession {
             match compactor.prepare(&guard, &settings) {
                 Some(x) => x,
                 None => {
+                    // Distinguish WHY, exactly as Pi does (agent-session.ts:1801-1807): a branch that
+                    // already ends in a `compaction` entry is "Already compacted"; anything else is
+                    // "Nothing to compact (session too small)".
+                    let already = matches!(
+                        guard.branch_path(None).last(),
+                        Some(cyrup_session::entry::Entry::Known(
+                            cyrup_session::entry::KnownEntry::Compaction { .. }
+                        ))
+                    );
                     drop(guard);
                     *Self::lock(&self.compaction_cancel) = None;
+                    let err = if already {
+                        SessionServiceError::AlreadyCompacted
+                    } else {
+                        SessionServiceError::NothingToCompact
+                    };
+                    // Pi's catch emits `compaction_end` with `errorMessage: "Compaction failed: …"`
+                    // for a non-abort throw (agent-session.ts:1908-1917).
                     self.fanout_emit(AgentSessionEvent::CompactionEnd {
                         reason,
                         result: None,
                         aborted: false,
                         will_retry: false,
-                        error_message: None,
+                        error_message: Some(format!("Compaction failed: {err}")),
                     })
                     .await;
-                    return Ok(None);
+                    return Err(err);
                 }
             }
         };
@@ -1164,6 +1185,9 @@ impl AgentSession {
         {
             BeforeCompactOutcome::Cancel => {
                 *Self::lock(&self.compaction_cancel) = None;
+                // Pi throws "Compaction cancelled" (agent-session.ts:1824); its catch classifies that
+                // exact message as an ABORT, so `compaction_end` carries `aborted:true` and NO
+                // errorMessage (agent-session.ts:1909-1916).
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
@@ -1172,7 +1196,7 @@ impl AgentSession {
                     error_message: None,
                 })
                 .await;
-                return Ok(None);
+                return Err(SessionServiceError::CompactionCancelled);
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
         };
@@ -1236,18 +1260,20 @@ impl AgentSession {
                     error_message: None,
                 })
                 .await;
-                Ok(Some(cr))
+                Ok(cr)
             }
+            // The internal `CompactionHooks` seam cancelled (`BeforeCompactDecision::Cancel`) — the
+            // same refusal Pi reports as "Compaction cancelled" (agent-session.ts:1824/1869).
             Ok(None) => {
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
-                    aborted: false,
+                    aborted: true,
                     will_retry: false,
                     error_message: None,
                 })
                 .await;
-                Ok(None)
+                Err(SessionServiceError::CompactionCancelled)
             }
             Err(e) => {
                 let aborted = matches!(e, cyrup_session::compaction::CompactionError::Aborted);
@@ -1264,7 +1290,20 @@ impl AgentSession {
                     error_message,
                 })
                 .await;
-                Err(e.into())
+                if aborted {
+                    // An in-flight abort (Esc during `/compact` → `abort_compaction`) is the SAME
+                    // refusal Pi raises as the bare `Compaction cancelled`
+                    // (agent-session.ts:1869 `if (this._compactionAbortController.signal.aborted)
+                    // { throw new Error("Compaction cancelled"); }`), propagated verbatim to an RPC
+                    // client by rpc-mode.ts:789-795. Surfacing the wrapped
+                    // `SessionServiceError::Compaction` here would emit `compaction: compaction
+                    // cancelled` instead, and Pi's own catch classifies an abort by comparing
+                    // `message === "Compaction cancelled"` (agent-session.ts:1911), so the exact
+                    // string is load-bearing.
+                    Err(SessionServiceError::CompactionCancelled)
+                } else {
+                    Err(e.into())
+                }
             }
         }
     }

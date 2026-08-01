@@ -2090,13 +2090,14 @@ impl<B: Backend> App<B> {
                 // Render the compaction-summary message (`compaction-summary-message.ts`): the
                 // `[compaction]` label + `**Compacted from N tokens**` markdown body produced by the
                 // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
-                Ok(Some(result)) => {
+                Ok(result) => {
                     self.state
                         .transcript
                         .push_compaction_summary(result.tokens_before, result.summary);
                 }
-                // No-op (nothing to compact / aborted): a plain status line.
-                Ok(None) => self.state.transcript.push_status("nothing to compact"),
+                // A refusal (nothing to compact / already compacted / an extension veto) is now an
+                // `Err` carrying Pi's reason string, so the status line names WHY instead of the old
+                // undifferentiated "nothing to compact".
                 Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
             },
             C::Clone => match session.clone_at(None).await {
