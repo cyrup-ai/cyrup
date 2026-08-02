@@ -677,11 +677,13 @@ async fn resolve_config_rows(
             skills: settings.global().skill_paths(),
             prompts: settings.global().prompt_template_paths(),
             themes: settings.global().theme_paths(),
+            extensions: settings.global().extension_paths(),
         },
         ResourceOverrides {
             skills: settings.project().skill_paths(),
             prompts: settings.project().prompt_template_paths(),
             themes: settings.project().theme_paths(),
+            extensions: settings.project().extension_paths(),
         },
     );
     let universe_disc = base(ResourceOverrides::default(), ResourceOverrides::default());

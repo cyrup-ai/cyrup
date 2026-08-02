@@ -2679,3 +2679,165 @@ async fn g1_project_settings_entry_trust_gated() {
         "trusted surfaces settings entry"
     );
 }
+
+// ===========================================================================
+// CFG-003 / CFG-004 — settings-declared packages + settings-declared local entries
+// ===========================================================================
+
+/// A package declared in settings (never installed) contributes its resources, and the object-form
+/// per-type include filter (Pi `applyPackageFilter`, package-manager.ts:2147-2171) is honored.
+#[tokio::test]
+async fn cfg003_settings_declared_package_is_discovered_with_its_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkgsrc");
+    make_package_tree(&pkg, true, false);
+    write(
+        &pkg.join("skills/beta/SKILL.md"),
+        &skill_md("beta", "beta skill"),
+    );
+
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    // No filter: everything the manifest declares loads.
+    let mut cfg = DiscoveryConfig::new(cwd.clone(), global.clone());
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter::default(),
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(report.registry.skills.contains("alpha"));
+    assert!(report.registry.skills.contains("beta"));
+    assert!(report.registry.prompts.contains("greet"));
+    assert!(report.registry.themes.contains("midnight"));
+    assert!(
+        report
+            .registry
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("deploy"))
+    );
+
+    // `skills: ["skills/alpha/**"]` selects alpha only; `themes: []` disables themes entirely.
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter {
+            skills: Some(vec!["skills/alpha/**".to_string()]),
+            themes: Some(Vec::new()),
+            ..Default::default()
+        },
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "the pattern keeps alpha"
+    );
+    assert!(
+        !report.registry.skills.contains("beta"),
+        "the pattern drops beta"
+    );
+    assert!(
+        !report.registry.themes.contains("midnight"),
+        "an explicitly EMPTY filter list disables the whole resource type"
+    );
+}
+
+/// A settings-declared package that is not on disk is a LOUD diagnostic, never a silent drop and
+/// never a failed discovery pass.
+#[tokio::test]
+async fn cfg003_missing_settings_declared_package_is_an_error_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: "./absent-package".into(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter::default(),
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("absent-package"))
+        .expect("a missing declared package must be reported");
+    assert_eq!(d.diagnostic_type, DiagnosticType::Error);
+    assert_eq!(d.resource_type, cyrup_resources::ResourceKind::Package);
+}
+
+/// CFG-004: a PROJECT-scope settings-declared package is trust-gated (fail closed), exactly like the
+/// project-installed tier.
+#[tokio::test]
+async fn cfg003_project_scope_declared_package_is_trust_gated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+    // Declared relative to the project base dir (Pi `join(cwd, CONFIG_DIR_NAME)`, :2058).
+    let pkg = cwd.join(".cyrup/local-pack");
+    make_package_tree(&pkg, true, false);
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: "local-pack".into(),
+        scope: InstallScope::Project,
+        filter: cyrup_resources::PackageFilter::default(),
+    }];
+    cfg.trusted_project = false;
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "untrusted project must load nothing"
+    );
+
+    cfg.trusted_project = true;
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "a trusted project resolves the declared package against <cwd>/.cyrup"
+    );
+}
+
+/// CFG-004: a plain path in the settings `extensions` array is LOADED as an extension root — Pi runs
+/// `resolveLocalEntries` over `RESOURCE_TYPES`, whose first member is `"extensions"`
+/// (package-manager.ts:194, :905-931).
+#[tokio::test]
+async fn cfg004_settings_declared_extension_entries_are_loaded_not_just_filtered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(cwd.join(".cyrup/exts/proj-ext")).unwrap();
+    fs::create_dir_all(global.join("exts/glob-ext")).unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.global_overrides = ResourceOverrides {
+        extensions: vec!["exts/glob-ext".to_string()],
+        ..Default::default()
+    };
+    cfg.project_overrides = ResourceOverrides {
+        extensions: vec!["exts/proj-ext".to_string()],
+        ..Default::default()
+    };
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    let roots = &report.registry.ext_crate_paths;
+    assert!(roots.iter().any(|p| p.ends_with("glob-ext")), "{roots:?}");
+    assert!(roots.iter().any(|p| p.ends_with("proj-ext")), "{roots:?}");
+
+    // Untrusted project: the project entry must not load; the global one still does.
+    cfg.trusted_project = false;
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    let roots = &report.registry.ext_crate_paths;
+    assert!(roots.iter().any(|p| p.ends_with("glob-ext")), "{roots:?}");
+    assert!(!roots.iter().any(|p| p.ends_with("proj-ext")), "{roots:?}");
+}

@@ -19,8 +19,8 @@ use cyrup_config::{
 use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
 use cyrup_provider::{Model, Provider};
 use cyrup_resources::{
-    discover, DiscoveryConfig, InstallScope, InstalledPackages, PackageStore, ResourceOverrides,
-    SkillPointer,
+    discover, ConfiguredPackage, DiscoveryConfig, InstallScope, InstalledPackages, PackageFilter,
+    PackageStore, ResourceOverrides, SkillPointer,
 };
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
 use cyrup_session::prompt::{
@@ -691,16 +691,30 @@ impl SessionBuilder {
         // discovery is gated by the GLOBAL layer's lists and project-scope by the PROJECT layer's —
         // not the merged effective view (which would let a project list silently widen the global
         // scope, or vice-versa). Empty lists — the default — preserve "discover everything".
+        //
+        // The SAME arrays also carry Pi's positive (plain-path) listings, which `resolveLocalEntries`
+        // LOADS at the settings tier (package-manager.ts:905-931, :2255-2276) — including the
+        // `extensions` array, the first member of Pi's `RESOURCE_TYPES` (:194). cyrup had shipped the
+        // filter half only for `extensions`, so a settings-declared extension root was inert (CFG-004).
         disc.global_overrides = ResourceOverrides {
             skills: settings.global().skill_paths(),
             prompts: settings.global().prompt_template_paths(),
             themes: settings.global().theme_paths(),
+            extensions: settings.global().extension_paths(),
         };
         disc.project_overrides = ResourceOverrides {
             skills: settings.project().skill_paths(),
             prompts: settings.project().prompt_template_paths(),
             themes: settings.project().theme_paths(),
+            extensions: settings.project().extension_paths(),
         };
+        // CFG-003: `settings.packages` is Pi's ONLY package channel — `PackageManager.resolve()`
+        // re-collects `projectSettings.packages` then `globalSettings.packages` on every call and
+        // resolves each entry to a working tree (package-manager.ts:891-901). cyrup read only its own
+        // `packages.json` install registry, so a package DECLARED in settings contributed nothing.
+        // Project entries are pushed first so they win the shared package precedence rank (:887-893).
+        let (configured_packages, package_errors) = configured_packages_from_settings(&settings);
+        disc.configured_packages = configured_packages;
         let report = discover(&disc, cancel.token()).await?;
         // TUI-006: the discovery pass's structured diagnostics (shadowed same-name skills, a
         // configured path that does not exist, a malformed frontmatter) used to be dropped on the
@@ -710,6 +724,39 @@ impl SessionBuilder {
         #[cfg_attr(not(feature = "wasm-host"), allow(unused_mut))]
         let mut startup_diagnostics =
             crate::services::StartupDiagnostics { resources: report.diagnostics.clone(), ..Default::default() };
+        // A malformed `packages` entry never takes the settings document (or the session) down; it
+        // is reported alongside the discovery diagnostics.
+        for message in package_errors {
+            startup_diagnostics.resources.push(cyrup_resources::ResourceDiagnostic::error(
+                cyrup_resources::ResourceKind::Package,
+                cfg.agent_dir.join("settings.json"),
+                message,
+            ));
+        }
+
+        // CFG-002: `<agent_dir>/models.json` — the user's custom-provider / custom-model file. Pi
+        // loads it ONCE per runtime (`ModelConfig.load(join(getAgentDir(),"models.json"))`,
+        // model-runtime.ts:137-139) and composes it over the built-in provider catalogs
+        // (`composeModelProvider`, provider-composer.ts:411-437). cyrup had the reader
+        // (`load_models_file`) and the path (`ConfigDirs::models_path`) but NO production caller, so
+        // the entire custom-provider surface was dead. A malformed file is reported and skipped —
+        // never fatal, never a panic (Pi keeps an empty snapshot + one error string,
+        // model-config.ts:248-271).
+        let (model_file, model_file_error) =
+            cyrup_config::load_models_file_reporting(&cfg.agent_dir.join("models.json"));
+        startup_diagnostics.models.extend(model_file_error);
+        // Surface composition errors (a provider block Pi would `throw` on) once, at startup, rather
+        // than on every catalog read.
+        {
+            let base = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+                credentials: None,
+                auth_context: None,
+            })
+            .get_models(None);
+            let (_, errors) = model_file.compose(&base);
+            startup_diagnostics.models.extend(errors);
+        }
+        let model_config = Arc::new(model_file);
 
         // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
         // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664), then
@@ -1115,6 +1162,7 @@ impl SessionBuilder {
             auth,
             resources,
             startup_diagnostics,
+            model_config,
             context: context_store,
             ext_host,
             guest_providers,
@@ -1441,6 +1489,57 @@ fn load_installed_packages(package_dir: &Path, cwd: &Path) -> InstalledPackages 
         }
     }
     installed
+}
+
+/// Collect the packages DECLARED in settings into discovery's settings-package channel (CFG-003).
+///
+/// 1:1 with the head of Pi's `PackageManager.resolve()` (package-manager.ts:891-900): PROJECT
+/// entries first, then GLOBAL, deduped by source identity so a project entry wins a collision — the
+/// exact ordering that makes project-scope resources beat global ones under the shared package
+/// precedence rank. Each entry's object-form include filters ride along
+/// (`const filter = typeof pkg === "object" ? pkg : undefined`, :1231).
+///
+/// Reads the two RAW LAYERS, never the merged effective view: the merged view cannot say which
+/// scope declared an entry, and discovery trust-gates project-scope packages.
+///
+/// A malformed entry is skipped with a message rather than dropping the array (or the settings
+/// document) — the returned `Vec<String>` becomes startup diagnostics.
+fn configured_packages_from_settings(
+    settings: &SettingsManager,
+) -> (Vec<ConfiguredPackage>, Vec<String>) {
+    let mut out: Vec<ConfiguredPackage> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (layer, scope) in [
+        (settings.project(), InstallScope::Project),
+        (settings.global(), InstallScope::Global),
+    ] {
+        let (declared, layer_errors) = layer.packages_with_errors();
+        errors.extend(layer_errors);
+        for entry in declared {
+            let source = entry.source().trim().to_string();
+            if source.is_empty() {
+                errors.push("settings `packages` entry has an empty `source`".to_string());
+                continue;
+            }
+            // Pi's `dedupePackages` (package-manager.ts:1681): project scope wins for the same
+            // package identity, so a later (global) entry for an already-seen source is dropped.
+            if out.iter().any(|p| p.source == source) {
+                continue;
+            }
+            let (extensions, skills, prompts, themes) = entry.filters();
+            out.push(ConfiguredPackage {
+                source,
+                scope,
+                filter: PackageFilter {
+                    extensions: extensions.map(<[String]>::to_vec),
+                    skills: skills.map(<[String]>::to_vec),
+                    prompts: prompts.map(<[String]>::to_vec),
+                    themes: themes.map(<[String]>::to_vec),
+                },
+            });
+        }
+    }
+    (out, errors)
 }
 
 /// Map the runtime mode to the extension `(ExtMode, has_ui)` (R-11-002).

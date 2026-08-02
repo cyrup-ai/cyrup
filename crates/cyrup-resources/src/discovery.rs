@@ -14,7 +14,8 @@ use crate::key::ResourceKey;
 use crate::package::manifest::{ManifestResourceType, resolve_local_entries};
 use crate::package::store::installed_dir;
 use crate::package::{
-    DisabledSet, InstalledPackage, InstalledPackages, ResourceSelector, resolve_manifest,
+    ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, PackageFilter,
+    ResourceSelector, resolve_manifest,
 };
 use crate::prompt::PromptTemplate;
 use crate::scope::{InstallScope, ResourceOrigin, ResourceScope};
@@ -132,6 +133,12 @@ pub struct ResourceOverrides {
     pub prompts: Vec<String>,
     #[serde(default)]
     pub themes: Vec<String>,
+    /// The settings `extensions` array. Pi's `RESOURCE_TYPES` is
+    /// `["extensions","skills","prompts","themes"]` (package-manager.ts:194) and `resolve()` runs the
+    /// SAME `resolveLocalEntries` pass over all four (package-manager.ts:905-931), so a plain path
+    /// here is a positive listing that LOADS an extension root — not merely a filter (CFG-004).
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 /// Everything discovery needs, passed in (keeps `cyrup-resources` core-only).
@@ -166,6 +173,12 @@ pub struct DiscoveryConfig {
     pub enable_themes: bool,
     pub cli: CliResourcePaths,
     pub installed: InstalledPackages,
+    /// Packages DECLARED in `settings.json` (`packages: [...]`), per settings layer. Pi's ONLY
+    /// package channel — `PackageManager.resolve()` re-reads
+    /// `projectSettings.packages`/`globalSettings.packages` on every call and resolves each entry to
+    /// a working tree (package-manager.ts:891-901). Resolved BEFORE [`Self::installed`]; a duplicate
+    /// working tree recorded in the install registry is skipped (CFG-003).
+    pub configured_packages: Vec<ConfiguredPackage>,
     /// From `resources_discover` (R-09-022).
     pub extra: DiscoveredPaths,
     /// Top-level per-resource enable/disable state.
@@ -201,12 +214,130 @@ impl DiscoveryConfig {
             enable_themes: true,
             cli: CliResourcePaths::default(),
             installed: InstalledPackages::default(),
+            configured_packages: Vec::new(),
             extra: DiscoveredPaths::default(),
             disabled: DisabledSet::default(),
             global_overrides: ResourceOverrides::default(),
             project_overrides: ResourceOverrides::default(),
         }
     }
+}
+
+/// One package working tree queued for resource collection, from either the settings channel
+/// ([`ConfiguredPackage`], CFG-003) or the install registry ([`InstalledPackage`]).
+struct PackageTree {
+    dir: PathBuf,
+    id: cyrup_core::PackageId,
+    tier: ResourceScope,
+    disabled: DisabledSet,
+    filter: PackageFilter,
+}
+
+/// Borrowed view of a [`PackageTree`] used inside the collection loop.
+struct PackageTreeRef<'a> {
+    id: &'a cyrup_core::PackageId,
+    disabled: &'a DisabledSet,
+    filter: &'a PackageFilter,
+}
+
+/// Apply a settings-declared package's per-type include filter to a collected buffer (Pi
+/// `applyPackageFilter`, package-manager.ts:2147-2171). `None` keeps everything (the package's own
+/// manifest already selected it); an explicitly EMPTY list disables the whole resource type
+/// (:2156-2162); otherwise `applyPatterns` selects, relative to the package root.
+fn retain_by_package_filter<T>(
+    buf: &mut Vec<T>,
+    path_of: impl Fn(&T) -> PathBuf,
+    package_root: &Path,
+    patterns: Option<&[String]>,
+) {
+    let Some(patterns) = patterns else {
+        return;
+    };
+    if patterns.is_empty() {
+        buf.clear();
+        return;
+    }
+    let all: Vec<PathBuf> = buf.iter().map(&path_of).collect();
+    let enabled = crate::package::manifest::apply_settings_patterns(package_root, &all, patterns);
+    buf.retain(|item| enabled.contains(&path_of(item)));
+}
+
+/// Resolve a settings-declared package entry to its on-disk working tree.
+///
+/// Pi's `resolvePackageSources` (package-manager.ts:1224-1283) resolves a `local` source against the
+/// scope base dir (`getBaseDirForScope`, 2055-2064: `<cwd>/.cyrup` for project, the agent dir for
+/// user) and *installs* an npm/git source that is missing. **[CYRUP-DELTA]**: cyrup performs no
+/// network install during session assembly — a non-local source resolves only through the existing
+/// install registry paths, and anything unresolvable becomes a loud [`ResourceDiagnostic`] instead of
+/// a silent drop or a failed session (constraint: malformed/missing declarations fail loudly + safely).
+fn resolve_configured_package(
+    declared: &ConfiguredPackage,
+    cfg: &DiscoveryConfig,
+) -> Result<PackageTree, Box<ResourceDiagnostic>> {
+    let tier = declared.scope.package_resource_scope();
+    let base = match declared.scope {
+        InstallScope::Project => cfg.cwd.join(".cyrup"),
+        InstallScope::Global => cfg.global_dir.clone(),
+    };
+    let source = crate::package::PackageSource::parse(declared.source.trim()).map_err(|e| {
+        Box::new(ResourceDiagnostic::error(
+            ResourceKind::Package,
+            &base,
+            format!(
+                "settings `packages` entry {:?} is not a usable package source: {e}",
+                declared.source
+            ),
+        ))
+    })?;
+    let id = source.package_id();
+    let dir = match &source {
+        // A local path resolves against the scope base dir, exactly like Pi's
+        // `resolveLocalExtensionSource` (package-manager.ts:1301-1327).
+        crate::package::PackageSource::Path { path } => {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                base.join(path)
+            }
+        }
+        // git/oci: use the tree a previous `cyrup install` materialized, if any.
+        _ => installed_dir(
+            &source,
+            declared.scope,
+            &id,
+            &cfg.package_global_dir,
+            cfg.project_root.as_deref(),
+        )
+        .ok_or_else(|| {
+            Box::new(ResourceDiagnostic::error(
+                ResourceKind::Package,
+                &base,
+                format!(
+                    "package {:?} is declared in settings but its install location could not be \
+                     resolved",
+                    declared.source
+                ),
+            ))
+        })?,
+    };
+    if !dir.is_dir() {
+        return Err(Box::new(ResourceDiagnostic::error(
+            ResourceKind::Package,
+            &dir,
+            format!(
+                "package {:?} is declared in settings but is not installed at this path — run \
+                 `cyrup install {}`",
+                declared.source, declared.source
+            ),
+        )));
+    }
+    Ok(PackageTree {
+        dir,
+        id,
+        tier,
+        disabled: DisabledSet::default(),
+        filter: declared.filter.clone(),
+    })
 }
 
 /// Whether an auto-discovered loose resource file is enabled by a settings override list. The match
@@ -428,6 +559,7 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             &mut skills,
             &mut prompts,
             &mut themes,
+            &mut ext_paths,
             &mut warnings,
             &mut diagnostics,
         );
@@ -440,15 +572,36 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         &mut skills,
         &mut prompts,
         &mut themes,
+        &mut ext_paths,
         &mut warnings,
         &mut diagnostics,
     );
 
-    // --- installed packages (R-09-015/016/017/018) ---
+    // --- packages: settings-declared (CFG-003) + the install registry (R-09-015/016/017/018) ---
     // All packages share precedence rank 4 (Pi `resourcePrecedenceRank`, package-manager.ts:185).
     // Pi pushes project-scope packages before global ones (allPackages, 887-893), so under that
-    // shared rank a project-local package wins a same-name tie with a global one. Stable-order the
-    // installed packages project-first to reproduce that (config order is preserved within a scope).
+    // shared rank a project-local package wins a same-name tie with a global one. Stable-order both
+    // channels project-first to reproduce that (config order is preserved within a scope).
+    //
+    // Pi's ONLY channel is the settings one — `resolve()` re-reads
+    // `projectSettings.packages`/`globalSettings.packages` on every call (891-901) — so the
+    // settings-declared trees are resolved FIRST and an install-registry record for the same working
+    // tree is skipped as a duplicate.
+    let mut trees: Vec<PackageTree> = Vec::new();
+    let mut ordered_cfg: Vec<&ConfiguredPackage> = cfg.configured_packages.iter().collect();
+    ordered_cfg.sort_by_key(|p| match p.scope {
+        InstallScope::Project => 0u8,
+        InstallScope::Global => 1u8,
+    });
+    for declared in ordered_cfg {
+        if declared.scope == InstallScope::Project && !cfg.trusted_project {
+            continue; // fail-closed trust gate (Pi `assertProjectTrustedForScope`, 2055-2058)
+        }
+        match resolve_configured_package(declared, cfg) {
+            Ok(tree) => trees.push(tree),
+            Err(diag) => diagnostics.push(*diag),
+        }
+    }
     let mut ordered_pkgs: Vec<&InstalledPackage> = cfg.installed.packages.iter().collect();
     ordered_pkgs.sort_by_key(|p| match p.scope {
         InstallScope::Project => 0u8,
@@ -458,7 +611,6 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         if pkg.scope == InstallScope::Project && !cfg.trusted_project {
             continue; // fail-closed trust gate
         }
-        let tier = pkg.scope.package_resource_scope();
         let Some(dir) = installed_dir(
             &pkg.source,
             pkg.scope,
@@ -469,6 +621,32 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             cfg.project_root.as_deref(),
         ) else {
             continue;
+        };
+        trees.push(PackageTree {
+            dir,
+            id: pkg.id.clone(),
+            tier: pkg.scope.package_resource_scope(),
+            disabled: pkg.disabled.clone(),
+            filter: PackageFilter::default(),
+        });
+    }
+    let mut seen_trees: Vec<PathBuf> = Vec::new();
+    for tree in trees {
+        let PackageTree {
+            dir,
+            id,
+            tier,
+            disabled,
+            filter,
+        } = tree;
+        if seen_trees.contains(&dir) {
+            continue;
+        }
+        seen_trees.push(dir.clone());
+        let pkg = PackageTreeRef {
+            id: &id,
+            disabled: &disabled,
+            filter: &filter,
         };
         let manifest = match resolve_manifest(&dir) {
             Ok(m) => m,
@@ -500,6 +678,12 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     !pkg.disabled
                         .is_disabled(&ResourceSelector::Skill(s.name.clone()))
                 });
+                retain_by_package_filter(
+                    &mut buf,
+                    |s| s.skill_md.clone(),
+                    &dir,
+                    pkg.filter.skills.as_deref(),
+                );
                 for s in &mut buf {
                     s.origin = origin.clone();
                 }
@@ -529,6 +713,12 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     !pkg.disabled
                         .is_disabled(&ResourceSelector::Prompt(p.key.as_str().to_string()))
                 });
+                retain_by_package_filter(
+                    &mut buf,
+                    |p| p.path.clone(),
+                    &dir,
+                    pkg.filter.prompts.as_deref(),
+                );
                 for p in &mut buf {
                     p.origin = origin.clone();
                 }
@@ -558,12 +748,19 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     !pkg.disabled
                         .is_disabled(&ResourceSelector::Theme(t.data.name.clone()))
                 });
+                retain_by_package_filter(
+                    &mut buf,
+                    |t| t.origin_path.clone().unwrap_or_default(),
+                    &dir,
+                    pkg.filter.themes.as_deref(),
+                );
                 for t in &mut buf {
                     t.origin = origin.clone();
                 }
                 themes.extend(buf);
             }
         }
+        let mut ext_buf: Vec<PathBuf> = Vec::new();
         for ext in &manifest.extensions {
             let name = ext
                 .file_name()
@@ -571,7 +768,18 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                 .unwrap_or_default()
                 .to_string();
             if !pkg.disabled.is_disabled(&ResourceSelector::Extension(name)) {
-                ext_paths.push(ext.clone());
+                ext_buf.push(ext.clone());
+            }
+        }
+        retain_by_package_filter(
+            &mut ext_buf,
+            Clone::clone,
+            &dir,
+            pkg.filter.extensions.as_deref(),
+        );
+        for e in ext_buf {
+            if !ext_paths.contains(&e) {
+                ext_paths.push(e);
             }
         }
     }
@@ -1024,9 +1232,18 @@ fn add_local_entries(
     skills: &mut Vec<Skill>,
     prompts: &mut Vec<PromptTemplate>,
     themes: &mut Vec<Theme>,
+    ext_paths: &mut Vec<PathBuf>,
     warnings: &mut Vec<ResourceWarning>,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
+    // `extensions` is the FIRST entry of Pi's `RESOURCE_TYPES` (package-manager.ts:194) and goes
+    // through the very same `resolveLocalEntries` pass (:905-931). A settings-declared extension
+    // root is therefore LOADED, not just pattern-filtered (CFG-004).
+    for e in resolve_local_entries(base, &overrides.extensions, ManifestResourceType::Extensions) {
+        if !ext_paths.contains(&e) {
+            ext_paths.push(e);
+        }
+    }
     if cfg.enable_skills {
         for md in resolve_local_entries(base, &overrides.skills, ManifestResourceType::Skills) {
             let root = md.parent().unwrap_or(&md).to_path_buf();

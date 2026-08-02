@@ -2272,6 +2272,31 @@ impl AgentSession {
         if self.services.guest_providers.has_provider(model.provider.as_str()) {
             return true;
         }
+        // A `models.json` provider that supplies its own `apiKey` is configured, exactly as Pi's
+        // `hasConfiguredAuth` counts a provider request config that carries a key
+        // (model-registry.ts:659-662; `composeApiKeyAuth`, provider-composer.ts:439).
+        //
+        // PRESENCE ONLY — deliberately does NOT resolve the value. The key is written in cyrup's
+        // config-value language (`${env:...}`/`${cmd:...}`), and resolving a `${cmd:...}` here would
+        // execute a shell command out of `models.json` on a *status* query. Pi never does that on
+        // this path: `hasConfiguredAuth` is a pure set-membership test against a precomputed
+        // snapshot (model-runtime.ts:372-374), and the snapshot is built once per refresh
+        // (:257-261), not per call — while this predicate is called inside filter loops
+        // (model-resolver.ts:480). Resolution stays where it belongs, on the request path.
+        // Consequence, accepted: a provider whose template turns out to be unresolvable still counts
+        // as configured here and fails later at request time, which is also what Pi does.
+        //
+        // Credential *acquisition* (OAuth) is deliberately out of scope: an `oauth`-only
+        // models.json provider is not counted as configured.
+        if let Some(cfg) = self
+            .services
+            .model_config
+            .providers
+            .get(model.provider.as_str())
+            && cfg.api_key.is_some()
+        {
+            return true;
+        }
         self.provider
             .current()
             .models()
@@ -2287,32 +2312,53 @@ impl AgentSession {
         self.services.auth.has_auth(provider, None)
     }
 
-    /// The FULL multi-provider model registry (Pi `providers/all.ts` → `getModels(None)`), unioned
-    /// with the current provider's own catalog (which includes the offline faux models + any custom-id
-    /// models that are not part of the built-in registry). Deduped by `provider/id`, current-provider
-    /// entries first. This is the resolution/enumeration source that spans providers, independent of
-    /// which single provider is currently installed.
+    /// Public view of [`Self::full_model_registry`] — every model the session can resolve, before
+    /// the configured-auth filter [`Self::available_model_catalog`] applies.
+    pub fn full_model_catalog(&self) -> Vec<Model> {
+        self.full_model_registry()
+    }
+
+    /// The FULL multi-provider model registry, deduped by `provider/id`: the session's own installed
+    /// provider + guest-registered providers + the compiled-in built-in catalogs, with
+    /// `<agent_dir>/models.json` composed over the whole union LAST — Pi's single composed registry
+    /// (`ModelRuntime.rebuildProviders`, model-runtime.ts:225-231). This is the resolution /
+    /// enumeration source that spans providers, independent of which single provider is installed.
     fn full_model_registry(&self) -> Vec<Model> {
-        let mut out: Vec<Model> = self.provider.current().models().to_vec();
+        // --- BASE layer, in Pi's `recomposeProvider` precedence (model-runtime.ts:201) ---
+        // `base = nativeExtensionProviders.get(id) ?? builtins.get(id)`: a registered provider
+        // shadows the compiled-in catalog, and the compiled-in catalog fills in the rest. The
+        // session's own installed provider comes first because it also carries the offline faux
+        // models and any custom-id model that is not a registry entry.
+        let mut base: Vec<Model> = self.provider.current().models().to_vec();
         // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
-        // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940). Unioned FIRST after
-        // the current provider so a guest override of a built-in id wins over the built-in entry.
+        // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
         for m in self.services.guest_providers.models() {
-            if !out.iter().any(|e| e.provider == m.provider && e.id == m.id) {
-                out.push(m);
+            if !base.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+                base.push(m);
             }
         }
-        let full = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+        for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
             credentials: None,
             auth_context: None,
         })
-        .get_models(None);
-        for m in full {
-            if !out.iter().any(|e| e.provider == m.provider && e.id == m.id) {
-                out.push(m);
+        .get_models(None)
+        {
+            if !base.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+                base.push(m);
             }
         }
-        out
+        // --- TOP layer: `<agent_dir>/models.json` (CFG-002) ---
+        // Pi composes LAST and REPLACES the provider in the collection
+        // (`this.models.setProvider(composeModelProvider(...))`, model-runtime.ts:215), so the
+        // overlay reaches EVERY consumer — including the provider the session is currently running
+        // on, which is the whole point of a `baseUrl` / `compat` / `modelOverrides` block ("point my
+        // provider at a proxy", "raise contextWindow on the model I'm using"). Composing over the
+        // union rather than over the compiled-in catalogs alone is what keeps the current provider's
+        // uncomposed entries from shadowing their composed counterparts. Composition errors were
+        // already reported at startup (`StartupDiagnostics::models`); here a rejected provider block
+        // simply keeps its built-ins.
+        let (composed, _errors) = self.services.model_config.compose(&base);
+        composed
     }
 
     /// The models the `/model` selector offers: the FULL registry filtered to CONFIGURED providers

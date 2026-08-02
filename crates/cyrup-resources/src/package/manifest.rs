@@ -374,6 +374,14 @@ pub(crate) fn resolve_local_entries(
 /// variant [`apply_patterns`] omits the include step because manifest source entries are already
 /// resolved into the candidate set.) Order: includes (or all) → excludes (`!`) → force-includes
 /// (`+`) → force-excludes (`-`).
+pub(crate) fn apply_settings_patterns(
+    base: &Path,
+    all: &[PathBuf],
+    patterns: &[String],
+) -> Vec<PathBuf> {
+    apply_patterns_full(base, all, patterns)
+}
+
 fn apply_patterns_full(base: &Path, all: &[PathBuf], patterns: &[String]) -> Vec<PathBuf> {
     let mut includes: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();

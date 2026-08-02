@@ -104,6 +104,45 @@ pub enum PackageSource {
     },
 }
 
+impl PackageSource {
+    /// The raw source string (Pi `getPackageSourceString`, package-manager.ts:1338-1340).
+    pub fn source(&self) -> &str {
+        match self {
+            PackageSource::Name(s) => s,
+            PackageSource::Detailed { source, .. } => source,
+        }
+    }
+
+    /// The per-resource include filters, `None` for a bare string entry (Pi
+    /// `const filter = typeof pkg === "object" ? pkg : undefined`, package-manager.ts:1231).
+    /// Order: `extensions`, `skills`, `prompts`, `themes` — Pi's `RESOURCE_TYPES` (:194).
+    #[allow(clippy::type_complexity)]
+    pub fn filters(
+        &self,
+    ) -> (
+        Option<&[String]>,
+        Option<&[String]>,
+        Option<&[String]>,
+        Option<&[String]>,
+    ) {
+        match self {
+            PackageSource::Name(_) => (None, None, None, None),
+            PackageSource::Detailed {
+                extensions,
+                skills,
+                prompts,
+                themes,
+                ..
+            } => (
+                extensions.as_deref(),
+                skills.as_deref(),
+                prompts.as_deref(),
+                themes.as_deref(),
+            ),
+        }
+    }
+}
+
 /// A key that is only honoured in the GLOBAL scope; stripped from project/CLI before merge.
 const GLOBAL_ONLY_KEYS: &[&str] = &["defaultProjectTrust"];
 
@@ -240,7 +279,48 @@ impl Settings {
     pub fn theme_paths(&self) -> Vec<String> {
         self.layer_string_list("themes")
     }
+
+    /// `getExtensionPaths` for THIS layer only. Pi's `RESOURCE_TYPES` starts with `"extensions"`
+    /// (package-manager.ts:194) and `resolve()` runs `resolveLocalEntries` over all four types per
+    /// scope (:905-931), so these plain paths LOAD extension roots — they are not merely filters.
+    pub fn extension_paths(&self) -> Vec<String> {
+        self.layer_string_list("extensions")
+    }
+
+    /// `getPackages` for THIS layer only (Pi reads `projectSettings.packages` and
+    /// `globalSettings.packages` separately so the project layer wins the dedupe and can be
+    /// trust-gated independently, package-manager.ts:891-898).
+    ///
+    /// Entries are parsed INDIVIDUALLY: one malformed entry is reported and skipped rather than
+    /// discarding the whole array (which is what a blanket `from_value::<Vec<_>>().ok()` does) and
+    /// never affects the rest of the settings document. Returns `(parsed, errors)`.
+    pub fn packages_with_errors(&self) -> (Vec<PackageSource>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        let Some(arr) = self.obj.get("packages").and_then(Value::as_array) else {
+            // A present-but-non-array `packages` is itself worth saying out loud.
+            if self.obj.contains_key("packages") {
+                errors.push("settings `packages` must be an array".to_string());
+            }
+            return (out, errors);
+        };
+        for (i, v) in arr.iter().enumerate() {
+            match serde_json::from_value::<PackageSource>(v.clone()) {
+                Ok(p) => out.push(p),
+                Err(e) => errors.push(format!(
+                    "settings `packages[{i}]` is not a package source: {e}"
+                )),
+            }
+        }
+        (out, errors)
+    }
+
+    /// [`Self::packages_with_errors`] without the error channel.
+    pub fn packages(&self) -> Vec<PackageSource> {
+        self.packages_with_errors().0
+    }
 }
+
 
 /// Remove keys that are only honoured globally (§4.8: `defaultProjectTrust`).
 fn strip_global_only(settings: &mut Settings) {
@@ -2268,5 +2348,52 @@ mod tests {
         mgr.set_nested(SettingsScope::Global, &["terminal", "showImages"], true.into()).unwrap();
         let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
         assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
+    }
+
+    /// CFG-003: the PER-LAYER `packages()` accessor (Pi reads `projectSettings.packages` and
+    /// `globalSettings.packages` separately, package-manager.ts:891-898) parses entry-by-entry, so
+    /// one malformed entry costs only that entry — not the array, and not the settings document.
+    #[test]
+    fn per_layer_packages_reports_a_bad_entry_and_keeps_the_good_ones() {
+        let s = Settings::parse(
+            r#"{"defaultModel":"anthropic/x","packages":[17,"good-pkg",{"source":"filtered","skills":["a"]}]}"#,
+        )
+        .unwrap();
+        let (pkgs, errors) = s.packages_with_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("packages[0]"), "{errors:?}");
+        assert_eq!(pkgs.len(), 2, "the two well-formed entries survive");
+        assert_eq!(pkgs[0].source(), "good-pkg");
+        assert_eq!(pkgs[1].source(), "filtered");
+        assert_eq!(pkgs[1].filters().1, Some(&["a".to_string()][..]));
+        // The rest of the document is untouched.
+        assert_eq!(
+            EffectiveSettings::from_settings(s)
+                .default_model()
+                .as_deref(),
+            Some("anthropic/x")
+        );
+    }
+
+    /// A non-array `packages` is itself reported rather than silently treated as absent.
+    #[test]
+    fn per_layer_packages_reports_a_non_array_value() {
+        let s = Settings::parse(r#"{"packages":"oops"}"#).unwrap();
+        let (pkgs, errors) = s.packages_with_errors();
+        assert!(pkgs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must be an array"), "{errors:?}");
+    }
+
+    /// CFG-004: the per-layer `extension_paths()` accessor exists (the merged view cannot say which
+    /// scope declared an entry, and project entries are trust-gated independently).
+    #[test]
+    fn per_layer_extension_paths() {
+        let s = Settings::parse(r#"{"extensions":["a","!b/*"]}"#).unwrap();
+        assert_eq!(
+            s.extension_paths(),
+            vec!["a".to_string(), "!b/*".to_string()]
+        );
+        assert!(Settings::default().extension_paths().is_empty());
     }
 }

@@ -82,6 +82,53 @@ pub struct InstalledPackage {
     pub disabled: DisabledSet,
 }
 
+/// Per-resource include filters declared alongside a settings-declared package source (Pi
+/// `PackageFilter`, package-manager.ts:184-190, read off the object form of a `packages` entry).
+///
+/// `None` for a resource type means "take the package's default resources for that type"; `Some`
+/// carries `applyPatterns` patterns, and an explicitly EMPTY list disables the type outright (Pi
+/// `applyPackageFilter`, package-manager.ts:2156-2162).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageFilter {
+    pub extensions: Option<Vec<String>>,
+    pub skills: Option<Vec<String>>,
+    pub prompts: Option<Vec<String>>,
+    pub themes: Option<Vec<String>>,
+}
+
+impl PackageFilter {
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_none()
+            && self.skills.is_none()
+            && self.prompts.is_none()
+            && self.themes.is_none()
+    }
+}
+
+/// A package **declared in settings** (`settings.json` `packages: [...]`) as opposed to one recorded
+/// by `cyrup install` into `packages.json`.
+///
+/// Pi has no separate install registry: `PackageManager.resolve()` re-reads
+/// `projectSettings.packages` + `globalSettings.packages` on EVERY call and resolves each entry to a
+/// working tree (installing it on demand), then collects its resources
+/// (package-manager.ts:891-901,1224-1283). cyrup keeps both channels: the install registry
+/// ([`InstalledPackages`]) and this settings channel, which the session builder feeds into
+/// discovery so a declared package is never inert (CFG-003).
+///
+/// **[CYRUP-DELTA] no on-demand install.** Pi's `resolvePackageSources` will `npm install` / `git
+/// clone` a missing source mid-resolve. cyrup does not perform network installs during session
+/// assembly: a `Path` source resolves directly, and a `git:`/`npm:`-style source resolves only if it
+/// is ALREADY installed at the matching scope. An unresolvable entry is surfaced as a
+/// [`crate::ResourceDiagnostic`], never silently dropped and never fatal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfiguredPackage {
+    /// The raw `source` string exactly as written in settings.
+    pub source: String,
+    /// Which settings layer declared it — Pi's `scope: "project" | "user"` (package-manager.ts:891-898).
+    pub scope: InstallScope,
+    pub filter: PackageFilter,
+}
+
 /// Persisted install registry (one per scope).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

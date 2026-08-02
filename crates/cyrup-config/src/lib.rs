@@ -25,6 +25,7 @@ pub mod error;
 pub mod lock;
 pub mod model;
 pub mod policy;
+pub mod provider_compose;
 pub mod settings;
 pub mod trust;
 
@@ -44,12 +45,14 @@ pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use model::{
-    CliModelResult, InitialModelResult, ModelCycler, ModelFile, ModelResolver, ParsedModel,
-    ProviderConfig, RestoredModelResult, ScopedModel, build_fallback_model,
-    default_model_per_provider, find_initial_model, load_custom_models, load_models_file,
-    parse_thinking_level, resolve_cli_model, restore_model_from_session,
+    CliModelResult, InitialModelResult, ModelCostOverride, ModelCycler, ModelDefinition, ModelFile,
+    ModelOverride, ModelResolver, ParsedModel, ProviderConfig, RestoredModelResult, ScopedModel,
+    build_fallback_model, default_model_per_provider, find_initial_model, load_custom_models,
+    load_models_file, load_models_file_reporting, parse_thinking_level, resolve_cli_model,
+    restore_model_from_session,
 };
 pub use policy::NetworkPolicy;
+pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
 pub use settings::{
     CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DefaultProjectTrust, EffectiveSettings,
     FileSettingsStore, InMemorySettingsStore, PackageSource, RetrySettings, Settings,

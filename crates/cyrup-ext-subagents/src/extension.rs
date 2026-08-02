@@ -91,8 +91,10 @@ use crate::spawn::parallel::{DispatchGuard, GlobalConcurrencyLimit};
 /// The literal, stable extension id every registration/log/doctor surface refers to.
 const EXTENSION_ID: &str = "subagents";
 
-/// The single LLM-visible tool name (R-SA-128).
-const TOOL_NAME: &str = "subagent";
+/// The single LLM-visible tool name (R-SA-128). Also the name a persona lists in its own `tools:`
+/// to be granted nested delegation — pi's `fanoutAuthorized = declaredBuiltinTools.includes(
+/// "subagent")` (`runs/shared/pi-args.ts:194`), read by [`crate::exec::build_attempt_spawn_plan`].
+pub(crate) const TOOL_NAME: &str = "subagent";
 
 // =================================================================================================
 // The SubagentExecutor: the ONE shared code path the tool and every slash command route through

@@ -51,9 +51,10 @@ pub use key::ResourceKey;
 pub use package::install::{PackageManager, security_notice_for};
 pub use package::source::{PackageSource, PinRef};
 pub use package::{
-    DisabledSet, InstalledPackage, InstalledPackages, ManifestResources, PackageStore,
-    ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT, SecurityNotice,
-    UpdateReport, UpdateTarget, has_unsafe_git_install_part, parse_git_url, resolve_manifest,
+    ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, ManifestResources,
+    PackageFilter, PackageStore, ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT,
+    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part, parse_git_url,
+    resolve_manifest,
 };
 pub use prompt::{PromptTemplate, expand_prompt_template, parse_command_args, substitute_args};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};

@@ -37,12 +37,18 @@ pub struct StartupDiagnostics {
     pub resources: Vec<ResourceDiagnostic>,
     /// Extensions that did not load (world-version mismatch, untrusted project-local, load fault).
     pub extensions: Vec<ExtensionLoadDiagnostic>,
+    /// `models.json` problems: a load/parse failure, or a provider block rejected during
+    /// composition. Pi keeps the exact same channel — `ModelConfig.getError()` for the whole file
+    /// (model-config.ts:251/:261/:271) plus `ModelRuntime.compositionErrors` per provider
+    /// (model-runtime.ts:104) — and starts normally with the built-in registry either way
+    /// (CFG-002).
+    pub models: Vec<String>,
 }
 
 impl StartupDiagnostics {
     /// Whether there is anything at all to report.
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty() && self.extensions.is_empty()
+        self.resources.is_empty() && self.extensions.is_empty() && self.models.is_empty()
     }
 }
 
@@ -67,6 +73,14 @@ pub struct AgentSessionServices {
     /// Load-time problems collected while assembling this session (TUI-006). See
     /// [`StartupDiagnostics`].
     pub startup_diagnostics: StartupDiagnostics,
+    /// The immutable, credential-blind `<agent_dir>/models.json` snapshot (Pi `ModelConfig`,
+    /// model-config.ts:232-279, loaded once by `ModelRuntime.create`, model-runtime.ts:137-139).
+    /// Composed over the built-in registry by
+    /// [`crate::session::AgentSession::full_model_catalog`], so a user-declared provider or model —
+    /// or a `baseUrl`/`compat`/`modelOverrides` patch on a built-in — is live in the session
+    /// (CFG-002). Empty when the file is absent or unreadable; failures land in
+    /// [`StartupDiagnostics::models`].
+    pub model_config: Arc<cyrup_config::ModelFile>,
     /// Session-scoped context cache (context files + skill pointers).
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.

@@ -675,8 +675,16 @@ impl AgentProgress {
 /// Everything one attempt's spawn needs beyond what [`AgentConfig`]/[`RunOptions`] already carry —
 /// factored out so [`SpawnedChildAttemptRunner`] can build a [`ChildSpawnSpec`] without repeating
 /// argv/env assembly inline in `run_attempt` itself.
-struct AttemptSpawnPlan {
-    spec: ChildSpawnSpec,
+///
+/// Public (with [`build_attempt_spawn_plan`]) as the P-5 cross-crate parity seam: the child env
+/// this plan carries is a CONTRACT the permission companion depends on
+/// (`cyrup-permission-system/tests/forwarding_spawn_env.rs` drives a real child process off THIS
+/// overlay to prove a subagent's `ask` reaches the parent's human), and a downstream proof that
+/// re-typed the env by hand would not have caught PERM-001 — the gate reading a key the spawn path
+/// never wrote — which is precisely the class of bug the seam exists to make visible.
+pub struct AttemptSpawnPlan {
+    /// The fully-assembled child spawn description: binary, argv, task arg, env overlay, cwd.
+    pub spec: ChildSpawnSpec,
 }
 
 /// The reasoning-level suffixes [`apply_thinking_suffix`] recognizes on a model id (pi
@@ -782,9 +790,11 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// `opts.fork_context` resolved a session file path); then the task prompt last (via
 /// [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
 ///
-/// Env overlay carries the incremented depth envelope (R-SA-054), the run sentinel, the agent's
-/// inherit flags ([`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`]), and the raw direct-MCP
-/// selector list ([`MCP_DIRECT_TOOLS_ENV`], or the `__none__` sentinel).
+/// Env overlay carries the child-ROLE pair
+/// ([`crate::spawn::nested_events::child_role_env`] — pi `pi-args.ts:329-330`), the incremented
+/// depth envelope (R-SA-054), the run sentinel, the agent's inherit flags
+/// ([`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`]), and the raw direct-MCP selector list
+/// ([`MCP_DIRECT_TOOLS_ENV`], or the `__none__` sentinel).
 ///
 /// The agent's own persona prose (`agent.system_prompt_body`) is delivered here as
 /// `--system-prompt=<body>` (`SystemPromptMode::Replace`) or `--append-system-prompt=<body>`
@@ -815,7 +825,7 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 ///
 /// Propagates [`ChildSpawnSpec::resolve_task_arg`]'s error (temp-file creation failure for an
 /// over-threshold task).
-fn build_attempt_spawn_plan(
+pub fn build_attempt_spawn_plan(
     agent: &AgentConfig,
     model: &ModelId,
     task_text: &str,
@@ -856,6 +866,18 @@ fn build_attempt_spawn_plan(
             }
         }
     }
+
+    // pi `pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
+    // a persona is granted NESTED delegation exactly when it declares the `subagent` tool itself.
+    // With `tools` unset, pi's `declaredBuiltinTools` is `[]` (`:189-193`, no capability ceiling in
+    // this port), so an agent that declares nothing is NOT fanout-authorized. This is the single
+    // input to the child-role env pair below, and through it to
+    // [`crate::extension::resolve_registration_mode`]: authorized → `ChildSafe` (the restricted,
+    // mutation-blocked `subagent` tool, pi `extension/fanout-child.ts:132`), unauthorized → the
+    // child registers no subagent surface at all and cannot delegate.
+    let fanout_authorized = builtin_tools
+        .iter()
+        .any(|tool| tool == crate::extension::TOOL_NAME);
 
     // pi: `--tools` is emitted ONLY when at least one builtin is declared; a direct-MCP-only agent
     // gets no `--tools` at all (`pi-args.ts:117-123`). The resolved direct-MCP tool names — the
@@ -935,6 +957,27 @@ fn build_attempt_spawn_plan(
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
 
     let mut env_overlay = crate::spawn::depth::to_env_overlay(&depth);
+    // PERM-001 / pi `augmentChildEnv` (`pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
+    // spawn. This is the process about to BE a subagent child, so it must say so — see
+    // [`crate::spawn::nested_events::child_role_env`] for the three subsystems that read it, chiefly
+    // the permission companion's child→parent ask-forwarding (a child whose `ask` fires with this
+    // flag absent installs no `ForwardingAskChannel`, finds no reachable human, and fails closed on
+    // every ask instead of reaching the PARENT's human through the spool).
+    //
+    // The companion fanout flag tracks the agent's OWN declared tools (`fanout_authorized` above),
+    // exactly as pi's `env[SUBAGENT_FANOUT_CHILD_ENV] = toolPlan.fanoutAuthorized ? "1" : "0"`. It is
+    // always written — an explicit `"0"`, never merely omitted — because a spawn env is an OVERLAY
+    // over the inherited environment ([`crate::spawn::SpawnedChild::spawn`] never clears it), so an
+    // absent entry would let a fanout-authorized process's own `CYRUP_SUBAGENT_FANOUT_CHILD=1` leak
+    // down into a grandchild that was never granted it.
+    //
+    // (What this pair does NOT carry is the nested-event ROUTE — `event_sink`/`root_run_id`/
+    // capability token, [`crate::spawn::nested_events::nested_child_auth_env`] — which no production
+    // path mints yet. An authorized child therefore delegates through its own NDJSON stream rather
+    // than onto a grandparent route; that wiring is separate and unported.)
+    for (key, value) in crate::spawn::nested_events::child_role_env(fanout_authorized) {
+        env_overlay.insert(key.to_string(), value.to_string());
+    }
     // Model-inherit sentinel (R-SA-041) never leaks a global default into the child's own
     // resolution beyond what `--model` above already pins explicitly for this attempt.
     env_overlay.insert("CYRUP_SUBAGENT_RUN".to_string(), "1".to_string());
@@ -2733,6 +2776,149 @@ mod tests {
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::depth::MAX_DEPTH_ENV_VAR),
             Some(&"4".to_string())
+        );
+    }
+
+    // ---- PERM-001: the child-ROLE env pair (pi `augmentChildEnv`, `pi-args.ts:329-330`) ----
+
+    /// The production spawn path MUST mark the child as a child. Without this entry the re-exec'd
+    /// process is indistinguishable from a top-level session, so
+    /// `cyrup_permission_system::permission_extension_for_env` gives it the LOCAL ask channel
+    /// instead of the `ForwardingAskChannel`; with no TTY it then has no reachable human and
+    /// fail-CLOSES every `ask`-tier tool call rather than forwarding it to the parent's human
+    /// through the `<agentDir>/sessions/permission-forwarding/` spool.
+    ///
+    /// The cross-process proof that the ask actually TRAVELS on this env is
+    /// `cyrup-permission-system/tests/forwarding_spawn_env.rs`; this test is the other half of that
+    /// chain — that the entry originates in the real spawn planner and not in a test's own hand.
+    #[test]
+    fn build_attempt_spawn_plan_marks_the_child_as_a_subagent_child_in_the_env_overlay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::CHILD_ENV),
+            Some(&"1".to_string()),
+            "every spawned child must carry the child-role flag; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+        // Explicit `"0"`, never absent: the overlay is applied OVER the inherited env, so omitting it
+        // would let a fanout-authorized parent's own `1` leak into an unauthorized grandchild.
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            Some(&"0".to_string()),
+            "an unauthorized child must be pinned to fanout=0, not left to inherit; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// The consequence of the flag, at the seam that reads it: a child spawned by the production
+    /// planner registers NO subagent surface at all (pi `extension/index.ts:177`), instead of the
+    /// full orchestrator surface — its own `subagent` tool, 13 slash commands and background
+    /// watcher — that an unmarked child was silently installing.
+    #[test]
+    fn a_child_spawned_by_the_production_planner_registers_no_subagent_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+
+        let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
+        let mode = crate::extension::resolve_registration_mode(
+            is_one(crate::spawn::nested_events::CHILD_ENV),
+            is_one(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+        );
+        assert!(
+            mode.is_none(),
+            "a plain spawned child must register nothing, got {mode:?} from overlay {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// The other half of pi's `fanoutAuthorized = declaredBuiltinTools.includes("subagent")`
+    /// (`runs/shared/pi-args.ts:194`, written to the env at `:330`): a persona that declares the
+    /// `subagent` tool IS granted nested delegation, so the flag must track the agent's tools rather
+    /// than being pinned off. Pinning it off makes [`RegistrationMode::ChildSafe`] unreachable in
+    /// production and the whole depth envelope (`max_depth`, R-SA-054) decorative — nothing could
+    /// ever reach depth 2.
+    #[test]
+    fn an_agent_declaring_the_subagent_tool_spawns_a_fanout_authorized_child_that_can_delegate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin(crate::extension::TOOL_NAME.to_string()),
+        ]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            Some(&"1".to_string()),
+            "a persona that declares `subagent` must be spawned fanout-authorized; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+        // The observable consequence at the seam that reads the flag: this child registers the
+        // restricted subagent surface, so it can delegate (pi `extension/fanout-child.ts:132`).
+        let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
+        let mode = crate::extension::resolve_registration_mode(
+            is_one(crate::spawn::nested_events::CHILD_ENV),
+            is_one(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+        );
+        assert_eq!(
+            mode,
+            Some(crate::extension::RegistrationMode::ChildSafe),
+            "a fanout-authorized child registers the restricted surface, got {mode:?} from overlay {:?}",
+            plan.spec.env_overlay
+        );
+        // It is still a CHILD: its asks forward to the parent's spool rather than resolving locally.
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::CHILD_ENV),
+            Some(&"1".to_string())
+        );
+    }
+
+    /// A persona that declares tools but NOT `subagent` stays unauthorized — the grant is per-agent,
+    /// not "anyone who declares any tools" (pi's `.includes("subagent")` is an exact membership
+    /// test).
+    #[test]
+    fn declaring_other_tools_does_not_grant_fanout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin("bash".to_string()),
+        ]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            Some(&"0".to_string()),
+            "only a declared `subagent` tool grants fanout; overlay was {:?}",
+            plan.spec.env_overlay
         );
     }
 

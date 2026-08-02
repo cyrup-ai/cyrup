@@ -211,16 +211,41 @@ async fn run() -> anyhow::Result<i32> {
     if let Some(export) = &cli.export {
         return export_session_html(export, cli.positionals.first().map(String::as_str)).await;
     }
+
+    // `<agent_dir>/models.json` — the user's custom-provider / custom-model file (CFG-002). Pi loads
+    // it ONCE per runtime (`ModelConfig.load(join(getAgentDir(),"models.json"))`,
+    // model-runtime.ts:137-139) and every provider/model resolution reads the registry composed from
+    // it (`rebuildProviders`, :225-231). It must be loaded HERE, before `--list-models` and before
+    // provider selection, or a declared provider is unlistable and unlaunchable. A load/parse
+    // failure is loud (a stderr warning) but never fatal: the file degrades to empty and the
+    // built-in registry stands (Pi keeps an empty snapshot + one error string, model-config.ts:251).
+    let models_json = {
+        let (file, load_error) = cyrup_config::load_models_file_reporting(&dirs.models_path());
+        let mut warnings: Vec<Diagnostic> = load_error.into_iter().map(Diagnostic::warning).collect();
+        // Per-provider composition failures (Pi's `compositionErrors` map, model-runtime.ts:104):
+        // the offending block is dropped, its built-ins survive, and the rest of the file applies.
+        warnings.extend(
+            cyrup::provider::models_json_composition_errors(&file)
+                .into_iter()
+                .map(Diagnostic::warning),
+        );
+        if !warnings.is_empty() {
+            report_diagnostics(&warnings);
+        }
+        Arc::new(file)
+    };
+
     // `--list-models` enumerates the FULL multi-provider registry (Pi `modelRegistry.getAvailable()`,
     // list-models.ts:35) — independent of `--provider`/`--model`, and resolved BEFORE provider
     // selection (so a `--provider <unknown>` does not gate the listing, matching Pi).
     if let Some(search) = &cli.list_models {
-        return list_models(&cyrup::provider::all_available_models(), search);
+        return list_models(&cyrup::provider::all_available_models(&models_json), search);
     }
     let mut provider = select_provider(
         cli.provider.as_deref(),
         cli.model.as_deref(),
         cli.api_key.as_deref(),
+        &models_json,
     )?;
 
     // Unknown-model diagnostic (Pi `resolveCliModel`, main.ts:377-378 / model-resolver.ts:494-500):
@@ -229,7 +254,7 @@ async fn run() -> anyhow::Result<i32> {
     if let Some(warning) = cyrup::unknown_model_warning(
         cli.provider.as_deref(),
         cli.model.as_deref(),
-        &cyrup::provider::all_available_models(),
+        &cyrup::provider::all_available_models(&models_json),
     ) {
         report_diagnostics(&[Diagnostic::warning(warning)]);
     }
@@ -289,8 +314,9 @@ async fn run() -> anyhow::Result<i32> {
             default_provider.as_deref(),
             default_model.as_deref(),
             &has_configured_auth,
+            &models_json,
         ) {
-            provider = select_provider(Some(&launch_provider), None, None)?;
+            provider = select_provider(Some(&launch_provider), None, None, &models_json)?;
             config.model_pattern = Some(launch_pattern);
         }
     }
@@ -306,7 +332,7 @@ async fn run() -> anyhow::Result<i32> {
         let session_cwd = config.cwd.clone();
         let mut factory_builder = SessionFactory::new(provider, config)
             .settings_store(settings_store.clone())
-            .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+            .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
         // SubAgents opt-in gate (default OFF, mirrors the two sibling companions) composed with the T6
         // child-mode gate (Pi `extension/index.ts:243-245` + `extension/fanout-child.ts:131`): a plain
         // TOP-LEVEL session attaches the orchestrator surface ONLY when opted in (`is_installed`:
@@ -416,7 +442,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
-                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
             // 119/120/123/124/125). Child-mode gated; `_concrete` returns `None` for a plain session.
@@ -485,7 +511,7 @@ async fn run() -> anyhow::Result<i32> {
             let session_cwd = config.cwd.clone();
             let mut builder = SessionBuilder::new(provider, config)
                 .settings_store(settings_store.clone())
-                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver));
+                .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
             // channels can be handed to SubAgents via `with_channels` (P5 handoff, CLOSING R-SA-037/
             // 119/120/123/124/125). The one-shot print/json mode is exactly what a spawned subagent
@@ -1472,7 +1498,7 @@ mod tests {
     /// exact divergences the crude matcher got wrong, verified against a real bundled catalog.
     #[test]
     fn resolve_scoped_models_uses_minimatch_semantics_like_pi() {
-        let catalog = cyrup::provider::all_available_models();
+        let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
 
         // Path-segment awareness: a 1-segment pattern (`anthropic*`, no `**`) can NEVER match the
         // 2-segment `anthropic/<id>` under minimatch, and `anthropic*` also does not match any bare
@@ -1519,7 +1545,7 @@ mod tests {
 
     fn scoped(provider: &str, id: &str) -> ScopedModel {
         // Build a `ScopedModel` from a real catalog entry so the pick exercises real `Model` fields.
-        let catalog = cyrup::provider::all_available_models();
+        let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
         let model = catalog
             .iter()
             .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)

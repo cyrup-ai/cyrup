@@ -88,11 +88,17 @@ const CONFIG_FILE: &str = "config.json";
 /// The project-scoped policy dir (pi `<cwd>/.pi/agent`; cyrup `<cwd>/.cyrup/agent`).
 const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 
-/// The subagent-child env flag (value `"1"`) — the SAME var `cyrup-ext-subagents` sets
-/// (`spawn::nested_events::CHILD_ENV = "CYRUP_SUBAGENT_CHILD"`). Read by literal name here to avoid a
-/// dependency on that crate for one const (P-5 discusses depending on it later for `control.rs`
-/// reuse).
-pub const CHILD_ENV_VAR: &str = "CYRUP_SUBAGENT_CHILD";
+/// The subagent-child env flag (value `"1"`) — literally the SAME const `cyrup-ext-subagents`
+/// writes into every spawned child's env overlay
+/// ([`cyrup_ext_subagents::spawn::nested_events::child_role_env`], driven from
+/// `exec::build_attempt_spawn_plan`).
+///
+/// Aliased rather than re-typed as a literal: this crate ALREADY depends on `cyrup-ext-subagents`
+/// (P-5, see `Cargo.toml`) and `ask.rs` already reads
+/// `cyrup_ext_subagents::PARENT_SESSION_ENV_VAR` through that dependency, so the duplicate string
+/// bought nothing and could silently drift out of agreement with the writer — which is exactly the
+/// failure mode PERM-001 was: the gate read a name nothing on the spawn path ever wrote.
+pub const CHILD_ENV_VAR: &str = cyrup_ext_subagents::spawn::nested_events::CHILD_ENV;
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
 

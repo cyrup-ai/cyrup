@@ -1441,9 +1441,18 @@ pub struct ProviderConfig {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub auth_header: Option<bool>,
-    /// Inline model definitions (preserved verbatim; full parsing lives in the model registry).
+    /// Provider-level compatibility overrides applied to every model of this provider (Pi
+    /// `ProviderConfigSchema.compat`, model-config.ts:196).
     #[serde(default)]
-    pub models: Vec<serde_json::Value>,
+    pub compat: Option<cyrup_provider::api::compat::OpenAiCompletionsCompat>,
+    /// Inline model definitions (Pi `ProviderConfigSchema.models`, model-config.ts:197).
+    #[serde(default)]
+    pub models: Vec<ModelDefinition>,
+    /// Per-model patches applied LAST, over built-ins and custom models alike (Pi
+    /// `ProviderConfigSchema.modelOverrides`, model-config.ts:198; applied at
+    /// provider-composer.ts:433-436).
+    #[serde(default)]
+    pub model_overrides: std::collections::BTreeMap<String, ModelOverride>,
 }
 
 /// Resolved request auth for a provider (Pi `ResolvedRequestAuth` ok-branch,
@@ -1485,17 +1494,149 @@ impl ProviderConfig {
     }
 }
 
+/// A single `models` entry inside a `models.json` provider block (Pi `ModelDefinitionSchema`,
+/// model-config.ts:152-166). Every field but `id` is optional and inherits from the provider block
+/// or from the same-id built-in model (Pi `modelFromJson`, provider-composer.ts:124-159).
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDefinition {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    #[serde(default)]
+    pub thinking_level_map: Option<cyrup_provider::model::ThinkingLevelMap>,
+    #[serde(default)]
+    pub input: Option<Vec<cyrup_provider::Modality>>,
+    #[serde(default)]
+    pub cost: Option<cyrup_provider::ModelCost>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub compat: Option<cyrup_provider::api::compat::OpenAiCompletionsCompat>,
+}
+
+/// A `modelOverrides` entry: a partial patch applied to an already-composed model (Pi
+/// `ModelOverrideSchema`, model-config.ts:168-186; applied last, provider-composer.ts:433-436).
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverride {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    #[serde(default)]
+    pub thinking_level_map: Option<cyrup_provider::model::ThinkingLevelMap>,
+    #[serde(default)]
+    pub input: Option<Vec<cyrup_provider::Modality>>,
+    #[serde(default)]
+    pub cost: Option<ModelCostOverride>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub compat: Option<cyrup_provider::api::compat::OpenAiCompletionsCompat>,
+}
+
+/// The partial `cost` shape a `modelOverrides` entry may carry (model-config.ts:174-182): every rate
+/// is individually optional and patches the composed model's cost.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostOverride {
+    #[serde(default)]
+    pub input: Option<f64>,
+    #[serde(default)]
+    pub output: Option<f64>,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub tiers: Option<Vec<cyrup_provider::ModelCostTier>>,
+}
+
 /// A parsed `models.json` in Pi's `{ providers: { <name>: ProviderConfig } }` shape
-/// (model-registry.ts:216-218).
+/// (model-registry.ts:216-218 / model-config.ts:188-190).
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 pub struct ModelFile {
     #[serde(default)]
     pub providers: std::collections::BTreeMap<String, ProviderConfig>,
 }
 
+/// Strip `//` line comments and trailing commas from JSON, leaving string literals untouched — a
+/// 1:1 port of Pi's `stripJsonComments` (coding-agent/src/utils/json.ts), which every `models.json`
+/// read goes through (`JSON.parse(stripJsonComments(content))`, model-config.ts:257).
+///
+/// Written as a single scanning pass rather than the two regex replaces, because Rust's `regex`
+/// crate has no backreference-free equivalent of the alternation trick and a scanner is exact.
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    // Byte offsets in `out` of pending `,` characters that may turn out to be trailing.
+    let mut pending_comma: Option<usize> = None;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                pending_comma = None;
+                out.push(c);
+                let mut escaped = false;
+                for sc in chars.by_ref() {
+                    out.push(sc);
+                    if escaped {
+                        escaped = false;
+                    } else if sc == '\\' {
+                        escaped = true;
+                    } else if sc == '"' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for sc in chars.by_ref() {
+                    if sc == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ',' => {
+                pending_comma = Some(out.len());
+                out.push(c);
+            }
+            '}' | ']' => {
+                if let Some(at) = pending_comma.take() {
+                    // Everything between the comma and here is whitespace (any other char cleared
+                    // `pending_comma`), so the comma is trailing: drop it.
+                    out.remove(at);
+                }
+                out.push(c);
+            }
+            c if c.is_whitespace() => out.push(c),
+            c => {
+                pending_comma = None;
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// Load a `models.json` provider-config file (Pi's `{ providers: {...} }` shape). A missing or
-/// empty file yields an empty [`ModelFile`]. This is additive alongside [`load_custom_models`]
-/// (which reads the legacy flat `Vec<Model>` shape) so existing consumers are unaffected.
+/// empty file yields an empty [`ModelFile`]. JSONC `//` comments and trailing commas are stripped
+/// first, exactly as Pi does (model-config.ts:257). This is additive alongside
+/// [`load_custom_models`] (which reads the legacy flat `Vec<Model>` shape).
 pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -1505,12 +1646,348 @@ pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     if text.trim().is_empty() {
         return Ok(ModelFile::default());
     }
-    let file: ModelFile = serde_json::from_str(&text)?;
+    let file: ModelFile = serde_json::from_str(&strip_json_comments(&text))?;
     Ok(file)
 }
 
+/// Load `<agent_dir>/models.json` into a composed [`ModelFile`], turning EVERY failure mode into a
+/// human-readable message instead of an error the caller might treat as fatal.
+///
+/// Pi keeps a `ModelConfig` with an empty provider map plus one distinct error string per failure —
+/// load / parse / schema (model-config.ts:251, :261, :271) — and the agent starts normally with the
+/// built-in registry. This mirrors that contract: the returned `ModelFile` is empty on failure and
+/// the `Option<String>` is the diagnostic the startup panel renders.
+pub fn load_models_file_reporting(path: &Path) -> (ModelFile, Option<String>) {
+    match load_models_file(path) {
+        Ok(file) => (file, None),
+        Err(ConfigError::Serde(e)) => (
+            ModelFile::default(),
+            Some(format!(
+                "Failed to parse models.json: {e}\n\nFile: {}",
+                path.display()
+            )),
+        ),
+        Err(e) => (
+            ModelFile::default(),
+            Some(format!(
+                "Failed to load models.json: {e}\n\nFile: {}",
+                path.display()
+            )),
+        ),
+    }
+}
+
+impl ModelFile {
+    /// Compose `base` (the built-in / provider-supplied registry) with this `models.json`, returning
+    /// the effective model list plus one message per rejected provider block.
+    ///
+    /// 1:1 with Pi's `composeModelProvider` restricted to the credential-blind layers
+    /// (provider-composer.ts:411-437): for every provider id in the union of `base` and the file,
+    /// `applyModelsJson` rewrites `baseUrl`/`compat` on the built-ins and upserts the declared
+    /// `models` (:161-199), then `modelOverrides` patches the result last (:433-436).
+    ///
+    /// A provider block that Pi would `throw` on (no distinguishing key, a custom model with no
+    /// resolvable `api`/`baseUrl`, a non-positive `contextWindow`/`maxTokens`) is REJECTED WHOLE —
+    /// its built-in models are kept untouched — and its message is returned. Pi's own
+    /// `compositionErrors` map does exactly this (model-runtime.ts:104), so a single bad block never
+    /// costs the user the rest of the registry.
+    ///
+    /// Provider ORDER follows Pi's `rebuildProviders` (model-runtime.ts:225-231): it iterates
+    /// `providerIds()` = `builtins ∪ … ∪ config.getProviderIds()`, a `Set` whose iteration order is
+    /// insertion order, so the built-ins keep their registration order and a provider that exists
+    /// only in `models.json` is appended after them. Composition REPLACES a provider's entries in
+    /// place (`models.setProvider(...)`, :215) — it never appends a second, shadowed copy.
+    pub fn compose(&self, base: &[Model]) -> (Vec<Model>, Vec<String>) {
+        let mut errors: Vec<String> = Vec::new();
+        let mut out: Vec<Model> = Vec::new();
+        // Pi's `providerIds()` order: base providers first (first-seen), then the file's own.
+        let mut order: Vec<&str> = Vec::new();
+        for m in base {
+            if !order.contains(&m.provider.as_str()) {
+                order.push(m.provider.as_str());
+            }
+        }
+        for provider_id in self.providers.keys() {
+            if !order.contains(&provider_id.as_str()) {
+                order.push(provider_id.as_str());
+            }
+        }
+        for provider_id in order {
+            let base_models: Vec<Model> = base
+                .iter()
+                .filter(|m| m.provider.as_str() == provider_id)
+                .cloned()
+                .collect();
+            let Some(config) = self.providers.get(provider_id) else {
+                // No overlay: the built-in stands untouched (Pi :210-214).
+                out.extend(base_models);
+                continue;
+            };
+            match apply_models_json(provider_id, &base_models, config) {
+                Ok(models) => out.extend(models),
+                Err(msg) => {
+                    errors.push(msg);
+                    // Keep the untouched built-ins for this provider (Pi records the error and
+                    // re-registers `base`, model-runtime.ts:218-221).
+                    out.extend(base_models);
+                }
+            }
+        }
+        (out, errors)
+    }
+}
+
+/// Pi `applyModelsJson` + `modelFromJson` + the `modelOverrides` map
+/// (provider-composer.ts:161-199, 124-159, 433-436), as one fallible composition over ONE provider's
+/// models. Returns the provider's effective model list, or Pi's own error string.
+pub(crate) fn apply_models_json(
+    provider_id: &str,
+    base_models: &[Model],
+    config: &ProviderConfig,
+) -> Result<Vec<Model>, String> {
+    let has_overrides = !config.model_overrides.is_empty();
+    if config.models.is_empty()
+        && config.base_url.is_none()
+        && config.headers.is_none()
+        && config.compat.is_none()
+        && !has_overrides
+        && config.api_key.is_none()
+        && config.auth_header.is_none()
+    {
+        return Err(format!(
+            "Provider {provider_id}: must specify \"baseUrl\", \"headers\", \"compat\", \
+             \"modelOverrides\", or \"models\"."
+        ));
+    }
+
+    // Step 1: rewrite every built-in with the provider-level baseUrl + compat (:186-190).
+    let mut models: Vec<Model> = base_models
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            if let Some(base_url) = &config.base_url {
+                m.base_url = base_url.clone();
+            }
+            m.compat = merge_compat(m.compat.as_ref(), config.compat.as_ref());
+            m
+        })
+        .collect();
+
+    // Step 2: upsert each declared model (:191-197).
+    for definition in &config.models {
+        let existing = models.iter().position(|m| m.id.as_str() == definition.id);
+        let defaults = existing.map_or_else(|| models.first(), |i| models.get(i));
+        let model = model_from_json(provider_id, definition, config, defaults)?;
+        match existing {
+            Some(i) => {
+                if let Some(slot) = models.get_mut(i) {
+                    *slot = model;
+                }
+            }
+            None => models.push(model),
+        }
+    }
+
+    // Step 3: modelOverrides are the topmost user-config layer (:433-436).
+    for m in &mut models {
+        if let Some(ov) = config.model_overrides.get(m.id.as_str()) {
+            apply_model_override(m, ov);
+        }
+    }
+    Ok(models)
+}
+
+/// Pi `modelFromJson` (provider-composer.ts:124-159): build one `Model` from a `models.json`
+/// definition, inheriting `api`/`baseUrl` from the provider block and then from the same-id built-in.
+fn model_from_json(
+    provider_id: &str,
+    definition: &ModelDefinition,
+    provider_config: &ProviderConfig,
+    defaults: Option<&Model>,
+) -> Result<Model, String> {
+    let api = definition
+        .api
+        .clone()
+        .or_else(|| provider_config.api.clone())
+        .or_else(|| defaults.map(|d| d.api.as_str().to_string()))
+        .ok_or_else(|| {
+            format!(
+                "Provider {provider_id}, model {}: no \"api\" specified. Set at provider or model \
+                 level.",
+                definition.id
+            )
+        })?;
+    let base_url = definition
+        .base_url
+        .clone()
+        .or_else(|| provider_config.base_url.clone())
+        .or_else(|| defaults.map(|d| d.base_url.clone()))
+        .ok_or_else(|| {
+            format!("Provider {provider_id}: \"baseUrl\" is required when defining custom models.")
+        })?;
+    if definition.context_window == Some(0) {
+        return Err(format!(
+            "Provider {provider_id}, model {}: invalid contextWindow",
+            definition.id
+        ));
+    }
+    if definition.max_tokens == Some(0) {
+        return Err(format!(
+            "Provider {provider_id}, model {}: invalid maxTokens",
+            definition.id
+        ));
+    }
+    Ok(Model {
+        id: definition.id.as_str().into(),
+        name: definition
+            .name
+            .clone()
+            .unwrap_or_else(|| definition.id.clone()),
+        api: api.as_str().into(),
+        provider: provider_id.into(),
+        base_url,
+        reasoning: definition.reasoning.unwrap_or(false),
+        input: definition
+            .input
+            .clone()
+            .unwrap_or_else(|| vec![cyrup_provider::Modality::Text]),
+        cost: definition.cost.clone().unwrap_or_default(),
+        context_window: definition.context_window.unwrap_or(128_000),
+        max_tokens: definition.max_tokens.unwrap_or(16_384),
+        thinking_level_map: definition.thinking_level_map.clone(),
+        // Pi sets `headers: undefined` on the composed model — `models.json` headers are REQUEST
+        // config resolved separately through `resolveConfiguredModelHeaders` (:156, :501-511), so
+        // they never leak into the credential-blind snapshot. cyrup's counterpart of that separate
+        // resolution is [`crate::provider_compose::raw_model_headers`], applied per request in
+        // `ConfiguredApiKeyAuth::resolve`; without it the declared header would be inert.
+        headers: None,
+        compat: merge_compat(provider_config.compat.as_ref(), definition.compat.as_ref()),
+    })
+}
+
+/// Pi `applyModelOverride` (provider-composer.ts): patch a composed model with a `modelOverrides`
+/// entry. Every field is individually optional; an absent field leaves the model unchanged.
+fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
+    if let Some(name) = &ov.name {
+        model.name = name.clone();
+    }
+    if let Some(r) = ov.reasoning {
+        model.reasoning = r;
+    }
+    // Pi `:104-106`: `override.thinkingLevelMap ? { ...model.thinkingLevelMap,
+    // ...override.thinkingLevelMap } : model.thinkingLevelMap` — a PARTIAL override patches the
+    // named levels and keeps the model's other entries. Replacing the map wholesale would silently
+    // change what every unmentioned thinking level sends on the wire. (The `modelFromJson` path is
+    // different and correct as written: a model DEFINITION's map is used verbatim, `:141`.)
+    if let Some(map) = &ov.thinking_level_map {
+        let mut merged = model.thinking_level_map.clone().unwrap_or_default();
+        for (level, value) in map {
+            merged.insert(level.clone(), value.clone());
+        }
+        model.thinking_level_map = Some(merged);
+    }
+    if let Some(input) = &ov.input {
+        model.input = input.clone();
+    }
+    if let Some(cw) = ov.context_window {
+        model.context_window = cw;
+    }
+    if let Some(mt) = ov.max_tokens {
+        model.max_tokens = mt;
+    }
+    if let Some(cost) = &ov.cost {
+        if let Some(v) = cost.input {
+            model.cost.input = v;
+        }
+        if let Some(v) = cost.output {
+            model.cost.output = v;
+        }
+        if let Some(v) = cost.cache_read {
+            model.cost.cache_read = v;
+        }
+        if let Some(v) = cost.cache_write {
+            model.cost.cache_write = v;
+        }
+        if let Some(t) = &cost.tiers {
+            model.cost.tiers = Some(t.clone());
+        }
+    }
+    if let Some(compat) = &ov.compat {
+        model.compat = merge_compat(model.compat.as_ref(), Some(compat));
+    }
+}
+
+/// The three `compat` members Pi deep-merges instead of replacing (`mergeCompat`,
+/// provider-composer.ts:87). Spelled in Pi's own wire (camelCase) form, because [`merge_compat`]
+/// merges over the serialized JSON — the same names the file on disk uses.
+const NESTED_COMPAT_KEYS: [&str; 3] = [
+    "openRouterRouting",
+    "vercelGatewayRouting",
+    "chatTemplateKwargs",
+];
+
+/// Pi `mergeCompat` (provider-composer.ts:78-96): the more specific layer wins per field, EXCEPT
+/// that the three object-valued members in [`NESTED_COMPAT_KEYS`] are themselves merged one level
+/// deep. Either side may be absent.
+///
+/// Both halves matter and Pi writes them as two passes:
+/// 1. `{ ...base, ...override }` — implemented over the serialized form so every present key of
+///    `over`, and only the present keys, lands on `base`;
+/// 2. the nested pass (`:87-95`) — for each of the three keys, `{ ...baseValue, ...overrideValue }`,
+///    so declaring e.g. `"openRouterRouting": { "zdr": true }` in `models.json` KEEPS the built-in's
+///    other routing fields instead of replacing the object wholesale (which would silently change
+///    the wire payload).
+///
+/// Pi's guard is `typeof value === "object" && value !== null` on EITHER side. When only one side is
+/// an object the spread reduces to that side, which pass 1 has already produced, so pass 2 below
+/// only has to act when both sides are objects. The one input where this differs from Pi is a
+/// non-object scalar overriding an object (Pi's spread would index the scalar's characters into the
+/// merged object, producing `{0:"x",…}` garbage that cannot deserialize); cyrup keeps the override
+/// scalar, which is pass 1's result.
+fn merge_compat(
+    base: Option<&cyrup_provider::api::compat::OpenAiCompletionsCompat>,
+    over: Option<&cyrup_provider::api::compat::OpenAiCompletionsCompat>,
+) -> Option<cyrup_provider::api::compat::OpenAiCompletionsCompat> {
+    match (base, over) {
+        (b, None) => b.cloned(),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(b), Some(o)) => {
+            let (Ok(serde_json::Value::Object(mut bm)), Ok(serde_json::Value::Object(om))) =
+                (serde_json::to_value(b), serde_json::to_value(o))
+            else {
+                return Some(o.clone());
+            };
+            // Capture both sides of the nested keys BEFORE the shallow spread overwrites them.
+            let nested: Vec<(&str, Option<serde_json::Value>, Option<serde_json::Value>)> =
+                NESTED_COMPAT_KEYS
+                    .iter()
+                    .map(|k| (*k, bm.get(*k).cloned(), om.get(*k).cloned()))
+                    .collect();
+            for (k, v) in om {
+                bm.insert(k, v);
+            }
+            for (key, base_value, over_value) in nested {
+                let (Some(base_obj), Some(over_obj)) = (
+                    base_value.as_ref().and_then(serde_json::Value::as_object),
+                    over_value.as_ref().and_then(serde_json::Value::as_object),
+                ) else {
+                    continue;
+                };
+                let mut merged = base_obj.clone();
+                for (k, v) in over_obj {
+                    merged.insert(k.clone(), v.clone());
+                }
+                bm.insert(key.to_string(), serde_json::Value::Object(merged));
+            }
+            serde_json::from_value(serde_json::Value::Object(bm))
+                .map_or_else(|_| Some(o.clone()), Some)
+        }
+    }
+}
+
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use cyrup_provider::{ApiId, Modality, ModelCost};
@@ -2022,5 +2499,140 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ---- models.json composition (CFG-002) --------------------------------------------------
+
+    fn oai(provider: &str, id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.to_string(),
+            api: ApiId::from("openai-completions"),
+            provider: provider.into(),
+            base_url: "https://builtin.example/v1".into(),
+            reasoning: false,
+            input: vec![Modality::Text],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 16_384,
+            thinking_level_map: None,
+            compat: None,
+            headers: None,
+        }
+    }
+
+    #[test]
+    fn models_json_jsonc_comments_and_trailing_commas_are_stripped() {
+        let dir = crate::test_util::temp_dir();
+        let path = dir.join("models.json");
+        std::fs::write(
+            &path,
+            "{\n  // leading comment\n  \"providers\": {\n    \"acme\": {\n      \"baseUrl\": \"https://acme.test/v1\", // trailing note\n      \"models\": [{ \"id\": \"a1\" },]\n    },\n  }\n}\n",
+        )
+        .unwrap();
+        let file = load_models_file(&path)
+            .expect("JSONC models.json must parse like Pi's stripJsonComments");
+        assert_eq!(file.providers.len(), 1);
+        assert_eq!(file.providers["acme"].models.len(), 1);
+        // A `//` sequence INSIDE a string literal survives.
+        std::fs::write(
+            &path,
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.test/v1"}}}"#,
+        )
+        .unwrap();
+        let file = load_models_file(&path).unwrap();
+        assert_eq!(
+            file.providers["acme"].base_url.as_deref(),
+            Some("https://acme.test/v1")
+        );
+    }
+
+    #[test]
+    fn models_json_upserts_a_custom_model_and_rewrites_the_builtin_base_url() {
+        let base = vec![oai("acme", "old")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"acme":{"baseUrl":"https://proxy.test/v1","models":[{"id":"new","name":"New"}]}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert!(errors.is_empty(), "{errors:?}");
+        let old = out
+            .iter()
+            .find(|m| m.id.as_str() == "old")
+            .expect("built-in kept");
+        assert_eq!(
+            old.base_url, "https://proxy.test/v1",
+            "baseUrl rewrites the built-in"
+        );
+        let new = out
+            .iter()
+            .find(|m| m.id.as_str() == "new")
+            .expect("custom model added");
+        assert_eq!(new.name, "New");
+        assert_eq!(
+            new.api.as_str(),
+            "openai-completions",
+            "api inherits from the built-in defaults"
+        );
+        assert_eq!(new.base_url, "https://proxy.test/v1");
+    }
+
+    #[test]
+    fn models_json_model_overrides_patch_a_builtin_last() {
+        let base = vec![oai("acme", "m1")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"acme":{"modelOverrides":{"m1":{"name":"Renamed","contextWindow":42,"cost":{"input":1.5}}}}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert!(errors.is_empty(), "{errors:?}");
+        let m = out.iter().find(|m| m.id.as_str() == "m1").unwrap();
+        assert_eq!(m.name, "Renamed");
+        assert_eq!(m.context_window, 42);
+        assert!((m.cost.input - 1.5).abs() < f64::EPSILON);
+        // Untouched fields survive the patch.
+        assert_eq!(m.max_tokens, 16_384);
+    }
+
+    #[test]
+    fn a_rejected_provider_block_keeps_its_builtins_and_reports() {
+        // No distinguishing key at all — Pi throws (provider-composer.ts:181-184).
+        let base = vec![oai("acme", "m1")];
+        let file: ModelFile =
+            serde_json::from_str(r#"{"providers":{"acme":{"name":"Acme"}}}"#).unwrap();
+        let (out, errors) = file.compose(&base);
+        assert_eq!(errors.len(), 1, "the bad block is reported");
+        assert!(errors[0].contains("must specify"), "{errors:?}");
+        assert!(
+            out.iter().any(|m| m.id.as_str() == "m1"),
+            "the built-ins survive a rejected block"
+        );
+    }
+
+    #[test]
+    fn a_custom_model_with_no_resolvable_base_url_is_rejected_loudly() {
+        // No built-ins to inherit from, no provider baseUrl → Pi throws (provider-composer.ts:137).
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"ghost":{"api":"openai-completions","models":[{"id":"x"}]}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&[]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("baseUrl"), "{errors:?}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn malformed_models_json_reports_instead_of_erroring_out() {
+        let dir = crate::test_util::temp_dir();
+        let path = dir.join("models.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty());
+        let err = err.expect("a parse failure must be reported");
+        assert!(err.contains("Failed to parse models.json"), "{err}");
+        // A missing file is NOT an error (Pi returns an empty snapshot on ENOENT, model-config.ts:248).
+        let (file, err) = load_models_file_reporting(&dir.join("absent.json"));
+        assert!(file.providers.is_empty() && err.is_none());
     }
 }

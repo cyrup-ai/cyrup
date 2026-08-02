@@ -751,8 +751,34 @@ pub fn nested_route_env(route: &NestedRoute) -> HashMap<String, String> {
     ])
 }
 
+/// The child-ROLE env pair EVERY spawned subagent child carries, and the SINGLE production source
+/// of those two entries — pi `augmentChildEnv` (`pi-args.ts:328-330`), where
+/// `env[SUBAGENT_CHILD_ENV] = "1"` and `env[SUBAGENT_FANOUT_CHILD_ENV] = fanoutAuthorized ? "1" : "0"`
+/// are written unconditionally on every spawn, next to each other, in that order.
+///
+/// Three independent subsystems key off this pair, which is why it is factored out rather than
+/// re-inlined per call site:
+/// 1. **Registration** ([`crate::extension::registration_mode_from_env`], pi
+///    `extension/index.ts:177` + `extension/fanout-child.ts:132`): a plain child registers NO
+///    subagent surface; a fanout-authorized child registers the restricted one.
+/// 2. **Parent-session anchoring** (pi `extension/index.ts:552`): only a NON-child overwrites
+///    [`crate::exec::PARENT_SESSION_ENV_VAR`] with its own session id.
+/// 3. **Permission ask-forwarding** (`cyrup_permission_system::permission_extension_for_env`, this
+///    crate's downstream consumer): a child installs the `ForwardingAskChannel` that writes its
+///    `ask` into the PARENT's filesystem spool instead of dying with no reachable human.
+///
+/// `authorized == false` blanks the fanout flag to an explicit `"0"` rather than leaving it absent.
+/// That is pi's own wording and it is load-bearing here: a spawn env is an OVERLAY applied over the
+/// inherited environment ([`crate::spawn::SpawnedChild::spawn`] never clears it), so an absent entry
+/// would let a fanout-authorized process's own `CYRUP_SUBAGENT_FANOUT_CHILD=1` leak down into a
+/// grandchild that was never granted the route.
+#[must_use]
+pub fn child_role_env(authorized: bool) -> [(&'static str, &'static str); 2] {
+    [(CHILD_ENV, "1"), (FANOUT_CHILD_ENV, if authorized { "1" } else { "0" })]
+}
+
 /// The `fanout-child` authorization env overlay (pi-args `augmentChildEnv`, the nested-route
-/// portion): sets [`FANOUT_CHILD_ENV`] and, **only when `authorized`**, propagates the route +
+/// portion): sets the [`child_role_env`] pair and, **only when `authorized`**, propagates the route +
 /// parent-address coordinates so the grandchild's events reach the grandparent. When not
 /// authorized, the parent coordinates are blanked (empty strings) so the child cannot spoof its way
 /// onto a route it was not granted.
@@ -763,8 +789,9 @@ pub fn nested_child_auth_env(
     address: Option<&NestedParentAddress>,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    env.insert(CHILD_ENV.to_string(), "1".to_string());
-    env.insert(FANOUT_CHILD_ENV.to_string(), if authorized { "1" } else { "0" }.to_string());
+    for (key, value) in child_role_env(authorized) {
+        env.insert(key.to_string(), value.to_string());
+    }
 
     let blank = String::new();
     let (event_sink, control_inbox, root_run_id, token) = match (authorized, route) {
