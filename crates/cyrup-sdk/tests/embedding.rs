@@ -84,7 +84,14 @@ async fn streamed_events_arrive_in_order() {
 
     let kinds: Vec<&str> = events.iter().map(AgentSessionEvent::kind).collect();
     assert_eq!(kinds.first(), Some(&"agent_start"), "must start with agent_start: {kinds:?}");
-    assert_eq!(kinds.last(), Some(&"agent_end"), "must end with agent_end: {kinds:?}");
+    // SEAM-005: the session event stream closes with `agent_settled` (the whole run, including any
+    // auto-retry / post-run compaction, is done), immediately after the last `agent_end`.
+    assert_eq!(kinds.last(), Some(&"agent_settled"), "must end with agent_settled: {kinds:?}");
+    assert_eq!(
+        kinds.iter().rev().nth(1),
+        Some(&"agent_end"),
+        "…preceded by the run's last agent_end: {kinds:?}"
+    );
 
     // turn_start precedes message_start precedes message_end precedes agent_end.
     let pos = |k: &str| kinds.iter().position(|x| *x == k);

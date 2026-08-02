@@ -45,9 +45,9 @@ pub use auth::{
     real_auth_path, resolve_api_key, resolve_api_key_refreshing, resolve_api_key_refreshing_in,
 };
 pub use differential::{
-    assert_event_kinds, canonical_event, canonicalize_cross_impl, diff_normalized, diff_sequences,
-    event_kind_sequence, pi_fixture_events, run_differential, stream_event_type_sequence,
-    value_type_sequence,
+    agent_loop_kinds, assert_event_kinds, canonical_event, canonicalize_cross_impl,
+    diff_normalized, diff_sequences, event_kind_sequence, pi_fixture_events, run_differential,
+    stream_event_type_sequence, value_type_sequence,
 };
 pub use golden::{normalize_value, snapshot, verify as verify_golden, verify_snapshot};
 pub use harness::{
@@ -126,7 +126,10 @@ mod smoke {
         let events = harness.run("what is the answer?").await.expect("run");
         let kinds = event_kind_sequence(&events);
         assert_eq!(kinds.first().map(String::as_str), Some("agent_start"));
-        assert_eq!(kinds.last().map(String::as_str), Some("agent_end"));
+        // SEAM-005: the session-layer stream closes with `agent_settled` (the WHOLE run is done),
+        // immediately after the run's last `agent_end`.
+        assert_eq!(kinds.last().map(String::as_str), Some("agent_settled"));
+        assert_eq!(kinds.iter().rev().nth(1).map(String::as_str), Some("agent_end"));
         assert!(kinds.iter().any(|k| k == "message_start"));
         assert!(kinds.iter().any(|k| k == "message_end"));
 
@@ -320,7 +323,7 @@ mod smoke {
         assert!(harness.session().services().auth.runtime_api_key(&provider).is_none());
         // The turn still completes (the faux provider requires no auth).
         let events = harness.run("hello").await.expect("run");
-        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_end"));
+        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_settled"));
     }
 
     /// `initialActiveToolNames` (Pi suite/harness.ts:68,184) seeds the visible/active tool set when
@@ -360,7 +363,12 @@ mod smoke {
             .await
             .expect("build harness");
         let events = harness.run("hello").await.expect("run");
-        let actual = event_kind_sequence(&events);
+        // The fixture is a capture of Pi's own `agentLoop()` (see its `_note`), so it contains only
+        // agent-loop events. cyrup's harness records SESSION events, whose superset includes
+        // `agent_settled` (SEAM-005) — a session-layer event Pi emits from `AgentSession`
+        // (agent-session.ts:581-588), never from the loop. Compare the agent-loop subset; padding
+        // the EXPECTED side would falsely assert Pi's loop emits it.
+        let actual = crate::differential::agent_loop_kinds(&event_kind_sequence(&events));
         assert_event_kinds(&expected, &actual)
             .expect("cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence");
     }
@@ -417,7 +425,7 @@ mod smoke {
         // The session resolves the default (first) model, and a turn completes.
         assert_eq!(harness.session().services().model.id.as_str(), "m-a");
         let events = harness.run("hi").await.expect("run");
-        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_end"));
+        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_settled"));
     }
 
     /// Queue-consuming harness flavour (Pi `registerFauxProvider`/`suite/harness.ts`): responses are

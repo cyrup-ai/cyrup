@@ -219,8 +219,7 @@ async fn live_host_services_control_reaches_a_real_session_effect() {
         .expect("control routes to the wired channel (LiveHostServices::wire_control_channel)");
 
     // The runtime drains + applies queued control ops at a command-tier-safe point.
-    let deferred = session.apply_pending_control().await;
-    assert!(deferred.is_empty(), "SendUserMessage is a session-tier op — fully applied, none deferred");
+    session.apply_pending_control().await;
     session.wait_for_idle().await;
 
     assert!(
@@ -228,14 +227,34 @@ async fn live_host_services_control_reaches_a_real_session_effect() {
         "the extension-driven control op produced a real session effect (the user message ran)"
     );
 
-    // A runtime-tier op (e.g. Reload) is NOT applied at the session tier — it is returned for the
-    // runtime to act on, so nothing is silently dropped.
+    // SEAM-003 rewrite of this assertion. It used to read:
+    //
+    //     let deferred = session.apply_pending_control().await;
+    //     assert_eq!(deferred.len(), 1, "Reload is runtime-tier — handed back to the runtime");
+    //
+    // which encoded the defect: `apply_pending_control` returned the runtime-tier ops "for the
+    // runtime to act on", and its only production caller did `let _deferred = …`. Nothing ever
+    // acted. `apply_pending_control` is now a SINK — a runtime-tier op is routed to the installed
+    // `RuntimeActions` (see `tests/control_ops.rs` for the positive, end-to-end proof), and on a
+    // BARE session like this one — built straight from `SessionBuilder`, never installed into an
+    // `AgentSessionRuntime` — there is no host to route to, so the op is REPORTED (a `tracing::warn`
+    // naming `SessionServiceError::NoRuntimeHost("reload")`) rather than silently dropped. What is
+    // asserted here is that the drain consumes it and leaves the session healthy.
     session
         .services()
         .host_services
         .control(ControlOp::Reload)
         .expect("control routes to the channel");
-    let deferred = session.apply_pending_control().await;
-    assert_eq!(deferred.len(), 1, "Reload is runtime-tier — handed back to the runtime");
-    assert!(matches!(deferred[0], ControlOp::Reload));
+    session.apply_pending_control().await;
+    assert!(
+        session.services().host_services.take_pending_control().is_empty(),
+        "the drain CONSUMED the runtime-tier op (it is not left queued for a caller that never comes)"
+    );
+    // The session is unharmed by a runtime-tier op it cannot service.
+    let _ = session.prompt("still alive").await.unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        user_texts(&session.messages().await).iter().any(|t| t.contains("still alive")),
+        "a runtime-tier op with no runtime host installed degrades cleanly"
+    );
 }

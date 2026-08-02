@@ -5,8 +5,13 @@
 //! - [`InlineMessage::content_markdown`] builds the human-readable body pi's `sendIncomingMessage`
 //!   passes to `pi.sendMessage({customType:"intercom_message", content, …})` (`index.ts:654-666`).
 //!   In cyrup this becomes the `content` field of `append_entry("intercom_message", …)` (the port doc
-//!   §4.2/§7.2 surface — cyrup has no `register_message_renderer`, so the card degrades to a custom
-//!   entry, §4.3).
+//!   §4.2/§7.2 surface — the card degrades to a custom entry, §4.3).
+//!
+//!   NOTE (EXT-006): the reason for that degradation is gone. `InitApi::register_message_renderer`
+//!   now exists for native built-ins and `ExtensionHost::render_message_call` routes a custom type
+//!   back to its owner, so this crate COULD register `"intercom_message"` and have
+//!   [`InlineMessage::render`] draw it the way `index.ts:1142-1146` does. Adopting it is deliberate
+//!   follow-up work in this crate, not a missing capability in the extension seam.
 //! - [`InlineMessage::render`] draws the bordered card (`registerMessageRenderer("intercom_message",
 //!   …)`, `index.ts:1142-1146`); cyrup embeds the rendered lines in the same `append_entry` payload
 //!   (`card`) so the human still sees the framed message even without a live renderer.

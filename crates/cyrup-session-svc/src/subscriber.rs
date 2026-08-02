@@ -3,8 +3,10 @@
 //! One [`SvcSubscriber`] is registered with the agent (ordered/awaited, func-02 R-02-012). On every
 //! agent event it (1) appends finalized messages to the session tree so persistence is durable
 //! across the turn (arch-04), and (2) fans the event out — as an [`AgentSessionEvent`] — to every
-//! live subscription. Run-scoped subscriptions (returned by `prompt`) are terminated after the
-//! run's `agent_end`; persistent subscriptions (returned by `subscribe`) live until dropped.
+//! live subscription. Run-scoped subscriptions (returned by `prompt`) are terminated after the run
+//! SETTLES — their last event is `agent_settled`, not `agent_end` (SEAM-005), since a run may
+//! continue past an `agent_end` for an auto-retry / post-run compaction / queued continuation.
+//! Persistent subscriptions (returned by `subscribe`) live until dropped.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,7 +47,8 @@ impl Fanout {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    /// A run-scoped subscription — terminated after the in-flight run emits `agent_end`.
+    /// A run-scoped subscription — terminated once the in-flight run SETTLES (its final event is
+    /// `agent_settled`, which follows the run's last `agent_end`).
     pub(crate) fn subscribe_run(&self) -> EventStream<AgentSessionEvent> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         lock(&self.run_scoped).push(tx);
@@ -73,8 +76,9 @@ impl Fanout {
     }
 
     /// Drop all run-scoped senders, terminating the streams returned by the just-finished `prompt`.
-    /// Called by the persist+fan-out subscriber (unbound legacy path) on `agent_end`, and by the
-    /// post-run driver (bound path) once the WHOLE post-run loop settles.
+    /// Called by the persist+fan-out subscriber (unbound legacy path) and by the post-run driver
+    /// (bound path), in both cases immediately AFTER `agent_settled` is emitted, so a run-scoped
+    /// consumer observes the settle as its last event.
     pub(crate) fn end_run(&self) {
         lock(&self.run_scoped).clear();
     }
@@ -205,7 +209,23 @@ impl EventSubscriber for SvcSubscriber {
         // 3. Terminate run-scoped subscriptions once the run settles — but ONLY on an unbound session.
         //    A bound session's post-run driver owns run termination (it may continue past this
         //    `agent_end` for a retry / compaction / queued continuation).
+        //
+        //    SEAM-005: this is ALSO the unbound session's settle point, and therefore where its
+        //    `agent_settled` belongs. Pi always settles (`_emitAgentSettled` is in `_runAgentPrompt`'s
+        //    `finally`, agent-session.ts:1063-1072). An unbound `AgentSession` has NO post-run driver
+        //    — `spawn_run`'s `None` arm starts the run and returns — so no retry, compaction or
+        //    queued continuation can follow this `agent_end`; the run is settled by construction the
+        //    instant it ends. Emitting here rather than in `spawn_run` matters: `agent.prompt`
+        //    returns as soon as the run is DISPATCHED, so a settle emitted there would fire while
+        //    the model was still streaming. Ordered before `end_run` so a run-scoped subscriber sees
+        //    it, and — like the bound path — extensions are notified before subscribers.
         if is_end && session.is_none() {
+            let cancel = self.session_cancel.child_token();
+            self.ext_host
+                .dispatcher()
+                .dispatch_notify(&cyrup_ext::HostEvent::AgentSettled, &cancel)
+                .await;
+            self.fanout.emit(AgentSessionEvent::AgentSettled).await;
             self.fanout.end_run();
         }
     }

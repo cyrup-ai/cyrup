@@ -205,7 +205,20 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
     // (a) the AgentSessionEvent stream order is correct.
     let kinds: Vec<&str> = events.iter().map(AgentSessionEvent::kind).collect();
     assert_eq!(kinds.first(), Some(&"agent_start"), "stream must start with agent_start: {kinds:?}");
-    assert_eq!(kinds.last(), Some(&"agent_end"), "stream must end with agent_end: {kinds:?}");
+    // SEAM-005: the run-scoped stream now closes on `agent_settled`, the event that says the WHOLE
+    // run (including any auto-retry / post-run compaction / queued continuation) is done — Pi's
+    // `_emitAgentSettled` likewise runs after the post-run loop, in `_runAgentPrompt`'s `finally`
+    // (agent-session.ts:1063-1072). `agent_end` is now the second-to-last event, not the last.
+    assert_eq!(
+        kinds.last(),
+        Some(&"agent_settled"),
+        "stream must end with agent_settled: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().rev().nth(1),
+        Some(&"agent_end"),
+        "…immediately preceded by the run's last agent_end: {kinds:?}"
+    );
     let tes = kinds.iter().position(|k| *k == "tool_execution_start").expect("tool_execution_start");
     let tee = kinds.iter().position(|k| *k == "tool_execution_end").expect("tool_execution_end");
     assert!(tes < tee, "tool exec start must precede end");

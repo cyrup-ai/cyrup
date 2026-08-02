@@ -7,11 +7,12 @@
 //! `watch`, and emit `session_start`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use cyrup_core::CancelToken;
 use cyrup_ext::{HostEvent, Reduced};
 use cyrup_session::manager::SessionManager;
+use serde_json::Value;
 use tokio::sync::{watch, RwLock};
 
 use crate::builder::SessionTarget;
@@ -90,11 +91,102 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
     out
 }
 
+/// The RUNTIME-tier half of a loaded extension's `control` capability — the sink an
+/// [`AgentSession`] routes `new-session`/`switch`/`fork`/`reload` to (SEAM-003).
+///
+/// This is cyrup's [`ExtensionCommandContextActions`] (Pi `extensions/types.ts:1652-1672`). Pi
+/// binds it with REAL implementations in every host — `modes/rpc/rpc-mode.ts:321-346` and
+/// `modes/print-mode.ts:75-95` both pass a `commandContextActions` bag wired to
+/// `runtimeHost.newSession`/`fork`/`switchSession` and `session.reload` — stores it at
+/// `agent-session.ts:2236-2238` and installs it from `_applyExtensionBindings` (:2308-2310) via
+/// `runner.bindCommandContext(...)`, so `ctx.newSession()` inside a command handler executes
+/// INLINE. cyrup used to queue the op onto `LiveHostServices`'s control channel and then discard
+/// the drained vector, so every one of these was a no-op end to end.
+///
+/// The session-LOCAL ops (`navigateTree`/`waitForIdle`/`sendMessage`) deliberately do NOT live here:
+/// they need no runtime host and are applied in place by
+/// [`AgentSession::apply_pending_control`].
+///
+/// Pi documents the resulting context staleness (`extensions/loader.ts:206-208`: "Do not use a
+/// captured pi or command ctx after `ctx.newSession()`, `ctx.fork()`, `ctx.switchSession()`, or
+/// `ctx.reload()`") — cyrup inherits it, since each of these disposes the session that queued the op.
+#[async_trait::async_trait]
+pub trait RuntimeActions: Send + Sync {
+    /// Pi `ctx.newSession(options)`. `opts` is the raw guest bag (`{parentSession, withSession}`).
+    async fn new_session(&self, opts: &Value) -> Result<(), SessionServiceError>;
+    /// Pi `ctx.switchSession(sessionPath, options)`.
+    async fn switch_session(&self, session_id: &str, opts: &Value)
+        -> Result<(), SessionServiceError>;
+    /// Pi `ctx.fork(entryId, {position, withSession})`.
+    async fn fork(&self, entry_id: &str, opts: &Value) -> Result<(), SessionServiceError>;
+    /// Pi `ctx.reload()`.
+    async fn reload(&self) -> Result<(), SessionServiceError>;
+}
+
+/// The [`RuntimeActions`] implementation backed by a live [`AgentSessionRuntime`].
+///
+/// Holds a `Weak` so the runtime → session → actions → runtime chain is not a reference cycle: the
+/// runtime owns the active session, the session holds this sink, and this sink must therefore NOT
+/// own the runtime. An op arriving after the runtime is dropped degrades to a typed
+/// [`SessionServiceError::NoRuntimeHost`], never a panic.
+struct RuntimeHostActions(Weak<AgentSessionRuntime>);
+
+impl RuntimeHostActions {
+    fn runtime(&self, op: &'static str) -> Result<Arc<AgentSessionRuntime>, SessionServiceError> {
+        self.0.upgrade().ok_or(SessionServiceError::NoRuntimeHost(op))
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeActions for RuntimeHostActions {
+    async fn new_session(&self, opts: &Value) -> Result<(), SessionServiceError> {
+        let rt = self.runtime("new_session")?;
+        let options = NewSessionOptions {
+            parent_session: opts
+                .get("parentSession")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        rt.new_session_with(options).await.map(|_| ())
+    }
+
+    async fn switch_session(
+        &self,
+        session_id: &str,
+        opts: &Value,
+    ) -> Result<(), SessionServiceError> {
+        let rt = self.runtime("switch_session")?;
+        let options = SwitchSessionOptions {
+            cwd_override: opts.get("cwdOverride").and_then(Value::as_str).map(PathBuf::from),
+        };
+        rt.switch_session_with(PathBuf::from(session_id), options).await.map(|_| ())
+    }
+
+    async fn fork(&self, entry_id: &str, opts: &Value) -> Result<(), SessionServiceError> {
+        let rt = self.runtime("fork")?;
+        // Pi `fork(entryId, {position: "before" | "at"})` (types.ts:1661-1664); the default is
+        // "before" (`const position = options?.position ?? "before"`, agent-session-runtime.ts:266).
+        let position = match opts.get("position").and_then(Value::as_str) {
+            Some("at") => ForkPosition::At,
+            _ => ForkPosition::Before,
+        };
+        rt.fork(cyrup_core::EntryId::from(entry_id), position).await.map(|_| ())
+    }
+
+    async fn reload(&self) -> Result<(), SessionServiceError> {
+        self.runtime("reload")?.reload(None).await
+    }
+}
+
 /// Owns the active session + rebuilds it on every cwd/session switch (arch-11 §3.4).
 pub struct AgentSessionRuntime {
     factory: Arc<SessionFactory>,
     inner: RwLock<RuntimeInner>,
     gen_tx: watch::Sender<u64>,
+    /// The [`RuntimeActions`] sink installed onto EVERY session this runtime owns — the initial one
+    /// in [`Self::create`] and each replacement in [`Self::install_inner`] (SEAM-003). Built once,
+    /// in `create`, because it needs a `Weak<Self>` that only exists after the `Arc` is minted.
+    actions: OnceLock<Arc<dyn RuntimeActions>>,
 }
 
 impl AgentSessionRuntime {
@@ -108,19 +200,35 @@ impl AgentSessionRuntime {
     /// for an initial runtime `main.ts:674` passes no `sessionStartEvent`, so it defaults to
     /// `{type:"session_start", reason:"startup"}` (agent-session.ts:389). Replacements are announced
     /// instead by [`Self::install_inner`] with their own reason.
+    ///
+    /// SEAM-003: the runtime is returned as an `Arc` because it must hand every session it owns a
+    /// `Weak`-backed [`RuntimeActions`] sink, and that `Weak` can only be taken from the `Arc`. The
+    /// sink is installed BEFORE `bind_extensions()` so a `session_start` handler that immediately
+    /// calls `ctx.newSession()`/`ctx.reload()` reaches a live host rather than a dead queue — Pi
+    /// installs `commandContextActions` as an argument OF `bindExtensions` (rpc-mode.ts:342-346), so
+    /// they are bound before the `session_start` emit at its tail (agent-session.ts:2250).
     pub async fn create(
         factory: Arc<SessionFactory>,
         target: SessionTarget,
-    ) -> Result<Self, SessionServiceError> {
+    ) -> Result<Arc<Self>, SessionServiceError> {
         let session = factory.build(target, None).await?.into_shared();
-        session.bind_extensions().await;
         let diagnostics = collect_diagnostics(&session);
         let (gen_tx, _rx) = watch::channel(0);
-        Ok(Self {
+        let this = Arc::new(Self {
             factory,
-            inner: RwLock::new(RuntimeInner { session, generation: 0, diagnostics }),
+            inner: RwLock::new(RuntimeInner {
+                session: session.clone(),
+                generation: 0,
+                diagnostics,
+            }),
             gen_tx,
-        })
+            actions: OnceLock::new(),
+        });
+        let actions: Arc<dyn RuntimeActions> = Arc::new(RuntimeHostActions(Arc::downgrade(&this)));
+        let _ = this.actions.set(actions.clone());
+        session.install_runtime_actions(actions);
+        session.bind_extensions().await;
+        Ok(this)
     }
 
     /// The active session (cheap `Arc` clone). Re-read after any replacement.
@@ -190,6 +298,13 @@ impl AgentSessionRuntime {
             current.dispose(reason).await;
             // Invalidate prior subscriptions with a terminal `SessionReplaced` (R-11-021).
             current.notify_replaced(new_gen).await;
+        }
+        // SEAM-003: hand the REPLACEMENT session the same runtime sink before it is announced, so a
+        // `ctx.newSession()` from a command on the new session works exactly as it did on the old
+        // one. Pi re-runs `bindExtensions({commandContextActions})` on every rebind
+        // (rpc-mode.ts:341-346 `rebindSession`), which is the same guarantee.
+        if let Some(actions) = self.actions.get() {
+            next.install_runtime_actions(actions.clone());
         }
         // Install + bump generation; recompute the build diagnostics for the new session.
         let diagnostics = collect_diagnostics(&next);

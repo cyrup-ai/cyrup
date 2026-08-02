@@ -135,6 +135,29 @@ interface events {
   // --- message renderer dispatch (R-08-020; Pi renderCall/renderResult, types.ts:472-481) ---
   // A guest that registered a renderer for `custom-type` renders a tool call / result into a
   // serialized widget tree (none = fall back to the runtime's default renderer).
+  //
+  // `custom-type` is the CUSTOM MESSAGE TYPE for a renderer registered via
+  // `registration.register-message-renderer`, or the TOOL NAME for a tool whose descriptor declares
+  // `has-renderer` — the host routes by that key alone (EXT-006).
+  //
+  // THE WIDGET VOCABULARY. Pi returns a live `pi-tui` `Component` the interactive mode adds as a
+  // child (`components/custom-message.ts:66-81`, `components/tool-execution.ts:81-112`); a WASM
+  // guest cannot hand back an object, so cyrup's wire analog is that component tree SERIALIZED, and
+  // the host flattens it to display rows (`cyrup-tui` `rendered_text`). The tags mirror the
+  // `pi-tui` components a renderer actually returns (`packages/tui/src/index.ts:13-32`):
+  //
+  //   "…"                                        a bare string — the degenerate `Text`
+  //   {"widget":"text","text":"…"}               `Text`   — the dominant shape
+  //   {"widget":"markdown","text":"…"}           `Markdown`
+  //   {"widget":"truncated-text","text":"…"}     `TruncatedText`
+  //   {"widget":"spacer","lines":n}              `Spacer` (n defaults to 1, clamped to 64)
+  //   {"widget":"box"|"container","children":[]} `Box` / `Container` — children stacked
+  //   {"widget":"hstack","children":[…]}         `HStack`  — children joined on one row
+  //   […]                                        shorthand for a stack
+  //
+  // `cyrup_ext_sdk::widget` constructs exactly these. Anything else — an unknown tag, a missing
+  // tag, a tree nested deeper than 16 — is drawn as pretty-printed JSON rather than dropped, so a
+  // mistyped node is visible instead of blank.
   render-call:   func(custom-type: string, call-json: string) -> option<string>;
   render-result: func(custom-type: string, result-json: string) -> option<string>;
 
@@ -176,6 +199,13 @@ interface events {
   // --- notify-only (return ignored); high-frequency ones are subscription-gated ---
   on-agent-start:           func();
   on-agent-end:             func(messages-json: string);
+  // agent_settled (Pi AgentSettledEvent, extensions/types.ts:721-725, subscribed at types.ts:1225):
+  // the run has FULLY settled — no automatic retry, post-run compaction or queued continuation will
+  // follow. Distinct from on-agent-end, which fires once per agent.prompt/agent.continue: a run that
+  // auto-retries delivers TWO on-agent-end calls and exactly ONE on-agent-settled. Pi emits it from
+  // the `finally` of _runAgentPrompt (agent-session.ts:1063-1072), to the extension runner FIRST and
+  // the session subscribers second.
+  on-agent-settled:         func();
   on-turn-start:            func(turn-index: u32, timestamp: u64);
   // turn_end (Pi TurnEndEvent, types.ts:703-709): the turn index, the finalized assistant `message`,
   // AND the `tool-results` produced this turn (`ToolResultMessage[]`).
@@ -465,8 +495,25 @@ interface ext-tools {
   get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description}
 }
 
+// Read-only ctx state (Pi `ExtensionContext`, extensions/types.ts:329-346). Pi puts `isIdle`,
+// `hasPendingMessages`, `isProjectTrusted` and `getSystemPrompt` on the BASE context — available to
+// EVERY handler, not just command handlers — so these are deliberately NOT tier-gated. The native
+// built-in path reads the same four values off `HostCtx::rich()`.
+interface ctx-state {
+  // Pi `ctx.isIdle()` (types.ts:333): false while an agent run is in flight.
+  is-idle:              func() -> bool;
+  // Pi `ctx.hasPendingMessages()` (types.ts:341): queued user messages awaiting the next turn.
+  has-pending-messages: func() -> bool;
+  // Pi `ctx.isProjectTrusted()` (types.ts:335).
+  is-project-trusted:   func() -> bool;
+  // Pi `ctx.getSystemPrompt()` (types.ts:346); empty string when no session backend is attached.
+  get-system-prompt:    func() -> string;
+}
+
 // COMMAND-ONLY (arch-08 §6.3, deadlock rule): session/runtime mutation. Calling any of
 // these from an event handler returns a host-side deadlock error (surfaced, never a hang).
+// EXCEPT `abort`/`shutdown` — see their comments: Pi puts both on the BASE `ExtensionContext`
+// (types.ts:339-340,344), callable from any handler, so cyrup does NOT tier-gate them.
 interface control {
   // opts-json carries the typed Pi option bags (newSession{parentSession,withSession},
   // fork{position,withSession}, switchSession{withSession}, navigateTree{summarize,…}, types.ts:346-368).
@@ -480,6 +527,16 @@ interface control {
   // send-message (types.ts:1223): opts-json carries {triggerTurn, deliverAs}.
   send-message:      func(message-json: string, opts-json: string) -> result<_, string>;
   send-user-message: func(content: string, opts-json: string) -> result<_, string>;
+
+  // Pi `ctx.abort()` (extensions/types.ts:339, "Abort the current agent run. Available in all
+  // contexts."): cancels the in-flight run. NOT tier-gated — an event handler (e.g. a
+  // `tool_call` gate that decides the whole run must stop) is exactly Pi's use case, and abort
+  // cannot deadlock the way a session REPLACEMENT op can.
+  abort:    func() -> result<_, string>;
+  // Pi `ctx.shutdown()` (extensions/types.ts:344, "Gracefully shutdown pi and exit. Available in
+  // all contexts."). Sets the host's shutdown-requested flag; the host acts on it at the next
+  // settle point (Pi rpc-mode.ts:355-358). Also NOT tier-gated.
+  shutdown: func() -> result<_, string>;
 }
 
 world extension {
@@ -497,6 +554,7 @@ world extension {
   import provider-stream;
   import ext-tools;
   import control;
+  import ctx-state;
 
   export events;
   // async init unit, awaited before the loader continues (R-08-001).

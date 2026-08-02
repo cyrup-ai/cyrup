@@ -95,6 +95,13 @@ pub enum ControlOp {
     SendUserMessage { content: String, opts: Value },
     SetModel(Value),
     SetThinkingLevel(String),
+    /// Abort the in-flight agent run (Pi `ctx.abort()`, extensions/types.ts:339 — "Available in all
+    /// contexts"). Legal from EVERY tier, unlike the session-replacement ops above.
+    Abort,
+    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, extensions/types.ts:344 — "Available
+    /// in all contexts"; the runner entry point is runner.ts:656-662). Legal from every tier. The
+    /// host acts on it at its next settle point (Pi rpc-mode.ts:355-358).
+    Shutdown,
 }
 
 /// The ONE host-owned, session-scoped lock that serializes HUMAN interactions across the companion
@@ -402,6 +409,34 @@ pub trait HostServices: Send + Sync {
         Err("control capability not available".into())
     }
 
+    // --- base-context state accessors (Pi `ExtensionContext`, extensions/types.ts:329-346). Pi puts
+    // these on the BASE context so EVERY handler can read them, not just command handlers; they back
+    // both the WIT `ctx-state` imports and the native path's `HostCtx::rich()` (EXT-005). Each
+    // defaults to the "no live session attached" answer rather than a confident wrong one. ---
+
+    /// Pi `ctx.isIdle()` (types.ts:333): whether no agent run is in flight. The default host has no
+    /// agent, so nothing is running — `true`.
+    fn is_idle(&self) -> bool {
+        true
+    }
+
+    /// Pi `ctx.hasPendingMessages()` (types.ts:341): user messages queued for the next turn.
+    fn has_pending_messages(&self) -> bool {
+        false
+    }
+
+    /// Pi `ctx.isProjectTrusted()` (types.ts:335). The default host grants no trust.
+    fn is_project_trusted(&self) -> bool {
+        false
+    }
+
+    /// Pi `ctx.getSystemPrompt()` (types.ts:346). `None` when no session backend is attached — the
+    /// WIT binding lowers that to the empty string, and the native `HostCtx::rich()` keeps it `None`
+    /// so a built-in can tell "unavailable" from "empty prompt".
+    fn system_prompt(&self) -> Option<String> {
+        None
+    }
+
     /// Persist a custom (non-LLM) entry (R-08-026); returns the new entry id.
     fn append_entry(&self, _custom_type: &str, _data: &Value) -> Result<String, String> {
         Err("append_entry not available".into())
@@ -510,6 +545,14 @@ pub struct CannedResponses {
     pub oauth_prompt: Option<String>,
     /// Id returned from a guest `login` flow's `onSelect`.
     pub oauth_select: Option<String>,
+    /// Canned `ctx.isIdle()` (Pi types.ts:333).
+    pub is_idle: bool,
+    /// Canned `ctx.hasPendingMessages()` (Pi types.ts:341).
+    pub has_pending_messages: bool,
+    /// Canned `ctx.isProjectTrusted()` (Pi types.ts:335).
+    pub is_project_trusted: bool,
+    /// Canned `ctx.getSystemPrompt()` (Pi types.ts:346).
+    pub system_prompt: Option<String>,
 }
 
 impl Default for CannedResponses {
@@ -535,6 +578,10 @@ impl Default for CannedResponses {
             editor_text: String::new(),
             oauth_prompt: Some(String::new()),
             oauth_select: None,
+            is_idle: true,
+            has_pending_messages: false,
+            is_project_trusted: false,
+            system_prompt: None,
         }
     }
 }
@@ -845,6 +892,18 @@ impl HostServices for RecordingServices {
             g.control_ops.push(op);
         }
         Ok(())
+    }
+    fn is_idle(&self) -> bool {
+        self.responses.is_idle
+    }
+    fn has_pending_messages(&self) -> bool {
+        self.responses.has_pending_messages
+    }
+    fn is_project_trusted(&self) -> bool {
+        self.responses.is_project_trusted
+    }
+    fn system_prompt(&self) -> Option<String> {
+        self.responses.system_prompt.clone()
     }
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
         let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;

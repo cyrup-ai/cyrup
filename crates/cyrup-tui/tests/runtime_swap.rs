@@ -42,7 +42,7 @@ async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
     faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
     let provider: Arc<dyn Provider> = faux;
     let factory = Arc::new(SessionFactory::new(provider, fx.config.clone()));
-    Arc::new(AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap())
+    AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap()
 }
 
 fn app() -> App<TestBackend> {

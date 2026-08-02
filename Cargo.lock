@@ -1356,6 +1356,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -1417,6 +1418,7 @@ name = "cyrup-tui"
 version = "0.0.0"
 dependencies = [
  "arboard",
+ "async-trait",
  "cyrup-agent",
  "cyrup-core",
  "cyrup-ext",

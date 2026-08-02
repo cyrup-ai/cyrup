@@ -135,6 +135,31 @@ pub fn value_type_sequence(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+/// Session-layer-only event kinds: emitted by cyrup's `AgentSession` facade, with NO counterpart in
+/// the agent LOOP.
+///
+/// `agent_settled` is the whole list today (SEAM-005). Pi draws the same line: `agent_settled` is
+/// declared on `AgentSession`'s own event union (agent-session.ts:146) and emitted by
+/// `_emitAgentSettled` (:581-588) from `_runAgentPrompt`'s `finally` — it is not an `AgentEvent` and
+/// `packages/agent/src/agent-loop.ts` never produces one.
+const SESSION_LAYER_ONLY_KINDS: &[&str] = &["agent_settled"];
+
+/// Drop the session-layer-only kinds from `actual` so a cyrup session-event sequence can be compared
+/// against a fixture captured from Pi's **agent loop**.
+///
+/// The `*.pi-captured.events.jsonl` fixtures are recorded by executing Pi's own `agentLoop()`
+/// directly (see each fixture's `_note` header), so by construction they contain only agent-loop
+/// events. Comparing a cyrup session-event sequence to one of them therefore has to compare the
+/// agent-loop SUBSET. Appending `agent_settled` to the expected side instead would be a lie: it
+/// would assert that Pi's agent loop emits an event that only its session layer does.
+///
+/// Use this ONLY against an agent-loop capture. For a session-layer expectation (a `run_differential`
+/// scenario, a golden JSONL of `AgentSessionEvent`) compare the full sequence — `agent_settled` is a
+/// real, ordering-significant part of it.
+pub fn agent_loop_kinds(actual: &[String]) -> Vec<String> {
+    actual.iter().filter(|k| !SESSION_LAYER_ONLY_KINDS.contains(&k.as_str())).cloned().collect()
+}
+
 /// A cross-impl-canonical rendering of one event value (volatile fields zeroed, `role` dropped,
 /// numbers coerced to `f64`) for field-level comparison between a Pi capture and a cyrup event.
 pub fn canonical_event(mut value: serde_json::Value) -> serde_json::Value {

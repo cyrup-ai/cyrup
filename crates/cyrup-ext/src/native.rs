@@ -213,17 +213,26 @@ impl HostCtx {
     }
 }
 
-/// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, and
-/// registered `(name, descriptor)` commands.
-pub(crate) type InitParts = (Subscriptions, Vec<Arc<dyn Tool>>, Vec<(String, CommandDescriptor)>);
+/// The decomposed result of [`InitApi`]: the declared subscriptions, registered tools, registered
+/// `(name, descriptor)` commands, and the tool names / custom types this extension declared a
+/// renderer for (EXT-006).
+pub(crate) type InitParts = (
+    Subscriptions,
+    Vec<Arc<dyn Tool>>,
+    Vec<(String, CommandDescriptor)>,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// What a native extension declares during [`NativeExtension::init`]: its subscriptions plus any
-/// tools/commands it registers (arch-08 §3.5). Mirrors the guest's registration imports.
+/// tools/commands/renderers it registers (arch-08 §3.5). Mirrors the guest's registration imports.
 #[derive(Default)]
 pub struct InitApi {
     subs: Subscriptions,
     tools: Vec<Arc<dyn Tool>>,
     commands: Vec<(String, CommandDescriptor)>,
+    tool_renderers: Vec<String>,
+    message_renderers: Vec<String>,
 }
 
 impl InitApi {
@@ -248,12 +257,33 @@ impl InitApi {
         self.commands.push((name.into(), desc));
     }
 
+    /// Declare that this extension renders CUSTOM MESSAGES of `custom_type` (Pi
+    /// `api.registerMessageRenderer(customType, renderer)`, extensions/types.ts:1284). The host
+    /// routes `render_message_call`/`render_message_result` for that type back to
+    /// [`NativeExtension::render_call`]/[`NativeExtension::render_result`]. First registration in
+    /// load order wins, matching Pi's `getMessageRenderer` loop (runner.ts:579-587).
+    ///
+    /// EXT-006: without this a native built-in could not register a renderer at all, which is why
+    /// `cyrup-intercom` had to degrade its message card to an unstyled custom entry.
+    pub fn register_message_renderer(&mut self, custom_type: impl Into<String>) {
+        self.message_renderers.push(custom_type.into());
+    }
+
+    /// Declare that this extension renders the TOOL named `tool_name` (Pi's per-tool
+    /// `ToolDefinition.renderCall`/`renderResult`, extensions/types.ts:472-481, resolved by
+    /// `modes/interactive/components/tool-execution.ts:81-112`). The guest path declares the same
+    /// thing through `ToolDescriptor.has_renderer`; a native tool is an already-executable
+    /// `Arc<dyn Tool>` and has no descriptor, so it declares it here.
+    pub fn register_tool_renderer(&mut self, tool_name: impl Into<String>) {
+        self.tool_renderers.push(tool_name.into());
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
     }
 
     pub(crate) fn into_parts(self) -> InitParts {
-        (self.subs, self.tools, self.commands)
+        (self.subs, self.tools, self.commands, self.tool_renderers, self.message_renderers)
     }
 }
 
@@ -268,6 +298,37 @@ pub trait NativeExtension: Send + Sync {
     /// Handle one event. Returns this extension's block/mutate/notify contribution.
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome;
 
+    /// Opt in to the PRE-TRUST bootstrap pass, where `project_trust` is asked (EXT-003). Default
+    /// `false`, and that default is load-bearing.
+    ///
+    /// Pi resolves project trust by loading a throwaway extension set first
+    /// (`resource-loader.ts:378-399`), taking the verdict, then loading the real set — and its
+    /// module cache holds FACTORIES, not instances (`loader.ts:148,414-437`), so the second pass
+    /// calls the factory again against a FRESH `Extension` + `ExtensionAPI`. cyrup has no such
+    /// re-instantiation for a native: a native built-in is a process-lifetime `Arc<dyn
+    /// NativeExtension>` handed to the builder, so running it through the bootstrap pass calls
+    /// [`Self::init`] **twice on the very same object**, with the same interior state.
+    ///
+    /// That is not hypothetical. `cyrup-ext-subagents`' `RegistrationMode::ChildSafe` arm spawns a
+    /// detached nested-control-inbox poller straight from `init`; a second `init` would start a
+    /// SECOND poller on the same inbox, each with its own private `seen` set, so both would resolve
+    /// and write back the same request. Its `Full` arm likewise re-runs sweeps its own comment
+    /// documents as "exactly once per process load". And the trigger is the COMMON case: any repo
+    /// carrying a `.cyrup/` directory has trust-requiring resources, and a subagent child re-execs
+    /// with no `--approve`.
+    ///
+    /// So the bootstrap pass loads only the natives that answer `true` here. WASM guests are
+    /// unaffected and always participate: a guest load builds a fresh instance in a fresh store,
+    /// which IS Pi's fresh-`Extension`-per-factory-call semantics.
+    ///
+    /// **Override this only if [`Self::init`] is idempotent**, because it will run twice on a
+    /// trust-requiring project. A native that subscribes to [`crate::EventKind::ProjectTrust`]
+    /// without overriding it is warned about at load time — its vote would otherwise be counted
+    /// only in the real pass, which happens after trust is already decided.
+    fn decides_project_trust(&self) -> bool {
+        false
+    }
+
     /// Execute a registered slash command this extension owns (Pi `command.handler(args, ctx)`,
     /// agent-session.ts:1159; R-08-016). `ctx` is **command-tier** (session mutation allowed). The
     /// optional `String` is the command's text output (Pi commands return `void`; cyrup mirrors the
@@ -281,6 +342,24 @@ pub trait NativeExtension: Send + Sync {
         _ctx: &HostCtx,
     ) -> Result<Option<String>, ExtError> {
         Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
+    }
+
+    /// Render a tool CALL / custom MESSAGE this extension declared a renderer for (Pi
+    /// `renderCall`, extensions/types.ts:472-473). `key` is the TOOL NAME for a tool renderer
+    /// declared via [`InitApi::register_tool_renderer`], or the CUSTOM TYPE for a message renderer
+    /// declared via [`InitApi::register_message_renderer`]. `None` (the default) falls the host back
+    /// to its own framing — the same degradation a faulting guest renderer gets.
+    ///
+    /// Sync on purpose: rendering is a pure projection of the payload, it runs on the UI's event
+    /// path, and an `async` renderer would let a built-in stall the frame.
+    fn render_call(&self, _key: &str, _call: &serde_json::Value) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The result-side companion of [`Self::render_call`] (Pi `renderResult`,
+    /// extensions/types.ts:475-481).
+    fn render_result(&self, _key: &str, _result: &serde_json::Value) -> Option<serde_json::Value> {
+        None
     }
 
     /// Late-bind the live `Arc<dyn HostServices>` backend (reconciliation §2 item 1 / P-1). Called by
@@ -306,6 +385,13 @@ pub struct NativeHandle {
     subs: Subscriptions,
     ctx: HostCtx,
     inner: Arc<dyn NativeExtension>,
+    /// The live capability backend, when the host was given one ([`crate::ExtensionHost::
+    /// load_native_with_services`]). Used to refresh [`HostCtxRich`] on EVERY dispatch (EXT-005):
+    /// idle/trust/usage/model/system-prompt are all live values, so a ctx built once at load time
+    /// would go stale — and, before EXT-005, `HostCtxRich::default()` meant a native built-in read a
+    /// confident `is_idle = false` / `is_project_trusted = false` rather than the truth.
+    #[cfg(feature = "wasm-host")]
+    services: Option<Arc<dyn crate::host::HostServices>>,
 }
 
 impl NativeHandle {
@@ -315,7 +401,45 @@ impl NativeHandle {
         ctx: HostCtx,
     ) -> Self {
         let id = inner.id();
-        Self { id, subs, ctx, inner }
+        Self {
+            id,
+            subs,
+            ctx,
+            inner,
+            #[cfg(feature = "wasm-host")]
+            services: None,
+        }
+    }
+
+    /// Attach the live capability backend so each dispatch gets a FRESH [`HostCtxRich`] (EXT-005).
+    #[cfg(feature = "wasm-host")]
+    #[must_use]
+    pub fn with_services(mut self, services: Option<Arc<dyn crate::host::HostServices>>) -> Self {
+        self.services = services;
+        self
+    }
+
+    /// The ctx for one dispatch: the handle's stable base ctx (tier, mode, cwd and — critically —
+    /// the SHARED [`HumanWaitGate`] the dispatcher's budget watchdog polls) with the rich fields
+    /// re-read from the live backend.
+    fn dispatch_ctx(&self) -> HostCtx {
+        #[cfg(feature = "wasm-host")]
+        if let Some(svc) = &self.services {
+            return self.ctx.clone().with_rich(rich_from_services(svc.as_ref()));
+        }
+        self.ctx.clone()
+    }
+}
+
+/// Snapshot the Pi `ExtensionContext` data fields (types.ts:329-346) off a live capability backend.
+#[cfg(feature = "wasm-host")]
+pub(crate) fn rich_from_services(svc: &dyn crate::host::HostServices) -> HostCtxRich {
+    HostCtxRich {
+        model: svc.current_model(),
+        is_idle: svc.is_idle(),
+        is_project_trusted: svc.is_project_trusted(),
+        context_usage: Some(svc.context_usage()),
+        system_prompt: svc.system_prompt(),
     }
 }
 
@@ -348,7 +472,8 @@ impl Extension for NativeHandle {
     ) -> Result<HookOutcome, ExtError> {
         // Containment: catch a panicking handler (R-08-036). `AssertUnwindSafe` is sound here — on
         // a caught unwind we discard the handler's state and surface an error; we never resume it.
-        let fut = AssertUnwindSafe(self.inner.on_event(ev, &self.ctx));
+        let ctx = self.dispatch_ctx();
+        let fut = AssertUnwindSafe(self.inner.on_event(ev, &ctx));
         let raced = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ExtError::Cancelled),

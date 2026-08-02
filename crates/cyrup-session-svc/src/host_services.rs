@@ -178,6 +178,37 @@ struct LiveSnapshot {
     /// `session_file()` when the live manager lock is momentarily contended — the file is deferred
     /// until the first assistant message and changes on fork, so the live read is authoritative.
     session_file: Option<PathBuf>,
+    /// The agent's CURRENT base system prompt (EXT-005; Pi `getSystemPrompt: () => this.systemPrompt`,
+    /// agent-session.ts:2434). Seeded by the builder and re-seeded by every
+    /// `AgentSession::push_active_tools` — a `setActiveTools` rebuild changes the prompt, and a guest
+    /// reading it back must see the rebuilt one, not the build-time one. The agent's own copy lives
+    /// behind an `async` accessor, which a SYNC host-services read cannot await, so it is mirrored.
+    system_prompt: Option<String>,
+    /// Whether the project is trusted (EXT-005; Pi `isProjectTrusted: () =>
+    /// this.settingsManager.isProjectTrusted()`, agent-session.ts:2410). Seeded by the builder from
+    /// the resolved `SettingsManager`, so a guest asking mid-session gets the session's REAL verdict
+    /// rather than the trait default's conservative `false`.
+    project_trusted: bool,
+}
+
+/// The live session's activity readback + interrupt, backing the `ctx-state`/`control` imports that
+/// only the running session can answer (EXT-005). Pi binds these straight to the session object:
+/// `isIdle: () => this.isIdle`, `hasPendingMessages: () => this.pendingMessageCount > 0` and
+/// `abort: () => { void this.abort() }` (agent-session.ts:2409-2419).
+///
+/// A separate trait rather than more snapshot fields because these are LIVE — a mirrored `is_idle`
+/// would be stale exactly when it matters (mid-run, which is when a handler asks). Attached by
+/// `AgentSession::into_shared` over a weak self-handle, so it never keeps the session alive.
+pub trait SessionActivity: Send + Sync {
+    /// Whether no agent run (including the post-run retry/compaction/continuation loop) is in
+    /// flight (Pi `isIdle`).
+    fn is_idle(&self) -> bool;
+    /// Queued steering + follow-up message count (Pi `pendingMessageCount`).
+    fn pending_message_count(&self) -> usize;
+    /// Interrupt the in-flight run NOW. Pi runs `void this.abort()` SYNCHRONOUSLY from the handler
+    /// that called `ctx.abort()` (agent-session.ts:2412-2418); deferring it to a turn-boundary drain
+    /// would abort a run that has already finished, i.e. nothing at all.
+    fn abort(&self);
 }
 
 /// A host-originated message injection routed from a background task's `inject_message` to the live
@@ -283,6 +314,10 @@ pub struct LiveHostServices {
     /// prompt the same human at once. Every native handed this backend Arc (via `set_host_services`)
     /// reads the identical lock.
     human_interaction: Arc<HumanInteractionLock>,
+    /// The live session's activity readback + interrupt (EXT-005), attached post-build via
+    /// [`Self::attach_session_activity`]. `None` on the default/by-value host, where the trait
+    /// defaults (idle, no pending messages, a no-op abort) are the honest answers.
+    activity: Mutex<Option<Arc<dyn SessionActivity>>>,
 }
 
 impl LiveHostServices {
@@ -308,6 +343,7 @@ impl LiveHostServices {
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
             inject_sink: Mutex::new(None),
             human_interaction: Arc::new(HumanInteractionLock::new()),
+            activity: Mutex::new(None),
         }
     }
 
@@ -335,6 +371,23 @@ impl LiveHostServices {
         let mut g = Self::lock(&self.snapshot);
         g.session_name = session_name;
         g.used_tokens = used_tokens;
+    }
+
+    /// Seed/refresh the mirrored system prompt + project-trust verdict a guest's `ctx-state` reads
+    /// (EXT-005). Called by the builder once and by `AgentSession::push_active_tools` on every
+    /// prompt rebuild.
+    pub fn update_prompt_state(&self, system_prompt: Option<String>, project_trusted: bool) {
+        let mut g = Self::lock(&self.snapshot);
+        if system_prompt.is_some() {
+            g.system_prompt = system_prompt;
+        }
+        g.project_trusted = project_trusted;
+    }
+
+    /// Attach the live session's activity readback + interrupt (EXT-005). Installed by
+    /// `AgentSession::into_shared` over a weak self-handle.
+    pub fn attach_session_activity(&self, activity: Arc<dyn SessionActivity>) {
+        *Self::lock(&self.activity) = Some(activity);
     }
 
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
@@ -681,11 +734,47 @@ impl HostServices for LiveHostServices {
     }
 
     fn control(&self, op: ControlOp) -> Result<(), String> {
+        // EXT-005: `ctx.abort()` must interrupt the run that is in flight RIGHT NOW. Pi binds it to
+        // `void this.abort()` invoked synchronously from the handler (agent-session.ts:2412-2418);
+        // cyrup's control queue drains only at turn boundaries, so a queued-only abort would fire
+        // after the run it was meant to stop had already ended — aborting nothing. Fire the live
+        // interrupt here, then still queue the op so the turn-boundary drain observes it (abort is
+        // idempotent, R-11-018) and a host without a live session keeps the queued behavior.
+        if matches!(op, ControlOp::Abort)
+            && let Some(activity) = Self::lock(&self.activity).clone()
+        {
+            activity.abort();
+        }
         let sink = Self::lock(&self.control).clone();
         match sink {
             Some(f) => f(op),
             None => Err("control capability not yet wired to a runtime".into()),
         }
+    }
+
+    // ---- EXT-005 `ctx-state` reads (Pi agent-session.ts:2409-2434) ----------------------------
+
+    fn is_idle(&self) -> bool {
+        // Live, never mirrored: a handler asks precisely while a run is in flight.
+        match Self::lock(&self.activity).clone() {
+            Some(a) => a.is_idle(),
+            None => true,
+        }
+    }
+
+    fn has_pending_messages(&self) -> bool {
+        match Self::lock(&self.activity).clone() {
+            Some(a) => a.pending_message_count() > 0,
+            None => false,
+        }
+    }
+
+    fn is_project_trusted(&self) -> bool {
+        Self::lock(&self.snapshot).project_trusted
+    }
+
+    fn system_prompt(&self) -> Option<String> {
+        Self::lock(&self.snapshot).system_prompt.clone()
     }
 
     fn exec(

@@ -42,6 +42,31 @@ use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
 use crate::tools::{DynamicToolState, ToolInfo};
 
+/// Upper bound on a `ControlOp::WaitIdle` drained at the command tier (SEAM-003). Pi's
+/// `ctx.waitForIdle()` is a promise resolved by `_resolveIdleWaitIfIdle` and cannot wedge the
+/// command path; cyrup's waits on the post-run driver watch, which a CONCURRENT run could hold
+/// indefinitely. The op is bounded and its expiry reported rather than hanging the drain.
+const WAIT_IDLE_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The op's Pi-facing name, for the SEAM-003 failure diagnostic.
+fn control_op_name(op: &ControlOp) -> &'static str {
+    match op {
+        ControlOp::NewSession { .. } => "new_session",
+        ControlOp::Switch { .. } => "switch_session",
+        ControlOp::Fork { .. } => "fork",
+        ControlOp::Navigate { .. } => "navigate_tree",
+        ControlOp::Reload => "reload",
+        ControlOp::Compact => "compact",
+        ControlOp::WaitIdle => "wait_idle",
+        ControlOp::SendMessage { .. } => "send_message",
+        ControlOp::SendUserMessage { .. } => "send_user_message",
+        ControlOp::SetModel(_) => "set_model",
+        ControlOp::SetThinkingLevel(_) => "set_thinking_level",
+        ControlOp::Abort => "abort",
+        ControlOp::Shutdown => "shutdown",
+    }
+}
+
 /// Where a fork anchors relative to the selected entry (Pi `fork(entryId, {position})`,
 /// agent-session-runtime.ts:259). `Before` anchors at the selected *user* message's parent and
 /// extracts its text (for re-editing); `At` anchors at the selected entry itself.
@@ -375,6 +400,19 @@ pub struct AgentSession {
     /// A keep-alive receiver so `driver_tx.send` never fails for want of a live receiver (a watch
     /// `Sender` with zero receivers drops the sent value); `wait_for_idle` subscribes fresh ones.
     _driver_keepalive: tokio::sync::watch::Receiver<bool>,
+    // ---- extension control sinks (SEAM-003 / EXT-005) ----
+    /// The RUNTIME-tier control sink (Pi `ExtensionCommandContextActions`, extensions/types.ts:
+    /// 1652-1672), installed by [`crate::AgentSessionRuntime`] before this session is announced.
+    /// `None` on a bare session built straight from [`crate::SessionBuilder`]; a runtime-tier op
+    /// then surfaces [`SessionServiceError::NoRuntimeHost`] as a warning diagnostic rather than being
+    /// silently dropped — Pi's pre-bind stubs throw `"Extension runtime not initialized…"` for the
+    /// same reason (extensions/loader.ts:173-176 `notInitialized`).
+    runtime_actions: OnceLock<Arc<dyn crate::runtime::RuntimeActions>>,
+    /// Latches `true` when a loaded extension calls `ctx.shutdown()` (Pi `ctx.shutdown()`,
+    /// extensions/types.ts:344 → `runner.shutdown()` → the host's `shutdownHandler`,
+    /// rpc-mode.ts:344-346). Hosts poll [`Self::shutdown_requested`] at their next settle point —
+    /// which is exactly what `agent_settled` is for (Pi rpc-mode.ts:355-358).
+    shutdown_requested: AtomicBool,
 }
 
 impl AgentSession {
@@ -446,7 +484,26 @@ impl AgentSession {
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
             _driver_keepalive: driver_keepalive,
+            runtime_actions: OnceLock::new(),
+            shutdown_requested: AtomicBool::new(false),
         }
+    }
+
+    /// Install the RUNTIME-tier control sink (SEAM-003). Called by [`crate::AgentSessionRuntime`] on
+    /// every session it owns — the initial one before `bind_extensions()`, each replacement before
+    /// its `session_start` — mirroring Pi, which passes `commandContextActions` INTO
+    /// `bindExtensions` and re-passes it on every `rebindSession` (rpc-mode.ts:341-346). Idempotent:
+    /// the first install wins (a host that also binds cannot displace the runtime's sink).
+    pub fn install_runtime_actions(&self, actions: Arc<dyn crate::runtime::RuntimeActions>) {
+        let _ = self.runtime_actions.set(actions);
+    }
+
+    /// Whether a loaded extension has asked the host to exit (Pi `ctx.shutdown()` → the host's
+    /// `shutdownHandler` setting `shutdownRequested = true`, rpc-mode.ts:344-346). A host checks
+    /// this at its settle point — see `AgentSessionEvent::AgentSettled` (SEAM-005), which is where
+    /// Pi checks it (rpc-mode.ts:355-358).
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
     }
 
     /// Wrap a freshly-built session in its owning `Arc` and bind the self-handle so the persist+fan-out
@@ -478,7 +535,22 @@ impl AgentSession {
             });
             Ok(())
         }));
+        // EXT-005: give the capability backend a LIVE readback of run activity + a real interrupt,
+        // so a guest's `ctx.isIdle()`/`ctx.hasPendingMessages()` answer from this session and its
+        // `ctx.abort()` stops the run that is in flight (Pi binds all three straight to the session,
+        // agent-session.ts:2409-2419). Weak, so the backend never keeps the session alive.
+        arc.services
+            .host_services
+            .attach_session_activity(Arc::new(SessionActivityHandle(Arc::downgrade(&arc))));
         arc
+    }
+
+    /// Whether NO agent work is in flight (Pi `isIdle`, agent-session.ts:759). True only when both
+    /// the post-run driver loop (retry / auto-compaction / queued continuation) and the agent's own
+    /// run have settled — the same two latches [`Self::wait_for_idle`] waits on, read without
+    /// awaiting so the SYNC `ctx.isIdle()` host import can answer.
+    pub fn is_idle(&self) -> bool {
+        !*self.driver_tx.borrow() && !self.agent.is_running()
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
@@ -604,9 +676,37 @@ impl AgentSession {
         }
         // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
         self.flush_pending_bash_messages().await;
-        // Terminate the run-scoped subscriptions returned by `prompt` now the whole loop has settled.
+        // SEAM-005: the run has FULLY settled — the post-run loop above is done, so no retry,
+        // compaction or queued continuation will follow. This is exactly Pi's `_emitAgentSettled()`
+        // call site: the `finally` of `_runAgentPrompt` (agent-session.ts:1063-1072), AFTER
+        // `_flushPendingBashMessages()` and BEFORE the idle wait resolves.
+        self.emit_agent_settled().await;
+        // Terminate the run-scoped subscriptions returned by `prompt` now the whole loop has
+        // settled. Ordered AFTER the settle emit so a run-scoped subscriber (what `prompt` hands
+        // back) actually observes `agent_settled` as its last event.
         self.fanout.end_run();
+        // Pi's `_resolveIdleWaitIfIdle()` runs in `_emitAgentSettled`'s own `finally` — i.e. the
+        // idle wait releases only after the event has been delivered. `driver_tx` is cyrup's idle
+        // latch, so it drops last.
         let _ = self.driver_tx.send(false);
+    }
+
+    /// Emit `agent_settled` (Pi `_emitAgentSettled`, agent-session.ts:581-588) — to the EXTENSION
+    /// RUNNER first, then to the session subscribers, matching Pi's order exactly
+    /// (`await this._extensionRunner.emit(...)` then `this._emit(...)`).
+    ///
+    /// Fires once per RUN, not once per agent loop: a turn that auto-retries produces two
+    /// `agent_end`s and exactly one `agent_settled`. That is the whole reason the event exists —
+    /// `agent_end` cannot tell a consumer whether more work is coming, which is why Pi's RPC host
+    /// checks its shutdown request here and nowhere else (rpc-mode.ts:355-358).
+    pub(crate) async fn emit_agent_settled(&self) {
+        let cancel = self.session_cancel.child_token();
+        self.services
+            .ext_host
+            .dispatcher()
+            .dispatch_notify(&HostEvent::AgentSettled, &cancel)
+            .await;
+        self.fanout_emit(AgentSessionEvent::AgentSettled).await;
     }
 
     /// Decide whether the just-finished run needs a continuation (Pi `_handlePostAgentRun`,
@@ -809,7 +909,16 @@ impl AgentSession {
         match self.services.ext_host.execute_native_command(name, args, &cancel).await {
             // A native extension owned + serviced the command (Pi short-circuits regardless of the
             // handler's own Ok/Err — the command was "handled").
-            Ok(Some(_)) => return true,
+            Ok(Some(_)) => {
+                // SEAM-003: drain the control ops the native handler queued. This route used to
+                // `return true` with NO drain at all, so a native built-in's `control(...)` sat in
+                // the queue until some later WASM command happened to run. Pi keeps native + wasm
+                // commands in one map and runs `commandContextActions` inline for both
+                // (agent-session.ts:1183-1200), so both routes must drain identically. Boxed for the
+                // same reason the wasm route is: a `SendUserMessage` op re-enters the prompt path.
+                Box::pin(self.apply_pending_control()).await;
+                return true;
+            }
             // No NATIVE owner: the name may still belong to a LIVE wasm guest command. Pi keeps
             // native + wasm commands in ONE map (`getCommand`, agent-session.ts:1183), so both
             // routes are tried before falling through to normal prompt handling.
@@ -839,11 +948,13 @@ impl AgentSession {
         // LLM interaction via `pi.sendMessage`), and treats a thrown handler as still "handled"
         // (agent-session.ts:1192-1200) — so a guest fault does not fall through to a prompt.
         let _ = self.services.ext_host.run_command(name, args, cancel).await;
-        // Apply the session-tier control ops the guest queued (compact / set-model / send-message /
-        // set-thinking-level). Runtime-tier ops are handed back for the runtime to act on. Boxed: a
+        // Apply every control op the guest queued — session-tier (compact / set-model /
+        // send-message / set-thinking-level / navigate / wait-idle) AND runtime-tier (new-session /
+        // switch / fork / reload), the latter through the installed [`crate::RuntimeActions`] sink
+        // (SEAM-003). This used to bind the runtime-tier ops to `_deferred` and drop them. Boxed: a
         // `send_user_message` op re-enters the prompt path (Pi `pi.sendMessage` from a command
         // handler), so the async future must introduce indirection to stay finitely sized.
-        let _deferred = Box::pin(self.apply_pending_control()).await;
+        Box::pin(self.apply_pending_control()).await;
         true
     }
 
@@ -2028,6 +2139,11 @@ impl AgentSession {
             .dispatcher()
             .dispatch_notify(&HostEvent::SessionStart { reason: reason.to_string() }, &cancel)
             .await;
+        // EXT-004: `session_start` is Pi's canonical place to register a tool dynamically
+        // (`examples/extensions/dynamic-tools.ts`). Pi's `registerTool` refreshes the registry
+        // inline; cyrup's crosses a SYNC wasm import, so the async push happens here — before any
+        // prompt, so the very first turn already sees the tool.
+        self.refresh_extension_tools().await;
     }
 
     // --------------------------------------------------------------- model control ----
@@ -2220,10 +2336,25 @@ impl AgentSession {
     /// point that bridges the SYNC guest `control()` call to the real ASYNC session effect: a guest
     /// that calls `session.setThinkingLevel(...)` / `setModel(...)` / `sendUserMessage(...)` / a
     /// compaction reaches [`crate::host_services::LiveHostServices`], which queues the op; here it is
-    /// applied. Session-tier ops are handled in place; runtime-tier ops (new/switch/fork/navigate/
-    /// reload/wait-idle/send-message) are returned so the runtime can act on them. Mutating from a
-    /// command tier respects the deadlock rule (R-08-008): never called from inside the agent loop.
-    pub async fn apply_pending_control(&self) -> Vec<ControlOp> {
+    /// applied. Mutating from a command tier respects the deadlock rule (R-08-008): never called
+    /// from inside the agent loop.
+    ///
+    /// SEAM-003: this is now a SINK, not a filter. It used to return the runtime-tier ops
+    /// (`new_session`/`switch`/`fork`/`navigate`/`reload`/`wait_idle`/`send_message`) "for the
+    /// runtime to act on" — and its single production caller (`try_execute_wasm_command`) dropped
+    /// the returned vector, while the NATIVE command route never drained at all. Every op is now
+    /// routed here:
+    ///
+    /// * `NewSession`/`Switch`/`Fork`/`Reload` → the installed [`crate::RuntimeActions`] sink (Pi
+    ///   binds these to the real `runtimeHost.*` in every host, rpc-mode.ts:321-346).
+    /// * `Navigate`/`WaitIdle`/`SendMessage`/`SendUserMessage`/`Compact` → applied in place; they
+    ///   are session-local and need no runtime host.
+    /// * `SetModel`/`SetThinkingLevel`/`Abort`/`Shutdown` → the `Send`-safe shared helper
+    ///   [`Self::apply_agent_state_op`], so the event-tier drain handles them identically.
+    ///
+    /// A failure is reported through the extension host's error listener (the same channel a
+    /// contained handler fault uses) — never a silent drop, and never a panic.
+    pub async fn apply_pending_control(&self) {
         // Fan out the facade events a guest state-mutation queued (entry_appended/session_info_changed):
         // the guest appended/renamed synchronously via `LiveHostServices`; emit here — the same
         // command-tier-safe bridge point the control ops drain at — so listeners observe them.
@@ -2235,38 +2366,165 @@ impl AgentSession {
         // updated the authoritative dynamic-tool view synchronously across the wasm-suspended call
         // (so `getActiveTools` already reflects it); the ASYNC agent push lands here — the same
         // command-tier-safe bridge point control ops / pending events drain at — before the next turn.
+        // EXT-004: surface any tool an extension registered since the last drain (Pi calls
+        // `refreshTools()` from `registerTool` itself; cyrup's registration crosses a SYNC wasm
+        // import, so the async agent push lands at this same bridge point). Ordered BEFORE the
+        // explicit `setActiveTools` push below so an extension that registered a tool AND then
+        // restricted the active set in the same handler gets what it asked for — in Pi the refresh
+        // happens inside `registerTool`, i.e. strictly earlier than any later `setActiveTools`, and
+        // `setActiveToolsByName` is always the last word.
+        self.refresh_extension_tools().await;
         if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
             self.push_active_tools(tools, prompt).await;
         }
         let ops = self.services.host_services.take_pending_control();
-        let mut deferred = Vec::new();
         for op in ops {
-            // Agent-state ops (SetModel/SetThinkingLevel) apply in place via the shared helper; it
-            // returns `Some(op)` for anything it did not handle so the routing below stays exhaustive.
-            match self.apply_agent_state_op(op).await {
-                None => {}
-                Some(ControlOp::SendUserMessage { content, .. }) => {
+            // Agent-state + lifecycle ops (SetModel/SetThinkingLevel/Abort/Shutdown) apply in place
+            // via the shared `Send`-safe helper; it returns `Some(op)` for anything it did not
+            // handle so the routing below stays exhaustive.
+            let Some(op) = self.apply_agent_state_op(op).await else { continue };
+            let name = control_op_name(&op);
+            let outcome = match op {
+                ControlOp::SendUserMessage { content, .. } => {
                     // A guest `sendUserMessage` op re-enters the prompt path (`send_user_message` →
                     // `prompt_accepted` → `prepare` → `try_execute_extension_command`), closing an
                     // `async fn` cycle. Box this cold re-entry edge so the future stays finitely
                     // sized (E0733) without adding indirection to the hot prompt path.
-                    let _ = Box::pin(self.send_user_message(content, None)).await;
+                    Box::pin(self.send_user_message(content, None)).await.map(|_| ())
                 }
-                Some(ControlOp::Compact) => {
-                    let _ = self.compact(None).await;
+                ControlOp::Compact => self.compact(None).await.map(|_| ()),
+                // ---- session-local runtime ops (no runtime host needed) ----
+                ControlOp::Navigate { entry_id, opts } => {
+                    Box::pin(self.control_navigate(&entry_id, &opts)).await
                 }
-                Some(other) => deferred.push(other),
+                ControlOp::WaitIdle => {
+                    // Pi's `waitForIdle` is a promise that cannot deadlock the command path; cyrup's
+                    // waits on the post-run driver watch. This drain normally runs BEFORE
+                    // `spawn_run`, so the flag is already false — but a concurrent run would
+                    // otherwise block the command path indefinitely, so bound it and surface the
+                    // expiry instead of hanging.
+                    match tokio::time::timeout(WAIT_IDLE_CONTROL_TIMEOUT, self.wait_for_idle()).await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(SessionServiceError::Io(
+                            "control op `wait_idle` timed out waiting for the agent to settle".into(),
+                        )),
+                    }
+                }
+                ControlOp::SendMessage { message, opts } => {
+                    Box::pin(self.control_send_message(&message, &opts)).await
+                }
+                // ---- RUNTIME-tier ops: only a host that installed a `RuntimeActions` can do these ----
+                ControlOp::NewSession { opts } => match self.runtime_actions.get() {
+                    Some(rt) => rt.new_session(&opts).await,
+                    None => Err(SessionServiceError::NoRuntimeHost("new_session")),
+                },
+                ControlOp::Switch { session_id, opts } => match self.runtime_actions.get() {
+                    Some(rt) => rt.switch_session(&session_id, &opts).await,
+                    None => Err(SessionServiceError::NoRuntimeHost("switch_session")),
+                },
+                ControlOp::Fork { entry_id, opts } => match self.runtime_actions.get() {
+                    Some(rt) => rt.fork(&entry_id, &opts).await,
+                    None => Err(SessionServiceError::NoRuntimeHost("fork")),
+                },
+                ControlOp::Reload => match self.runtime_actions.get() {
+                    Some(rt) => rt.reload().await,
+                    None => Err(SessionServiceError::NoRuntimeHost("reload")),
+                },
+                // Handled by `apply_agent_state_op` above; unreachable, but keep the match total so
+                // a future `ControlOp` variant is a compile error rather than a silent drop.
+                other => Err(SessionServiceError::Io(format!("unrouted control op: {other:?}"))),
+            };
+            if let Err(e) = outcome {
+                self.report_control_failure(name, &e);
             }
         }
-        deferred
     }
 
-    /// Apply a single AGENT-STATE control op (`SetModel`/`SetThinkingLevel`) in place, returning
-    /// `None` when it was one of those (handled) or `Some(op)` when it is some other op the caller
-    /// must route itself. Both are pure agent-state mutations the next turn reads (Pi
-    /// `setModel`/`setThinkingLevel`, agent-session.ts:1476-1490 / 1541-1572). Shared by
-    /// [`Self::apply_pending_control`] (command-tier drain) and [`Self::apply_pending_agent_control`]
-    /// (GAP-11 event-tier turn-boundary drain) so the two never drift. Note it does NOT touch the
+    /// Apply a `ControlOp::Navigate` (Pi `ctx.navigateTree(targetId, {summarize, customInstructions,
+    /// replaceInstructions, label})`, extensions/types.ts:1665-1668, bound to `session.navigateTree`
+    /// at rpc-mode.ts:325-337).
+    async fn control_navigate(
+        &self,
+        entry_id: &str,
+        opts: &serde_json::Value,
+    ) -> Result<(), SessionServiceError> {
+        let options = NavigateTreeOptions {
+            summarize: opts.get("summarize").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            custom_instructions: opts
+                .get("customInstructions")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            replace_instructions: opts
+                .get("replaceInstructions")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            label: opts.get("label").and_then(serde_json::Value::as_str).map(str::to_string),
+        };
+        self.navigate_tree(EntryId::from(entry_id), options).await.map(|_| ())
+    }
+
+    /// Apply a `ControlOp::SendMessage` (Pi `ctx.sendMessage(message, {triggerTurn, deliverAs})`,
+    /// extensions/types.ts:395-398/1223). `message` is the guest's
+    /// `Pick<CustomMessage, "customType"|"content"|"display"|"details">`.
+    async fn control_send_message(
+        &self,
+        message: &serde_json::Value,
+        opts: &serde_json::Value,
+    ) -> Result<(), SessionServiceError> {
+        use serde_json::Value;
+        let custom_type = message
+            .get("customType")
+            .and_then(Value::as_str)
+            .unwrap_or("extension")
+            .to_string();
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        let display = message.get("display").and_then(Value::as_bool).unwrap_or(true);
+        let details = message.get("details").cloned();
+        let deliver_as = match opts.get("deliverAs").and_then(Value::as_str) {
+            Some("steer") => Some(crate::event::DeliverAs::Steer),
+            Some("followUp") => Some(crate::event::DeliverAs::FollowUp),
+            Some("nextTurn") => Some(crate::event::DeliverAs::NextTurn),
+            _ => None,
+        };
+        // Pi's `triggerTurn` runs a fresh turn OVER the custom message when idle
+        // (`_runAgentPrompt(appMessage)`); `deliverAs` takes precedence, exactly as in
+        // `send_custom_message`/`inject_message`.
+        let trigger_turn = opts.get("triggerTurn").and_then(Value::as_bool).unwrap_or(false);
+        if trigger_turn && deliver_as.is_none() && !self.is_streaming().await {
+            let msg = AgentMessage::Custom {
+                kind: custom_type,
+                payload: content,
+                timestamp: Some(now_ms()),
+            };
+            return self.spawn_run(vec![msg]).await;
+        }
+        self.send_custom_message(&custom_type, content, display, details, deliver_as).await
+    }
+
+    /// Surface a control-op failure. SEAM-003's contract is that an op is either PERFORMED or
+    /// REPORTED — never silently dropped, which is exactly what the old `let _deferred = …` did.
+    /// Pi's pre-bind action stubs throw `"Extension runtime not initialized…"`
+    /// (extensions/loader.ts:173-176 `notInitialized`) rather than no-op; cyrup cannot throw across
+    /// the drain, so it warns.
+    fn report_control_failure(&self, op: &str, err: &SessionServiceError) {
+        tracing::warn!(op = %op, error = %err, "extension control op failed");
+    }
+
+    /// Apply a single AGENT-STATE / LIFECYCLE control op in place, returning `None` when it was one
+    /// of those (handled) or `Some(op)` when it is some other op the caller must route itself.
+    ///
+    /// `SetModel`/`SetThinkingLevel` are pure agent-state mutations the next turn reads (Pi
+    /// `setModel`/`setThinkingLevel`, agent-session.ts:1476-1490 / 1541-1572). `Abort`/`Shutdown`
+    /// join them because Pi puts BOTH on the base `ExtensionContext` — "Available in all contexts"
+    /// (extensions/types.ts:339,344) — so `cyrup-ext`'s `control::Host` deliberately does not
+    /// `require_command_tier()` them and they can arrive from an EVENT handler. Handling them here,
+    /// in the shared helper, is what makes the event-tier turn-boundary drain
+    /// ([`Self::apply_pending_agent_control`]) service them instead of re-queueing them until some
+    /// later command happens to run.
+    ///
+    /// Shared by [`Self::apply_pending_control`] (command-tier drain) and
+    /// [`Self::apply_pending_agent_control`] so the two never drift. Note it does NOT touch the
     /// `send_user_message`/`compact` re-entry arms — whose prompt-path futures are `!Send` — so a
     /// caller that needs a `Send` future (the spawned post-run driver) can use it.
     async fn apply_agent_state_op(&self, op: ControlOp) -> Option<ControlOp> {
@@ -2281,6 +2539,19 @@ impl AgentSession {
                 if let Some((provider, model)) = parse_model_ref(&v) {
                     let _ = self.set_model_id(provider, model).await;
                 }
+                None
+            }
+            // Pi `ctx.abort()` (types.ts:339): "Abort the current agent run." Bound at
+            // agent-session.ts:2405 to `void this.abort()`.
+            ControlOp::Abort => {
+                self.abort();
+                None
+            }
+            // Pi `ctx.shutdown()` (types.ts:344) → the host's `shutdownHandler`, which in Pi's RPC
+            // mode is exactly `() => { shutdownRequested = true }` (rpc-mode.ts:344-346); the host
+            // acts on it at the next `agent_settled`.
+            ControlOp::Shutdown => {
+                self.shutdown_requested.store(true, Ordering::SeqCst);
                 None
             }
             other => Some(other),
@@ -2306,15 +2577,19 @@ impl AgentSession {
         for ev in self.services.host_services.take_pending_events() {
             self.fanout_emit(ev).await;
         }
+        // EXT-004, event-tier twin of the drain in `apply_pending_control` (same ordering rule:
+        // the refresh runs first so an explicit `setActiveTools` still has the last word).
+        self.refresh_extension_tools().await;
         if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
             self.push_active_tools(tools, prompt).await;
         }
         for op in self.services.host_services.take_pending_control() {
             if let Some(other) = self.apply_agent_state_op(op).await {
-                // Unreachable in practice — live.rs gates every non-agent-state control op to the
-                // command tier, so only SetModel/SetThinkingLevel can be queued from an event handler.
-                // Re-queue (never drop) as a guard so a future gating change can't silently lose a
-                // command-tier op; the command-tier drain (`apply_pending_control`) will handle it.
+                // Unreachable in practice — live.rs gates every non-base-context control op to the
+                // command tier, so only SetModel/SetThinkingLevel/Abort/Shutdown can be queued from
+                // an event handler, and `apply_agent_state_op` handles all four. Re-queue (never
+                // drop) as a guard so a future gating change can't silently lose a command-tier op;
+                // the command-tier drain (`apply_pending_control`) will handle it.
                 let _ = cyrup_ext::host::HostServices::control(&*self.services.host_services, other);
             }
         }
@@ -3609,7 +3884,50 @@ impl AgentSession {
     /// [`Self::apply_pending_control`] so both reach the live agent identically.
     async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
         self.agent.set_tools(tools).await;
-        self.agent.set_system_prompt(prompt).await;
+        self.agent.set_system_prompt(prompt.clone()).await;
+        // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the agent —
+        // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
+        // and a guest reading it back must see the rebuilt one.
+        self.services
+            .host_services
+            .update_prompt_state(Some(prompt), self.services.settings.project_trusted());
+    }
+
+    /// Surface tools an extension registered AFTER its `init` to the LIVE agent (EXT-004; Pi
+    /// `refreshTools` → `_refreshToolRegistry`, extensions/loader.ts:249-256 →
+    /// agent-session.ts:2452-2546).
+    ///
+    /// `ExtensionHost::refresh_tools` re-materializes a late descriptor into an executable
+    /// `Arc<dyn Tool>`, but that alone only changes the extension host's view. The model's tool
+    /// array and the system prompt come from [`crate::tools::DynamicToolState`], which the builder
+    /// snapshots ONCE — so without this the tool existed and could not be called. Merging here
+    /// mirrors Pi's tail exactly: new names are auto-activated (`if (!previousRegistryNames.has(
+    /// toolName)) nextActiveToolNames.push(toolName)` … `setActiveToolsByName(...)`,
+    /// agent-session.ts:2534-2545) and the rebuilt `(tools, prompt)` is pushed to the agent.
+    ///
+    /// Cheap and idempotent: a relaxed atomic load short-circuits when nothing was registered.
+    pub(crate) async fn refresh_extension_tools(&self) {
+        match self.services.ext_host.refresh_tools() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "extension tool refresh failed; the late tool stays invisible");
+                return;
+            }
+        }
+        // `&[]` = "no built-in base": what comes back is exactly the extension-contributed set,
+        // which is what merges into the registry (the built-ins are already in it).
+        let ext_tools = match self.services.ext_host.active_tools(&[]) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "extension tool refresh failed; the late tool stays invisible");
+                return;
+            }
+        };
+        let push = { Self::lock(&self.dynamic_tools).merge_registered(ext_tools) };
+        if let Some((tools, prompt)) = push {
+            self.push_active_tools(tools, prompt).await;
+        }
     }
 
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the
@@ -3623,6 +3941,28 @@ impl AgentSession {
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71,384).
     pub fn register_custom_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>) {
         Self::lock(&self.dynamic_tools).register_custom(tools);
+    }
+}
+
+/// The live [`crate::host_services::SessionActivity`] backing a guest's `ctx.isIdle()` /
+/// `ctx.hasPendingMessages()` / `ctx.abort()` (EXT-005). Weak so the capability backend — which the
+/// session itself owns — can never keep the session alive.
+struct SessionActivityHandle(std::sync::Weak<AgentSession>);
+
+impl crate::host_services::SessionActivity for SessionActivityHandle {
+    fn is_idle(&self) -> bool {
+        // A dropped session is not running anything: idle is the honest answer.
+        self.0.upgrade().is_none_or(|s| s.is_idle())
+    }
+
+    fn pending_message_count(&self) -> usize {
+        self.0.upgrade().map_or(0, |s| s.pending_message_count())
+    }
+
+    fn abort(&self) {
+        if let Some(s) = self.0.upgrade() {
+            s.abort();
+        }
     }
 }
 

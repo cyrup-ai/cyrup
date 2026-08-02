@@ -42,26 +42,46 @@ pub fn run_init(factory: fn() -> ExtensionApi) -> Result<(), String> {
     Ok(())
 }
 
+thread_local! {
+    /// Tools registered AFTER `init`, from inside a live handler (Pi's
+    /// `examples/extensions/dynamic-tools.ts` pattern: `api.registerTool()` called from a
+    /// `session_start` handler, which `extensions/loader.ts:249-256` follows with
+    /// `runtime.refreshTools()`). Kept in a SEPARATE cell from `API` because a handler runs while
+    /// `API` is already immutably borrowed by [`dispatch`] — pushing into it would panic the guest.
+    static LATE_TOOLS: RefCell<Vec<crate::api::RegisteredTool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lower an author-facing [`crate::descriptor::ToolDescriptor`] onto the WIT record.
+fn lower_tool_descriptor(d: &crate::descriptor::ToolDescriptor) -> types::ToolDescriptor {
+    types::ToolDescriptor {
+        name: d.name.clone(),
+        label: d.label.clone(),
+        description: d.description.clone(),
+        parameters_json: d.parameters.to_string(),
+        exec_mode: d.execution_mode.map(|m| match m {
+            crate::descriptor::ExecMode::Parallel => types::ExecMode::Parallel,
+            crate::descriptor::ExecMode::Sequential => types::ExecMode::Sequential,
+        }),
+        prompt_snippet: d.prompt_snippet.clone(),
+        prompt_guidelines: d.prompt_guidelines.clone(),
+        has_renderer: d.has_renderer,
+    }
+}
+
+/// Register a tool from inside a live handler (the body behind [`crate::ctx::Ctx::register_tool`]).
+/// Pushes the descriptor across the `registration.register-tool` import — which marks the host's
+/// tool set dirty — and stores the executor so the subsequent `execute-tool` can find it.
+pub fn register_tool_late(tool: crate::api::RegisteredTool) {
+    registration::register_tool(&lower_tool_descriptor(&tool.descriptor));
+    LATE_TOOLS.with(|c| c.borrow_mut().push(tool));
+}
+
 /// Flush the author's declared registrations through the host imports + declare the subscription set.
 fn push_registrations(api: &ExtensionApi) {
     registration::subscribe(&api.subscription_kinds());
 
     for t in api.tools() {
-        let d = &t.descriptor;
-        let wit = types::ToolDescriptor {
-            name: d.name.clone(),
-            label: d.label.clone(),
-            description: d.description.clone(),
-            parameters_json: d.parameters.to_string(),
-            exec_mode: d.execution_mode.map(|m| match m {
-                crate::descriptor::ExecMode::Parallel => types::ExecMode::Parallel,
-                crate::descriptor::ExecMode::Sequential => types::ExecMode::Sequential,
-            }),
-            prompt_snippet: d.prompt_snippet.clone(),
-            prompt_guidelines: d.prompt_guidelines.clone(),
-            has_renderer: d.has_renderer,
-        };
-        registration::register_tool(&wit);
+        registration::register_tool(&lower_tool_descriptor(&t.descriptor));
     }
     for (name, cmd) in &api.commands {
         let desc_json = serde_json::to_string(&cmd.descriptor).unwrap_or_else(|_| "{}".into());
@@ -140,10 +160,18 @@ pub fn run_tool(
 ) -> Result<types::ToolOutput, String> {
     let params = serde_json::from_str(&params_json).unwrap_or(Value::Null);
     let call = ToolCall::new(call_id, params);
-    let out = API.with(|c| match c.borrow().as_ref() {
-        Some(api) => api.execute_tool(&name, call),
-        None => Err(format!("no such tool: {name}")),
-    })?;
+    // A late-registered tool (registered from a live handler) is not in `API.tools`; check that
+    // table first so a dynamically-registered tool is genuinely executable, not just announced.
+    let late = LATE_TOOLS.with(|c| {
+        c.borrow().iter().find(|t| t.descriptor.name == name).map(|t| t.exec.execute(call.clone()))
+    });
+    let out = match late {
+        Some(r) => r?,
+        None => API.with(|c| match c.borrow().as_ref() {
+            Some(api) => api.execute_tool(&name, call),
+            None => Err(format!("no such tool: {name}")),
+        })?,
+    };
     Ok(types::ToolOutput {
         content_json: serde_json::to_string(&out.content).unwrap_or_else(|_| "[]".into()),
         details_json: out.details.map(|d| d.to_string()),

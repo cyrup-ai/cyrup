@@ -10,7 +10,7 @@ fn manifest_parses_camelcase_and_capabilities() {
     let json = br#"{
         "id": "todo-tool",
         "version": "0.2.1",
-        "world": "cyrup:ext@0.1",
+        "world": "cyrup:ext@0.2",
         "entry": "src/lib.rs",
         "capabilities": { "fs": ["read:.", "write:.cyrup/todo"], "exec": false, "net": false, "ui": true }
     }"#;
@@ -23,7 +23,28 @@ fn manifest_parses_camelcase_and_capabilities() {
 }
 
 #[test]
-fn world_version_compatible_same_major() {
+fn world_version_compatible_same_major_and_at_least_the_host_minor() {
+    let m = ExtensionManifest {
+        id: "x".into(),
+        version: "1.0.0".into(),
+        world: HOST_WORLD.into(),
+        entry: None,
+        capabilities: Default::default(),
+    };
+    assert!(m.check_world(HOST_WORLD).is_ok());
+
+    // A guest built against a NEWER minor is accepted: it may want imports this host lacks, and
+    // that failure is specific and reportable. The reverse (below) is not.
+    let ahead = ExtensionManifest { world: "cyrup:ext@0.99".into(), ..m.clone() };
+    assert!(ahead.check_world(HOST_WORLD).is_ok());
+}
+
+/// SEAM-005 added the `events.on-agent-settled` EXPORT, which an already-built 0.1 guest does not
+/// implement. Without a MINOR check that guest passes `check_world` and then dies at instantiation
+/// with an opaque wasmtime missing-export link error; with it, the host refuses up front with a
+/// typed `ExtError::WorldVersion` naming both versions.
+#[test]
+fn world_version_older_minor_is_rejected_before_instantiation() {
     let m = ExtensionManifest {
         id: "x".into(),
         version: "1.0.0".into(),
@@ -31,7 +52,12 @@ fn world_version_compatible_same_major() {
         entry: None,
         capabilities: Default::default(),
     };
-    assert!(m.check_world(HOST_WORLD).is_ok());
+    let err = m.check_world(HOST_WORLD).unwrap_err();
+    assert!(
+        matches!(&err, cyrup_ext::ExtError::WorldVersion { found, required }
+            if found == "cyrup:ext@0.1" && required == HOST_WORLD),
+        "a guest one MINOR behind the host is refused with a typed error: {err:?}"
+    );
 }
 
 #[test]

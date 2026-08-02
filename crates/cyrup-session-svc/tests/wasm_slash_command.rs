@@ -278,3 +278,47 @@ fn fixture_component_exists() {
     let p = fixture_component();
     assert!(Path::new(&p).exists(), "fixture component missing at {}", p.display());
 }
+
+/// SEAM-005 across the WIT boundary: the `events.on-agent-settled` EXPORT this change added to
+/// BOTH world.wit copies is actually invoked on a live guest.
+///
+/// The demo subscribes `agent_settled` (cyrup-ext-sdk `example.rs`) and notifies with a distinct
+/// string. Driving one real turn must produce EXACTLY ONE such notification — proving the host
+/// dispatches the synthesised `HostEvent::AgentSettled` into the guest, and that it is a per-RUN
+/// event, not a per-agent-loop one (the guest's `agent_start` notification is the control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_guest_receives_agent_settled_across_the_wit_boundary() {
+    let wasm_path = fixture_component();
+    let bytes = std::fs::read(&wasm_path).expect("read fixture component bytes");
+
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .unwrap()
+        .into_shared(); // bound: the post-run driver (and therefore the settle emit) is live.
+
+    let ext = session
+        .load_wasm_extension(ExtensionId::from("demo"), &bytes)
+        .await
+        .expect("load + init the live wasm extension");
+
+    assert!(
+        !ext.guest().notifications().iter().any(|n| n.contains("agent settled")),
+        "nothing settled before the run"
+    );
+
+    let _ = session.prompt("hello").await.unwrap();
+    session.wait_for_idle().await;
+
+    let notes = ext.guest().notifications();
+    assert_eq!(
+        notes.iter().filter(|n| n.contains("demo: agent settled")).count(),
+        1,
+        "the guest's on-agent-settled export was invoked exactly once for the run: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("demo extension active")),
+        "control: the guest's agent_start handler ran too, so this is not a dispatch-wide failure"
+    );
+}

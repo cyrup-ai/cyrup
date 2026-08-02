@@ -54,7 +54,7 @@ async fn discover_trust_load_command_reload() {
     std::fs::create_dir_all(&ext_dir).unwrap();
     std::fs::write(
         ext_dir.join("extension.json"),
-        r#"{ "id": "demo", "version": "1.0.0", "world": "cyrup:ext@0.1" }"#,
+        r#"{ "id": "demo", "version": "1.0.0", "world": "cyrup:ext@0.2" }"#,
     )
     .unwrap();
     std::fs::write(ext_dir.join("demo.wasm"), &bytes).unwrap();

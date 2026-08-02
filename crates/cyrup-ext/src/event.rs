@@ -45,12 +45,18 @@ pub enum EventKind {
     SessionCompact = 27,
     SessionBeforeTree = 28,
     SessionTree = 29,
+    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725; subscribed at
+    /// types.ts:1225). Fired once an agent run has FULLY settled — no automatic retry, post-run
+    /// compaction or queued continuation will follow. Pi emits it from the `finally` of
+    /// `_runAgentPrompt` (agent-session.ts:1063-1072) via `_emitAgentSettled` (:581-588), which
+    /// notifies the extension runner FIRST and the session subscribers second (SEAM-005).
+    AgentSettled = 30,
 }
 
 impl EventKind {
-    /// The number of distinct kinds (must stay <= 64 for the bitset). 1:1 with Pi's 30-event
-    /// catalog (extensions/types.ts:1133-1171).
-    pub const COUNT: u8 = 30;
+    /// The number of distinct kinds (must stay <= 64 for the bitset). 1:1 with Pi's 31-event
+    /// catalog (extensions/types.ts:1133-1171 + `agent_settled` at :1225).
+    pub const COUNT: u8 = 31;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -86,6 +92,7 @@ impl EventKind {
             27 => SessionCompact,
             28 => SessionBeforeTree,
             29 => SessionTree,
+            30 => AgentSettled,
             _ => return None,
         })
     }
@@ -124,6 +131,7 @@ impl EventKind {
             SessionCompact => "session_compact",
             SessionBeforeTree => "session_before_tree",
             SessionTree => "session_tree",
+            AgentSettled => "agent_settled",
         }
     }
 
@@ -350,6 +358,15 @@ pub enum HostEvent {
         override_result: Option<Value>,
     },
     SessionTree { tree: Value },
+    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725) — a payload-free
+    /// notification that the whole run, including every automatic continuation, has settled.
+    ///
+    /// Deliberately absent from [`HostEvent::from_agent`]: it has NO `AgentEvent` source. It is
+    /// SYNTHESISED by `cyrup-session-svc` at the post-run driver's tail (the point that corresponds
+    /// to Pi's `_runAgentPrompt` `finally`), which is the only place that knows the retry /
+    /// compaction / queued-continuation loop is done. Routing it through the `ExtSubscriber` seam
+    /// would fire it once per `agent_end` instead of once per run.
+    AgentSettled,
 }
 
 impl HostEvent {
@@ -386,6 +403,7 @@ impl HostEvent {
             HostEvent::SessionCompact { .. } => K::SessionCompact,
             HostEvent::SessionBeforeTree { .. } => K::SessionBeforeTree,
             HostEvent::SessionTree { .. } => K::SessionTree,
+            HostEvent::AgentSettled => K::AgentSettled,
         }
     }
 

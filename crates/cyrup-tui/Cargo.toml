@@ -11,6 +11,14 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# ON by default, matching cyrup-ext and cyrup-session-svc. Nothing in `src/` is gated on it: the
+# feature exists so `tests/wasm_renderer_screen.rs` — the EXT-006 end-to-end that draws a LIVE WASM
+# guest's serialized widget tree onto real terminal cells — can `#![cfg(feature = "wasm-host")]`
+# itself out of a native-only build instead of failing to compile there.
+default = ["wasm-host"]
+wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
+
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-session-svc = { workspace = true }
@@ -61,3 +69,6 @@ cyrup-agent = { workspace = true }
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true
+# EXT-006: the renderer-routing test declares a `NativeExtension` (an `#[async_trait]` trait) so it
+# can register a renderer the way a real built-in does.
+async-trait = { workspace = true }

@@ -57,7 +57,7 @@ async fn build_session(
 }
 
 /// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
-async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> AgentSessionRuntime {
+async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
@@ -246,7 +246,15 @@ async fn json_mode_emits_ordered_event_stream() {
     // Every event line parsed; the ordered `type` tags bracket the run.
     let kinds: Vec<&str> = events.iter().map(type_of).collect();
     assert_eq!(kinds.first(), Some(&"agent_start"), "must start with agent_start: {kinds:?}");
-    assert_eq!(kinds.last(), Some(&"agent_end"), "must end with agent_end: {kinds:?}");
+    // SEAM-005: json mode writes EVERY subscribed session event verbatim (Pi print-mode.ts:103-108),
+    // so the stream now closes with `agent_settled` — the run's last `agent_end` immediately
+    // precedes it.
+    assert_eq!(kinds.last(), Some(&"agent_settled"), "must end with agent_settled: {kinds:?}");
+    assert_eq!(
+        kinds.iter().rev().nth(1),
+        Some(&"agent_end"),
+        "…preceded by the run's last agent_end: {kinds:?}"
+    );
 
     let tes = kinds.iter().position(|k| *k == "tool_execution_start").expect("tool_execution_start");
     let tee = kinds.iter().position(|k| *k == "tool_execution_end").expect("tool_execution_end");

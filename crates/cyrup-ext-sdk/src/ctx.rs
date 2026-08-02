@@ -56,6 +56,90 @@ impl Ctx {
         }
     }
 
+    /// Register a tool from inside a LIVE handler, after `init` (Pi `api.registerTool()` called at
+    /// runtime — `examples/extensions/dynamic-tools.ts` registers from a `session_start` handler;
+    /// `extensions/loader.ts:249-256` follows every registration with `runtime.refreshTools()`).
+    /// The host re-materializes it into an executable handle at its next tool refresh, so the tool
+    /// is model-visible on the following turn.
+    pub fn register_tool(
+        &self,
+        descriptor: crate::descriptor::ToolDescriptor,
+        exec: impl crate::api::ToolExec,
+    ) {
+        let tool = crate::api::RegisteredTool { descriptor, exec: Box::new(exec) };
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::register_tool_late(tool);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = tool;
+    }
+
+    // --- base-context state + lifecycle (Pi `ExtensionContext`, types.ts:329-346). Pi puts ALL of
+    // these on the base context — "Available in all contexts" — so they live on `Ctx`, not on
+    // `CommandCtx`, and the host does not tier-gate them (EXT-005). ---
+
+    /// Whether no agent run is in flight (Pi `ctx.isIdle()`, types.ts:333).
+    pub fn is_idle(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::is_idle();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        true
+    }
+
+    /// Whether user messages are queued for the next turn (Pi `ctx.hasPendingMessages()`,
+    /// types.ts:341).
+    pub fn has_pending_messages(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::has_pending_messages();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        false
+    }
+
+    /// Whether the project is trusted (Pi `ctx.isProjectTrusted()`, types.ts:335).
+    pub fn is_project_trusted(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::is_project_trusted();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        false
+    }
+
+    /// The active system prompt (Pi `ctx.getSystemPrompt()`, types.ts:346); empty when no session
+    /// backend is attached.
+    pub fn system_prompt(&self) -> String {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::get_system_prompt();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        String::new()
+    }
+
+    /// Abort the in-flight agent run (Pi `ctx.abort()`, types.ts:339 — available in all contexts).
+    pub fn abort(&self) -> Result<(), String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::control::abort();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Ok(())
+    }
+
+    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, types.ts:344 — available in all
+    /// contexts). The host exits at its next settle point.
+    pub fn shutdown(&self) -> Result<(), String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::control::shutdown();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Ok(())
+    }
+
     // --- active-tool / command introspection (Pi getActiveTools/…/getCommands, types.ts:1257-1266) ---
 
     /// The names of the currently-active tools (Pi `getActiveTools`).

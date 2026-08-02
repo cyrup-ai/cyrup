@@ -44,6 +44,16 @@ impl PromptRebuilder {
         Self { base, contributions }
     }
 
+    /// Record (or replace) a tool's prompt contribution so a tool registered AFTER the build
+    /// contributes its snippet/guidelines to the rebuilt prompt (EXT-004; Pi rebuilds
+    /// `_toolPromptSnippets`/`_toolPromptGuidelines` from the refreshed definition registry,
+    /// agent-session.ts:2487-2506). Without this a late tool would reach the model's tool array
+    /// with no prompt guidance at all.
+    fn upsert_contribution(&mut self, tool: &Arc<dyn Tool>) {
+        self.contributions
+            .insert(tool.name().to_string(), crate::builder::tool_contribution(tool));
+    }
+
     /// Rebuild the base system prompt for `active` tools, pulling each tool's contribution from the
     /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
     fn rebuild(&self, active: &[String]) -> String {
@@ -128,5 +138,40 @@ impl DynamicToolState {
         for t in tools {
             self.registry.insert(t.name().to_string(), t);
         }
+    }
+
+    /// Merge the extension-contributed tool set into the registry and AUTO-ACTIVATE anything that
+    /// was not registered before (EXT-004; Pi `_refreshToolRegistry`, agent-session.ts:2452-2546 —
+    /// `for (const toolName of this._toolRegistry.keys()) { if (!previousRegistryNames.has(toolName))
+    /// nextActiveToolNames.push(toolName); }` then `setActiveToolsByName([...new Set(...)])`).
+    ///
+    /// Returns the rebuilt `(tools, system_prompt)` to push to the agent, or `None` when nothing was
+    /// genuinely new — a re-registration of an already-known tool updates the registry entry (a
+    /// later definition wins, as it does at build time) but must not disturb the active set, and an
+    /// unchanged set must not cost a prompt rebuild on every drain.
+    ///
+    /// This is deliberately NOT `register_custom`: a custom tool is registered *inert* (Pi's
+    /// build-time `customTools` are activated by selection), whereas an extension tool registered at
+    /// runtime is the extension asking for it to be USABLE — Pi auto-activates exactly this case.
+    pub(crate) fn merge_registered(
+        &mut self,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Option<(Vec<Arc<dyn Tool>>, String)> {
+        let mut newly_registered: Vec<String> = Vec::new();
+        for t in tools {
+            let name = t.name().to_string();
+            self.rebuilder.upsert_contribution(&t);
+            if self.registry.insert(name.clone(), t).is_none() {
+                newly_registered.push(name);
+            }
+        }
+        // Pi filters the auto-activation through `new Set(...)`; a name already active stays once.
+        newly_registered.retain(|n| !self.active.contains(n));
+        if newly_registered.is_empty() {
+            return None;
+        }
+        let mut names = self.active.clone();
+        names.extend(newly_registered);
+        Some(self.set_active(&names))
     }
 }

@@ -91,6 +91,14 @@ pub struct ResolvedCommand {
 #[derive(Default)]
 pub struct ExtensionRegistry {
     inner: RwLock<RegistryInner>,
+    /// Set whenever a tool registration lands (host tool OR guest descriptor) — Pi's
+    /// `registerTool()` ends with `runtime.refreshTools()` on EVERY registration
+    /// (extensions/loader.ts:249-256). cyrup cannot mint the executable `Arc<dyn Tool>` inside the
+    /// guest's `register-tool` import (the `LiveExtension` does not exist yet during `init`, and the
+    /// store is borrowed during a later call), so the host instead marks the tool set DIRTY here and
+    /// re-materializes at [`crate::ExtensionHost::refresh_tools`]. Outside the `RwLock` so the check
+    /// is a relaxed atomic load, not a lock acquisition (EXT-004).
+    tools_dirty: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -121,6 +129,20 @@ struct RegistryInner {
     /// (gap-08 #28), so it is held as a descriptor here rather than as an `Arc<dyn Tool>`.
     guest_tool_order: Vec<String>,
     guest_tools: HashMap<String, (ExtensionId, ToolDescriptor)>,
+    /// Which extension owns the RENDERER for a tool name (`ToolDescriptor.has_renderer` =>
+    /// Pi's per-tool `renderCall`/`renderResult`, extensions/types.ts:472-481, resolved by
+    /// `modes/interactive/components/tool-execution.ts:81-112`). Populated by
+    /// [`ExtensionRegistry::register_guest_tool`]; read by
+    /// [`crate::ExtensionHost::render_tool_call`]/[`crate::ExtensionHost::render_tool_result`] to
+    /// route a tool NAME back to the guest that can render it (EXT-006). Without this table
+    /// `has_renderer` was a field nothing read.
+    tool_renderer_owner: HashMap<String, ExtensionId>,
+    /// Which extension owns the CUSTOM-MESSAGE renderer for a custom type (Pi
+    /// `registerMessageRenderer(customType, renderer)`, extensions/types.ts:1284, resolved by
+    /// `extensions/runner.ts:579-587 getMessageRenderer` — FIRST extension in load order wins).
+    /// Populated by [`ExtensionRegistry::register_message_renderer`]; read by
+    /// [`crate::ExtensionHost::render_message_call`]/[`crate::ExtensionHost::render_message_result`].
+    message_renderer_owner: HashMap<String, ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -138,7 +160,21 @@ impl ExtensionRegistry {
         }
         g.tool_owner.insert(name.clone(), owner);
         g.tools.insert(name, tool);
+        drop(g);
+        self.mark_tools_dirty();
         Ok(())
+    }
+
+    /// Mark the tool set as changed (Pi's `runtime.refreshTools()` trigger, loader.ts:249-256).
+    /// Consumed by [`Self::take_tools_dirty`].
+    pub fn mark_tools_dirty(&self) {
+        self.tools_dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Take-and-clear the "tools changed since the last refresh" flag (EXT-004). `true` = at least
+    /// one tool registration landed since the previous call.
+    pub fn take_tools_dirty(&self) -> bool {
+        self.tools_dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Register a guest (WASM) tool by descriptor (R-08-012). Last insert wins (override); insertion
@@ -154,8 +190,56 @@ impl ExtensionRegistry {
         if !g.guest_tools.contains_key(&name) {
             g.guest_tool_order.push(name.clone());
         }
+        // A descriptor that declares `has_renderer` makes its owner the renderer for that TOOL name
+        // (Pi's per-tool `renderCall`/`renderResult`, types.ts:472-481) — EXT-006.
+        if desc.has_renderer {
+            g.tool_renderer_owner.insert(name.clone(), owner.clone());
+        } else {
+            g.tool_renderer_owner.remove(&name);
+        }
         g.guest_tools.insert(name, (owner, desc));
+        drop(g);
+        self.mark_tools_dirty();
         Ok(())
+    }
+
+    /// Record a per-TOOL renderer registration for a tool that is NOT described by a guest
+    /// [`ToolDescriptor`] — i.e. a NATIVE extension's tool, which arrives as an already-executable
+    /// `Arc<dyn Tool>` and therefore carries no `has_renderer` flag (Pi does not distinguish:
+    /// `ToolDefinition.renderCall` is declared the same way whichever runtime supplies the tool,
+    /// extensions/types.ts:472-481). LAST registration wins here, matching
+    /// [`Self::register_guest_tool`]'s descriptor path (a re-registered descriptor re-points the
+    /// owner) rather than the first-wins custom-MESSAGE rule.
+    pub fn register_tool_renderer(
+        &self,
+        owner: ExtensionId,
+        tool_name: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        self.lock_write()?.tool_renderer_owner.insert(tool_name.into(), owner);
+        Ok(())
+    }
+
+    /// The extension that renders the tool named `name` (`ToolDescriptor.has_renderer`), if any.
+    pub fn tool_renderer_owner(&self, name: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.tool_renderer_owner.get(name).cloned())
+    }
+
+    /// Record a custom-MESSAGE renderer registration (Pi `registerMessageRenderer(customType, …)`,
+    /// types.ts:1284). FIRST registration wins, matching Pi's load-order `getMessageRenderer` loop
+    /// (runner.ts:579-587) which returns the first extension that declares the type.
+    pub fn register_message_renderer(
+        &self,
+        owner: ExtensionId,
+        custom_type: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.message_renderer_owner.entry(custom_type.into()).or_insert(owner);
+        Ok(())
+    }
+
+    /// The extension that renders custom messages of `custom_type` (first-wins), if any.
+    pub fn message_renderer_owner(&self, custom_type: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.message_renderer_owner.get(custom_type).cloned())
     }
 
     /// All registered tool names with Pi's **first-registration-wins** ordering (`getAllRegisteredTools`,
@@ -214,6 +298,17 @@ impl ExtensionRegistry {
     pub fn guest_tool_descriptors(&self) -> Result<Vec<ToolDescriptor>, ExtError> {
         let g = self.lock_read()?;
         Ok(g.guest_tool_order.iter().filter_map(|n| g.guest_tools.get(n).map(|(_, d)| d.clone())).collect())
+    }
+
+    /// All guest tool descriptors in registration order, each with its OWNING extension id — what
+    /// [`crate::ExtensionHost::refresh_tools`] needs to wrap a descriptor into an executable
+    /// `WasmTool` bound to the right live instance (EXT-004).
+    pub fn guest_tool_entries(&self) -> Result<Vec<(ExtensionId, ToolDescriptor)>, ExtError> {
+        let g = self.lock_read()?;
+        Ok(g.guest_tool_order
+            .iter()
+            .filter_map(|n| g.guest_tools.get(n).map(|(o, d)| (o.clone(), d.clone())))
+            .collect())
     }
 
     /// Whether a guest tool with this name is registered.
@@ -417,6 +512,10 @@ impl ExtensionRegistry {
     pub fn clear(&self) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
         *g = RegistryInner::default();
+        drop(g);
+        // A cleared registry has no tools to re-materialize; drop any pending refresh so the next
+        // `refresh_tools` after a reload does not walk an empty table (R-08-005).
+        self.take_tools_dirty();
         Ok(())
     }
 

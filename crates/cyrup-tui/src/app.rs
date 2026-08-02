@@ -2297,6 +2297,28 @@ impl<B: Backend> App<B> {
     /// yields a `&cyrup_core::AssistantMessage`). `cyrup-provider` is a direct dependency, so the
     /// token-by-token render (gap 1) is live, not deferred.
     pub fn ingest_event(&mut self, ev: &AgentSessionEvent) {
+        self.ingest_event_rendered(ev, None);
+    }
+
+    /// [`Self::ingest_event`], first giving the loaded extensions a chance to RENDER the event
+    /// (EXT-006). This is the production fold the interactive run loop uses; the sync
+    /// [`Self::ingest_event`] is the no-extensions shorthand.
+    ///
+    /// Pi resolves a renderer at the point of display — `extensionRunner.getMessageRenderer(...)`
+    /// for a custom message (interactive-mode.ts:3324-3336) and the per-tool `renderCall`/
+    /// `renderResult` for a tool row (components/tool-execution.ts:81-112). cyrup's fold is sync
+    /// (it mutates `&mut self` from a `select!` arm) while a guest renderer is an async wasm call,
+    /// so the renderer runs FIRST and its text rides into the fold.
+    pub async fn ingest_event_with_extensions(
+        &mut self,
+        ev: &AgentSessionEvent,
+        ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    ) {
+        let rendered = extension_render(ext_host, ev).await;
+        self.ingest_event_rendered(ev, rendered);
+    }
+
+    fn ingest_event_rendered(&mut self, ev: &AgentSessionEvent, rendered: Option<String>) {
         match ev {
             AgentSessionEvent::AgentStart => {
                 self.state.status.set_streaming(true);
@@ -2310,6 +2332,14 @@ impl<B: Backend> App<B> {
                 // persist through the turn, then scroll up as committed history).
                 self.state.transcript.commit_tools();
             }
+            // SEAM-005 `agent_settled` (Pi interactive-mode.ts:3137): the run has fully settled —
+            // no retry, post-run compaction or queued continuation will follow. Pi's interactive
+            // mode does exactly ONE thing here, `await this.checkShutdownRequested()`; the visual
+            // teardown already happened on `agent_end` above. That shutdown check lives in the
+            // async event-loop arm (`run`, the `events.next()` branch) rather than in this sync
+            // fold, which cannot `await` or return control to the caller — so this arm is a
+            // deliberate no-op, NOT a missing case.
+            AgentSessionEvent::AgentSettled => {}
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
             // A finished message: an extension `Custom` message renders as a distinct labeled block
             // (`custom-message.ts`, interactive-mode.ts:3083). Core user/assistant text is already
@@ -2321,7 +2351,10 @@ impl<B: Backend> App<B> {
                 // the `Custom` arm is detected via its serde projection (`tag = "role"`,
                 // `rename_all_fields = camelCase`) rather than a direct match — no dependency ripple.
                 if let Some((kind, body)) = custom_message_from_event(ev) {
-                    self.state.transcript.push_custom_message(kind, body);
+                    // EXT-006: `rendered` is the text the extension that registered a renderer for
+                    // this custom type produced; absent one it is `None` and the default
+                    // `[kind] body` framing draws (Pi `CustomMessageComponent`).
+                    self.state.transcript.push_custom_message_rendered(kind, body, rendered);
                 }
             }
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
@@ -2331,7 +2364,13 @@ impl<B: Backend> App<B> {
                 // Hand the raw call args to the transcript so each built-in renders its Pi-specific
                 // `renderCall` header (path+range / `$ command` / `/pattern/` / …), not a generic
                 // one-liner (transcript.rs `tool_lines` dispatch).
-                self.state.transcript.push_tool_start(tool_name.clone(), args.clone());
+                // EXT-006: an extension that declared a renderer for THIS tool supplies the call
+                // header; `None` keeps the built-in per-tool dispatch.
+                self.state.transcript.push_tool_start_rendered(
+                    tool_name.clone(),
+                    args.clone(),
+                    rendered,
+                );
             }
             AgentSessionEvent::ToolExecutionUpdate { partial_result, .. } => {
                 self.state.transcript.push_tool_update(Some(partial_result.clone()));
@@ -2339,10 +2378,11 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::ToolExecutionEnd { tool_name, is_error, result, .. } => {
                 // The full `{content, details, terminate}` result flows through so `renderResult` can
                 // reach each tool's `details` (edit `diff`, bash/read truncation, …).
-                self.state.transcript.push_tool_end(
+                self.state.transcript.push_tool_end_rendered(
                     tool_name.clone(),
                     *is_error,
                     Some(result.clone()),
+                    rendered,
                 );
                 // Progressively flush finished tools to native scrollback mid-turn so the inline
                 // viewport holds only the running tail, not the whole turn's tool stack (the
@@ -2600,6 +2640,193 @@ fn read_clipboard_image_to_temp() -> Option<std::path::PathBuf> {
 /// `AgentMessage` is only a dev-dependency here, so the message is inspected through `serde_json`
 /// (`{"role":"custom","kind":…,"payload":…}`) instead of a direct pattern match — no dep ripple.
 /// Returns `None` for any non-custom (core user/assistant/toolResult) message.
+/// Whether the interactive host should exit NOW because a loaded extension called `ctx.shutdown()`
+/// (EXT-005 / SEAM-005).
+///
+/// Pi checks a pending shutdown at exactly two moments, and cyrup's run loop calls this at both:
+///
+/// * `at_settle` — the `agent_settled` arm, `case "agent_settled": await
+///   this.checkShutdownRequested()` (interactive-mode.ts:3137-3138). A settle means the whole run
+///   is over (no retry, no post-run compaction, no queued continuation), so no idle re-check is
+///   needed or wanted;
+/// * otherwise — the `shutdownHandler` Pi binds in `bindExtensions`,
+///   `this.shutdownRequested = true; if (this.session.isIdle) { void this.shutdown(); }`
+///   (interactive-mode.ts:1753-1757). This is what makes Pi's own canonical example,
+///   `examples/extensions/shutdown-command.ts` — a `/quit` COMMAND that never starts a run — exit
+///   at all; gating solely on a settle would strand it forever.
+///
+/// Kept as a named predicate rather than an inline condition so it is testable without driving a
+/// real terminal event loop.
+pub fn should_honor_extension_shutdown(
+    session: &cyrup_session_svc::AgentSession,
+    at_settle: bool,
+) -> bool {
+    session.shutdown_requested() && (at_settle || session.is_idle())
+}
+
+/// How long the fold waits for an extension renderer before falling back to the built-in framing.
+///
+/// A renderer is a presentation concern on the interactive event path; it must never be able to
+/// wedge the frame. The call runs on its OWN task (not inline in the `select!` arm) for the same
+/// reason `AppAction::ExtensionShortcut` spawns: a guest handler may synchronously block on a
+/// `ui.{confirm,input,…}` capability whose reply only THIS loop can deliver, and awaiting it inline
+/// would be a genuine self-deadlock. Spawn + bounded wait makes the worst case "the block draws
+/// with its built-in renderer", never a hang.
+const EXTENSION_RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ask the loaded extensions to render this event, if any registered a renderer for it (EXT-006).
+///
+/// * a custom message → the extension that registered `custom_type` (Pi `getMessageRenderer`,
+///   runner.ts:579-587, resolved at interactive-mode.ts:3326);
+/// * a tool start/end → the extension that declared a renderer for that TOOL NAME (Pi's per-tool
+///   `renderCall`/`renderResult`, tool-execution.ts:81-112).
+///
+/// `None` for every other event, and for any event whose key has no registered renderer — the cheap
+/// SYNC `has_*_renderer` pre-check runs first so the common path pays nothing.
+pub async fn extension_render(
+    ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    ev: &AgentSessionEvent,
+) -> Option<String> {
+    enum Which {
+        Message(String, serde_json::Value),
+        ToolCall(String, serde_json::Value),
+        ToolResult(String, serde_json::Value),
+    }
+    let which = match ev {
+        AgentSessionEvent::MessageEnd { .. } => {
+            let (kind, _) = custom_message_from_event(ev)?;
+            if !ext_host.has_message_renderer(&kind) {
+                return None;
+            }
+            let message = serde_json::to_value(ev).ok()?.get("message")?.clone();
+            Which::Message(kind, message)
+        }
+        AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
+            if !ext_host.has_tool_renderer(tool_name) {
+                return None;
+            }
+            Which::ToolCall(tool_name.clone(), args.clone())
+        }
+        AgentSessionEvent::ToolExecutionEnd { tool_name, result, .. } => {
+            if !ext_host.has_tool_renderer(tool_name) {
+                return None;
+            }
+            Which::ToolResult(tool_name.clone(), result.clone())
+        }
+        _ => return None,
+    };
+    let host = ext_host.clone();
+    let task = tokio::spawn(async move {
+        match which {
+            Which::Message(key, payload) => host.render_message_call(&key, &payload).await,
+            Which::ToolCall(key, payload) => host.render_tool_call(&key, &payload).await,
+            Which::ToolResult(key, payload) => host.render_tool_result(&key, &payload).await,
+        }
+    });
+    let abort = task.abort_handle();
+    match tokio::time::timeout(EXTENSION_RENDER_TIMEOUT, task).await {
+        Ok(Ok(v)) => v.map(|v| rendered_text(&v)),
+        // A panicking renderer task degrades to the built-in framing, like a faulting one.
+        Ok(Err(_)) => None,
+        Err(_) => {
+            // Cancel the wedged call rather than detaching it: dropping a `JoinHandle` only
+            // detaches, and a renderer that blocks once will block again on the next event, so
+            // detached tasks would pile up behind the instance's store lock.
+            abort.abort();
+            None
+        }
+    }
+}
+
+/// How deep a widget tree may nest before the flattener gives up (a guest can hand the host any
+/// JSON, including a pathologically deep one; the flattener must terminate on adversarial input).
+const MAX_WIDGET_DEPTH: usize = 16;
+
+/// Flatten a renderer's returned JSON — a SERIALIZED WIDGET TREE — into the display text the
+/// transcript draws.
+///
+/// This is the host half of the `render-call`/`render-result` contract documented in
+/// `cyrup-ext/wit/world.wit`. Pi's renderers return an in-process `pi-tui` `Component` which the
+/// interactive mode adds as a child of `CustomMessageComponent`/`ToolExecutionComponent`
+/// (`components/custom-message.ts:66-81`, `components/tool-execution.ts:81-112`); nothing is ever
+/// stringified. A WASM guest cannot hand back a live object, so cyrup's wire analog is the
+/// component tree SERIALIZED, and the host is what turns it back into rows — the exact step that
+/// was missing: every non-string return used to be pretty-printed, so a guest following cyrup's own
+/// SDK example (`{"widget":"text","text":…}`) drew a raw JSON blob where Pi draws the component.
+///
+/// The vocabulary mirrors the `pi-tui` components a renderer actually returns (`packages/tui/src/
+/// index.ts:13-32`); it is duplicated verbatim in both WIT world copies and constructed by
+/// `cyrup_ext_sdk::widget` on the guest side:
+///
+/// | JSON                                              | Pi component      |
+/// |---------------------------------------------------|-------------------|
+/// | `"…"` (a bare string)                              | `Text` (degenerate) |
+/// | `{"widget":"text","text":"…"}`                     | `Text` — the dominant shape |
+/// | `{"widget":"markdown","text":"…"}`                 | `Markdown`        |
+/// | `{"widget":"truncated-text","text":"…"}`           | `TruncatedText`   |
+/// | `{"widget":"spacer","lines":n}` (default 1)        | `Spacer`          |
+/// | `{"widget":"box"\|"container","children":[…]}`     | `Box` / `Container` — stacked |
+/// | `{"widget":"hstack","children":[…]}`               | `HStack` — joined on one row |
+/// | `[…]` (a bare array)                               | shorthand for a stack |
+///
+/// Anything the vocabulary does not cover — an unknown `widget` tag, a missing tag, a tree deeper
+/// than [`MAX_WIDGET_DEPTH`] — falls back to the pretty-printed JSON rather than being dropped, so
+/// an author who mistypes a node SEES the node instead of a blank row. The fallback applies to the
+/// WHOLE tree, not the offending node, so the JSON on screen is the one the guest actually returned.
+fn rendered_text(v: &serde_json::Value) -> String {
+    flatten_widget(v, 0)
+        .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+}
+
+/// One node of [`rendered_text`]'s widget tree. `None` = "not a widget I know", which the caller
+/// turns into the whole-tree JSON fallback.
+fn flatten_widget(v: &serde_json::Value, depth: usize) -> Option<String> {
+    use serde_json::Value;
+    if depth > MAX_WIDGET_DEPTH {
+        return None;
+    }
+    match v {
+        // A bare string is the degenerate `Text` node: a renderer that just wants to hand back the
+        // lines it wants drawn should not have to wrap them.
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => flatten_children(items, depth, "\n"),
+        Value::Object(o) => {
+            let text = || o.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+            let children = |sep: &str| match o.get("children") {
+                Some(Value::Array(items)) => flatten_children(items, depth, sep),
+                // A container with no children is an empty row, not an error (Pi's `Container`
+                // renders nothing until something is added to it).
+                None => Some(String::new()),
+                Some(_) => None,
+            };
+            match o.get("widget").and_then(Value::as_str)? {
+                "text" | "markdown" | "truncated-text" => Some(text()),
+                "spacer" => {
+                    // `n` blank rows = a string of `n - 1` newlines (one empty row needs no
+                    // separator). Clamped so a guest cannot ask the transcript for a million rows.
+                    let n = o.get("lines").and_then(Value::as_u64).unwrap_or(1).min(64) as usize;
+                    Some("\n".repeat(n.saturating_sub(1)))
+                }
+                "box" | "container" => children("\n"),
+                "hstack" => children(""),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Flatten every child, joining with `sep`. One unrecognized child fails the WHOLE tree so the
+/// caller's JSON fallback shows the guest's actual return rather than a half-rendered tree with a
+/// silently missing row.
+fn flatten_children(items: &[serde_json::Value], depth: usize, sep: &str) -> Option<String> {
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(flatten_widget(item, depth.saturating_add(1))?);
+    }
+    Some(out.join(sep))
+}
+
 fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(String, String)> {
     let value = serde_json::to_value(ev).ok()?;
     let message = value.get("message")?;
@@ -3433,7 +3660,10 @@ impl App<CrosstermBackend<Stdout>> {
                             }
                         }
                         AppAction::Command(cmd) => {
-                            self.execute_command(cmd, &session, runtime.as_ref()).await
+                            self.execute_command(cmd, &session, runtime.as_ref()).await;
+                            if should_honor_extension_shutdown(&session, false) {
+                                return Ok(());
+                            }
                         }
                         AppAction::ExtensionShortcut(key) => {
                             // Route the fired shortcut to the owning live extension (R-08-017; Pi
@@ -3510,7 +3740,21 @@ impl App<CrosstermBackend<Stdout>> {
                 }
                 maybe_ev = events.next() => {
                     let Some(ev) = maybe_ev else { continue };
-                    self.ingest_event(&ev);
+                    // EXT-006: fold through the extension-aware path so a registered renderer
+                    // actually draws the block (a custom message / a tool row). No renderer for the
+                    // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
+                    let ext_host = session.services().ext_host.clone();
+                    self.ingest_event_with_extensions(&ev, &ext_host).await;
+                    // SEAM-005 / EXT-005: a guest's `ctx.shutdown()` is honored at the settle point
+                    // (Pi interactive-mode.ts:3137-3138 `case "agent_settled": await
+                    // this.checkShutdownRequested()`), and only there — `agent_end` cannot tell us
+                    // whether a retry or a queued continuation is still coming.
+                    if should_honor_extension_shutdown(
+                        &session,
+                        matches!(ev, AgentSessionEvent::AgentSettled),
+                    ) {
+                        return Ok(());
+                    }
                     self.draw_synchronized()?;
                 }
                 ok = theme_changed => {

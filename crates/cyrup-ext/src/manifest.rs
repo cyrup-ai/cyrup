@@ -36,7 +36,14 @@ pub struct Capabilities {
 }
 
 /// The world version this host implements.
-pub const HOST_WORLD: &str = "cyrup:ext@0.1";
+///
+/// Bumped 0.1 → 0.2 by SEAM-005, which added the `events.on-agent-settled` EXPORT. An added export
+/// is breaking for an already-built guest: a 0.1 component simply does not have the function, and
+/// [`crate::host::LiveExtension`] would fail at instantiation with a raw wasmtime link error rather
+/// than a typed [`ExtError::WorldVersion`]. [`ExtensionManifest::check_world`] is minor-aware for
+/// exactly that reason. (The `ctx-state`/`control.abort`/`control.shutdown` additions in the same
+/// batch are IMPORTS, which are additive and would not have needed a bump on their own.)
+pub const HOST_WORLD: &str = "cyrup:ext@0.2";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.
@@ -51,17 +58,27 @@ impl ExtensionManifest {
         Self::from_json(&bytes)
     }
 
-    /// Check world-version compatibility (arch-08 §4.1): same MAJOR is required; a MAJOR mismatch
-    /// is surfaced as a typed error, never a trap.
+    /// Check world-version compatibility (arch-08 §4.1): the MAJOR must match AND the guest's MINOR
+    /// must be at least the host's. Both mismatches are surfaced as a typed error, never a trap.
+    ///
+    /// The MINOR rule is what makes an added EXPORT safe to ship. The host's world grows by adding
+    /// guest exports (`events.on-agent-settled`, SEAM-005); a guest built against an older MINOR
+    /// does not implement them, so instantiation would fail deep inside wasmtime with an opaque
+    /// missing-export link error. Comparing MINOR here turns that into
+    /// [`ExtError::WorldVersion`] at manifest-check time, before any bytes are instantiated. A guest
+    /// with a HIGHER minor is accepted: it may want imports this host lacks, and that failure is
+    /// specific and reportable, whereas the reverse is not.
     pub fn check_world(&self, host: &str) -> Result<(), ExtError> {
-        let major = |w: &str| -> Option<String> {
-            // `cyrup:ext@MAJOR.MINOR` -> "MAJOR"
+        // `cyrup:ext@MAJOR.MINOR[.PATCH]` -> (MAJOR, MINOR); a missing/garbled MINOR reads as 0.
+        let parts = |w: &str| -> Option<(String, u32)> {
             let after_at = w.split('@').nth(1)?;
-            let major = after_at.split('.').next()?;
-            Some(major.to_string())
+            let mut it = after_at.split('.');
+            let major = it.next()?.to_string();
+            let minor = it.next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+            Some((major, minor))
         };
-        match (major(&self.world), major(host)) {
-            (Some(a), Some(b)) if a == b => Ok(()),
+        match (parts(&self.world), parts(host)) {
+            (Some((gmaj, gmin)), Some((hmaj, hmin))) if gmaj == hmaj && gmin >= hmin => Ok(()),
             _ => Err(ExtError::WorldVersion {
                 found: self.world.clone(),
                 required: host.to_string(),

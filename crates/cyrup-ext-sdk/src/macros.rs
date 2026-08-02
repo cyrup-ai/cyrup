@@ -238,6 +238,9 @@ macro_rules! export_extension {
                 fn on_agent_end(messages_json: ::std::string::String) {
                     $crate::guest::notify(8, &[&messages_json]);
                 }
+                fn on_agent_settled() {
+                    $crate::guest::notify(30, &[]);
+                }
                 fn on_turn_start(turn_index: u32, timestamp: u64) {
                     $crate::guest::notify(9, &[&turn_index.to_string(), &timestamp.to_string()]);
                 }

@@ -58,7 +58,7 @@ pub use host_services::{
 };
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{
-    AgentSessionRuntime, NewSessionOptions, RuntimeDiagnostic, RuntimeForkResult,
+    AgentSessionRuntime, NewSessionOptions, RuntimeActions, RuntimeDiagnostic, RuntimeForkResult,
     SwitchResult, SwitchSessionOptions,
 };
 pub use services::AgentSessionServices;

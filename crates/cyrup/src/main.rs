@@ -365,11 +365,9 @@ async fn run() -> anyhow::Result<i32> {
             factory_builder = factory_builder.with_native_extension(ext);
         }
         let factory = Arc::new(factory_builder);
-        let runtime = Arc::new(
-            AgentSessionRuntime::create(factory, target)
-                .await
-                .context("building agent session runtime")?,
-        );
+        let runtime = AgentSessionRuntime::create(factory, target)
+            .await
+            .context("building agent session runtime")?;
         let session = runtime.session().await;
         apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
         // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
@@ -461,7 +459,7 @@ async fn run() -> anyhow::Result<i32> {
             }
             let factory = Arc::new(factory_builder);
             let runtime = match AgentSessionRuntime::create(factory, target).await {
-                Ok(r) => Arc::new(r),
+                Ok(r) => r,
                 // Non-interactive no-models-available guard (Pi main.ts:795-798): print the provider
                 // login guidance + exit 1 instead of a generic build error.
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),

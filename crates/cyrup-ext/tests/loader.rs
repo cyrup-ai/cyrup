@@ -21,7 +21,7 @@ fn write_ext(base: &Path, name: &str, with_wasm: bool) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let manifest = format!(
-        r#"{{ "id": "{name}", "version": "1.0.0", "world": "cyrup:ext@0.1" }}"#
+        r#"{{ "id": "{name}", "version": "1.0.0", "world": "cyrup:ext@0.2" }}"#
     );
     std::fs::write(dir.join("extension.json"), manifest).unwrap();
     if with_wasm {

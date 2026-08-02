@@ -42,7 +42,7 @@ fn config(fx: &Fixture) -> SessionConfig {
 }
 
 /// Build the runtime using only SDK re-exports (the construction primitive R-11-019).
-async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> AgentSessionRuntime {
+async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux;
     let cfg = config(fx);
     let target = cfg.target.clone();

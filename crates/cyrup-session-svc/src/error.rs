@@ -79,6 +79,16 @@ pub enum SessionServiceError {
     #[error("invalid entry id for forking: {0}")]
     InvalidForkEntry(String),
 
+    /// A loaded extension asked for a RUNTIME-tier control op (`newSession`/`switchSession`/`fork`/
+    /// `reload`) on a session that no host installed an [`crate::RuntimeActions`] sink onto — a bare
+    /// [`crate::AgentSession`] built straight from [`crate::SessionBuilder`] rather than through an
+    /// [`crate::AgentSessionRuntime`]. Pi's equivalent is the pre-`bindCommandContext` action stub,
+    /// which throws `"Extension runtime not initialized…"` (extensions/loader.ts:173-176
+    /// `notInitialized`) rather than silently doing nothing. The op name is carried so the
+    /// diagnostic names what was refused.
+    #[error("control op `{0}` requires a session runtime host; none is installed on this session")]
+    NoRuntimeHost(&'static str),
+
     #[error("import file not found: {0}")]
     ImportFileNotFound(String),
 

@@ -86,6 +86,16 @@ impl ToolDescriptor {
         self.execution_mode = Some(m);
         self
     }
+
+    /// Declare that this tool renders its own call/result rows (Pi `ToolDefinition.renderCall`/
+    /// `renderResult`, extensions/types.ts:472-481). The host records the OWNER of the renderer for
+    /// this tool NAME and routes rendering back through the guest's `render-call`/`render-result`
+    /// exports (keyed by the tool name); register the matching renderer with
+    /// [`crate::ExtensionApi::register_message_renderer`] under the SAME name.
+    pub fn has_renderer(mut self, yes: bool) -> Self {
+        self.has_renderer = yes;
+        self
+    }
 }
 
 /// What a guest sends to register a command (R-08-016; Pi types.ts:1105-1111).

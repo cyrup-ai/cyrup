@@ -188,6 +188,33 @@ impl Dispatcher {
         out
     }
 
+    /// Load-ordered dispatch that STOPS at the first extension whose `handled` value satisfies
+    /// `decided` (Pi `emitProjectTrustEvent`, extensions/runner.ts:203-232: the loop `return`s the
+    /// moment a handler answers anything other than `"undecided"`). Distinct from
+    /// [`Self::dispatch_collect_handled`], which deliberately runs EVERY subscriber for an
+    /// aggregation event (`resources_discover`). Using the collect-all variant for `project_trust`
+    /// let a second extension's handler run — and side-effect — after the decision was already
+    /// made. Faults are contained + skipped (R-08-036).
+    pub async fn dispatch_first_handled(
+        &self,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+        decided: impl Fn(&HandledValue) -> bool,
+    ) -> Option<(cyrup_core::ExtensionId, HandledValue)> {
+        let kind = ev.kind();
+        if self.no_subscribers(kind) {
+            return None;
+        }
+        for ext in self.subscribers_for(kind) {
+            match self.invoke_contained(&ext, ev, cancel).await {
+                Ok(HookOutcome::Handled(v)) if decided(&v) => return Some((ext.id().clone(), v)),
+                Ok(_) => {}
+                Err(e) => self.report(kind, ext.id(), &e),
+            }
+        }
+        None
+    }
+
     /// Subscription-gated, load-ordered block/mutate chaining (arch-08 §6.1). First `Block` wins;
     /// `[mutate]` patches fold into `ev` so the next handler observes the folded value (R-08-011).
     pub async fn dispatch_block_mutate(

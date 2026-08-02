@@ -25,7 +25,7 @@ pub struct ProjectTrustDecision {
 /// Pi's tri-state `project_trust` decision (`ProjectTrustEventDecision`, types.ts:508): `"yes"` /
 /// `"no"` are terminal; `"undecided"` falls through to the next handler. A legacy JSON boolean
 /// `trusted` is tolerated (`true`→yes, `false`→no) so older payloads still decide.
-fn parse_trust_decision(v: &serde_json::Value) -> Option<bool> {
+pub fn parse_trust_decision(v: &serde_json::Value) -> Option<bool> {
     match v.get("trusted") {
         Some(serde_json::Value::String(s)) => match s.as_str() {
             "yes" => Some(true),

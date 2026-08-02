@@ -131,10 +131,20 @@ async fn json_dispatch_emits_ordered_event_stream() {
         Some("agent_start"),
         "the first event after the header is agent_start"
     );
+    // SEAM-005: the stream now closes with `agent_settled`. Pi's json mode writes EVERY subscribed
+    // session event verbatim (`session.subscribe(event => writeRawStdout(JSON.stringify(event)))`,
+    // print-mode.ts:103-108), and `agent_settled` is emitted last (agent-session.ts:585, from
+    // `_runAgentPrompt`'s `finally`), so a pi json consumer sees it too. `agent_end` is now
+    // second-to-last.
     assert_eq!(
         kinds.last().map(String::as_str),
+        Some("agent_settled"),
+        "stream closes with agent_settled (the whole run, not just the last agent loop)"
+    );
+    assert_eq!(
+        kinds.iter().rev().nth(1).map(String::as_str),
         Some("agent_end"),
-        "stream closes with agent_end"
+        "…immediately preceded by the run's last agent_end"
     );
     assert_eq!(code, 0);
 }

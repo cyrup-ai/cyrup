@@ -8,7 +8,12 @@ use crate::dispatch::Dispatcher;
 use crate::error::ExtError;
 use crate::event::{HostEvent, InputEventSource, InputStreamingBehavior};
 use crate::hooks::ExtHooks;
-use crate::loader::{DiscoveredExtension, DiscoveryRoots, LoadError, LoadExtensionsResult};
+use crate::loader::{DiscoveredExtension, DiscoveryRoots};
+// Only the wasm-host guest-loading path constructs these; `discover()` (ungated) needs just the
+// two above, so gate the rest to keep `--no-default-features` warning-free.
+#[cfg(feature = "wasm-host")]
+use crate::loader::{LoadError, LoadExtensionsResult};
+#[cfg(feature = "wasm-host")]
 use crate::manifest::HOST_WORLD;
 use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
 use crate::registry::ExtensionRegistry;
@@ -131,6 +136,11 @@ pub struct ExtensionHost {
     /// `bus.emit` from one reaches another's subscribed `bus-deliver` handler (gap-08 §5.3).
     #[cfg(feature = "wasm-host")]
     bus: Arc<crate::host::SharedBus>,
+    /// The live capability backend the session injected (via [`Self::load_native_with_services`]).
+    /// Threaded into every native dispatch/command ctx so a built-in's `ctx.rich()` reports the
+    /// LIVE idle/trust/usage/model/system-prompt instead of `HostCtxRich::default()` (EXT-005).
+    #[cfg(feature = "wasm-host")]
+    services: RwLock<Option<Arc<dyn crate::host::HostServices>>>,
 }
 
 impl Default for ExtensionHost {
@@ -155,6 +165,8 @@ impl ExtensionHost {
             live: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm-host")]
             bus: Arc::new(crate::host::SharedBus::new()),
+            #[cfg(feature = "wasm-host")]
+            services: RwLock::new(None),
         }
     }
 
@@ -178,8 +190,19 @@ impl ExtensionHost {
         ext: Arc<dyn NativeExtension>,
         services: Arc<dyn crate::host::HostServices>,
     ) -> Result<(), ExtError> {
-        ext.set_host_services(services);
+        ext.set_host_services(services.clone());
+        // Keep the backend so EVERY native dispatch/command ctx can carry live rich fields
+        // (EXT-005), not just the built-ins that stash the Arc themselves.
+        if let Ok(mut g) = self.services.write() {
+            *g = Some(services);
+        }
         self.load_native_inner(ext).await
+    }
+
+    /// The injected capability backend, if one was supplied (EXT-005).
+    #[cfg(feature = "wasm-host")]
+    fn host_services(&self) -> Option<Arc<dyn crate::host::HostServices>> {
+        self.services.read().ok().and_then(|g| g.clone())
     }
 
     /// The shared native-load body (register tools/commands, build subscriptions, wire into the
@@ -191,13 +214,35 @@ impl ExtensionHost {
 
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
-        let (subs, tools, commands) = api.into_parts();
+        let (subs, tools, commands, tool_renderers, message_renderers) = api.into_parts();
+
+        // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
+        // `decides_project_trust` is skipped by the pre-trust bootstrap pass, so its vote arrives
+        // after trust is already decided and is silently ignored. Say so once, at load, rather than
+        // letting the author debug a handler that "runs but changes nothing".
+        if subs.contains(crate::EventKind::ProjectTrust) && !ext.decides_project_trust() {
+            tracing::warn!(
+                extension = %id,
+                "extension subscribes to `project_trust` but does not override \
+                 `NativeExtension::decides_project_trust`; its verdict cannot affect the session's \
+                 trust decision, which is made before this (post-trust) load"
+            );
+        }
 
         for tool in tools {
             self.registry.register_tool(id.clone(), tool)?;
         }
         for (name, desc) in commands {
             self.registry.register_command(id.clone(), name, desc)?;
+        }
+        // EXT-006: a native built-in's renderer declarations land in the SAME registry tables the
+        // guest path writes, so `render_tool_call`/`render_message_call` route by name/type without
+        // caring which runtime supplies the renderer.
+        for tool_name in tool_renderers {
+            self.registry.register_tool_renderer(id.clone(), tool_name)?;
+        }
+        for custom_type in message_renderers {
+            self.registry.register_message_renderer(id.clone(), custom_type)?;
         }
 
         // Keep the native handle for command-tier slash execution (R-08-016) before it is wrapped
@@ -206,8 +251,10 @@ impl ExtensionHost {
             g.insert(id.clone(), ext.clone());
         }
         let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
-        let handle = Arc::new(NativeHandle::new(ext, subs, ctx));
-        self.dispatcher.add(handle)?;
+        let handle = NativeHandle::new(ext, subs, ctx);
+        #[cfg(feature = "wasm-host")]
+        let handle = handle.with_services(self.host_services());
+        self.dispatcher.add(Arc::new(handle))?;
         Ok(())
     }
 
@@ -234,6 +281,13 @@ impl ExtensionHost {
             None => return Ok(None),
         };
         let ctx = HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
+        // Live rich fields for the command ctx too (EXT-005) — a command handler reading
+        // `ctx.is_idle()`/`ctx.is_project_trusted()` used to get `HostCtxRich::default()`.
+        #[cfg(feature = "wasm-host")]
+        let ctx = match self.host_services() {
+            Some(svc) => ctx.with_rich(crate::native::rich_from_services(svc.as_ref())),
+            None => ctx,
+        };
         let fut = std::panic::AssertUnwindSafe(ext.execute_command(name, args, &ctx));
         use futures::FutureExt;
         let raced = tokio::select! {
@@ -258,21 +312,101 @@ impl ExtensionHost {
     }
 
     /// The merged active tool set: built-ins overridden by extension tools (R-08-012/014).
+    ///
+    /// Re-materializes any tool registered SINCE the last call first ([`Self::refresh_tools`]) —
+    /// Pi's `registerTool()` ends with `runtime.refreshTools()` on every registration
+    /// (extensions/loader.ts:249-256), so a tool a guest registers from inside a `session_start`
+    /// handler is model-visible on the next turn (`examples/extensions/dynamic-tools.ts`). Before
+    /// EXT-004 the wrapping happened exactly once, immediately after `init`, so a post-`init`
+    /// registration produced a descriptor no caller could ever execute.
     pub fn active_tools(&self, base: &[Arc<dyn Tool>]) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.refresh_tools()?;
         self.registry.active_tools(base)
     }
 
-    /// Aggregate the `project_trust` decision across extensions (Pi runner.ts:1046; gap-08 #4). The
-    /// FIRST extension that returns a parseable `{trusted, remember}` wins; `None` = no decision (the
-    /// host falls back to its own trust prompt).
+    /// Re-materialize guest tool descriptors registered after their extension's `init` into
+    /// executable `Arc<dyn Tool>` handles (Pi `refreshTools` → `_refreshToolRegistry`,
+    /// agent-session.ts:2452-2546; EXT-004). Returns whether the executable tool set changed, so a
+    /// caller can skip an expensive downstream rebuild (system prompt / active-set push).
+    ///
+    /// Cheap when nothing changed: a relaxed atomic load, no lock. Sync on purpose — wrapping a
+    /// descriptor is pure bookkeeping, so this is callable from `active_tools` and from a
+    /// non-async drain alike.
+    pub fn refresh_tools(&self) -> Result<bool, ExtError> {
+        if !self.registry.take_tools_dirty() {
+            return Ok(false);
+        }
+        self.materialize_guest_tools()
+    }
+
+    /// The `wasm-host` half of [`Self::refresh_tools`]: wrap every guest descriptor that has no
+    /// executable counterpart yet into a [`crate::host::WasmTool`] bound to its OWNING live instance.
+    #[cfg(feature = "wasm-host")]
+    fn materialize_guest_tools(&self) -> Result<bool, ExtError> {
+        let mut changed = false;
+        for (owner, desc) in self.registry.guest_tool_entries()? {
+            if self.registry.tool(&desc.name)?.is_some() {
+                continue;
+            }
+            let Some(ext) = self.live.read().ok().and_then(|g| g.get(&owner).cloned()) else {
+                // A descriptor whose owner is not (yet) live: skip it rather than fabricating a
+                // tool that cannot execute. Re-arm so the next refresh retries once it is live.
+                self.registry.mark_tools_dirty();
+                continue;
+            };
+            let tool: Arc<dyn Tool> = Arc::new(crate::host::WasmTool::new(ext, desc));
+            self.registry.register_tool(owner, tool)?;
+            changed = true;
+        }
+        // `register_tool` re-dirties the flag by design (it is the same signal a host-tool
+        // registration raises); clear the marks THIS pass produced so a caller does not loop.
+        if changed {
+            self.registry.take_tools_dirty();
+        }
+        Ok(changed)
+    }
+
+    /// Native-only build: a native extension's tools are already executable `Arc<dyn Tool>`s
+    /// registered directly into the registry, so "re-materialize" is a no-op — but the dirty flag
+    /// still reports that the set CHANGED, which is what the caller acts on.
+    #[cfg(not(feature = "wasm-host"))]
+    fn materialize_guest_tools(&self) -> Result<bool, ExtError> {
+        Ok(true)
+    }
+
+    /// Register a tool AFTER its extension's `init` (Pi `api.registerTool()` called from a live
+    /// handler, extensions/loader.ts:249-256 — the `examples/extensions/dynamic-tools.ts` pattern).
+    /// Marks the tool set dirty so the next [`Self::refresh_tools`]/[`Self::active_tools`] surfaces
+    /// it. This is the NATIVE analog of the guest's `registration.register-tool` import, which a
+    /// native built-in cannot reach (it has no wasm boundary to call across).
+    pub fn register_late_tool(
+        &self,
+        owner: ExtensionId,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), ExtError> {
+        self.registry.register_tool(owner, tool)
+    }
+
+    /// Aggregate the `project_trust` decision across extensions (Pi `emitProjectTrustEvent`,
+    /// extensions/runner.ts:203-232). The FIRST extension that returns a DECIDED tri-state
+    /// (`"yes"`/`"no"`) wins and the chain stops there — an `"undecided"` handler falls through.
+    /// `None` = nobody decided (the host falls back to its saved/default/prompt tiers).
+    ///
+    /// Short-circuiting matters beyond efficiency: Pi returns the instant a handler decides, so a
+    /// later extension's `project_trust` handler must not run at all — it would otherwise execute
+    /// (and side-effect) with its verdict silently discarded.
     pub async fn aggregate_project_trust(
         &self,
         cancel: &CancelToken,
     ) -> Option<crate::ProjectTrustDecision> {
         use crate::event::HostEvent;
-        let handled =
-            self.dispatcher.dispatch_collect_handled(&HostEvent::ProjectTrust, cancel).await;
-        crate::fold_project_trust(&handled)
+        let hit = self
+            .dispatcher
+            .dispatch_first_handled(&HostEvent::ProjectTrust, cancel, |HandledValue(v)| {
+                crate::aggregate::parse_trust_decision(v).is_some()
+            })
+            .await?;
+        crate::fold_project_trust(std::slice::from_ref(&hit))
     }
 
     /// Aggregate the skill/prompt/theme paths every extension provides (Pi `resources_discover`,
@@ -487,6 +621,139 @@ impl ExtensionHost {
         }
     }
 
+    /// Render a TOOL CALL through the extension that registered a renderer for that tool (Pi's
+    /// per-tool `ToolDefinition.renderCall`, extensions/types.ts:472-473, resolved by
+    /// `modes/interactive/components/tool-execution.ts:81-112` — the extension's definition is
+    /// preferred over the built-in). `None` = no extension renders this tool (draw the standard
+    /// shell), which is also what a faulting renderer degrades to.
+    ///
+    /// This is the missing link EXT-006 was about: `ToolDescriptor.has_renderer` was recorded and
+    /// `LiveExtension::render_call` existed, but nothing could get from a tool NAME to the guest
+    /// that renders it, so both were dead outside a unit test.
+    pub async fn render_tool_call(&self, tool_name: &str, call: &Value) -> Option<Value> {
+        let owner = self.registry.tool_renderer_owner(tool_name).ok().flatten()?;
+        self.render_via(&owner, tool_name, call, true).await
+    }
+
+    /// Render a TOOL RESULT through the tool's registered renderer (Pi `renderResult`,
+    /// extensions/types.ts:475-481). See [`Self::render_tool_call`].
+    pub async fn render_tool_result(&self, tool_name: &str, result: &Value) -> Option<Value> {
+        let owner = self.registry.tool_renderer_owner(tool_name).ok().flatten()?;
+        self.render_via(&owner, tool_name, result, false).await
+    }
+
+    /// Render a CUSTOM MESSAGE through the extension that registered a renderer for `custom_type`
+    /// (Pi `registerMessageRenderer` + `getMessageRenderer`, extensions/types.ts:1284 /
+    /// runner.ts:579-587; first extension in load order wins). `None` = no renderer, so the host
+    /// falls back to its own labeled-message framing.
+    ///
+    /// CYRUP-DELTA: Pi keeps two distinct renderer surfaces — the per-tool `renderCall`/
+    /// `renderResult` above and this per-custom-type `MessageRenderer`. cyrup's WIT exposes ONE
+    /// pair of guest exports (`render-call`/`render-result`, keyed by an opaque `custom-type`), so
+    /// both surfaces route through them; the two are kept apart by their REGISTRY tables
+    /// (`tool_renderer_owner` vs `message_renderer_owner`), not by the wire shape.
+    pub async fn render_message_call(&self, custom_type: &str, message: &Value) -> Option<Value> {
+        let owner = self.registry.message_renderer_owner(custom_type).ok().flatten()?;
+        self.render_via(&owner, custom_type, message, true).await
+    }
+
+    /// The result-side companion of [`Self::render_message_call`].
+    pub async fn render_message_result(&self, custom_type: &str, message: &Value) -> Option<Value> {
+        let owner = self.registry.message_renderer_owner(custom_type).ok().flatten()?;
+        self.render_via(&owner, custom_type, message, false).await
+    }
+
+    /// Invoke `render-call`/`render-result` on a specific extension, containing faults LOCALLY
+    /// (`warn!` + `None`) the way [`Self::deliver_bus_events`] does. Deliberately NOT routed through
+    /// `dispatch_block_mutate`: a renderer is a presentation concern and a faulting one must never
+    /// be able to block the tool call it was asked to draw (R-08-036).
+    ///
+    /// NATIVE owners are tried first and are available in EVERY build (a native renderer needs no
+    /// wasm host); a guest owner resolves against the live instance map only under `wasm-host`.
+    async fn render_via(
+        &self,
+        owner: &ExtensionId,
+        key: &str,
+        payload: &Value,
+        is_call: bool,
+    ) -> Option<Value> {
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
+            // A panicking native renderer must degrade to the default framing, never take the
+            // frame down with it (R-08-036) — the same containment the guest arm gets below.
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if is_call {
+                    native.render_call(key, payload)
+                } else {
+                    native.render_result(key, payload)
+                }
+            }));
+            return match rendered {
+                Ok(v) => v,
+                Err(panic) => {
+                    tracing::warn!(
+                        extension = %owner, key = %key,
+                        error = %native_panic_msg(panic),
+                        "native renderer panicked (falling back to the default renderer)"
+                    );
+                    None
+                }
+            };
+        }
+        self.render_via_guest(owner, key, payload, is_call).await
+    }
+
+    #[cfg(feature = "wasm-host")]
+    async fn render_via_guest(
+        &self,
+        owner: &ExtensionId,
+        key: &str,
+        payload: &Value,
+        is_call: bool,
+    ) -> Option<Value> {
+        let ext = self.live.read().ok().and_then(|g| g.get(owner).cloned())?;
+        let out = if is_call {
+            ext.render_call(key, payload).await
+        } else {
+            ext.render_result(key, payload).await
+        };
+        match out {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    extension = %owner, key = %key, error = %e,
+                    "extension renderer fault contained (falling back to the default renderer)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Native-only build: no live guest can hold a renderer, so a guest-owned key draws with the
+    /// host's own framing. (A NATIVE-owned key is still rendered — see [`Self::render_via`].)
+    #[cfg(not(feature = "wasm-host"))]
+    async fn render_via_guest(
+        &self,
+        _owner: &ExtensionId,
+        _key: &str,
+        _payload: &Value,
+        _is_call: bool,
+    ) -> Option<Value> {
+        None
+    }
+
+    /// Whether ANY extension registered a renderer for this tool name (Pi
+    /// `hasRendererDefinition`, tool-execution.ts:81-112) — the cheap check a UI makes before
+    /// paying for a guest round trip.
+    pub fn has_tool_renderer(&self, tool_name: &str) -> bool {
+        self.registry.tool_renderer_owner(tool_name).ok().flatten().is_some()
+    }
+
+    /// Whether ANY extension registered a custom-message renderer for `custom_type` (Pi
+    /// `getMessageRenderer(...) !== undefined`, runner.ts:579-587).
+    pub fn has_message_renderer(&self, custom_type: &str) -> bool {
+        self.registry.message_renderer_owner(custom_type).ok().flatten().is_some()
+    }
+
     pub fn registry(&self) -> &ExtensionRegistry {
         &self.registry
     }
@@ -623,16 +890,16 @@ impl ExtensionHost {
         )
         .await?;
         let ext = Arc::new(ext);
-        // Surface the guest's registered tools as executable handles in the active set: each runs
-        // by dispatching `execute-tool` back into this live instance (R-08-012/014/015).
-        for desc in self.registry.guest_tool_descriptors()? {
-            let tool: Arc<dyn Tool> = Arc::new(crate::host::WasmTool::new(ext.clone(), desc));
-            self.registry.register_tool(id.clone(), tool)?;
-        }
         self.dispatcher.add(ext.clone())?;
         if let Ok(mut g) = self.live.write() {
             g.insert(id, ext.clone());
         }
+        // Surface the guest's registered tools as executable handles in the active set: each runs
+        // by dispatching `execute-tool` back into ITS OWN live instance (R-08-012/014/015). Done
+        // through the shared re-materializer (EXT-004) so an `init`-time registration and a later
+        // one take exactly the same path — and so a descriptor is bound to its OWNING instance
+        // rather than to whichever extension happened to load last.
+        self.materialize_guest_tools()?;
         Ok(ext)
     }
 

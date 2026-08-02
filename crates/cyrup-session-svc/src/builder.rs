@@ -12,7 +12,8 @@ use std::sync::Arc;
 use cyrup_agent::Agent;
 use cyrup_core::{CancelToken, ModelRef, RunCancel, ModelThinkingLevel};
 use cyrup_config::{
-    decide_trust, has_trust_requiring_resources, AppMode, AuthStore, InMemorySettingsStore,
+    decide_trust_with_extension, has_trust_requiring_resources, AppMode, AuthStore,
+    ExtensionTrust, InMemorySettingsStore,
     ModelResolver, Settings, SettingsManager, SettingsStore, TrustInputs, TrustOutcome,
 };
 use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
@@ -434,14 +435,37 @@ impl SessionBuilder {
         );
         let default_trust = settings.effective().default_project_trust();
         let has_resources = has_trust_requiring_resources(&cwd, &cfg.home);
-        let outcome = decide_trust(TrustInputs {
-            has_resources,
-            trust_override: cfg.trust_override,
-            saved: None,
-            default_trust,
-            mode: cfg.app_mode,
-            prompt_choice: None,
-        });
+        // Pi's `shouldResolveProjectTrust` guard (main.ts:676-678): only pay for a pre-trust
+        // extension pass when the answer is actually in doubt — no explicit `--approve/--no-approve`
+        // and there IS something to gate. In every other case this is the exact previous code path.
+        let ext_trust = if cfg.trust_override.is_none() && has_resources {
+            pre_trust_extension_verdict(&cfg, &cwd, &self.native_extensions).await
+        } else {
+            None
+        };
+        if let Some(d) = &ext_trust
+            && d.remember
+        {
+            // Pi persists via `trustStore.set` (project-trust.ts:46-95). The builder has no
+            // `TrustStore` wired (it also passes `saved: None`), so say so rather than pretending
+            // the decision was remembered.
+            tracing::warn!(
+                extension = %d.by, trusted = d.trusted,
+                "extension project_trust asked to `remember` the decision, but no trust store is \
+                 wired into the session builder — the verdict applies to this session only"
+            );
+        }
+        let outcome = decide_trust_with_extension(
+            TrustInputs {
+                has_resources,
+                trust_override: cfg.trust_override,
+                saved: None,
+                default_trust,
+                mode: cfg.app_mode,
+                prompt_choice: None,
+            },
+            ext_trust.map(|d| ExtensionTrust { trusted: d.trusted, remember: d.remember }),
+        );
         let trusted = matches!(outcome, TrustOutcome::Trusted);
         settings.set_project_trusted(trusted);
 
@@ -861,6 +885,13 @@ impl SessionBuilder {
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
         )));
         host_services.attach_dynamic_tools(dynamic_tools.clone());
+        // EXT-005: seed the guest-visible `ctx.getSystemPrompt()` / `ctx.isProjectTrusted()` reads
+        // from the values this build resolved (Pi binds both straight to the session:
+        // `getSystemPrompt: () => this.systemPrompt` and `isProjectTrusted: () =>
+        // this.settingsManager.isProjectTrusted()`, agent-session.ts:2410,2434). Without this a
+        // guest got the trait defaults — an empty prompt and a confident, wrong `false` for trust,
+        // even in a project cyrup had just decided IS trusted.
+        host_services.update_prompt_state(Some(system_prompt.clone()), settings.project_trusted());
 
         // ---- 7. seed the agent transcript from the resumed branch (R-04-011). The manager was
         // created at step 2b; `existing` already holds its context.
@@ -1278,12 +1309,75 @@ fn fallback_model(
 /// (agent-session.ts:2490-2504) — never a name-keyed table — so a tool that declares no snippet is
 /// simply absent from the "Available tools" section (system-prompt.ts:79-80: `tools.filter(name =>
 /// !!toolSnippets?.[name])`), and one that declares guidelines contributes them as bullets.
-fn tool_contribution(tool: &Arc<dyn cyrup_core::Tool>) -> ToolPromptContribution {
+pub(crate) fn tool_contribution(tool: &Arc<dyn cyrup_core::Tool>) -> ToolPromptContribution {
     ToolPromptContribution {
         tool: Arc::<str>::from(tool.name()),
         snippet: tool.prompt_snippet().map(Arc::<str>::from),
         guidelines: tool.prompt_guidelines().iter().copied().map(Arc::<str>::from).collect(),
     }
+}
+
+/// Consult the extensions' `project_trust` verdict BEFORE the trust decision is frozen (EXT-003).
+///
+/// Pi does this with a deliberate throwaway load: `resource-loader.ts:378-399` calls
+/// `loadProjectTrustExtensions()` (which forces `setProjectTrusted(false)` and loads only the global
+/// plus CLI-configured tier), awaits `options.resolveProjectTrust({extensionsResult})`, drops that
+/// set via `clearExtensionCache()`, then loads everything again against the real verdict. The
+/// callback is wired at `main.ts:691-712` → `resolveProjectTrusted` (`core/project-trust.ts:46-95`),
+/// which slots the extension verdict between the `--approve` override and the saved decision.
+///
+/// cyrup had `ExtensionHost::aggregate_project_trust`, the `project_trust` event kind, the WIT
+/// `on-project-trust` export AND `cyrup_config::decide_trust_with_extension` — all of them, with
+/// zero production callers, because trust was decided in builder step 1 and the `ExtensionHost` was
+/// not constructed until step 4b. This is the missing call.
+///
+/// The pass is a THROWAWAY host: passing `project_trusted = false` is what restricts the loaded set
+/// (`DiscoveredExtension::is_trusted` = `origin.is_pre_trust() || project_trusted`, loader.rs:57-60),
+/// so a project-local extension cannot vote itself trusted. Natives are loaded WITHOUT the live
+/// `HostServices` backend — it does not exist this early, and Pi's `projectTrustContext` likewise
+/// carries only ui + cwd.
+///
+/// NATIVES ARE OPT-IN. Pi's module cache holds FACTORIES, not instances (`loader.ts:148,414-437`),
+/// so its second pass calls the factory again against a fresh `Extension` + `ExtensionAPI`. A cyrup
+/// native has no such re-instantiation: it is a process-lifetime `Arc<dyn NativeExtension>`, so
+/// loading it here would call `init` TWICE ON THE SAME OBJECT. That is not theoretical —
+/// `cyrup-ext-subagents`' `ChildSafe` arm spawns a detached nested-control-inbox poller from `init`,
+/// and a second one would race the first over the same inbox — and the trigger is the common case
+/// (any repo with a `.cyrup/` directory; a subagent child re-execs with no `--approve`). So only
+/// natives that answer `NativeExtension::decides_project_trust` — whose contract is "my `init` is
+/// idempotent" — take part. WASM guests always do: a guest load builds a fresh instance in a fresh
+/// store, which IS Pi's fresh-per-factory-call semantics.
+async fn pre_trust_extension_verdict(
+    cfg: &SessionConfig,
+    cwd: &Path,
+    natives: &[Arc<dyn NativeExtension>],
+) -> Option<cyrup_ext::ProjectTrustDecision> {
+    let (mode, has_ui) = ext_mode(cfg.app_mode);
+    let host_config = HostConfig { mode, has_ui, cwd: cwd.to_path_buf() };
+    #[cfg(feature = "wasm-host")]
+    let host = ExtensionHost::with_wasm(host_config).ok()?;
+    #[cfg(not(feature = "wasm-host"))]
+    let host = ExtensionHost::new(host_config);
+
+    for ext in natives.iter().filter(|e| e.decides_project_trust()) {
+        // A load failure in the throwaway pass must not fail the build — the real load at step 4b
+        // surfaces it. Skip and keep polling the rest.
+        if let Err(e) = host.load_native(ext.clone()).await {
+            tracing::debug!(error = %e, "pre-trust extension load skipped");
+        }
+    }
+    #[cfg(feature = "wasm-host")]
+    {
+        let roots = extension_discovery_roots(cfg);
+        let deny: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(cyrup_ext::DenyServices);
+        // `false` = pre-trust tier only (global + CLI-configured), exactly Pi's
+        // `loadProjectTrustExtensions()`.
+        let _ = host.discover_and_load(&roots, false, deny).await;
+    }
+
+    let decision = host.aggregate_project_trust(&CancelToken::new()).await;
+    // The host (and every instance it loaded) is dropped here — Pi's `clearExtensionCache()`.
+    decision
 }
 
 /// Build the extension discovery roots from the config (Pi `resourceLoaderOptions`

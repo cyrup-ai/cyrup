@@ -48,6 +48,10 @@ mod kind {
     pub const SESSION_COMPACT: u8 = 27;
     pub const SESSION_BEFORE_TREE: u8 = 28;
     pub const SESSION_TREE: u8 = 29;
+    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725; subscribed at
+    /// types.ts:1225) — the run has FULLY settled: no retry, post-run compaction or queued
+    /// continuation will follow (SEAM-005).
+    pub const AGENT_SETTLED: u8 = 30;
 }
 
 /// The block/mutate/notify contribution a handler returns (mirrors the host `HookOutcome`). The
@@ -597,6 +601,12 @@ impl ExtensionApi {
     }
     pub fn on_agent_end(&mut self, f: impl Fn(AgentEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::AGENT_END, notify(move |a, c| f(AgentEndEvent { messages: json(arg(a, 0)) }, c)));
+    }
+    /// Pi `on("agent_settled", handler)` (extensions/types.ts:1225). Fires ONCE per run, after every
+    /// automatic retry / post-run compaction / queued continuation has finished — unlike
+    /// [`Self::on_agent_end`], which fires once per `agent.prompt`/`agent.continue`.
+    pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) {
+        self.handlers.insert(kind::AGENT_SETTLED, notify(move |_a, c| f(c)));
     }
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TURN_START, notify(move |a, c| {

@@ -15,13 +15,38 @@ use crate::{
 use serde_json::{json, Value};
 
 /// A trivial custom renderer for the demo's `custom_type` (Pi `renderCall`/`renderResult`).
+///
+/// The return is a SERIALIZED WIDGET TREE — cyrup's wire analog of the `pi-tui` `Component` a Pi
+/// renderer returns. Build it with [`crate::widget`] rather than a hand-written `json!`: the host
+/// draws only the documented vocabulary as rows and falls back to pretty-printed JSON for anything
+/// else, so a typo here is a JSON blob in the user's transcript.
 struct DemoRenderer;
 impl MessageRenderer for DemoRenderer {
     fn render_call(&self, call: &Value, _ctx: &crate::Ctx) -> Option<Value> {
-        Some(json!({ "widget": "text", "text": format!("demo call: {call}") }))
+        Some(crate::widget::text(format!("demo call: {call}")))
     }
     fn render_result(&self, result: &Value, _ctx: &crate::Ctx) -> Option<Value> {
-        Some(json!({ "widget": "text", "text": format!("demo result: {result}") }))
+        Some(crate::widget::text(format!("demo result: {result}")))
+    }
+}
+
+/// The per-TOOL renderer for `demo_echo` (Pi `ToolDefinition.renderCall`/`renderResult`,
+/// extensions/types.ts:472-481). Registered under the TOOL NAME, which is the key the host routes
+/// a tool row by (EXT-006).
+///
+/// The call side returns a MULTI-NODE tree (Pi renderers routinely return a `Container` of a header
+/// plus detail rows) so the demo exercises the host flattener's stacking, not just the degenerate
+/// single-`Text` case.
+struct DemoToolRenderer;
+impl MessageRenderer for DemoToolRenderer {
+    fn render_call(&self, call: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+        Some(crate::widget::stack([
+            crate::widget::text(format!("guest-rendered echo call: {call}")),
+            crate::widget::text("(drawn by the demo extension)"),
+        ]))
+    }
+    fn render_result(&self, result: &Value, _ctx: &crate::Ctx) -> Option<Value> {
+        Some(crate::widget::text(format!("guest-rendered echo result: {result}")))
     }
 }
 
@@ -32,6 +57,23 @@ pub fn build() -> ExtensionApi {
 
     // Permission gate (R-08-010): block any `bash` tool call with a reason.
     api.on_tool_call(|ev, ctx| {
+        // EXT-005: `abort`/`shutdown` are BASE-context ops in Pi ("Available in all contexts",
+        // extensions/types.ts:339,344) — so an EVENT handler like this gate may call them. Both are
+        // deliberately NOT command-tier-gated host-side.
+        if ev.name == "abortme" {
+            match ctx.abort() {
+                Ok(()) => ctx.ui().notify("demo: abort requested from a tool_call handler"),
+                Err(e) => ctx.ui().notify(&format!("demo: abort rejected: {e}")),
+            }
+            return Outcome::block("aborting the run");
+        }
+        if ev.name == "shutdownme" {
+            match ctx.shutdown() {
+                Ok(()) => ctx.ui().notify("demo: shutdown requested from a tool_call handler"),
+                Err(e) => ctx.ui().notify(&format!("demo: shutdown rejected: {e}")),
+            }
+            return Outcome::block("shutting down");
+        }
         if ev.name == "bash" {
             // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:135).
             ctx.ui().notify_with("permission-gate: blocked a bash call", NotifyKind::Error);
@@ -53,6 +95,55 @@ pub fn build() -> ExtensionApi {
             Err(e) => ctx.ui().notify(&format!("thinking level rejected: {e}")),
         }
     });
+
+    // SEAM-005: `agent_settled` (Pi `on("agent_settled", …)`, extensions/types.ts:1225). Fires ONCE
+    // per run, after every automatic retry / post-run compaction / queued continuation — unlike
+    // `agent_start`/`agent_end` above, which fire once per agent loop. The distinct notification
+    // text is what lets a host test prove the GUEST's handler ran across the WIT boundary.
+    api.on_agent_settled(|ctx| {
+        ctx.ui().notify("demo: agent settled");
+    });
+
+    // EXT-004: register a tool from a LIVE handler, after `init` — Pi's
+    // `examples/extensions/dynamic-tools.ts` registers from exactly this event, and
+    // `extensions/loader.ts:249-256` follows every `registerTool()` with `runtime.refreshTools()`.
+    // The host must re-materialize the descriptor into an EXECUTABLE handle; before EXT-004 the
+    // wrapping happened once right after `init`, so this tool could never be called.
+    api.on_session_start(|ev, ctx| {
+        ctx.ui().notify(&format!("demo: session_start ({})", ev.reason));
+        ctx.register_tool(
+            ToolDescriptor::new(
+                "demo_late",
+                json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            )
+            .description("Registered after init, from a session_start handler (demo)."),
+            |call: ToolCall| {
+                let text = call.params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(ToolOutput::text(format!("late: {text}")))
+            },
+        );
+    });
+
+    // EXT-005: report the BASE-context state accessors (Pi types.ts:329-346) back as text so a test
+    // can prove the guest reads the HOST's live answer rather than a hard-coded default.
+    api.register_command(
+        "ctxstate",
+        CommandDescriptor::new("Report the base-context state accessors (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let base = ctx.ctx();
+            Ok(Some(format!(
+                "idle={} pending={} trusted={} prompt={}",
+                base.is_idle(),
+                base.has_pending_messages(),
+                base.is_project_trusted(),
+                base.system_prompt(),
+            )))
+        },
+    );
 
     // --- the previously-dead mutating seams, now driven by the assembled host (gap-08 #1-#5) ---
 
@@ -196,7 +287,10 @@ pub fn build() -> ExtensionApi {
                 "required": ["text"]
             }),
         )
-        .description("Echo the input text back (demo tool)."),
+        .description("Echo the input text back (demo tool).")
+        // EXT-006: this tool draws its OWN call/result rows (Pi `renderCall`/`renderResult`,
+        // types.ts:472-481). The matching renderer is registered under the tool NAME below.
+        .has_renderer(true),
         |call: ToolCall| {
             let text =
                 call.params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -541,8 +635,13 @@ pub fn build() -> ExtensionApi {
         },
     );
 
-    // A custom message renderer (R-08-020) keyed by a custom tool type.
+    // A custom-MESSAGE renderer (Pi `registerMessageRenderer(customType, renderer)`,
+    // types.ts:1284) keyed by a custom message type.
     api.register_message_renderer("demo", DemoRenderer);
+    // EXT-006: the per-TOOL renderer for `demo_echo` (whose descriptor declares `has_renderer`).
+    // Keyed by the TOOL NAME — that is how the host routes a tool row back to the guest that draws
+    // it (Pi `getCallRenderer`/`getResultRenderer`, tool-execution.ts:81-112).
+    api.register_message_renderer("demo_echo", DemoToolRenderer);
 
     // A custom provider with OAuth + a custom `streamSimple` (Pi `registerProvider({oauth, streamSimple})`,
     // the `custom-provider-*` examples). The `login` flow drives the host `oauth` callbacks; the

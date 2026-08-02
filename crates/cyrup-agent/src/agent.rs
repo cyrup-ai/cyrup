@@ -1366,6 +1366,14 @@ impl Agent {
         }
     }
 
+    /// Whether a run is in flight, read WITHOUT awaiting (Pi `_isAgentRunActive`, the flag behind
+    /// `AgentSession.isIdle`, agent-session.ts:881-883). The sync counterpart of
+    /// [`Self::wait_for_idle`]: an extension's `ctx.isIdle()` host import is a synchronous read and
+    /// cannot await the latch.
+    pub fn is_running(&self) -> bool {
+        *self.running_rx.borrow()
+    }
+
     /// Active run's abort signal, if one is active (Pi `agent.signal`, agent.ts:294-297). Callers can
     /// observe cancellation without holding the agent's internal slot.
     pub fn signal(&self) -> Option<CancelToken> {

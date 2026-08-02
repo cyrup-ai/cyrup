@@ -32,6 +32,9 @@ cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
 cyrup-ext = { workspace = true }
 thiserror = { workspace = true }
+# Version-pinned directly here, matching cyrup-ext/Cargo.toml:29 (the workspace has no `tracing`
+# alias). Used for the non-fatal diagnostics the builder must surface rather than drop silently.
+tracing = "0.1.44"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

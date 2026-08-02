@@ -62,7 +62,12 @@ pub enum Entry {
     SkillInvocation { name: String, content: String },
     /// A custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
     /// `body`, styled distinctly from a plain user message.
-    Custom { label: String, body: String },
+    ///
+    /// `rendered` carries the text an extension's registered message renderer produced for this
+    /// custom type (EXT-006); when present it REPLACES the label+markdown framing, because the
+    /// renderer already owns the presentation (Pi hands the resolved renderer to
+    /// `CustomMessageComponent` instead of the default, interactive-mode.ts:3324-3336).
+    Custom { label: String, body: String, rendered: Option<String> },
     /// A branch-summary message (`branch-summary-message.ts`): a bold `[branch]` label + the
     /// `**Branch Summary**` markdown body produced when navigating away from a branch.
     BranchSummary(String),
@@ -97,6 +102,14 @@ pub struct ToolRun {
     /// Frozen run duration in milliseconds, set on [`TranscriptView::push_tool_end`]. Rendered as the
     /// bash `Took {d}s` footer once the command finishes.
     duration_ms: Option<u64>,
+    /// The CALL text an extension's registered renderer produced for this tool (EXT-006; Pi
+    /// `ToolDefinition.renderCall`, extensions/types.ts:472-473, preferred over the built-in by
+    /// `tool-execution.ts:81-112`). `None` = no extension renders this tool, so the built-in
+    /// per-tool dispatch draws it.
+    pub rendered_call: Option<String>,
+    /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
+    /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
+    pub rendered_result: Option<String>,
 }
 
 /// The scrolling conversation history.
@@ -306,6 +319,19 @@ impl TranscriptView {
     /// Record a tool starting (live in the viewport): name + the raw call args (`ToolExecutionStart`).
     /// The args drive the per-tool `renderCall` header (path/command/pattern/range/…).
     pub fn push_tool_start(&mut self, name: impl Into<String>, args: Value) {
+        self.push_tool_start_rendered(name, args, None);
+    }
+
+    /// [`Self::push_tool_start`] with the CALL text an extension's registered renderer produced
+    /// (EXT-006). `rendered` replaces the built-in per-tool header for this run; `None` keeps the
+    /// built-in dispatch (Pi prefers the extension's `renderCall` when the tool declares one,
+    /// tool-execution.ts:81-112).
+    pub fn push_tool_start_rendered(
+        &mut self,
+        name: impl Into<String>,
+        args: Value,
+        rendered: Option<String>,
+    ) {
         self.active_tools.push(ToolRun {
             name: name.into(),
             args,
@@ -314,6 +340,8 @@ impl TranscriptView {
             done: false,
             started_at: Some(std::time::Instant::now()),
             duration_ms: None,
+            rendered_call: rendered,
+            rendered_result: None,
         });
     }
 
@@ -331,12 +359,25 @@ impl TranscriptView {
     /// with that name still running, else a fresh done entry so a missed start never drops the result).
     /// Freezes the run duration for the bash `Took …` footer.
     pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
+        self.push_tool_end_rendered(name, is_error, result, None);
+    }
+
+    /// [`Self::push_tool_end`] with the RESULT text an extension's registered renderer produced
+    /// (EXT-006; Pi `renderResult`, extensions/types.ts:475-481). `None` keeps the built-in body.
+    pub fn push_tool_end_rendered(
+        &mut self,
+        name: impl Into<String>,
+        is_error: bool,
+        result: Option<Value>,
+        rendered: Option<String>,
+    ) {
         let name = name.into();
         if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name) {
             run.done = true;
             run.is_error = is_error;
             run.result = result;
             run.duration_ms = run.started_at.map(|s| s.elapsed().as_millis() as u64);
+            run.rendered_result = rendered;
         } else {
             self.active_tools.push(ToolRun {
                 name,
@@ -346,6 +387,8 @@ impl TranscriptView {
                 done: true,
                 started_at: None,
                 duration_ms: None,
+                rendered_call: None,
+                rendered_result: rendered,
             });
         }
     }
@@ -431,7 +474,30 @@ impl TranscriptView {
     /// Push a custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
     /// `body`.
     pub fn push_custom_message(&mut self, label: impl Into<String>, body: impl Into<String>) {
-        self.pending.push(Entry::Custom { label: label.into(), body: body.into() });
+        self.pending.push(Entry::Custom {
+            label: label.into(),
+            body: body.into(),
+            rendered: None,
+        });
+    }
+
+    /// [`Self::push_custom_message`] with the text an extension's registered message renderer
+    /// produced for this custom type (EXT-006; Pi resolves the renderer at
+    /// `interactive-mode.ts:3326` — `extensionRunner.getMessageRenderer(message.customType)` — and
+    /// hands it to `CustomMessageComponent` INSTEAD of the default framing). When `rendered` is
+    /// `Some`, the extension's lines are emitted verbatim: no `[label]` bracket, no markdown
+    /// re-wrap, because the renderer already decided how the block looks.
+    pub fn push_custom_message_rendered(
+        &mut self,
+        label: impl Into<String>,
+        body: impl Into<String>,
+        rendered: Option<String>,
+    ) {
+        self.pending.push(Entry::Custom {
+            label: label.into(),
+            body: body.into(),
+            rendered,
+        });
     }
 
     /// Push a branch-summary message (`branch-summary-message.ts`): the `**Branch Summary**` body
@@ -528,6 +594,17 @@ pub(crate) fn tool_lines(
     theme: &UiTheme,
 ) -> Vec<Line<'static>> {
     let mut block: Vec<Line<'static>> = Vec::new();
+    // EXT-006: an extension that registered a renderer for THIS tool name owns the block (Pi
+    // prefers the extension's `renderCall`/`renderResult` over the built-in's,
+    // tool-execution.ts:81-112). Checked before the built-in dispatch so an extension can also
+    // override how a BUILT-IN tool draws, exactly as Pi's definition-registry override does.
+    if run.rendered_call.is_some() || run.rendered_result.is_some() {
+        render_extension(run, expanded, theme, &mut block);
+        let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
+        let mut out = vec![Line::default()];
+        out.extend(finalize_block(block, width, bg));
+        return out;
+    }
     match run.name.as_str() {
         "read" => render_read(run, expanded, theme, &mut block),
         "write" => render_write(run, expanded, theme, &mut block),
@@ -768,6 +845,30 @@ fn render_ls(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<
 
 /// Non-built-in tools fall back to Pi's `formatToolExecution` (tool-execution.ts:365-376): the bold
 /// tool name + pretty-printed args + any text output.
+/// Draw a tool whose renderer an extension supplied (EXT-006). The extension's `renderCall` text
+/// is the header; its `renderResult` text is the body, shown once the run finishes (collapsed runs
+/// keep the header only, matching every built-in's collapsed form). A half-supplied renderer
+/// degrades gracefully: a missing call text falls back to the tool NAME header, a missing result
+/// text simply omits the body.
+fn render_extension(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    match &run.rendered_call {
+        Some(call) => {
+            for l in call.split('\n') {
+                out.push(Line::styled(l.to_string(), theme.tool_title_style()));
+            }
+        }
+        None => out.push(Line::styled(run.name.clone(), theme.tool_title_style())),
+    }
+    if let Some(result) = &run.rendered_result
+        && (run.done || expanded)
+        && !result.trim().is_empty()
+    {
+        for l in result.split('\n') {
+            out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+        }
+    }
+}
+
 fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
     if !run.args.is_null()
@@ -1218,10 +1319,18 @@ pub(crate) fn entry_lines(
             // form — `skill-invocation-message.ts` expanded branch).
             labeled_message_lines("skill", &format!("**{name}**"), content, theme, width)
         }
-        Entry::Custom { label, body } => {
+        Entry::Custom { label, body, rendered } => match rendered {
+            // EXT-006: an extension registered a renderer for this custom type, so ITS output is
+            // the block (Pi hands the resolved renderer to `CustomMessageComponent` in place of the
+            // default framing, interactive-mode.ts:3324-3336). Emitted verbatim — the renderer
+            // already owns the presentation, so no `[label]` bracket is added.
+            Some(text) => text
+                .split('\n')
+                .map(|l| Line::styled(l.to_string(), theme.dim_style()))
+                .collect(),
             // A bracketed extension-type label + the markdown body (`custom-message.ts`).
-            labeled_message_lines(label, "", body, theme, width)
-        }
+            None => labeled_message_lines(label, "", body, theme, width),
+        },
         Entry::BranchSummary(summary) => {
             labeled_message_lines("branch", "**Branch Summary**", summary, theme, width)
         }

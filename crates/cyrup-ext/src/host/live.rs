@@ -125,6 +125,10 @@ impl bindings::cyrup::ext::registration::Host for HostState {
 
     async fn register_message_renderer(&mut self, custom_type: String) {
         let Ok(guest) = guest_of(self) else { return };
+        // Record it in the SHARED registry so the host can route a custom type back to its owning
+        // guest (Pi `getMessageRenderer`, runner.ts:579-587) — the per-guest `GuestState` vec below
+        // is host-side bookkeeping only and no consumer can reach it by custom type (EXT-006).
+        let _ = guest.registry.register_message_renderer(guest.owner.clone(), custom_type.clone());
         guest.add_renderer(custom_type);
     }
 
@@ -817,6 +821,42 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
         guest.services.control(ControlOp::SendUserMessage { content, opts })
     }
+
+    /// Pi `ctx.abort()` (extensions/types.ts:339): "Abort the current agent run. **Available in all
+    /// contexts.**" Deliberately NOT `require_command_tier()`-gated — unlike the session-REPLACEMENT
+    /// ops above, aborting cannot re-enter the guest, and Pi's canonical use is an event handler (a
+    /// `tool_call` gate) deciding the run must stop. Pi binds it at agent-session.ts:2405-2436.
+    async fn abort(&mut self) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.services.control(ControlOp::Abort)
+    }
+
+    /// Pi `ctx.shutdown()` (extensions/types.ts:344): "Gracefully shutdown pi and exit. **Available
+    /// in all contexts.**" (runner entry point runner.ts:656-662). Also untiered, for the same
+    /// reason as [`Self::abort`].
+    async fn shutdown(&mut self) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        guest.services.control(ControlOp::Shutdown)
+    }
+}
+
+/// Read-only base-context state (Pi `ExtensionContext`, extensions/types.ts:329-346). Served
+/// straight off the injected [`crate::host::HostServices`] backend, so a guest reads the LIVE
+/// session's answer instead of a hard-coded default (EXT-005). Untiered: Pi puts all four on the
+/// base context, available to every handler.
+impl bindings::cyrup::ext::ctx_state::Host for HostState {
+    async fn is_idle(&mut self) -> bool {
+        guest_of(self).map(|g| g.services.is_idle()).unwrap_or(true)
+    }
+    async fn has_pending_messages(&mut self) -> bool {
+        guest_of(self).map(|g| g.services.has_pending_messages()).unwrap_or(false)
+    }
+    async fn is_project_trusted(&mut self) -> bool {
+        guest_of(self).map(|g| g.services.is_project_trusted()).unwrap_or(false)
+    }
+    async fn get_system_prompt(&mut self) -> String {
+        guest_of(self).ok().and_then(|g| g.services.system_prompt()).unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,6 +1501,10 @@ async fn invoke(
         HostEvent::AgentEnd { messages } => {
             let m = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
             api.call_on_agent_end(store, &m).await.and_then(|()| noop())
+        }
+        // agent_settled (Pi `_emitAgentSettled`, agent-session.ts:581-588): payload-free, notify-only.
+        HostEvent::AgentSettled => {
+            api.call_on_agent_settled(store).await.and_then(|()| noop())
         }
         HostEvent::TurnStart { turn_index, timestamp } => {
             api.call_on_turn_start(store, *turn_index, *timestamp).await.and_then(|()| noop())

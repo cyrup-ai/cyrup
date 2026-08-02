@@ -27,6 +27,7 @@ pub mod example;
 pub mod macros;
 pub mod provider;
 pub mod tool_factory;
+pub mod widget;
 
 #[cfg(target_arch = "wasm32")]
 pub mod guest;
@@ -77,6 +78,10 @@ pub mod prelude {
         OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream,
         StreamSimple,
     };
+    /// The serialized widget tree a renderer returns (EXT-006). Exported as a MODULE, not flat
+    /// names, so `widget::text(..)` reads at the call site and cannot collide with the `text`
+    /// field/method names an extension author already has in scope.
+    pub use crate::widget;
     pub use crate::tool_factory::define_tool;
 }
 

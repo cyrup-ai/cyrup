@@ -201,6 +201,14 @@ pub enum AgentSessionEvent {
     EntryAppended {
         entry: Value,
     },
+    /// The agent run has FULLY settled: no automatic retry, post-run compaction or queued
+    /// continuation will follow (Pi `{ type: "agent_settled" }`, agent-session.ts:146 /
+    /// `AgentSettledEvent`, extensions/types.ts:721-725). Distinct from `agent_end`, which fires
+    /// once per `agent.prompt`/`agent.continue` — a turn that auto-retries emits TWO `agent_end`s
+    /// and exactly ONE `agent_settled`. Pi emits it from the `finally` of `_runAgentPrompt`
+    /// (:1063-1072), after `_flushPendingBashMessages()`, and its hosts key shutdown + idle
+    /// bookkeeping off it (rpc-mode.ts:355-358, interactive-mode.ts:3137).
+    AgentSettled,
     /// A session was started/replaced by the runtime (Pi `session_start`,
     /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
     SessionStart {
@@ -283,6 +291,7 @@ impl AgentSessionEvent {
             AgentSessionEvent::ToolExecutionEnd { .. } => "tool_execution_end",
             AgentSessionEvent::TurnEnd { .. } => "turn_end",
             AgentSessionEvent::AgentEnd { .. } => "agent_end",
+            AgentSessionEvent::AgentSettled => "agent_settled",
             AgentSessionEvent::QueueUpdate { .. } => "queue_update",
             AgentSessionEvent::CompactionStart { .. } => "compaction_start",
             AgentSessionEvent::CompactionEnd { .. } => "compaction_end",

@@ -527,8 +527,23 @@ where
     let reader_task = tokio::spawn(read_lines(reader, cmd_tx));
 
     let mut reader_open = true;
-    // True from the moment a run is accepted until its `agent_end` is observed.
+    // True from the moment a run is accepted until its `agent_settled` is observed (SEAM-005 — the
+    // whole run, not just the first agent loop).
     let mut in_flight = false;
+    // Latches when a loaded extension called `ctx.shutdown()` (Pi's `shutdownRequested` closure
+    // variable, set by the `shutdownHandler` bound in `bindExtensions`, rpc-mode.ts:344-346). It is
+    // sampled every loop iteration — not only at the settle point — because a session REPLACEMENT
+    // (`ctx.newSession()` from another handler) brings a fresh `AgentSession` with a fresh flag, and
+    // Pi's closure variable would have survived that. Acted on at the next
+    // [`shutdown_checkpoint`], which is Pi's `checkShutdownRequested` call sites (:357 and :786).
+    let mut shutdown_requested = false;
+    // Whether the loop has reached a point at which Pi calls `checkShutdownRequested()`. Pi has TWO
+    // such points, not one: the `agent_settled` arm (rpc-mode.ts:355-358) AND the tail of every
+    // handled command (`await checkShutdownRequested()`, rpc-mode.ts:786). The second is
+    // load-bearing — Pi's own canonical example of `ctx.shutdown()`
+    // (`examples/extensions/shutdown-command.ts`) is a `/quit` COMMAND that exits with no agent run
+    // ever having happened, so gating on a settle alone would make that command silently do nothing.
+    let mut shutdown_checkpoint = false;
 
     // In-flight dispatches of the potentially-BLOCKING and session-replacing commands, driven
     // CONCURRENTLY with continued input reading so an `abort`/`abort_bash` line arriving mid-command
@@ -564,6 +579,8 @@ where
                             let dispatched =
                                 dispatch(runtime, &session, &line, &mut in_flight).await;
                             write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                            // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786).
+                            shutdown_checkpoint = true;
                         } else {
                             // Everything else — including the blocking `bash`/`compact`/`export_html`
                             // and the session-replacing `new_session`/`switch_session`/`fork`/`clone`
@@ -582,6 +599,9 @@ where
                 // written only here + the inline arm, both on this single loop task, so the writer is
                 // never shared across the concurrent dispatch futures (they only compute a response).
                 write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786) — the
+                // concurrent-dispatch twin of the inline arm above.
+                shutdown_checkpoint = true;
                 if dispatched.rebind {
                     // The active session was replaced — re-acquire it and re-subscribe (the prior
                     // subscription was terminated, R-11-021).
@@ -625,15 +645,39 @@ where
             }
             maybe_ev = events.next() => {
                 if let Some(ev) = maybe_ev {
-                    if matches!(ev, AgentSessionEvent::AgentEnd { .. }) {
+                    // SEAM-005: a run is "in flight" until it SETTLES, not until its first
+                    // `agent_end`. `agent_end` fires once per agent loop, so an auto-retry / post-run
+                    // compaction / queued continuation produces another one — clearing the flag there
+                    // let the EOF shutdown check below fire mid-run and cut the stream (and, on a
+                    // fast turn, race the trailing `agent_settled` line off the wire entirely).
+                    // `agent_settled` is emitted exactly once, at the end of the whole run, on every
+                    // path — including a failed `agent.prompt`, whose settle still runs.
+                    if matches!(ev, AgentSessionEvent::AgentSettled) {
                         in_flight = false;
                     }
+                    // SEAM-005 + EXT-005: a loaded extension's `ctx.shutdown()` is honoured at the
+                    // SETTLE point, never mid-run — Pi checks `shutdownRequested` in exactly this
+                    // arm (`if (event.type === "agent_settled") void checkShutdownRequested()`,
+                    // rpc-mode.ts:355-358). Waiting for `agent_settled` rather than `agent_end` is
+                    // load-bearing: `agent_end` fires again after an auto-retry or a post-run
+                    // compaction, so exiting there would cut a run that is still going.
+                    let settled = matches!(ev, AgentSessionEvent::AgentSettled);
                     // The internal `SessionReplaced` terminal is a rebind signal, not a Pi event.
                     if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
                         write_out(writer, &RpcOut::Event(Box::new(ev))).await?;
                     }
+                    if settled {
+                        shutdown_checkpoint = true;
+                    }
                 }
             }
+        }
+
+        shutdown_requested |= session.shutdown_requested();
+        if shutdown_requested && shutdown_checkpoint && !in_flight {
+            // Pi `checkShutdownRequested` (rpc-mode.ts:363-372): stop reading, let the loop's own
+            // teardown flush whatever is buffered, and return.
+            reader_open = false;
         }
 
         if !reader_open && !in_flight && dispatches.is_empty() {
