@@ -350,3 +350,112 @@ async fn rpc_dispatch_disposes_the_runtime_at_reader_eof() {
         "RPC dispatch must dispose the runtime at reader EOF (Pi rpc-mode.ts:723-739/:801-803)"
     );
 }
+
+// ----------------------------------------------------------------------------------------------
+// SEAM-001 — the mirror image of SEAM-002: every non-interactive host must ANNOUNCE the initial
+// session with `session_start{reason:"startup"}` before it runs anything. Pi binds the extension
+// host at print-mode.ts:73 / rpc-mode.ts:318, ahead of the send loop, and `bindExtensions` ends by
+// emitting `_sessionStartEvent` (agent-session.ts:2250), which defaults to
+// `{type:"session_start", reason:"startup"}` (agent-session.ts:389). Pre-fix cyrup emitted
+// `session_start` ONLY from the runtime's replacement tail, so a one-shot `cyrup -p …` run — the
+// same path a spawned subagent child re-execs into — never announced its one and only session.
+// ----------------------------------------------------------------------------------------------
+
+/// Drain `sub` until the stream ends (or a per-event timeout elapses) and return the ordered event
+/// kind strings.
+async fn drain_kinds(
+    sub: &mut cyrup_sdk::core::EventStream<cyrup_session_svc::AgentSessionEvent>,
+) -> Vec<&'static str> {
+    use futures::StreamExt;
+    let mut kinds = Vec::new();
+    for _ in 0..400 {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), sub.next()).await {
+            Ok(Some(ev)) => kinds.push(ev.kind()),
+            _ => break,
+        }
+    }
+    kinds
+}
+
+/// Assert `session_start` is present exactly once and precedes the first `agent_start`.
+fn assert_announced_before_run(kinds: &[&str], mode: &str) {
+    let starts = kinds.iter().filter(|k| **k == "session_start").count();
+    assert_eq!(
+        starts, 1,
+        "{mode} dispatch must emit exactly one session_start (Pi agent-session.ts:2250); saw {kinds:?}"
+    );
+    let start_at = kinds.iter().position(|k| *k == "session_start").unwrap();
+    let agent_at = kinds
+        .iter()
+        .position(|k| *k == "agent_start")
+        .unwrap_or_else(|| panic!("{mode} dispatch must actually run a turn; saw {kinds:?}"));
+    assert!(
+        start_at < agent_at,
+        "{mode} dispatch must announce the session BEFORE the first prompt \
+         (Pi binds extensions at print-mode.ts:73, ahead of the send loop at :121); saw {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_dispatch_announces_session_start_before_the_run() {
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+    let mut sub = session.subscribe();
+
+    let mut out: Vec<u8> = Vec::new();
+    run_print_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    let kinds = drain_kinds(&mut sub).await;
+    assert_announced_before_run(&kinds, "PRINT");
+}
+
+#[tokio::test]
+async fn json_dispatch_announces_session_start_before_the_run() {
+    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+    let mut sub = session.subscribe();
+
+    let mut out: Vec<u8> = Vec::new();
+    run_json_dispatch(&session, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    let kinds = drain_kinds(&mut sub).await;
+    assert_announced_before_run(&kinds, "JSON");
+}
+
+/// RPC: `AgentSessionRuntime::create` is the bind point for the persistent host (Pi rpc-mode.ts:318
+/// `rebindSession()` invoked at :381), so the session handed out by the runtime is already
+/// announced — and a later host bind must not repeat it.
+#[tokio::test]
+async fn rpc_runtime_announces_the_initial_session_at_startup() {
+    use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+    let factory = Arc::new(SessionFactory::new(provider, config));
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+
+    let session = runtime.session().await;
+    let mut sub = session.subscribe();
+    // A host that binds after taking the runtime's session must NOT produce a second announcement.
+    cyrup::run::announce_session_start(&session).await;
+
+    let kinds = drain_kinds(&mut sub).await;
+    assert!(
+        !kinds.contains(&"session_start"),
+        "the runtime already announced its initial session; a host bind must not repeat it, saw {kinds:?}"
+    );
+}

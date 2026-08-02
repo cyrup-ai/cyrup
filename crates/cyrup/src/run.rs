@@ -22,6 +22,9 @@ pub async fn run_print_dispatch<W: Write>(
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
+    // Bind + announce BEFORE the first prompt — Pi's `rebindSession()` → `session.bindExtensions()`
+    // runs at print-mode.ts:73, ahead of the send loop at :121 (see [`announce_session_start`]).
+    announce_session_start(session).await;
     let messages =
         std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
     let mut err = std::io::stderr();
@@ -46,6 +49,8 @@ pub async fn run_json_dispatch<W: Write>(
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
+    // Same startup bind as PRINT — print-mode.ts:73 serves both modes (`mode === "json" ? …`).
+    announce_session_start(session).await;
     let ran = async {
         run_json(session, initial_input(inputs), out).await?;
         for follow_up in &inputs.follow_ups {
@@ -58,6 +63,22 @@ pub async fn run_json_dispatch<W: Write>(
     dispose_session(session).await;
     ran?;
     Ok(0)
+}
+
+/// Bind the extension host to `session` and announce it with `session_start{reason:"startup"}` (Pi
+/// `session.bindExtensions(...)`, print-mode.ts:73 → agent-session.ts:2250, whose event defaults to
+/// `{type:"session_start", reason:"startup"}` at agent-session.ts:389).
+///
+/// The mirror image of [`dispose_session`]: the ONE startup announcement every non-interactive
+/// one-shot host funnels through. Without it no extension observes the FIRST — and for `cyrup -p`
+/// the ONLY — session of the process, so the permission gate never refreshes its per-cwd policy or
+/// starts the ask-forwarding watcher, subagents never reset background-run tracking, and intercom's
+/// `SessionStart` arm never runs. Interactive/RPC get theirs from `AgentSessionRuntime::create`.
+///
+/// Idempotent per session (`AgentSession::bind_extensions`), so a host that also drives a runtime
+/// cannot announce twice.
+pub async fn announce_session_start(session: &AgentSession) {
+    session.bind_extensions().await;
 }
 
 /// Emit `session_shutdown{reason:"quit"}` and tear the session down (Pi `AgentSessionRuntime.dispose`

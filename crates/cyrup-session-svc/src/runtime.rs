@@ -100,11 +100,20 @@ pub struct AgentSessionRuntime {
 impl AgentSessionRuntime {
     /// Build the initial runtime from a `factory` + initial `target` (Pi `createAgentSessionRuntime`,
     /// agent-session-runtime.ts:406).
+    ///
+    /// The initial session is ANNOUNCED here (`session_start{reason:"startup"}`) — the mirror image
+    /// of the `session_shutdown` [`Self::dispose`] emits at teardown. Pi's hosts do this by calling
+    /// `session.bindExtensions()` right after `createAgentSessionRuntime` (rpc-mode.ts:318 via
+    /// `rebindSession`, interactive-mode.ts:1698), which emits the session's `_sessionStartEvent`;
+    /// for an initial runtime `main.ts:674` passes no `sessionStartEvent`, so it defaults to
+    /// `{type:"session_start", reason:"startup"}` (agent-session.ts:389). Replacements are announced
+    /// instead by [`Self::install_inner`] with their own reason.
     pub async fn create(
         factory: Arc<SessionFactory>,
         target: SessionTarget,
     ) -> Result<Self, SessionServiceError> {
         let session = factory.build(target, None).await?.into_shared();
+        session.bind_extensions().await;
         let diagnostics = collect_diagnostics(&session);
         let (gen_tx, _rx) = watch::channel(0);
         Ok(Self {

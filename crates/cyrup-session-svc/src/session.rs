@@ -293,6 +293,11 @@ pub struct AgentSession {
     /// prompts through additional [`crate::AgentSession::prompt`]-scoped `run_json` calls, so the
     /// header emitter ([`Self::claim_json_header`]) consults this latch to stay one-shot per session.
     json_header_written: AtomicBool,
+    /// Latches `true` the first time this session is announced with `session_start`. Pi emits its
+    /// `_sessionStartEvent` exactly once per `AgentSession` (agent-session.ts:2250, reached from
+    /// `bindExtensions`); the latch keeps that one-shot contract when a host binds a session the
+    /// runtime already announced.
+    start_announced: AtomicBool,
     /// Facade-side mirror of the steering queue text (Pi `_steeringMessages`, agent-session.ts:476)
     /// for `queue_update` emission + introspection; the authoritative queue lives in the agent.
     steering_messages: Mutex<Vec<String>>,
@@ -409,6 +414,7 @@ impl AgentSession {
             session_cancel,
             session_id,
             json_header_written: AtomicBool::new(false),
+            start_announced: AtomicBool::new(false),
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
             model_fallback_message,
@@ -1985,9 +1991,32 @@ impl AgentSession {
         self.fanout.invalidate(generation).await;
     }
 
+    /// Bind this session to its extension host and announce it as a FRESH START (Pi
+    /// `bindExtensions`, agent-session.ts:2229-2251, whose tail is
+    /// `await this._extensionRunner.emit(this._sessionStartEvent)`; that event defaults to
+    /// `{type:"session_start", reason:"startup"}` at agent-session.ts:389).
+    ///
+    /// This is the seam every host calls exactly once for the INITIAL session, before any prompt —
+    /// pi does it from print-mode.ts:73, rpc-mode.ts:318 and interactive-mode.ts:1698. In cyrup the
+    /// bindings themselves are installed at build time, so the remaining work is the announcement.
+    ///
+    /// Session REPLACEMENTS (`new`/`resume`/`fork`/`reload`) are announced by the runtime's install
+    /// tail with their own reason, which is why this is idempotent per session: whichever tier
+    /// announces first wins and a later bind is a no-op (pi likewise emits `_sessionStartEvent`
+    /// exactly once per `AgentSession`).
+    pub async fn bind_extensions(&self) {
+        self.emit_session_start("startup", None).await;
+    }
+
     /// Announce this (freshly-installed) session to its subscribers + extensions (Pi `session_start`,
-    /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
+    /// agent-session-runtime.ts:215). `reason` ∈ `startup`/`new`/`resume`/`fork`/`reload`.
+    ///
+    /// At most ONE announcement is emitted per session (pi emits `_sessionStartEvent` once, from
+    /// `bindExtensions`); subsequent calls return without emitting.
     pub async fn emit_session_start(&self, reason: &str, previous_session_file: Option<String>) {
+        if self.start_announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.fanout_emit(AgentSessionEvent::SessionStart {
             reason: reason.to_string(),
             previous_session_file,
