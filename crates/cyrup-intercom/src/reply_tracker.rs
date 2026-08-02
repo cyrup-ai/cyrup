@@ -87,8 +87,11 @@ impl ReplyTracker {
         self.current_turn_context = None;
     }
 
-    /// Resolve which inbound ask a `reply` targets (`resolveReplyTarget`, `:52-93`) with the exact
-    /// precedence: explicit `reply_to` → current turn context → single pending → `to`-filter → error.
+    /// Resolve which inbound ask a `reply` targets (`resolveReplyTarget`, `:52-90`) with the exact
+    /// precedence: explicit `reply_to` → explicit `to` → current turn context → single pending →
+    /// error. Both explicit hints outrank the inferred target, and the `to`-filter is TERMINAL
+    /// (`:67-76`): zero matches errors with `No pending ask from "…"` rather than falling through to
+    /// the turn context or the lone pending ask, so an addressed reply can never be misrouted.
     ///
     /// # Errors
     /// Returns a human-readable message when the target cannot be uniquely resolved.
@@ -114,31 +117,25 @@ impl ReplyTracker {
             return Ok(target);
         }
 
-        if let Some(current) = &self.current_turn_context {
-            return Ok(current.clone());
-        }
-
         let pending: Vec<IntercomContext> = self.pending_asks.values().cloned().collect();
-        if pending.len() == 1
-            && let Some(only) = pending.first().cloned()
-        {
-            return Ok(only);
-        }
 
         if let Some(to) = to {
             let matches: Vec<IntercomContext> =
                 pending.iter().filter(|c| matches_pending_sender(c, to)).cloned().collect();
-            if matches.len() == 1
-                && let Some(only) = matches.first().cloned()
-            {
-                return Ok(only);
-            }
             if matches.len() > 1 {
                 return Err(format!("Multiple pending asks from \"{to}\" — use the sender session ID instead."));
             }
-            if pending.len() > 1 {
-                return Err(format!("No pending ask from \"{to}\""));
-            }
+            return matches.into_iter().next().ok_or_else(|| format!("No pending ask from \"{to}\""));
+        }
+
+        if let Some(current) = &self.current_turn_context {
+            return Ok(current.clone());
+        }
+
+        if pending.len() == 1
+            && let Some(only) = pending.first().cloned()
+        {
+            return Ok(only);
         }
 
         if pending.is_empty() {
@@ -330,6 +327,89 @@ mod tests {
         // With a `to` hint that uniquely matches, it resolves.
         let target = rt.resolve_reply_target(Some("alice"), None, now_ms()).expect("resolves by name");
         assert_eq!(target.from.id, "s1");
+    }
+
+    // reply-tracker.test.ts:57-66 — "explicit to overrides the current turn context". An explicit
+    // `to` is evaluated BEFORE the current turn context, so a reply addressed to the reviewer must
+    // route to the reviewer's ask even while the planner's ask is the active turn context.
+    #[test]
+    fn explicit_to_overrides_current_turn_context() {
+        let mut rt = ReplyTracker::new(600_000);
+        let current = rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1002);
+
+        // Sanity: with no `to`, the current turn context still wins (the other ordering).
+        let bare = rt.resolve_reply_target(None, None, 1003).expect("current turn context resolves");
+        assert_eq!(bare.message.id, "ask-1", "no `to` must fall back to the current turn context");
+        assert_eq!(bare.from.id, "planner-id");
+
+        // The inverted-precedence bug: `to` must beat the current turn context.
+        let target = rt.resolve_reply_target(Some("reviewer"), None, 1003).expect("`to` resolves");
+        assert_eq!(target.message.id, "ask-2", "explicit `to` must override the current turn context");
+        assert_eq!(target.from.id, "reviewer-id");
+
+        // And a `to` that matches nothing must error rather than silently falling back.
+        let err = rt.resolve_reply_target(Some("missing"), None, 1003).expect_err("unmatched `to` errors");
+        assert_eq!(err, "No pending ask from \"missing\"");
+    }
+
+    // An unmatched `to` must error even when exactly ONE ask is pending — upstream's
+    // `No pending ask from "..."` throw at reply-tracker.ts:75 is unconditional.
+    #[test]
+    fn explicit_to_beats_the_single_pending_shortcut() {
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+
+        // Sanity: with no `to`, the single pending ask resolves (the other ordering).
+        let bare = rt.resolve_reply_target(None, None, 1001).expect("single pending resolves");
+        assert_eq!(bare.message.id, "ask-1");
+
+        let err = rt
+            .resolve_reply_target(Some("reviewer"), None, 1001)
+            .expect_err("a `to` naming nobody must not fall through to the lone pending ask");
+        assert_eq!(err, "No pending ask from \"reviewer\"");
+    }
+
+    // reply-tracker.test.ts:47-55 — `to` matches by session id or by case-insensitive name.
+    #[test]
+    fn explicit_to_matches_by_id_or_name() {
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
+
+        assert_eq!(rt.resolve_reply_target(Some("reviewer"), None, 1002).expect("by name").message.id, "ask-2");
+        assert_eq!(rt.resolve_reply_target(Some("planner-id"), None, 1002).expect("by id").message.id, "ask-1");
+        assert_eq!(rt.resolve_reply_target(Some("REVIEWER"), None, 1002).expect("case-insensitive").message.id, "ask-2");
+    }
+
+    // reply-tracker.ts:72-74 — two pending asks from the same sender is ambiguous, even when a
+    // turn context is active (which under the inverted order would have masked the error).
+    #[test]
+    fn explicit_to_with_multiple_matches_errors_over_turn_context() {
+        let mut rt = ReplyTracker::new(600_000);
+        let first = rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-2"), 1001);
+        rt.queue_turn_context(first);
+        rt.begin_turn(1002);
+
+        let err = rt.resolve_reply_target(Some("planner"), None, 1003).expect_err("ambiguous `to`");
+        assert_eq!(err, "Multiple pending asks from \"planner\" — use the sender session ID instead.");
+    }
+
+    // reply-tracker.ts:55-64 — `reply_to` still outranks `to`, and `to` is only a cross-check.
+    #[test]
+    fn explicit_reply_to_still_outranks_to() {
+        let mut rt = ReplyTracker::new(600_000);
+        rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
+
+        let target = rt.resolve_reply_target(None, Some("ask-2"), 1002).expect("reply_to resolves");
+        assert_eq!(target.from.id, "reviewer-id");
+
+        let err = rt.resolve_reply_target(Some("planner"), Some("ask-2"), 1002).expect_err("mismatched pair");
+        assert_eq!(err, "Pending ask \"ask-2\" is not from \"planner\"");
     }
 
     #[test]
