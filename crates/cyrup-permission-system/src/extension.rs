@@ -56,7 +56,7 @@ use serde_json::{json, Value};
 use cyrup_core::ExtensionId;
 use cyrup_ext::{
     EventKind, EventPatch, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi,
-    NativeExtension,
+    NativeExtension, NotifyKind,
 };
 
 use crate::ask::{
@@ -95,6 +95,66 @@ const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 pub const CHILD_ENV_VAR: &str = "CYRUP_SUBAGENT_CHILD";
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
+
+/// pi's `notifyWarning` + `shownWarnings` pair (`index.ts:1573,1586-1592`): the ONE user-visible
+/// sink every policy-file / config-file load warning funnels into, deduped for the life of a
+/// session so a per-tool-call reload storm cannot spam the same message.
+///
+/// Before this existed, [`PermissionManager::with_on_warning`] was called only from unit tests, so
+/// in production a malformed `cyrup-permissions.jsonc` fell back to `ask`-everything **in total
+/// silence** — indistinguishable from a policy that genuinely says `ask`.
+///
+/// Holds the SAME late-bound `Arc<OnceLock<Arc<dyn HostServices>>>` the extension does, so a
+/// manager built during construction (before the host attaches its backend) still delivers once
+/// the backend lands — that late binding is why this is a shared handle and not a captured
+/// `Arc<dyn HostServices>`.
+struct WarningSink {
+    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    /// pi `shownWarnings` (`index.ts:1573`).
+    shown: Mutex<HashSet<String>>,
+}
+
+impl WarningSink {
+    fn new(host_services: Arc<OnceLock<Arc<dyn HostServices>>>) -> Self {
+        Self { host_services, shown: Mutex::new(HashSet::new()) }
+    }
+
+    /// pi `notifyWarning` (`index.ts:1586-1592`): drop a message already shown this session, else
+    /// remember it and push it to the host as a `warning` notification.
+    ///
+    /// \[CYRUP-DELTA] pi's guard is `!runtimeContext?.hasUI` — two conditions rolled into one,
+    /// because pi's `ctx.ui.notify` is only reachable through a live context. Cyrup splits those:
+    /// "is a host backend attached at all" is `host_services.get()`, which is the direct analog of
+    /// pi's `runtimeContext != null` and is what is checked here. The `hasUI` half is NOT
+    /// re-imposed: cyrup's [`HostServices::notify`] is already a fire-and-forget effect whose
+    /// default implementation is a no-op and whose live implementation routes to whatever sink the
+    /// active mode installed, so a headless host drops it on its own — and re-adding the check
+    /// would suppress the warning in modes (e.g. RPC) that DO surface notifications.
+    fn notify(&self, message: &str) {
+        let Some(services) = self.host_services.get() else {
+            return;
+        };
+        if !guard(&self.shown).insert(message.to_string()) {
+            return;
+        }
+        services.notify(message, NotifyKind::Warning);
+    }
+
+    /// pi `resetShownWarnings` (`index.ts:1582-1584`), called on session start / reload / shutdown.
+    fn reset(&self) {
+        guard(&self.shown).clear();
+    }
+}
+
+/// Build a [`PermissionManager`] whose `onWarning` is bound to `sink` — the analog of pi's
+/// `createPermissionManagerForCwd(cwd, notifyWarning)` (`index.ts:1536-1550`), which likewise
+/// threads the callback through EVERY construction site (`:1595`, `:2081`, `:2109-2110`). This is
+/// the only way this crate builds a manager, so no construction site can silently drop policy-load
+/// warnings again.
+fn manager_with_warnings(paths: ManagerPaths, sink: &Arc<WarningSink>) -> PermissionManager {
+    let sink = Arc::clone(sink);
+    PermissionManager::new(paths).with_on_warning(move |message| sink.notify(message))
+}
 
 /// The permission-system extension: the layered policy engine + two approval stores + prompt dedup +
 /// the fail-closed ask channel, gating every tool call via `before_tool_call`.
@@ -146,6 +206,14 @@ pub struct PermissionSystemExtension {
     /// `explicitlyRequestedSkillNames`, `index.ts:1559` / `index.ts:2192-2206`): a direct user action,
     /// so its skill-file reads bypass the skill-read ask/deny even under a hiding agent (`index.ts:2243`).
     explicitly_requested_skill_names: Mutex<HashSet<String>>,
+    /// pi's `notifyWarning` closure (`index.ts:1586-1592`), shared by value with every
+    /// [`PermissionManager`] this extension builds (`onWarning`) and used directly for the
+    /// extension-config load warning.
+    warnings: Arc<WarningSink>,
+    /// pi `lastConfigWarning` (`index.ts:1572`): the extension-config warning already reported, so
+    /// a repeated refresh that keeps failing the same way notifies once and a refresh that STOPS
+    /// failing re-arms the report (`refreshExtensionConfig`, `index.ts:1610-1618`).
+    last_config_warning: Mutex<Option<String>>,
 }
 
 impl PermissionSystemExtension {
@@ -240,10 +308,41 @@ impl PermissionSystemExtension {
     /// invalidate the agent-start cache (`invalidateAgentStartCache`, `:1575-1581`) by clearing the
     /// cached active-skill enforcement entries. Shared by both the `session_start` handler and a
     /// `resources_discover` reload.
+    /// Also surfaces the extension-config load warning (pi `refreshExtensionConfig`,
+    /// `index.ts:1600-1618`) — this is the one place a malformed `config.json` becomes visible,
+    /// since construction happens before any host backend is attached.
     fn refresh_config_and_manager(&self, cwd: &Path) {
-        *guard(&self.manager) = PermissionManager::new(Self::manager_paths_for(&self.agent_dir, cwd));
-        *guard(&self.config) = ExtensionConfig::load(&Self::config_path_for(&self.agent_dir));
+        // pi order (`refreshSessionRuntimeState`, `index.ts:2077-2085`): config first, manager
+        // second.
+        let loaded = ExtensionConfig::load_with_result(&Self::config_path_for(&self.agent_dir));
+        *guard(&self.config) = loaded.config;
+        self.report_config_warning(loaded.warning);
+        *guard(&self.manager) =
+            manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
         guard(&self.active_skill_entries).clear();
+    }
+
+    /// pi `refreshExtensionConfig`'s warning branch (`index.ts:1610-1618`): report a NEW warning
+    /// once and remember it; clear the memo when the load comes back clean, so a later recurrence
+    /// is reported again.
+    fn report_config_warning(&self, warning: Option<String>) {
+        let Some(warning) = warning else {
+            *guard(&self.last_config_warning) = None;
+            return;
+        };
+        // Scoped so the memo lock is released before the sink is touched — `notify` takes its own
+        // lock and reaches the host.
+        let is_new = {
+            let mut last = guard(&self.last_config_warning);
+            let is_new = last.as_deref() != Some(warning.as_str());
+            if is_new {
+                *last = Some(warning.clone());
+            }
+            is_new
+        };
+        if is_new {
+            self.warnings.notify(&warning);
+        }
     }
 
     /// Assemble from explicit parts (used by tests that point the global policy path at a fixture file
@@ -282,9 +381,14 @@ impl PermissionSystemExtension {
         install_watcher: bool,
         host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
     ) -> Self {
+        // Built BEFORE the struct literal: `host_services` is moved into the literal below, and the
+        // sink needs its own handle on the same `OnceLock` so the manager's `onWarning` binding
+        // observes the backend the host attaches LATER (`set_host_services` runs after
+        // construction).
+        let warnings = Arc::new(WarningSink::new(Arc::clone(&host_services)));
         Self {
             id: ExtensionId::from(EXTENSION_ID),
-            manager: Mutex::new(PermissionManager::new(paths)),
+            manager: Mutex::new(manager_with_warnings(paths, &warnings)),
             session_approvals: Mutex::new(SessionApprovalStore::new()),
             permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
@@ -297,6 +401,8 @@ impl PermissionSystemExtension {
             agent_name: resolve_agent_name_from_env(),
             active_skill_entries: Mutex::new(Vec::new()),
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
+            warnings,
+            last_config_warning: Mutex::new(None),
         }
     }
 
@@ -879,6 +985,11 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.session_approvals).clear();
                 guard(&self.dedup).clear();
                 guard(&self.explicitly_requested_skill_names).clear();
+                // pi `resetShownWarnings()` (`index.ts:2079`, the first statement of
+                // `refreshSessionRuntimeState`): a new session re-arms every load warning, so a
+                // still-malformed policy file is reported again rather than staying suppressed by
+                // the previous session's dedup set.
+                self.warnings.reset();
                 // pi `refreshSessionRuntimeState` (`index.ts:2077-2085`, called unconditionally from
                 // every `session_start`): re-read `config.json` from disk and rebuild the
                 // `PermissionManager`'s policy paths from the CURRENT session `ctx.cwd` (not just the
@@ -904,6 +1015,8 @@ impl NativeExtension for PermissionSystemExtension {
                 // carries no `reason` field (unlike pi's event), so every dispatch is treated as the
                 // "reload" case — the only variant this host event exposes.
                 guard(&self.dedup).clear();
+                // pi `resetShownWarnings()` (`index.ts:2105`, the reload branch's first statement).
+                self.warnings.reset();
                 self.refresh_config_and_manager(&ctx.cwd);
                 HookOutcome::Noop
             }
@@ -917,6 +1030,8 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.dedup).clear();
                 guard(&self.explicitly_requested_skill_names).clear();
                 guard(&self.active_skill_entries).clear();
+                // pi `resetShownWarnings()` (`index.ts:2125`).
+                self.warnings.reset();
                 self.stop_forwarding_watcher();
                 HookOutcome::Noop
             }
@@ -939,23 +1054,48 @@ fn env_truthy(name: &str) -> bool {
 }
 
 /// DI-5 "installed" detection (opt-in): the gate attaches only when the user has installed it —
-/// either the [`INSTALL_ENV_VAR`] is truthy, or a policy/config file exists. NOT installed → zero
-/// gating (unchanged core behavior); installed → default-ASK per category (faithful to pi
-/// `permission-manager.ts:44-50`). This keeps the crate compiled + wired at all three sites while
-/// never bricking the default (policy-less) app with fail-closed asks on every tool.
+/// either the [`INSTALL_ENV_VAR`] is truthy, or a policy file exists, or the extension config has
+/// been edited away from its auto-generated template. NOT installed → zero gating (unchanged core
+/// behavior); installed → default-ASK per category (faithful to pi `permission-manager.ts:44-50`).
+/// This keeps the crate compiled + wired at all three sites while never bricking the default
+/// (policy-less) app with fail-closed asks on every tool.
+///
+/// **Every install signal is reversible** (PERM-002). Before this, the probe accepted the bare
+/// EXISTENCE of `<agent_dir>/cyrup-permission-system/config.json` — but that file is written by
+/// this crate itself, unconditionally, as a side effect of constructing the extension
+/// ([`ExtensionConfig::ensure_on_disk`] via [`PermissionSystemExtension::derive_parts`]). So a
+/// single `CYRUP_PERMISSION_SYSTEM=1` run left a permanent artifact behind that kept the gate
+/// armed forever after, with no supported way to turn it back off: unsetting the env var did
+/// nothing, and the file silently reappeared on the very next run if deleted.
+///
+/// The chosen semantics: `config.json` counts as an install signal only once its bytes DIFFER
+/// from the pristine template ([`ExtensionConfig::is_pristine_default_file`]) — i.e. once a human
+/// actually configured something. Both directions of the security argument are covered:
+/// - It cannot silently DISABLE a gate an operator intended. The env var is untouched; both
+///   policy paths are files only a human writes; and a hand-authored (therefore non-pristine)
+///   `config.json` still installs, so an operator whose only install signal was that file keeps
+///   the gate. An unreadable `config.json` is likewise treated as configured (fail-safe).
+/// - It cannot leave an operator PERMANENTLY stuck with a gate they never asked for: the only
+///   case it newly returns `false` is the untouched, machine-written template, where no policy
+///   file and no env opt-in exist either — a state in which the manager would have had no rules
+///   at all and merely defaulted every category to `ask`.
+///
+/// Upstream `pi-permission-system` has no "installed" probe to copy (the extension gates whatever
+/// loads it); its v0.8.0 answer to "how do I turn this off" is a separate `"enabled": false`
+/// master switch in `config.json` (`extension-config.ts:12,88` → `index.ts:1475`), which is
+/// tracked as its own port item and is complementary to — not a substitute for — un-latching this
+/// probe.
 #[must_use]
 pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
     if env_truthy(INSTALL_ENV_VAR) {
         return true;
     }
     let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
-    [
-        agent_dir.join(POLICY_FILE),
-        project_dir.join(POLICY_FILE),
-        agent_dir.join(CONFIG_DIR).join(CONFIG_FILE),
-    ]
-    .iter()
-    .any(|p| p.exists())
+    if [agent_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)].iter().any(|p| p.exists()) {
+        return true;
+    }
+    let config_path = PermissionSystemExtension::config_path_for(agent_dir);
+    config_path.exists() && !ExtensionConfig::is_pristine_default_file(&config_path)
 }
 
 /// The binary-side wiring entry point `crates/cyrup/src/main.rs` calls at each of its three
@@ -1186,5 +1326,183 @@ mod tests {
         // pre-check must fail CLOSED immediately, never touching the lock/dialog machinery.
         let outcome = ext.on_event(&bash_call("call-1"), &event_ctx(agent_dir)).await;
         assert!(matches!(outcome, HookOutcome::Block { .. }));
+    }
+
+    // ============================================================================================
+    // PERM-002 / PERM-003 regression tests.
+    // ============================================================================================
+
+    /// Run `body` with [`INSTALL_ENV_VAR`] guaranteed unset, restoring the ambient value after —
+    /// serialized against every other env-mutating test in the crate by the shared
+    /// [`crate::ext_config::env_lock`].
+    fn without_install_env<T>(body: impl FnOnce() -> T) -> T {
+        let _lock = crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var(INSTALL_ENV_VAR).ok();
+        // SAFETY: serialized by `env_lock`, and restored below before the guard drops.
+        unsafe { std::env::remove_var(INSTALL_ENV_VAR) };
+        let out = body();
+        // SAFETY: same scope/serialization; restores whatever the ambient shell had.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(INSTALL_ENV_VAR, v),
+                None => std::env::remove_var(INSTALL_ENV_VAR),
+            }
+        }
+        out
+    }
+
+    /// PERM-002. Merely CONSTRUCTING the extension materializes
+    /// `<agent_dir>/cyrup-permission-system/config.json` on disk (`ExtensionConfig::ensure_on_disk`),
+    /// and `is_installed` used to accept that file's bare existence as an install signal. So one
+    /// `CYRUP_PERMISSION_SYSTEM=1` run permanently latched the gate on for every later run in that
+    /// agent dir, with no way to turn it back off — deleting the file did not help either, because
+    /// the next construction re-created it.
+    ///
+    /// Observable contract, all three directions in one test:
+    ///  1. after a full construct-and-materialize cycle with no env opt-in and no policy file,
+    ///     `is_installed` is false again and `permission_extension_for_env` attaches NOTHING;
+    ///  2. an operator-edited `config.json` still installs (the fix cannot silently disable a gate
+    ///     whose only install signal was a hand-written config);
+    ///  3. a policy file still installs, unaffected.
+    #[test]
+    fn auto_materialized_config_does_not_latch_the_gate_on() {
+        without_install_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            let cwd = dir.path().join("project");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
+
+            assert!(!is_installed(&agent_dir, &cwd), "clean agent dir must not be installed");
+
+            // The opt-in run: build the extension exactly as the binary wiring does. This is the
+            // step that writes `config.json`.
+            let installed = PermissionSystemExtension::new(agent_dir.clone(), cwd.clone());
+            drop(installed);
+            assert!(
+                config_path.exists(),
+                "constructing the extension must still materialize the editable config template"
+            );
+
+            // The NEXT run, with the env opt-in gone and no policy file anywhere. The leftover
+            // template is the extension's own footprint, not an operator decision.
+            assert!(
+                !is_installed(&agent_dir, &cwd),
+                "the auto-written config template must not latch the gate on for every later run"
+            );
+            assert!(
+                permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none(),
+                "an un-opted-in run must attach no gate at all"
+            );
+
+            // An operator who configures the extension by hand IS opting in — that signal must
+            // survive, or un-latching would have become a way to silently disable a real gate.
+            std::fs::write(&config_path, "{\n  \"yoloMode\": true\n}\n").unwrap();
+            assert!(
+                is_installed(&agent_dir, &cwd),
+                "a hand-edited config.json must still install the gate"
+            );
+
+            // ...and reverting it to the pristine template turns it back off: the switch is
+            // two-way, which is the whole point.
+            std::fs::write(&config_path, ExtensionConfig::default_config_content()).unwrap();
+            assert!(!is_installed(&agent_dir, &cwd), "reverting the config must turn the gate off");
+
+            // A policy file remains an install signal regardless of the config file.
+            write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
+            assert!(is_installed(&agent_dir, &cwd), "a policy file must still install the gate");
+        });
+    }
+
+    /// A [`HostServices`] double that enumerates a registry (so the unknown-tool gate lets the call
+    /// through to the policy engine) AND records every `notify` the extension pushes at the host.
+    struct NotifyRecorder {
+        names: Vec<String>,
+        notifications: Mutex<Vec<(String, NotifyKind)>>,
+    }
+
+    impl NotifyRecorder {
+        fn new() -> Self {
+            Self { names: vec!["bash".to_string()], notifications: Mutex::new(Vec::new()) }
+        }
+        fn warnings(&self) -> Vec<String> {
+            guard(&self.notifications)
+                .iter()
+                .filter(|(_, kind)| *kind == NotifyKind::Warning)
+                .map(|(message, _)| message.clone())
+                .collect()
+        }
+    }
+
+    impl HostServices for NotifyRecorder {
+        fn all_tool_names(&self) -> Option<Vec<String>> {
+            Some(self.names.clone())
+        }
+        fn notify(&self, message: &str, kind: NotifyKind) {
+            guard(&self.notifications).push((message.to_string(), kind));
+        }
+    }
+
+    /// PERM-003. pi threads `notifyWarning` into EVERY `PermissionManager` it builds
+    /// (`createPermissionManagerForCwd(cwd, notifyWarning)`, `index.ts:1595,2081,2109-2110`) and
+    /// into `refreshExtensionConfig` (`index.ts:1614`), so a policy or config file that exists but
+    /// does not parse reaches the human as a `warning` notification.
+    ///
+    /// BEFORE this fix `PermissionManager::with_on_warning` had no caller outside this crate's own
+    /// unit tests and `refresh_config_and_manager` used the warning-discarding `ExtensionConfig::
+    /// load`, so both failures degraded in TOTAL SILENCE: a typo'd `cyrup-permissions.jsonc` fell
+    /// back to "ask everything", which looks exactly like a policy that genuinely says ask. This
+    /// test drives a real session lifecycle + tool call and asserts the messages actually arrive at
+    /// the host boundary.
+    #[tokio::test]
+    async fn malformed_policy_and_config_files_notify_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        // Present, but truncated mid-object: exists (so it is not the silent ENOENT case) and does
+        // not parse.
+        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "allow" "#);
+        write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), "{ not json");
+
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+        let host = Arc::new(NotifyRecorder::new());
+        ext.set_host_services(host.clone());
+
+        let ctx = event_ctx(agent_dir.clone());
+        let start = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        assert!(matches!(start, HookOutcome::Noop));
+        // A real tool call is what forces the policy layers to be read.
+        let _ = ext.on_event(&bash_call("call-1"), &ctx).await;
+
+        let warnings = host.warnings();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Failed to parse permission config at")
+                && w.contains(POLICY_FILE)
+                && w.ends_with("using ask fallback.")),
+            "the unparseable policy file must reach the host as a warning; got {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Failed to parse permission-system config at")
+                && w.ends_with("using default extension config.")),
+            "the unparseable extension config must reach the host as a warning; got {warnings:?}"
+        );
+
+        // pi `shownWarnings` (`index.ts:1573,1586-1592`): each distinct message is reported at most
+        // once per session, so a reload storm cannot spam the user. Re-running the whole refresh +
+        // tool-call cycle must not duplicate anything already shown.
+        let before = warnings.len();
+        let _ = ext.on_event(&bash_call("call-2"), &ctx).await;
+        assert_eq!(host.warnings().len(), before, "warnings must be deduped within a session");
+
+        // ...and a NEW session re-arms them (pi `resetShownWarnings`, `index.ts:2079`), so a file
+        // that is still broken is reported again rather than silently suppressed forever.
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        let _ = ext.on_event(&bash_call("call-3"), &ctx).await;
+        assert!(
+            host.warnings().len() > before,
+            "a new session must re-report a still-broken file; got {:?}",
+            host.warnings()
+        );
     }
 }

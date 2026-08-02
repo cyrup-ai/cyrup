@@ -175,7 +175,7 @@ impl ExtensionConfig {
     /// by hand (rather than via `serde_json`, whose default `Map` is alphabetically ordered) so the
     /// on-disk template matches pi's `debug`/`yoloMode`/`forwardedPromptTimeoutSeconds` order byte
     /// for byte.
-    fn default_config_content() -> String {
+    pub(crate) fn default_config_content() -> String {
         let default = ExtensionConfig::default();
         let timeout = match default.forwarded_prompt_timeout_seconds {
             Some(seconds) => seconds.to_string(),
@@ -185,6 +185,25 @@ impl ExtensionConfig {
             "{{\n  \"debug\": {},\n  \"yoloMode\": {},\n  \"forwardedPromptTimeoutSeconds\": {timeout}\n}}\n",
             default.debug, default.yolo_mode
         )
+    }
+
+    /// Whether `path` currently holds the BYTE-EXACT pristine template
+    /// [`Self::ensure_on_disk`] auto-materializes — i.e. nothing has edited it since this crate
+    /// created it.
+    ///
+    /// This exists for the install probe (`extension::is_installed`). `config.json` is written by
+    /// THIS crate as a side effect of merely constructing the extension, so its existence is a
+    /// footprint of the code, not evidence that an operator asked for the gate; counting it
+    /// latched the gate permanently on after a single opt-in run. Any deviation from the template
+    /// IS evidence, because only a human (or another tool) writes those bytes.
+    ///
+    /// Deliberately conservative in the ambiguous direction: a present-but-unreadable file reports
+    /// `false` (not pristine ⇒ treated as configured), because for a security gate the safe answer
+    /// to "I cannot tell" is "assume it was configured". An ABSENT file also reports `false`, so
+    /// callers must test existence separately (`is_installed` does).
+    #[must_use]
+    pub fn is_pristine_default_file(path: &Path) -> bool {
+        std::fs::read_to_string(path).is_ok_and(|text| text == Self::default_config_content())
     }
 
     /// pi `normalizePermissionSystemConfig` (`extension-config.ts:69-85`).
@@ -210,19 +229,21 @@ impl ExtensionConfig {
     }
 }
 
+/// Guards every test in this crate that mutates process-wide environment state
+/// (`CONFIG_PATH_ENV_KEY` here, `extension::INSTALL_ENV_VAR` there) from running concurrently with
+/// any other such test. Lives outside the `tests` module (and is `pub(crate)`) precisely so the
+/// *same* lock instance serializes both modules — a per-module lock would not, and `cargo test`
+/// runs the whole crate's unit tests in one process.
+#[cfg(test)]
+pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use std::sync::{Mutex, OnceLock};
-
     use super::*;
-
-    /// Guards tests that mutate `CONFIG_PATH_ENV_KEY` (process-wide state) from running
-    /// concurrently with each other.
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn absent_is_defaults() {
@@ -329,7 +350,7 @@ mod tests {
     // no environment variable was ever consulted anywhere in the crate.
     #[test]
     fn env_var_overrides_default_config_path() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let overridden = dir.path().join("overridden.json");
         std::fs::write(&overridden, r#"{"debug": true}"#).unwrap();
