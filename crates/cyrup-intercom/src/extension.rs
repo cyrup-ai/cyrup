@@ -38,7 +38,7 @@ use crate::identity::{
     ChildOrchestratorMetadata, ENV_INTERCOM_SESSION_ID, preferred_supervisor_target,
     presence_name, read_child_orchestrator_metadata,
 };
-use crate::inbound::spawn_inbound_loop;
+use crate::inbound::{schedule_inbound_flush, spawn_inbound_loop};
 use crate::paths::{agent_dir_path, broker_socket_path, intercom_dir_path};
 use crate::seams::{IntercomClarifyChannel, IntercomDeliveryChannel, IntercomSteerChannel};
 use crate::session_state::SharedIntercomState;
@@ -339,6 +339,9 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::SessionShutdown { .. } => {
+                // `clearInboundFlushTimer()` (index.ts:1070): a pending debounce must not outlive the
+                // session and fire against a torn-down host.
+                self.state.set_flush_timer(None);
                 if let Some(client) = self.state.client() {
                     client.disconnect();
                 }
@@ -352,6 +355,10 @@ impl NativeExtension for IntercomExtension {
             }
             HostEvent::AgentEnd { .. } => {
                 self.sync_presence("idle");
+                // `pi.on("agent_end") -> scheduleInboundFlush(0)` (index.ts:1116-1117): the run that
+                // was in flight has ended, so drain anything that arrived while this session was
+                // busy (`InboundPolicy::Queue`) instead of leaving it parked until the next message.
+                schedule_inbound_flush(&self.state, 0);
                 HookOutcome::Noop
             }
             HostEvent::ToolExecStart { name, .. } => {
@@ -370,8 +377,10 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::TurnEnd { .. } => {
-                // `pi.on("turn_end") -> replyTracker.endTurn()` (index.ts:1074-1080).
+                // `pi.on("turn_end") -> replyTracker.endTurn()` + `scheduleInboundFlush(0)`
+                // (index.ts:1080-1086).
                 self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).end_turn();
+                schedule_inbound_flush(&self.state, 0);
                 HookOutcome::Noop
             }
             _ => HookOutcome::Noop,

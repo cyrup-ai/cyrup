@@ -32,6 +32,15 @@ pub struct SharedIntercomState {
     /// "running in non-interactive mode" busy auto-reply. Defaults `false` (no UI) until the
     /// `SessionStart` handler sets it — a headless/degraded session then takes the auto-reply branch.
     has_ui: AtomicBool,
+    /// Messages that arrived while this session was BUSY and has a UI (pi `pendingIdleMessages`,
+    /// `index.ts:711-714` `queueIdleMessage`). Drained by [`crate::inbound::flush_idle_messages`]
+    /// once the session goes idle, oldest first — the first entry delivered as pi's `"trigger"`
+    /// delivery, the rest as non-triggering `"followUp"`s.
+    pending_idle: Mutex<Vec<crate::inbound::PendingInbound>>,
+    /// The single live debounce timer behind [`crate::inbound::schedule_inbound_flush`] (pi's
+    /// `inboundFlushTimer` + `clearInboundFlushTimer`, `index.ts:674-684`). Replacing it aborts the
+    /// prior task, so a burst of inbound messages coalesces into ONE flush instead of N.
+    flush_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Inbound ask tracking (`ReplyTracker`).
     pub tracker: Mutex<ReplyTracker>,
     /// The outbound single-slot reply waiter (`replyWaiter`).
@@ -53,6 +62,8 @@ impl SharedIntercomState {
             client: Mutex::new(None),
             host_services: Mutex::new(None),
             has_ui: AtomicBool::new(false),
+            pending_idle: Mutex::new(Vec::new()),
+            flush_timer: Mutex::new(None),
             tracker: Mutex::new(ReplyTracker::new(ask_timeout_ms)),
             waiter: OutboundReplyWaiter::new(),
             config,
@@ -89,6 +100,58 @@ impl SharedIntercomState {
     #[must_use]
     pub fn has_ui(&self) -> bool {
         self.has_ui.load(Ordering::SeqCst)
+    }
+
+    /// Whether NO agent run is currently in flight (pi `ctx.isIdle()`, `index.ts:745`) — the FIRST
+    /// axis of the inbound delivery policy, ahead of [`Self::has_ui`]. Read live off the bound
+    /// `HostServices` backend on every inbound message (an agent can start/finish between two of
+    /// them). With no backend bound (headless/degraded, or a session whose host never attached) the
+    /// answer is `true` — the same "no live session attached ⇒ nothing is running" default
+    /// `HostServices::is_idle` itself returns, so a degraded session delivers rather than queueing
+    /// forever.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.host_services().is_none_or(|services| services.is_idle())
+    }
+
+    /// Queue an inbound message for delivery once this session goes idle (pi `queueIdleMessage`,
+    /// `index.ts:711-714`). Ordering is preserved; the caller schedules the debounced flush.
+    pub fn push_pending_inbound(&self, pending: crate::inbound::PendingInbound) {
+        self.pending_idle.lock().unwrap_or_else(|e| e.into_inner()).push(pending);
+    }
+
+    /// Drain every queued idle message (pi `pendingIdleMessages.splice(0, length)`,
+    /// `index.ts:705`), oldest first.
+    #[must_use]
+    pub fn take_pending_inbound(&self) -> Vec<crate::inbound::PendingInbound> {
+        std::mem::take(&mut *self.pending_idle.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// How many messages are waiting for this session to go idle (pi's
+    /// `pendingIdleMessages.length === 0` early return, `index.ts:686-688`).
+    #[must_use]
+    pub fn pending_inbound_len(&self) -> usize {
+        self.pending_idle.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Install the debounce timer task, ABORTING whichever one it replaces (pi
+    /// `clearInboundFlushTimer()` immediately before `setTimeout`, `index.ts:678-683`). Passing
+    /// `None` is the bare clear pi's `session_shutdown` performs (`index.ts:1070`).
+    pub fn set_flush_timer(&self, handle: Option<tokio::task::JoinHandle<()>>) {
+        let previous = std::mem::replace(
+            &mut *self.flush_timer.lock().unwrap_or_else(|e| e.into_inner()),
+            handle,
+        );
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    /// Release the timer slot WITHOUT aborting it — what the flush task itself calls on entry, since
+    /// the handle in the slot at that moment is its own (aborting it would kill the very task that
+    /// is running, and any retry it schedules).
+    pub fn release_flush_timer(&self) {
+        let _ = std::mem::take(&mut *self.flush_timer.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     /// Resolve a name/id/unique-prefix `to` to a single session id against the live session list

@@ -171,6 +171,24 @@ pub struct SubagentExecutor {
     /// pi `fanout-child.ts:53-128`) to service an interrupt/resume request a grandparent orchestrator
     /// addressed at a run nested inside THIS process.
     foreground_controls: Arc<std::sync::Mutex<HashMap<String, ForegroundControlEntry>>>,
+    /// The per-SESSION subagent spawn budget (pi `SubagentState.subagentSpawns`,
+    /// `shared/types.ts:842`: `{ sessionId: string | null; count: number }`). Charged UP FRONT by
+    /// [`Self::reserve_subagent_spawns`] at every accepted execution dispatch, so a run that later
+    /// fails still consumes its reservation — exactly pi's `reserveSubagentSpawns`
+    /// (`runs/foreground/subagent-executor.ts:266-282`), which sets `count = used + requested`
+    /// before any child is planned and never refunds. Reset when the recorded session id no longer
+    /// matches the live one, and again at `SessionStart` ([`Self::reset_spawn_budget`], pi
+    /// `resetSessionState`, `extension/index.ts:590`).
+    spawn_budget: std::sync::Mutex<SpawnBudget>,
+}
+
+/// One session's subagent spawn budget (pi `SubagentState.subagentSpawns`, `shared/types.ts:842`).
+/// `session_id` is the session the `count` was accumulated under — pi's `string | null`, so a
+/// headless/unpersisted session (`None`) is a legitimate identity that still accumulates.
+#[derive(Debug, Default)]
+struct SpawnBudget {
+    session_id: Option<String>,
+    count: u32,
 }
 
 /// One live foreground run's control surface (pi `SubagentState.foregroundControls`'s per-entry
@@ -288,6 +306,7 @@ impl SubagentExecutor {
             delivery: Arc::new(crate::tui::intercom::NoTransportChannel),
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
         }
     }
 
@@ -346,6 +365,63 @@ impl SubagentExecutor {
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+    }
+
+    /// Reserve `requested` subagent spawns against THIS session's budget (pi `reserveSubagentSpawns`,
+    /// `runs/foreground/subagent-executor.ts:266-282`), returning pi's exact over-limit text on
+    /// breach and `Ok(())` otherwise.
+    ///
+    /// The reservation is charged UP FRONT (`count = used + requested`) and never refunded — pi
+    /// deliberately bills a run at dispatch, so a fan-out that later fails still consumes its share
+    /// of the session's budget. `requested == 0` is a no-op (pi's `if (input.requested <= 0) return
+    /// undefined`), so a call that spawns nothing (e.g. an empty/`action` shape) never touches the
+    /// counter. The comparison is pi's strict `used + requested > maxSpawns`, so a call that lands
+    /// exactly ON the cap is allowed.
+    ///
+    /// The session identity is [`Self::root_parent_session`] — cyrup's analog of pi's
+    /// `state.currentSessionId` (captured from the live `HostServices::session_id` at the root
+    /// `SessionStart`). A change of session id resets the counter in place, exactly as pi's
+    /// `if (state.subagentSpawns?.sessionId !== sessionId)` guard does, so a long-lived process that
+    /// starts a second session starts that session with a fresh budget.
+    ///
+    /// # Errors
+    /// The over-limit notice (pi's verbatim string) when `used + requested` exceeds `max_spawns`.
+    pub fn reserve_subagent_spawns(&self, requested: u32, max_spawns: u32) -> Result<(), String> {
+        if requested == 0 {
+            return Ok(());
+        }
+        let session_id = self.root_parent_session();
+        let mut budget = self
+            .spawn_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if budget.session_id != session_id {
+            *budget = SpawnBudget { session_id, count: 0 };
+        }
+        let used = budget.count;
+        if u64::from(used) + u64::from(requested) > u64::from(max_spawns) {
+            return Err(format!(
+                "Subagent spawn limit reached for this session ({used}/{max_spawns} used, \
+                 {requested} requested). Complete the work directly or start a new session."
+            ));
+        }
+        budget.count = used.saturating_add(requested);
+        Ok(())
+    }
+
+    /// Reset this session's spawn budget to zero under the CURRENT session id (pi
+    /// `resetSessionState`'s `state.subagentSpawns = { sessionId: state.currentSessionId, count: 0 }`,
+    /// `extension/index.ts:590`). Called from the `SessionStart` handler right after the
+    /// parent-session anchor is captured, so a second session on a long-lived process (SDK embedder /
+    /// test harness) starts from a clean budget even when neither session had a resolvable id — the
+    /// case [`Self::reserve_subagent_spawns`]' own id-change guard cannot detect on its own.
+    pub fn reset_spawn_budget(&self) {
+        let session_id = self.root_parent_session();
+        *self
+            .spawn_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SpawnBudget { session_id, count: 0 };
     }
 
     /// The out-of-band delivery channel (R-SA-123/124/125), for the run driver's grouped-result
@@ -4828,6 +4904,27 @@ impl Tool for SubagentTool {
             )));
         }
 
+        // pi `reserveSubagentSpawns` (`subagent-executor.ts:266-282`, called at `:3434-3441` right
+        // after the mode is settled and before any `ExecutionContextData` is built): charge this
+        // dispatch's worst-case spawn count against the SESSION-wide budget
+        // (`config.maxSubagentSpawnsPerSession`, default 40) and reject the whole call — never a
+        // partial fan-out — once the session has exhausted it. The budget is per SESSION, not per
+        // turn, and the reservation is billed up front, so a run that fails later still counts.
+        //
+        // [CYRUP-DELTA, deliberate] pi runs `validateExecutionChainBindings` immediately BEFORE this
+        // reserve; in this crate that validation lives inside `route_chain_mode`, so a structurally
+        // invalid chain is billed here and rejected a moment later. Moving the reserve past the
+        // routing call would instead bill each mode arm separately (and twice for a chain that
+        // re-enters), which is the worse divergence; the over-charge only affects a call that was
+        // going to error anyway.
+        let cfg = self.executor.config_snapshot().await;
+        if let Err(limit_notice) = self.executor.reserve_subagent_spawns(
+            count_requested_subagent_spawns(&parsed, &cfg),
+            cfg.max_subagent_spawns_per_session,
+        ) {
+            return Err(ToolError::new(limit_notice));
+        }
+
         if has_tasks {
             return self.route_parallel_mode(&parsed, &effective_cwd, cancel).await;
         }
@@ -4841,6 +4938,59 @@ impl Tool for SubagentTool {
         // per-child folds would multiplex through the same `SubagentUpdatePayload.progress[]`).
         self.route_single(&parsed, &effective_cwd, on_update, cancel).await
     }
+}
+
+/// pi `countRequestedSubagentSpawns` (`runs/foreground/subagent-executor.ts:284-292`): how many
+/// subagent spawns ONE accepted execution dispatch will charge against the session budget.
+///
+/// * PARALLEL (`tasks[]`) → one spawn per task.
+/// * CHAIN (`chain[]`) → per step: a **dynamic-parallel** step (pi `isDynamicParallelStep`:
+///   `expand` + `collect` + a NON-array `parallel`) is billed its worst case, `expand.maxItems ??
+///   config.chain.dynamicFanout.maxItems ?? 0`; any other step is billed
+///   `getStepAgents(step).length` — the length of its `parallel[]` task array for a static parallel
+///   step, otherwise `1` for the single `agent` a sequential step names (pi returns `[step.agent]`,
+///   length 1, even when `agent` is absent).
+/// * SINGLE → `1` when an `agent` was named, else `0`.
+///
+/// Saturating throughout: a caller cannot overflow the counter by declaring an absurd `maxItems`.
+fn count_requested_subagent_spawns(
+    params: &SubagentToolParams,
+    cfg: &SubagentExtensionConfig,
+) -> u32 {
+    if let Some(tasks) = params.tasks.as_ref() {
+        return u32::try_from(tasks.len()).unwrap_or(u32::MAX);
+    }
+    if let Some(chain) = params.chain.as_ref() {
+        return chain.iter().fold(0u32, |total, step| {
+            total.saturating_add(chain_step_requested_spawns(step, cfg))
+        });
+    }
+    u32::from(params.agent.is_some())
+}
+
+/// One chain step's spawn charge — the body of [`count_requested_subagent_spawns`]'s `chain` fold
+/// (pi's `chain.reduce(...)`, `subagent-executor.ts:286-291`), kept separate so the dynamic-fanout
+/// worst case and the static `getStepAgents` count stay individually readable.
+fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtensionConfig) -> u32 {
+    // pi `isDynamicParallelStep` (`shared/settings.ts:131-133`), the same predicate
+    // `discovery::chains` already ports: `expand` + `collect` + a NON-array `parallel`.
+    let is_dynamic = step.get("expand").is_some()
+        && step.get("collect").is_some()
+        && step.get("parallel").is_some_and(|p| !p.is_array());
+    if is_dynamic {
+        return step
+            .get("expand")
+            .and_then(|expand| expand.get("maxItems"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| cfg.dynamic_fanout_max_items())
+            .unwrap_or(0);
+    }
+    // pi `getStepAgents(step).length` (`shared/settings.ts:136-144`): a static parallel step's
+    // `parallel[]` length, else exactly one agent.
+    step.get("parallel")
+        .and_then(serde_json::Value::as_array)
+        .map_or(1, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX))
 }
 
 /// pi `duplicateSubagentCallResult` (`subagent-executor.ts:2770-2779`)'s content text, verbatim.
@@ -5328,6 +5478,12 @@ impl NativeExtension for SubagentsExtension {
                 // so the permission companion's child→parent ask-forwarding spool can address this
                 // session's inbox.
                 self.executor.capture_parent_session_anchor();
+
+                // pi `resetSessionState`'s `state.subagentSpawns = { sessionId: state.currentSessionId,
+                // count: 0 }` (`extension/index.ts:590`): a new session always starts with a fresh
+                // per-session spawn budget. Ordered AFTER the anchor capture so the budget is stamped
+                // with THIS session's id.
+                self.executor.reset_spawn_budget();
 
                 self.executor.resume_tracking(&ctx.cwd).await;
                 // C6: install the background-completion watcher (notify.ts / result-watcher.ts) so a
@@ -8077,6 +8233,149 @@ mod tests {
         assert!(!clarify_true.is_background(&SubagentExtensionConfig::default(), 0));
     }
 
+    /// SUBA-002 regression (pi `reserveSubagentSpawns`, `subagent-executor.ts:266-282` +
+    /// `:3434-3441`): `maxSubagentSpawnsPerSession` is ENFORCED across a session's successive
+    /// dispatches, not merely parsed. Pre-fix, the config field had no read site anywhere in the
+    /// crate, so every call below routed straight into execution and the second/third calls failed
+    /// with `"agent not found: ghost"` instead of the spawn-limit notice.
+    ///
+    /// The budget is charged UP FRONT: call 1 requests 2 of a 2-spawn budget and is admitted (it
+    /// then fails on the unresolvable agent, as pi's would), and that failure does NOT refund — call
+    /// 2 is rejected before any routing at all.
+    #[tokio::test]
+    async fn spawn_budget_is_charged_per_session_and_rejects_the_call_that_would_exceed_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 2,
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let tool = ext.subagent_tool();
+
+        async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+            tool.execute(
+                ToolCallId::from("t"),
+                params,
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+        }
+
+        // Call 1: a 2-task fan-out exactly fills the 2-spawn budget (pi's comparison is a STRICT
+        // `used + requested > maxSpawns`, so landing on the cap is admitted). It is admitted, and
+        // therefore fails downstream on the unresolvable agent — NOT on the budget.
+        let admitted = dispatch(&tool, serde_json::json!({
+            "tasks": [{ "agent": "ghost", "task": "a" }, { "agent": "ghost", "task": "b" }]
+        }))
+        .await
+        .expect_err("an unresolvable agent still fails after the reservation is granted");
+        assert!(
+            admitted.to_string().contains("agent not found: ghost"),
+            "the first call must be ADMITTED past the budget (failing only on the agent): {admitted}"
+        );
+
+        // Call 2: the budget was billed up front and is not refunded by call 1's failure, so a
+        // single further spawn is now over the cap and the whole call is rejected before routing.
+        let rejected = dispatch(&tool, serde_json::json!({ "agent": "ghost", "task": "c" }))
+            .await
+            .expect_err("the session's spawn budget is exhausted");
+        assert_eq!(
+            rejected.to_string(),
+            "Subagent spawn limit reached for this session (2/2 used, 1 requested). \
+             Complete the work directly or start a new session.",
+            "pi's verbatim over-limit notice, with used/max/requested filled in"
+        );
+        assert!(
+            !rejected.to_string().contains("agent not found"),
+            "the rejection must fire BEFORE any routing/agent resolution: {rejected}"
+        );
+
+        // A fresh session zeroes the budget (pi `resetSessionState`), so the very same call is
+        // admitted again afterwards.
+        ext.executor().reset_spawn_budget();
+        let after_reset = dispatch(&tool, serde_json::json!({ "agent": "ghost", "task": "c" }))
+            .await
+            .expect_err("post-reset the call is admitted and fails only on the agent");
+        assert!(
+            after_reset.to_string().contains("agent not found: ghost"),
+            "a session reset must restore the budget: {after_reset}"
+        );
+    }
+
+    /// SUBA-002's request-counting rules (pi `countRequestedSubagentSpawns`,
+    /// `subagent-executor.ts:284-292`), observed through the rejection notice's `N requested` field:
+    /// a CHAIN bills each step, with a dynamic-parallel step billed its worst-case fan-out
+    /// (`expand.maxItems`, else `config.chain.dynamicFanout.maxItems`, else 0) and a static parallel
+    /// step billed its task count.
+    #[tokio::test]
+    async fn chain_spawn_count_bills_dynamic_fanout_worst_case_and_parallel_width() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                chain: Some(crate::registration::ExtensionChainConfig {
+                    dynamic_fanout: Some(crate::registration::DynamicFanoutConfig {
+                        max_items: Some(7),
+                    }),
+                }),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let tool = ext.subagent_tool();
+
+        async fn reject_text(tool: &SubagentTool, params: serde_json::Value) -> String {
+            tool.execute(
+                ToolCallId::from("t"),
+                params,
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("over the 1-spawn budget")
+            .to_string()
+        }
+
+        // Every chain below is STRUCTURALLY VALID (the dynamic steps satisfy
+        // `validate_dynamic_step_shape`), so the notice asserted here is the budget's, not a shape
+        // diagnostic that happens to precede it.
+        //
+        // A sequential step (1) + a static parallel step of width 3 (3) + a dynamic-parallel step
+        // with its own `expand.maxItems: 5` (5) == 9 requested.
+        let explicit = reject_text(&tool, serde_json::json!({ "chain": [
+            { "agent": "ghost", "task": "a", "as": "targets" },
+            { "parallel": [
+                { "agent": "ghost", "task": "b" },
+                { "agent": "ghost", "task": "c" },
+                { "agent": "ghost", "task": "d" }
+            ] },
+            {
+                "expand": { "from": { "output": "targets", "path": "/items" }, "maxItems": 5 },
+                "collect": { "as": "gathered" },
+                "parallel": { "agent": "ghost", "task": "Handle {item}" }
+            }
+        ]}))
+        .await;
+        assert!(explicit.contains("(0/1 used, 9 requested)"), "got: {explicit}");
+
+        // With `expand.maxItems` omitted the dynamic step falls back to the CONFIGURED
+        // `chain.dynamicFanout.maxItems` (7 here), so 1 + 7 == 8 requested.
+        ext.executor().reset_spawn_budget();
+        let configured = reject_text(&tool, serde_json::json!({ "chain": [
+            { "agent": "ghost", "task": "a", "as": "targets" },
+            {
+                "expand": { "from": { "output": "targets", "path": "/items" } },
+                "collect": { "as": "gathered" },
+                "parallel": { "agent": "ghost", "task": "Handle {item}" }
+            }
+        ]}))
+        .await;
+        assert!(configured.contains("(0/1 used, 8 requested)"), "got: {configured}");
+    }
+
     /// Dispatch discrimination: management/control/parallel/chain modes are each RECOGNIZED and
     /// routed to their own arm rather than mis-parsed as a broken SINGLE call. Management/control
     /// still short-circuit at their P1 stubs; parallel/chain now route to REAL execution, proven
@@ -10050,6 +10349,7 @@ mod tests {
                 output: cost_total / 2.0,
                 cache_read: 0.0,
                 cache_write: 0.0,
+                tiers: None,
             },
             context_window,
             max_tokens,
