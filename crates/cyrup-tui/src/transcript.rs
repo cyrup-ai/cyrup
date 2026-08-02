@@ -45,6 +45,11 @@ pub enum Entry {
     Tool(ToolRun),
     /// A status / notification line (model change, compaction, queue, …).
     Status(String),
+    /// An `error`-styled notice appended after an assistant turn that did not finish cleanly
+    /// (`assistant-message.ts:175-201`): the max-output-token truncation notice, the abort wording,
+    /// or `Error: {message}`. Rendered as a blank spacer + one error-coloured line, matching Pi's
+    /// `Spacer(1)` + `Text(theme.fg("error", …), outputPad, 0)`.
+    Error(String),
     /// A bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`): a top `DynamicBorder`,
     /// a bold-accent `title`, a blank, the `markdown` body, then a bottom `DynamicBorder`
     /// (interactive-mode.ts:5502-5507).
@@ -403,6 +408,13 @@ impl TranscriptView {
     /// Record a status / notification line.
     pub fn push_status(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Status(text.into()));
+    }
+
+    /// Record an `error`-styled notice line — the incomplete/failed-turn footer Pi appends to an
+    /// assistant message (`assistant-message.ts:177-201`). Distinct from
+    /// [`push_status`](Self::push_status), which is dim and bulleted.
+    pub fn push_error(&mut self, text: impl Into<String>) {
+        self.pending.push(Entry::Error(text.into()));
     }
 
     /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).
@@ -1218,6 +1230,16 @@ pub(crate) fn entry_lines(
             labeled_message_lines("compaction", &header, summary, theme, width)
         }
         Entry::Status(text) => vec![Line::styled(format!("• {text}"), theme.dim_style())],
+        Entry::Error(text) => {
+            // Pi: `Spacer(1)` then `Text(theme.fg("error", text), outputPad, 0)`
+            // (assistant-message.ts:178-188). One logical line — the scrollback flush wraps it at
+            // the content width via `wrapped_height`/`Paragraph::wrap`, exactly like a long prose
+            // paragraph.
+            let mut out = vec![Line::styled(text.clone(), theme.error_style())];
+            pad_lines(&mut out, output_pad);
+            out.insert(0, Line::default());
+            out
+        }
         Entry::Block { title, markdown } => {
             let rule = "─".repeat(width.max(1));
             let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);

@@ -2458,6 +2458,9 @@ impl<B: Backend> App<B> {
     /// `AssistantMessage` text and records its token usage in the footer. Non-text streaming frames
     /// (start/text-start/text-end/thinking*/toolcall*) carry only the running `partial`; the
     /// authoritative text reaches us via `TextDelta` + the terminal, so nothing is rendered for them.
+    ///
+    /// A terminal whose `stop_reason` is not a clean stop also appends Pi's error-styled
+    /// incomplete/failed-turn notice ([`stop_reason_notice`], `assistant-message.ts:175-201`).
     fn ingest_stream_event(&mut self, ev: &StreamEvent) {
         match ev {
             StreamEvent::TextDelta { delta, .. } => {
@@ -2479,9 +2482,55 @@ impl<B: Backend> App<B> {
                 }
                 // Accumulate the turn into the cumulative session footer totals (footer.ts:86-107).
                 self.state.status.add_usage(&message.usage);
+                // A turn that did not finish cleanly gets Pi's error-styled footer notice
+                // (assistant-message.ts:175-201) — otherwise a 5xx, an abort or a max-token
+                // truncation would end the turn with no explanation at all.
+                if let Some(notice) = stop_reason_notice(message) {
+                    self.state.transcript.push_error(notice);
+                }
             }
             _ => {}
         }
+    }
+}
+
+/// The `error`-styled notice Pi appends after an assistant turn that did not finish cleanly
+/// (`assistant-message.ts:175-201`), or `None` for a clean turn.
+///
+/// * `length` → the max-output-token sentence, emitted **unconditionally**: a length stop can land
+///   before a tool call is complete, so it is surfaced even on a tool turn (`:177`).
+/// * `aborted` / `error` → emitted only when the message carries NO `toolCall` content (`:189`),
+///   because for those the tool-execution component already reports the failure.
+/// * `aborted` shows `errorMessage` unless it is the internal `Request was aborted` sentinel, in
+///   which case the user-facing wording is `Operation aborted` (`:190-197`).
+/// * `error` shows `Error: {errorMessage || "Unknown error"}` (`:198-201`).
+fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Option<String> {
+    use cyrup_core::StopReason;
+    if message.stop_reason == StopReason::Length {
+        return Some(
+            "Error: Model stopped because it reached the maximum output token limit. \
+             The response may be incomplete."
+                .to_string(),
+        );
+    }
+    let has_tool_calls =
+        message.content.iter().any(|c| matches!(c, cyrup_core::Content::ToolCall(_)));
+    if has_tool_calls {
+        return None;
+    }
+    match message.stop_reason {
+        StopReason::Aborted => Some(match message.error_message.as_deref() {
+            Some(m) if !m.is_empty() && m != "Request was aborted" => m.to_string(),
+            _ => "Operation aborted".to_string(),
+        }),
+        StopReason::Error => Some(format!(
+            "Error: {}",
+            match message.error_message.as_deref() {
+                Some(m) if !m.is_empty() => m,
+                _ => "Unknown error",
+            }
+        )),
+        StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
     }
 }
 
