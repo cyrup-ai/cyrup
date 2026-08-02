@@ -328,7 +328,8 @@ pub enum HostEvent {
     SessionBeforeSwitch { target_id: String },
     SessionBeforeFork { entry_id: String },
     /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587): the computed
-    /// `preparation` (`CompactionPreparation`), the `branch_entries` in scope, optional
+    /// `preparation` (`CompactionPreparation`, whose `messagesToSummarize`/`turnPrefixMessages`
+    /// carry RAW `AgentMessage`s with their roles intact), the `branch_entries` in scope, optional
     /// `custom_instructions`, the trigger `reason` (`"manual"|"threshold"|"overflow"`), and
     /// `will_retry`. A handler may veto (`block`) or return a compaction override via `mutate` — the
     /// folded override lands in `override_result` (Pi `SessionBeforeCompactResult.compaction`).

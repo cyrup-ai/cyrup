@@ -9,6 +9,7 @@ use crate::compaction::serialize::serialize_conversation;
 use crate::compaction::summarize::{
     SummarizationRequest, Summarizer, SUMMARIZATION_SYSTEM_PROMPT,
 };
+use cyrup_core::Usage;
 use crate::compaction::tokens::{
     estimate_agent_message, estimate_custom_message_content, estimate_summary_text,
 };
@@ -16,6 +17,15 @@ use crate::context::{branch_summary_message, compaction_summary_message};
 use crate::entry::{Entry, KnownEntry};
 use cyrup_core::{ModelRef, ModelThinkingLevel};
 use cyrup_provider::Model;
+
+/// A branch summary plus the usage of the call that produced it — Pi `BranchSummaryResult`
+/// (`branch-summarization.ts:34-40`), whose `usage` is optional because the "nothing to summarize"
+/// short-circuit returns before any model call.
+#[derive(Clone, Debug)]
+pub struct BranchSummaryOutput {
+    pub text: String,
+    pub usage: Option<Usage>,
+}
 
 /// The LLM messages an entry contributes to a branch summary, its Pi `estimateTokens` cost, and
 /// whether it is a summary entry (eligible for the over-budget force-include). `None` skips the
@@ -103,6 +113,26 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
+/// Pi's fallback context window for a model whose catalog reports none — `model.contextWindow ||
+/// 128000` (`branch-summarization.ts:315`).
+pub const DEFAULT_BRANCH_CONTEXT_WINDOW: u32 = 128_000;
+
+/// The branch-summary token budget: `(model.context_window || 128000) − reserve_tokens` (Pi
+/// `branch-summarization.ts:315-317`).
+///
+/// The `|| 128000` fallback is load-bearing and its absence fails INVERTED.
+/// [`prepare_branch_entries`] reads `budget == 0` as "no limit" (as Pi reads a non-positive `tokenBudget`), so a model with a
+/// zero/unknown context window would otherwise get an UNLIMITED budget and serialize the entire
+/// abandoned branch into one summarization prompt — instead of the 111616-token cap Pi applies.
+///
+/// A `reserve_tokens` larger than the window saturates to `0`, which matches Pi: its subtraction
+/// goes negative and `tokenBudget > 0` is likewise false, so both treat that case as "no limit".
+pub fn branch_token_budget(model: &Model, reserve_tokens: u32) -> u32 {
+    let window = u32::try_from(model.context_window).unwrap_or(u32::MAX);
+    let window = if window == 0 { DEFAULT_BRANCH_CONTEXT_WINDOW } else { window };
+    window.saturating_sub(reserve_tokens)
+}
+
 /// The entries unique to the abandoned branch (old leaf back to, but excluding, the common ancestor)
 /// and the common-ancestor id (R-05-016).
 pub struct BranchCollection {
@@ -183,16 +213,24 @@ fn prepend(selected: &mut Vec<Message>, mut head: Vec<Message>) {
 
 /// Generate a branch summary (preamble + structured summary + machine file blocks). The
 /// summarization completion is capped at a fixed 2048 tokens (Pi `branch-summarization.ts:341`).
+///
+/// Returns the text together with the call's [`Usage`], which the caller persists on the
+/// `branch_summary` entry (Pi `BranchSummaryResult.usage` → `BranchSummaryEntry.usage`,
+/// `branch-summarization.ts:372`, `session-manager.ts:88-89`). The short-circuit placeholder path
+/// makes no call, hence `usage: None`.
 pub async fn generate_branch_summary<S: Summarizer>(
     summarizer: &S,
     prep: &BranchPreparation,
     model: &Model,
     cancel: CancelToken,
-) -> Result<String, CompactionError> {
+) -> Result<BranchSummaryOutput, CompactionError> {
     // Pi short-circuits BEFORE the model call when there is nothing to summarize, returning the
     // placeholder string (`branch-summarization.ts:309-311`). The caller decides whether to append.
     if prep.messages.is_empty() {
-        return Ok(BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string());
+        return Ok(BranchSummaryOutput {
+            text: BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string(),
+            usage: None,
+        });
     }
     let transcript = serialize_conversation(&prep.messages);
     let prompt =
@@ -206,6 +244,10 @@ pub async fn generate_branch_summary<S: Summarizer>(
             api: Some(model.api.clone()),
             model: model.id.clone(),
         },
+        // Pi builds the branch-summary request options INLINE — `{ apiKey, headers, env, signal,
+        // maxTokens: 2048 }` (`branch-summarization.ts:348`) — rather than through
+        // `createSummarizationOptions`, so `reasoning` is never set for a branch summary even on a
+        // reasoning model with thinking enabled. `Off` is that absence, not an oversight.
         thinking: ModelThinkingLevel::Off,
     };
     let resp = summarizer.complete(req, cancel).await?;
@@ -225,10 +267,13 @@ pub async fn generate_branch_summary<S: Summarizer>(
                 .collect::<Vec<_>>()
                 .join("\n");
             let (read, modified) = prep.file_ops.compute_lists();
-            Ok(format!(
-                "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                format_file_operations(&read, &modified)
-            ))
+            Ok(BranchSummaryOutput {
+                text: format!(
+                    "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+                    format_file_operations(&read, &modified)
+                ),
+                usage: Some(resp.usage),
+            })
         }
     }
 }

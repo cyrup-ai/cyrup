@@ -18,16 +18,17 @@ pub mod settings;
 pub mod summarize;
 pub mod tokens;
 
-use cyrup_core::{CancelToken, EntryId};
+use cyrup_core::{CancelToken, EntryId, ModelThinkingLevel, Usage};
 use cyrup_provider::Model;
 
 use crate::entry::{Entry, KnownEntry};
 use crate::manager::SessionManager;
 
 pub use branch::{
-    collect_entries_for_branch_summary, generate_branch_summary, prepare_branch_entries,
-    BranchCollection, BranchPreparation, BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE,
-    BRANCH_SUMMARY_PROMPT,
+    branch_token_budget, collect_entries_for_branch_summary, generate_branch_summary,
+    prepare_branch_entries, BranchCollection, BranchPreparation, BranchSummaryOutput,
+    BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
+    DEFAULT_BRANCH_CONTEXT_WINDOW,
 };
 pub use cutpoint::{find_cut_point, find_turn_start, find_valid_cut_points, CutPoint};
 pub use error::CompactionError;
@@ -41,9 +42,10 @@ pub use prepare::{prepare_compaction, CompactionPreparation};
 pub use serialize::serialize_conversation;
 pub use settings::{BranchSummarySettings, CompactionSettings};
 pub use summarize::{
-    compact_default, generate_summary, generate_turn_prefix_summary, ProviderSummarizer,
-    SummarizationRequest, Summarizer, SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT,
-    TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
+    combine_usage, compact_default, complete_summarization, generate_summary,
+    generate_turn_prefix_summary, summarization_reasoning, DefaultCompaction, ProviderSummarizer,
+    SummarizationRequest, SummaryOutput, Summarizer, SUMMARIZATION_PROMPT,
+    SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use tokens::{
     context_tokens_from_usage, estimate_context_tokens, estimate_context_tokens_raw,
@@ -56,12 +58,40 @@ pub struct Compactor<S: Summarizer, H: CompactionHooks> {
     summarizer: S,
     hooks: H,
     cache: TokenCache,
+    thinking: ModelThinkingLevel,
 }
 
 impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
     /// Build a compactor over an injected summarizer + hook dispatcher.
+    ///
+    /// The thinking level defaults to `Off`; production callers bind the live session level with
+    /// [`Self::with_thinking`].
     pub fn new(summarizer: S, hooks: H) -> Self {
-        Self { summarizer, hooks, cache: TokenCache::default() }
+        Self {
+            summarizer,
+            hooks,
+            cache: TokenCache::default(),
+            thinking: ModelThinkingLevel::Off,
+        }
+    }
+
+    /// Bind the session's thinking level for the summarization calls this compactor makes.
+    ///
+    /// Pi passes `this.thinkingLevel` at every `compact(...)` call site
+    /// (`agent-session.ts:1855,2129`); cyrup builds one `Compactor` per compaction operation from
+    /// the same live session state that supplies the model, so the level is bound here alongside
+    /// the summarizer. It reaches the request only through
+    /// [`summarize::summarization_reasoning`], which reproduces Pi's
+    /// `model.reasoning && level !== "off"` gate. Branch summaries deliberately ignore it — see
+    /// [`branch::generate_branch_summary`].
+    pub fn with_thinking(mut self, thinking: ModelThinkingLevel) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    /// The bound session thinking level.
+    pub fn thinking(&self) -> ModelThinkingLevel {
+        self.thinking
     }
 
     /// The per-session token-estimate cache (R-05-024).
@@ -188,7 +218,8 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         external_override: Option<CompactionOverride>,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
-        let (summary, first_kept, tokens_before, details, from_hook) = match external_override {
+        let (summary, first_kept, tokens_before, details, usage, from_hook) = match external_override
+        {
             // An external extension override (Pi `SessionBeforeCompactResult.compaction`) wins over
             // the internal `CompactionHooks` seam: its summary/details land in the entry (fromExtension).
             Some(ov) => (
@@ -196,6 +227,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 ov.first_kept_entry_id.unwrap_or_else(|| prep.first_kept_entry_id.clone()),
                 ov.tokens_before.unwrap_or(u64::from(prep.tokens_before)),
                 ov.details.unwrap_or_else(|| serde_json::json!({})),
+                ov.usage,
                 true,
             ),
             None => {
@@ -220,29 +252,33 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                         first_kept_entry_id,
                         tokens_before,
                         details,
+                        usage,
                     } => (
                         summary,
                         first_kept_entry_id,
                         tokens_before,
                         details.unwrap_or_else(|| serde_json::json!({})),
+                        usage,
                         true,
                     ),
                     BeforeCompactDecision::Proceed => {
-                        let summary = compact_default(
+                        let produced = compact_default(
                             &self.summarizer,
                             prep,
                             model,
                             custom_instructions.as_deref(),
+                            self.thinking,
                             cancel.clone(),
                         )
                         .await?;
                         let details = serde_json::to_value(prep.file_ops.to_details())
                             .unwrap_or_else(|_| serde_json::json!({}));
                         (
-                            summary,
+                            produced.summary,
                             prep.first_kept_entry_id.clone(),
                             u64::from(prep.tokens_before),
                             details,
+                            produced.usage,
                             false,
                         )
                     }
@@ -255,6 +291,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             first_kept,
             tokens_before,
             Some(details),
+            usage,
             from_hook,
         )?;
         let entry = compaction_entry_of(session, &id).ok_or(CompactionError::MissingEntryId)?;
@@ -303,11 +340,12 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
 
         // before-tree hook: cancel navigation / supply custom summary / proceed (R-05-022).
         let decision = self.hooks.before_tree(&event, cancel.child_token()).await?;
-        let (summary_and_details, from_hook): (Option<(String, serde_json::Value)>, bool) =
+        type SummaryPayload = Option<(String, serde_json::Value, Option<Usage>)>;
+        let (summary_and_details, from_hook): (SummaryPayload, bool) =
             match decision {
                 BeforeTreeDecision::Cancel => return Ok(None),
                 BeforeTreeDecision::CustomSummary { summary, details } if user_wants_summary => {
-                    (Some((summary, details.unwrap_or_else(|| serde_json::json!({})))), true)
+                    (Some((summary, details.unwrap_or_else(|| serde_json::json!({})), None)), true)
                 }
                 // Proceed, or a custom summary the user did not ask for → default path.
                 BeforeTreeDecision::Proceed | BeforeTreeDecision::CustomSummary { .. } => {
@@ -318,19 +356,17 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                         // (`agent-session.ts:2787`): with NO abandoned entries, produce nothing.
                         (None, false)
                     } else {
-                        // Budget = model context window − reserve (Pi `branch-summarization.ts:304-307`),
-                        // NOT a flat reserve_tokens — this keeps far more branch history than a bare
-                        // reserve would.
-                        let budget = u32::try_from(model.context_window)
-                            .unwrap_or(u32::MAX)
-                            .saturating_sub(settings.reserve_tokens);
+                        // Budget = (context window || 128000) − reserve (Pi
+                        // `branch-summarization.ts:315-317`), NOT a flat reserve_tokens — this
+                        // keeps far more branch history than a bare reserve would.
+                        let budget = branch_token_budget(model, settings.reserve_tokens);
                         let prep = prepare_branch_entries(&collection.entries, budget);
                         // `generate_branch_summary` returns the "No content to summarize" placeholder
                         // when the abandoned branch filtered to no messages (all `toolResult` / over
                         // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
                         // non-empty placeholder (`agent-session.ts:2844`) — so we append it too rather
                         // than silently dropping an explored branch.
-                        let summary = generate_branch_summary(
+                        let produced = generate_branch_summary(
                             &self.summarizer,
                             &prep,
                             model,
@@ -339,7 +375,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                         .await?;
                         let details = serde_json::to_value(prep.file_ops.to_details())
                             .unwrap_or_else(|_| serde_json::json!({}));
-                        (Some((summary, details)), false)
+                        (Some((produced.text, details, produced.usage)), false)
                     }
                 }
             };
@@ -348,10 +384,15 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         session.branch(&target_id)?;
 
         let entry = match summary_and_details {
-            Some((summary, details)) => {
+            Some((summary, details, usage)) => {
                 let from_id = old_leaf.clone().unwrap_or_else(|| EntryId::from("root"));
-                let id =
-                    session.append_branch_summary(from_id, summary, Some(details), from_hook)?;
+                let id = session.append_branch_summary(
+                    from_id,
+                    summary,
+                    Some(details),
+                    usage,
+                    from_hook,
+                )?;
                 branch_summary_entry_of(session, &id)
             }
             None => None,
@@ -377,6 +418,7 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
             first_kept_entry_id,
             tokens_before,
             details,
+            usage,
             from_hook,
         })) => Some(CompactionEntry {
             id: base.id.clone(),
@@ -386,6 +428,7 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
             tokens_before: *tokens_before,
             from_hook: from_hook.unwrap_or(false),
             details: details.clone(),
+            usage: usage.clone(),
         }),
         _ => None,
     }
@@ -399,6 +442,7 @@ fn branch_summary_entry_of(session: &SessionManager, id: &EntryId) -> Option<Bra
             from_id,
             summary,
             details,
+            usage,
             from_hook,
         })) => Some(BranchSummaryEntry {
             id: base.id.clone(),
@@ -407,6 +451,7 @@ fn branch_summary_entry_of(session: &SessionManager, id: &EntryId) -> Option<Bra
             from_id: from_id.clone(),
             from_hook: from_hook.unwrap_or(false),
             details: details.clone(),
+            usage: usage.clone(),
         }),
         _ => None,
     }

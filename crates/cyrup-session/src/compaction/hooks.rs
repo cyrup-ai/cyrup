@@ -2,10 +2,11 @@
 //! are plain serde structs (they cross the WASM boundary as serialized events per ADR-0002); the
 //! dispatcher is injected so `cyrup-session` does not depend on `cyrup-ext`.
 
-use cyrup_core::{CancelToken, EntryId, Message};
+use cyrup_core::{CancelToken, EntryId, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_message::AgentMessage;
 use crate::compaction::error::CompactionError;
 use crate::compaction::files::CompactionDetails;
 use crate::compaction::settings::CompactionSettings;
@@ -34,6 +35,9 @@ pub struct CompactionEntry {
     pub from_hook: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Token spend of the summarization call(s) (Pi `CompactionEntry.usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// The appended branch-summary entry payload (R-05-016/022).
@@ -49,14 +53,23 @@ pub struct BranchSummaryEntry {
     pub from_hook: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Token spend of the branch-summarization call (Pi `BranchSummaryEntry.usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// Input to the before-compact hook (R-05-019).
+///
+/// The two message lists are RAW [`AgentMessage`]s — roles (`bashExecution`, `custom`,
+/// `branchSummary`, `compactionSummary`) intact, `excludeFromContext` bash commands included — so a
+/// guest sees exactly what Pi's `CompactionPreparation` carries
+/// (`coding-agent/src/core/compaction/compaction.ts:690-700`) and can dispatch on `role` /
+/// `customType` the way an extension ported from Pi expects.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BeforeCompactEvent {
-    pub messages_to_summarize: Vec<Message>,
-    pub turn_prefix_messages: Vec<Message>,
+    pub messages_to_summarize: Vec<AgentMessage>,
+    pub turn_prefix_messages: Vec<AgentMessage>,
     pub previous_summary: Option<String>,
     pub file_ops: CompactionDetails,
     pub tokens_before: u64,
@@ -83,6 +96,10 @@ pub enum BeforeCompactDecision {
         tokens_before: u64,
         #[serde(default)]
         details: Option<Value>,
+        /// Usage the hook reports for its own summarization, if any (Pi threads
+        /// `extensionCompaction.usage` into `appendCompaction`, `agent-session.ts:1844,1872`).
+        #[serde(default)]
+        usage: Option<Usage>,
     },
 }
 
@@ -98,6 +115,9 @@ pub struct CompactionOverride {
     pub first_kept_entry_id: Option<EntryId>,
     pub tokens_before: Option<u64>,
     pub details: Option<Value>,
+    /// The guest's reported summarization usage (Pi `CompactionResult.usage`), persisted verbatim
+    /// on the appended entry.
+    pub usage: Option<Usage>,
 }
 
 /// Post-compact notification (R-05-021).

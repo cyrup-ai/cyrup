@@ -5,7 +5,10 @@
 
 use cyrup_core::{Content, Message, ModelRef};
 
-use crate::agent_message::{custom_to_message, AgentMessage};
+use crate::agent_message::{
+    custom_to_message, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage,
+    CustomRoleMessage, MessageRole,
+};
 use crate::entry::{Entry, KnownEntry};
 
 /// Compaction-summary wrapper (Pi `COMPACTION_SUMMARY_PREFIX`/`SUFFIX`, `messages.ts:11-17`). The
@@ -42,8 +45,15 @@ impl SessionContext {
 ///   user messages; an `excludeFromContext` bash message is dropped);
 /// - `CustomMessage` (entry) → a user message;
 /// - `BranchSummary` (non-empty) → the wrapped branch-summary message;
+/// - `Compaction` → the wrapped compaction-summary message (Pi `sessionEntryToContextMessages`'s
+///   `compaction` arm, `session-manager.ts:404-406`, composed with `convertToLlm`'s
+///   `compactionSummary` arm). Reachable only for an *older* compaction that survives inside the
+///   window kept by a LATER one — the governing (latest) compaction is prepended by the path
+///   builders and excluded from their per-entry loops by range, exactly as Pi's
+///   `buildContextEntries` keeps it at the head and iterates `0..compactionIdx`
+///   (`session-manager.ts:441-453`);
 /// - everything else (`Custom`, `Label`, `ModelChange`, `ThinkingLevelChange`, `SessionInfo`,
-///   `Compaction`, `Unknown`) → skipped.
+///   `Unknown`) → skipped.
 pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
     if let Entry::Known(k) = e {
         match k {
@@ -53,6 +63,13 @@ pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
             }
             KnownEntry::BranchSummary { summary, base, .. } if !summary.is_empty() => {
                 out.push(branch_summary_message(summary, parse_entry_ts(&base.timestamp)));
+            }
+            KnownEntry::Compaction { summary, tokens_before, base, .. } => {
+                out.push(compaction_summary_message(
+                    summary,
+                    *tokens_before,
+                    parse_entry_ts(&base.timestamp),
+                ));
             }
             _ => {}
         }
@@ -129,43 +146,48 @@ pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
     messages
 }
 
-/// A message of Pi's **raw `AgentMessage`** context (Pi `buildSessionContext().messages`,
-/// `session-manager.ts:386-403`), used ONLY for the `tokensBefore` / `should_compact` token
-/// estimate. Unlike [`build_context_messages`] (which `convertToLlm`-renders every non-core role to
-/// a wrapped core `user` message), this keeps the `bashExecution` / `custom` / `branchSummary` /
-/// `compactionSummary` roles intact so [`crate::compaction::tokens::estimate_context_tokens_raw`]
-/// can dispatch on them exactly as Pi `estimateTokens` does (`compaction.ts:256-296`): a
-/// `bashExecution` costs `(command+output)/4` **even when `excludeFromContext`** (Pi's raw context
-/// never drops it), and a summary costs `summary.length/4` **without** the LLM wrapper prefix/suffix.
-#[derive(Clone, Debug)]
-pub enum RawContextMessage {
-    /// A `type:"message"` entry's raw `AgentMessage` (core / bash / custom-role). Boxed because the
-    /// core `AssistantMessage` arm dwarfs the other variants.
-    Agent(Box<AgentMessage>),
-    /// A `custom_message` entry's content (Pi `createCustomMessage` → `custom` role).
-    CustomContent(serde_json::Value),
-    /// A non-empty `branch_summary` entry's summary text (Pi `createBranchSummaryMessage`).
-    BranchSummary(String),
-    /// A `compaction` entry's summary text (Pi `createCompactionSummaryMessage`).
-    CompactionSummary(String),
-}
-
-/// Append the **raw `AgentMessage`** form of an entry, mirroring Pi `buildSessionContext`'s
-/// `appendMessage` (`session-manager.ts:389-399`) but WITHOUT `convertToLlm` rendering — the
-/// `appendMessage` arms are: `message` → `entry.message`, `custom_message` →
-/// `createCustomMessage(...)`, non-empty `branch_summary` → `createBranchSummaryMessage(...)`.
-/// Everything else is skipped (the compaction summary is prepended by the caller, exactly as Pi).
-fn push_as_raw(out: &mut Vec<RawContextMessage>, e: &Entry) {
+/// Append the **raw `AgentMessage`** form of an entry — Pi `sessionEntryToContextMessages`
+/// (`session-manager.ts:383-408`) without `convertToLlm` rendering. The arms are: `message` →
+/// `entry.message`, `custom_message` → `createCustomMessage(...)`, non-empty `branch_summary` →
+/// `createBranchSummaryMessage(...)`, `compaction` → `createCompactionSummaryMessage(...)`.
+/// Everything else is skipped.
+///
+/// The `compaction` arm only fires for an *older* compaction kept inside a later one's window: the
+/// path builders prepend the governing compaction themselves and exclude it from the per-entry loop
+/// by range, mirroring Pi's `buildContextEntries` (`session-manager.ts:441-453`), which puts the
+/// latest compaction at the head of the list and then iterates `0..compactionIdx`.
+///
+/// Keeping the `bashExecution` / `custom` / `branchSummary` / `compactionSummary` roles intact is
+/// what lets [`crate::compaction::tokens::estimate_context_tokens_raw`] dispatch on them exactly as
+/// Pi `estimateTokens` does (`compaction.ts:256-296`): a `bashExecution` costs
+/// `(command+output)/4` **even when `excludeFromContext`** (Pi's raw context never drops it), and a
+/// summary costs `summary.length/4` **without** the LLM wrapper prefix/suffix.
+fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
     if let Entry::Known(k) = e {
         match k {
-            KnownEntry::Message { message, .. } => {
-                out.push(RawContextMessage::Agent(Box::new(message.clone())));
+            KnownEntry::Message { message, .. } => out.push(message.clone()),
+            KnownEntry::CustomMessage { content, custom_type, display, details, base } => {
+                out.push(AgentMessage::Custom(CustomRoleMessage {
+                    custom_type: custom_type.clone(),
+                    content: content.clone(),
+                    display: *display,
+                    details: details.clone(),
+                    timestamp: parse_entry_ts(&base.timestamp),
+                }));
             }
-            KnownEntry::CustomMessage { content, .. } => {
-                out.push(RawContextMessage::CustomContent(content.clone()));
+            KnownEntry::BranchSummary { summary, from_id, base, .. } if !summary.is_empty() => {
+                out.push(AgentMessage::BranchSummary(BranchSummaryMessage {
+                    summary: summary.clone(),
+                    from_id: from_id.clone(),
+                    timestamp: parse_entry_ts(&base.timestamp),
+                }));
             }
-            KnownEntry::BranchSummary { summary, .. } if !summary.is_empty() => {
-                out.push(RawContextMessage::BranchSummary(summary.clone()));
+            KnownEntry::Compaction { summary, tokens_before, base, .. } => {
+                out.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                    summary: summary.clone(),
+                    tokens_before: *tokens_before,
+                    timestamp: parse_entry_ts(&base.timestamp),
+                }));
             }
             _ => {}
         }
@@ -173,42 +195,63 @@ fn push_as_raw(out: &mut Vec<RawContextMessage>, e: &Entry) {
 }
 
 /// The raw-context projection of ONE entry — Pi `sessionEntryToContextMessages(entry)`
-/// (`session-manager.ts:381-403`): `message` → its raw `AgentMessage`, `custom_message` → its
-/// content, a NON-EMPTY `branch_summary` → its summary, `compaction` → its summary, everything else
-/// → nothing.
+/// (`session-manager.ts:383-408`): `message` → its raw `AgentMessage`, `custom_message` →
+/// `createCustomMessage(...)`, a NON-EMPTY `branch_summary` → `createBranchSummaryMessage(...)`,
+/// `compaction` → `createCompactionSummaryMessage(...)`, everything else → nothing.
 ///
 /// An entry is "context-visible" iff this is non-empty — the predicate Pi's live `findCutPoint`
-/// uses both for its token accumulation and for its back-scan (`compaction.ts:418-446`).
-///
-/// The `compaction` arm exists HERE but deliberately not in [`push_as_raw`]: the path builders
-/// prepend a compaction's summary themselves (Pi folds the same summary in via
-/// `buildContextEntries`, which keeps the compaction entry at the head of the context list), so
-/// projecting it a second time inside the per-entry loop would double-count it.
-pub fn raw_context_messages(e: &Entry) -> Vec<RawContextMessage> {
-    if let Entry::Known(KnownEntry::Compaction { summary, .. }) = e {
-        return vec![RawContextMessage::CompactionSummary(summary.clone())];
-    }
+/// uses both for its token accumulation and for its back-scan (`compaction.ts:418-446`). Use
+/// [`context_message_role`] where only the classification is needed: it answers the same question
+/// without cloning the message.
+pub fn raw_context_messages(e: &Entry) -> Vec<AgentMessage> {
     let mut out = Vec::new();
     push_as_raw(&mut out, e);
     out
 }
 
+/// The role of the single message [`raw_context_messages`] would project this entry to, or `None`
+/// when the entry is context-invisible (`sessionEntryToContextMessages(entry).length === 0`).
+///
+/// This is the classification half of the projection, extracted so the cut-point layer can run Pi's
+/// `isCutPointMessage` / `isTurnStartMessage` predicates and its back-scan visibility test over
+/// every entry in a range WITHOUT cloning summaries and assistant content. It must stay in lockstep
+/// with [`raw_context_messages`]: every arm that projects a message here must project one there,
+/// with the same role — notably the `!summary.is_empty()` guard on `branch_summary`, which is Pi's
+/// `if (entry.type === "branch_summary" && entry.summary)` (`session-manager.ts:400`).
+pub fn context_message_role(e: &Entry) -> Option<MessageRole> {
+    match e {
+        Entry::Known(KnownEntry::Message { message, .. }) => Some(message.role()),
+        Entry::Known(KnownEntry::CustomMessage { .. }) => Some(MessageRole::Custom),
+        Entry::Known(KnownEntry::BranchSummary { summary, .. }) if !summary.is_empty() => {
+            Some(MessageRole::BranchSummary)
+        }
+        Entry::Known(KnownEntry::Compaction { .. }) => Some(MessageRole::CompactionSummary),
+        _ => None,
+    }
+}
+
 /// Build the active-path **raw `AgentMessage`** context exactly as Pi `buildSessionContext` does
-/// (`session-manager.ts:382-430`), but returning [`RawContextMessage`]s for token estimation only.
+/// (`session-manager.ts:382-430`) — Pi's `messages` field is `AgentMessage[]`, roles intact.
 /// Handles the compaction boundary identically to [`build_context_messages`]: emit the compaction
 /// summary first, then kept entries from `firstKeptEntryId`, then everything after. This is the input
 /// to `tokensBefore` / `should_compact` so the estimate matches Pi
 /// `estimateContextTokens(buildSessionContext(pathEntries).messages)` (`compaction.ts:678`) rather
 /// than estimating over the LLM-rendered text.
-pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<RawContextMessage> {
+pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
     let mut messages = Vec::new();
     match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
         Some((cpos, Entry::Known(KnownEntry::Compaction {
             summary,
             first_kept_entry_id,
+            tokens_before,
+            base,
             ..
         }))) => {
-            messages.push(RawContextMessage::CompactionSummary(summary.clone()));
+            messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                summary: summary.clone(),
+                tokens_before: *tokens_before,
+                timestamp: parse_entry_ts(&base.timestamp),
+            }));
             if let Some(before) = path.get(..cpos) {
                 let mut keeping = false;
                 for e in before {

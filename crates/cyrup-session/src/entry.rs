@@ -5,7 +5,7 @@
 //! `serde(tag=…)` + untagged-fallback shape is not expressible with `serde_derive`, so [`Entry`]
 //! hand-implements `Serialize`/`Deserialize` and delegates known variants to [`KnownEntry`].
 
-use cyrup_core::{EntryId, ModelId, ProviderId};
+use cyrup_core::{EntryId, ModelId, ProviderId, Usage};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -36,9 +36,11 @@ pub enum KnownEntry {
     Message {
         #[serde(flatten)]
         base: EntryBase,
-        /// The full Pi `AgentMessage` superset (`user`/`assistant`/`toolResult` plus the
-        /// `bashExecution`/`custom` roles), so bash/custom-role entries parse instead of degrading
-        /// to [`Entry::Unknown`] and being dropped from context (Pi `session-manager.ts:954`).
+        /// The full Pi `AgentMessage` union (`user`/`assistant`/`toolResult` plus the
+        /// `bashExecution`/`custom`/`branchSummary`/`compactionSummary` roles), so those entries
+        /// parse instead of degrading to [`Entry::Unknown`] and being dropped from context (Pi
+        /// `session-manager.ts:954`; Pi parses session files without validation, so a fork or a
+        /// hand-edited file carrying a summary role here is read, not discarded).
         message: AgentMessage,
     },
     ModelChange {
@@ -60,6 +62,13 @@ pub enum KnownEntry {
         tokens_before: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
+        /// Token spend of the LLM call(s) that produced `summary` (Pi `CompactionEntry.usage`,
+        /// `session-manager.ts:69-80`). On a split turn Pi records the SUM of the history call and
+        /// the turn-prefix call (`combineUsage`, `compaction.ts:877`). Optional and
+        /// `skip_serializing_if`-elided so a hook-supplied compaction that reports no usage stays
+        /// byte-identical to Pi's, and so a Pi-written entry that carries one round-trips (R-00-013).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_hook: Option<bool>,
     },
@@ -70,6 +79,10 @@ pub enum KnownEntry {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
+        /// Token spend of the branch-summarization call (Pi `BranchSummaryEntry.usage`,
+        /// `session-manager.ts:88-89`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_hook: Option<bool>,
     },

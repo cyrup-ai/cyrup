@@ -134,7 +134,7 @@ fn a04_3_build_context_with_compaction() {
     let u2 = m.append_message(user("keep-q")).unwrap();
     let _a2 = m.append_message(assistant("keep-a")).unwrap();
     let _comp = m
-        .append_compaction("SUMMARY-OF-OLD".to_string(), u2.clone(), 1234, None, false)
+        .append_compaction("SUMMARY-OF-OLD".to_string(), u2.clone(), 1234, None, None, false)
         .unwrap();
     let _u3 = m.append_message(user("new-q")).unwrap();
     let _a3 = m.append_message(assistant("new-a")).unwrap();

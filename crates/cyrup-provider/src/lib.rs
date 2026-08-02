@@ -138,7 +138,9 @@ pub use utils::node_http_proxy::{
 };
 pub use utils::overflow::{is_context_overflow, overflow_patterns};
 pub use utils::refresh::RefreshDedup;
-pub use utils::retry::is_retryable_assistant_error;
+pub use utils::retry::{
+    RetryObserver, RetryPolicy, is_retryable_assistant_error, retry_assistant_call,
+};
 pub use utils::simple_options::{
     SimpleStreamOptions, ThinkingBudgets, adjust_max_tokens_for_thinking, build_base_options,
     clamp_max_tokens_to_context, clamp_reasoning,

@@ -7,6 +7,8 @@ use cyrup_core::{Content, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_message::AgentMessage;
+
 /// Default `details` payload stored on a compaction/branch-summary entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +51,15 @@ impl FileOps {
                     }
                 }
             }
+        }
+    }
+
+    /// [`Self::absorb_message`] over a raw [`AgentMessage`] — Pi `extractFileOpsFromMessage`
+    /// (`utils.ts:38-55`) takes an `AgentMessage` and only its `assistant` arm does any work, so
+    /// bash/custom/summary roles contribute nothing.
+    pub fn absorb_agent_message(&mut self, msg: &AgentMessage) {
+        if let AgentMessage::Core(m) = msg {
+            self.absorb_message(m);
         }
     }
 

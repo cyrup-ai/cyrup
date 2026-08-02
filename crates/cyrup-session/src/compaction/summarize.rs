@@ -4,10 +4,15 @@
 use std::sync::Arc;
 
 use cyrup_core::{
-    AssistantMessage, CancelToken, Content, Message, ModelRef, StopReason, ModelThinkingLevel,
+    AssistantMessage, CancelToken, Content, Message, ModelRef, StopReason, ModelThinkingLevel, Usage,
 };
-use cyrup_provider::{collect_message, Context, Model, Provider, StreamOptions};
+use cyrup_core::Cost;
+use cyrup_provider::{
+    collect_message, retry_assistant_call, CacheRetention, Context, Model, Provider, RetryObserver,
+    RetryPolicy, StreamOptions,
+};
 
+use crate::agent_message::{convert_to_llm, AgentMessage};
 use crate::compaction::error::CompactionError;
 use crate::compaction::files::format_file_operations;
 use crate::compaction::prepare::CompactionPreparation;
@@ -116,6 +121,52 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.";
 
+/// One summarization call's result: the summary text plus the token spend that produced it — Pi's
+/// `{ text, usage }` (`generateSummaryWithUsage` / `generateTurnPrefixSummary`,
+/// `compaction.ts:596-616,882-896`). The usage is what lands in `CompactionEntry.usage`, so it must
+/// survive all the way from the provider response to the appended entry.
+#[derive(Clone, Debug)]
+pub struct SummaryOutput {
+    pub text: String,
+    pub usage: Usage,
+}
+
+/// The default compaction's product: the merged summary text and the usage of the LLM call(s) that
+/// produced it (`None` only when no call was made at all).
+#[derive(Clone, Debug)]
+pub struct DefaultCompaction {
+    pub summary: String,
+    pub usage: Option<Usage>,
+}
+
+/// Field-wise sum of two `Usage`s — a 1:1 port of Pi `combineUsage` (`compaction.ts:884-909`).
+/// `cacheWrite1h`/`reasoning` stay `None` unless at least one side reports them (Pi spreads the key
+/// in conditionally, so an absent value must not materialize as a `0`).
+pub fn combine_usage(first: &Usage, second: &Usage) -> Usage {
+    Usage {
+        input: first.input.saturating_add(second.input),
+        output: first.output.saturating_add(second.output),
+        cache_read: first.cache_read.saturating_add(second.cache_read),
+        cache_write: first.cache_write.saturating_add(second.cache_write),
+        cache_write_1h: match (first.cache_write_1h, second.cache_write_1h) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        },
+        reasoning: match (first.reasoning, second.reasoning) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        },
+        total_tokens: first.total_tokens.saturating_add(second.total_tokens),
+        cost: Cost {
+            input: first.cost.input + second.cost.input,
+            output: first.cost.output + second.cost.output,
+            cache_read: first.cost.cache_read + second.cost.cache_read,
+            cache_write: first.cost.cache_write + second.cost.cache_write,
+            total: first.cost.total + second.cost.total,
+        },
+    }
+}
+
 /// A single non-streaming summarization request (arch-05 §3.6).
 pub struct SummarizationRequest<'a> {
     pub system_prompt: &'a str,
@@ -137,15 +188,81 @@ pub trait Summarizer: Send + Sync {
     ) -> Result<AssistantMessage, CompactionError>;
 }
 
+/// The shared choke point for EVERY compaction / turn-prefix / branch summarization call — a 1:1
+/// port of Pi `completeSummarization` (`compaction.ts:555-581`). Both production `Summarizer`s
+/// (this crate's [`ProviderSummarizer`] and the session service's `DynSummarizer`) route through
+/// it, so the three request-shaping rules below cannot drift apart:
+///
+/// 1. **`cache_retention: None`** and **a fresh `session_id`** — "Summaries are standalone
+///    requests, so isolate routing and avoid cache writes that cannot be reused"
+///    (`compaction.ts:570-575`). Leaving `cache_retention` unset would let the encoder resolve it
+///    from `PI_CACHE_RETENTION` (defaulting to `Short`), billing a prompt-cache write on a
+///    one-shot request that can never be read back; leaving `session_id` unset would ride the
+///    summarization along on the live session's cache-routing affinity.
+/// 2. **`reasoning: req.thinking`** — the level the caller already gated through
+///    [`summarization_reasoning`] (Pi `createSummarizationOptions`, `compaction.ts:539-553`).
+/// 3. **[`retry_assistant_call`]** — so a transient stream drop (`terminated`, socket close)
+///    honors the configured [`RetryPolicy`] instead of failing the whole compaction on the first
+///    attempt (`compaction.ts:555-560`).
+///
+/// Cancellation still resolves to [`CompactionError::Aborted`]: the outer race is kept so a
+/// cancelled token short-circuits even if the provider has not yet delivered its terminal aborted
+/// event, and the token is also handed to the retry loop so its backoff sleep is abortable.
+pub async fn complete_summarization(
+    provider: &dyn Provider,
+    model: &Model,
+    req: SummarizationRequest<'_>,
+    retry: RetryPolicy,
+    callbacks: Option<&dyn RetryObserver>,
+    cancel: CancelToken,
+) -> Result<AssistantMessage, CompactionError> {
+    let ctx = Context {
+        system_prompt: Some(req.system_prompt.to_string()),
+        messages: vec![Message::User {
+            content: vec![Content::text(req.prompt_text)],
+            timestamp: 0,
+        }],
+        tools: Vec::new(),
+    };
+    let opts = StreamOptions {
+        cancel: Some(cancel.clone()),
+        max_tokens: Some(u64::from(req.max_tokens)),
+        cache_retention: Some(CacheRetention::None),
+        session_id: Some(crate::ids::gen_session_id()),
+        reasoning: req.thinking,
+        ..StreamOptions::default()
+    };
+    let ctx_ref = &ctx;
+    let opts_ref = &opts;
+    let produce =
+        move || async move { collect_message(provider.stream(model, ctx_ref, opts_ref)).await };
+    let call = retry_assistant_call(produce, retry, Some(&cancel), callbacks);
+    match cancel.run_until_cancelled(call).await {
+        Some(msg) => Ok(msg),
+        None => Err(CompactionError::Aborted),
+    }
+}
+
 /// Production `Summarizer`: a thin wrapper over a `cyrup-provider` `Provider` + `Model` (arch-01).
 pub struct ProviderSummarizer<P: Provider> {
     provider: Arc<P>,
     model: Model,
+    retry: RetryPolicy,
 }
 
 impl<P: Provider> ProviderSummarizer<P> {
+    /// A summarizer with retries OFF — Pi's `retry?: RetryPolicy` left `undefined`, which returns
+    /// the first response unchanged (`retry.ts:159-160`). Production callers must supply the
+    /// session's policy via [`Self::with_retry`].
     pub fn new(provider: Arc<P>, model: Model) -> Self {
-        Self { provider, model }
+        Self { provider, model, retry: RetryPolicy::DISABLED }
+    }
+
+    /// Bind the session's retry policy, as Pi threads `settingsManager.getRetrySettings()` into
+    /// every summarization call (`agent-session.ts:1858,2132,2997`).
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -155,24 +272,18 @@ impl<P: Provider> Summarizer for ProviderSummarizer<P> {
         req: SummarizationRequest<'_>,
         cancel: CancelToken,
     ) -> Result<AssistantMessage, CompactionError> {
-        let ctx = Context {
-            system_prompt: Some(req.system_prompt.to_string()),
-            messages: vec![Message::User {
-                content: vec![Content::text(req.prompt_text)],
-                timestamp: 0,
-            }],
-            tools: Vec::new(),
-        };
-        let opts = StreamOptions {
-            cancel: Some(cancel.clone()),
-            max_tokens: Some(u64::from(req.max_tokens)),
-            ..StreamOptions::default()
-        };
-        let stream = self.provider.stream(&self.model, &ctx, &opts);
-        match cancel.run_until_cancelled(collect_message(stream)).await {
-            Some(msg) => Ok(msg),
-            None => Err(CompactionError::Aborted),
-        }
+        complete_summarization(&*self.provider, &self.model, req, self.retry, None, cancel).await
+    }
+}
+
+/// Pi `createSummarizationOptions` (`compaction.ts:539-553`): the session thinking level reaches a
+/// summarization request only when the model actually supports reasoning AND the level is not
+/// `off` — otherwise Pi leaves `options.reasoning` unset, which this port spells `Off`.
+pub fn summarization_reasoning(model: &Model, level: ModelThinkingLevel) -> ModelThinkingLevel {
+    if model.reasoning && level != ModelThinkingLevel::Off {
+        level
+    } else {
+        ModelThinkingLevel::Off
     }
 }
 
@@ -209,15 +320,23 @@ fn join_text(content: &[Content]) -> String {
 
 /// Generate a summary for `msgs` via the model with the structured format, previous summary, and
 /// custom instructions (R-05-008/012/014).
+///
+/// `msgs` are RAW [`AgentMessage`]s; `convert_to_llm` runs here, immediately before
+/// `serialize_conversation`, exactly as Pi does
+/// (`compaction.ts:650-651`: `const llmMessages = convertToLlm(currentMessages);`). The transcript
+/// bytes are therefore identical to rendering earlier — only the extension-visible preparation and
+/// the "is there anything to summarize?" test see the raw form.
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_summary<S: Summarizer>(
     summarizer: &S,
-    msgs: &[Message],
+    msgs: &[AgentMessage],
     model: &Model,
     reserve: u32,
     instructions: Option<&str>,
     previous_summary: Option<&str>,
+    thinking: ModelThinkingLevel,
     cancel: CancelToken,
-) -> Result<String, CompactionError> {
+) -> Result<SummaryOutput, CompactionError> {
     let mut base = if previous_summary.is_some() {
         UPDATE_SUMMARIZATION_PROMPT.to_string()
     } else {
@@ -227,7 +346,7 @@ pub async fn generate_summary<S: Summarizer>(
         base.push_str(&format!("\n\nAdditional focus: {instr}"));
     }
 
-    let transcript = serialize_conversation(msgs);
+    let transcript = serialize_conversation(&convert_to_llm(msgs));
     let mut prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n");
     if let Some(prev) = previous_summary {
         prompt.push_str(&format!("<previous-summary>\n{prev}\n</previous-summary>\n\n"));
@@ -244,7 +363,7 @@ pub async fn generate_summary<S: Summarizer>(
             5,
         ),
         model: model_ref(model),
-        thinking: ModelThinkingLevel::Off,
+        thinking: summarization_reasoning(model, thinking),
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
@@ -252,19 +371,21 @@ pub async fn generate_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         StopReason::Aborted => Err(CompactionError::Aborted),
-        _ => Ok(join_text(&resp.content)),
+        _ => Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage }),
     }
 }
 
-/// Generate the turn-prefix summary for a split turn (R-05-006).
+/// Generate the turn-prefix summary for a split turn (R-05-006). `msgs` are RAW
+/// [`AgentMessage`]s; `convert_to_llm` runs here, as in Pi (`compaction.ts:941-942`).
 pub async fn generate_turn_prefix_summary<S: Summarizer>(
     summarizer: &S,
-    msgs: &[Message],
+    msgs: &[AgentMessage],
     model: &Model,
     reserve: u32,
+    thinking: ModelThinkingLevel,
     cancel: CancelToken,
-) -> Result<String, CompactionError> {
-    let transcript = serialize_conversation(msgs);
+) -> Result<SummaryOutput, CompactionError> {
+    let transcript = serialize_conversation(&convert_to_llm(msgs));
     let prompt =
         format!("<conversation>\n{transcript}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}");
     let req = SummarizationRequest {
@@ -277,7 +398,7 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
             2,
         ),
         model: model_ref(model),
-        thinking: ModelThinkingLevel::Off,
+        thinking: summarization_reasoning(model, thinking),
     };
     let resp = summarizer.complete(req, cancel).await?;
     match resp.stop_reason {
@@ -285,7 +406,7 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         StopReason::Aborted => Err(CompactionError::Aborted),
-        _ => Ok(join_text(&resp.content)),
+        _ => Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage }),
     }
 }
 
@@ -296,47 +417,70 @@ pub async fn compact_default<S: Summarizer>(
     prep: &CompactionPreparation,
     model: &Model,
     instructions: Option<&str>,
+    thinking: ModelThinkingLevel,
     cancel: CancelToken,
-) -> Result<String, CompactionError> {
+) -> Result<DefaultCompaction, CompactionError> {
     let reserve = prep.settings.reserve_tokens;
-    let mut summary = if prep.is_split_turn && !prep.turn_prefix_messages.is_empty() {
+    // Usage is threaded out alongside the text so it can be persisted on the compaction entry (Pi
+    // `CompactionResult.usage`, `compaction.ts:88-89`). On a split turn BOTH calls are billed and Pi
+    // records their sum (`combineUsage(historyUsage, turnPrefixResult.usage)`, `compaction.ts:877`);
+    // when the history half is skipped ("No prior history.") only the turn-prefix call is charged.
+    let (mut summary, usage) = if prep.is_split_turn && !prep.turn_prefix_messages.is_empty() {
         let history = if prep.messages_to_summarize.is_empty() {
-            "No prior history.".to_string()
+            None
         } else {
-            generate_summary(
-                summarizer,
-                &prep.messages_to_summarize,
-                model,
-                reserve,
-                instructions,
-                prep.previous_summary.as_deref(),
-                cancel.clone(),
+            Some(
+                generate_summary(
+                    summarizer,
+                    &prep.messages_to_summarize,
+                    model,
+                    reserve,
+                    instructions,
+                    prep.previous_summary.as_deref(),
+                    thinking,
+                    cancel.clone(),
+                )
+                .await?,
             )
-            .await?
         };
         let prefix = generate_turn_prefix_summary(
             summarizer,
             &prep.turn_prefix_messages,
             model,
             reserve,
+            thinking,
             cancel,
         )
         .await?;
-        format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}")
+        let history_text =
+            history.as_ref().map_or_else(|| "No prior history.".to_string(), |h| h.text.clone());
+        let merged = match &history {
+            Some(h) => combine_usage(&h.usage, &prefix.usage),
+            None => prefix.usage.clone(),
+        };
+        (
+            format!(
+                "{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+                prefix.text
+            ),
+            Some(merged),
+        )
     } else {
-        generate_summary(
+        let result = generate_summary(
             summarizer,
             &prep.messages_to_summarize,
             model,
             reserve,
             instructions,
             prep.previous_summary.as_deref(),
+            thinking,
             cancel,
         )
-        .await?
+        .await?;
+        (result.text, Some(result.usage))
     };
 
     let (read, modified) = prep.file_ops.compute_lists();
     summary.push_str(&format_file_operations(&read, &modified));
-    Ok(summary)
+    Ok(DefaultCompaction { summary, usage })
 }

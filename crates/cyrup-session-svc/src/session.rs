@@ -12,16 +12,17 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use cyrup_agent::{Agent, AgentMessage};
 use cyrup_core::{
     AssistantMessage, CancelToken, Content, EntryId, EventStream, Message, ModelId,
-    ModelRef, ModelThinkingLevel, ProviderId, SessionId,
+    ModelRef, ModelThinkingLevel, ProviderId, SessionId, Usage,
 };
 use cyrup_ext::host::ControlOp;
 use cyrup_ext::{
     CompactionReduction, HostEvent, InputEventSource, InputStreamingBehavior, Reduced, TreeReduction,
 };
-use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model};
+use cyrup_provider::{is_context_overflow, is_retryable_assistant_error, Model, RetryPolicy};
 use cyrup_session::compaction::{
-    context_tokens_from_usage, estimate_context_tokens, BranchSummarySettings, CompactionOverride,
-    CompactionPreparation, CompactionReason, CompactionSettings, Compactor, NoHooks,
+    context_tokens_from_usage, estimate_context_tokens, BranchSummaryOutput, BranchSummarySettings,
+    CompactionOverride, CompactionPreparation, CompactionReason, CompactionSettings, Compactor,
+    NoHooks,
 };
 use cyrup_session::context::SessionContext;
 use cyrup_session::header::SessionHeader;
@@ -1243,8 +1244,12 @@ impl AgentSession {
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
-        let compactor = Compactor::new(summarizer, NoHooks);
+        let summarizer =
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+        // Pi threads the session thinking level into every compaction summarization call
+        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
+        // gate before it reaches the request.
+        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
         let settings = self.compaction_settings.clone();
 
         // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
@@ -1498,7 +1503,8 @@ impl AgentSession {
         user_wants_summary: bool,
     ) -> Result<Option<String>, SessionServiceError> {
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
+        let summarizer =
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -1543,7 +1549,7 @@ impl AgentSession {
         options: NavigateTreeOptions,
     ) -> Result<NavigateTreeOutcome, SessionServiceError> {
         use cyrup_session::compaction::{
-            collect_entries_for_branch_summary, prepare_branch_entries,
+            branch_token_budget, collect_entries_for_branch_summary, prepare_branch_entries,
         };
         use cyrup_session::entry::{Entry, KnownEntry};
 
@@ -1650,20 +1656,25 @@ impl AgentSession {
         let mut guard = self.manager.lock().await;
 
         let mut from_extension_summary = false;
-        let mut summary_payload: Option<(String, serde_json::Value)> = None;
+        // (text, details, usage) — `usage` is the summarization call's token spend, persisted on the
+        // appended `branch_summary` entry (Pi `BranchSummaryEntry.usage`). An extension-supplied
+        // summary reports none.
+        let mut summary_payload: Option<(String, serde_json::Value, Option<Usage>)> = None;
         if let Some((text, details)) = override_summary {
             // The extension supplied the branch summary directly (agent-session.ts:2762-2775).
             if options.summarize {
-                summary_payload = Some((text, details));
+                summary_payload = Some((text, details, None));
                 from_extension_summary = true;
             }
         } else if options.summarize && !collection.entries.is_empty() {
             // Summarize the abandoned branch (agent-session.ts:2787). Pi still appends the non-empty
             // "No content to summarize" placeholder, so we gate only on the collected entry count.
             let model = Self::lock(&self.compaction_model).clone();
-            let budget = u32::try_from(model.context_window)
-                .unwrap_or(u32::MAX)
-                .saturating_sub(self.branch_summary_settings.reserve_tokens);
+            // `(contextWindow || 128000) − reserve` (Pi `branch-summarization.ts:315-317`). The
+            // fallback matters: without it a model reporting a zero context window would get budget
+            // `0`, which `prepare_branch_entries` reads as "no limit".
+            let budget =
+                branch_token_budget(&model, self.branch_summary_settings.reserve_tokens);
             let prep = prepare_branch_entries(&collection.entries, budget);
             let cancel = self.session_cancel.child_token();
             *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -1678,10 +1689,10 @@ impl AgentSession {
                 .await;
             *Self::lock(&self.branch_summary_cancel) = None;
             match result {
-                Ok(text) => {
+                Ok(produced) => {
                     let details = serde_json::to_value(prep.file_ops.to_details())
                         .unwrap_or_else(|_| serde_json::json!({}));
-                    summary_payload = Some((text, details));
+                    summary_payload = Some((produced.text, details, produced.usage));
                 }
                 Err(cyrup_session::compaction::CompactionError::Aborted) => {
                     return Ok(NavigateTreeOutcome {
@@ -1696,11 +1707,12 @@ impl AgentSession {
 
         // Apply the navigation + summary/label (agent-session.ts:2845-2868).
         let summary_entry = match &summary_payload {
-            Some((text, details)) => {
+            Some((text, details, usage)) => {
                 let id = guard.branch_with_summary(
                     new_leaf.as_ref(),
                     text.clone(),
                     Some(details.clone()),
+                    usage.clone(),
                     from_extension_summary,
                 )?;
                 let entry = branch_summary_entry_of(&guard, &id);
@@ -1765,7 +1777,7 @@ impl AgentSession {
         custom_instructions: Option<&str>,
         replace_instructions: bool,
         cancel: CancelToken,
-    ) -> Result<String, cyrup_session::compaction::CompactionError> {
+    ) -> Result<BranchSummaryOutput, cyrup_session::compaction::CompactionError> {
         use cyrup_session::compaction::{
             format_file_operations, serialize_conversation, SummarizationRequest, Summarizer,
             BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
@@ -1774,7 +1786,10 @@ impl AgentSession {
         // Pi short-circuits BEFORE the model call when there is nothing to summarize
         // (branch-summarization.ts:309-311).
         if prep.messages.is_empty() {
-            return Ok(BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string());
+            return Ok(BranchSummaryOutput {
+                text: BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string(),
+                usage: None,
+            });
         }
         let transcript = serialize_conversation(&prep.messages);
         // Instruction selection (branch-summarization.ts:319-326): `replace` swaps the default
@@ -1787,7 +1802,8 @@ impl AgentSession {
             _ => BRANCH_SUMMARY_PROMPT.to_string(),
         };
         let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
+        let summarizer =
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
         let req = SummarizationRequest {
             system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
             prompt_text: prompt,
@@ -1797,6 +1813,9 @@ impl AgentSession {
                 api: Some(model.api.clone()),
                 model: model.id.clone(),
             },
+            // Pi builds the branch-summary options inline (`{ apiKey, headers, env, signal,
+            // maxTokens: 2048 }`, branch-summarization.ts:348) rather than through
+            // `createSummarizationOptions`, so `reasoning` is never set for a branch summary.
             thinking: ModelThinkingLevel::Off,
         };
         let resp = summarizer.complete(req, cancel).await?;
@@ -1820,10 +1839,15 @@ impl AgentSession {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let (read, modified) = prep.file_ops.compute_lists();
-                Ok(format!(
-                    "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                    format_file_operations(&read, &modified)
-                ))
+                Ok(BranchSummaryOutput {
+                    text: format!(
+                        "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+                        format_file_operations(&read, &modified)
+                    ),
+                    // The branch-summary call's token spend is persisted on the entry (Pi
+                    // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
+                    usage: Some(resp.usage),
+                })
             }
         }
     }
@@ -3277,6 +3301,21 @@ impl AgentSession {
         Self::lock(&self.auto_retry_override).unwrap_or(self.retry_enabled_default)
     }
 
+    /// The retry policy handed to every summarization call (compaction, turn-prefix, branch).
+    ///
+    /// Pi passes `this.settingsManager.getRetrySettings()` — the RESOLVED SETTINGS, not the
+    /// interactive auto-retry toggle (`agent-session.ts:1858,2132,2997`), so this deliberately
+    /// reads the settings defaults rather than [`Self::auto_retry_enabled`]: pausing the visible
+    /// turn-level auto-retry must not silently make a transient socket close abort a whole
+    /// compaction.
+    pub fn summarization_retry(&self) -> RetryPolicy {
+        RetryPolicy::new(
+            self.retry_enabled_default,
+            self.retry_max_retries,
+            self.retry_base_delay_ms,
+        )
+    }
+
     /// Toggle auto-retry (Pi `setAutoRetryEnabled`, agent-session.ts:2565). Facade-side override of
     /// the settings `retry.enabled` value (settings persistence lives one layer down).
     pub fn set_auto_retry_enabled(&self, enabled: bool) {
@@ -3518,8 +3557,12 @@ impl AgentSession {
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         let model = { Self::lock(&self.compaction_model).clone() };
-        let summarizer = DynSummarizer::new(self.provider.current(), model.clone());
-        let compactor = Compactor::new(summarizer, NoHooks);
+        let summarizer =
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+        // Pi threads the session thinking level into every compaction summarization call
+        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
+        // gate before it reaches the request.
+        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
         let settings = self.effective_compaction_settings();
 
         // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
@@ -4011,8 +4054,12 @@ enum BeforeCompactOutcome {
 }
 
 /// Serialize a [`CompactionPreparation`] into the Pi `CompactionPreparation` byte-shape (camelCase)
-/// for the `session_before_compact` seam (compaction.ts:634-650): the guest reads the real cut point,
+/// for the `session_before_compact` seam (compaction.ts:690-700): the guest reads the real cut point,
 /// the messages to summarize, the file operations, and the compaction settings.
+///
+/// `messagesToSummarize`/`turnPrefixMessages` are RAW `AgentMessage`s (Pi's own element type), so a
+/// guest sees `{"role":"bashExecution","command":…}` / `{"role":"custom","customType":…}` rather
+/// than the `convertToLlm`-rendered user messages, and `!!`-excluded bash commands are included.
 fn compaction_preparation_value(prep: &CompactionPreparation) -> serde_json::Value {
     serde_json::json!({
         "firstKeptEntryId": prep.first_kept_entry_id,
@@ -4034,6 +4081,9 @@ fn parse_compaction_override(v: &serde_json::Value) -> CompactionOverride {
         first_kept_entry_id: v.get("firstKeptEntryId").and_then(|s| s.as_str()).map(EntryId::from),
         tokens_before: v.get("tokensBefore").and_then(serde_json::Value::as_u64),
         details: v.get("details").cloned(),
+        // Pi threads `extensionCompaction.usage` straight into `appendCompaction`
+        // (`agent-session.ts:1844,1872`); a malformed/absent bag simply records no usage.
+        usage: v.get("usage").and_then(|u| serde_json::from_value(u.clone()).ok()),
     }
 }
 
@@ -4120,6 +4170,15 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
                 (SessionDagKind::Message, clip(format!("[bash]: {}", normalize(&b.command))))
             }
             SessMsg::Custom(c) => (SessionDagKind::Message, format!("[{}]", c.custom_type)),
+            // Pi's `AgentMessage` union also admits the two summary roles inside a `type:"message"`
+            // entry; label them like the equivalent standalone entries.
+            SessMsg::BranchSummary(b) => (
+                SessionDagKind::Compaction,
+                clip(format!("branch summary: {}", normalize(&b.summary))),
+            ),
+            SessMsg::CompactionSummary(_) => {
+                (SessionDagKind::Compaction, "compaction".to_string())
+            }
         },
         Entry::Known(KnownEntry::ModelChange { model_id, .. }) => {
             (SessionDagKind::ModelChange, format!("model → {model_id}"))
@@ -4214,6 +4273,7 @@ fn branch_summary_entry_of(
             from_id,
             summary,
             details,
+            usage,
             from_hook,
         })) => Some(BranchSummaryEntry {
             id: base.id.clone(),
@@ -4222,6 +4282,7 @@ fn branch_summary_entry_of(
             from_id: from_id.clone(),
             from_hook: from_hook.unwrap_or(false),
             details: details.clone(),
+            usage: usage.clone(),
         }),
         _ => None,
     }

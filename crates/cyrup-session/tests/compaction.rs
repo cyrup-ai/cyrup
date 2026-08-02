@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
-    AssistantMessage, CancelToken, Content, EntryId, Message, StopReason, ToolCall, ToolCallId,
-    Usage,
+    AssistantMessage, CancelToken, Content, EntryId, Message, ModelThinkingLevel, StopReason,
+    ToolCall, ToolCallId, Usage,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Model;
+use cyrup_provider::faux::{
+    faux_assistant_message, faux_text, FauxProvider, FauxResponseStep,
+};
+use cyrup_provider::{CacheRetention, Model, RetryPolicy, StreamOptions};
 use cyrup_session::compaction::cutpoint::{find_cut_point, CutPoint};
 use cyrup_session::compaction::hooks::{
     BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
@@ -577,6 +579,7 @@ async fn a05_8_before_compact_cancel_and_custom() {
             first_kept_entry_id: first_kept.clone(),
             tokens_before: 42,
             details: Some(json!({ "readFiles": ["x.rs"], "modifiedFiles": [] })),
+            usage: None,
         });
         let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
         let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
@@ -767,7 +770,8 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
         first_kept_entry_id: EntryId::from("e1"),
         tokens_before: 1234,
         details: None,
-        from_hook: None,
+        usage: None,
+            from_hook: None,
     });
     // e3: EXCLUDED bash (cmd 15 + out 75 = 90 → 23) — Pi raw context still counts it.
     let e3 = Entry::known(KnownEntry::Message {
@@ -789,7 +793,8 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
         from_id: EntryId::from("x"),
         summary: "a branch summary body describing the abandoned branch in some detail".into(),
         details: None,
-        from_hook: None,
+        usage: None,
+            from_hook: None,
     });
     // e5: custom_message (content len 48 → 12)
     let e5 = Entry::known(KnownEntry::CustomMessage {
@@ -921,7 +926,8 @@ fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str) -> Entry 
         summary: summary.to_string(),
         from_id: EntryId::from("from"),
         details: None,
-        from_hook: None,
+        usage: None,
+            from_hook: None,
     })
 }
 
@@ -1029,6 +1035,7 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
             first_kept_entry_id: EntryId::from("e0"),
             tokens_before: 99_999,
             details: None,
+            usage: None,
             from_hook: None,
         }),
         msg_entry("e2", Some("e1"), user("recent turn")),
@@ -1042,4 +1049,1206 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
         cut.first_kept_index, 2,
         "the budget is exhausted by the prior summary, so e0 is re-summarized — got {cut:?}"
     );
+}
+
+// ------------------------------------------------------- THEME F (live coding-agent fork) -----
+//
+// Pi has two forked compaction implementations. cyrup ported
+// `packages/agent/src/harness/compaction/compaction.ts`; pi's LIVE path is
+// `packages/coding-agent/src/core/compaction/compaction.ts`. They split in pi commit a6f720e6
+// (2026-07-09), which replaced every structural `switch (entry.type)` in the cut-point layer with a
+// projection through `sessionEntryToContextMessages(entry)`. The tests below pin the LIVE behavior.
+
+/// A `type:"message"` entry holding a NON-core `AgentMessage` (bash/custom role).
+fn agent_msg_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> Entry {
+    Entry::known(KnownEntry::Message {
+        base: EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent.map(EntryId::from),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        },
+        message,
+    })
+}
+
+fn bash_msg(command: &str, output: &str, excluded: bool) -> AgentMessage {
+    AgentMessage::BashExecution(BashExecutionMessage {
+        command: command.to_string(),
+        output: output.to_string(),
+        exit_code: Some(0),
+        cancelled: false,
+        truncated: false,
+        full_output_path: None,
+        timestamp: 0,
+        exclude_from_context: excluded.then_some(true),
+    })
+}
+
+/// A hook dispatcher that captures the `BeforeCompactEvent` it was handed.
+#[derive(Default)]
+struct CapturingHooks {
+    events: Mutex<Vec<BeforeCompactEvent>>,
+}
+
+impl CompactionHooks for CapturingHooks {
+    async fn before_compact(
+        &self,
+        ev: &BeforeCompactEvent,
+        _cancel: CancelToken,
+    ) -> Result<BeforeCompactDecision, CompactionError> {
+        self.events.lock().unwrap().push(ev.clone());
+        Ok(BeforeCompactDecision::Proceed)
+    }
+    async fn post_compact(&self, _ev: &PostCompactEvent) {}
+    async fn before_tree(
+        &self,
+        _ev: &BeforeTreeEvent,
+        _cancel: CancelToken,
+    ) -> Result<BeforeTreeDecision, CompactionError> {
+        Ok(BeforeTreeDecision::Proceed)
+    }
+    async fn post_tree(&self, _ev: &PostTreeEvent) {}
+}
+
+// ------------------------------------------------------------------ F-1 -----------------------
+
+#[test]
+fn f1_empty_branch_summary_is_neither_a_cut_point_nor_a_turn_start() {
+    // `sessionEntryToContextMessages` projects a `branch_summary` entry only `if (entry.summary)`
+    // (`session-manager.ts:400-402`), so an EMPTY branch summary is context-invisible: it is not a
+    // valid cut point and it does not start a turn. cyrup's ported fork matched
+    // `KnownEntry::BranchSummary { .. }` structurally at both sites, so it snapped the cut onto the
+    // empty entry AND reported it as the turn start — producing an empty turn prefix.
+    let entries = vec![
+        msg_entry("e0", None, user("please refactor the parser module thoroughly")),
+        msg_entry("e1", Some("e0"), assistant_tool("read", "src/main.rs")),
+        msg_entry(
+            "e2",
+            Some("e1"),
+            tool_result("read", "src/main.rs", "0123456789012345678901234567890123456789"),
+        ),
+        branch_summary_entry("e3", Some("e2"), ""),
+        msg_entry("e4", Some("e3"), user("recent")),
+    ];
+    let cache = TokenCache::default();
+    assert_eq!(cache.estimate_raw_entry(&entries[3]), 0, "an empty branch summary costs nothing");
+
+    // Budget walk: e4 = 2 tokens, e3 = 0 (skipped), e2 = 10 ⇒ crosses 8 at e2, snapping forward.
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), 8);
+    assert_eq!(cut.first_kept_index, 3, "back-scan folds the invisible entry in — got {cut:?}");
+    assert!(
+        cut.is_split_turn,
+        "the empty branch summary does not start a turn, so the cut splits e0's turn — got {cut:?}"
+    );
+    assert_eq!(cut.turn_start_index, Some(0), "the turn starts at the user message e0");
+}
+
+#[tokio::test]
+async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
+    // Observable end-to-end consequence of the predicate above.
+    let summ = RecordingSummarizer::new(vec!["PREFIX-SUMMARY"]);
+    let compactor = Compactor::new(summ, NoHooks);
+    let model = faux_model();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
+
+    let cwd = PathBuf::from("/proj/f1");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("please refactor the parser module thoroughly")).unwrap();
+    m.append_message(assistant_tool("read", "src/main.rs")).unwrap();
+    m.append_message(tool_result(
+        "read",
+        "src/main.rs",
+        "0123456789012345678901234567890123456789",
+    ))
+    .unwrap();
+    let from = m.leaf_id().cloned().unwrap();
+    m.append_branch_summary(from, String::new(), None, None, false).unwrap();
+    m.append_message(user("recent")).unwrap();
+
+    let entry = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("compaction runs");
+
+    let prompts = compactor.summarizer().prompts();
+    assert_eq!(prompts.len(), 1, "only the turn-prefix half is summarized: {prompts:?}");
+    assert!(
+        prompts[0].contains("This is the PREFIX of a turn"),
+        "the single call is the turn-prefix prompt: {}",
+        prompts[0]
+    );
+    assert!(
+        entry.summary.starts_with("No prior history."),
+        "no history precedes the split turn: {}",
+        entry.summary
+    );
+    assert!(
+        entry.summary.contains("**Turn Context (split turn):**"),
+        "the split-turn marker is present: {}",
+        entry.summary
+    );
+
+    // The built context keeps only the empty branch summary (invisible) + the recent user message.
+    let ctx = m.build_context();
+    let joined = ctx.messages.iter().map(first_text).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("recent"), "the kept tail survives: {joined}");
+    assert!(!joined.contains("refactor the parser"), "the summarized history is gone: {joined}");
+}
+
+// ------------------------------------------------------------------ F-2 -----------------------
+
+#[test]
+fn f2_custom_role_message_entry_starts_a_turn() {
+    // `isTurnStartMessage` returns true for role `custom` (`compaction.ts:323-336`). cyrup's
+    // `AgentMessage::is_turn_start` covered only `user`/`bashExecution`, so a cut landing on a
+    // custom-role message was mis-reported as a mid-turn split.
+    let entries = vec![
+        msg_entry("e0", None, user("older question about the parser")),
+        msg_entry("e1", Some("e0"), assistant("older answer")),
+        agent_msg_entry(
+            "e2",
+            Some("e1"),
+            AgentMessage::Custom(cyrup_session::agent_message::CustomRoleMessage {
+                custom_type: "ext.note".to_string(),
+                content: json!("please continue"),
+                display: true,
+                details: None,
+                timestamp: 0,
+            }),
+        ),
+    ];
+    let cut = find_cut_point(&entries, &TokenCache::default(), 0, entries.len(), 3);
+    assert_eq!(cut.first_kept_index, 2);
+    assert!(!cut.is_split_turn, "a custom-role message is a clean turn boundary — got {cut:?}");
+    assert_eq!(cut.turn_start_index, None);
+}
+
+#[test]
+fn f2_bash_execution_cut_is_not_a_split_turn() {
+    // Regression lock on behavior that is already correct: `bashExecution` is a turn start, so a cut
+    // landing on one must NOT be a split turn (which would burn an extra summarization call and emit
+    // a bogus "**Turn Context (split turn):**" section).
+    let entries = vec![
+        msg_entry("e0", None, user("older question about the parser")),
+        msg_entry("e1", Some("e0"), assistant("older answer")),
+        agent_msg_entry("e2", Some("e1"), bash_msg("npm test", "all green here ok", false)),
+    ];
+    let cut = find_cut_point(&entries, &TokenCache::default(), 0, entries.len(), 3);
+    assert_eq!(cut.first_kept_index, 2);
+    assert!(!cut.is_split_turn, "a bashExecution starts a turn — got {cut:?}");
+    assert_eq!(cut.turn_start_index, None);
+}
+
+// ------------------------------------------------------------------ F-3 -----------------------
+
+/// Build the F-3 fixture session: two bash entries (one `!!`-excluded) and a `custom_message`
+/// followed by one recent turn. With `keep_recent_tokens = 7` the cut lands on the recent user
+/// message, so the whole prefix is the summarized history.
+fn f3_session() -> SessionManager {
+    let cwd = PathBuf::from("/proj/f3");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_agent_message(bash_msg("npm test", "ok", false)).unwrap();
+    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true)).unwrap();
+    m.append_custom_message("ext.note", json!("injected note"), true, None).unwrap();
+    m.append_message(user("recent question here")).unwrap();
+    m.append_message(assistant("recent answer here")).unwrap();
+    m
+}
+
+#[tokio::test]
+async fn f3_before_compact_event_carries_raw_agent_messages() {
+    // Pi's `getMessageFromEntryForCompaction` returns `sessionEntryToContextMessages(entry)[0]` — a
+    // RAW `AgentMessage` with its role intact (`compaction.ts:80-85`), and `convertToLlm` is applied
+    // later, inside `generateSummary`. cyrup rendered to core `Message`s in `prepareCompaction`, so a
+    // guest saw `{role:"user", text:"Ran `npm test`…"}`, could not read `customType`, and never saw
+    // `!!`-excluded commands at all.
+    let summ = RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]);
+    let compactor = Compactor::new(summ, CapturingHooks::default());
+    let model = faux_model();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    let mut m = f3_session();
+
+    compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("compaction runs");
+
+    let events = compactor.hooks().events.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    let msgs = serde_json::to_value(&events[0].messages_to_summarize).unwrap();
+    let arr = msgs.as_array().expect("array");
+    assert_eq!(arr.len(), 3, "every projected entry is present, `!!` included: {msgs}");
+    assert_eq!(arr[0]["role"], "bashExecution", "roles are preserved: {msgs}");
+    assert_eq!(arr[0]["command"], "npm test");
+    assert_eq!(arr[0]["output"], "ok");
+    assert_eq!(arr[0]["exitCode"], 0);
+    assert_eq!(arr[1]["role"], "bashExecution");
+    assert_eq!(arr[1]["command"], "cat secret");
+    assert_eq!(arr[1]["excludeFromContext"], true);
+    assert_eq!(arr[2]["role"], "custom", "a custom_message keeps its role: {msgs}");
+    assert_eq!(arr[2]["customType"], "ext.note");
+    assert_eq!(arr[2]["content"], "injected note");
+
+    // ...and the summarization prompt text is UNCHANGED: `convertToLlm` still runs, just later.
+    let prompts = compactor.summarizer().prompts();
+    assert_eq!(prompts.len(), 1, "one summarization call: {prompts:?}");
+    assert!(prompts[0].contains("[User]: Ran `npm test`"), "bash renders as before: {}", prompts[0]);
+    assert!(prompts[0].contains("[User]: injected note"), "custom renders as before: {}", prompts[0]);
+    assert!(
+        !prompts[0].contains("cat secret"),
+        "an `!!` command is still excluded from the LLM transcript: {}",
+        prompts[0]
+    );
+}
+
+#[test]
+fn f3_history_of_only_excluded_bash_still_compacts() {
+    // Pi's `if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined`
+    // counts an `excludeFromContext` bash message as content (it is a raw `AgentMessage`). cyrup had
+    // already dropped it in `convertToLlm`, so a history made entirely of `!!` commands looked empty
+    // and compaction silently did not run.
+    let entries = vec![
+        agent_msg_entry("e0", None, bash_msg("cat secret", "s3cr3t", true)),
+        agent_msg_entry("e1", Some("e0"), bash_msg("cat other", "s3cr3t2", true)),
+        msg_entry("e2", Some("e1"), user("recent question here")),
+        msg_entry("e3", Some("e2"), assistant("recent answer here")),
+    ];
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    let prep = prepare_compaction(&entries, &TokenCache::default(), &settings)
+        .expect("a history of `!!` bash entries is still compactable");
+    assert_eq!(prep.first_kept_entry_id, EntryId::from("e2"));
+    assert_eq!(prep.messages_to_summarize.len(), 2, "both excluded commands are carried");
+}
+
+#[tokio::test]
+async fn f3_compaction_is_append_only_on_disk() {
+    // Constraint: the JSONL record is append-only and lossless — compaction appends ONE entry and
+    // never rewrites history (DI-9 / R-05-011).
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f3_append");
+    let lay = layout(root.path(), &cwd);
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_agent_message(bash_msg("npm test", "ok", false)).unwrap();
+    m.append_agent_message(bash_msg("cat secret", "s3cr3t", true)).unwrap();
+    m.append_custom_message("ext.note", json!("injected note"), true, None).unwrap();
+    m.append_message(user("recent question here")).unwrap();
+    m.append_message(assistant("recent answer here")).unwrap();
+
+    let file = m.session_file().unwrap().to_path_buf();
+    let before = std::fs::read_to_string(&file).unwrap();
+
+    let compactor = Compactor::new(RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]), NoHooks);
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
+    compactor
+        .run_compaction(
+            &mut m,
+            &faux_model(),
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("compaction runs");
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(after.starts_with(&before), "existing JSONL bytes are untouched");
+    let added: Vec<&str> = after[before.len()..].lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(added.len(), 1, "exactly one line was appended: {added:?}");
+    let v: serde_json::Value = serde_json::from_str(added[0]).unwrap();
+    assert_eq!(v["type"], "compaction");
+}
+
+#[test]
+fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
+    // `context_message_role` is the no-clone classification half of `raw_context_messages`; the
+    // cut-point layer trusts them to agree. Drift between the two is exactly the defect the live
+    // fork removed (an entry classified as a cut point / turn start while projecting no context),
+    // so pin the invariant across every entry kind cyrup can hold.
+    let entries = vec![
+        msg_entry("m0", None, user("hello")),
+        msg_entry("m1", None, assistant("hi")),
+        msg_entry("m2", None, tool_result("read", "a.rs", "body")),
+        agent_msg_entry("m3", None, bash_msg("ls", "a.rs", false)),
+        agent_msg_entry("m4", None, bash_msg("cat secret", "s3cr3t", true)),
+        agent_msg_entry(
+            "m5",
+            None,
+            AgentMessage::Custom(cyrup_session::agent_message::CustomRoleMessage {
+                custom_type: "ext.note".to_string(),
+                content: json!("note"),
+                display: true,
+                details: None,
+                timestamp: 0,
+            }),
+        ),
+        custom_message_entry("m6", None, "injected"),
+        branch_summary_entry("m7", None, "a summary"),
+        branch_summary_entry("m8", None, ""),
+        Entry::known(KnownEntry::Compaction {
+            base: EntryBase {
+                id: EntryId::from("m9"),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            summary: "prior".to_string(),
+            first_kept_entry_id: EntryId::from("m0"),
+            tokens_before: 10,
+            details: None,
+            usage: None,
+            from_hook: None,
+        }),
+        Entry::known(KnownEntry::ModelChange {
+            base: EntryBase {
+                id: EntryId::from("m10"),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            provider: "p".into(),
+            model_id: "m".into(),
+        }),
+        Entry::known(KnownEntry::Custom {
+            base: EntryBase {
+                id: EntryId::from("m11"),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            custom_type: "ext.state".to_string(),
+            data: None,
+        }),
+    ];
+
+    for e in &entries {
+        let projected = cyrup_session::context::raw_context_messages(e);
+        let role = cyrup_session::context::context_message_role(e);
+        assert_eq!(
+            role.is_some(),
+            !projected.is_empty(),
+            "visibility disagrees for {:?}",
+            e.id()
+        );
+        assert_eq!(
+            role,
+            projected.first().map(AgentMessage::role),
+            "role disagrees for {:?}",
+            e.id()
+        );
+    }
+
+    // The two entries that the harness fork got wrong, spelled out.
+    assert_eq!(cyrup_session::context::context_message_role(&entries[8]), None, "empty branch_summary");
+    assert_eq!(
+        cyrup_session::context::context_message_role(&entries[5]),
+        Some(cyrup_session::MessageRole::Custom),
+        "custom-role message entry"
+    );
+}
+
+// ------------------------------------------------------------------ F-4 -----------------------
+
+/// A `Usage` with the fields these tests care about set and the conditional ones absent.
+fn usage_of(input: u64, output: u64, cost_total: f64) -> Usage {
+    Usage {
+        input,
+        output,
+        cache_read: 0,
+        cache_write: 0,
+        cache_write_1h: None,
+        reasoning: None,
+        total_tokens: input + output,
+        cost: cyrup_core::Cost {
+            input: cost_total,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: cost_total,
+        },
+    }
+}
+
+/// A summarizer whose completions carry scripted `Usage`s, so the persisted
+/// `CompactionEntry.usage` can be checked against the exact spend of the exact calls made.
+struct UsageSummarizer {
+    usages: Mutex<VecDeque<Usage>>,
+    calls: Mutex<usize>,
+}
+
+impl UsageSummarizer {
+    fn new(usages: Vec<Usage>) -> Self {
+        Self { usages: Mutex::new(usages.into()), calls: Mutex::new(0) }
+    }
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl Summarizer for UsageSummarizer {
+    async fn complete(
+        &self,
+        _req: SummarizationRequest<'_>,
+        _cancel: CancelToken,
+    ) -> Result<AssistantMessage, CompactionError> {
+        *self.calls.lock().unwrap() += 1;
+        let u = self.usages.lock().unwrap().pop_front().unwrap_or_default();
+        let mut msg = faux_assistant_message(vec![faux_text("SUMMARY")], StopReason::Stop);
+        msg.usage = u;
+        Ok(msg)
+    }
+}
+
+/// The compaction entry of a session, as it was written to the JSONL file.
+fn compaction_line(m: &SessionManager) -> serde_json::Value {
+    let path = m.session_file().expect("persisted session");
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v["type"] == "compaction")
+        .expect("a compaction line on disk")
+}
+
+#[tokio::test]
+async fn f4_compaction_entry_records_the_summed_usage_of_a_split_turn() {
+    // Pi threads the summarization spend end to end — `CompactionResult.usage`
+    // (`compaction.ts:88-89`) → `appendCompaction(..., usage)` (`session-manager.ts:1096-1116`) →
+    // the persisted `CompactionEntry.usage` (`session-manager.ts:69-80`). On a SPLIT turn BOTH
+    // calls are billed and Pi records `combineUsage(historyUsage, turnPrefixResult.usage)`
+    // (`compaction.ts:877`). cyrup discarded the `AssistantMessage` after reading its text, so the
+    // single most expensive operation a session performs left no trace on disk.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f4_usage");
+    let lay = layout(root.path(), &cwd);
+
+    let history = usage_of(100, 20, 0.50);
+    let mut prefix = usage_of(7, 3, 0.25);
+    prefix.cache_read = 11;
+    prefix.reasoning = Some(4); // present on ONE side only — Pi still emits the merged key
+    let compactor = Compactor::new(UsageSummarizer::new(vec![history, prefix]), NoHooks);
+    let model = faux_model();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
+
+    // The A-05-3 transcript: two complete turns then one oversized final turn, so the cut lands
+    // mid-turn and both summarization halves run.
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("first turn question short")).unwrap();
+    m.append_message(assistant("first turn answer short")).unwrap();
+    m.append_message(user("second turn question short")).unwrap();
+    m.append_message(assistant(&"x ".repeat(120))).unwrap();
+
+    let entry = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("split-turn compaction produces an entry");
+
+    assert_eq!(compactor.summarizer().calls(), 2, "history + turn-prefix halves both ran");
+    let recorded = entry.usage.clone().expect("the entry records the summarization spend");
+    assert_eq!(recorded.input, 107, "inputs of both calls are summed");
+    assert_eq!(recorded.output, 23);
+    assert_eq!(recorded.cache_read, 11);
+    assert_eq!(recorded.total_tokens, 130);
+    assert!((recorded.cost.total - 0.75).abs() < 1e-9, "costs are summed: {}", recorded.cost.total);
+    assert_eq!(recorded.reasoning, Some(4), "a one-sided optional field still merges");
+    assert_eq!(recorded.cache_write_1h, None, "an absent-on-both optional stays absent");
+
+    // On disk, in Pi's camelCase shape, on the compaction line itself.
+    let line = compaction_line(&m);
+    assert_eq!(line["usage"]["input"], 107);
+    assert_eq!(line["usage"]["totalTokens"], 130);
+    assert_eq!(line["usage"]["reasoning"], 4);
+    assert!(
+        line["usage"].get("cacheWrite1h").is_none(),
+        "Pi's conditional spread omits the key entirely: {}",
+        line["usage"]
+    );
+
+    // And it survives a reload — this is the audit trail the field exists for.
+    let reopened = SessionManager::open(m.session_file().unwrap()).unwrap();
+    let reloaded = reopened
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Known(KnownEntry::Compaction { usage, .. }) => Some(usage.clone()),
+            _ => None,
+        })
+        .expect("compaction entry reloads");
+    assert_eq!(reloaded, Some(recorded));
+}
+
+#[tokio::test]
+async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
+    // The other half of `combineUsage`'s guard: when the history summary is skipped (Pi's
+    // `historyUsage ? combineUsage(...) : turnPrefixResult.usage`, `compaction.ts:877`) the entry
+    // must carry the turn-prefix call's usage VERBATIM — no zero-valued phantom addend, and no
+    // optional field materialized as `0`.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f4_single");
+    let lay = layout(root.path(), &cwd);
+
+    let only = usage_of(64, 8, 0.125);
+    let compactor = Compactor::new(UsageSummarizer::new(vec![only.clone()]), NoHooks);
+    let model = faux_model();
+    let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
+
+    // The F-1 transcript: an empty branch summary makes the cut a split turn with NO history half.
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("please refactor the parser module thoroughly")).unwrap();
+    m.append_message(assistant_tool("read", "src/main.rs")).unwrap();
+    m.append_message(tool_result(
+        "read",
+        "src/main.rs",
+        "0123456789012345678901234567890123456789",
+    ))
+    .unwrap();
+    let from = m.leaf_id().cloned().unwrap();
+    m.append_branch_summary(from, String::new(), None, None, false).unwrap();
+    m.append_message(user("recent")).unwrap();
+
+    let entry = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &settings,
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("compaction runs");
+
+    assert_eq!(compactor.summarizer().calls(), 1, "only the turn-prefix half is summarized");
+    assert!(entry.summary.starts_with("No prior history."), "no history half ran");
+    assert_eq!(entry.usage, Some(only), "the lone call's usage is recorded verbatim");
+    let line = compaction_line(&m);
+    assert_eq!(line["usage"]["input"], 64);
+    assert!(line["usage"].get("reasoning").is_none(), "absent optionals stay absent");
+}
+
+#[test]
+fn f4_a_pi_written_usage_survives_the_jsonl_roundtrip() {
+    // R-00-013: cyrup must re-export a Pi-written session unchanged. Before `usage` existed on
+    // `KnownEntry::Compaction`, serde silently dropped it on read, so rewriting a Pi session lost
+    // the compaction's cost record.
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("pi-usage.jsonl");
+    let contents = concat!(
+        r#"{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/x"}"#,
+        "\n",
+        r#"{"type":"message","id":"aaaa1111","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":0}}"#,
+        "\n",
+        r#"{"type":"compaction","id":"bbbb2222","parentId":"aaaa1111","timestamp":"2026-01-01T00:00:02Z","summary":"PRIOR","firstKeptEntryId":"aaaa1111","tokensBefore":900,"usage":{"input":11,"output":22,"cacheRead":3,"cacheWrite":4,"totalTokens":40,"cost":{"input":0.1,"output":0.2,"cacheRead":0.0,"cacheWrite":0.0,"total":0.3}},"fromHook":false}"#,
+        "\n",
+    );
+    std::fs::write(&file, contents).unwrap();
+
+    let m = SessionManager::open(&file).unwrap();
+    let usage = m
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Known(KnownEntry::Compaction { usage, .. }) => usage.clone(),
+            _ => None,
+        })
+        .expect("the Pi-written usage is parsed, not dropped");
+    assert_eq!(usage.input, 11);
+    assert_eq!(usage.total_tokens, 40);
+    assert!((usage.cost.total - 0.3).abs() < 1e-9);
+
+    let mut buf = Vec::new();
+    m.export_jsonl(&mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+    let line: serde_json::Value = out
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v["type"] == "compaction")
+        .expect("compaction line on export");
+    assert_eq!(line["usage"]["input"], 11);
+    assert_eq!(line["usage"]["cacheWrite"], 4);
+    assert_eq!(line["usage"]["cost"]["total"], 0.3);
+}
+
+// ------------------------------------------------------------------ F-5 -----------------------
+
+#[test]
+fn f5_an_earlier_compaction_inside_the_kept_window_stays_in_the_context() {
+    // Pi's `buildContextEntries` puts the LATEST compaction at the head of the context list and then
+    // iterates `path[0..compactionIdx]` from `firstKeptEntryId` (`session-manager.ts:441-453`);
+    // every one of those entries is projected through `sessionEntryToContextMessages`, which has an
+    // explicit `compaction` arm (`session-manager.ts:404-406`). So an EARLIER compaction that falls
+    // inside the newer one's kept window re-emits its summary. cyrup's per-entry projection had no
+    // `compaction` arm, silently deleting that summary from what the model sees.
+    let cwd = PathBuf::from("/proj/f5");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("oldest question")).unwrap();
+    m.append_message(assistant("oldest answer")).unwrap();
+    let keep = m.append_message(user("kept question")).unwrap();
+    m.append_message(assistant("kept answer")).unwrap();
+    m.append_compaction("SUMMARY-ONE".to_string(), keep.clone(), 100, None, None, false).unwrap();
+    m.append_message(user("later question")).unwrap();
+    m.append_message(assistant("later answer")).unwrap();
+    // A second compaction whose cut lands BEFORE the first compaction entry — what happens on a
+    // small context window, where `keep_recent_tokens` is not reachable inside window − reserve.
+    m.append_compaction("SUMMARY-TWO".to_string(), keep.clone(), 200, None, None, false).unwrap();
+    m.append_message(user("newest question")).unwrap();
+
+    let texts: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
+    assert_eq!(
+        texts.len(),
+        7,
+        "latest summary + 2 kept + the earlier summary + 2 after + 1 newest: {texts:?}"
+    );
+    assert!(texts[0].contains("SUMMARY-TWO"), "the governing summary leads: {texts:?}");
+    assert_eq!(texts[1], "kept question");
+    assert_eq!(texts[2], "kept answer");
+    assert!(
+        texts[3].contains("SUMMARY-ONE"),
+        "the earlier compaction's summary is still in context: {texts:?}"
+    );
+    assert!(
+        texts[3].contains("The conversation history before this point was compacted"),
+        "and it is wrapped exactly like any compaction summary: {}",
+        texts[3]
+    );
+    assert_eq!(texts[4], "later question");
+    assert_eq!(texts[5], "later answer");
+    assert_eq!(texts[6], "newest question");
+    assert_eq!(
+        texts.iter().filter(|t| t.contains("SUMMARY-TWO")).count(),
+        1,
+        "the governing compaction is emitted once, never doubled: {texts:?}"
+    );
+
+    // The raw projection that MEASURES the context must see the same two summaries the built
+    // context contains — otherwise `tokens_before` / `should_compact` disagree with reality.
+    let path: Vec<&Entry> = m.entries().iter().collect();
+    let raw = build_context_agent_messages(&path);
+    assert_eq!(
+        raw.iter().filter(|msg| matches!(msg, AgentMessage::CompactionSummary(_))).count(),
+        2,
+        "both compaction summaries are measured: {raw:?}"
+    );
+    assert_eq!(raw.len(), texts.len(), "measured and rendered projections have the same shape");
+}
+
+#[test]
+fn f5_a_compaction_outside_the_kept_window_is_still_dropped() {
+    // The negative control for the arm above: an earlier compaction is re-emitted only because it
+    // falls inside the newer cut's range. Pi's loop starts at `firstKeptEntryId`, so a compaction
+    // before that point is summarized away like any other entry.
+    let cwd = PathBuf::from("/proj/f5b");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    let q1 = m.append_message(user("oldest question")).unwrap();
+    m.append_message(assistant("oldest answer")).unwrap();
+    m.append_compaction("SUMMARY-ONE".to_string(), q1, 100, None, None, false).unwrap();
+    let later = m.append_message(user("later question")).unwrap();
+    m.append_message(assistant("later answer")).unwrap();
+    m.append_compaction("SUMMARY-TWO".to_string(), later, 200, None, None, false).unwrap();
+
+    let texts: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
+    assert_eq!(texts.len(), 3, "latest summary + the two kept messages: {texts:?}");
+    assert!(texts[0].contains("SUMMARY-TWO"));
+    assert!(
+        !texts.iter().any(|t| t.contains("SUMMARY-ONE")),
+        "the superseded summary is outside the kept window: {texts:?}"
+    );
+}
+
+// ------------------------------------------------------------------ F-6 -----------------------
+// Summarization request shaping: Pi routes EVERY compaction / turn-prefix / branch-summary call
+// through `completeSummarization` (`compaction.ts:555-581`), which (a) retries transient stream
+// drops under the configured policy, (b) isolates the request from the session's prompt cache and
+// cache routing, and (c) carries the reasoning level `createSummarizationOptions` computed.
+
+/// Captures the resolved `StreamOptions` of every summarization call the faux provider sees.
+#[derive(Clone, Default)]
+struct OptionSpy(Arc<Mutex<Vec<StreamOptions>>>);
+
+impl OptionSpy {
+    fn seen(&self) -> Vec<StreamOptions> {
+        self.0.lock().unwrap().clone()
+    }
+    /// A scripted step that records the options and answers with `body`.
+    fn step(&self, body: &'static str) -> FauxResponseStep {
+        let sink = self.0.clone();
+        FauxResponseStep::factory(move |_ctx, opts, _state, _model| {
+            sink.lock().unwrap().push(opts.clone());
+            faux_assistant_message(vec![faux_text(body)], StopReason::Stop)
+        })
+    }
+}
+
+/// A step that fails the way a dropped socket does — Pi classifies `terminated` as retryable
+/// (`retry.ts:63`).
+fn transient_failure_step() -> FauxResponseStep {
+    FauxResponseStep::factory(|_ctx, _opts, _state, _model| {
+        let mut msg = faux_assistant_message(vec![], StopReason::Error);
+        msg.error_message = Some("terminated".to_string());
+        msg
+    })
+}
+
+/// A deterministic failure Pi refuses to retry (`retry.ts:20`).
+fn quota_failure_step() -> FauxResponseStep {
+    FauxResponseStep::factory(|_ctx, _opts, _state, _model| {
+        let mut msg = faux_assistant_message(vec![], StopReason::Error);
+        msg.error_message = Some("insufficient_quota: add credits".to_string());
+        msg
+    })
+}
+
+/// A four-turn transcript that compacts under `f6_settings()`, plus the layout it lives in.
+fn f6_session(root: &Path, cwd: &Path) -> SessionManager {
+    let lay = layout(root, cwd);
+    let mut m = SessionManager::create(cwd, &lay, NewSessionOpts::default()).unwrap();
+    for i in 0..4 {
+        m.append_message(user(&format!("question number {i} with several words to add some size")))
+            .unwrap();
+        m.append_message(assistant(&format!(
+            "answer number {i} with several words to add some size as well"
+        )))
+        .unwrap();
+    }
+    m
+}
+
+fn f6_settings() -> CompactionSettings {
+    CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 40 }
+}
+
+#[tokio::test]
+async fn f6_a_transient_stream_drop_is_retried_and_the_compaction_still_lands() {
+    // Pi wraps the summarization producer in `retryAssistantCall` "so transient stream drops (e.g.
+    // `terminated`, socket close) honor the configured retry policy instead of failing the whole
+    // compaction on the first attempt" (`compaction.ts:555-560`). Without it a single dropped
+    // socket aborts the compaction and, on the overflow path, strands the session over-window.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f6_retry");
+
+    let faux = Arc::new(FauxProvider::new());
+    // This transcript compacts as a SPLIT turn, so two summarization calls are expected; the drop
+    // hits the first (history) half.
+    faux.set_response_steps(vec![
+        transient_failure_step(),
+        faux_assistant_message(vec![faux_text("HISTORY-OK")], StopReason::Stop).into(),
+        faux_assistant_message(vec![faux_text("PREFIX-OK")], StopReason::Stop).into(),
+    ]);
+    let model = faux.model().clone();
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone())
+            .with_retry(RetryPolicy::new(true, 3, 0)),
+        NoHooks,
+    );
+
+    let mut m = f6_session(root.path(), &cwd);
+    let entries_before = m.entries().len();
+
+    let entry = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &f6_settings(),
+            CompactionReason::Threshold,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the retried attempt produces a compaction entry");
+
+    assert_eq!(faux.call_count(), 3, "two summarization halves, the first one retried once");
+    assert!(
+        entry.summary.contains("HISTORY-OK"),
+        "the SUCCEEDING attempt's text is what is stored: {}",
+        entry.summary
+    );
+    assert!(entry.summary.contains("PREFIX-OK"), "and the second half still ran");
+
+    // Observable end state: the summary heads the rebuilt context, and the append-only JSONL grew
+    // by exactly the one compaction entry.
+    let ctx = m.build_context();
+    assert!(
+        first_text(&ctx.messages[0]).contains("HISTORY-OK"),
+        "context leads with the summary"
+    );
+    assert!(ctx.messages.len() < entries_before, "context is reduced vs the full history");
+    assert_eq!(m.entries().len(), entries_before + 1);
+    let reopened = SessionManager::open(m.session_file().unwrap()).unwrap();
+    assert_eq!(reopened.entries().len(), entries_before + 1, "history is intact on reload");
+}
+
+#[tokio::test]
+async fn f6_a_with_retries_disabled_the_same_drop_kills_the_compaction() {
+    // The negative control: `retry: undefined` returns the first response unchanged
+    // (`retry.ts:159-160`). This is the behavior cyrup had unconditionally.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f6_noretry");
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        transient_failure_step(),
+        faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop).into(),
+    ]);
+    let model = faux.model().clone();
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+
+    let mut m = f6_session(root.path(), &cwd);
+    let entries_before = m.entries().len();
+    let before: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
+
+    let err = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &f6_settings(),
+            CompactionReason::Threshold,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .expect_err("the first drop fails the whole compaction");
+    assert!(matches!(err, CompactionError::Summarization(_)), "{err:?}");
+
+    assert_eq!(faux.call_count(), 1, "no second attempt was made");
+    assert!(!has_compaction(&m), "nothing was appended");
+    assert_eq!(m.entries().len(), entries_before);
+    let after: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
+    assert_eq!(after, before, "the built context is untouched by the failed compaction");
+}
+
+#[tokio::test]
+async fn f6_a_a_quota_error_fails_fast_even_with_retries_enabled() {
+    // `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` wins over the retryable set (`retry.ts:225`), so
+    // a billing/quota failure must not burn the retry budget with backoff sleeps.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f6_quota");
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        quota_failure_step(),
+        faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop).into(),
+    ]);
+    let model = faux.model().clone();
+    let compactor = Compactor::new(
+        ProviderSummarizer::new(faux.clone(), model.clone())
+            .with_retry(RetryPolicy::new(true, 5, 60_000)),
+        NoHooks,
+    );
+
+    let mut m = f6_session(root.path(), &cwd);
+    let entries_before = m.entries().len();
+
+    let err = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &f6_settings(),
+            CompactionReason::Threshold,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .expect_err("a deterministic provider error is terminal");
+    assert!(matches!(err, CompactionError::Summarization(_)), "{err:?}");
+    assert_eq!(faux.call_count(), 1, "no retry, and no 60s backoff sleep");
+    assert!(!has_compaction(&m));
+    assert_eq!(m.entries().len(), entries_before);
+}
+
+#[tokio::test]
+async fn f6_b_summarization_is_isolated_from_the_session_cache_and_routing() {
+    // "Summaries are standalone requests, so isolate routing and avoid cache writes that cannot be
+    // reused" — `cacheRetention: "none"` + a fresh `sessionId` per call (`compaction.ts:570-575`).
+    // Leaving `cache_retention` unset lets the encoder resolve it from `PI_CACHE_RETENTION`
+    // (defaulting to Short), billing a cache write on a one-shot request.
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/f6_cache");
+
+    let spy = OptionSpy::default();
+    let faux = Arc::new(FauxProvider::new());
+    // Enough scripted steps for both rounds whether or not either cut splits a turn.
+    faux.set_response_steps((0..6).map(|_| spy.step(FULL_SUMMARY)).collect());
+    let model = faux.model().clone();
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+
+    let mut m = f6_session(root.path(), &cwd);
+    for round in 0..2 {
+        let entry = compactor
+            .run_compaction(
+                &mut m,
+                &model,
+                &f6_settings(),
+                CompactionReason::Threshold,
+                None,
+                false,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("round {round} compacts"));
+        assert!(entry.summary.contains("## Goal"));
+        m.append_message(user("another question with several words to add some size")).unwrap();
+        m.append_message(assistant("another answer with several words to add some size")).unwrap();
+    }
+
+    let seen = spy.seen();
+    assert!(seen.len() >= 2, "at least one summarization call per round: {}", seen.len());
+    for (i, opts) in seen.iter().enumerate() {
+        assert_eq!(
+            opts.cache_retention,
+            Some(CacheRetention::None),
+            "call {i} must not write a prompt-cache entry it can never read back"
+        );
+        assert!(opts.session_id.is_some(), "call {i} carries its own routing id");
+    }
+    let mut ids: Vec<String> = seen
+        .iter()
+        .filter_map(|o| o.session_id.as_ref().map(|id| id.as_str().to_string()))
+        .collect();
+    let total = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        total,
+        "each summarization gets a FRESH id, not the session's own affinity"
+    );
+    let session_id = m.header().id.as_str().to_string();
+    assert!(
+        !ids.contains(&session_id),
+        "the live session id is never reused for a summarization"
+    );
+
+    // Both compactions are real: two entries on disk, and the newest summary governs the context.
+    let compactions = m
+        .entries()
+        .iter()
+        .filter(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+        .count();
+    assert_eq!(compactions, 2);
+    assert!(first_text(&m.build_context().messages[0]).contains("## Goal"));
+}
+
+#[tokio::test]
+async fn f6_c_the_session_thinking_level_reaches_both_summarization_halves() {
+    // `createSummarizationOptions` sets `options.reasoning = thinkingLevel` when the model supports
+    // reasoning and the level is not "off" (`compaction.ts:549-551`), and BOTH halves of a split
+    // turn go through it (`compaction.ts:858,875`). cyrup hardcoded `Off` and never read the field,
+    // so summaries on a reasoning model were produced without reasoning.
+    let spy = OptionSpy::default();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![spy.step("HISTORY-SUMMARY"), spy.step("PREFIX-SUMMARY")]);
+    let mut model = faux.model().clone();
+    model.reasoning = true;
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
+        .with_thinking(ModelThinkingLevel::High);
+
+    let cwd = PathBuf::from("/proj/f6_thinking");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("first turn question short")).unwrap();
+    m.append_message(assistant("first turn answer short")).unwrap();
+    m.append_message(user("second turn question short")).unwrap();
+    m.append_message(assistant(&"x ".repeat(120))).unwrap();
+
+    let entry = compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("split-turn compaction produces an entry");
+
+    let seen = spy.seen();
+    assert_eq!(seen.len(), 2, "history half + turn-prefix half");
+    for (i, opts) in seen.iter().enumerate() {
+        assert_eq!(opts.reasoning, ModelThinkingLevel::High, "half {i} was summarized WITH thinking");
+    }
+    // And the merged text of both halves is what the session records + shows the model.
+    assert!(entry.summary.contains("HISTORY-SUMMARY"));
+    assert!(entry.summary.contains("PREFIX-SUMMARY"));
+    assert!(first_text(&m.build_context().messages[0]).contains("PREFIX-SUMMARY"));
+}
+
+#[tokio::test]
+async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summaries() {
+    // Pi's gate is `model.reasoning && thinkingLevel && thinkingLevel !== "off"`; and branch
+    // summaries build their options inline WITHOUT `createSummarizationOptions`
+    // (`branch-summarization.ts:348`), so they never carry a reasoning level at all.
+    let spy = OptionSpy::default();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![spy.step(FULL_SUMMARY), spy.step(FULL_SUMMARY)]);
+    let mut model = faux.model().clone();
+    model.reasoning = false;
+
+    let cwd = PathBuf::from("/proj/f6_nothink");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("shared question with some words")).unwrap();
+    let shared = m.append_message(assistant("shared answer with some words")).unwrap();
+    m.append_message(user("branch one question with some words")).unwrap();
+    let l1 = m.append_message(assistant("branch one answer with some words")).unwrap();
+    m.branch(&shared).unwrap();
+    m.append_message(user("branch two question with some words")).unwrap();
+    let l2 = m.append_message(assistant("branch two answer with some words")).unwrap();
+
+    // (a) A non-reasoning model never receives a level, however the session is configured.
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
+        .with_thinking(ModelThinkingLevel::High);
+    compactor
+        .run_compaction(
+            &mut m,
+            &model,
+            &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
+            CompactionReason::Manual,
+            None,
+            false,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("compaction runs");
+
+    // (b) A branch summary on a REASONING model still carries no level.
+    let mut reasoning_model = faux.model().clone();
+    reasoning_model.reasoning = true;
+    let branch_compactor =
+        Compactor::new(ProviderSummarizer::new(faux.clone(), reasoning_model.clone()), NoHooks)
+            .with_thinking(ModelThinkingLevel::High);
+    let summary = branch_compactor
+        .run_branch_summary(
+            &mut m,
+            &reasoning_model,
+            l2,
+            Some(l1),
+            true,
+            &BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false },
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("branch summary is appended");
+    assert!(summary.summary.contains("## Goal"));
+
+    let seen = spy.seen();
+    assert_eq!(seen.len(), 2, "one compaction call + one branch-summary call");
+    assert_eq!(seen[0].reasoning, ModelThinkingLevel::Off, "non-reasoning model gets no level");
+    assert_eq!(seen[1].reasoning, ModelThinkingLevel::Off, "branch summaries never set reasoning");
+}
+
+#[tokio::test]
+async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
+    // `const contextWindow = model.contextWindow || 128000` (`branch-summarization.ts:315`). Without
+    // the fallback the budget is `0 - reserve` → saturates to 0, which `prepare_branch_entries`
+    // reads as "no limit" — so a model with an unknown window would serialize an ENTIRE abandoned
+    // branch into one prompt instead of capping it at 128000 − 16384 = 111616 tokens.
+    const RESERVE: u32 = 16_384;
+    // 12 messages × 10000 tokens = 120000 > 111616, so the newest-first walk must drop the oldest.
+    let big = |marker: &str| format!("{marker} {}", "x".repeat(40_000 - marker.len() - 1));
+
+    let summarizer = RecordingSummarizer::new(vec![FULL_SUMMARY, FULL_SUMMARY]);
+    let compactor = Compactor::new(summarizer, NoHooks);
+
+    let cwd = PathBuf::from("/proj/f6_budget");
+    let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m.append_message(user("shared question")).unwrap();
+    let shared = m.append_message(assistant("shared answer")).unwrap();
+    for i in 0..12 {
+        m.append_message(user(&big(&format!("ABANDONED-{i}")))).unwrap();
+    }
+    let abandoned_leaf = m.leaf_id().cloned().unwrap();
+    m.branch(&shared).unwrap();
+    let target = m.append_message(user("the branch we return to")).unwrap();
+
+    let mut zero_window = faux_model();
+    zero_window.context_window = 0;
+    let settings = BranchSummarySettings { reserve_tokens: RESERVE, skip_prompt: false };
+
+    let entry = compactor
+        .run_branch_summary(
+            &mut m,
+            &zero_window,
+            target.clone(),
+            Some(abandoned_leaf.clone()),
+            true,
+            &settings,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("a branch summary is appended");
+    assert!(entry.summary.contains("## Goal"));
+    assert!(m.build_context().messages.iter().any(|msg| first_text(msg).contains("## Goal")));
+
+    let prompt = compactor.summarizer().prompts().pop().expect("one summarization call");
+    assert!(prompt.contains("ABANDONED-11"), "the newest abandoned work is always summarized");
+    assert!(
+        !prompt.contains("ABANDONED-0 "),
+        "the oldest abandoned entry is over the 111616-token cap and must be dropped"
+    );
+
+    // Control: a model that DOES report a window big enough for the whole branch keeps all of it,
+    // proving the truncation above comes from the 128000 fallback and not from some other limit.
+    let mut wide = faux_model();
+    wide.context_window = 400_000;
+    let wide_compactor = Compactor::new(RecordingSummarizer::new(vec![FULL_SUMMARY]), NoHooks);
+    let mut m2 = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
+    m2.append_message(user("shared question")).unwrap();
+    let shared2 = m2.append_message(assistant("shared answer")).unwrap();
+    for i in 0..12 {
+        m2.append_message(user(&big(&format!("ABANDONED-{i}")))).unwrap();
+    }
+    let leaf2 = m2.leaf_id().cloned().unwrap();
+    m2.branch(&shared2).unwrap();
+    let target2 = m2.append_message(user("the branch we return to")).unwrap();
+    wide_compactor
+        .run_branch_summary(
+            &mut m2,
+            &wide,
+            target2,
+            Some(leaf2),
+            true,
+            &settings,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("a branch summary is appended");
+    let wide_prompt = wide_compactor.summarizer().prompts().pop().expect("one call");
+    assert!(wide_prompt.contains("ABANDONED-0 "), "a 400k window fits the whole branch");
 }

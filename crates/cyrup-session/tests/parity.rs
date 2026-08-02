@@ -893,6 +893,7 @@ fn g5_summary_messages_carry_entry_timestamp() {
             first_kept_entry_id: EntryId::from("e0"),
             tokens_before: 9,
             details: None,
+            usage: None,
             from_hook: None,
         }),
     ];

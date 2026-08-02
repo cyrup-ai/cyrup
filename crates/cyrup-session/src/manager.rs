@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{EntryId, Message, ModelId, ModelRef, ProviderId, SessionId};
+use cyrup_core::{EntryId, Message, ModelId, ModelRef, ProviderId, SessionId, Usage};
 use serde_json::Value;
 
 use crate::agent_message::AgentMessage;
@@ -480,12 +480,16 @@ impl SessionManager {
         }))
     }
 
+    /// Append a compaction entry (Pi `appendCompaction(summary, firstKeptEntryId, tokensBefore,
+    /// details, fromHook, usage)`, `session-manager.ts:1096-1116`). `usage` is the token spend of
+    /// the summarization call(s); `None` when the summary came from a hook that reported none.
     pub fn append_compaction(
         &mut self,
         summary: String,
         first_kept: EntryId,
         tokens_before: u64,
         details: Option<Value>,
+        usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
         self.push_entry(Entry::known(KnownEntry::Compaction {
@@ -494,6 +498,7 @@ impl SessionManager {
             first_kept_entry_id: first_kept,
             tokens_before,
             details,
+            usage,
             from_hook: Some(from_hook),
         }))
     }
@@ -639,6 +644,7 @@ impl SessionManager {
         to: Option<&EntryId>,
         summary: String,
         details: Option<Value>,
+        usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
         match to {
@@ -651,6 +657,7 @@ impl SessionManager {
             from_id,
             summary,
             details,
+            usage,
             from_hook: Some(from_hook),
         }))
     }
@@ -664,6 +671,7 @@ impl SessionManager {
         from_id: EntryId,
         summary: String,
         details: Option<Value>,
+        usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
         self.push_entry(Entry::known(KnownEntry::BranchSummary {
@@ -671,6 +679,7 @@ impl SessionManager {
             from_id,
             summary,
             details,
+            usage,
             from_hook: Some(from_hook),
         }))
     }

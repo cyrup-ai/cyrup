@@ -1,23 +1,33 @@
 //! Compaction preparation (arch-05 §3.4/§6.2, R-05-007/019). Pure: derives everything a compaction
 //! needs from the current branch path. Returns `None` when there is nothing to compact.
 
-use cyrup_core::{EntryId, Message};
+use cyrup_core::EntryId;
 
+use crate::agent_message::AgentMessage;
 use crate::compaction::cutpoint::find_cut_point;
 use crate::compaction::files::FileOps;
 use crate::compaction::settings::CompactionSettings;
 use crate::compaction::tokens::{estimate_context_tokens_raw, TokenCache};
-use crate::context::{build_context_agent_messages, push_as_message};
+use crate::context::{build_context_agent_messages, raw_context_messages};
 use crate::entry::{Entry, KnownEntry};
 
 /// The prepared compaction (also the before-compact hook input).
+///
+/// The two message lists carry **raw [`AgentMessage`]s**, roles intact — Pi
+/// `CompactionPreparation.messagesToSummarize: AgentMessage[]`
+/// (`coding-agent/src/core/compaction/compaction.ts:690-700`). `convertToLlm` is applied later, in
+/// [`crate::compaction::summarize::generate_summary`], immediately before `serializeConversation`.
+/// Rendering here instead (as the harness fork's port did) would flatten a `bashExecution` into a
+/// ``Ran `cmd` `` user message, discard a `custom` message's `customType`, and DROP
+/// `excludeFromContext` bash messages outright — invisible to any extension reading this payload,
+/// and enough to make a history of only `!!` commands look empty and skip compaction entirely.
 #[derive(Clone, Debug)]
 pub struct CompactionPreparation {
     pub first_kept_entry_id: EntryId,
     /// `boundary_start .. history_end`.
-    pub messages_to_summarize: Vec<Message>,
+    pub messages_to_summarize: Vec<AgentMessage>,
     /// `turn_start .. first_kept` (split turn only).
-    pub turn_prefix_messages: Vec<Message>,
+    pub turn_prefix_messages: Vec<AgentMessage>,
     pub is_split_turn: bool,
     pub tokens_before: u32,
     pub previous_summary: Option<String>,
@@ -25,13 +35,20 @@ pub struct CompactionPreparation {
     pub settings: CompactionSettings,
 }
 
-/// Convert a slice of entries to their LLM-message form (drops non-message entries).
-pub(crate) fn messages_for(entries: &[Entry]) -> Vec<Message> {
-    let mut out = Vec::new();
-    for e in entries {
-        push_as_message(&mut out, e);
+/// The raw `AgentMessage` an entry contributes to a compaction — Pi
+/// `getMessageFromEntryForCompaction` (`compaction.ts:80-85`):
+/// `sessionEntryToContextMessages(entry)[0]`, with `compaction` entries excluded (a previous
+/// compaction's summary reaches the model through `previousSummary`, not the transcript).
+pub(crate) fn message_for_compaction(entry: &Entry) -> Option<AgentMessage> {
+    if matches!(entry, Entry::Known(KnownEntry::Compaction { .. })) {
+        return None;
     }
-    out
+    raw_context_messages(entry).into_iter().next()
+}
+
+/// Project a slice of entries to their raw `AgentMessage` form (drops entries that contribute none).
+pub(crate) fn messages_for(entries: &[Entry]) -> Vec<AgentMessage> {
+    entries.iter().filter_map(message_for_compaction).collect()
 }
 
 /// Derive a compaction from the current branch `path`. `None` ⇒ nothing to compact (already
@@ -100,10 +117,10 @@ pub fn prepare_compaction(
         file_ops.absorb_prev_details(d);
     }
     for m in &messages_to_summarize {
-        file_ops.absorb_message(m);
+        file_ops.absorb_agent_message(m);
     }
     for m in &turn_prefix_messages {
-        file_ops.absorb_message(m);
+        file_ops.absorb_agent_message(m);
     }
 
     // tokens_before = estimated size of the ENTIRE pre-compaction context being reduced (Pi

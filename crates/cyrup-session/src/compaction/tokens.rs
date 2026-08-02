@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use cyrup_core::{Content, EntryId, Message, StopReason, Usage};
 
 use crate::agent_message::AgentMessage;
-use crate::context::{push_as_message, RawContextMessage};
+use crate::context::push_as_message;
 use crate::entry::Entry;
 
 /// Images count as this many chars before the `/4` division (Pi parity).
@@ -34,10 +34,11 @@ pub fn estimate_tokens(msg: &Message) -> u32 {
     chars.div_ceil(4) as u32
 }
 
-/// Pi `estimateTokens` over the full `AgentMessage` superset (`compaction.ts:256-296`): a
+/// Pi `estimateTokens` over the full `AgentMessage` union (`compaction.ts:256-296`): a
 /// `bashExecution` costs `(command.length + output.length)/4`; a `custom` costs its content
-/// chars/4; core roles match [`estimate_tokens`]. This is what the cut-point walk accumulates, so
-/// it must match Pi's raw per-message estimate (not the rendered LLM text).
+/// chars/4; a `branchSummary`/`compactionSummary` costs `summary.length/4` (WITHOUT the LLM wrapper
+/// prefix/suffix); core roles match [`estimate_tokens`]. This is what the cut-point walk
+/// accumulates, so it must match Pi's raw per-message estimate, not the rendered LLM text.
 pub fn estimate_agent_message(msg: &AgentMessage) -> u32 {
     match msg {
         AgentMessage::Core(m) => estimate_tokens(m),
@@ -46,6 +47,8 @@ pub fn estimate_agent_message(msg: &AgentMessage) -> u32 {
             (utf16_len(&b.command) + utf16_len(&b.output)).div_ceil(4) as u32
         }
         AgentMessage::Custom(c) => custom_content_chars(&c.content).div_ceil(4) as u32,
+        AgentMessage::BranchSummary(b) => estimate_summary_text(&b.summary),
+        AgentMessage::CompactionSummary(c) => estimate_summary_text(&c.summary),
     }
 }
 
@@ -149,34 +152,17 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextUsageEstimate {
     }
 }
 
-/// Pi `estimateTokens` over a single [`RawContextMessage`] (`compaction.ts:256-296`): a
-/// `bashExecution` costs `(command+output)/4` (counted even when `excludeFromContext`), a `custom`
-/// costs its content chars/4, a `branchSummary`/`compactionSummary` costs `summary.length/4`, and
-/// core roles match [`estimate_tokens`]. This is the raw per-role basis Pi uses for `tokensBefore`,
-/// NOT the LLM-rendered text.
-fn estimate_raw_message(msg: &RawContextMessage) -> u32 {
-    match msg {
-        RawContextMessage::Agent(a) => estimate_agent_message(a),
-        RawContextMessage::CustomContent(c) => estimate_custom_message_content(c),
-        RawContextMessage::BranchSummary(s) | RawContextMessage::CompactionSummary(s) => {
-            estimate_summary_text(s)
-        }
-    }
-}
-
 /// Estimate live context over the **raw `AgentMessage`** context (Pi
 /// `estimateContextTokens(buildSessionContext(pathEntries).messages)`, `compaction.ts:192-228,678`).
 /// Identical anchor logic to [`estimate_context_tokens`] — prefer the last *valid* core-assistant
 /// usage, then locally estimate the trailing messages — but the trailing estimate dispatches on the
-/// raw role via [`estimate_raw_message`], so bash/summary/excluded-bash entries after the anchor are
-/// counted exactly as Pi counts them (not as their `convertToLlm`-rendered, wrapper-padded text).
-pub fn estimate_context_tokens_raw(messages: &[RawContextMessage]) -> ContextUsageEstimate {
+/// raw role via [`estimate_agent_message`], so bash/summary/excluded-bash entries after the anchor
+/// are counted exactly as Pi counts them (not as their `convertToLlm`-rendered, wrapper-padded text).
+pub fn estimate_context_tokens_raw(messages: &[AgentMessage]) -> ContextUsageEstimate {
     let mut last_usage_index = None;
     let mut usage_tokens = 0;
     for (i, m) in messages.iter().enumerate() {
-        if let RawContextMessage::Agent(boxed) = m
-            && let AgentMessage::Core(Message::Assistant(a)) = boxed.as_ref()
-        {
+        if let AgentMessage::Core(Message::Assistant(a)) = m {
             let valid = !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted);
             let tok = context_tokens_from_usage(&a.usage);
             if valid && tok > 0 {
@@ -190,7 +176,7 @@ pub fn estimate_context_tokens_raw(messages: &[RawContextMessage]) -> ContextUsa
         .get(trailing_start..)
         .unwrap_or(&[])
         .iter()
-        .map(estimate_raw_message)
+        .map(estimate_agent_message)
         .fold(0u32, |a, b| a.saturating_add(b));
     ContextUsageEstimate {
         tokens: usage_tokens.saturating_add(trailing_tokens),
@@ -207,7 +193,7 @@ pub fn estimate_context_tokens_raw(messages: &[RawContextMessage]) -> ContextUsa
 enum EstimateKind {
     /// [`push_as_message`] + [`estimate_tokens`] — the LLM-rendered projection.
     Rendered,
-    /// [`crate::context::raw_context_messages`] + [`estimate_raw_message`] — Pi's raw projection,
+    /// [`crate::context::raw_context_messages`] + [`estimate_agent_message`] — Pi's raw projection,
     /// what `findCutPoint` accumulates.
     Raw,
 }
@@ -260,7 +246,7 @@ impl TokenCache {
         self.cached(entry, EstimateKind::Raw, || {
             crate::context::raw_context_messages(entry)
                 .iter()
-                .map(estimate_raw_message)
+                .map(estimate_agent_message)
                 .fold(0u32, |a, b| a.saturating_add(b))
         })
     }

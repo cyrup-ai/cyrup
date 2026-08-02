@@ -32,7 +32,10 @@ pub use compaction::{
     serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionHooks,
     CompactionReason, CompactionSettings, NoHooks, Summarizer,
 };
-pub use agent_message::{AgentMessage, BashExecutionMessage, CustomRoleMessage};
+pub use agent_message::{
+    convert_to_llm, AgentMessage, BashExecutionMessage, BranchSummaryMessage,
+    CompactionSummaryMessage, CustomRoleMessage, MessageRole,
+};
 pub use context::SessionContext;
 pub use entry::{Entry, EntryBase, KnownEntry};
 pub use error::SessionError;

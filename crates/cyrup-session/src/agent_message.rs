@@ -1,16 +1,25 @@
-//! The extended message model carried inside a `type:"message"` entry (Pi `AgentMessage`,
-//! `messages.ts:8,69-77`). Pi stores **every** message role inside a `SessionMessageEntry.message`
-//! field — not just `user`/`assistant`/`toolResult`, but also the `bashExecution` (`!` shell
-//! command, `messages.ts:29-40`) and `custom` (extension `sendMessage`, `messages.ts:46-53`) roles.
+//! The extended message model Pi calls `AgentMessage` (`messages.ts:8,26-66` + the
+//! `CustomAgentMessages` declaration merging at `messages.ts:68-77`). Pi's union is
+//! `user`/`assistant`/`toolResult` **plus** four coding-agent roles: `bashExecution` (`!` shell
+//! command, `messages.ts:29-40`), `custom` (extension `sendMessage`, `messages.ts:46-53`),
+//! `branchSummary` (`messages.ts:55-60`) and `compactionSummary` (`messages.ts:62-67`).
 //!
-//! `cyrup_core::Message` is a closed `user`/`assistant`/`toolResult` enum, so a bash/custom-role
-//! message cannot live there. [`AgentMessage`] is the cyrup-session-local superset used ONLY as the
-//! inner type of [`crate::entry::KnownEntry::Message`]; it keeps such entries parseable (instead of
-//! degrading to `Entry::Unknown` and being silently dropped from context / cut-points / token
-//! estimation), and renders them to LLM-form `user` messages exactly like Pi's `convertToLlm`
-//! (`messages.ts:148-195`).
+//! `cyrup_core::Message` is a closed `user`/`assistant`/`toolResult` enum, so none of the four can
+//! live there. [`AgentMessage`] is the cyrup-session-local superset that mirrors Pi's union exactly.
+//! It serves two roles:
+//!
+//! - the inner type of [`crate::entry::KnownEntry::Message`], keeping bash/custom-role entries
+//!   parseable (instead of degrading to `Entry::Unknown` and being silently dropped from context /
+//!   cut-points / token estimation); and
+//! - the element type of Pi's **raw context projection** — `sessionEntryToContextMessages`
+//!   (`session-manager.ts:383-408`) returns `AgentMessage[]`, and that projection is what
+//!   `findCutPoint` classifies, what `estimateTokens` measures, and what `prepareCompaction` hands
+//!   to extensions (see [`crate::context::raw_context_messages`]).
+//!
+//! [`convert_to_llm`] renders the union down to core `user` messages exactly like Pi's
+//! `convertToLlm` (`messages.ts:148-195`) — applied at the LLM boundary, never earlier.
 
-use cyrup_core::{Content, Message};
+use cyrup_core::{Content, EntryId, Message};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -55,14 +64,74 @@ pub struct CustomRoleMessage {
     pub timestamp: i64,
 }
 
-/// The superset of message roles Pi stores inside a `type:"message"` entry (Pi `AgentMessage`).
-/// `Core` covers `user`/`assistant`/`toolResult` ([`cyrup_core::Message`]); the extra arms carry the
-/// `bashExecution`/`custom` roles that the closed core enum cannot represent.
+/// A `branchSummary`-role message (Pi `BranchSummaryMessage`, `messages.ts:55-60`), produced by
+/// `createBranchSummaryMessage` from a `branch_summary` entry.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchSummaryMessage {
+    pub summary: String,
+    pub from_id: EntryId,
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+/// A `compactionSummary`-role message (Pi `CompactionSummaryMessage`, `messages.ts:62-67`),
+/// produced by `createCompactionSummaryMessage` from a `compaction` entry.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSummaryMessage {
+    pub summary: String,
+    #[serde(default)]
+    pub tokens_before: u64,
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+/// The full Pi `AgentMessage` union. `Core` covers `user`/`assistant`/`toolResult`
+/// ([`cyrup_core::Message`]); the four extra arms carry the coding-agent roles the closed core enum
+/// cannot represent (`messages.ts:68-77`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentMessage {
     Core(Message),
     BashExecution(BashExecutionMessage),
     Custom(CustomRoleMessage),
+    BranchSummary(BranchSummaryMessage),
+    CompactionSummary(CompactionSummaryMessage),
+}
+
+/// The role of an [`AgentMessage`], as the `switch (message.role)` predicates in Pi's cut-point
+/// layer see it (`compaction.ts:308-336`). Carried separately so an entry can be classified without
+/// cloning its message (see [`crate::context::context_message_role`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    ToolResult,
+    BashExecution,
+    Custom,
+    BranchSummary,
+    CompactionSummary,
+}
+
+impl MessageRole {
+    /// Pi `isCutPointMessage` (`compaction.ts:308-321`): every role EXCEPT `toolResult` may serve
+    /// as a cut boundary — a tool result must stay with its call.
+    pub fn is_cut_point(self) -> bool {
+        !matches!(self, MessageRole::ToolResult)
+    }
+
+    /// Pi `isTurnStartMessage` (`compaction.ts:323-336`): `user`, `bashExecution`, `custom`,
+    /// `branchSummary` and `compactionSummary` start a turn; `assistant` and `toolResult` do not.
+    pub fn is_turn_start(self) -> bool {
+        matches!(
+            self,
+            MessageRole::User
+                | MessageRole::BashExecution
+                | MessageRole::Custom
+                | MessageRole::BranchSummary
+                | MessageRole::CompactionSummary
+        )
+    }
 }
 
 impl AgentMessage {
@@ -71,26 +140,39 @@ impl AgentMessage {
         AgentMessage::Core(m)
     }
 
+    /// The wire `role` of this message.
+    pub fn role(&self) -> MessageRole {
+        match self {
+            AgentMessage::Core(Message::User { .. }) => MessageRole::User,
+            AgentMessage::Core(Message::Assistant(_)) => MessageRole::Assistant,
+            AgentMessage::Core(Message::ToolResult { .. }) => MessageRole::ToolResult,
+            AgentMessage::BashExecution(_) => MessageRole::BashExecution,
+            AgentMessage::Custom(_) => MessageRole::Custom,
+            AgentMessage::BranchSummary(_) => MessageRole::BranchSummary,
+            AgentMessage::CompactionSummary(_) => MessageRole::CompactionSummary,
+        }
+    }
+
     /// `true` for the core `assistant` role (turn/model detection).
     pub fn is_core_assistant(&self) -> bool {
         matches!(self, AgentMessage::Core(Message::Assistant(_)))
     }
 
-    /// `true` for the core `toolResult` role (never a valid cut point — Pi `compaction.ts:321-322`).
+    /// `true` for the core `toolResult` role (never a valid cut point — Pi `compaction.ts:320-321`).
     pub fn is_tool_result(&self) -> bool {
         matches!(self, AgentMessage::Core(Message::ToolResult { .. }))
     }
 
-    /// `true` for a turn-start role: core `user`, or `bashExecution` (Pi treats bash as a
-    /// user/turn boundary — `compaction.ts:313,359`).
+    /// Pi `isTurnStartMessage` (`compaction.ts:323-336`) — see [`MessageRole::is_turn_start`].
     pub fn is_turn_start(&self) -> bool {
-        matches!(self, AgentMessage::Core(Message::User { .. }) | AgentMessage::BashExecution(_))
+        self.role().is_turn_start()
     }
 
     /// Render to the LLM `user`-form message(s), per Pi `convertToLlm` (`messages.ts:148-195`).
     /// `Core` is passed through verbatim; a `bashExecution` becomes a `user` text message (or is
     /// dropped when `excludeFromContext`); a `custom` message unwraps its `content` to a `user`
-    /// message. Pushes nothing for a dropped bash message.
+    /// message; a `branchSummary`/`compactionSummary` becomes its wrapped `user` note. Pushes
+    /// nothing for a dropped bash message.
     pub fn push_llm(&self, out: &mut Vec<Message>) {
         match self {
             AgentMessage::Core(m) => out.push(m.clone()),
@@ -104,8 +186,29 @@ impl AgentMessage {
                 });
             }
             AgentMessage::Custom(c) => out.push(custom_to_message(&c.content, c.timestamp)),
+            AgentMessage::BranchSummary(b) => {
+                out.push(crate::context::branch_summary_message(&b.summary, b.timestamp));
+            }
+            AgentMessage::CompactionSummary(c) => {
+                out.push(crate::context::compaction_summary_message(
+                    &c.summary,
+                    c.tokens_before,
+                    c.timestamp,
+                ));
+            }
         }
     }
+}
+
+/// Pi `convertToLlm(messages)` (`messages.ts:148-195`): render a raw `AgentMessage` list down to
+/// core LLM messages, dropping `excludeFromContext` bash messages. Applied at the LLM boundary only
+/// — the cut-point layer and the extension-facing compaction preparation both carry the RAW list.
+pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        m.push_llm(&mut out);
+    }
+    out
 }
 
 /// Convert a `BashExecutionMessage` to user-message text (Pi `bashExecutionToText`,
@@ -188,6 +291,22 @@ impl Serialize for AgentMessage {
                 map.serialize_entry("timestamp", &c.timestamp)?;
                 map.end()
             }
+            AgentMessage::BranchSummary(b) => {
+                let mut map = s.serialize_map(Some(4))?;
+                map.serialize_entry("role", "branchSummary")?;
+                map.serialize_entry("summary", &b.summary)?;
+                map.serialize_entry("fromId", &b.from_id)?;
+                map.serialize_entry("timestamp", &b.timestamp)?;
+                map.end()
+            }
+            AgentMessage::CompactionSummary(c) => {
+                let mut map = s.serialize_map(Some(4))?;
+                map.serialize_entry("role", "compactionSummary")?;
+                map.serialize_entry("summary", &c.summary)?;
+                map.serialize_entry("tokensBefore", &c.tokens_before)?;
+                map.serialize_entry("timestamp", &c.timestamp)?;
+                map.end()
+            }
         }
     }
 }
@@ -208,6 +327,16 @@ impl<'de> Deserialize<'de> for AgentMessage {
                 let c =
                     serde_json::from_value::<CustomRoleMessage>(v).map_err(D::Error::custom)?;
                 Ok(AgentMessage::Custom(c))
+            }
+            Some("branchSummary") => {
+                let b =
+                    serde_json::from_value::<BranchSummaryMessage>(v).map_err(D::Error::custom)?;
+                Ok(AgentMessage::BranchSummary(b))
+            }
+            Some("compactionSummary") => {
+                let c = serde_json::from_value::<CompactionSummaryMessage>(v)
+                    .map_err(D::Error::custom)?;
+                Ok(AgentMessage::CompactionSummary(c))
             }
             _ => {
                 let m = serde_json::from_value::<Message>(v).map_err(D::Error::custom)?;

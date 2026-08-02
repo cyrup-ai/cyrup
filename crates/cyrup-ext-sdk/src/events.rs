@@ -203,8 +203,10 @@ pub struct SessionBeforeForkEvent {
 /// `session_before_compact` (Pi `SessionBeforeCompactEvent`, types.ts:577-587). Byte-shape:
 /// `{preparation, branchEntries, customInstructions?, reason, willRetry}` — the computed
 /// `preparation` (Pi `CompactionPreparation`: firstKeptEntryId/messagesToSummarize/
-/// turnPrefixMessages/isSplitTurn/tokensBefore/previousSummary?/fileOps/settings), the branch
-/// entries in scope, optional custom instructions, the trigger `reason`
+/// turnPrefixMessages/isSplitTurn/tokensBefore/previousSummary?/fileOps/settings — the two message
+/// arrays are RAW `AgentMessage`s, so `bashExecution`/`custom`/`branchSummary`/`compactionSummary`
+/// keep their `role` and their role-specific fields, and `excludeFromContext` bash commands are
+/// present), the branch entries in scope, optional custom instructions, the trigger `reason`
 /// (`"manual"|"threshold"|"overflow"`), and `willRetry`. The non-serializable `signal: AbortSignal`
 /// is omitted from the seam. A handler returns [`SessionBeforeCompactResult`] via
 /// [`crate::Outcome::compaction_override`] or vetoes via [`crate::Outcome::block`].
@@ -353,6 +355,13 @@ pub struct SessionBeforeCompactResult {
     /// Extension-specific structured details (Pi `CompactionResult.details?`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Token spend the guest reports for its own summarization (Pi `CompactionResult.usage?`,
+    /// `compaction.ts:88-89`). The host persists it verbatim on the appended compaction entry
+    /// (`CompactionEntry.usage`, `session-manager.ts:69-80`), so it shows up in per-session totals.
+    /// Shape is Pi's `Usage` (`{input, output, cacheRead, cacheWrite, totalTokens, cost{…}}`); kept
+    /// as raw JSON here so the guest crate stays free of the host's message types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
 }
 
 /// `session_before_tree` override (Pi `SessionBeforeTreeResult`, types.ts:1082-1094). Returned via

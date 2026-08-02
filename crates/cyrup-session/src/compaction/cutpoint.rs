@@ -2,10 +2,25 @@
 //!
 //! The cut MUST NOT fall between a tool call and its tool result: `ToolResult` entries are never
 //! valid cut points, so the first-kept boundary always snaps to a user/assistant/bash/custom/summary
-//! entry, keeping a tool call and its following results on the same side. Mirrors Pi
-//! `findValidCutPoints`/`findTurnStartIndex`/`findCutPoint` (`compaction.ts:305-454`).
+//! entry, keeping a tool call and its following results on the same side. Mirrors Pi's **live**
+//! fork, `coding-agent/src/core/compaction/compaction.ts:308-462`
+//! (`isCutPointMessage`/`isTurnStartMessage`/`isTurnStartEntry`/`findValidCutPoints`/
+//! `findTurnStartIndex`/`findCutPoint`).
+//!
+//! Every one of the four decisions this module makes — is an entry a valid cut point, does it start
+//! a turn, does it consume keep-recent budget, does it stop the back-scan — is a predicate over the
+//! SAME projection, `sessionEntryToContextMessages(entry)`. Pi's live fork unified them in commit
+//! a6f720e6 (2026-07-09); the older harness fork
+//! (`agent/src/harness/compaction/compaction.ts`) that cyrup originally ported instead switched on
+//! `entry.type` structurally at each site, which made an entry's classification disagree with its
+//! own context visibility (an EMPTY `branch_summary` counted as a cut point and a turn start while
+//! contributing nothing to the context, and a `custom`-role message was not a turn start). Here the
+//! projection is reached through [`crate::context::context_message_role`] (classification, no
+//! clone) and [`crate::compaction::tokens::TokenCache::estimate_raw_entry`] (measurement, memoized).
 
+use crate::agent_message::MessageRole;
 use crate::compaction::tokens::TokenCache;
+use crate::context::context_message_role;
 use crate::entry::{Entry, KnownEntry};
 
 /// The chosen boundary between summarized-history and kept-recent.
@@ -13,48 +28,43 @@ use crate::entry::{Entry, KnownEntry};
 pub struct CutPoint {
     /// Index of the first entry to KEEP verbatim.
     pub first_kept_index: usize,
-    /// User message index that starts the turn being split, or `None`.
+    /// Index of the entry that starts the turn being split, or `None`.
     pub turn_start_index: Option<usize>,
-    /// True iff the cut lands mid-turn (the cut entry is not a user message).
+    /// True iff the cut lands mid-turn — the cut entry does not itself start a turn (Pi
+    /// `isTurnStartEntry`) and an earlier in-range entry does.
     pub is_split_turn: bool,
 }
 
-/// Whether an entry may serve as a cut boundary (Pi `findValidCutPoints`, `compaction.ts:305-343`):
-/// a `message` entry whose role is NOT `toolResult`, a `branch_summary` entry, or a `custom_message`
-/// entry. `model_change`/`thinking_level_change`/`compaction`/`custom`/`label`/`session_info` are
-/// explicitly NOT valid.
+/// Whether an entry is context-visible at all — Pi
+/// `sessionEntryToContextMessages(entry).length > 0` (`compaction.ts:445`). Used by the back-scan.
+fn is_context_visible(entry: &Entry) -> bool {
+    context_message_role(entry).is_some()
+}
+
+/// Whether an entry may serve as a cut boundary — Pi `findValidCutPoints`
+/// (`compaction.ts:351-362`): skip `compaction` entries outright, then keep the entry iff its
+/// projection contains a non-`toolResult` message (`isCutPointMessage`). A tool result must stay
+/// with the call that produced it, and an entry that projects to NOTHING (an empty
+/// `branch_summary`, a `model_change`, a `label`, …) is not a boundary the context can express.
 fn is_valid_cut_point(entry: &Entry) -> bool {
-    matches!(
-        entry,
-        Entry::Known(KnownEntry::Message { message, .. }) if !message.is_tool_result()
-    ) || matches!(
-        entry,
-        Entry::Known(KnownEntry::BranchSummary { .. } | KnownEntry::CustomMessage { .. })
-    )
-}
-
-/// Whether an entry starts a turn (Pi `findTurnStartIndex`, `compaction.ts:350-365`): a
-/// `branch_summary`/`custom_message` entry (user-role messages), or a `message` entry with role
-/// `user` or `bashExecution`.
-fn is_turn_start_entry(entry: &Entry) -> bool {
-    match entry {
-        Entry::Known(KnownEntry::BranchSummary { .. } | KnownEntry::CustomMessage { .. }) => true,
-        Entry::Known(KnownEntry::Message { message, .. }) => message.is_turn_start(),
-        _ => false,
+    if matches!(entry, Entry::Known(KnownEntry::Compaction { .. })) {
+        return false;
     }
+    context_message_role(entry).is_some_and(MessageRole::is_cut_point)
 }
 
-/// Whether the cut entry is a core `user` message (Pi `compaction.ts:446`: only role `user` makes a
-/// non-split cut — a `bashExecution` is treated as a split-turn start).
-fn is_core_user_entry(entry: &Entry) -> bool {
-    matches!(
-        entry,
-        Entry::Known(KnownEntry::Message { message, .. })
-            if matches!(message, crate::agent_message::AgentMessage::Core(cyrup_core::Message::User { .. }))
-    )
+/// Whether an entry starts a turn — Pi `isTurnStartEntry` (`compaction.ts:338-343`): never a
+/// `compaction` entry, otherwise iff its projection contains a `user`, `bashExecution`, `custom`,
+/// `branchSummary` or `compactionSummary` message (`isTurnStartMessage`).
+fn is_turn_start_entry(entry: &Entry) -> bool {
+    if matches!(entry, Entry::Known(KnownEntry::Compaction { .. })) {
+        return false;
+    }
+    context_message_role(entry).is_some_and(MessageRole::is_turn_start)
 }
 
-/// Valid cut boundaries (indices) in `[start, end)` (R-05-005).
+/// Valid cut boundaries (indices) in `[start, end)` (R-05-005; Pi `findValidCutPoints`,
+/// `coding-agent/src/core/compaction/compaction.ts:351-362`).
 pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut i = start;
@@ -68,7 +78,8 @@ pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec
     out
 }
 
-/// First turn-start entry at or before `idx` (Pi `findTurnStartIndex`), bounded by `start`.
+/// First turn-start entry at or before `idx`, bounded by `start` (Pi `findTurnStartIndex`,
+/// `coding-agent/src/core/compaction/compaction.ts:369-376`; `None` is Pi's `-1`).
 pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<usize> {
     let mut i = idx.min(entries.len());
     loop {
@@ -151,7 +162,7 @@ pub fn find_cut_point(
         match entries.get(cut_idx - 1) {
             Some(Entry::Known(KnownEntry::Compaction { .. })) | None => break,
             Some(prev) => {
-                if !crate::context::raw_context_messages(prev).is_empty() {
+                if is_context_visible(prev) {
                     break;
                 }
                 cut_idx -= 1;
@@ -159,11 +170,19 @@ pub fn find_cut_point(
         }
     }
 
-    // Split-turn iff the cut entry is not a core `user` message and a prior turn start exists.
-    let is_user = entries.get(cut_idx).is_some_and(is_core_user_entry);
-    let (is_split_turn, turn_start_index) = if is_user {
+    // Split-turn determination — Pi:
+    //   const startsTurn = isTurnStartEntry(cutEntry);
+    //   const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+    //   isSplitTurn: !startsTurn && turnStartIndex !== -1
+    // (`coding-agent/src/core/compaction/compaction.ts:452-461`). The cut splits a turn iff the
+    // entry we keep from does NOT itself begin one and some earlier entry in range does.
+    let starts_turn = entries.get(cut_idx).is_some_and(is_turn_start_entry);
+    let (is_split_turn, turn_start_index) = if starts_turn {
         (false, None)
     } else {
+        // `find_turn_start` scans from `cut_idx` downward; since `!starts_turn` it can never return
+        // `cut_idx` itself, so the guard below is an invariant check, not a behavioral filter —
+        // keep it so a future predicate change cannot silently produce an EMPTY turn prefix.
         match find_turn_start(entries, cut_idx, start) {
             Some(ts) if ts < cut_idx => (true, Some(ts)),
             _ => (false, None),
