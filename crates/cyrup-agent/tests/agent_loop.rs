@@ -1024,3 +1024,128 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
     assert_eq!(count_turn_starts(&events), 2, "loop must continue after a truncated batch: {n:?}");
     assert_eq!(n.last().map(String::as_str), Some("agent_end"));
 }
+
+// ----------------------------------------------------------------------------
+// AGENT-002 — a parallel batch defers the START of every execution until every
+// call in the batch has been prepared. Pi's `executeToolCallsParallel` pushes a
+// LAZY closure per prepared call during the prep loop (agent-loop.ts:522-533) and
+// only invokes them in the following `Promise.all` (agent-loop.ts:540-542), so no
+// tool body runs while a later call's `before_tool_call` — the permission dialog —
+// is still open. Deferring the start must NOT serialize the batch: once started,
+// the calls still run concurrently.
+// ----------------------------------------------------------------------------
+
+struct RendezvousTool {
+    name: String,
+    params: Value,
+    log: Arc<Mutex<Vec<String>>>,
+    rendezvous: Arc<tokio::sync::Barrier>,
+}
+
+impl RendezvousTool {
+    fn new(
+        name: &str,
+        log: Arc<Mutex<Vec<String>>>,
+        rendezvous: Arc<tokio::sync::Barrier>,
+    ) -> Arc<Self> {
+        Arc::new(Self { name: name.into(), params: obj_schema(), log, rendezvous })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RendezvousTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.log.lock().unwrap().push(format!("exec_start:{}", self.name));
+        // Both bodies must be in flight at the same time for this to release.
+        if tokio::time::timeout(Duration::from_secs(5), self.rendezvous.wait()).await.is_ok() {
+            self.log.lock().unwrap().push(format!("rendezvous:{}", self.name));
+        }
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false })
+    }
+}
+
+/// Stands in for the permission gate: `before_tool_call` for `gate` blocks (as a human
+/// would) while the rest of the batch is still being prepared.
+struct SlowGateHook {
+    log: Arc<Mutex<Vec<String>>>,
+    gate: String,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl Hooks for SlowGateHook {
+    async fn before_tool_call(
+        &self,
+        ctx: BeforeToolCall<'_>,
+        _cancel: CancelToken,
+    ) -> Result<BeforeOutcome, HookError> {
+        let name = ctx.tool_name.to_string();
+        self.log.lock().unwrap().push(format!("hook_enter:{name}"));
+        if name == self.gate {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.log.lock().unwrap().push(format!("hook_exit:{name}"));
+        Ok(BeforeOutcome::Proceed)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_002_parallel_defers_execution_until_whole_batch_is_prepared() {
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+    let first = RendezvousTool::new("first", log.clone(), rendezvous.clone());
+    let second = RendezvousTool::new("second", log.clone(), rendezvous.clone());
+
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(
+            vec![faux_tool_call("first", json!({})), faux_tool_call("second", json!({}))],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![first, second])
+        .hooks(Arc::new(SlowGateHook {
+            log: log.clone(),
+            gate: "second".into(),
+            delay: Duration::from_millis(250),
+        }))
+        .build();
+
+    agent.prompt("go").await.unwrap();
+    agent.wait_for_idle().await;
+
+    let seen = log.lock().unwrap().clone();
+    let pos = |needle: &str| {
+        seen.iter().position(|s| s == needle).unwrap_or_else(|| panic!("missing {needle}: {seen:?}"))
+    };
+
+    // The gate for call #2 must close BEFORE call #1's body starts.
+    assert!(
+        pos("hook_exit:second") < pos("exec_start:first"),
+        "tool 'first' executed while 'second' was still in before_tool_call: {seen:?}"
+    );
+    assert!(
+        pos("hook_exit:second") < pos("exec_start:second"),
+        "execution must start only after the whole batch is prepared: {seen:?}"
+    );
+
+    // …and deferring the start must not serialize the batch: both bodies overlap.
+    assert!(
+        seen.contains(&"rendezvous:first".to_string())
+            && seen.contains(&"rendezvous:second".to_string()),
+        "parallel batch must still run concurrently once started: {seen:?}"
+    );
+}

@@ -1004,6 +1004,15 @@ impl RunCtx {
 
     /// Parallel batch: `tool_execution_start` in source order, `tool_execution_end` in completion
     /// order, tool-result messages + `turn_end.toolResults` in source order (R-02-015/016/017).
+    ///
+    /// Preparation and execution are two distinct phases. Pi's `executeToolCallsParallel` pushes a
+    /// LAZY closure per prepared call while it walks the batch (agent-loop.ts:522-533) and only
+    /// invokes them in the `Promise.all` that follows the loop (agent-loop.ts:540-542), so NO tool
+    /// body starts until EVERY call in the batch has been prepared. That matters because
+    /// `before_tool_call` is where the permission dialog blocks on a human: starting call #1 while
+    /// call #2's dialog is still open would let a tool run against state the user has not yet
+    /// approved. Deferring the start is not serialization — once the whole batch is prepared the
+    /// bodies are spawned together and run concurrently, exactly as `Promise.all` does.
     async fn execute_parallel(
         &self,
         assistant: &AssistantMessage,
@@ -1014,7 +1023,16 @@ impl RunCtx {
         let mut finalized: Vec<Option<Finalized>> = (0..n).map(|_| None).collect();
         let (tx, mut rx) = mpsc::channel::<ToolRuntimeMsg>(64);
         let mut joinset: JoinSet<()> = JoinSet::new();
-        let mut remaining = 0usize;
+        /// One prepared-but-not-yet-started call — the Rust analogue of Pi's deferred
+        /// `finalizedCalls.push(async () => …)` closure.
+        struct Deferred {
+            source_index: usize,
+            tool: Arc<dyn Tool>,
+            args: Value,
+            call_id: ToolCallId,
+            tool_name: String,
+        }
+        let mut deferred: Vec<Deferred> = Vec::new();
 
         for (idx, call) in calls.iter().enumerate() {
             self.emit(AgentEvent::ToolExecutionStart {
@@ -1037,41 +1055,55 @@ impl RunCtx {
                         *slot = Some(fin);
                     }
                 }
-                Prep::Ready { tool, args } => {
-                    remaining += 1;
-                    let accepting = Arc::new(AtomicBool::new(true));
-                    let acc2 = accepting.clone();
-                    let utx = tx.clone();
-                    let ftx = tx.clone();
-                    let cid = call.id.clone();
-                    let tname = call.name.clone();
-                    let child = self.cancel.child();
-                    joinset.spawn(async move {
-                        let sink_cid = cid.clone();
-                        let on_update: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
-                            if acc2.load(Ordering::Acquire) {
-                                let _ = utx.try_send(ToolRuntimeMsg::Update {
-                                    call_id: sink_cid.clone(),
-                                    partial: u,
-                                });
-                            }
-                        });
-                        let outcome = tool.execute(cid.clone(), args, child, on_update).await;
-                        accepting.store(false, Ordering::Release);
-                        let _ = ftx
-                            .send(ToolRuntimeMsg::Finished {
-                                call_id: cid,
-                                source_index: idx,
-                                tool_name: tname,
-                                outcome,
-                            })
-                            .await;
-                    });
-                }
+                // Prepared only — the body is NOT started here. Pi defers it to the
+                // post-loop `Promise.all` so a later call's `before_tool_call` cannot
+                // still be open while this one runs.
+                Prep::Ready { tool, args } => deferred.push(Deferred {
+                    source_index: idx,
+                    tool,
+                    args,
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                }),
             }
             if self.cancel.is_cancelled() {
                 break;
             }
+        }
+
+        // Phase two — every call in the batch is prepared; start them all together
+        // (Pi `await Promise.all(finalizedCalls.map(…))`, agent-loop.ts:540-542). Calls
+        // deferred before an abort broke the loop are still started, exactly as Pi's
+        // already-pushed closures are.
+        let mut remaining = deferred.len();
+        for Deferred { source_index, tool, args, call_id, tool_name } in deferred {
+            let accepting = Arc::new(AtomicBool::new(true));
+            let acc2 = accepting.clone();
+            let utx = tx.clone();
+            let ftx = tx.clone();
+            let cid = call_id;
+            let child = self.cancel.child();
+            joinset.spawn(async move {
+                let sink_cid = cid.clone();
+                let on_update: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
+                    if acc2.load(Ordering::Acquire) {
+                        let _ = utx.try_send(ToolRuntimeMsg::Update {
+                            call_id: sink_cid.clone(),
+                            partial: u,
+                        });
+                    }
+                });
+                let outcome = tool.execute(cid.clone(), args, child, on_update).await;
+                accepting.store(false, Ordering::Release);
+                let _ = ftx
+                    .send(ToolRuntimeMsg::Finished {
+                        call_id: cid,
+                        source_index,
+                        tool_name,
+                        outcome,
+                    })
+                    .await;
+            });
         }
         drop(tx);
 
