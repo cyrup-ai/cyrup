@@ -96,6 +96,12 @@ pub struct Collision {
 pub struct ResourceDiagnostic {
     #[serde(rename = "type")]
     pub diagnostic_type: DiagnosticType,
+    /// Which resource family the diagnostic is about. Pi gets this split for free — `getSkills()`,
+    /// `getPrompts()` and `getThemes()` each return their own `diagnostics` array, which is what
+    /// lets the startup panel print separate `[Skill conflicts]` / `[Prompt conflicts]` /
+    /// `[Theme conflicts]` blocks (interactive-mode.ts:1641-1690). cyrup's discovery pass returns
+    /// ONE flat list, so the family has to travel on the diagnostic itself.
+    pub resource_type: ResourceKind,
     pub message: String,
     pub path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,18 +114,23 @@ impl ResourceDiagnostic {
         path: impl Into<PathBuf>,
         message: impl Into<String>,
     ) -> Self {
-        let _ = kind;
         Self {
             diagnostic_type: DiagnosticType::Warning,
+            resource_type: kind,
             message: message.into(),
             path: path.into(),
             collision: None,
         }
     }
 
-    pub fn error(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+    pub fn error(
+        kind: ResourceKind,
+        path: impl Into<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             diagnostic_type: DiagnosticType::Error,
+            resource_type: kind,
             message: message.into(),
             path: path.into(),
             collision: None,
@@ -137,6 +148,7 @@ impl ResourceDiagnostic {
         let loser = loser_path.into();
         Self {
             diagnostic_type: DiagnosticType::Collision,
+            resource_type,
             message: format!("name \"{name}\" collision"),
             path: loser.clone(),
             collision: Some(Collision {

@@ -48,6 +48,17 @@ syntect = { workspace = true }
 # under the `show_images` toggle. `image` decodes/resizes the source bytes (already in-workspace).
 ratatui-image = { workspace = true }
 image = { workspace = true }
+# TUI-004 — the OSC 11 / DSR `?996` terminal probes (`terminal_query.rs`). Reading the reply needs a
+# `poll(2)`-bounded read straight off the stdin fd: crossterm has no OSC/DSR event and its `poll`
+# would swallow the bytes into its own parser, while any blocking-read design would either hang on a
+# silent terminal or steal the user's first keystroke. `rustix` is the safe, pure-Rust (linux_raw,
+# no C) wrapper for that pair, so `#![forbid(unsafe_code)]` here is unaffected.
+rustix = { workspace = true }
+# Tool-result `image` content blocks arrive base64-encoded on the wire (`Content::Image { data }`,
+# cyrup-core `message.rs:220`), so the transcript decodes them before handing the bytes to `image`
+# (Pi's `ToolExecutionComponent` passes the same base64 straight to its `Image` component,
+# tool-execution.ts:342-349).
+base64 = { workspace = true }
 # Clipboard IMAGE paste (gap-12 F5; Ctrl+V — `handleClipboardImagePaste`, interactive-mode.ts:2537-2557
 # + `utils/clipboard-image.ts`/`clipboard-native.ts`). `arboard` reads a native-clipboard image
 # (NSPasteboard on macOS, X11/Wayland on Linux) — the faithful Rust analog of Pi's native clipboard

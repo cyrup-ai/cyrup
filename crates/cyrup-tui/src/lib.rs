@@ -58,9 +58,11 @@ mod selector;
 mod session_search;
 mod session_selector;
 mod settings_selector;
+mod startup;
 mod startup_selector;
 mod status;
 mod status_indicator;
+mod terminal_query;
 mod text_input;
 mod theme;
 mod transcript;
@@ -91,8 +93,8 @@ pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
-    detect_capabilities, detect_capabilities_from, ImageBlock, ImageProtocol, ImageRenderer,
-    TerminalCapabilities,
+    detect_capabilities, detect_capabilities_from, image_fallback_text, ImageBlock, ImageProtocol,
+    ImageRenderer, TerminalCapabilities,
 };
 pub use keymap::{
     Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
@@ -118,12 +120,25 @@ pub use status::{format_tokens, StatusLine};
 pub use text_input::TextInputSelector;
 pub use tree_selector::{FilterMode, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
+pub use startup::{
+    build_startup_lines, display_path, extension_diagnostics, resource_diagnostics,
+    DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
+    StartupRole, StartupSpan,
+};
+pub use terminal_query::{
+    find_color_scheme_report, find_osc11_background_color, parse_color_scheme_report,
+    parse_osc11_background_color, saw_device_attributes, NoTerminalProbe, StdinTerminalProbe,
+    TerminalProbe, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
+};
 pub use theme::{
-    color_of, rgb_to_256, BackgroundTheme, ColorMode, TerminalTheme, ThemeController, ThinkingTheme,
-    UiTheme,
+    color_of, detect_terminal_background_from_env, detect_terminal_background_theme,
+    detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb, BackgroundTheme, ColorMode,
+    DetectionConfidence, TerminalTheme, TerminalThemeDetection, TerminalThemeSource,
+    ThemeController, ThinkingTheme, UiTheme,
 };
 pub use transcript::{
-    content_text, parse_skill_block, Entry, ParsedSkillBlock, TranscriptView,
+    content_text, parse_skill_block, thinking_text, Entry, ParsedSkillBlock, ResultImage,
+    TranscriptView, DEFAULT_IMAGE_WIDTH_CELLS, HIDDEN_THINKING_LABEL,
 };
 
 /// Re-export the exact crossterm ratatui uses (version-matched; ADR-0001 — never add a direct

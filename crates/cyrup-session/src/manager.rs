@@ -9,7 +9,7 @@ use cyrup_core::{EntryId, Message, ModelId, ModelRef, ProviderId, SessionId, Usa
 use serde_json::Value;
 
 use crate::agent_message::AgentMessage;
-use crate::context::{build_context_messages, SessionContext};
+use crate::context::{build_context_agent_messages, build_context_messages, SessionContext};
 use crate::entry::{Entry, EntryBase, KnownEntry};
 use crate::ids::validate_session_id;
 use crate::error::SessionError;
@@ -717,6 +717,31 @@ impl SessionManager {
 
         let messages = build_context_messages(&path);
         SessionContext { messages, thinking_level: thinking, model }
+    }
+
+    /// The active-path context with its **roles intact** — Pi's
+    /// `buildContextEntries().flatMap(sessionEntryToContextMessages)` (`session-manager.ts:441-453`
+    /// composed with `:383-408`), i.e. [`build_context`](Self::build_context) *without* the
+    /// `convertToLlm` flattening.
+    ///
+    /// [`build_context`](Self::build_context) is the LLM boundary: it renders a `compaction`,
+    /// `branch_summary`, `custom_message` or `bashExecution` entry down to a `user` message carrying
+    /// the wrapper prose the model conditions on. A UI that replays a resumed session must NOT see
+    /// that flattening — Pi's `renderSessionEntries` feeds the raw projection so each role still
+    /// reaches its own component (`CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`,
+    /// `CustomMessageComponent`, `BashExecutionComponent`; interactive-mode.ts:3506-3516, :3308-3350).
+    /// This is that projection.
+    ///
+    /// Note a `!!`-prefixed (`excludeFromContext`) bash message is PRESENT here and absent from
+    /// [`build_context`](Self::build_context) — Pi's raw context keeps it too (`messages.ts:153-155`
+    /// drops it only in `convertToLlm`), which is why the user still sees their own `!!` command
+    /// after a resume.
+    pub fn build_context_raw(&self) -> Vec<AgentMessage> {
+        let path = self.branch_path(None);
+        if path.is_empty() {
+            return Vec::new();
+        }
+        build_context_agent_messages(&path)
     }
 
     // ------------------------------------------------------------- export / accessors ---------

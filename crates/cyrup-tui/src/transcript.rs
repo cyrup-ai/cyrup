@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::bash::BashExecution;
 use crate::component::Component;
+use crate::image::{image_fallback_text, ImageBlock};
 use crate::theme::UiTheme;
 
 /// A committed transcript entry.
@@ -39,6 +40,17 @@ pub enum Entry {
     User(String),
     /// A finalized assistant message.
     Assistant(String),
+    /// A finalized run of assistant **thinking**/reasoning blocks (`assistant-message.ts:115-166`).
+    ///
+    /// Pi coalesces every consecutive `thinking` content block of a turn into ONE section joined by
+    /// `\n\n` (`:116-127`) and renders it as italic `thinkingText` markdown (`:145-165`) — or, when
+    /// `hideThinkingBlock` is set, as the single static `Thinking...` label (`:139-143`).
+    ///
+    /// `hidden` freezes that choice **at commit time**: Pi's `setHideThinkingBlock` (`:57-62`)
+    /// re-renders every prior assistant message live, but cyrup's committed entries have already
+    /// left the render tree for native scrollback (`App::flush_committed` → `insert_before`), so a
+    /// runtime toggle can only affect entries committed after the flip (ADR-0001).
+    Thinking { text: String, hidden: bool },
     /// A finished tool execution (`tool-execution.ts`): the tool name + the raw call args + the raw
     /// result value + error flag. Each built-in dispatches to its Pi-specific rich render
     /// (`core/tools/{read,write,edit,bash,grep,find,ls}.ts` `renderCall`/`renderResult`).
@@ -74,6 +86,12 @@ pub enum Entry {
     /// A compaction-summary message (`compaction-summary-message.ts`): a bold `[compaction]` label
     /// noting the pre-compaction token count + the `**Compacted from N tokens**` summary markdown.
     CompactionSummary { tokens_before: u64, summary: String },
+    /// The startup loaded-resources / diagnostics panel (`showLoadedResources`,
+    /// interactive-mode.ts:1480-1690) — the `[Context]`/`[Skills]`/`[Prompts]`/`[Extensions]`/
+    /// `[Themes]` inventory and the `[Skill conflicts]`/`[Prompt conflicts]`/`[Extension issues]`/
+    /// `[Theme conflicts]` blocks. Pre-formatted by [`crate::startup::build_startup_lines`] because
+    /// the expand/collapse choice cannot be revisited once committed (see that module's docs).
+    LoadedResources(Vec<crate::startup::StartupLine>),
 }
 
 /// One tool execution, shown live in the viewport while it runs (`tool-execution.ts` pending box) and
@@ -86,6 +104,17 @@ pub enum Entry {
 pub struct ToolRun {
     /// Tool name (`read`, `bash`, `edit`, …).
     pub name: String,
+    /// The provider-assigned `toolCallId` of the call this run renders (`ToolCall::id`,
+    /// message.rs:150 / `AgentSessionEvent::Tool*::tool_call_id`). This is the IDENTITY Pi pairs a
+    /// result to its call by: every rendered call component is filed under `content.id`
+    /// (interactive-mode.ts:3473, and `pendingTools.set(event.toolCallId, …)` at `:3096` on the live
+    /// path) and every result resolves with `get(message.toolCallId)` (`:3483`, `:3113`). Matching by
+    /// [`name`](ToolRun::name) instead swaps the bodies of two calls to the SAME tool in one turn —
+    /// the batched shape parallel tool execution produces routinely.
+    ///
+    /// `None` only when the caller had no id in hand (a synthesized run from a result whose start
+    /// was missed, or a test/legacy `push_tool_start`), in which case the name fallback applies.
+    pub call_id: Option<String>,
     /// The raw tool-call arguments (`renderCall(args)`) — the path/command/pattern/offset/limit/…
     /// each tool's header is built from. `Value::Null` when a start was missed.
     pub args: Value,
@@ -110,6 +139,27 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<String>,
+    /// The `image` content blocks of the result, decoded once when the run finishes
+    /// (`tool-execution.ts:331-350` filters `content` for `type === "image"` on every display
+    /// update). Decoding here rather than per frame keeps a screenshot-sized PNG off the redraw path.
+    pub images: Vec<ResultImage>,
+}
+
+/// One `image` content block of a tool result (`{type:"image", data, mimeType}`) — the wire mime type
+/// plus the decoded raster, or `None` when the bytes were not a recognizable image. A block that
+/// fails to decode still renders Pi's text stand-in ([`crate::image::image_fallback_text`]) so the
+/// user is told an image came back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResultImage {
+    /// The declared `mimeType` (`image/png`, …), or `image/unknown` when the block omitted it —
+    /// Pi's own default in `getTextOutput` (render-utils.ts:53).
+    pub mime_type: String,
+    /// The decoded raster, downscaled to [`MAX_RASTER_PX`], or `None` if the base64/format could
+    /// not be decoded.
+    pub block: Option<ImageBlock>,
+    /// The **source** pixel dimensions, before any downscale — what Pi's `imageFallback` reports
+    /// (`getImageDimensions(img.data, img.mimeType)`, render-utils.ts:55-56).
+    pub dimensions: Option<(u32, u32)>,
 }
 
 /// The scrolling conversation history.
@@ -125,12 +175,29 @@ pub struct TranscriptView {
     pending: Vec<Entry>,
     /// The assistant turn currently streaming, if any (the only entry the viewport renders).
     streaming: Option<String>,
+    /// The assistant **reasoning** currently streaming (`StreamEvent::ThinkingDelta`), if any. Held
+    /// separately from `streaming` because Pi renders thinking as its own block above the answer
+    /// text (`assistant-message.ts:115-166`), in its own italic `thinkingText` colour.
+    thinking: Option<String>,
+    /// `hideThinkingBlock` (settings-manager.ts; Pi `AssistantMessageComponent.hideThinkingBlock`,
+    /// assistant-message.ts:126): render one static `Thinking...` label instead of the reasoning
+    /// body. Read when a thinking run is rendered live and frozen into [`Entry::Thinking::hidden`]
+    /// when it commits.
+    hide_thinking: bool,
     /// Tool executions for the active turn, rendered live in the viewport until the turn ends, then
     /// committed (`tool-execution.ts` keeps tool components live in the message region). Honors the
     /// shared `tool_expanded` flag so `Ctrl+O` visibly expands/collapses in-flight tool output.
     active_tools: Vec<ToolRun>,
     /// Whether tool output renders expanded (full result) vs collapsed (`Ctrl+O`, `app.tools.expand`).
     pub tool_expanded: bool,
+    /// `terminal.showImages` (Pi `ToolExecutionComponent.showImages`, tool-execution.ts:335). ON:
+    /// a tool result's `image` blocks rasterize inline; OFF: they render as Pi's `[Image: …]` text
+    /// stand-in (`getTextOutput`, render-utils.ts:49-59). Default `true`, matching
+    /// `settings.terminal.showImages`.
+    show_images: bool,
+    /// `terminal.imageWidthCells` (Pi `maxWidthCells`, tool-execution.ts:348; default 60): the cell
+    /// width an inline tool-result image is clamped to.
+    image_width_cells: u16,
     /// The live `!`/`!!` bash execution, if one is running/just-finished and not yet committed
     /// (`bash-execution.ts` — the component stays live in the message region, then scrolls up).
     bash: Option<BashExecution>,
@@ -153,9 +220,15 @@ pub struct TranscriptView {
 impl TranscriptView {
     /// An empty transcript.
     pub fn new() -> Self {
-        // Pi's `outputPad` defaults to 1 (settings-manager.ts:1186), unlike the `0` a derived
-        // `Default` would give — seed it explicitly so fresh transcripts match Pi's default padding.
-        TranscriptView { output_pad: 1, ..TranscriptView::default() }
+        // Pi's `outputPad` defaults to 1 (settings-manager.ts:1186), `terminal.showImages` to
+        // `true` and `terminal.imageWidthCells` to 60 (settings-manager.ts:1047-1066) — none of
+        // which a derived `Default` would give, so seed them explicitly.
+        TranscriptView {
+            output_pad: 1,
+            show_images: true,
+            image_width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
+            ..TranscriptView::default()
+        }
     }
 
     /// The horizontal output padding (`outputPad`, columns) applied to user/assistant messages — read
@@ -173,6 +246,28 @@ impl TranscriptView {
         self.output_pad = pad;
     }
 
+    /// Set `terminal.showImages` (Pi `ToolExecutionComponent.showImages`): rasterize a tool result's
+    /// `image` blocks inline, or fall back to Pi's `[Image: …]` text stand-in.
+    pub fn set_show_images(&mut self, show: bool) {
+        self.show_images = show;
+    }
+
+    /// Whether inline tool-result images are on (read by the shell when flushing committed entries).
+    pub fn show_images(&self) -> bool {
+        self.show_images
+    }
+
+    /// Set `terminal.imageWidthCells` (Pi `maxWidthCells`): the cell width an inline image is
+    /// clamped to. `0` is coerced to 1 so a degenerate setting cannot produce a zero-width raster.
+    pub fn set_image_width_cells(&mut self, cells: u16) {
+        self.image_width_cells = cells.max(1);
+    }
+
+    /// The inline-image cell-width clamp (read by the shell when flushing committed entries).
+    pub fn image_width_cells(&self) -> u16 {
+        self.image_width_cells
+    }
+
     /// Committed entries not yet flushed to scrollback (test/inspection access).
     pub fn pending(&self) -> &[Entry] {
         &self.pending
@@ -185,7 +280,10 @@ impl TranscriptView {
 
     /// True while an assistant turn is actively streaming **or** a tool/bash run is live in the viewport.
     pub fn has_active(&self) -> bool {
-        self.streaming.is_some() || !self.active_tools.is_empty() || self.bash.is_some()
+        self.streaming.is_some()
+            || self.thinking.is_some()
+            || !self.active_tools.is_empty()
+            || self.bash.is_some()
     }
 
     /// Start a live `!`/`!!` bash execution block (replaces any prior uncommitted one). `cancel_hint`
@@ -246,6 +344,31 @@ impl TranscriptView {
         if let Some(b) = self.bash.take() {
             self.pending.push(Entry::Bash(b));
         }
+    }
+
+    /// Commit an ALREADY-FINISHED `!`/`!!` execution straight to scrollback, without going through
+    /// the live block. This is the replay path for a persisted `bashExecution` message (Pi
+    /// `addMessageToChat`'s `bashExecution` arm — `new BashExecutionComponent(command, ui,
+    /// excludeFromContext)` + `appendOutput(output)` + `setComplete(...)`, interactive-mode.ts:3310-3322),
+    /// so a resumed session shows the user's own `!` commands as bash blocks instead of the
+    /// ``Ran `cmd` ``  prose `convertToLlm` renders them to for the model.
+    ///
+    /// Pi's `setComplete` also takes `truncated`/`fullOutputPath`; [`BashExecution`] does not model
+    /// truncation, so those are not replayed (the same gap the live `!` path already has).
+    pub fn push_bash_execution(
+        &mut self,
+        command: impl Into<String>,
+        excluded: bool,
+        output: &str,
+        exit_code: Option<i32>,
+        cancelled: bool,
+    ) {
+        let mut b = BashExecution::new(command, excluded);
+        if !output.is_empty() {
+            b.append_output(output);
+        }
+        b.set_complete(exit_code, cancelled);
+        self.pending.push(Entry::Bash(b));
     }
 
     /// Take every committed entry, leaving the pending buffer empty. The shell renders the returned
@@ -311,29 +434,85 @@ impl TranscriptView {
         }
     }
 
-    /// Drop any in-flight streaming partial without committing (abort, R-10-030).
+    /// Drop any in-flight streaming partial without committing (abort, R-10-030). Drops the live
+    /// reasoning buffer too — an aborted turn shows neither its partial answer nor its partial
+    /// thinking.
     pub fn discard_streaming(&mut self) {
         self.streaming = None;
+        self.thinking = None;
+    }
+
+    /// Append a streamed chunk of assistant **reasoning** to the in-flight thinking buffer
+    /// (`StreamEvent::ThinkingDelta`, provider `stream.rs:413`). Pi renders the thinking blocks of a
+    /// turn as their own section (`assistant-message.ts:115-166`), so the buffer is kept apart from
+    /// the answer text.
+    pub fn push_thinking_delta(&mut self, delta: &str) {
+        match &mut self.thinking {
+            Some(buf) => buf.push_str(delta),
+            None => self.thinking = Some(delta.to_string()),
+        }
+    }
+
+    /// The current reasoning partial, if a turn is thinking (test/inspection access).
+    pub fn thinking(&self) -> Option<&str> {
+        self.thinking.as_deref()
+    }
+
+    /// Finalize the turn's reasoning. `text` (the authoritative `thinking` blocks of the terminal
+    /// message, coalesced by [`thinking_text`]) replaces the streamed buffer when given; otherwise
+    /// the accumulated buffer commits. Whitespace-only reasoning commits nothing, exactly as Pi
+    /// skips a run whose trimmed blocks are all empty (`assistant-message.ts:128-130`).
+    ///
+    /// The `hideThinkingBlock` choice is frozen into the entry here — see [`Entry::Thinking`].
+    pub fn commit_thinking(&mut self, text: Option<String>) {
+        let final_text = text.or_else(|| self.thinking.take());
+        self.thinking = None;
+        if let Some(t) = final_text
+            && !t.trim().is_empty()
+        {
+            self.pending.push(Entry::Thinking { text: t, hidden: self.hide_thinking });
+        }
+    }
+
+    /// Set `hideThinkingBlock` live (Pi `setHideThinkingBlock`, assistant-message.ts:57-62). Affects
+    /// the live reasoning block and every entry committed afterwards; already-flushed scrollback is
+    /// immutable (see [`Entry::Thinking`]).
+    pub fn set_hide_thinking_block(&mut self, hide: bool) {
+        self.hide_thinking = hide;
+    }
+
+    /// Whether the reasoning body is collapsed to the `Thinking...` label (test/inspection access).
+    pub fn hide_thinking_block(&self) -> bool {
+        self.hide_thinking
     }
 
     /// Record a tool starting (live in the viewport): name + the raw call args (`ToolExecutionStart`).
     /// The args drive the per-tool `renderCall` header (path/command/pattern/range/…).
+    ///
+    /// Prefer [`Self::push_tool_start_rendered`] with the call's `toolCallId` wherever one is in
+    /// hand — see [`ToolRun::call_id`]. This id-less form pairs its result by tool name alone, which
+    /// cannot distinguish two concurrent calls to the same tool.
     pub fn push_tool_start(&mut self, name: impl Into<String>, args: Value) {
-        self.push_tool_start_rendered(name, args, None);
+        self.push_tool_start_rendered(name, None, args, None);
     }
 
-    /// [`Self::push_tool_start`] with the CALL text an extension's registered renderer produced
-    /// (EXT-006). `rendered` replaces the built-in per-tool header for this run; `None` keeps the
-    /// built-in dispatch (Pi prefers the extension's `renderCall` when the tool declares one,
-    /// tool-execution.ts:81-112).
+    /// [`Self::push_tool_start`] with the call's `toolCallId` and the CALL text an extension's
+    /// registered renderer produced (EXT-006).
+    ///
+    /// `call_id` is the key the matching result is resolved by ([`ToolRun::call_id`]; Pi files each
+    /// `ToolExecutionComponent` under `content.id`, interactive-mode.ts:3473). `rendered` replaces
+    /// the built-in per-tool header for this run; `None` keeps the built-in dispatch (Pi prefers the
+    /// extension's `renderCall` when the tool declares one, tool-execution.ts:81-112).
     pub fn push_tool_start_rendered(
         &mut self,
         name: impl Into<String>,
+        call_id: Option<String>,
         args: Value,
         rendered: Option<String>,
     ) {
         self.active_tools.push(ToolRun {
             name: name.into(),
+            call_id,
             args,
             result: None,
             is_error: false,
@@ -342,45 +521,67 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
+            images: Vec::new(),
         });
     }
 
-    /// Update the latest still-running tool's partial result (`ToolExecutionUpdate`): the raw partial
-    /// result value, rendered by the tool's `renderResult` with `isPartial = true`.
-    pub fn push_tool_update(&mut self, partial: Option<Value>) {
-        if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done)
+    /// Update a running tool's partial result (`ToolExecutionUpdate`): the raw partial result value,
+    /// rendered by the tool's `renderResult` with `isPartial = true`.
+    ///
+    /// Routed to the run whose [`call_id`](ToolRun::call_id) matches, as Pi does
+    /// (`this.pendingTools.get(event.toolCallId)`, interactive-mode.ts:3104); `None` falls back to
+    /// the latest still-running tool.
+    pub fn push_tool_update(&mut self, call_id: Option<&str>, partial: Option<Value>) {
+        let run = match call_id {
+            Some(id) => self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id)),
+            None => self.active_tools.iter_mut().rev().find(|r| !r.done),
+        };
+        if let Some(run) = run
             && partial.is_some()
         {
             run.result = partial;
         }
     }
 
-    /// Record a tool finishing: attach the raw result/error to the matching live run (the latest run
-    /// with that name still running, else a fresh done entry so a missed start never drops the result).
-    /// Freezes the run duration for the bash `Took …` footer.
+    /// Record a tool finishing: attach the raw result/error to the matching live run, else a fresh
+    /// done entry so a missed start never drops the result. Freezes the run duration for the bash
+    /// `Took …` footer.
+    ///
+    /// Prefer [`Self::push_tool_end_rendered`] with the result's `toolCallId` — see
+    /// [`ToolRun::call_id`] and [`Self::pending_run_mut`].
     pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
-        self.push_tool_end_rendered(name, is_error, result, None);
+        self.push_tool_end_rendered(name, None, is_error, result, None);
     }
 
-    /// [`Self::push_tool_end`] with the RESULT text an extension's registered renderer produced
-    /// (EXT-006; Pi `renderResult`, extensions/types.ts:475-481). `None` keeps the built-in body.
+    /// [`Self::push_tool_end`] with the result's `toolCallId` and the RESULT text an extension's
+    /// registered renderer produced (EXT-006; Pi `renderResult`, extensions/types.ts:475-481).
+    ///
+    /// `call_id` selects the run this result belongs to — Pi's
+    /// `renderedPendingTools.get(message.toolCallId)` (interactive-mode.ts:3483) / `pendingTools.get
+    /// (event.toolCallId)` (`:3113`). `rendered = None` keeps the built-in body.
     pub fn push_tool_end_rendered(
         &mut self,
         name: impl Into<String>,
+        call_id: Option<&str>,
         is_error: bool,
         result: Option<Value>,
         rendered: Option<String>,
     ) {
         let name = name.into();
-        if let Some(run) = self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name) {
+        // Decode the result's `image` content blocks ONCE here (`tool-execution.ts:331-350`), not on
+        // every frame — a screenshot-sized PNG must never be re-decoded per redraw.
+        let images = result.as_ref().map(decode_result_images).unwrap_or_default();
+        if let Some(run) = self.pending_run_mut(&name, call_id) {
             run.done = true;
             run.is_error = is_error;
             run.result = result;
             run.duration_ms = run.started_at.map(|s| s.elapsed().as_millis() as u64);
             run.rendered_result = rendered;
+            run.images = images;
         } else {
             self.active_tools.push(ToolRun {
                 name,
+                call_id: call_id.map(str::to_string),
                 args: Value::Null,
                 result,
                 is_error,
@@ -389,7 +590,41 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
+                images,
             });
+        }
+    }
+
+    /// Resolve the still-running tool run a result belongs to.
+    ///
+    /// Pi's rule, exactly: a result is looked up by its `toolCallId` and by nothing else
+    /// (interactive-mode.ts:3483 on replay, `:3113` live), because one assistant turn routinely
+    /// issues several calls to the SAME tool and only the id tells them apart.
+    ///
+    /// The two fallbacks below never fire for a real provider turn (every `ToolCall` carries an
+    /// `id`); they exist so a caller with no id in hand — a test, or a `ToolExecutionEnd` whose
+    /// start was dropped — still lands somewhere sensible rather than nowhere:
+    ///
+    /// * `call_id: Some(id)` matches that id; failing that, a same-name run that carries NO id at
+    ///   all (an id-less start being completed by an id-carrying end). It never falls back to a run
+    ///   bearing a *different* id — that is precisely the mispairing this exists to prevent.
+    /// * `call_id: None` takes the latest still-running run of that name (the pre-id behavior).
+    fn pending_run_mut(&mut self, name: &str, call_id: Option<&str>) -> Option<&mut ToolRun> {
+        match call_id {
+            Some(id) => {
+                if let Some(idx) = self
+                    .active_tools
+                    .iter()
+                    .position(|r| !r.done && r.call_id.as_deref() == Some(id))
+                {
+                    return self.active_tools.get_mut(idx);
+                }
+                self.active_tools
+                    .iter_mut()
+                    .rev()
+                    .find(|r| !r.done && r.call_id.is_none() && r.name == name)
+            }
+            None => self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name),
         }
     }
 
@@ -451,6 +686,16 @@ impl TranscriptView {
     /// Record a status / notification line.
     pub fn push_status(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Status(text.into()));
+    }
+
+    /// Push the startup loaded-resources / diagnostics panel (Pi `showLoadedResources`,
+    /// interactive-mode.ts:1480-1690). No-op when there is nothing to show — a `quietStartup` boot
+    /// with no problems prints nothing at all, exactly like Pi.
+    pub fn push_loaded_resources(&mut self, lines: Vec<crate::startup::StartupLine>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.pending.push(Entry::LoadedResources(lines));
     }
 
     /// Record an `error`-styled notice line — the incomplete/failed-turn footer Pi appends to an
@@ -537,6 +782,21 @@ impl TranscriptView {
 
     fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
+        // The live reasoning block renders ABOVE the answer text, the order Pi's content walk
+        // produces for a reasoning model (thinking blocks precede the text blocks of the turn) —
+        // `assistant-message.ts:115-166`.
+        if let Some(thinking) = &self.thinking {
+            let mut td = thinking_lines(thinking, self.hide_thinking, theme);
+            if !td.is_empty() {
+                pad_lines(&mut td, self.output_pad);
+                lines.extend(td);
+                // Pi's `hasVisibleContentAfter` spacer (`:134-137`): a blank only when more visible
+                // assistant content follows.
+                if self.streaming.is_some() {
+                    lines.push(Line::default());
+                }
+            }
+        }
         if let Some(partial) = &self.streaming {
             let body = crate::markdown::trim_partial_closing_fence(partial);
             let mut md =
@@ -556,7 +816,13 @@ impl TranscriptView {
         // Live tool executions render below the streaming partial, honoring the expand flag so
         // `Ctrl+O` toggles their result body in the viewport before the turn commits.
         for run in &self.active_tools {
-            lines.extend(tool_lines(run, self.tool_expanded, width, theme));
+            lines.extend(tool_lines(
+                run,
+                self.tool_expanded,
+                width,
+                theme,
+                ImageOpts { show: self.show_images, width_cells: self.image_width_cells },
+            ));
         }
         // The live `!`/`!!` bash block renders last (`bash-execution.ts` sits in the message region).
         if let Some(b) = &self.bash {
@@ -578,6 +844,39 @@ const DEFAULT_MAX_BYTES: u64 = 50 * 1024;
 /// same literal the existing bash/tool hints use.
 const EXPAND_KEY: &str = "ctrl+o";
 
+/// Pi's `terminal.imageWidthCells` default (settings-manager.ts:1060-1066) — the cell width an
+/// inline tool-result image is clamped to (`maxWidthCells`, tool-execution.ts:348).
+pub const DEFAULT_IMAGE_WIDTH_CELLS: u16 = 60;
+
+/// Upper bound (px, either side) a tool-result image is downscaled to when it is decoded. A
+/// half-block raster is at most a few dozen cells wide, so nothing above this is ever visible — and
+/// the bound is what keeps the per-frame clone+resize of a screenshot-sized PNG off the render path.
+const MAX_RASTER_PX: u32 = 1024;
+
+/// Pi's `hiddenThinkingLabel` default (`assistant-message.ts:29`) — the single static line shown in
+/// place of the reasoning body when `hideThinkingBlock` is on.
+pub const HIDDEN_THINKING_LABEL: &str = "Thinking...";
+
+/// Render one run of assistant reasoning (`assistant-message.ts:139-165`): the static
+/// [`HIDDEN_THINKING_LABEL`] when `hidden`, otherwise the coalesced thinking body.
+///
+/// Both forms are painted with the `thinkingText` role in italic
+/// ([`UiTheme::thinking_text_style`]). Pi renders the body through `Markdown` with a `{color, italic}`
+/// override, i.e. every span is forced to the one colour regardless of markdown structure; cyrup
+/// therefore emits the body as plain styled lines rather than re-styling a markdown tree, which is
+/// visually equivalent and keeps the thinking block free of syntax-highlight colours.
+fn thinking_lines(text: &str, hidden: bool, theme: &UiTheme) -> Vec<Line<'static>> {
+    let style = theme.thinking_text_style();
+    if hidden {
+        return vec![Line::styled(HIDDEN_THINKING_LABEL.to_string(), style)];
+    }
+    let body = text.trim();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split('\n').map(|l| Line::styled(l.to_string(), style)).collect()
+}
+
 /// Render one tool execution into styled lines by dispatching on the tool name to its Pi-specific
 /// `renderCall`/`renderResult` (`tool-execution.ts` composes each built-in's renderers, not a generic
 /// one-liner): edit → a self-diff (`edit.ts:390`), bash → an output tail + truncation + `Took …`
@@ -592,6 +891,7 @@ pub(crate) fn tool_lines(
     expanded: bool,
     width: usize,
     theme: &UiTheme,
+    images: ImageOpts,
 ) -> Vec<Line<'static>> {
     let mut block: Vec<Line<'static>> = Vec::new();
     // EXT-006: an extension that registered a renderer for THIS tool name owns the block (Pi
@@ -600,26 +900,122 @@ pub(crate) fn tool_lines(
     // override how a BUILT-IN tool draws, exactly as Pi's definition-registry override does.
     if run.rendered_call.is_some() || run.rendered_result.is_some() {
         render_extension(run, expanded, theme, &mut block);
-        let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
-        let mut out = vec![Line::default()];
-        out.extend(finalize_block(block, width, bg));
-        return out;
+    } else {
+        match run.name.as_str() {
+            "read" => render_read(run, expanded, theme, &mut block),
+            "write" => render_write(run, expanded, theme, &mut block),
+            "edit" => render_edit(run, theme, &mut block),
+            "bash" => render_bash(run, expanded, theme, &mut block),
+            "grep" => render_grep(run, expanded, theme, &mut block),
+            "find" => render_find(run, expanded, theme, &mut block),
+            "ls" => render_ls(run, expanded, theme, &mut block),
+            _ => render_generic(run, theme, &mut block),
+        }
     }
-    match run.name.as_str() {
-        "read" => render_read(run, expanded, theme, &mut block),
-        "write" => render_write(run, expanded, theme, &mut block),
-        "edit" => render_edit(run, theme, &mut block),
-        "bash" => render_bash(run, expanded, theme, &mut block),
-        "grep" => render_grep(run, expanded, theme, &mut block),
-        "find" => render_find(run, expanded, theme, &mut block),
-        "ls" => render_ls(run, expanded, theme, &mut block),
-        _ => render_generic(run, theme, &mut block),
+    // `image` content blocks (`tool-execution.ts:330-350`). Pi adds a real `Image` component per
+    // block when `caps.images && showImages`, and otherwise `getTextOutput` appends the
+    // `imageFallback` indicator to the text body (render-utils.ts:49-59). The two cases split around
+    // `finalize_block` because a half-block raster must NOT get the tool block's background tint
+    // patched over its cells — matching Pi, whose images are siblings of the tool box, not children.
+    let inline = images.show && !run.images.is_empty() && run.images.iter().all(|i| i.block.is_some());
+    if !inline {
+        push_image_fallbacks(run, theme, &mut block);
     }
     // The block is state-tinted (bg-only); a leading untinted blank stands in for the component Spacer.
     let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
     let mut out = vec![Line::default()];
     out.extend(finalize_block(block, width, bg));
+    if inline {
+        out.extend(image_raster_lines(run, width, images.width_cells));
+    }
     out
+}
+
+/// How a tool result's `image` blocks should render: `show` is `terminal.showImages`, `width_cells`
+/// is `terminal.imageWidthCells` (Pi's `maxWidthCells`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageOpts {
+    pub show: bool,
+    pub width_cells: u16,
+}
+
+impl Default for ImageOpts {
+    fn default() -> Self {
+        ImageOpts { show: true, width_cells: DEFAULT_IMAGE_WIDTH_CELLS }
+    }
+}
+
+/// Append Pi's `[Image: …]` text stand-in for each `image` content block (`imageFallback`,
+/// terminal-image.ts:546-558, reached from `getTextOutput`, render-utils.ts:49-59) — used when
+/// `showImages` is off or a block could not be decoded.
+///
+/// Divergence worth naming: Pi splices this into the tool's TEXT output, so a collapsed `read` (whose
+/// `renderResult` returns `""` unless expanded) shows nothing at all. cyrup appends it to the block
+/// unconditionally, matching the inline-raster case — which Pi also renders regardless of `expanded`
+/// — so an image result is never silently invisible.
+fn push_image_fallbacks(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    for img in &run.images {
+        out.push(Line::styled(
+            image_fallback_text(&img.mime_type, img.dimensions, None),
+            theme.tool_output_style(),
+        ));
+    }
+}
+
+/// Rasterize each decoded `image` content block into half-block cell rows, each preceded by the
+/// blank spacer Pi puts before every image component (`new Spacer(1)`, tool-execution.ts:342).
+/// The raster is clamped to `width_cells` and to the content width. See
+/// [`ImageBlock::halfblock_lines`] for why this is half-blocks rather than the negotiated
+/// Kitty/iTerm2 protocol.
+fn image_raster_lines(run: &ToolRun, width: usize, width_cells: u16) -> Vec<Line<'static>> {
+    let cols = width_cells.min(width.min(u16::MAX as usize) as u16).max(1);
+    let mut out = Vec::new();
+    for img in run.images.iter().filter_map(|i| i.block.as_ref()) {
+        let rows = img.halfblock_lines(cols);
+        if rows.is_empty() {
+            continue;
+        }
+        out.push(Line::default());
+        out.extend(rows);
+    }
+    out
+}
+
+/// Decode the `image` content blocks of a raw tool result (`{content:[{type:"image", data, mimeType}]}`)
+/// into [`ResultImage`]s — Pi's `result.content.filter((c) => c.type === "image")`
+/// (tool-execution.ts:331). A block whose base64 or pixel format cannot be decoded is kept with
+/// `block: None` so its text stand-in still renders.
+fn decode_result_images(result: &Value) -> Vec<ResultImage> {
+    use base64::Engine as _;
+    let content = match result {
+        Value::Object(o) => o.get("content"),
+        Value::Array(_) => Some(result),
+        _ => None,
+    };
+    let Some(Value::Array(items)) = content else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("image"))
+        .map(|o| {
+            let mime_type = o
+                .get("mimeType")
+                .or_else(|| o.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("image/unknown")
+                .to_string();
+            let decoded = o
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok())
+                .and_then(|bytes| ImageBlock::decode(&bytes, mime_type.clone()));
+            // Read the SOURCE dimensions (what Pi's `imageFallback` reports) before bounding the
+            // raster the renderer will actually clone+resize each frame.
+            let dimensions = decoded.as_ref().map(ImageBlock::dimensions);
+            let block = decoded.map(|b| b.downscaled(MAX_RASTER_PX));
+            ResultImage { mime_type, block, dimensions }
+        })
+        .collect()
 }
 
 /// Apply the shared tool-block chrome to each already-fg-styled line: a 1-column left inset (Pi's
@@ -1008,8 +1404,12 @@ fn push_error_body(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>
 }
 
 /// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-64): join the `text`
-/// blocks of `{content:[…]}` (an `image` block → `[image]`), else a `text`/`output`/`stdout`/`message`
-/// string field, else a bare string/array. Carriage returns are stripped.
+/// blocks of `{content:[…]}`, else a `text`/`output`/`stdout`/`message` string field, else a bare
+/// string/array. Carriage returns are stripped.
+///
+/// `image` blocks are NOT represented here — they are rendered by [`tool_lines`], either as an
+/// inline half-block raster or as Pi's `[Image: …]` stand-in ([`push_image_fallbacks`]) — so this is
+/// the `showImages`-on half of Pi's `getTextOutput`, whose image-indicator half lives there.
 fn result_text(result: &Value) -> String {
     match result {
         Value::String(s) => s.replace('\r', ""),
@@ -1029,7 +1429,8 @@ fn result_text(result: &Value) -> String {
     }
 }
 
-/// Join a `content` block array into text (`text` blocks concatenated with `\n`; `image` → `[image]`).
+/// Join a `content` block array into text (`text` blocks concatenated with `\n`). `image` blocks are
+/// skipped — [`tool_lines`] renders them (raster or `[Image: …]` stand-in).
 fn content_blocks_text(content: &Value) -> String {
     match content {
         Value::Array(items) => {
@@ -1042,9 +1443,6 @@ fn content_blocks_text(content: &Value) -> String {
                     {
                         parts.push(t.replace('\r', ""));
                         continue;
-                    }
-                    if ty == Some("image") {
-                        parts.push("[image]".to_string());
                     }
                 } else if let Some(s) = it.as_str() {
                     parts.push(s.replace('\r', ""));
@@ -1259,6 +1657,7 @@ pub(crate) fn entry_lines(
     theme: &UiTheme,
     width: usize,
     output_pad: usize,
+    images: ImageOpts,
 ) -> Vec<Line<'static>> {
     match entry {
         Entry::User(text) => {
@@ -1302,11 +1701,18 @@ pub(crate) fn entry_lines(
             pad_lines(&mut md, output_pad);
             md
         }
+        Entry::Thinking { text, hidden } => {
+            // The reasoning section (`assistant-message.ts:139-165`), padded like every other
+            // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]).
+            let mut out = thinking_lines(text, *hidden, theme);
+            pad_lines(&mut out, output_pad);
+            out
+        }
         Entry::Tool(run) => {
             // Committed tools render in their last (expanded-at-commit) form; a diff result always
             // renders in full. We commit with the at-the-time expand flag captured by the caller —
             // here we always show the full body so finalized scrollback keeps the complete record.
-            tool_lines(run, true, width, theme)
+            tool_lines(run, true, width, theme, images)
         }
         Entry::Bash(b) => {
             // Committed bash blocks render in full (the complete record), like committed tools.
@@ -1362,6 +1768,7 @@ pub(crate) fn entry_lines(
             out.push(Line::styled(rule, theme.border_style()));
             out
         }
+        Entry::LoadedResources(lines) => crate::startup::startup_lines(lines, theme, output_pad),
     }
 }
 
@@ -1441,6 +1848,25 @@ pub fn content_text(content: &[Content]) -> String {
         .join("")
 }
 
+/// Coalesce the `Thinking` content blocks of a message into one section, joined by `\n\n` — Pi's
+/// inner run-collecting loop (`assistant-message.ts:116-127`), which trims each block and skips the
+/// empty ones. `redacted` blocks carry no readable text and are dropped with the rest of the empties.
+///
+/// Pi keeps *runs* of adjacent thinking blocks separate (a text block between two runs starts a new
+/// section); cyrup's transcript carries a single reasoning block per turn, so every run of a message
+/// folds into one — the difference is only visible when a model interleaves text and thinking.
+pub fn thinking_text(content: &[Content]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Thinking { thinking, .. } => Some(thinking.trim()),
+            _ => None,
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// A skill block parsed out of a submitted/replayed user message (Pi `ParsedSkillBlock`,
 /// agent-session.ts:103).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1508,18 +1934,18 @@ mod output_pad_tests {
     fn output_pad_left_indents_committed_messages() {
         let theme = UiTheme::dark();
         // pad = 1 → a leading space before the label.
-        let u1 = entry_lines(&Entry::User("hello".into()), &theme, 80, 1);
+        let u1 = entry_lines(&Entry::User("hello".into()), &theme, 80, 1, ImageOpts::default());
         assert!(line_text(&u1[0]).starts_with(" you: "), "pad=1 user: {:?}", line_text(&u1[0]));
-        let a1 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1);
+        let a1 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 1, ImageOpts::default());
         assert!(
             line_text(&a1[0]).starts_with(" assistant: "),
             "pad=1 assistant: {:?}",
             line_text(&a1[0])
         );
         // pad = 0 → flush-left (no leading space).
-        let u0 = entry_lines(&Entry::User("hello".into()), &theme, 80, 0);
+        let u0 = entry_lines(&Entry::User("hello".into()), &theme, 80, 0, ImageOpts::default());
         assert!(line_text(&u0[0]).starts_with("you: "), "pad=0 user: {:?}", line_text(&u0[0]));
-        let a0 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 0);
+        let a0 = entry_lines(&Entry::Assistant("hi".into()), &theme, 80, 0, ImageOpts::default());
         assert!(
             line_text(&a0[0]).starts_with("assistant: "),
             "pad=0 assistant: {:?}",

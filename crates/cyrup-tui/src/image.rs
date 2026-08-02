@@ -136,6 +136,23 @@ pub struct ImageBlock {
     label: String,
 }
 
+impl std::fmt::Debug for ImageBlock {
+    /// Identity, not pixels: a `DynamicImage`'s derived `Debug` would dump the whole raster into any
+    /// `{:?}` of a transcript entry.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (w, h) = self.dimensions();
+        f.debug_struct("ImageBlock").field("label", &self.label).field("size", &(w, h)).finish()
+    }
+}
+
+impl PartialEq for ImageBlock {
+    /// Compares the label + pixel dimensions, NOT the raster — enough to tell two transcript entries
+    /// apart (which is all `Entry: PartialEq` is used for) without a full per-pixel scan.
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && self.dimensions() == other.dimensions()
+    }
+}
+
 impl ImageBlock {
     /// Wrap an already-decoded [`DynamicImage`] with a display `label`.
     pub fn new(image: DynamicImage, label: impl Into<String>) -> Self {
@@ -147,6 +164,20 @@ impl ImageBlock {
     pub fn decode(bytes: &[u8], label: impl Into<String>) -> Option<Self> {
         let image = image::load_from_memory(bytes).ok()?;
         Some(ImageBlock { image, label: label.into() })
+    }
+
+    /// Downscale the raster (aspect-preserved) so neither side exceeds `max_px`; a no-op when it
+    /// already fits. Used for images that will only ever be shown as a half-block raster a few dozen
+    /// cells wide: it bounds the per-render clone + resize cost of a screenshot-sized payload, which
+    /// would otherwise be paid on every frame the picture is on screen. The label is kept, so
+    /// callers wanting the SOURCE dimensions must read them before downscaling.
+    #[must_use]
+    pub fn downscaled(self, max_px: u32) -> Self {
+        let (w, h) = self.dimensions();
+        if w <= max_px && h <= max_px {
+            return self;
+        }
+        ImageBlock { image: self.image.thumbnail(max_px, max_px), label: self.label }
     }
 
     /// Read + decode an image file, labelling it with the path (the `@`-mention / attachment source).
@@ -174,6 +205,138 @@ impl ImageBlock {
             Span::styled(self.label.clone(), theme.base_style()),
             Span::styled(format!(" ({w}×{h})"), theme.dim_style()),
         ])
+    }
+
+    /// Rasterize this image into styled [`Line`]s using the portable Unicode **half-block** protocol
+    /// — the form an inline image can take when it has to survive as ordinary terminal cells.
+    ///
+    /// `cols` bounds the width in cells (Pi's `maxWidthCells` / `terminal.imageWidthCells`,
+    /// tool-execution.ts:348); the height follows from the source aspect ratio. Returns an empty
+    /// vector when the image cannot be encoded at that size — callers then fall back to
+    /// [`image_fallback_text`].
+    ///
+    /// **Why half-blocks and not the negotiated Kitty/iTerm2 protocol**: those protocols work by
+    /// planting an escape sequence inside a terminal cell. cyrup's transcript hands its rendered
+    /// `Line`s to `Paragraph … .wrap()` — both in the live viewport and, through
+    /// `Terminal::insert_before`, into native scrollback — and a re-wrapped escape sequence is
+    /// corrupt output, not an image. Half-blocks are ordinary `▀` cells with fg/bg colours, so they
+    /// wrap, scroll and snapshot correctly. This is a deliberate downgrade from Pi's per-terminal
+    /// protocol selection for TOOL-RESULT images, and is the reason
+    /// [`ImageRenderer::render`] (the attachment strip, which draws a real widget into a frame) still
+    /// uses the negotiated protocol.
+    pub fn halfblock_lines(&self, cols: u16) -> Vec<Line<'static>> {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+
+        let picker = Picker::halfblocks();
+        let font = picker.font_size();
+        let (iw, ih) = self.dimensions();
+        let fw = u32::from(font.width.max(1));
+        let fh = u32::from(font.height.max(1));
+        // The image's NATURAL footprint in cells; `cols` only ever clamps it DOWN (Pi's
+        // `maxWidthCells` is an upper bound, never an upscale).
+        let natural_cols = iw.div_ceil(fw).max(1);
+        let natural_rows = ih.div_ceil(fh).max(1);
+        let cols = u32::from(cols.max(1)).min(natural_cols);
+        // Give `Resize::Fit` the full natural height as headroom and let it pick the
+        // aspect-preserving size; the unused rows come back blank and are trimmed below.
+        let (cols, rows) = (
+            cols.min(u32::from(u16::MAX)) as u16,
+            natural_rows.min(u32::from(u16::MAX)) as u16,
+        );
+
+        let area = Rect { x: 0, y: 0, width: cols, height: rows };
+        let Ok(protocol) =
+            picker.new_protocol(self.image.clone(), Size::new(cols, rows), Resize::Fit(None))
+        else {
+            return Vec::new();
+        };
+        let mut buf = Buffer::empty(area);
+        Image::new(&protocol).allow_clipping(true).render(area, &mut buf);
+        buffer_to_lines(&buf)
+    }
+}
+
+/// Convert a rendered off-screen [`ratatui::buffer::Buffer`] into [`Line`]s, coalescing runs of
+/// same-styled cells into one [`Span`]. Trailing **untouched** rows (blank text AND default style)
+/// are dropped so the aspect-preserving fit does not reserve empty scrollback below the raster. A
+/// blank row that carries a background colour is part of the picture and is kept.
+fn buffer_to_lines(buf: &ratatui::buffer::Buffer) -> Vec<Line<'static>> {
+    let area = buf.area;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    for y in area.y..area.y.saturating_add(area.height) {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut run_style: Option<ratatui::style::Style> = None;
+        for x in area.x..area.x.saturating_add(area.width) {
+            let Some(cell) = buf.cell((x, y)) else { continue };
+            let style = cell.style();
+            if run_style != Some(style) {
+                if let Some(prev) = run_style.take()
+                    && !run.is_empty()
+                {
+                    spans.push(Span::styled(std::mem::take(&mut run), prev));
+                }
+                run_style = Some(style);
+            }
+            run.push_str(cell.symbol());
+        }
+        if let Some(prev) = run_style
+            && !run.is_empty()
+        {
+            spans.push(Span::styled(run, prev));
+        }
+        lines.push(Line::from(spans));
+    }
+    // `Buffer::empty` leaves cells blank with `Color::Reset` fg/bg, so "untouched" means blank text
+    // AND no painted background — never merely blank, since a solid-colour image row IS spaces.
+    let untouched = |l: &Line<'static>| {
+        l.spans.iter().all(|s| {
+            s.content.trim().is_empty()
+                && matches!(s.style.bg, None | Some(ratatui::style::Color::Reset))
+        })
+    };
+    while lines.last().is_some_and(untouched) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Pi's `imageFallback` (`tui/src/terminal-image.ts:546-558`): the one-line text stand-in shown when
+/// the terminal cannot render inline images (or `showImages` is off). Format is
+/// `[Image: {filename} [{mimeType}] {w}x{h}]`, with `filename` and the dimensions omitted when
+/// unknown. cyrup drops Pi's OSC-8 hyperlink wrapping of the filename (hyperlinks are out of scope
+/// here) but keeps the `~`-shortening of a `$HOME`-relative path (`shortenImagePath`, `:533-539`).
+pub fn image_fallback_text(
+    mime_type: &str,
+    dimensions: Option<(u32, u32)>,
+    filename: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = filename.filter(|n| !n.is_empty()) {
+        parts.push(shorten_image_path(name));
+    }
+    parts.push(format!("[{mime_type}]"));
+    if let Some((w, h)) = dimensions {
+        parts.push(format!("{w}x{h}"));
+    }
+    format!("[Image: {}]", parts.join(" "))
+}
+
+/// `shortenImagePath` (terminal-image.ts:533-539): rewrite a `$HOME`-rooted absolute path to `~/…`.
+fn shorten_image_path(filename: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else { return filename.to_string() };
+    let home = home.to_string_lossy();
+    if home.is_empty() {
+        return filename.to_string();
+    }
+    if filename == home {
+        return "~".to_string();
+    }
+    match filename.strip_prefix(home.as_ref()) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => filename.to_string(),
     }
 }
 

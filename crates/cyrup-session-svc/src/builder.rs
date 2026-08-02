@@ -702,6 +702,14 @@ impl SessionBuilder {
             themes: settings.project().theme_paths(),
         };
         let report = discover(&disc, cancel.token()).await?;
+        // TUI-006: the discovery pass's structured diagnostics (shadowed same-name skills, a
+        // configured path that does not exist, a malformed frontmatter) used to be dropped on the
+        // floor here. Pi shows them at startup even under `quietStartup`
+        // (`showDiagnosticsWhenQuiet: true`, interactive-mode.ts:1769), so they now travel on
+        // `AgentSessionServices::startup_diagnostics` for the front-end to render.
+        #[cfg_attr(not(feature = "wasm-host"), allow(unused_mut))]
+        let mut startup_diagnostics =
+            crate::services::StartupDiagnostics { resources: report.diagnostics.clone(), ..Default::default() };
 
         // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
         // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664), then
@@ -722,10 +730,16 @@ impl SessionBuilder {
             // `control` capability reaches the same queue `apply_pending_control` drains.
             let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
             // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
-            // diagnostics, main.ts:679-682) surface to the caller once the diagnostics channel reaches
-            // the bin; today they are recorded on the result.
-            let _load_result =
+            // diagnostics, main.ts:679-682) are retained on `startup_diagnostics` so the TUI can
+            // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here.
+            let load_result =
                 ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
+            startup_diagnostics.extensions.extend(load_result.errors.iter().map(|e| {
+                crate::services::ExtensionLoadDiagnostic {
+                    path: e.path.clone(),
+                    error: e.error.clone(),
+                }
+            }));
         }
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
@@ -1100,6 +1114,7 @@ impl SessionBuilder {
             project_trusted: trusted,
             auth,
             resources,
+            startup_diagnostics,
             context: context_store,
             ext_host,
             guest_providers,

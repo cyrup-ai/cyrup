@@ -179,6 +179,14 @@ syntect              = { version = "5.3.0", default-features = false, features =
 # for higher-quality sixel encoding); sixel still works via the pure-Rust `icy_sixel`, so the
 # workspace stays all-Rust with no system library. `crossterm` matches ratatui's backend.
 ratatui-image        = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+# Bounded terminal-query I/O for cyrup-tui's OSC 11 / DSR `?996` background+color-scheme probes
+# (Pi `tui.ts:1174-1220`). We must (a) wait for a reply with a HARD timeout and (b) consume ONLY the
+# reply, never a byte of the user's typing — crossterm's event API cannot express either (it has no
+# OSC/DSR event and its `poll` consumes into its own parser), so the probe needs `poll(2)` +
+# `read(2)` directly. `rustix` is the pure-Rust, `unsafe`-free wrapper for exactly that: on Linux it
+# is a `linux_raw` syscall backend with NO C dependency, keeping `#![forbid(unsafe_code)]` intact in
+# cyrup-tui. Already in the graph transitively (tempfile/is-terminal); only `event` (poll) is enabled.
+rustix               = { version = "1.1", default-features = false, features = ["std", "event"] }
 
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:

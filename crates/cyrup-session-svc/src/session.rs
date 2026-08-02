@@ -1207,6 +1207,29 @@ impl AgentSession {
         self.emit_queue_update().await;
     }
 
+    /// Take-all both queues and RETURN what was drained, in Pi's `(steering, followUp)` shape
+    /// (`AgentSession.clearQueue()` returns `{steering, followUp}`, agent-session.ts:1416 — the
+    /// value `restoreQueuedMessagesToEditor` reads at interactive-mode.ts:4065).
+    ///
+    /// [`Self::clear_queue`] throws that value away, which forces a caller that wants the text to
+    /// read `steering_messages()`/`follow_up_messages()` first and clear second — a lost-update race
+    /// with a concurrent `steer`/`follow_up`. This is the atomic form: the mirrors and the agent's
+    /// authoritative queues are taken in one pass (`Agent::drain_queues_for_restore`), then
+    /// `queue_update` is emitted so the footer count drops to zero.
+    pub async fn drain_queue(&self) -> (Vec<String>, Vec<String>) {
+        // Both mirrors are taken under their guards together so the pair is consistent; the agent
+        // drain happens after they are released, keeping the facade→agent lock nesting `steer` /
+        // `follow_up` avoid (they too drop the mirror guard before calling into the agent).
+        let drained = {
+            let mut steering = Self::lock(&self.steering_messages);
+            let mut follow_up = Self::lock(&self.follow_up_messages);
+            (std::mem::take(&mut *steering), std::mem::take(&mut *follow_up))
+        };
+        self.agent.drain_queues_for_restore();
+        self.emit_queue_update().await;
+        drained
+    }
+
     /// Emit a `queue_update` snapshot of both facade queues (Pi `_emitQueueUpdate`,
     /// agent-session.ts:1382).
     async fn emit_queue_update(&self) {
@@ -2899,8 +2922,26 @@ impl AgentSession {
     }
 
     /// The persisted transcript messages on the current branch (R-11-014 `get_messages`).
+    ///
+    /// This is the **LLM-flattened** view (`convertToLlm`): a compaction/branch summary, an
+    /// extension `custom` message and a `!` bash execution all arrive as `user` messages carrying
+    /// their wrapper prose. Anything that RENDERS the conversation wants
+    /// [`raw_context_messages`](Self::raw_context_messages) instead.
     pub async fn messages(&self) -> Vec<Message> {
         self.manager.lock().await.build_context().messages
+    }
+
+    /// The current branch's context with its **roles intact** — Pi's
+    /// `buildContextEntries().flatMap(sessionEntryToContextMessages)`
+    /// (`session-manager.ts:441-453` + `:383-408`), the input Pi's `renderSessionEntries` replays a
+    /// resumed session from (interactive-mode.ts:3506-3516).
+    ///
+    /// Unlike [`messages`](Self::messages) this has NOT been through `convertToLlm`, so a
+    /// `compactionSummary` / `branchSummary` / `custom` / `bashExecution` still identifies itself and
+    /// a front-end can route it to its own component instead of drawing the wrapper text as a user
+    /// turn.
+    pub async fn raw_context_messages(&self) -> Vec<cyrup_session::agent_message::AgentMessage> {
+        self.manager.lock().await.build_context_raw()
     }
 
     /// The id of the current branch leaf (Pi `sessionManager.getLeafId()`, agent-session.ts:2705).

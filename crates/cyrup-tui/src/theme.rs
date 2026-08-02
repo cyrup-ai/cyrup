@@ -510,6 +510,18 @@ impl UiTheme {
     pub fn md_code_block_border_style(&self) -> Style {
         self.role_style("mdCodeBlockBorder", "#666666")
     }
+    /// Assistant **reasoning** (thinking) body — `thinkingText`, italic (Pi
+    /// `assistant-message.ts:145-165` renders each run of `thinking` blocks as one Markdown section
+    /// with `{color: theme.fg("thinkingText", …), italic: true}`; the collapsed
+    /// `hideThinkingBlock` label at `:139-143` uses the same role). `thinkingText` is `gray`
+    /// (`#808080`) in Pi's `dark.json:33` and `mediumGray` in `light.json:32`; the hex default here
+    /// is the dark one, used only when the live theme omits the role.
+    ///
+    /// NOTE this is a different thing from [`ThinkingTheme`], which is the per-reasoning-**level**
+    /// editor-border palette (`thinkingOff`…`thinkingXhigh`).
+    pub fn thinking_text_style(&self) -> Style {
+        self.role_style("thinkingText", "#808080").add_modifier(Modifier::ITALIC)
+    }
     /// Blockquote body — `mdQuote`, italic (`markdown.ts:414-461`).
     pub fn md_quote_style(&self) -> Style {
         self.role_style("mdQuote", "#969896").add_modifier(Modifier::ITALIC)
@@ -823,17 +835,105 @@ impl TerminalTheme {
     /// `COLORFGBG` as the background palette index and classify by its luminance; on no hint, fall back
     /// to [`TerminalTheme::Dark`] (Pi's `"fallback"` / low-confidence default).
     pub fn detect() -> TerminalTheme {
-        let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
-        if let Some(bg) = colorfgbg_background_index(&colorfgbg) {
-            let (r, g, b) = ansi256_to_rgb(bg);
-            return if relative_luminance(r, g, b) >= 0.5 {
-                TerminalTheme::Light
-            } else {
-                TerminalTheme::Dark
-            };
-        }
+        detect_terminal_background_from_env(&std::env::var("COLORFGBG").unwrap_or_default()).theme
+    }
+}
+
+/// Where a [`TerminalThemeDetection`] came from (Pi `TerminalThemeDetection.source`,
+/// `theme.ts:691-697`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalThemeSource {
+    /// An OSC 11 reply from the terminal itself.
+    TerminalBackground,
+    /// The `COLORFGBG` environment hint.
+    ColorFgBg,
+    /// Nothing answered — Pi's low-confidence `dark` default.
+    Fallback,
+}
+
+/// How much a detection can be trusted (Pi `confidence`). Pi persists `settings.theme` only on
+/// `"high"` (`theme-controller.ts:57-61`); a `Fallback` guess must never be written to disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectionConfidence {
+    High,
+    Low,
+}
+
+/// The result of a background-polarity detection (Pi `TerminalThemeDetection`, `theme.ts:691-697`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalThemeDetection {
+    pub theme: TerminalTheme,
+    pub source: TerminalThemeSource,
+    /// Human-readable provenance, shown by `/debug` and Pi's theme diagnostics.
+    pub detail: String,
+    pub confidence: DetectionConfidence,
+}
+
+/// Pi `getThemeForRgbColor` (`theme.ts:743-745`): an sRGB-linearized relative luminance at or above
+/// `0.5` is a light background.
+pub fn theme_for_rgb(r: u8, g: u8, b: u8) -> TerminalTheme {
+    if relative_luminance(r, g, b) >= 0.5 {
+        TerminalTheme::Light
+    } else {
         TerminalTheme::Dark
     }
+}
+
+/// Pi `detectTerminalBackgroundFromEnv` (`theme.ts:747-765`) with `COLORFGBG` passed in rather than
+/// read from the process (env reads are global mutable state; the caller owns the read).
+pub fn detect_terminal_background_from_env(colorfgbg: &str) -> TerminalThemeDetection {
+    if let Some(bg) = colorfgbg_background_index(colorfgbg) {
+        let (r, g, b) = ansi256_to_rgb(bg);
+        return TerminalThemeDetection {
+            theme: theme_for_rgb(r, g, b),
+            source: TerminalThemeSource::ColorFgBg,
+            detail: format!("background color index {bg}"),
+            confidence: DetectionConfidence::High,
+        };
+    }
+    TerminalThemeDetection {
+        theme: TerminalTheme::Dark,
+        source: TerminalThemeSource::Fallback,
+        detail: "no terminal background hint found".to_string(),
+        confidence: DetectionConfidence::Low,
+    }
+}
+
+/// Pi `detectTerminalBackgroundTheme` (`theme.ts:768-788`): **ask the terminal first** with OSC 11
+/// and classify the reply, falling back to `COLORFGBG` when the query times out or is unparseable.
+///
+/// This is the half cyrup was missing (TUI-004): production only ever read `COLORFGBG`, which most
+/// terminals — including iTerm2, Ghostty, Alacritty, WezTerm and Terminal.app — do not set, so a
+/// light-background user was always handed the dark theme.
+pub fn detect_terminal_background_theme(
+    probe: &dyn crate::terminal_query::TerminalProbe,
+    timeout: std::time::Duration,
+    colorfgbg: &str,
+) -> TerminalThemeDetection {
+    if let Some((r, g, b)) = probe.query_background_color(timeout) {
+        return TerminalThemeDetection {
+            theme: theme_for_rgb(r, g, b),
+            source: TerminalThemeSource::TerminalBackground,
+            detail: format!("OSC 11 background rgb({r}, {g}, {b})"),
+            confidence: DetectionConfidence::High,
+        };
+    }
+    detect_terminal_background_from_env(colorfgbg)
+}
+
+/// Pi `detectTerminalThemeForAuto` (`theme.ts:790-801`): for an `auto` (`light/dark`) setting the
+/// terminal's *declared* color scheme (DSR `?996` → `CSI ? 997 ; N n`) wins over inferring polarity
+/// from the background color, because a terminal that implements the notification protocol knows its
+/// own preference. Unsupported ⇒ fall through to [`detect_terminal_background_theme`].
+pub fn detect_terminal_theme_for_auto(
+    probe: &dyn crate::terminal_query::TerminalProbe,
+    timeout: std::time::Duration,
+    colorfgbg: &str,
+) -> TerminalTheme {
+    if let Some(scheme) = probe.query_color_scheme(timeout) {
+        return scheme;
+    }
+    detect_terminal_background_theme(probe, timeout, colorfgbg).theme
 }
 
 /// Pi `parseAutoThemeSetting` (`theme.ts:638-653`): a `"<light>/<dark>"` setting with exactly one
@@ -882,6 +982,17 @@ pub struct ThemeController {
     terminal_theme: TerminalTheme,
     active_name: String,
     generation: u64,
+    /// The raw `settings.theme` value the controller booted from, retained so
+    /// [`Self::sync_with_terminal`] can re-run Pi's `applyFromSettings` once the terminal is in raw
+    /// mode and can actually answer a query.
+    theme_setting: Option<String>,
+    /// Whether the resolved setting is an `auto` (`light/dark`) pair, i.e. whether Pi would have
+    /// enabled color-scheme notifications (`setAutoSync(true)`, `theme-controller.ts:107-111`).
+    auto_sync: bool,
+    /// The theme name a HIGH-confidence detection wants written back to `settings.theme` (Pi
+    /// `settingsManager.setTheme(detection.theme)` + `flush()`, `theme-controller.ts:57-61`). Only
+    /// ever set when the user has no explicit setting.
+    persist: Option<String>,
 }
 
 impl ThemeController {
@@ -897,12 +1008,90 @@ impl ThemeController {
     ) -> Self {
         let active_name = resolve_theme_setting(theme_setting, terminal_theme)
             .unwrap_or_else(|| terminal_theme.theme_name().to_string());
-        ThemeController { color_mode, terminal_theme, active_name, generation: 0 }
+        ThemeController {
+            color_mode,
+            terminal_theme,
+            active_name,
+            generation: 0,
+            theme_setting: theme_setting.map(str::to_string),
+            auto_sync: parse_auto_theme_setting(theme_setting).is_some(),
+            persist: None,
+        }
     }
 
     /// Boot with the color mode + terminal polarity detected from the environment (the binary path).
+    ///
+    /// This is only the FIRST half of Pi's boot: it uses `COLORFGBG` alone, because at this point the
+    /// terminal is not yet in raw mode and cannot answer an escape query. Call
+    /// [`Self::sync_with_terminal`] once raw mode is on to complete it.
     pub fn boot_from_env(theme_setting: Option<&str>) -> Self {
         ThemeController::boot(theme_setting, ColorMode::detect(), TerminalTheme::detect())
+    }
+
+    /// Re-run Pi's `applyFromSettings` (`theme-controller.ts:37-63`) now that the terminal can be
+    /// **asked** rather than merely guessed at from `COLORFGBG`. Returns the freshly projected
+    /// [`UiTheme`] when the active theme actually changed, so the caller repaints only then.
+    ///
+    /// The three branches are Pi's, in Pi's order:
+    ///
+    /// 1. an `auto` (`light/dark`) setting → [`detect_terminal_theme_for_auto`] (DSR `?996` first,
+    ///    then OSC 11, then `COLORFGBG`), auto-sync on, and the matching arm applied;
+    /// 2. an explicit `settings.theme` → auto-sync off, the name applied verbatim, no query at all
+    ///    (Pi never probes when the user has chosen; `:46-49`);
+    /// 3. no setting → [`detect_terminal_background_theme`], and on `confidence == High` the result
+    ///    is offered back for persistence via [`Self::theme_to_persist`].
+    ///
+    /// `colorfgbg` is the raw env value; pass `""` when unset. Timing/safety of the query itself is
+    /// the probe's contract — see [`crate::terminal_query`].
+    pub fn sync_with_terminal(
+        &mut self,
+        probe: &dyn crate::terminal_query::TerminalProbe,
+        timeout: std::time::Duration,
+        colorfgbg: &str,
+    ) -> Option<UiTheme> {
+        let setting = self.theme_setting.clone();
+        let resolved = if let Some((light, dark)) = parse_auto_theme_setting(setting.as_deref()) {
+            self.terminal_theme = detect_terminal_theme_for_auto(probe, timeout, colorfgbg);
+            self.auto_sync = true;
+            match self.terminal_theme {
+                TerminalTheme::Light => light,
+                TerminalTheme::Dark => dark,
+            }
+        } else if let Some(name) = setting {
+            self.auto_sync = false;
+            name
+        } else {
+            self.auto_sync = false;
+            let detection = detect_terminal_background_theme(probe, timeout, colorfgbg);
+            self.terminal_theme = detection.theme;
+            let name = detection.theme.theme_name().to_string();
+            if detection.confidence == DetectionConfidence::High {
+                self.persist = Some(name.clone());
+            }
+            name
+        };
+        (resolved != self.active_name).then(|| self.set_theme_name(resolved))
+    }
+
+    /// Whether the active setting is an `auto` pair, i.e. whether Pi would keep terminal
+    /// color-scheme notifications (mode `2031`) enabled and re-theme on every change.
+    ///
+    /// cyrup reports this but deliberately does **not** enable mode `2031`, and the reason is a
+    /// safety one rather than an oversight: crossterm surfaces no event for the unsolicited
+    /// `CSI ? 997 ; N n` notification, so every push the terminal sent would reach `event::read()`
+    /// and be mis-decoded as stray keystrokes into the user's prompt. Turning the notifications on
+    /// without a consumer is strictly worse than leaving them off. Independently, committed
+    /// transcript rows have already gone to `Terminal::insert_before` and live in the terminal's own
+    /// scrollback, so a mid-session polarity flip could never recolor what is already on screen
+    /// (ADR-0001). Detection therefore happens once, at boot.
+    pub fn auto_sync(&self) -> bool {
+        self.auto_sync
+    }
+
+    /// The theme name a high-confidence detection wants persisted to `settings.theme`, if any (Pi
+    /// `theme-controller.ts:57-61`). Consumed once by the caller that owns the settings manager.
+    pub fn theme_to_persist(&self) -> Option<&str> {
+        self.persist.as_deref()
     }
 
     /// The projected render theme for the active name (built-in lookup, then depth projection). This is

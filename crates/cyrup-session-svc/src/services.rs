@@ -8,8 +8,43 @@ use std::sync::Arc;
 use cyrup_config::{AuthStore, SettingsManager};
 use cyrup_ext::ExtensionHost;
 use cyrup_provider::Model;
-use cyrup_resources::ResourceRegistry;
+use cyrup_resources::{ResourceDiagnostic, ResourceRegistry};
 use cyrup_session::prompt::ContextStore;
+
+/// One extension that failed to load, kept per-path (Pi `LoadExtensionsResult.errors`, surfaced as
+/// `{type: "error", message, path}` in the `[Extension issues]` startup block,
+/// interactive-mode.ts:1660-1665).
+#[derive(Clone, Debug)]
+pub struct ExtensionLoadDiagnostic {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Everything that went wrong (or was shadowed) while this session's resources were discovered and
+/// its extensions loaded — Pi's `showLoadedResources` diagnostics half (interactive-mode.ts:
+/// 1641-1690), which prints `[Skill conflicts]`, `[Prompt conflicts]`, `[Extension issues]` and
+/// `[Theme conflicts]` at startup **even under `quietStartup`** (`showDiagnosticsWhenQuiet: true`,
+/// `:1769`).
+///
+/// The builder used to compute both halves and throw them away (`discover()`'s `DiscoveryReport`
+/// carries `diagnostics`; `discover_and_load` returns per-path `errors`), so a shadowed skill, a
+/// configured-but-missing prompt path or an extension that failed to instantiate was completely
+/// invisible in the TUI. Retaining them here is the data seam the front-end reads (TUI-006).
+#[derive(Clone, Debug, Default)]
+pub struct StartupDiagnostics {
+    /// Structured skill/prompt/theme diagnostics from the discovery pass, split by
+    /// `ResourceDiagnostic::resource_type` at render time.
+    pub resources: Vec<ResourceDiagnostic>,
+    /// Extensions that did not load (world-version mismatch, untrusted project-local, load fault).
+    pub extensions: Vec<ExtensionLoadDiagnostic>,
+}
+
+impl StartupDiagnostics {
+    /// Whether there is anything at all to report.
+    pub fn is_empty(&self) -> bool {
+        self.resources.is_empty() && self.extensions.is_empty()
+    }
+}
 
 /// Everything bound to a single cwd / session (arch-11 §3.3).
 pub struct AgentSessionServices {
@@ -29,6 +64,9 @@ pub struct AgentSessionServices {
     pub auth: Arc<AuthStore>,
     /// Discovered resources snapshot (skills / prompts / themes).
     pub resources: Arc<ResourceRegistry>,
+    /// Load-time problems collected while assembling this session (TUI-006). See
+    /// [`StartupDiagnostics`].
+    pub startup_diagnostics: StartupDiagnostics,
     /// Session-scoped context cache (context files + skill pointers).
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.

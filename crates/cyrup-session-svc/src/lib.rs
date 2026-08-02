@@ -61,7 +61,7 @@ pub use runtime::{
     AgentSessionRuntime, NewSessionOptions, RuntimeActions, RuntimeDiagnostic, RuntimeForkResult,
     SwitchResult, SwitchSessionOptions,
 };
-pub use services::AgentSessionServices;
+pub use services::{AgentSessionServices, ExtensionLoadDiagnostic, StartupDiagnostics};
 pub use session::{
     AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, NavigateTreeOptions,
     NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
@@ -87,6 +87,13 @@ pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
 /// Re-exported so the TUI `/resume` selector can name the session-list rows
 /// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
 pub use cyrup_session::listing::SessionInfo;
+/// Re-exported so a front-end can walk the ROLE-tagged context
+/// [`AgentSession::raw_context_messages`] returns — Pi's `AgentMessage` union
+/// (`messages.ts:26-77`), whose `bashExecution`/`custom`/`branchSummary`/`compactionSummary` arms
+/// [`cyrup_core::Message`] cannot represent — without a direct `cyrup-session` dependency. This is
+/// what lets the TUI replay a resumed session into its per-role components instead of the
+/// LLM-flattened `user` text (interactive-mode.ts:3506-3516).
+pub use cyrup_session::agent_message;
 /// Re-exported so the CLI bin can resolve `--session`/`--fork` partial-UUID + global-cross-project
 /// references (Pi `resolveSessionPath`, main.ts:163-189) without a direct `cyrup-session` dependency:
 /// [`list_in_dir`] lists a cwd's sessions and [`list_all`] scans every project under the root.

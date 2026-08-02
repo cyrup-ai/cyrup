@@ -62,7 +62,7 @@ use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
 use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
-use crate::transcript::{content_text, entry_lines, TranscriptView};
+use crate::transcript::{content_text, entry_lines, thinking_text, TranscriptView};
 use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
 
 /// The number of visual lines a `PageUp`/`PageDown` scrolls the active region by (a conservative
@@ -87,6 +87,15 @@ pub enum AppAction {
     Dequeue,
     /// The user requested an abort/interrupt of the in-flight run (Esc).
     Interrupt,
+    /// Esc pressed **while a turn is streaming** (Pi `defaultEditor.onEscape` first branch,
+    /// interactive-mode.ts:2636-2637 → `restoreQueuedMessagesToEditor({abort: true})`).
+    ///
+    /// Distinct from [`Self::Interrupt`] because pi does not merely abort here: it first take-alls
+    /// BOTH pending queues and puts their text back into the editor, so steering / follow-up
+    /// messages the user typed during the run survive the interrupt instead of being silently
+    /// dropped. The run loop drains ([`AgentSession::drain_queue`]), hands the result to
+    /// [`App::restore_queued_to_editor`], and only then aborts.
+    InterruptRestoreQueued,
     /// The user requested to quit the session.
     Quit,
     /// The user requested to suspend the process to the background (Ctrl+Z / SIGTSTP). The run loop
@@ -697,6 +706,199 @@ impl<B: Backend> App<B> {
         self.state.transcript.push_status(msg);
     }
 
+    /// Seed the transcript from a session's persisted conversation — Pi's `renderInitialMessages()`
+    /// → `renderSessionEntries(buildContextEntries(), {updateFooter, populateHistory})`
+    /// (interactive-mode.ts:3548-3562) and the `rebuildChatFromMessages()` used after a compaction
+    /// or a tree/fork navigation (`:3599-3601`, `:1737-1742`).
+    ///
+    /// Without this a `/resume`, `/fork`, `/import`, `--resume` or `--continue` shows an EMPTY view
+    /// even though the session file holds the whole conversation, because
+    /// [`rebind_session`](Self::rebind_session) starts the new session from a fresh
+    /// [`TranscriptView`].
+    ///
+    /// **Feed it [`AgentSession::raw_context_messages`], never `AgentSession::messages()`.** The
+    /// latter is the LLM boundary (`convertToLlm`, `messages.ts:148-195`): it has already rendered a
+    /// compaction summary, a branch summary, an extension `custom` message and a `!` bash execution
+    /// down to `user` messages carrying wrapper prose ("The conversation history before this point
+    /// was compacted into the following summary: …"), which would replay as the *user* having typed
+    /// that text — and would seed it into the editor's Up-arrow history. Pi feeds the RAW projection
+    /// for exactly this reason: `renderSessionEntries` maps entries through
+    /// `sessionEntryToContextMessages` (interactive-mode.ts:3506-3516) whose roles are still
+    /// `compactionSummary`/`branchSummary`/`custom`/`bashExecution`, and `addMessageToChat`
+    /// (`:3308-3350`) routes each to its own component.
+    ///
+    /// The port follows Pi's `renderSessionItems` walk (`:3415-3497`) + `addMessageToChat`
+    /// (`:3308-3413`):
+    /// * `user` → the user block (a `<skill …>` submission still splits into its `[skill]`
+    ///   invocation + the trailing message, via [`TranscriptView::push_user`]) and, like Pi's
+    ///   `populateHistory`, the prompt is pushed into the editor's Up-arrow history;
+    /// * `assistant` → the reasoning section, the answer markdown, a live tool block per `toolCall`
+    ///   content, and the not-finished-cleanly notice ([`stop_reason_notice`]);
+    /// * `toolResult` → attached to the matching open tool block by tool name, then the finished
+    ///   leading run is committed so tools land between the assistant turns that bracket them
+    ///   rather than all at the end;
+    /// * `bashExecution` → a committed bash block (`BashExecutionComponent`, `:3310-3322`),
+    ///   dim-bordered for a `!!` (`excludeFromContext`) run;
+    /// * `custom` → the labeled extension block, **only when `display`** (`:3323-3336`);
+    /// * `compactionSummary` / `branchSummary` → their own summary blocks (`:3337-3350`).
+    ///
+    /// **ADR-0001 divergence, deliberate**: Pi calls `chatContainer.clear()` before replaying, which
+    /// wipes the previous session off the screen. cyrup's committed entries live in the terminal's
+    /// native scrollback (`insert_before`) and cannot be erased, so after a mid-session `/resume`
+    /// the previous conversation stays visible ABOVE the replayed one. The replay itself needs no
+    /// re-render: it starts from an empty transcript and flushes forward normally.
+    ///
+    /// **Known gap**: Pi resolves an extension's registered message renderer for a replayed `custom`
+    /// message (`getMessageRenderer(message.customType)`, `:3326`). cyrup's renderer lookup is async
+    /// with a timeout (see `render_with_extensions`), and this walk is synchronous, so a replayed
+    /// custom message draws with the built-in `[type] body` framing. The LIVE path
+    /// ([`AgentSessionEvent::MessageEnd`]) still honors the renderer.
+    pub fn replay_session(&mut self, messages: &[cyrup_session_svc::agent_message::AgentMessage]) {
+        use cyrup_core::{Content, Message};
+        use cyrup_session_svc::agent_message::AgentMessage;
+        use serde_json::Value;
+        for message in messages {
+            match message {
+                AgentMessage::Core(Message::User { content, .. }) => {
+                    let text = content_text(content);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    self.state.transcript.push_user(text.clone());
+                    // Pi `populateHistory` (interactive-mode.ts:3387): replayed prompts are
+                    // recallable with Up, so a resumed session can re-run its own last message.
+                    self.state.editor.push_history(&text);
+                }
+                AgentMessage::Core(Message::Assistant(m)) => {
+                    let thinking = thinking_text(&m.content);
+                    if !thinking.is_empty() {
+                        self.state.transcript.commit_thinking(Some(thinking));
+                    }
+                    let text = content_text(&m.content);
+                    if !text.trim().is_empty() {
+                        self.state.transcript.commit_assistant(Some(text));
+                    }
+                    for call in m.content.iter().filter_map(|c| match c {
+                        Content::ToolCall(call) => Some(call),
+                        _ => None,
+                    }) {
+                        // Pi files each replayed call component under `content.id`
+                        // (`renderedPendingTools.set(content.id, component)`,
+                        // interactive-mode.ts:3473) so the `toolResult` below resolves to the exact
+                        // call that produced it — two `read`s in one turn are indistinguishable by
+                        // name.
+                        self.state.transcript.push_tool_start_rendered(
+                            call.name.clone(),
+                            Some(call.id.as_str().to_string()),
+                            Value::Object(call.arguments.clone()),
+                            None,
+                        );
+                    }
+                    if let Some(notice) = stop_reason_notice(m) {
+                        self.state.transcript.push_error(notice);
+                    }
+                }
+                AgentMessage::Core(Message::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                }) => {
+                    // The shape every per-tool `renderResult` reads (`{content, details}`).
+                    let mut result = serde_json::Map::new();
+                    result.insert(
+                        "content".to_string(),
+                        serde_json::to_value(content).unwrap_or(Value::Null),
+                    );
+                    if let Some(d) = details {
+                        result.insert("details".to_string(), d.clone());
+                    }
+                    // `renderedPendingTools.get(message.toolCallId)` (`:3483`) — an exact id lookup,
+                    // never a name scan.
+                    self.state.transcript.push_tool_end_rendered(
+                        tool_name.clone(),
+                        Some(tool_call_id.as_str()),
+                        *is_error,
+                        Some(Value::Object(result)),
+                        None,
+                    );
+                    // Keep call order in scrollback: commit the finished leading run now instead of
+                    // deferring every tool of the whole replay to the end.
+                    self.state.transcript.commit_finished_leading_tools();
+                }
+                AgentMessage::BashExecution(b) => {
+                    self.state.transcript.push_bash_execution(
+                        b.command.clone(),
+                        b.exclude_from_context.unwrap_or(false),
+                        &b.output,
+                        b.exit_code.and_then(|c| i32::try_from(c).ok()),
+                        b.cancelled,
+                    );
+                }
+                AgentMessage::Custom(c) => {
+                    // Pi renders a custom message only when it opted into display
+                    // (`if (message.display)`, interactive-mode.ts:3324).
+                    if c.display {
+                        self.state
+                            .transcript
+                            .push_custom_message(c.custom_type.clone(), custom_message_text(&c.content));
+                    }
+                }
+                AgentMessage::BranchSummary(b) => {
+                    self.state.transcript.push_branch_summary(b.summary.clone());
+                }
+                AgentMessage::CompactionSummary(c) => {
+                    self.state
+                        .transcript
+                        .push_compaction_summary(c.tokens_before, c.summary.clone());
+                }
+            }
+        }
+        // A tool call whose result never persisted (an interrupted turn) still commits, as-is.
+        self.state.transcript.commit_tools();
+    }
+
+    /// Emit the startup loaded-resources / diagnostics panel (Pi `showLoadedResources`,
+    /// interactive-mode.ts:1480-1690, called with `{force: false, showDiagnosticsWhenQuiet: true}`
+    /// at `:1769`).
+    ///
+    /// TUI-006: without this, extension load failures, shadowed skills and missing prompt paths were
+    /// entirely invisible in cyrup — the data existed (`AgentSessionServices::startup_diagnostics`)
+    /// but nothing rendered it. Push it before the first draw so it lands at the top of scrollback,
+    /// ahead of the conversation.
+    pub fn push_loaded_resources(&mut self, report: &crate::startup::StartupReport) {
+        self.state.transcript.push_loaded_resources(crate::startup::build_startup_lines(report));
+    }
+
+    /// Put already-queued steering/follow-up text back into the editor — the buffer half of Pi's
+    /// `restoreQueuedMessagesToEditor` (interactive-mode.ts:4064-4083). `queued` is
+    /// `[...steering, ...followUp]` **already drained** from the session (Pi's `clearAllQueues()`
+    /// at `:4065`, here [`AgentSession::drain_queue`]); this half is pure, so the run loop owns the
+    /// async drain and the abort and the App owns what the user sees.
+    ///
+    /// The queued messages join with a blank line and are PREPENDED to whatever is already typed,
+    /// with empty parts dropped (`:4074-4077` — `[queuedText, currentText].filter(t => t.trim())`).
+    /// An empty queue leaves the editor untouched and returns `0`, which is how
+    /// [`AppAction::Dequeue`] decides between Pi's two `handleDequeue` statuses (`:3834-3841`).
+    /// The Esc path (`{abort: true}`) shows no status at all — Pi's escape branch never calls
+    /// `showStatus`.
+    pub fn restore_queued_to_editor(&mut self, queued: &[String]) -> usize {
+        if queued.is_empty() {
+            return 0;
+        }
+        let queued_text = queued.join("\n\n");
+        let current = self.state.editor.text();
+        let combined = [queued_text, current]
+            .into_iter()
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.state.editor.set_text(&combined);
+        queued.len()
+    }
+
     /// Render one frame: first flush newly-committed entries to native scrollback (R-ARCH-TUI-003),
     /// then draw the active region into the inline viewport (pure: `state -> frame`).
     pub fn draw(&mut self) -> Result<(), TuiError>
@@ -780,9 +982,15 @@ impl<B: Backend> App<B> {
         // Content width for markdown wrapping: the live terminal width (R-ARCH-TUI-005), fallback 80.
         let width = self.terminal.backend().size().map(|s| s.width as usize).unwrap_or(80);
         let output_pad = self.state.transcript.output_pad();
+        // Committed tool-result images keep rendering — a half-block raster is ordinary cells, so it
+        // survives `insert_before` into native scrollback (see `ImageBlock::halfblock_lines`).
+        let images = crate::transcript::ImageOpts {
+            show: self.state.transcript.show_images(),
+            width_cells: self.state.transcript.image_width_cells(),
+        };
         let lines: Vec<Line<'static>> = committed
             .iter()
-            .flat_map(|e| entry_lines(e, &self.state.theme, width, output_pad))
+            .flat_map(|e| entry_lines(e, &self.state.theme, width, output_pad, images))
             .collect();
         self.state.scrollback.extend(lines.iter().cloned());
         let style = self.state.theme.base_style();
@@ -1035,11 +1243,20 @@ impl<B: Backend> App<B> {
                     self.state.transcript.bash_complete(None, true);
                     self.state.transcript.commit_bash();
                 }
+                // Pi branches on `this.session.isStreaming` FIRST (interactive-mode.ts:2636): an Esc
+                // that lands mid-turn restores the queued steering/follow-up text to the editor and
+                // THEN aborts, so nothing the user typed during the run is lost. Read the flag
+                // before the local teardown below clears it.
+                let streaming = self.state.status.streaming;
                 self.state.transcript.discard_streaming();
                 self.state.transcript.commit_tools();
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();
-                AppAction::Interrupt
+                if streaming {
+                    AppAction::InterruptRestoreQueued
+                } else {
+                    AppAction::Interrupt
+                }
             }
             // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3361-3369): a second Ctrl+C
             // within 500 ms of the previous one EXITS — there is NO emptiness gate (Pi does not require
@@ -1588,6 +1805,10 @@ impl<B: Backend> App<B> {
             }
             SelectorKind::ShowImages => {
                 self.state.show_images = value == "yes";
+                // TUI-007: the toggle governs TOOL-RESULT images too (Pi passes `showImages` into
+                // every `ToolExecutionComponent`, interactive-mode.ts:3449), not just the editor's
+                // attachment strip. Off ⇒ Pi's `[Image: …]` text stand-in.
+                self.state.transcript.set_show_images(self.state.show_images);
                 let label = if self.state.show_images { "inline" } else { "placeholder" };
                 self.state.transcript.push_status(format!("images → {label}"));
                 None
@@ -2081,6 +2302,24 @@ impl<B: Backend> App<B> {
                     let pad = if value == "0" { 0 } else { 1 };
                     self.state.transcript.set_output_pad(pad);
                 }
+                // `hideThinkingBlock` likewise takes effect live (Pi `setHideThinkingBlock`,
+                // assistant-message.ts:57-62) — on the in-flight reasoning block and on every entry
+                // committed after the flip. Pi additionally re-renders the ALREADY-shown assistant
+                // messages; cyrup's committed rows have left the render tree for native scrollback
+                // (`flush_committed` → `insert_before`), so history keeps the form it committed with.
+                if id == "hideThinkingBlock" {
+                    self.state.transcript.set_hide_thinking_block(value == "true");
+                }
+                // The image rows are live too (Pi re-reads them per `ToolExecutionComponent`).
+                if id == "terminal.showImages" {
+                    self.state.show_images = value == "true";
+                    self.state.transcript.set_show_images(self.state.show_images);
+                }
+                if id == "terminal.imageWidthCells"
+                    && let Ok(cells) = value.parse::<u16>()
+                {
+                    self.state.transcript.set_image_width_cells(cells);
+                }
                 match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
@@ -2327,6 +2566,9 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::AgentEnd { .. } => {
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();
+                // Reasoning commits BEFORE the answer text so the scrollback order matches Pi's
+                // content walk (thinking section, then the assistant markdown).
+                self.state.transcript.commit_thinking(None);
                 self.state.transcript.commit_assistant(None);
                 // Commit the turn's live tool executions into scrollback (`tool-execution.ts` tools
                 // persist through the turn, then scroll up as committed history).
@@ -2360,26 +2602,36 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
                 self.ingest_stream_event(assistant_message_event);
             }
-            AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
+            AgentSessionEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
                 // Hand the raw call args to the transcript so each built-in renders its Pi-specific
                 // `renderCall` header (path+range / `$ command` / `/pattern/` / …), not a generic
                 // one-liner (transcript.rs `tool_lines` dispatch).
+                // The `toolCallId` is what the matching `ToolExecutionEnd` is paired back by — Pi
+                // files the component under it (`pendingTools.set(event.toolCallId, component)`,
+                // interactive-mode.ts:3096). A turn that batches two `read`s cannot be resolved by
+                // tool name.
                 // EXT-006: an extension that declared a renderer for THIS tool supplies the call
                 // header; `None` keeps the built-in per-tool dispatch.
                 self.state.transcript.push_tool_start_rendered(
                     tool_name.clone(),
+                    Some(tool_call_id.as_str().to_string()),
                     args.clone(),
                     rendered,
                 );
             }
-            AgentSessionEvent::ToolExecutionUpdate { partial_result, .. } => {
-                self.state.transcript.push_tool_update(Some(partial_result.clone()));
+            AgentSessionEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
+                // Pi: `this.pendingTools.get(event.toolCallId)` (interactive-mode.ts:3104).
+                self.state
+                    .transcript
+                    .push_tool_update(Some(tool_call_id.as_str()), Some(partial_result.clone()));
             }
-            AgentSessionEvent::ToolExecutionEnd { tool_name, is_error, result, .. } => {
+            AgentSessionEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, result } => {
                 // The full `{content, details, terminate}` result flows through so `renderResult` can
-                // reach each tool's `details` (edit `diff`, bash/read truncation, …).
+                // reach each tool's `details` (edit `diff`, bash/read truncation, …), and the
+                // `toolCallId` routes it to the run that made THIS call (`:3113`).
                 self.state.transcript.push_tool_end_rendered(
                     tool_name.clone(),
+                    Some(tool_call_id.as_str()),
                     *is_error,
                     Some(result.clone()),
                     rendered,
@@ -2495,9 +2747,15 @@ impl<B: Backend> App<B> {
     /// buffer via [`TranscriptView::push_assistant_delta`], so the viewport grows a character at a
     /// time exactly like Pi's interactive stream. A terminal event (`Done`/`Error`, recoverable via
     /// [`StreamEvent::terminal_message`]) replaces the partial with the authoritative
-    /// `AssistantMessage` text and records its token usage in the footer. Non-text streaming frames
-    /// (start/text-start/text-end/thinking*/toolcall*) carry only the running `partial`; the
-    /// authoritative text reaches us via `TextDelta` + the terminal, so nothing is rendered for them.
+    /// `AssistantMessage` text and records its token usage in the footer.
+    ///
+    /// `ThinkingDelta { delta, .. }` (provider `stream.rs:413`) grows the separate live *reasoning*
+    /// block via [`TranscriptView::push_thinking_delta`]; the terminal event commits the message's
+    /// authoritative `thinking` blocks ([`thinking_text`]) ahead of the answer text, matching Pi's
+    /// in-order content walk (`assistant-message.ts:115-166`). The remaining non-text frames
+    /// (start/text-start/text-end/thinking-start/thinking-end/toolcall*) carry only the running
+    /// `partial`, whose content already reaches us via the deltas + the terminal, so nothing is
+    /// rendered for them.
     ///
     /// A terminal whose `stop_reason` is not a clean stop also appends Pi's error-styled
     /// incomplete/failed-turn notice ([`stop_reason_notice`], `assistant-message.ts:175-201`).
@@ -2508,7 +2766,25 @@ impl<B: Backend> App<B> {
                     self.state.transcript.push_assistant_delta(delta);
                 }
             }
+            // Reasoning deltas (provider `stream.rs:413`) grow their own live block above the
+            // answer text, exactly as Pi renders the turn's `thinking` content
+            // (`assistant-message.ts:115-166`). `ThinkingStart`/`ThinkingEnd` carry no incremental
+            // text of their own — the authoritative blocks arrive with the terminal message below.
+            StreamEvent::ThinkingDelta { delta, .. } => {
+                if !delta.is_empty() {
+                    self.state.transcript.push_thinking_delta(delta);
+                }
+            }
             StreamEvent::Done { message, .. } | StreamEvent::Error { error: message, .. } => {
+                // Commit the reasoning FIRST (Pi walks content in order and thinking precedes the
+                // answer), preferring the terminal message's authoritative `thinking` blocks over
+                // whatever streamed — a redacted/summarised block only ever arrives terminally.
+                let thinking = thinking_text(&message.content);
+                if thinking.is_empty() {
+                    self.state.transcript.commit_thinking(None);
+                } else {
+                    self.state.transcript.commit_thinking(Some(thinking));
+                }
                 let text = content_text(&message.content);
                 if text.is_empty() {
                     // Pure tool-use / empty terminal: keep any streamed partial; `AgentEnd` commits it.
@@ -3502,6 +3778,20 @@ impl App<CrosstermBackend<Stdout>> {
         self.state
             .transcript
             .set_output_pad(session.services().settings.effective().output_pad().max(0) as usize);
+        // Same for `hideThinkingBlock` (Pi seeds `this.hideThinkingBlock = getHideThinkingBlock()`
+        // before constructing any `AssistantMessageComponent`): the very first reasoning block must
+        // already honour the persisted setting.
+        self.state
+            .transcript
+            .set_hide_thinking_block(session.services().settings.effective().hide_thinking_block());
+        // `terminal.showImages` / `terminal.imageWidthCells` govern how a tool result's `image`
+        // content blocks render (TUI-007) — seed both before the first frame.
+        let eff = session.services().settings.effective();
+        self.state.show_images = eff.show_images();
+        self.state.transcript.set_show_images(self.state.show_images);
+        self.state
+            .transcript
+            .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -3576,6 +3866,21 @@ impl App<CrosstermBackend<Stdout>> {
                                 c.cancel();
                             }
                         }
+                        AppAction::InterruptRestoreQueued => {
+                            // Pi `onEscape` while streaming (interactive-mode.ts:2636-2637):
+                            // `restoreQueuedMessagesToEditor({abort: true})` — take-all BOTH queues,
+                            // put their text back in the editor, and only then abort. Without the
+                            // restore, an Esc during a turn silently discards every steering /
+                            // follow-up message the user typed while it ran.
+                            let (steering, follow_up) = session.drain_queue().await;
+                            let queued: Vec<String> =
+                                steering.into_iter().chain(follow_up).collect();
+                            self.restore_queued_to_editor(&queued);
+                            session.abort();
+                            if let Some(c) = bash_cancel.take() {
+                                c.cancel();
+                            }
+                        }
                         AppAction::RunBash { command, .. } => {
                             // Replace any prior job (its token is dropped → child orphaned-but-exits).
                             if let Some(c) = bash_cancel.take() {
@@ -3638,25 +3943,21 @@ impl App<CrosstermBackend<Stdout>> {
                             // prepend it to the current editor buffer. When nothing is queued, show
                             // Pi's exact `No queued messages to restore` status and leave the editor
                             // untouched.
-                            let mut queued = session.steering_messages();
-                            queued.extend(session.follow_up_messages());
-                            if queued.is_empty() {
-                                self.state.transcript.push_status("No queued messages to restore");
-                            } else {
-                                let n = queued.len();
-                                session.clear_queue().await;
-                                let queued_text = queued.join("\n\n");
-                                let current = self.state.editor.text();
-                                let combined = [queued_text, current]
-                                    .into_iter()
-                                    .filter(|t| !t.trim().is_empty())
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                self.state.editor.set_text(&combined);
-                                self.state.transcript.push_status(format!(
+                            // One atomic take-all (Pi's `clearAllQueues()` returns what it drained),
+                            // not a read-then-clear pair — the split form loses any message queued
+                            // between the two calls.
+                            let (steering, follow_up) = session.drain_queue().await;
+                            let queued: Vec<String> =
+                                steering.into_iter().chain(follow_up).collect();
+                            match self.restore_queued_to_editor(&queued) {
+                                0 => self
+                                    .state
+                                    .transcript
+                                    .push_status("No queued messages to restore"),
+                                n => self.state.transcript.push_status(format!(
                                     "Restored {n} queued message{} to editor",
                                     if n > 1 { "s" } else { "" }
-                                ));
+                                )),
                             }
                         }
                         AppAction::Command(cmd) => {
@@ -3784,6 +4085,27 @@ impl App<CrosstermBackend<Stdout>> {
                         self.state.transcript.set_output_pad(
                             session.services().settings.effective().output_pad().max(0) as usize,
                         );
+                        self.state.transcript.set_hide_thinking_block(
+                            session.services().settings.effective().hide_thinking_block(),
+                        );
+                        let eff = session.services().settings.effective();
+                        self.state.show_images = eff.show_images();
+                        self.state.transcript.set_show_images(self.state.show_images);
+                        self.state.transcript.set_image_width_cells(
+                            eff.image_width_cells().clamp(1, u16::MAX as i64) as u16,
+                        );
+                                        // TUI-003: seed the view from the swapped-in session's conversation (Pi
+                        // re-runs `renderInitialMessages()` after a tree/fork navigation,
+                        // interactive-mode.ts:1737-1742). Without this a `/resume`, `/fork` or
+                        // `/import` leaves the user staring at an empty transcript while the
+                        // session file holds the whole history. `raw_context_messages` (NOT
+                        // `messages()`) is Pi's `buildContextEntries()` projection: roles intact,
+                        // so a compaction/branch summary, a `custom` message and a `!` run each
+                        // reach their own component instead of replaying as user prose.
+                        let restored = session.raw_context_messages().await;
+                        if !restored.is_empty() {
+                            self.replay_session(&restored);
+                        }
                         // The swapped-in session owns a fresh extension host; re-source its
                         // registered shortcut key-ids (R-08-017) so a post-swap press still routes.
                         let shortcuts = session.services().ext_host.shortcut_keys();

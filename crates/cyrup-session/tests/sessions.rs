@@ -462,3 +462,80 @@ fn labels_and_session_name() {
     assert_eq!(m.label(&u), Some("important"));
     assert_eq!(m.session_name().as_deref(), Some("My Session"));
 }
+
+// --------------------------------------------- raw context projection (Pi buildContextEntries) --
+
+/// [`SessionManager::build_context_raw`] is Pi's
+/// `buildContextEntries().flatMap(sessionEntryToContextMessages)` (`session-manager.ts:441-453` +
+/// `:383-408`) — the projection a UI replays a resumed session from. It must keep the
+/// `compactionSummary` / `branchSummary` / `custom` / `bashExecution` roles that
+/// [`SessionManager::build_context`] flattens to `user` at the LLM boundary (`convertToLlm`,
+/// `messages.ts:148-195`); a front-end fed the flattened form draws the wrapper prose as something
+/// the user typed.
+#[test]
+fn build_context_raw_keeps_the_roles_build_context_flattens() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/raw-context");
+    let lay = layout(root.path(), &cwd);
+
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    let u = m.append_message(user("start")).unwrap();
+    m.append_message(assistant("ok")).unwrap();
+    m.append_compaction("we did a refactor".into(), u.clone(), 42_000, None, None, false).unwrap();
+    m.append_branch_summary(u.clone(), "tried a rewrite".into(), None, None, false).unwrap();
+    m.append_custom_message("review.note", serde_json::json!("three findings"), true, None)
+        .unwrap();
+    m.append_agent_message(AgentMessage::BashExecution(
+        cyrup_session::agent_message::BashExecutionMessage {
+            command: "git status".into(),
+            output: "clean".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 0,
+            exclude_from_context: None,
+        },
+    ))
+    .unwrap();
+
+    let raw = m.build_context_raw();
+    let roles: Vec<_> = raw.iter().map(cyrup_session::agent_message::AgentMessage::role).collect();
+    use cyrup_session::agent_message::MessageRole;
+    assert_eq!(
+        roles,
+        vec![
+            MessageRole::CompactionSummary,
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::BranchSummary,
+            MessageRole::Custom,
+            MessageRole::BashExecution,
+        ],
+        "the raw projection keeps every role intact"
+    );
+
+    // The LLM view, by contrast, is all `user`/`assistant` — the wrapper prose a UI must never show.
+    let llm = m.build_context().messages;
+    assert!(
+        llm.iter().any(|msg| matches!(msg, Message::User { content, .. }
+            if first_text_blocks(content).contains("compacted into the following summary"))),
+        "build_context still flattens the compaction into user prose (the LLM boundary)"
+    );
+    assert!(
+        llm.iter().any(|msg| matches!(msg, Message::User { content, .. }
+            if first_text_blocks(content).starts_with("Ran `git status`"))),
+        "…and the `!` run into `Ran `cmd`` prose"
+    );
+}
+
+fn first_text_blocks(content: &[Content]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}

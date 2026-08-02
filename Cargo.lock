@@ -1419,6 +1419,7 @@ version = "0.0.0"
 dependencies = [
  "arboard",
  "async-trait",
+ "base64",
  "cyrup-agent",
  "cyrup-core",
  "cyrup-ext",
@@ -1430,6 +1431,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
+ "rustix 1.1.4",
  "serde_json",
  "syntect",
  "tempfile",

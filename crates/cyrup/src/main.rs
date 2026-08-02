@@ -34,7 +34,7 @@ use cyrup_session_svc::{
     SessionFactory, SessionInfo, SessionLayout, SessionServiceError, SessionTarget, SessionsRoot,
     UserInput, list_all, list_in_dir,
 };
-use cyrup_tui::{App, ThemeController, UiTheme, crossterm_input_stream};
+use cyrup_tui::{App, StdinTerminalProbe, ThemeController, UiTheme, crossterm_input_stream};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -394,7 +394,8 @@ async fn run() -> anyhow::Result<i32> {
         }
         timings.print();
         let inputs = build_inputs(&cli, &dirs.cwd).await?;
-        let interactive = run_interactive(runtime.clone(), session, inputs, cancel).await;
+        let interactive =
+            run_interactive(runtime.clone(), session, inputs, cli.verbose, cancel).await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
         // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
         // extensions can flush/deregister. Runs even when the TUI loop errored out.
@@ -1118,12 +1119,75 @@ async fn run_interactive_benchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Assemble Pi's startup panel input from the live session (TUI-006). The listing halves come from
+/// the session's own resource snapshot / context store / extension host; the diagnostics half comes
+/// from `AgentSessionServices::startup_diagnostics`, which the builder now retains instead of
+/// discarding (`showLoadedResources`, interactive-mode.ts:1519-1690).
+fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::StartupReport {
+    use cyrup_resources::ResourceKind;
+    let services = session.services();
+    let home = Some(services.home.as_path());
+    let snapshot = services.context.snapshot();
+    cyrup_tui::StartupReport {
+        verbose,
+        quiet_startup: services.settings.effective().quiet_startup(),
+        // Pi's `[Context]` list is the system-prompt source + appended prompts + the `AGENTS.md`
+        // chain, in load order (`:1551-1555`, `{sort: false}`).
+        context_files: snapshot
+            .context_files
+            .iter()
+            .map(|f| cyrup_tui::display_path(&f.path, home))
+            .collect(),
+        skills: services.resources.skills.all().iter().map(|s| s.name.clone()).collect(),
+        // Prompt templates list as their slash command (Pi `/${template.name}`, `:1596`).
+        prompts: services
+            .resources
+            .prompts
+            .all()
+            .iter()
+            .map(|p| format!("/{}", p.name))
+            .collect(),
+        extensions: services.ext_host.loaded_ids().iter().map(|id| id.to_string()).collect(),
+        // Built-ins are excluded — Pi lists only themes with a `sourcePath` (`:1615`).
+        themes: services
+            .resources
+            .themes
+            .all()
+            .iter()
+            .filter(|t| t.origin_path.is_some())
+            .map(|t| t.data.name.clone())
+            .collect(),
+        skill_diagnostics: cyrup_tui::resource_diagnostics(
+            &services.startup_diagnostics.resources,
+            ResourceKind::Skill,
+            home,
+        ),
+        prompt_diagnostics: cyrup_tui::resource_diagnostics(
+            &services.startup_diagnostics.resources,
+            ResourceKind::Prompt,
+            home,
+        ),
+        extension_diagnostics: cyrup_tui::extension_diagnostics(
+            &services.startup_diagnostics.extensions,
+            home,
+        ),
+        theme_diagnostics: cyrup_tui::resource_diagnostics(
+            &services.startup_diagnostics.resources,
+            ResourceKind::Theme,
+            home,
+        ),
+    }
+}
+
 /// The interactive front-end: build the TUI over a real `CrosstermBackend<Stdout>`, seed any initial
 /// prompt, and run the event loop against the live session. Restores the terminal on exit.
 async fn run_interactive(
     runtime: Arc<AgentSessionRuntime>,
     session: Arc<AgentSession>,
     inputs: Inputs,
+    // `--verbose` — Pi's `options.verbose`, which overrides `quietStartup` for the startup listing
+    // (`cli.rs:818` has always advertised exactly that; TUI-006 makes it true).
+    verbose: bool,
     cancel: CancelToken,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
@@ -1131,8 +1195,31 @@ async fn run_interactive(
     // unset/`auto` setting resolves against the detected terminal polarity; every role is projected
     // into the detected `ColorMode` (feature #3) so 256-color terminals get indexed colors.
     let theme_setting = session.services().settings.effective().theme_setting();
-    let controller = ThemeController::boot_from_env(theme_setting.as_deref());
+    let mut controller = ThemeController::boot_from_env(theme_setting.as_deref());
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
+    // TUI-004: now that `into_stdout` has raw mode on — and BEFORE `crossterm_input_stream` spawns
+    // the reader thread that would race us for the reply bytes — complete Pi's boot detection by
+    // actually ASKING the terminal (OSC 11, and DSR `?996` for an `auto` setting) instead of
+    // trusting `COLORFGBG`, which most terminals never set. The probe is hard-bounded at Pi's
+    // 100 ms (`theme-controller.ts:41,53`) and consumes nothing when the terminal stays silent; see
+    // `cyrup_tui::terminal_query` for the timeout / input-safety contract.
+    let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
+    if let Some(theme) = controller.sync_with_terminal(
+        &StdinTerminalProbe,
+        std::time::Duration::from_millis(100),
+        &colorfgbg,
+    ) {
+        app.set_theme(theme);
+    }
+    // Pi persists a HIGH-confidence detection back to `settings.theme` so the next boot skips the
+    // query entirely (`theme-controller.ts:57-61`). A low-confidence fallback is never written.
+    if let Some(name) = controller.theme_to_persist() {
+        let _ = session.persist_setting(
+            cyrup_session_svc::SettingsScope::Global,
+            "theme",
+            serde_json::Value::String(name.to_string()),
+        );
+    }
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
 
@@ -1180,8 +1267,25 @@ async fn run_interactive(
         rx
     });
 
+    // TUI-006: the startup loaded-resources / diagnostics panel (Pi `showLoadedResources`,
+    // interactive-mode.ts:1480-1690, invoked with `showDiagnosticsWhenQuiet: true` at `:1769`).
+    // Pushed BEFORE the replay + the first prompt so it heads the scrollback, and before the
+    // reader thread starts. `quietStartup` hides the inventory; it never hides a load failure.
+    app.push_loaded_resources(&build_startup_report(&session, verbose));
+
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
+
+    // TUI-003: a `--resume`/`--continue` boot starts on an existing branch, so seed the transcript
+    // from it before the first frame — Pi's `renderInitialMessages()` (interactive-mode.ts:3548).
+    // A fresh session has no messages and replays nothing. `raw_context_messages` keeps the
+    // `compactionSummary`/`branchSummary`/`custom`/`bashExecution` roles that `messages()` would
+    // have flattened to `user` prose at the LLM boundary (Pi feeds `renderSessionEntries` the same
+    // raw projection, interactive-mode.ts:3506-3516).
+    let restored = session.raw_context_messages().await;
+    if !restored.is_empty() {
+        app.replay_session(&restored);
+    }
 
     if !inputs.is_empty() {
         app.state_mut().transcript.push_user(inputs.initial.clone());

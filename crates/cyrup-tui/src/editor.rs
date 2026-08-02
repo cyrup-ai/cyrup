@@ -985,6 +985,13 @@ impl InputEditor {
 
     // ---- history ---------------------------------------------------------------------------
 
+    /// Seed the prompt history with an already-submitted line — Pi's `editor.addToHistory?.(text)`
+    /// on the `populateHistory` replay path (interactive-mode.ts:3387). Same skip rules as a live
+    /// submission; call in chronological order so the newest replayed prompt ends up first.
+    pub fn push_history(&mut self, text: &str) {
+        self.add_to_history(text);
+    }
+
     /// Add a raw submitted line to history (skip blank + consecutive-dup, `editor.ts:381-391`).
     fn add_to_history(&mut self, text: &str) {
         if text.trim().is_empty() {
