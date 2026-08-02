@@ -83,7 +83,7 @@ impl ImagesModel {
             base_url: self.base_url.clone(),
             reasoning: false,
             input: self.input.clone(),
-            cost: self.cost,
+            cost: self.cost.clone(),
             context_window: 0,
             max_tokens: 0,
             thinking_level_map: self.thinking_level_map.clone(),

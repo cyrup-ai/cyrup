@@ -69,7 +69,7 @@ pub use images::{
     get_image_models, get_image_providers, image_models, images_builtin_registry,
     openrouter_image_models, register_images_builtins,
 };
-pub use model::{Modality, Model, ModelCost};
+pub use model::{Modality, Model, ModelCost, ModelCostTier};
 pub use provider::Provider;
 pub use providers::all::{
     all_images_providers, all_providers, all_providers_with, default_images_models, default_models,

@@ -1475,7 +1475,7 @@ mod tests {
 
         let mk = |id: &str, input: f64, output: f64| {
             let mut d = FauxModelDefinition::new(id);
-            d.cost = ModelCost { input, output, cache_read: 0.0, cache_write: 0.0 };
+            d.cost = ModelCost { input, output, cache_read: 0.0, cache_write: 0.0, tiers: None };
             d
         };
         // Order the alias-preferred pick FIRST (byte-descending `s` > `o` -> sonnet), so the naive

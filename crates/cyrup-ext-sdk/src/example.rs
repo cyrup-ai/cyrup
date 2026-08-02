@@ -689,7 +689,13 @@ pub fn build() -> ExtensionApi {
                 // Full Pi model shape (sdk gap #26): reasoning/input modalities/cost/contextWindow/maxTokens.
                 reasoning: true,
                 input: vec!["text".into(), "image".into()],
-                cost: crate::ModelCost { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+                cost: crate::ModelCost {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                    tiers: None,
+                },
                 context_window: Some(200000),
                 max_tokens: Some(8192),
                 ..Default::default()

@@ -94,6 +94,58 @@ mod tests {
         assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));
     }
 
+    /// Pi's generator wraps exactly the long-context OpenAI models in `withOpenAiLongContextPricing`
+    /// (generate-models.ts:333-364, :2127-2130): a single tier above 272,000 input tokens at 2×
+    /// input, 1.5× output, 2× cacheRead, 2× cacheWrite. Without it a 300k-token gpt-5.4-pro request
+    /// is billed at half the real rate.
+    #[test]
+    fn long_context_models_carry_the_272k_pricing_tier() {
+        let models = openai_models();
+        let long_context = ["gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro"];
+        for id in long_context {
+            let m = models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} missing from catalog"));
+            let tiers = m
+                .cost
+                .tiers
+                .as_ref()
+                .unwrap_or_else(|| panic!("{id} has no pricing tiers"));
+            assert_eq!(tiers.len(), 1, "{id}");
+            let t = &tiers[0];
+            assert_eq!(t.input_tokens_above, 272_000, "{id}");
+            assert!((t.input - m.cost.input * 2.0).abs() < 1e-9, "{id} input");
+            assert!((t.output - m.cost.output * 1.5).abs() < 1e-9, "{id} output");
+            assert!((t.cache_read - m.cost.cache_read * 2.0).abs() < 1e-9, "{id} cacheRead");
+            assert!((t.cache_write - m.cost.cache_write * 2.0).abs() < 1e-9, "{id} cacheWrite");
+        }
+        // Every other OpenAI model stays flat-priced.
+        for m in &models {
+            if !long_context.contains(&m.id.as_str()) {
+                assert!(m.cost.tiers.is_none(), "{} gained a tier", m.id.as_str());
+            }
+        }
+    }
+
+    /// End-to-end: the catalog rate + the pricing function together bill a real long-context
+    /// gpt-5.4-pro request at the long-context price.
+    #[test]
+    fn gpt_5_4_pro_bills_long_context_input_at_the_tier_rate() {
+        let models = openai_models();
+        let m = models.iter().find(|m| m.id.as_str() == "gpt-5.4-pro").expect("gpt-5.4-pro");
+        let mut usage = cyrup_core::Usage { input: 300_000, output: 1_000, ..Default::default() };
+        crate::usage::apply_cost(&m.cost, &mut usage);
+        // Base $30/1e6 would be $9.00; the long-context tier is $60/1e6 => $18.00.
+        assert!(
+            (usage.cost.input - 18.0).abs() < 1e-6,
+            "long-context input cost was {} (base-rate billing is 9.0)",
+            usage.cost.input
+        );
+        // Output at 1.5x: 1_000 @ 270/1e6 = 0.27.
+        assert!((usage.cost.output - 0.27).abs() < 1e-9, "output {}", usage.cost.output);
+    }
+
     #[test]
     fn provider_identity_and_env_mapping() {
         let p = openai_provider();

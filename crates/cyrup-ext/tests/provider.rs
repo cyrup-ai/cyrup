@@ -43,6 +43,57 @@ fn api_key_resolution_literal_env_command() {
     assert_eq!(resolve_api_key(Some("!printf secret123")).unwrap(), Some("secret123".to_string()));
 }
 
+/// PROV-001, extension surface: Pi's `ProviderModelConfig.cost` is a full `ModelCost`, tiers
+/// included (coding-agent/src/core/extensions/types.ts:1493). A registered long-context model whose
+/// tiers were dropped at the seam gets billed at half the real rate above the threshold.
+#[test]
+fn registered_model_carries_long_context_pricing_tiers_across_the_seam() {
+    let mut hub = ProviderHub::new();
+    let cfg = json!({
+        "name": "Acme",
+        "apiKey": "sk-x",
+        "api": "openai-completions",
+        "baseUrl": "https://acme.example/v1",
+        "models": [{
+            "id": "acme-long",
+            "name": "Acme Long",
+            "contextWindow": 1_000_000,
+            "maxTokens": 64_000,
+            "cost": {
+                "input": 2.5,
+                "output": 15.0,
+                "cacheRead": 0.25,
+                "cacheWrite": 0.0,
+                "tiers": [{
+                    "inputTokensAbove": 272_000,
+                    "input": 5.0,
+                    "output": 22.5,
+                    "cacheRead": 0.5,
+                    "cacheWrite": 0.0
+                }]
+            }
+        }]
+    });
+    hub.register("acme".into(), &cfg).unwrap();
+    let reg = hub.get("acme").expect("registration stored");
+
+    let models = reg.build_models();
+    assert_eq!(models.len(), 1);
+    let cost = &models[0].cost;
+    let tiers = cost.tiers.as_ref().expect("tiers survived the seam");
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers[0].input_tokens_above, 272_000);
+
+    // Observable consequence: a 300k-token request bills at the tier rate, not the base rate.
+    let mut usage = cyrup_core::Usage { input: 300_000, ..Default::default() };
+    cyrup_provider::apply_cost(cost, &mut usage);
+    assert!(
+        (usage.cost.input - 1.5).abs() < 1e-9,
+        "long-context input cost was {} (base-rate billing is 0.75)",
+        usage.cost.input
+    );
+}
+
 #[test]
 fn provider_hub_defers_until_bind_then_flushes() {
     let mut hub = ProviderHub::new();

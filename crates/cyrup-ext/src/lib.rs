@@ -67,7 +67,7 @@ pub use native::{
     NativeExtension, NativeHandle,
 };
 pub use provider::{
-    resolve_api_key, ModelCost, ModelRegistrySink, ProviderConfig, ProviderHub,
+    resolve_api_key, ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub,
     ProviderModelConfig, ProviderRegistration,
 };
 pub use registry::{

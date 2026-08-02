@@ -230,8 +230,25 @@ pub struct ProviderConfig {
     pub has_stream_simple: bool,
 }
 
-/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1422).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// One long-context pricing tier for a registered model (Pi `ModelCostTier`, ai/types.ts:750-753).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostTier {
+    #[serde(default)]
+    pub input_tokens_above: u64,
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1493 — rates plus
+/// optional request-wide input pricing tiers).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     #[serde(default)]
@@ -242,6 +259,8 @@ pub struct ModelCost {
     pub cache_read: f64,
     #[serde(default)]
     pub cache_write: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<ModelCostTier>>,
 }
 
 /// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1404-1429). Now

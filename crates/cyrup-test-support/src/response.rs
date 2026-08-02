@@ -59,7 +59,7 @@ pub fn faux_model_from_def(def: &FauxModelDefinition) -> Model {
         base_url: "http://localhost:0".into(),
         reasoning: def.reasoning,
         input: def.input.clone(),
-        cost: def.cost,
+        cost: def.cost.clone(),
         context_window: def.context_window,
         max_tokens: def.max_tokens,
         thinking_level_map: None,

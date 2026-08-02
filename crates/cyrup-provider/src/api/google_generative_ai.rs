@@ -1289,6 +1289,7 @@ mod tests {
                 output: 2.5,
                 cache_read: 0.03,
                 cache_write: 0.0,
+                tiers: None,
             },
             context_window: 1_048_576,
             max_tokens: 65_536,

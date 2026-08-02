@@ -26,6 +26,7 @@ fn cost(input: f64, output: f64, cache_read: f64) -> ModelCost {
         output,
         cache_read,
         cache_write: 0.0,
+        tiers: None,
     }
 }
 

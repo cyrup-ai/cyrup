@@ -17,7 +17,27 @@ pub enum Modality {
     Image,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+/// One request-wide pricing tier (Pi `ModelCostTier`, types.ts:750-753). Carries the same four
+/// per-1e6-token rates as [`ModelCost`] plus the input-token threshold above which they apply.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostTier {
+    /// Use this tier for requests whose total input usage *exceeds* this token count (strict `>`).
+    pub input_tokens_above: u64,
+    /// USD per 1e6 tokens.
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// Per-1e6-token rates for a model (Pi `ModelCost extends ModelCostRates`, types.ts:743-758).
+///
+/// `tiers` is Pi's long-context pricing ladder: the highest matching `inputTokensAbove` threshold
+/// replaces *all four* base rates for the whole request (see [`crate::usage::compute_cost`], a port
+/// of Pi `calculateCost`, models.ts:639-658). Additive and defaulted, so a catalog entry or a
+/// provider-registered model that omits it keeps flat pricing.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     /// USD per 1e6 tokens.
@@ -25,6 +45,8 @@ pub struct ModelCost {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<ModelCostTier>>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

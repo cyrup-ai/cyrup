@@ -41,9 +41,27 @@ pub struct ProviderConfig {
     pub has_stream_simple: bool,
 }
 
-/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1422). All four
-/// rates are required by Pi (they may be `0`); kept as `f64` rates per token.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// One long-context pricing tier for a registered model (Pi `ModelCostTier`, ai/types.ts:750-753).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostTier {
+    #[serde(default)]
+    pub input_tokens_above: u64,
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+/// Per-token cost for a registered model (Pi `ProviderModelConfig.cost`, types.ts:1493 — "per-
+/// million-token cost rates and optional request-wide input pricing tiers"). All four base rates
+/// are required by Pi (they may be `0`); `tiers` is optional and, when present, replaces every base
+/// rate for requests whose total input usage exceeds the highest matching threshold.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     #[serde(default)]
@@ -54,6 +72,8 @@ pub struct ModelCost {
     pub cache_read: f64,
     #[serde(default)]
     pub cache_write: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<ModelCostTier>>,
 }
 
 /// Per-model config inside a [`ProviderConfig`] (Pi `ProviderModelConfig`, types.ts:1404-1429).
@@ -203,6 +223,18 @@ impl ProviderRegistration {
                     output: m.cost.output,
                     cache_read: m.cost.cache_read,
                     cache_write: m.cost.cache_write,
+                    tiers: m.cost.tiers.as_ref().map(|tiers| {
+                        tiers
+                            .iter()
+                            .map(|t| cyrup_provider::ModelCostTier {
+                                input_tokens_above: t.input_tokens_above,
+                                input: t.input,
+                                output: t.output,
+                                cache_read: t.cache_read,
+                                cache_write: t.cache_write,
+                            })
+                            .collect()
+                    }),
                 },
                 context_window: m.context_window.unwrap_or(128_000),
                 max_tokens: m.max_tokens.unwrap_or(16_384),

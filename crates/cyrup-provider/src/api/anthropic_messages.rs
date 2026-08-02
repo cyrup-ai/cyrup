@@ -1288,9 +1288,16 @@ async fn process_block_start(
     };
     match cb.get("type").and_then(Value::as_str) {
         Some("text") => {
+            // Seed from the payload Anthropic ships on the open event (Pi
+            // `text: event.content_block.text ?? ""`, anthropic-messages.ts:591). Dropping it loses
+            // the first chunk of the block whenever the server front-loads text here.
             dec.blocks.push(Block::Text {
                 index,
-                text: String::new(),
+                text: cb
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             });
             send_with_pos(dec, model, api, sink, |pos, partial| {
                 StreamEvent::TextStart {
@@ -1301,10 +1308,23 @@ async fn process_block_start(
             .await
         }
         Some("thinking") => {
+            // Same seeding for thinking (Pi `thinking: event.content_block.thinking ?? ""`,
+            // `thinkingSignature: event.content_block.signature ?? ""`, anthropic-messages.ts:
+            // 599-600). The signature especially: a thinking block replayed back to Anthropic
+            // without its signature is rejected, so a server that delivers the signature on the
+            // open event (and never as a `signature_delta`) must not have it discarded.
             dec.blocks.push(Block::Thinking {
                 index,
-                thinking: String::new(),
-                signature: String::new(),
+                thinking: cb
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                signature: cb
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 redacted: false,
             });
             send_with_pos(dec, model, api, sink, |pos, partial| {
@@ -1621,6 +1641,7 @@ mod tests {
                 output: 25.0,
                 cache_read: 0.5,
                 cache_write: 6.25,
+                tiers: None,
             },
             context_window: 200_000,
             max_tokens: 64_000,
@@ -2160,6 +2181,105 @@ mod tests {
         let (thinking, sig) = thinking.expect("thinking block");
         assert_eq!(thinking, "reason");
         assert_eq!(sig.as_deref(), Some("SIG"));
+    }
+
+    /// DRIFT-003: `content_block_start` may already carry the head of a text block. Pi seeds the
+    /// block with `event.content_block.text ?? ""`; dropping it silently truncates the reply.
+    #[tokio::test]
+    async fn content_block_start_text_payload_is_kept() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hel\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+
+        // The seeded head is visible on the very first partial snapshot, not only at the end.
+        let start_partial = events.iter().find_map(|e| match e {
+            StreamEvent::TextStart { partial, .. } => Some(partial.clone()),
+            _ => None,
+        });
+        let start_text = start_partial
+            .expect("text_start")
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Content::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("text block on the start partial");
+        assert_eq!(start_text, "Hel");
+
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        let msg = done.expect("done");
+        let text = msg
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Content::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("text block");
+        assert_eq!(text, "Hello", "the content_block_start head was dropped");
+    }
+
+    /// DRIFT-003: the same for thinking blocks. The signature matters most — a thinking block
+    /// replayed to Anthropic without its signature is rejected, so a signature delivered only on
+    /// the open event must survive.
+    #[tokio::test]
+    async fn content_block_start_thinking_and_signature_payload_is_kept() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"rea\",\"signature\":\"SIG-FROM-START\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"son\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let m = model();
+        let events = collect(raw.as_bytes().to_vec(), &m).await;
+        let done = events.iter().find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        let msg = done.expect("done");
+        let (thinking, sig) = msg
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Content::Thinking {
+                    thinking,
+                    thinking_signature,
+                    ..
+                } => Some((thinking.clone(), thinking_signature.clone())),
+                _ => None,
+            })
+            .expect("thinking block");
+        assert_eq!(thinking, "reason", "the thinking head was dropped");
+        assert_eq!(
+            sig.as_deref(),
+            Some("SIG-FROM-START"),
+            "the signature from content_block_start was dropped — the block is unreplayable"
+        );
     }
 
     #[tokio::test]
