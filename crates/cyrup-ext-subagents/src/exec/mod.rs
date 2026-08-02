@@ -727,6 +727,14 @@ pub const AGENT_NAME_ENV_VAR: &str = "CYRUP_SUBAGENT_AGENT_NAME";
 /// pi's `__none__` sentinel for [`MCP_DIRECT_TOOLS_ENV`] when no direct MCP tools are declared.
 const MCP_DIRECT_TOOLS_NONE_SENTINEL: &str = "__none__";
 
+/// The child flag carrying a `SystemPromptMode::Replace` persona body (pi `pi-args.ts:165`'s
+/// `"--system-prompt"`; the host side is `cyrup/src/cli.rs`'s `#[arg(long = "system-prompt")]`).
+const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
+
+/// The child flag carrying a `SystemPromptMode::Append` persona body (pi `pi-args.ts:165`'s
+/// `"--append-system-prompt"`; repeatable host-side, joined with `\n`).
+const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
+
 /// pi `applyThinkingSuffix` (`pi-args.ts:76-81`): append `:<thinking>` to a model id, unless the
 /// model already ends with a recognized `:<level>` suffix (leave it untouched) or either input is
 /// absent (return the model as-is). Operates on strings so the exact pi rule — including the `off`
@@ -768,7 +776,9 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// only when at least one builtin is declared (pi's `builtinTools.length > 0` gate); the agent's
 /// extension threading (`--no-extensions` + `--extension <path>` allowlist when `agent.extensions`
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
-/// on); `--no-skills` when the agent does not inherit skills; an optional `--session <path>` (when
+/// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
+/// `--append-system-prompt=<persona body>` per `agent.system_prompt_mode` when the body is
+/// non-empty (ONE argv element, `=`-joined — see below); an optional `--session <path>` (when
 /// `opts.fork_context` resolved a session file path); then the task prompt last (via
 /// [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
 ///
@@ -776,12 +786,30 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// inherit flags ([`INHERIT_PROJECT_CONTEXT_ENV`]/[`INHERIT_SKILLS_ENV`]), and the raw direct-MCP
 /// selector list ([`MCP_DIRECT_TOOLS_ENV`], or the `__none__` sentinel).
 ///
-/// System prompt steering for `output_mode == FileOnly` (R-SA-024's system-prompt half) is
-/// applied to `task` BEFORE this function is called — see [`build_task_text`] — since this crate's
-/// spawn contract carries the system prompt as part of the composed task/system text handed to
-/// the child rather than a separate `--system-prompt` argv flag for subagent runs specifically
-/// (mirroring `agent.system_prompt_mode`'s own task-text-composition role, R-SA-024's own
-/// wording: "steered at generation time... not merely conveyed via argv").
+/// The agent's own persona prose (`agent.system_prompt_body`) is delivered here as
+/// `--system-prompt=<body>` (`SystemPromptMode::Replace`) or `--append-system-prompt=<body>`
+/// (`SystemPromptMode::Append`) — pi `pi-args.ts:159-165` (v0.34.0), where the mode picks the flag
+/// and the body always ships. Nothing child-side re-resolves the persona from
+/// [`AGENT_NAME_ENV_VAR`] (that var is read only by the permission companion), so this argv pair is
+/// the ONLY channel the persona has.
+///
+/// System prompt steering for `output_mode == FileOnly` (R-SA-024's system-prompt half) and the
+/// `<available_skills>` pointer block remain composed into `task` BEFORE this function is called —
+/// see [`build_task_text`] — rather than being folded into the persona body the way pi's
+/// `execution.ts:1053-1062` composes them, so that a `Replace`-mode persona cannot suppress the
+/// orchestrator's own scaffolding.
+///
+/// **[CYRUP-DELTA]** pi writes the composed prompt to a `0600` temp file and passes the PATH,
+/// because pi's `resolvePromptInput` (`resource-loader.ts:53-68`) reads `--system-prompt`'s value
+/// from disk when it names an existing file. `cyrup`'s own `--system-prompt`/`--append-system-prompt`
+/// take LITERAL text (`cyrup/src/cli.rs:125-129` → `SessionConfig::system_prompt`, no path
+/// resolution anywhere), so the body is passed inline; handing over a path here would deliver the
+/// path string itself as the child's system prompt. Inline means the `=`-joined single-argv form is
+/// mandatory, not stylistic — clap refuses a detached value beginning with `-`, and markdown
+/// personas routinely open on a `- bullet` or a `---` rule. An empty/whitespace-only body emits NO flag at
+/// all (pi always emits it, but pi's value is the persona PLUS skills, memory and output-path
+/// steering, so it is never meaningfully empty; emitting `--system-prompt ""` here would blank the
+/// child's assembled prompt instead).
 ///
 /// # Errors
 ///
@@ -879,6 +907,24 @@ fn build_attempt_spawn_plan(
     // pi: a subagent that does not inherit skills is spawned with `--no-skills` (`pi-args.ts:139`).
     if !agent.inherit_skills {
         args.push("--no-skills".to_string());
+    }
+
+    // SUBA-001 / pi `pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
+    // agent's `systemPromptMode` only chooses which flag carries it. See this function's doc
+    // comment for the literal-text-vs-temp-file `[CYRUP-DELTA]` and the empty-body rule.
+    let persona_body = agent.system_prompt_body.trim();
+    if !persona_body.is_empty() {
+        let flag = match agent.system_prompt_mode {
+            SystemPromptMode::Replace => SYSTEM_PROMPT_FLAG,
+            SystemPromptMode::Append => APPEND_SYSTEM_PROMPT_FLAG,
+        };
+        // `--flag=<body>` (ONE argv element), never `--flag <body>` (two): the child's clap parser
+        // refuses a separate value that starts with `-`, and a markdown persona body very commonly
+        // opens on a `- bullet` or a `---` rule. Verified against the real binary: `--system-prompt
+        // "- be terse"` dies with `error: unexpected argument '- ' found`, while
+        // `--system-prompt=- be terse` parses. The `=` split is on the FIRST `=` only, so a body
+        // containing `=` round-trips intact.
+        args.push(format!("{flag}={persona_body}"));
     }
 
     if let Some(session_path) = &opts.fork_context.session_file_path {
@@ -987,29 +1033,27 @@ fn build_attempt_spawn_plan(
     })
 }
 
-/// Compose the final task text handed to the child: acceptance-contract injection (R-SA-023) then
-/// output-path system-prompt steering (R-SA-024's file-only half) then, when
-/// `agent.system_prompt_mode == Append`, the agent's own system-prompt body appended after both
-/// (mirroring [`crate::discovery::types::SystemPromptMode::Append`]'s documented role: this
-/// agent's own frontmatter prose combines with orchestrator-injected scaffolding rather than
-/// replacing it). `Replace` mode leaves the agent's own `system_prompt_body` for the spawned
-/// child's own system-prompt resolution to apply independently (out of this module's scope — this
-/// function only ever touches the TASK text, never the child's actual `--system-prompt`
-/// invocation, which this crate does not set at all, letting the child's own agent-persona
-/// resolution own that).
+/// Compose the final task text handed to the child: acceptance-contract injection (R-SA-023), then
+/// output-path system-prompt steering (R-SA-024's file-only half), then the skill-pointer block.
+///
+/// The agent's OWN persona prose is deliberately NOT part of this text. It travels as
+/// `--system-prompt`/`--append-system-prompt` on the child's argv — see
+/// [`build_attempt_spawn_plan`] (SUBA-001, pi `pi-args.ts:159-165`). Previously `Append` mode
+/// concatenated the body here and `Replace` mode dropped it on the floor entirely, on the mistaken
+/// premise that the child re-resolved its own persona; nothing child-side does (the
+/// [`AGENT_NAME_ENV_VAR`] anchor is read only by the permission companion), so every
+/// `Replace`-mode subagent — 7 of the 8 bundled personas and every user-authored agent — ran with
+/// no persona at all.
 ///
 /// The pre-resolved `skill_injection` (the lazy `<available_skills>` pointer block built ONCE per
-/// run by [`run_sync`] via [`crate::discovery::skills::build_skill_injection`]) is appended LAST,
-/// after any Append-mode system-prompt body — matching pi, where the skill injection is composed
-/// onto the end of the child's system prompt (`execution.ts:949-952`). It is composed into the task
-/// text here (rather than a separate `--system-prompt` flag) because this crate carries the
-/// orchestrator-injected scaffolding as part of the task/system text handed to the child (see this
-/// function's own note above about `agent.system_prompt_mode`). Empty when the agent/step declares
-/// no skills, so the common no-skills case appends nothing. This is ORTHOGONAL to
-/// `agent.inherit_skills` (the `--no-skills` child flag): an agent that does not inherit skills
-/// still receives its explicitly-listed skills through this block.
+/// run by [`run_sync`] via [`crate::discovery::skills::build_skill_injection`]) is appended LAST.
+/// pi composes it onto the persona system prompt instead (`execution.ts:1054-1056`); keeping it in
+/// the task text here is what lets a `Replace`-mode persona (which wholesale replaces the child's
+/// assembled system prompt) coexist with orchestrator-injected scaffolding rather than suppress it.
+/// Empty when the agent/step declares no skills, so the common no-skills case appends nothing. This
+/// is ORTHOGONAL to `agent.inherit_skills` (the `--no-skills` child flag): an agent that does not
+/// inherit skills still receives its explicitly-listed skills through this block.
 fn build_task_text(
-    agent: &AgentConfig,
     task: &str,
     opts: &RunOptions,
     contract: &AcceptanceContract,
@@ -1026,16 +1070,10 @@ fn build_task_text(
         }
         OutputMode::FileAndInline | OutputMode::Inline => with_acceptance,
     };
-    let with_system_prompt = match agent.system_prompt_mode {
-        SystemPromptMode::Append if !agent.system_prompt_body.is_empty() => {
-            format!("{with_output_path}\n\n{}", agent.system_prompt_body)
-        }
-        SystemPromptMode::Append | SystemPromptMode::Replace => with_output_path,
-    };
     if skill_injection.is_empty() {
-        with_system_prompt
+        with_output_path
     } else {
-        format!("{with_system_prompt}\n\n{skill_injection}")
+        format!("{with_output_path}\n\n{skill_injection}")
     }
 }
 
@@ -1091,7 +1129,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         }
 
         let task_text =
-            build_task_text(self.agent, self.task, self.opts, self.contract, &self.skill_injection);
+            build_task_text(self.task, self.opts, self.contract, &self.skill_injection);
 
         // R-SA-054/055/056 (SAFETY-CRITICAL, C15): the CHILD about to be spawned is one recursion
         // hop deeper than THIS process, so its env overlay MUST carry the incremented envelope —
@@ -2436,7 +2474,7 @@ mod tests {
         opts.output_path = Some(dir.path().join("out.md"));
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
 
-        let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
+        let text = build_task_text("do the thing", &opts, &contract, "");
         assert!(text.starts_with("do the thing"));
         assert!(text.contains("Acceptance Contract"));
         assert!(text.contains("out.md"));
@@ -2461,7 +2499,7 @@ mod tests {
                 description: Some("Use fallback mode.".to_string()),
             },
         ]);
-        let text = build_task_text(&agent, "do the thing", &opts, &contract, &injection);
+        let text = build_task_text("do the thing", &opts, &contract, &injection);
 
         assert!(text.starts_with("do the thing"));
         assert!(text.contains("<available_skills>"));
@@ -2478,17 +2516,102 @@ mod tests {
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
     }
 
+    // ---- SUBA-001: persona system-prompt delivery (pi `pi-args.ts:159-165` @ v0.34.0) ----
+
     #[test]
-    fn build_task_text_appends_system_prompt_body_in_append_mode() {
+    fn build_attempt_spawn_plan_delivers_the_persona_body_as_system_prompt_in_replace_mode() {
+        // The critical path: 7 of the 8 bundled personas (and every user-authored agent, per
+        // `default_system_prompt_mode`) declare `systemPromptMode: replace`. The child MUST be
+        // spawned with `--system-prompt=<persona body>` — pi `pi-args.ts:164-165` picks
+        // `--system-prompt` for `replace` — or the subagent runs as a generic coding agent that
+        // received nothing but the task text.
+        //
+        // The body deliberately opens on a markdown bullet: the `=` encoding is not cosmetic, the
+        // child's clap parser rejects `--system-prompt` followed by a separate `- …` value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        agent.system_prompt_body = "- You are the REVIEWER persona.\n- Only review.".to_string();
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path())
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        let delivered = argv
+            .iter()
+            .find(|a| a.starts_with("--system-prompt"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            delivered, "--system-prompt=- You are the REVIEWER persona.\n- Only review.",
+            "replace mode must ship the persona body on --system-prompt; argv was {argv:?}"
+        );
+        // `replace` must never also append — the two flags are mutually exclusive per mode.
+        assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
+    }
+
+    #[test]
+    fn build_attempt_spawn_plan_delivers_the_persona_body_as_append_in_append_mode() {
+        // pi `pi-args.ts:164-165`: the mode picks the FLAG, the body always ships.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
         agent.system_prompt_mode = SystemPromptMode::Append;
         agent.system_prompt_body = "You are a delegate persona.".to_string();
         let opts = base_opts(dir.path(), &["m1"]);
         let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
 
-        let text = build_task_text(&agent, "do the thing", &opts, &contract, "");
-        assert!(text.contains("You are a delegate persona."));
+        let task_text = build_task_text("do the thing", &opts, &contract, "");
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path())
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        let delivered = argv
+            .iter()
+            .find(|a| a.starts_with("--append-system-prompt"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            delivered, "--append-system-prompt=You are a delegate persona.",
+            "append mode must ship the persona body on --append-system-prompt; argv was {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
+        // Delivered EXACTLY once: the body no longer rides along inside the task text as well.
+        assert!(
+            !plan.spec.task_arg.contains("You are a delegate persona."),
+            "append-mode persona must not be duplicated into the task text: {}",
+            plan.spec.task_arg
+        );
+    }
+
+    #[test]
+    fn build_attempt_spawn_plan_omits_the_system_prompt_flag_for_an_empty_persona_body() {
+        // A persona with no prose must not blank the child's own assembled system prompt.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        agent.system_prompt_body = "   \n\t ".to_string();
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
+        assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
     #[test]

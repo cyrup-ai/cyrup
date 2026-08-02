@@ -30,8 +30,10 @@
 //! cwd and looks names up in the resulting [`cyrup_resources::ResourceSet`]. cyrup's project config
 //! dir is `.cyrup` (pi's `.pi`); user skills live under `~/.cyrup/skills` + `~/.agents/skills`.
 //!
-//! The child system prompt injection itself is wired in [`crate::exec`] (`build_task_text` composes
-//! the [`build_skill_injection`] block into the task text handed to the spawned child), honoring the
+//! The child skill injection itself is wired in [`crate::exec`] (`build_task_text` composes
+//! the [`build_skill_injection`] block into the task text handed to the spawned child — pi folds it
+//! into the persona system prompt instead, `execution.ts:1054-1056`, but cyrup keeps it in the task
+//! text so a `Replace`-mode persona cannot suppress it), honoring the
 //! agent's own `skills` list and leaving `inherit_skills` (the `--no-skills` child flag) orthogonal:
 //! an `inherit_skills: false` agent still receives its EXPLICITLY-listed skills as pointers, exactly
 //! like pi (`execution.ts:935-952` builds the injection from `options.skills ?? agent.skills`
