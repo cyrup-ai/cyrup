@@ -207,6 +207,7 @@ pub fn thinking_level_key(level: ModelThinkingLevel) -> &'static str {
         ModelThinkingLevel::Medium => "medium",
         ModelThinkingLevel::High => "high",
         ModelThinkingLevel::Xhigh => "xhigh",
+        ModelThinkingLevel::Max => "max",
     }
 }
 

@@ -52,6 +52,11 @@ fn structured_sub_themes_make_every_bg_and_thinking_field_addressable() {
     assert_eq!(think.medium, Color::Rgb(0x81, 0xa2, 0xbe));
     assert_eq!(think.xhigh, Color::Rgb(0xd1, 0x83, 0xe8));
     assert_eq!(think.low, Color::Rgb(0x5f, 0x87, 0xaf), "omitted level uses the spec dark fallback");
+    // PROV-002: this assembled theme predates the `max` rung and omits `thinkingMax`, so it must
+    // reuse its OWN resolved `xhigh` color (Pi's `thinkingMax ?? thinkingXhigh`, theme.ts:329) —
+    // not the spec dark hex, and not the neutral border.
+    assert_eq!(think.max, think.xhigh, "a theme without thinkingMax falls back to xhigh");
+    assert_eq!(theme.thinking_border_style("max").fg, Some(think.xhigh));
 
     // The structured fields drive the live accessors (one source of truth): the medium thinking rule
     // style resolves to the same field color.

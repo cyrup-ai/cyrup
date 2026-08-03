@@ -128,7 +128,7 @@ pub enum SessionCommand {
     GetAvailableModels,
 
     // ---- Thinking ----
-    /// Set the thinking level (`off`|`minimal`|`low`|`medium`|`high`|`xhigh`).
+    /// Set the thinking level (`off`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`).
     SetThinkingLevel { level: ModelThinkingLevel },
     /// Cycle to the next thinking level.
     CycleThinkingLevel,
@@ -1272,6 +1272,29 @@ async fn read_lines<R: AsyncBufRead + Unpin>(mut reader: R, tx: mpsc::Sender<Str
 mod tests {
     use super::*;
     use cyrup_ext::DialogOptions;
+
+    /// PROV-002: the RPC surface must accept `max`. `SessionCommand` is serde-driven, so this
+    /// pins that an RPC client can actually reach the top rung (and that a bogus level still
+    /// produces a clean error rather than a silent lower level).
+    #[test]
+    fn set_thinking_level_accepts_max_over_rpc() {
+        let cmd: SessionCommand =
+            serde_json::from_str(r#"{"type":"set_thinking_level","level":"max"}"#)
+                .expect("`max` must deserialize");
+        assert!(matches!(
+            cmd,
+            SessionCommand::SetThinkingLevel {
+                level: ModelThinkingLevel::Max
+            }
+        ));
+        assert!(
+            serde_json::from_str::<SessionCommand>(
+                r#"{"type":"set_thinking_level","level":"ultra"}"#
+            )
+            .is_err(),
+            "an unknown level is a serde error, not a silent downgrade"
+        );
+    }
 
     fn editor_request(title: &str, initial: &str) -> UiRequest {
         let (reply, _rx) = oneshot::channel();

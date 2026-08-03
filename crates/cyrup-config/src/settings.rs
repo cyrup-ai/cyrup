@@ -1873,6 +1873,21 @@ mod tests {
         assert_eq!(s.default_thinking_level(), ModelThinkingLevel::default());
     }
 
+    /// PROV-002 / pi `test/max-thinking.test.ts` ("is accepted by CLI and settings"): a settings
+    /// file declaring `"max"` must round-trip to the `Max` rung, not silently fall back to `off`.
+    #[test]
+    fn default_thinking_level_accepts_max() {
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(r#"{ "defaultThinkingLevel": "max" }"#).unwrap(),
+        );
+        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::Max);
+        // A genuinely unknown level still degrades to the default rather than erroring.
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(r#"{ "defaultThinkingLevel": "ultra" }"#).unwrap(),
+        );
+        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::default());
+    }
+
     #[test]
     fn theme_split_get_theme_vs_get_theme_setting() {
         // settings-manager.ts:718-727

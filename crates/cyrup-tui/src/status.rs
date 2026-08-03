@@ -86,7 +86,7 @@ pub struct StatusLine {
     pub context_window: Option<u64>,
     /// Auto-compaction enabled → ` (auto)` suffix on the context segment.
     pub auto_compact: bool,
-    /// Current reasoning level (`off`…`xhigh`). Rendered only when [`reasoning`](Self::reasoning) is set.
+    /// Current reasoning level (`off`…`xhigh`/`max`). Rendered only when [`reasoning`](Self::reasoning) is set.
     pub thinking_level: String,
     /// Whether the active model supports reasoning (`state.model?.reasoning`, `footer.ts:185`). When
     /// set, the right cluster appends ` • thinking off` / ` • {level}`.

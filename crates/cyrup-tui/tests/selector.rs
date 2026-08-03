@@ -76,8 +76,9 @@ fn thinking_selector_renders_borders_labels_and_cursor() {
     // Full-width DynamicBorder rules top & bottom (spec/tui/05 §11) — at least two ruled rows.
     let rule_rows = text.lines().filter(|l| l.contains("──────────")).count();
     assert!(rule_rows >= 2, "expected top+bottom `─` rules, got {rule_rows}:\n{text}");
-    // Every Pi thinking level + its description (thinking-selector.ts:11-18).
-    for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
+    // Every Pi thinking level + its description (thinking-selector.ts:11-19). `max` is the rung
+    // Pi added in fbdd4638; without it the top of the ladder is unreachable from the TUI.
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
         assert!(text.contains(level), "missing level {level}:\n{text}");
     }
     assert!(text.contains("No reasoning"), "missing description:\n{text}");

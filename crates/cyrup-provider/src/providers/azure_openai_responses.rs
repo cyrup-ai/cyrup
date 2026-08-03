@@ -88,7 +88,8 @@ mod tests {
     #[test]
     fn catalog_parses_with_expected_count_and_tags() {
         let models = azure_openai_responses_models();
-        assert_eq!(models.len(), 42);
+        // pi `azure-openai-responses.models.ts` @91585d9a (45 — GPT-5.6 trio, `7df2a94e`).
+        assert_eq!(models.len(), 45);
         assert!(
             models
                 .iter()
@@ -115,7 +116,7 @@ mod tests {
         let p = azure_openai_responses_provider();
         assert_eq!(p.id(), &ProviderId::from("azure-openai-responses"));
         assert_eq!(p.name(), "Azure OpenAI");
-        assert_eq!(p.models().len(), 42);
+        assert_eq!(p.models().len(), 45);
     }
 
     #[tokio::test]

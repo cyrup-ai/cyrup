@@ -121,7 +121,7 @@
    "low": "high",
    "medium": "high",
    "high": "high",
-   "xhigh": "max"
+   "max": "max"
   },
   "input": [
    "text"

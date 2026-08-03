@@ -579,8 +579,8 @@
   "maxTokens": 16384
  },
  {
-  "id": "z-ai/glm-5.1",
-  "name": "GLM-5.1",
+  "id": "z-ai/glm-5.2",
+  "name": "GLM-5.2",
   "api": "openai-completions",
   "provider": "nvidia",
   "baseUrl": "https://integrate.api.nvidia.com/v1",
@@ -605,7 +605,7 @@
    "cacheRead": 0,
    "cacheWrite": 0
   },
-  "contextWindow": 131072,
+  "contextWindow": 1000000,
   "maxTokens": 131072
  }
 ]

@@ -9,7 +9,8 @@ use cyrup_provider::Model;
 
 use crate::error::ConfigError;
 
-/// Parse a thinking-level token (`off|minimal|low|medium|high|xhigh`).
+/// Parse a thinking-level token (`off|minimal|low|medium|high|xhigh|max` — Pi
+/// `VALID_THINKING_LEVELS`, args.ts:59).
 pub fn parse_thinking_level(s: &str) -> Option<ModelThinkingLevel> {
     match s.trim().to_ascii_lowercase().as_str() {
         "off" => Some(ModelThinkingLevel::Off),
@@ -18,6 +19,7 @@ pub fn parse_thinking_level(s: &str) -> Option<ModelThinkingLevel> {
         "medium" => Some(ModelThinkingLevel::Medium),
         "high" => Some(ModelThinkingLevel::High),
         "xhigh" => Some(ModelThinkingLevel::Xhigh),
+        "max" => Some(ModelThinkingLevel::Max),
         _ => None,
     }
 }
@@ -2021,6 +2023,34 @@ mod tests {
             "claude-opus-4-latest"
         );
         assert_eq!(parsed.thinking_level, Some(ModelThinkingLevel::High));
+    }
+
+    /// PROV-002: `max` is a valid level token (Pi `VALID_THINKING_LEVELS`, args.ts:59), so a
+    /// `model:max` shorthand must SPLIT. Before the fix `parse_thinking_level("max")` returned
+    /// `None`, so `:max` was swallowed into the model id and the pattern failed to resolve.
+    #[test]
+    fn max_thinking_shorthand_parses() {
+        assert_eq!(parse_thinking_level("max"), Some(ModelThinkingLevel::Max));
+        assert_eq!(parse_thinking_level("MAX"), Some(ModelThinkingLevel::Max));
+        assert_eq!(parse_thinking_level("bogus"), None);
+
+        let models = vec![model("anthropic", "claude-opus-4-6", "Claude Opus 4.6")];
+        let r = ModelResolver::new(&models);
+        let parsed = r.parse_pattern("claude-opus-4-6:max", true);
+        assert_eq!(
+            parsed.model.as_ref().expect("model resolves").id.as_str(),
+            "claude-opus-4-6"
+        );
+        assert_eq!(parsed.thinking_level, Some(ModelThinkingLevel::Max));
+
+        // …and on the glob/scope path too.
+        let scoped = r.resolve_scope(&["anthropic/*:max".to_string()]);
+        assert!(!scoped.is_empty());
+        assert!(
+            scoped
+                .iter()
+                .all(|s| s.thinking_level == Some(ModelThinkingLevel::Max))
+        );
     }
 
     #[test]

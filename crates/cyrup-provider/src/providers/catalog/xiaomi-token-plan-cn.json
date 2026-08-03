@@ -1,29 +1,5 @@
 [
  {
-  "id": "mimo-v2-omni",
-  "name": "MiMo-V2-Omni",
-  "api": "openai-completions",
-  "provider": "xiaomi-token-plan-cn",
-  "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
-  "compat": {
-   "requiresReasoningContentOnAssistantMessages": true,
-   "thinkingFormat": "deepseek"
-  },
-  "reasoning": true,
-  "input": [
-   "text",
-   "image"
-  ],
-  "cost": {
-   "input": 0.14,
-   "output": 0.28,
-   "cacheRead": 0.0028,
-   "cacheWrite": 0
-  },
-  "contextWindow": 262144,
-  "maxTokens": 131072
- },
- {
   "id": "mimo-v2-pro",
   "name": "MiMo-V2-Pro",
   "api": "openai-completions",
@@ -38,9 +14,9 @@
    "text"
   ],
   "cost": {
-   "input": 0.435,
-   "output": 0.87,
-   "cacheRead": 0.0036,
+   "input": 0,
+   "output": 0,
+   "cacheRead": 0,
    "cacheWrite": 0
   },
   "contextWindow": 1048576,
@@ -62,9 +38,9 @@
    "image"
   ],
   "cost": {
-   "input": 0.14,
-   "output": 0.28,
-   "cacheRead": 0.0028,
+   "input": 0,
+   "output": 0,
+   "cacheRead": 0,
    "cacheWrite": 0
   },
   "contextWindow": 1048576,
@@ -85,32 +61,9 @@
    "text"
   ],
   "cost": {
-   "input": 0.435,
-   "output": 0.87,
-   "cacheRead": 0.0036,
-   "cacheWrite": 0
-  },
-  "contextWindow": 1048576,
-  "maxTokens": 131072
- },
- {
-  "id": "mimo-v2.5-pro-ultraspeed",
-  "name": "MiMo-V2.5-Pro-UltraSpeed",
-  "api": "openai-completions",
-  "provider": "xiaomi-token-plan-cn",
-  "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
-  "compat": {
-   "requiresReasoningContentOnAssistantMessages": true,
-   "thinkingFormat": "deepseek"
-  },
-  "reasoning": true,
-  "input": [
-   "text"
-  ],
-  "cost": {
-   "input": 1.305,
-   "output": 2.61,
-   "cacheRead": 0.0108,
+   "input": 0,
+   "output": 0,
+   "cacheRead": 0,
    "cacheWrite": 0
   },
   "contextWindow": 1048576,

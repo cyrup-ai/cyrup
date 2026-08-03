@@ -134,19 +134,21 @@ mod tests {
     /// failure or a dropped entry makes this fail loudly.
     const EXPECTED_COUNTS: &[(&str, usize)] = &[
         ("ant-ling", 3),
-        ("cerebras", 2),
+        ("cerebras", 3),
         ("deepseek", 2),
         ("groq", 7),
-        ("huggingface", 48),
+        ("huggingface", 49),
         ("moonshotai", 9),
         ("moonshotai-cn", 9),
         ("nvidia", 20),
-        ("openrouter", 256),
-        ("xai", 7),
+        ("openrouter", 270),
+        ("xai", 8),
         ("xiaomi", 6),
-        ("xiaomi-token-plan-ams", 5),
-        ("xiaomi-token-plan-cn", 5),
-        ("xiaomi-token-plan-sgp", 5),
+        // The three token-plan catalogs dropped to 3 in pi `cc2db980`, which stopped cloning the
+        // API-billing Xiaomi catalog into every region (see `catalog_data.rs`, PROV-004).
+        ("xiaomi-token-plan-ams", 3),
+        ("xiaomi-token-plan-cn", 3),
+        ("xiaomi-token-plan-sgp", 3),
         ("zai", 6),
         ("zai-coding-cn", 6),
     ];
@@ -188,7 +190,8 @@ mod tests {
     #[test]
     fn deepseek_catalog_carries_thinking_map_and_compat() {
         // DeepSeek models carry the deepseek thinking format + a thinkingLevelMap (high->"high",
-        // xhigh->"max"), proving the catalog's compat + thinkingLevelMap deserialize 1:1.
+        // max->"max" per pi deepseek.models.ts @91585d9a), proving the catalog's compat +
+        // thinkingLevelMap deserialize 1:1.
         let models = DEEPSEEK.models();
         let m = models
             .iter()
@@ -205,7 +208,8 @@ mod tests {
         );
         let map = m.thinking_level_map.as_ref().expect("map");
         assert_eq!(map.get("high"), Some(&Some("high".to_string())));
-        assert_eq!(map.get("xhigh"), Some(&Some("max".to_string())));
+        assert_eq!(map.get("max"), Some(&Some("max".to_string())));
+        assert_eq!(map.get("xhigh"), None);
     }
 
     #[test]

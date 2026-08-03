@@ -48,6 +48,7 @@ pub enum ThinkingArg {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ThinkingArg {
@@ -60,6 +61,7 @@ impl ThinkingArg {
             ThinkingArg::Medium => ModelThinkingLevel::Medium,
             ThinkingArg::High => ModelThinkingLevel::High,
             ThinkingArg::Xhigh => ModelThinkingLevel::Xhigh,
+            ThinkingArg::Max => ModelThinkingLevel::Max,
         }
     }
 }
@@ -113,7 +115,7 @@ pub struct Cli {
     /// Runtime API key for the selected provider (defaults to env vars).
     #[arg(long = "api-key")]
     pub api_key: Option<String>,
-    /// Thinking level: off, minimal, low, medium, high, xhigh.
+    /// Thinking level: off, minimal, low, medium, high, xhigh, max.
     #[arg(long = "thinking", value_enum)]
     pub thinking: Option<ThinkingArg>,
     /// Comma-separated model patterns for Ctrl+P cycling (globs/fuzzy/`:level`).
@@ -803,7 +805,7 @@ Options:
                                  Applies to built-in, extension, and custom tools
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
                                  Applies to built-in, extension, and custom tools
-  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
+  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)
@@ -1389,6 +1391,32 @@ mod tests {
         assert!(resume.persist);
         let ephemeral = parse(&["--no-session"]).to_session_config(&d, AppMode::Interactive);
         assert!(!ephemeral.persist);
+    }
+
+    /// PROV-002 (pi `test/max-thinking.test.ts`, "is accepted by CLI"): `--thinking max` must
+    /// parse, and a `model:max` suffix must split off the model id. Before the fix clap rejected
+    /// `max` with a usage error and `split_model_level` left `:max` glued to the id.
+    #[test]
+    fn thinking_max_is_accepted_by_the_cli() {
+        assert_eq!(ThinkingArg::Max.to_level(), ModelThinkingLevel::Max);
+        assert_eq!(
+            ThinkingArg::from_str("max", true).expect("clap accepts `max`"),
+            ThinkingArg::Max
+        );
+
+        let d = dirs();
+        let cli = parse(&["--thinking", "max"]);
+        let config = cli.to_session_config(&d, AppMode::Print);
+        assert_eq!(config.thinking_level, Some(ModelThinkingLevel::Max));
+
+        // `model:max` splits (Pi `resolveModelScope`).
+        let (base, level) = split_model_level("anthropic/claude-opus-4-6:max");
+        assert_eq!(base, "anthropic/claude-opus-4-6");
+        assert_eq!(level, Some(ThinkingArg::Max));
+        // A non-level suffix is still left alone.
+        let (base, level) = split_model_level("anthropic/claude-opus-4-6");
+        assert_eq!(base, "anthropic/claude-opus-4-6");
+        assert_eq!(level, None);
     }
 
     #[test]

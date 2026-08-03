@@ -4,7 +4,7 @@ use crate::HeaderMap;
 use crate::api::compat::OpenAiCompletionsCompat;
 use cyrup_core::{ApiId, ModelId, ProviderId};
 
-/// Maps pi thinking levels (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) to provider/model
+/// Maps pi thinking levels (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) to provider/model
 /// specific reasoning values. Mirrors Pi's `ThinkingLevelMap = Partial<Record<ModelThinkingLevel,
 /// string | null>>`: a missing key uses the provider default, a `null` value marks the level
 /// unsupported, and a string overrides the wire value sent for that level.

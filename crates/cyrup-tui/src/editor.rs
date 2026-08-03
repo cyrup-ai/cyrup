@@ -127,7 +127,7 @@ pub struct InputEditor {
     pastes: BTreeMap<u32, String>,
     /// Monotonic id for the next large paste (`editor.ts:82` `paste_counter`).
     paste_counter: u32,
-    /// The current reasoning level (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) — the editor's
+    /// The current reasoning level (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) — the editor's
     /// top/bottom rule color is the primary always-visible thinking-level signal
     /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3). Recolored green in bash mode. Updated by
     /// the app on `ThinkingLevelChanged`; `"medium"` until set.

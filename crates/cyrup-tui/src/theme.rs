@@ -349,6 +349,7 @@ impl UiTheme {
             "medium" => thinking.medium,
             "high" => thinking.high,
             "xhigh" => thinking.xhigh,
+            "max" => thinking.max,
             // An unrecognized level keeps the neutral border color.
             _ => return self.border_style(),
         };
@@ -383,13 +384,19 @@ impl UiTheme {
     /// each resolved from the live theme with the spec/tui/03 §3.3 dark-hex fallback so it is total.
     pub fn thinking(&self) -> ThinkingTheme {
         let level = |key: &str, default_hex: &str| self.role_color(key, default_hex);
+        let xhigh = level("thinkingXhigh", "#d183e8");
         ThinkingTheme {
             off: level("thinkingOff", "#666666"),
             minimal: level("thinkingMinimal", "#6e6e6e"),
             low: level("thinkingLow", "#5f87af"),
             medium: level("thinkingMedium", "#81a2be"),
             high: level("thinkingHigh", "#b294bb"),
-            xhigh: level("thinkingXhigh", "#d183e8"),
+            xhigh,
+            // Pi made `thinkingMax` an OPTIONAL theme token with an explicit
+            // `colors.thinkingMax ?? colors.thinkingXhigh` fallback (theme.ts:93,329,358) so
+            // pre-`max` user themes keep loading. Ported verbatim: a theme that omits the token
+            // reuses its OWN resolved `xhigh` color, never a hardcoded default.
+            max: self.roles.get("thinkingMax").copied().unwrap_or(xhigh),
         }
     }
 
@@ -649,8 +656,11 @@ pub struct ThinkingTheme {
     pub medium: Color,
     /// `high`.
     pub high: Color,
-    /// `xhigh` — maximum reasoning.
+    /// `xhigh` — extra-high reasoning.
     pub xhigh: Color,
+    /// `max` — maximum reasoning. Falls back to [`ThinkingTheme::xhigh`] when the theme omits the
+    /// optional `thinkingMax` token (Pi theme.ts:329).
+    pub max: Color,
 }
 
 /// Map a resolved color role onto a `ratatui::Color`. `Inherit` ⇒ `None` (terminal default).
@@ -1169,6 +1179,49 @@ fn ansi256_to_rgb(index: u8) -> (u8, u8, u8) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// PROV-002: the `max` rung needs its own editor border color. The built-ins define
+    /// `thinkingMax` (Pi dark.json `#ff5fff` / light.json `#af005f`), so it must be distinct from
+    /// `xhigh` and `thinking_border_style("max")` must resolve it rather than fall through to the
+    /// neutral border.
+    #[test]
+    fn thinking_max_has_its_own_border_color_in_the_builtins() {
+        for theme in [UiTheme::dark(), UiTheme::light()] {
+            let t = theme.thinking();
+            assert_ne!(
+                t.max, t.xhigh,
+                "`{}` must give `max` its own color",
+                theme.name
+            );
+            assert_eq!(theme.thinking_border_style("max").fg, Some(t.max));
+            assert_ne!(
+                theme.thinking_border_style("max"),
+                theme.border_style(),
+                "`max` must not fall through to the neutral border"
+            );
+        }
+    }
+
+    /// Pi made `thinkingMax` an OPTIONAL theme token with a `?? thinkingXhigh` fallback
+    /// (theme.ts:93,329,358) so themes authored before the rung existed keep working. Ported:
+    /// a theme without the token reuses its OWN `xhigh` color. (Pi's own regression test is
+    /// `coding-agent/test/max-thinking.test.ts`, "falls back to thinkingXhigh for legacy themes".)
+    #[test]
+    fn legacy_theme_without_thinking_max_falls_back_to_xhigh() {
+        let mut legacy = UiTheme::dark();
+        legacy.roles.remove("thinkingMax");
+        let t = legacy.thinking();
+        assert_eq!(t.max, t.xhigh, "legacy themes reuse their xhigh color");
+        assert_eq!(
+            legacy.thinking_border_style("max"),
+            legacy.thinking_border_style("xhigh")
+        );
+        // A genuinely unknown level still falls through to the neutral border.
+        assert_eq!(
+            legacy.thinking_border_style("ultra"),
+            legacy.border_style()
+        );
+    }
 
     #[test]
     fn color_mode_projects_rgb_to_indexed_and_leaves_named_alone() {

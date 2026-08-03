@@ -313,14 +313,17 @@ impl ListSelector {
     /// Thinking-level picker (`thinking-selector.ts:11-55`): one row per available level with its
     /// token-estimate description, `maxVisible = levels.len()`, preselecting `current`.
     pub fn thinking(current: &str) -> Self {
-        // `LEVEL_DESCRIPTIONS` (`thinking-selector.ts:11-18`), in Pi's order.
-        const LEVELS: [(&str, &str); 6] = [
+        // `LEVEL_DESCRIPTIONS` (`thinking-selector.ts:11-19`), in Pi's order. Pi's `max` commit
+        // (fbdd4638) renamed the `xhigh` copy from "Maximum" to "Extra-high" and gave "Maximum
+        // reasoning" to the new top rung.
+        const LEVELS: [(&str, &str); 7] = [
             ("off", "No reasoning"),
             ("minimal", "Very brief reasoning (~1k tokens)"),
             ("low", "Light reasoning (~2k tokens)"),
             ("medium", "Moderate reasoning (~8k tokens)"),
             ("high", "Deep reasoning (~16k tokens)"),
-            ("xhigh", "Maximum reasoning (~32k tokens)"),
+            ("xhigh", "Extra-high reasoning (~32k tokens)"),
+            ("max", "Maximum reasoning"),
         ];
         let rows: Vec<_> = LEVELS
             .iter()

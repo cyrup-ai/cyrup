@@ -2156,6 +2156,7 @@ impl<B: Backend> App<B> {
                             ModelThinkingLevel::Medium => "medium",
                             ModelThinkingLevel::High => "high",
                             ModelThinkingLevel::Xhigh => "xhigh",
+                            ModelThinkingLevel::Max => "max",
                         };
                         self.state.transcript.push_status(format!("Thinking level: {label}"));
                     }

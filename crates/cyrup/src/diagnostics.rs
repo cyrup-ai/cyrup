@@ -48,8 +48,9 @@ impl Diagnostic {
     }
 }
 
-/// Valid `--thinking` levels (Pi `VALID_THINKING_LEVELS`, args.ts:57).
-const VALID_THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+/// Valid `--thinking` levels (Pi `VALID_THINKING_LEVELS`, args.ts:59 — `max` added in fbdd4638).
+const VALID_THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Valid `--mode` values (Pi args.ts:80).
 const VALID_MODES: [&str; 3] = ["text", "json", "rpc"];
 
@@ -208,6 +209,15 @@ mod tests {
         let (clean, diags) = apply_arg_leniency(&v(&["--thinking", "high"]));
         assert_eq!(clean, v(&["--thinking", "high"]));
         assert!(diags.is_empty());
+        // PROV-002: `max` is valid (Pi `VALID_THINKING_LEVELS`, args.ts:59). Before the fix the
+        // leniency pass warned "Invalid thinking level \"max\"" and DROPPED the flag, so the top
+        // rung could not be reached from the command line at all.
+        let (clean, diags) = apply_arg_leniency(&v(&["--thinking", "max", "go"]));
+        assert_eq!(clean, v(&["--thinking", "max", "go"]));
+        assert!(diags.is_empty(), "{diags:?}");
+        // …and the advertised value list names it.
+        let (_, diags) = apply_arg_leniency(&v(&["--thinking", "ultra"]));
+        assert!(diags[0].message.ends_with("xhigh, max"), "{}", diags[0].message);
     }
 
     #[test]

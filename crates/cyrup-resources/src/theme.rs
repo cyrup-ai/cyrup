@@ -259,6 +259,9 @@ pub const REQUIRED_COLOR_TOKENS: [&str; 51] = [
     "thinkingMedium",
     "thinkingHigh",
     "thinkingXhigh",
+    // NOTE: `thinkingMax` is deliberately NOT here. Pi declares it `Type.Optional(...)`
+    // (theme.ts:93) and falls back `thinkingMax ?? thinkingXhigh` (theme.ts:329,358) so themes
+    // authored before the `max` rung keep validating. Both built-ins below do define it.
     // Bash Mode
     "bashMode",
 ];
@@ -588,6 +591,7 @@ pub const BUILTIN_DARK_JSON: &str = r##"{
     "thinkingMedium": "#81a2be",
     "thinkingHigh": "#b294bb",
     "thinkingXhigh": "#d183e8",
+    "thinkingMax": "#ff5fff",
 
     "bashMode": "green"
   },
@@ -674,6 +678,7 @@ pub const BUILTIN_LIGHT_JSON: &str = r##"{
     "thinkingMedium": "teal",
     "thinkingHigh": "#875f87",
     "thinkingXhigh": "#8b008b",
+    "thinkingMax": "#af005f",
 
     "bashMode": "green"
   },

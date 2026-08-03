@@ -186,8 +186,10 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = anthropic_models();
-        // Every entry in Pi's `anthropic.models.ts` (24 models).
-        assert_eq!(models.len(), 24);
+        // Every entry in Pi's `anthropic.models.ts` @91585d9a (14 models). pi `cc2db980` switched
+        // generation to models.dev's per-provider catalogs, retiring the ten EOL Claude 3.x/4.0
+        // entries cyrup's older snapshot still carried (see `tests/catalog_data.rs`, PROV-004).
+        assert_eq!(models.len(), 14);
         assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "anthropic"));
         assert!(models.iter().all(|m| m.base_url == ANTHROPIC_BASE_URL));
@@ -205,20 +207,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {id}"))
         };
 
-        // Opus 4.7: adaptive thinking + temperature unsupported + xhigh->xhigh map.
+        // Opus 4.7: adaptive thinking + temperature unsupported + xhigh->xhigh AND max->max
+        // (pi anthropic.models.ts:155 @91585d9a — `{"xhigh":"xhigh","max":"max"}`).
         let opus47 = find("claude-opus-4-7");
         let c: &ModelCompat = opus47.compat.as_ref().expect("compat");
         assert_eq!(c.force_adaptive_thinking, Some(true));
         assert_eq!(c.supports_temperature, Some(false));
-        assert_eq!(
-            opus47
-                .thinking_level_map
-                .as_ref()
-                .and_then(|m| m.get("xhigh")),
-            Some(&Some("xhigh".to_string()))
-        );
+        let m47 = opus47.thinking_level_map.as_ref().expect("opus-4-7 map");
+        assert_eq!(m47.get("xhigh"), Some(&Some("xhigh".to_string())));
+        assert_eq!(m47.get("max"), Some(&Some("max".to_string())));
 
-        // Opus 4.6: adaptive + xhigh->"max".
+        // Opus 4.6: adaptive, and the ONLY native rung is `max` (pi anthropic.models.ts:136
+        // @91585d9a — `{"max":"max"}`). cyrup used to carry `{"xhigh":"max"}`, which made the
+        // selector display `xhigh` while the wire effort was `max`; the label and the wire value
+        // must now agree.
         let opus46 = find("claude-opus-4-6");
         assert_eq!(
             opus46
@@ -227,13 +229,9 @@ mod tests {
                 .and_then(|c| c.force_adaptive_thinking),
             Some(true)
         );
-        assert_eq!(
-            opus46
-                .thinking_level_map
-                .as_ref()
-                .and_then(|m| m.get("xhigh")),
-            Some(&Some("max".to_string()))
-        );
+        let m46 = opus46.thinking_level_map.as_ref().expect("opus-4-6 map");
+        assert_eq!(m46.get("max"), Some(&Some("max".to_string())));
+        assert_eq!(m46.get("xhigh"), None, "4.6 has no native xhigh rung");
 
         // Opus 4.5: pricing + context window.
         let opus45 = find("claude-opus-4-5");
@@ -242,8 +240,13 @@ mod tests {
         assert_eq!(opus45.context_window, 200_000);
         assert_eq!(opus45.max_tokens, 64_000);
 
-        // Haiku 3 is a non-reasoning model.
-        assert!(!find("claude-3-haiku-20240307").reasoning);
+        // Sonnet 4.5 carries the full 1M context window (pi anthropic.models.ts:185 @91585d9a,
+        // raised in `cc2db980`); the old snapshot capped it at 200k.
+        assert_eq!(find("claude-sonnet-4-5").context_window, 1_000_000);
+
+        // After `cc2db980` retired the Claude 3.x entries, every remaining Anthropic model is a
+        // reasoning model — there is no non-reasoning Claude left to pin.
+        assert!(models.iter().all(|m| m.reasoning));
     }
 
     #[test]
@@ -251,7 +254,7 @@ mod tests {
         let p = anthropic_provider();
         assert_eq!(p.id().as_str(), "anthropic");
         assert!(p.get_model("claude-opus-4-5").is_some());
-        assert!(p.models().len() >= 20);
+        assert_eq!(p.models().len(), 14);
     }
 
     #[test]
@@ -260,7 +263,7 @@ mod tests {
             ("kimi-coding", 3usize),
             ("minimax", 3),
             ("minimax-cn", 3),
-            ("vercel-ai-gateway", 186),
+            ("vercel-ai-gateway", 192),
         ];
         for (id, count) in expected {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));

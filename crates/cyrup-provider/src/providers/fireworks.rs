@@ -101,10 +101,10 @@ mod tests {
         let gc = glm.compat.as_ref().expect("compat");
         assert_eq!(gc.supports_store, Some(false));
         assert_eq!(gc.supports_developer_role, Some(false));
-        assert_eq!(
-            glm.thinking_level_map.as_ref().and_then(|m| m.get("xhigh")),
-            Some(&Some("max".to_string()))
-        );
+        // pi fireworks.models.ts @91585d9a maps the top rung as `"max":"max"` (never `xhigh`).
+        let gm = glm.thinking_level_map.as_ref().expect("glm map");
+        assert_eq!(gm.get("max"), Some(&Some("max".to_string())));
+        assert_eq!(gm.get("xhigh"), None);
 
         // deepseek-v4-flash is anthropic-messages with session-affinity + no-eager-tool-streaming.
         let ds = find("accounts/fireworks/models/deepseek-v4-flash");

@@ -1417,6 +1417,7 @@ fn thinking_level_str(level: cyrup_sdk::core::ModelThinkingLevel) -> &'static st
         L::Medium => "medium",
         L::High => "high",
         L::Xhigh => "xhigh",
+        L::Max => "max",
     }
 }
 
@@ -1511,13 +1512,15 @@ mod tests {
             scoped.len()
         );
 
-        // Character classes (`[08]`) are real minimatch syntax the crude matcher could not express
-        // (it fell through to a literal-substring miss). Pi matches exactly the -0 and -8 opus ids.
-        let scoped = resolve_scoped_models(&catalog, &["anthropic/claude-opus-4-[08]".to_string()]);
+        // Character classes (`[68]`) are real minimatch syntax the crude matcher could not express
+        // (it fell through to a literal-substring miss). Pi matches exactly the -6 and -8 opus ids.
+        // (This used to read `[08]`; `claude-opus-4-0` was retired upstream in pi `cc2db980` — see
+        // cyrup-provider `tests/catalog_data.rs`, PROV-004.)
+        let scoped = resolve_scoped_models(&catalog, &["anthropic/claude-opus-4-[68]".to_string()]);
         let ids: Vec<&str> = scoped.iter().map(|s| s.model.id.as_str()).collect();
         assert!(
-            ids.contains(&"claude-opus-4-0") && ids.contains(&"claude-opus-4-8"),
-            "`anthropic/claude-opus-4-[08]` char-class must scope both opus ids, got {ids:?}"
+            ids.contains(&"claude-opus-4-6") && ids.contains(&"claude-opus-4-8"),
+            "`anthropic/claude-opus-4-[68]` char-class must scope both opus ids, got {ids:?}"
         );
         assert!(
             scoped.iter().all(|s| s.model.provider.as_str() == "anthropic"),

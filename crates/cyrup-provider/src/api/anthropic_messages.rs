@@ -478,6 +478,7 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
     };
     if let Some(Some(mapped)) = model.thinking_level_map.as_ref().and_then(|m| m.get(key)) {
         return mapped.clone();
@@ -485,7 +486,10 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
     match level {
         ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
         ThinkingLevel::Medium => "medium".to_string(),
-        ThinkingLevel::High | ThinkingLevel::Xhigh => "high".to_string(),
+        // Pi's switch has no `xhigh`/`max` case: both land on `default: "high"`
+        // (anthropic-messages.ts:786-798). Only an explicit `thinkingLevelMap` entry (handled
+        // above) promotes them to the native `xhigh`/`max` efforts.
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high".to_string(),
     }
 }
 
@@ -1799,6 +1803,110 @@ mod tests {
         let body = build_body(&m, &user_ctx("deep"), &opts);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    /// PROV-002: the `max` rung must reach `output_config.effort` as `"max"` (Pi
+    /// `mapThinkingLevelToEffort`, anthropic-messages.ts:781-799 — the map lookup wins).
+    #[test]
+    fn adaptive_thinking_encodes_max_effort() {
+        let mut m = model();
+        m.compat = Some(ModelCompat {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        });
+        m.thinking_level_map = Some(
+            [("max".to_string(), Some("max".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::Max,
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("deepest"), &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    /// With no `thinkingLevelMap` entry, `max` falls to Pi's `default: "high"` arm — it must NOT
+    /// leak a bare `"max"` to a model that never advertised the effort.
+    #[test]
+    fn unmapped_max_falls_back_to_high_effort() {
+        let mut m = model();
+        m.compat = Some(ModelCompat {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        });
+        m.thinking_level_map = None;
+        let body = build_body(
+            &m,
+            &user_ctx("x"),
+            &StreamOptions {
+                reasoning: ModelThinkingLevel::Max,
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    /// The real-catalog end of PROV-002: on `claude-opus-4-6` the level the UI DISPLAYS and the
+    /// effort that goes on the wire must be the same string. Before the fix the catalog carried
+    /// `{"xhigh":"max"}`, so the footer said `xhigh` while Anthropic received `max`.
+    #[test]
+    fn max_label_matches_the_wire_effort_on_opus_4_6() {
+        use crate::collection::{clamp_thinking_level, get_supported_thinking_levels};
+        let m = crate::providers::anthropic_models()
+            .iter()
+            .find(|m| m.id.as_str() == "claude-opus-4-6")
+            .expect("opus-4-6")
+            .clone();
+
+        // The only top rung this model offers is `max`; a request for `xhigh` promotes onto it.
+        let levels = get_supported_thinking_levels(&m);
+        assert!(levels.contains(&ModelThinkingLevel::Max), "{levels:?}");
+        assert!(!levels.contains(&ModelThinkingLevel::Xhigh), "{levels:?}");
+        let selected = clamp_thinking_level(&m, ModelThinkingLevel::Xhigh);
+        assert_eq!(selected, ModelThinkingLevel::Max);
+
+        let body = build_body(
+            &m,
+            &user_ctx("x"),
+            &StreamOptions {
+                reasoning: selected,
+                ..Default::default()
+            },
+        );
+        let wire = body["output_config"]["effort"].as_str().expect("effort");
+        assert_eq!(wire, "max");
+        assert_eq!(
+            crate::api::compat::thinking_level_key(selected),
+            wire,
+            "displayed level and wire effort must agree"
+        );
+    }
+
+    /// `claude-sonnet-5` advertises BOTH top rungs and they must stay distinct on the wire.
+    #[test]
+    fn sonnet_5_sends_xhigh_and_max_distinctly() {
+        let m = crate::providers::anthropic_models()
+            .iter()
+            .find(|m| m.id.as_str() == "claude-sonnet-5")
+            .expect("sonnet-5")
+            .clone();
+        let effort = |level| {
+            build_body(
+                &m,
+                &user_ctx("x"),
+                &StreamOptions {
+                    reasoning: level,
+                    ..Default::default()
+                },
+            )["output_config"]["effort"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(effort(ModelThinkingLevel::Xhigh).as_deref(), Some("xhigh"));
+        assert_eq!(effort(ModelThinkingLevel::Max).as_deref(), Some("max"));
     }
 
     #[test]

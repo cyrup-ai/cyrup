@@ -601,6 +601,7 @@ fn model_thinking_to_unified(level: ModelThinkingLevel) -> Option<ThinkingLevel>
         ModelThinkingLevel::Medium => Some(ThinkingLevel::Medium),
         ModelThinkingLevel::High => Some(ThinkingLevel::High),
         ModelThinkingLevel::Xhigh => Some(ThinkingLevel::Xhigh),
+        ModelThinkingLevel::Max => Some(ThinkingLevel::Max),
     }
 }
 

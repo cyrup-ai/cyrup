@@ -235,6 +235,9 @@ fn reasoning_effort(level: ModelThinkingLevel) -> Option<&'static str> {
         ModelThinkingLevel::Medium => Some("medium"),
         ModelThinkingLevel::High => Some("high"),
         ModelThinkingLevel::Xhigh => Some("xhigh"),
+        // Pi `reasoningEffort` is the level string verbatim (openai-completions.ts:621) and its
+        // `OpenAICompletionsOptions.reasoningEffort` union includes `"max"` (:143).
+        ModelThinkingLevel::Max => Some("max"),
     }
 }
 
@@ -2345,6 +2348,47 @@ mod tests {
         };
         let body = build_body(&m, &Context::default(), &opts);
         assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    /// PROV-002: `max` is a first-class `reasoning_effort` value. Pi passes the level string
+    /// verbatim (`reasoningEffort = clampedReasoning`, openai-completions.ts:621) and its option
+    /// union lists `"max"` (:143).
+    #[test]
+    fn openai_reasoning_effort_encodes_max() {
+        let m = openai_model();
+        let body = build_body(
+            &m,
+            &Context::default(),
+            &StreamOptions {
+                reasoning: ModelThinkingLevel::Max,
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    /// The real corrected catalog: `deepseek-v4-pro` maps `max -> "max"` (pi deepseek.models.ts
+    /// @91585d9a) and must send it, proving the DRIFT-008 catalog values reach the wire.
+    #[test]
+    fn deepseek_catalog_sends_max_effort() {
+        use crate::collection::get_supported_thinking_levels;
+        let m = crate::providers::fleet::DEEPSEEK
+            .models()
+            .iter()
+            .find(|m| m.id.as_str() == "deepseek-v4-pro")
+            .expect("deepseek-v4-pro")
+            .clone();
+        assert!(get_supported_thinking_levels(&m).contains(&ModelThinkingLevel::Max));
+        let body = build_body(
+            &m,
+            &Context::default(),
+            &StreamOptions {
+                reasoning: ModelThinkingLevel::Max,
+                max_tokens: Some(64),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["reasoning_effort"], "max", "body={body}");
     }
 
     #[test]

@@ -384,13 +384,14 @@ fn merge_headers(
 // ---- model capability helpers (Pi models.ts:397) ----
 
 /// The full ordered extended-thinking ladder (Pi `EXTENDED_THINKING_LEVELS`).
-pub const EXTENDED_THINKING_LEVELS: [ModelThinkingLevel; 6] = [
+pub const EXTENDED_THINKING_LEVELS: [ModelThinkingLevel; 7] = [
     ModelThinkingLevel::Off,
     ModelThinkingLevel::Minimal,
     ModelThinkingLevel::Low,
     ModelThinkingLevel::Medium,
     ModelThinkingLevel::High,
     ModelThinkingLevel::Xhigh,
+    ModelThinkingLevel::Max,
 ];
 
 fn level_key(level: ModelThinkingLevel) -> &'static str {
@@ -398,8 +399,8 @@ fn level_key(level: ModelThinkingLevel) -> &'static str {
 }
 
 /// The thinking levels a model supports (Pi `getSupportedThinkingLevels`). A non-reasoning model
-/// supports only `off`. A `thinkingLevelMap` value of `null` marks a level unsupported; `xhigh`
-/// additionally requires an explicit (non-`undefined`) map entry.
+/// supports only `off`. A `thinkingLevelMap` value of `null` marks a level unsupported; `xhigh` and
+/// `max` additionally require an explicit (non-`undefined`) map entry (Pi models.ts:670).
 pub fn get_supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
     if !model.reasoning {
         return vec![ModelThinkingLevel::Off];
@@ -415,7 +416,11 @@ pub fn get_supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
             match mapped {
                 Some(None) => false, // explicit null → unsupported
                 Some(Some(_)) => true,
-                None => *level != ModelThinkingLevel::Xhigh, // undefined: xhigh requires an entry
+                // undefined: `xhigh`/`max` require an entry, every other rung is implicit.
+                None => !matches!(
+                    *level,
+                    ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max
+                ),
             }
         })
         .collect()
@@ -692,7 +697,8 @@ mod tests {
             vec![ModelThinkingLevel::Off]
         );
 
-        // Reasoning, no map → off,minimal,low,medium,high (xhigh requires an explicit entry).
+        // Reasoning, no map → off,minimal,low,medium,high (xhigh AND max each require an explicit
+        // entry — Pi models.ts:670 `if (level === "xhigh" || level === "max")`).
         let r = model("p", "b", true, None);
         assert_eq!(
             get_supported_thinking_levels(&r),
@@ -705,14 +711,22 @@ mod tests {
             ]
         );
 
-        // null entry removes a level; explicit xhigh entry adds it.
+        // null entry removes a level; explicit xhigh/max entries add them.
         let mut map = ThinkingLevelMap::new();
         map.insert("low".to_string(), None); // unsupported
-        map.insert("xhigh".to_string(), Some("max".to_string())); // enabled
+        map.insert("xhigh".to_string(), Some("xhigh".to_string())); // enabled
+        map.insert("max".to_string(), Some("max".to_string())); // enabled
         let r2 = model("p", "c", true, Some(map));
         let levels = get_supported_thinking_levels(&r2);
         assert!(!levels.contains(&ModelThinkingLevel::Low));
         assert!(levels.contains(&ModelThinkingLevel::Xhigh));
+        assert!(levels.contains(&ModelThinkingLevel::Max));
+        // `max` is opt-in exactly like `xhigh`: an explicit null keeps it off the ladder even
+        // though every lower rung is implicitly on.
+        let mut null_max = ThinkingLevelMap::new();
+        null_max.insert("max".to_string(), None);
+        let r3 = model("p", "d", true, Some(null_max));
+        assert!(!get_supported_thinking_levels(&r3).contains(&ModelThinkingLevel::Max));
     }
 
     #[test]
@@ -721,12 +735,29 @@ mod tests {
         let mut map = ThinkingLevelMap::new();
         map.insert("medium".to_string(), None);
         map.insert("high".to_string(), None);
-        map.insert("xhigh".to_string(), Some("max".to_string()));
+        map.insert("xhigh".to_string(), Some("xhigh".to_string()));
         let m = model("p", "c", true, Some(map));
         // medium unsupported → nearest higher supported is xhigh.
         assert_eq!(
             clamp_thinking_level(&m, ModelThinkingLevel::Medium),
             ModelThinkingLevel::Xhigh
+        );
+        // `max` is above every supported rung → the upward walk finds nothing and the downward
+        // walk lands on xhigh (Pi models.ts:688-691).
+        assert_eq!(
+            clamp_thinking_level(&m, ModelThinkingLevel::Max),
+            ModelThinkingLevel::Xhigh
+        );
+
+        // The mirror case, and the one the corrected `claude-opus-4-6` catalog produces: `max` is
+        // the ONLY top rung, so a request for `xhigh` must promote UP to it rather than fall to
+        // `high`. This only works because `Max` is declared after `Xhigh` in the ladder.
+        let mut only_max = ThinkingLevelMap::new();
+        only_max.insert("max".to_string(), Some("max".to_string()));
+        let m_max = model("p", "e", true, Some(only_max));
+        assert_eq!(
+            clamp_thinking_level(&m_max, ModelThinkingLevel::Xhigh),
+            ModelThinkingLevel::Max
         );
 
         // Non-reasoning model clamps everything to off.

@@ -33,6 +33,9 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Xhigh,
+    /// The top rung (Pi added `"max"` in fbdd4638). Declared LAST so the declaration order stays
+    /// the ascending ladder `EXTENDED_THINKING_LEVELS` walks when clamping upward.
+    Max,
 }
 
 /// A model's selectable reasoning level (Pi `ModelThinkingLevel = "off" | ThinkingLevel`,
@@ -48,6 +51,8 @@ pub enum ModelThinkingLevel {
     Medium,
     High,
     Xhigh,
+    /// See [`ThinkingLevel::Max`]. Last, for the same ladder-ordering reason.
+    Max,
 }
 
 impl ModelThinkingLevel {
@@ -60,6 +65,7 @@ impl ModelThinkingLevel {
             ModelThinkingLevel::Medium => Some(ThinkingLevel::Medium),
             ModelThinkingLevel::High => Some(ThinkingLevel::High),
             ModelThinkingLevel::Xhigh => Some(ThinkingLevel::Xhigh),
+            ModelThinkingLevel::Max => Some(ThinkingLevel::Max),
         }
     }
 
@@ -77,6 +83,7 @@ impl From<ThinkingLevel> for ModelThinkingLevel {
             ThinkingLevel::Medium => ModelThinkingLevel::Medium,
             ThinkingLevel::High => ModelThinkingLevel::High,
             ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+            ThinkingLevel::Max => ModelThinkingLevel::Max,
         }
     }
 }
@@ -683,6 +690,22 @@ mod tests {
         assert_eq!(ModelThinkingLevel::High.level(), Some(ThinkingLevel::High));
         assert!(ModelThinkingLevel::Minimal.is_on());
         assert_eq!(ModelThinkingLevel::from(ThinkingLevel::Low), ModelThinkingLevel::Low);
+    }
+
+    /// PROV-002: the `max` rung Pi added in fbdd4638 (`types.ts:79`). It must be an ON level and
+    /// must serialize to the bare `"max"` key the `thinkingLevelMap`, settings and session
+    /// persistence all use.
+    #[test]
+    fn max_is_a_first_class_on_level() {
+        assert_eq!(ModelThinkingLevel::Max.level(), Some(ThinkingLevel::Max));
+        assert!(ModelThinkingLevel::Max.is_on());
+        assert_eq!(ModelThinkingLevel::from(ThinkingLevel::Max), ModelThinkingLevel::Max);
+        assert_eq!(serde_json::to_value(ModelThinkingLevel::Max).expect("ser"), serde_json::json!("max"));
+        assert_eq!(serde_json::to_value(ThinkingLevel::Max).expect("ser"), serde_json::json!("max"));
+        assert_eq!(
+            serde_json::from_value::<ModelThinkingLevel>(serde_json::json!("max")).expect("de"),
+            ModelThinkingLevel::Max
+        );
     }
 
     #[test]

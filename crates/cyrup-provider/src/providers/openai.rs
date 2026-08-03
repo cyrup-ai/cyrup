@@ -87,8 +87,9 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openai_models();
-        // Every entry in Pi's `openai.models.ts` (42 models).
-        assert_eq!(models.len(), 42);
+        // Every entry in Pi's `openai.models.ts` @91585d9a (45 models — the GPT-5.6 trio landed in
+        // `7df2a94e`).
+        assert_eq!(models.len(), 45);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_RESPONSES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openai"));
         assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));
@@ -101,7 +102,17 @@ mod tests {
     #[test]
     fn long_context_models_carry_the_272k_pricing_tier() {
         let models = openai_models();
-        let long_context = ["gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro"];
+        // The GPT-5.6 trio (pi `7df2a94e`, openai.models.ts @91585d9a) carries the same 272k tier
+        // with the same 2x/1.5x/2x/2x multipliers as the 5.4/5.5 family.
+        let long_context = [
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ];
         for id in long_context {
             let m = models
                 .iter()

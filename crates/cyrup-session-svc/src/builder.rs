@@ -1193,7 +1193,7 @@ pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
     if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
 }
 
-/// Serialize a [`ModelThinkingLevel`] to its persisted snake/camel key (`off`/`minimal`/…/`xhigh`).
+/// Serialize a [`ModelThinkingLevel`] to its persisted snake/camel key (`off`/`minimal`/…/`xhigh`/`max`).
 pub(crate) fn thinking_level_to_str(level: ModelThinkingLevel) -> String {
     serde_json::to_value(level)
         .ok()
@@ -1561,6 +1561,34 @@ fn today() -> time::Date {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::http_proxy_overlay;
+
+    /// PROV-002: the persisted session key for the `max` rung. Both directions go through serde,
+    /// so this pins that the enum change actually reaches session replay + the `model:max`
+    /// fallback suffix path (`fallback_model` calls `thinking_level_from_str`).
+    #[test]
+    fn thinking_level_max_round_trips_through_the_persisted_key() {
+        use super::{thinking_level_from_str, thinking_level_to_str};
+        use cyrup_core::ModelThinkingLevel;
+
+        assert_eq!(thinking_level_to_str(ModelThinkingLevel::Max), "max");
+        assert_eq!(thinking_level_from_str("max"), Some(ModelThinkingLevel::Max));
+        for level in [
+            ModelThinkingLevel::Off,
+            ModelThinkingLevel::Minimal,
+            ModelThinkingLevel::Low,
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+            ModelThinkingLevel::Max,
+        ] {
+            assert_eq!(
+                thinking_level_from_str(&thinking_level_to_str(level)),
+                Some(level),
+                "{level:?} must survive a persist/restore round-trip"
+            );
+        }
+        assert_eq!(thinking_level_from_str("ultra"), None);
+    }
 
     #[test]
     fn http_proxy_overlay_sets_both_proxy_keys_or_none() {

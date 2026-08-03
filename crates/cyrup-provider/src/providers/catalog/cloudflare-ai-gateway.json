@@ -150,7 +150,8 @@
 		"reasoning": true,
 		"thinkingLevelMap": {
 			"off": null,
-			"xhigh": "xhigh"
+			"xhigh": "xhigh",
+			"max": "max"
 		},
 		"input": [
 			"text",
@@ -269,7 +270,7 @@
 		},
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"xhigh": "max"
+			"max": "max"
 		},
 		"input": [
 			"text",
@@ -297,7 +298,8 @@
 		},
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"xhigh": "xhigh"
+			"xhigh": "xhigh",
+			"max": "max"
 		},
 		"input": [
 			"text",
@@ -325,7 +327,8 @@
 		},
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"xhigh": "xhigh"
+			"xhigh": "xhigh",
+			"max": "max"
 		},
 		"input": [
 			"text",
@@ -397,6 +400,9 @@
 			"forceAdaptiveThinking": true
 		},
 		"reasoning": true,
+		"thinkingLevelMap": {
+			"max": "max"
+		},
 		"input": [
 			"text",
 			"image"
@@ -421,6 +427,10 @@
 			"forceAdaptiveThinking": true
 		},
 		"reasoning": true,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
 		"input": [
 			"text",
 			"image"

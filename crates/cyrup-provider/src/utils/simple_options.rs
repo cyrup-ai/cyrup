@@ -98,11 +98,15 @@ pub fn build_base_options(
 }
 
 /// Clamp a reasoning effort to the levels token-budget providers understand (Pi `clampReasoning`,
-/// simple-options.ts:47-49): `xhigh` collapses to `high`; every other level is unchanged.
+/// simple-options.ts:48-49): `xhigh` AND `max` both collapse to `high`; every other level is
+/// unchanged. Matched exhaustively (no `_` arm) so a future rung cannot silently pass through.
 pub fn clamp_reasoning(effort: ThinkingLevel) -> ThinkingLevel {
     match effort {
-        ThinkingLevel::Xhigh => ThinkingLevel::High,
-        other => other,
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => ThinkingLevel::High,
+        ThinkingLevel::Minimal => ThinkingLevel::Minimal,
+        ThinkingLevel::Low => ThinkingLevel::Low,
+        ThinkingLevel::Medium => ThinkingLevel::Medium,
+        ThinkingLevel::High => ThinkingLevel::High,
     }
 }
 
@@ -140,8 +144,10 @@ fn budget_for_level(level: ThinkingLevel, custom: Option<&ThinkingBudgets>) -> u
         ThinkingLevel::Minimal => (1024, custom.and_then(|c| c.minimal)),
         ThinkingLevel::Low => (2048, custom.and_then(|c| c.low)),
         ThinkingLevel::Medium => (8192, custom.and_then(|c| c.medium)),
-        // `clamp_reasoning` collapses `xhigh` to `high`; both land here.
-        ThinkingLevel::High | ThinkingLevel::Xhigh => (16384, custom.and_then(|c| c.high)),
+        // `clamp_reasoning` collapses `xhigh` and `max` to `high`; all three land here.
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
+            (16384, custom.and_then(|c| c.high))
+        }
     };
     override_val.unwrap_or(default)
 }

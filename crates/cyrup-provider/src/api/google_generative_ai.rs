@@ -395,14 +395,14 @@ fn thinking_level(effort: ThinkingLevel, model: &Model) -> Option<&'static str> 
         return match effort {
             ThinkingLevel::Minimal | ThinkingLevel::Low => Some("LOW"),
             ThinkingLevel::Medium | ThinkingLevel::High => Some("HIGH"),
-            ThinkingLevel::Xhigh => None,
+            ThinkingLevel::Xhigh | ThinkingLevel::Max => None,
         };
     }
     if is_gemma4(model) {
         return match effort {
             ThinkingLevel::Minimal | ThinkingLevel::Low => Some("MINIMAL"),
             ThinkingLevel::Medium | ThinkingLevel::High => Some("HIGH"),
-            ThinkingLevel::Xhigh => None,
+            ThinkingLevel::Xhigh | ThinkingLevel::Max => None,
         };
     }
     match effort {
@@ -410,7 +410,9 @@ fn thinking_level(effort: ThinkingLevel, model: &Model) -> Option<&'static str> 
         ThinkingLevel::Low => Some("LOW"),
         ThinkingLevel::Medium => Some("MEDIUM"),
         ThinkingLevel::High => Some("HIGH"),
-        ThinkingLevel::Xhigh => None,
+        // Pi types the parameter `ClampedThinkingLevel = Exclude<ThinkingLevel, "xhigh"|"max">`
+        // (google-generative-ai.ts:410), so both fall off every switch as `undefined`.
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => None,
     }
 }
 
@@ -427,7 +429,7 @@ fn google_budget(
             ThinkingLevel::Minimal => c.minimal,
             ThinkingLevel::Low => c.low,
             ThinkingLevel::Medium => c.medium,
-            ThinkingLevel::High | ThinkingLevel::Xhigh => c.high,
+            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => c.high,
         };
         if let Some(v) = v {
             return Some(v as i64);
@@ -450,8 +452,8 @@ fn google_budget(
             ThinkingLevel::Low => Some(low),
             ThinkingLevel::Medium => Some(medium),
             ThinkingLevel::High => Some(high),
-            // Pi `budgets[xhigh]` is `undefined` → omit.
-            ThinkingLevel::Xhigh => None,
+            // Pi `budgets[xhigh]` / `budgets[max]` are `undefined` → omit.
+            ThinkingLevel::Xhigh | ThinkingLevel::Max => None,
         },
         None => Some(-1),
     }

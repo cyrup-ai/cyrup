@@ -687,11 +687,12 @@ pub struct AttemptSpawnPlan {
     pub spec: ChildSpawnSpec,
 }
 
-/// The reasoning-level suffixes [`apply_thinking_suffix`] recognizes on a model id (pi
-/// `THINKING_LEVELS`, `pi-args.ts:10`). Includes `off` — a value cyrup-core's closed on-only
+/// The reasoning-level suffixes [`apply_thinking_suffix`] recognizes on a model id (pi-subagents
+/// `THINKING_LEVELS`, `src/shared/model-info.ts:1`; `max` added upstream in 747de75). Includes
+/// `off` — a value cyrup-core's closed on-only
 /// `ThinkingLevel` enum cannot itself represent, but which the string-level suffix check must still
 /// recognize so a model id that already ends `:off` is never double-suffixed.
-const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Child env flag: whether the subagent inherits the parent's project-context files
 /// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`pi-args.ts:199`).
@@ -2958,6 +2959,24 @@ mod tests {
         assert_eq!(
             apply_thinking_suffix(Some("model:high"), Some("low")).as_deref(),
             Some("model:high")
+        );
+    }
+
+    /// PROV-002: `max` must be a RECOGNIZED suffix. With the 6-entry list, a model id already
+    /// ending `:max` was not recognized and got double-suffixed to `model:max:high`, producing an
+    /// unresolvable id for the child process. Upstream pi-subagents fixed this in 747de75
+    /// (`src/shared/model-info.ts:1`).
+    #[test]
+    fn apply_thinking_suffix_recognizes_max_as_an_existing_level() {
+        assert_eq!(
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:max"), Some("high")).as_deref(),
+            Some("anthropic/claude-opus-4-6:max"),
+            "an existing `:max` must not be double-suffixed"
+        );
+        // …and `max` is appendable as a level in its own right.
+        assert_eq!(
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6"), Some("max")).as_deref(),
+            Some("anthropic/claude-opus-4-6:max")
         );
     }
 
