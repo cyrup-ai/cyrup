@@ -419,7 +419,7 @@ async fn execute_bash_interactive_emits_user_bash_with_live_values() {
         .expect("build");
 
     let _ = session
-        .execute_bash_interactive("echo hello", BashOptions { exclude_from_context: true }, None)
+        .execute_bash_interactive("echo hello", BashOptions { exclude_from_context: true, id: None }, None)
         .await;
 
     let seen = probe.lock().unwrap().clone();
@@ -447,7 +447,7 @@ async fn execute_bash_never_emits_user_bash() {
         .expect("build");
 
     let _ = session
-        .execute_bash("echo hello", BashOptions { exclude_from_context: true }, None)
+        .execute_bash("echo hello", BashOptions { exclude_from_context: true, id: None }, None)
         .await;
 
     let seen = probe.lock().unwrap().clone();

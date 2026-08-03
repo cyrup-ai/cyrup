@@ -200,7 +200,10 @@ pub struct OutboundReplyWaiter {
 struct WaiterSlot {
     from: String,
     reply_to: String,
-    tx: oneshot::Sender<Message>,
+    /// `Ok(reply)` on delivery; `Err(reason)` when the slot is failed out from under the waiter —
+    /// pi `rejectReplyWaiter(new Error(...))` (`index.ts:507-509`), which the client `disconnected`
+    /// handler fires so an ask cannot hang across a reconnect (`index.ts:783-784`).
+    tx: oneshot::Sender<std::result::Result<Message, String>>,
 }
 
 impl OutboundReplyWaiter {
@@ -216,7 +219,11 @@ impl OutboundReplyWaiter {
     ///
     /// # Errors
     /// Returns the busy message when a slot is already occupied.
-    pub fn register(&self, from: String, reply_to: String) -> Result<oneshot::Receiver<Message>, String> {
+    pub fn register(
+        &self,
+        from: String,
+        reply_to: String,
+    ) -> Result<oneshot::Receiver<std::result::Result<Message, String>>, String> {
         let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return Err("Already waiting for a reply".to_string());
@@ -245,10 +252,30 @@ impl OutboundReplyWaiter {
         if matched
             && let Some(slot) = guard.take()
         {
-            let _ = slot.tx.send(message.clone());
+            let _ = slot.tx.send(Ok(message.clone()));
             return true;
         }
         matched
+    }
+
+    /// Fail whatever ask is outstanding with `reason` — pi `rejectReplyWaiter`
+    /// (`index.ts:507-509`), fired from the client `disconnected` handler
+    /// (`Disconnected while waiting for reply: …`, `index.ts:783-784`) and from the session
+    /// replace/shutdown paths (`index.ts:940,1066`).
+    ///
+    /// Without this, an ask that was in flight when the socket dropped would sit in its slot until
+    /// the full ask timeout (10 min by default) waiting for a reply that can never arrive: the
+    /// broker has no mailbox, so the answer is not redelivered after a reconnect. Returns whether a
+    /// waiter was actually failed.
+    pub fn fail_pending(&self, reason: &str) -> bool {
+        let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match slot {
+            Some(slot) => {
+                let _ = slot.tx.send(Err(reason.to_string()));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Clear the slot if it is the one for `reply_to` (tool cleanup on timeout/cancel/error). Dropping
@@ -449,9 +476,23 @@ mod tests {
             content: MessageContent { text: "answer".to_string(), attachments: None },
         };
         assert!(waiter.try_deliver(&session("supervisor", Some("supervisor")), &reply));
-        let got = rx.await.expect("received");
+        let got = rx.await.expect("received").expect("delivered, not failed");
         assert_eq!(got.content.text, "answer");
         assert!(!waiter.is_waiting(), "slot freed after delivery");
+    }
+
+    /// The disconnect edge must FAIL an in-flight ask with pi's reason
+    /// (`Disconnected while waiting for reply: …`, `index.ts:783-784`) rather than leaving it to
+    /// hang until the ask timeout — the answer can never arrive, because the broker has no mailbox.
+    #[tokio::test]
+    async fn outbound_waiter_fails_pending_on_disconnect() {
+        let waiter = OutboundReplyWaiter::new();
+        let rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
+        assert!(waiter.fail_pending("Disconnected while waiting for reply: socket closed"));
+        let reason = rx.await.expect("resolved immediately").expect_err("failed, not delivered");
+        assert_eq!(reason, "Disconnected while waiting for reply: socket closed");
+        assert!(!waiter.is_waiting(), "slot freed by the failure");
+        assert!(!waiter.fail_pending("again"), "nothing left to fail");
     }
 
     #[test]

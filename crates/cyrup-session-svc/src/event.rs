@@ -98,6 +98,20 @@ pub enum DeliverAs {
     NextTurn,
 }
 
+/// Which summarization a retry belongs to — Pi's discriminated pair on
+/// `summarization_retry_attempt_start` (`agent-session.ts:173-178`) and the `source` argument of
+/// `_summarizationRetryCallbacks` (`:2641-2643`). Serialized flattened, so `source` is a sibling
+/// key of `type` and `reason` only appears on the compaction arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "source", rename_all = "camelCase")]
+pub enum SummarizationRetrySource {
+    /// Pi `{ source: "branchSummary" }` — `generateBranchSummary` (`agent-session.ts:2998`).
+    BranchSummary,
+    /// Pi `{ source: "compaction", reason }` — manual `compact` (`:1859`) and `_runAutoCompaction`
+    /// (`:2133`), which passes the live threshold/overflow reason through.
+    Compaction { reason: CompactionReason },
+}
+
 /// The event super-set the seam exposes (arch-11 §3.2).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
@@ -178,6 +192,45 @@ pub enum AgentSessionEvent {
         attempt: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_error: Option<String>,
+    },
+    /// A summarization retry was scheduled — emitted BEFORE the backoff sleep (Pi
+    /// `summarization_retry_scheduled`, agent-session.ts:166-172, emitted from
+    /// `_summarizationRetryCallbacks.onRetryScheduled`, :2648-2656). Distinct from
+    /// [`Self::AutoRetryStart`], which covers the turn-level retry: this one fires while a
+    /// compaction / branch summarization is in flight, so the front-end can replace the
+    /// compaction indicator with a retry countdown instead of appearing hung.
+    SummarizationRetryScheduled {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: String,
+    },
+    /// The backoff elapsed and the summarization call is being re-issued (Pi
+    /// `summarization_retry_attempt_start`, agent-session.ts:173-178 / :2657-2663). `source`
+    /// carries the context the TUI needs to recreate the underlying indicator; it is flattened so
+    /// the wire shape is Pi's discriminated pair — `{"source":"branchSummary"}` or
+    /// `{"source":"compaction","reason":"manual"}`.
+    SummarizationRetryAttemptStart {
+        #[serde(flatten)]
+        source: SummarizationRetrySource,
+    },
+    /// The summarization retry loop settled (Pi `summarization_retry_finished`,
+    /// agent-session.ts:179 / :2664-2667). Deliberately payload-free: Pi's `onRetryFinished`
+    /// receives `(success, attempt, finalError)` but `_summarizationRetryCallbacks` discards all
+    /// three, so adding fields here would diverge the RPC shape. Fires at most ONCE per
+    /// summarization call, and only when at least one retry was actually scheduled — a call that
+    /// succeeds on its first attempt emits none of these three events
+    /// (`retry.ts:176/183/188`, ported at `cyrup-provider/src/utils/retry.rs`'s `last_retry` guard).
+    SummarizationRetryFinished,
+    /// A chunk of combined output from the out-of-loop [`crate::AgentSession::execute_bash`] seam
+    /// (Pi `bash_execution_update`, agent-session.ts:181, emitted from `executeBash`'s `onChunk`
+    /// wrapper at :2785-2787). Pi emits this for EVERY caller, including ones that pass no
+    /// `onChunk` sink, so a front-end that only observes events still renders live bash output.
+    /// `id` is `options?.id` and is omitted from the JSON when absent, matching Pi's optional field.
+    BashExecutionUpdate {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        delta: String,
     },
     ModelChanged {
         provider: String,
@@ -297,6 +350,14 @@ impl AgentSessionEvent {
             AgentSessionEvent::CompactionEnd { .. } => "compaction_end",
             AgentSessionEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentSessionEvent::AutoRetryEnd { .. } => "auto_retry_end",
+            AgentSessionEvent::SummarizationRetryScheduled { .. } => {
+                "summarization_retry_scheduled"
+            }
+            AgentSessionEvent::SummarizationRetryAttemptStart { .. } => {
+                "summarization_retry_attempt_start"
+            }
+            AgentSessionEvent::SummarizationRetryFinished => "summarization_retry_finished",
+            AgentSessionEvent::BashExecutionUpdate { .. } => "bash_execution_update",
             AgentSessionEvent::ModelChanged { .. } => "model_changed",
             AgentSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
             AgentSessionEvent::SessionInfoChanged { .. } => "session_info_changed",

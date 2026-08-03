@@ -53,10 +53,11 @@ impl ContactSupervisorTool {
     }
 
     async fn dispatch(&self, params: ContactParams, cancel: &CancelToken) -> Result<ToolResult, ToolError> {
-        let client = self
-            .state
-            .client()
-            .ok_or_else(|| ToolError::new("intercom is not connected to the broker"))?;
+        // `ensureConnected("tool")` (`index.ts:1231`): reconnect (and respawn the broker) on demand
+        // rather than failing forever after one earlier connection failure.
+        let client = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Tool)
+            .await
+            .map_err(|e| ToolError::new(format!("intercom is not connected to the broker: {e}")))?;
 
         let supervisor = self.resolve_supervisor(&client).await;
         if client.session_id().as_deref() == Some(supervisor.as_str()) {

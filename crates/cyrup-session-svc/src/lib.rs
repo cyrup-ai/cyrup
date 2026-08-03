@@ -47,7 +47,7 @@ pub use error::SessionServiceError;
 pub use export::session_jsonl_to_html;
 pub use event::{
     AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
-    UserInput,
+    SummarizationRetrySource, UserInput,
 };
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;

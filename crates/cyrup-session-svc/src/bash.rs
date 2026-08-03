@@ -44,6 +44,10 @@ pub type BashChunkSink = Option<Box<dyn FnMut(&str) + Send>>;
 pub struct BashOptions {
     /// `!!` prefix: keep the output out of the LLM context (still recorded for history).
     pub exclude_from_context: bool,
+    /// Optional identifier echoed on every `bash_execution_update` event (Pi `options.id`,
+    /// agent-session.ts:2769/2786), so a front-end driving several concurrent `executeBash` calls
+    /// can route the deltas. Absent from the emitted JSON when `None`, matching Pi's `id?: string`.
+    pub id: Option<String>,
 }
 
 /// Run `command` against `proc` in `cwd`, streaming combined output to `on_chunk`, honoring `cancel`

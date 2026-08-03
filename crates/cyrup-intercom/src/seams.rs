@@ -90,7 +90,10 @@ impl DeliveryChannel for IntercomDeliveryChannel {
                 let _ = services.inject_message(&text, Some("subagent-result"), true, true);
                 return Ok(true);
             };
-            let Some(client) = self.state.client() else {
+            // pi's relay path uses `ensureConnected("background")` (`index.ts:1000`), so a relay that
+            // lands while the connection is down reconnects instead of degrading forever; a failure
+            // here re-arms the reconnect ladder (background is the one reason that does).
+            let Ok(client) = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background).await else {
                 return Ok(false); // not connected → degrade (keep full inline).
             };
             let resolved = match self.state.resolve_target(&client, &target).await {
@@ -129,8 +132,10 @@ impl SteerChannel for IntercomSteerChannel {
     fn steer(&self, target: String, text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async move {
             // Not connected → no registered receiver reachable (the genuine delivery-failed fallback,
-            // pi's "intercom target is not registered" precondition), NOT a transport error.
-            let Some(client) = self.state.client() else {
+            // pi's "intercom target is not registered" precondition), NOT a transport error. As with
+            // the delivery channel, reconnect first (`ensureConnected("background")`, `index.ts:1000`)
+            // so a dropped connection does not permanently disable steering.
+            let Ok(client) = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background).await else {
                 return Ok(false);
             };
             // Resolve the deterministic target (name) to a live session id when one is registered;

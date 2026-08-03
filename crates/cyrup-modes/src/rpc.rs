@@ -1024,7 +1024,17 @@ async fn handle(
             // dispatcher's `catch` (`rpc-mode.ts:756-772`), which emits an `error(...)` response
             // with no history entry ever recorded. Mirror that via the same `Ok`/`Err` pattern every
             // other fallible command here uses (e.g. `compact` above).
-            match session.execute_bash(&command, BashOptions { exclude_from_context }, None).await {
+            // Pi threads the JSON-RPC request id into `executeBash`'s options (`rpc-mode.ts:574`,
+            // `id`), so every `bash_execution_update` it emits carries the id of the request whose
+            // output it belongs to. The wire id may be a string OR a number (see `raw_id`'s doc);
+            // render a non-string id with its JSON spelling rather than dropping it.
+            let bash_id = raw_id
+                .as_ref()
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            match session
+                .execute_bash(&command, BashOptions { exclude_from_context, id: bash_id }, None)
+                .await
+            {
                 Ok(result) => RpcResponse::ok(
                     "bash",
                     id,

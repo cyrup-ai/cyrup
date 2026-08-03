@@ -141,7 +141,9 @@ impl AgentSession {
             C::Bash { command, exclude_from_context } => O::Bash(
                 self.execute_bash(
                     &command,
-                    crate::BashOptions { exclude_from_context },
+                    // No request id on the in-process command seam (Pi's `options.id` is the
+                    // JSON-RPC request id, supplied only by `rpc-mode.ts:574`).
+                    crate::BashOptions { exclude_from_context, id: None },
                     None,
                 )
                 .await?,

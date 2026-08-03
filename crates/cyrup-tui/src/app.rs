@@ -22,7 +22,10 @@ use cyrup_core::{CancelToken, EventStream, ModelThinkingLevel};
 use cyrup_ext::host::HostServices;
 use cyrup_provider::StreamEvent;
 use cyrup_resources::theme::ThemeData;
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, InputSource, UserInput};
+use cyrup_session_svc::{
+    AgentSession, AgentSessionEvent, CompactionReason, InputSource, SummarizationRetrySource,
+    UserInput,
+};
 use cyrup_session_svc::{
     AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
 };
@@ -2682,6 +2685,58 @@ impl<B: Backend> App<B> {
                 self.state.indicator.set(IndicatorKind::Retry, Some(msg.clone()));
                 self.state.transcript.push_status(msg);
             }
+            AgentSessionEvent::SummarizationRetryScheduled {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
+                // Pi `interactive-mode.ts:3222-3229`: surface the transient error, then swap the
+                // compaction/branch indicator for the same `RetryStatusIndicator` the turn-level
+                // auto-retry uses, so a compacting session shows a countdown rather than hanging.
+                self.state.transcript.push_error(error_message.clone());
+                let seconds = delay_ms.div_ceil(1000);
+                let msg = format!("Retrying ({attempt}/{max_attempts}) in {seconds}s…");
+                self.state.indicator.set(IndicatorKind::Retry, Some(msg.clone()));
+                self.state.transcript.push_status(msg);
+            }
+            AgentSessionEvent::SummarizationRetryAttemptStart { source } => {
+                // Pi `interactive-mode.ts:3231-3240`: clear the retry indicator and RECREATE the
+                // underlying one from `source` — that is the only reason the event carries it.
+                let (kind, msg) = match source {
+                    SummarizationRetrySource::BranchSummary => {
+                        (IndicatorKind::BranchSummary, "Summarizing branch…".to_string())
+                    }
+                    SummarizationRetrySource::Compaction { reason } => (
+                        IndicatorKind::Compaction,
+                        match reason {
+                            CompactionReason::Manual => "Compacting context…".to_string(),
+                            CompactionReason::Overflow => {
+                                "Context overflow detected, Auto-compacting…".to_string()
+                            }
+                            CompactionReason::Threshold => "Auto-compacting…".to_string(),
+                        },
+                    ),
+                };
+                self.state.indicator.set(kind, Some(msg));
+            }
+            AgentSessionEvent::SummarizationRetryFinished => {
+                // Pi `interactive-mode.ts:3242-3245`: `clearStatusIndicator("retry")` only — it is
+                // a no-op unless the retry indicator is the live one, which it is exactly when the
+                // loop ended DURING a backoff (exhausted / aborted). A loop that ended on a
+                // successful retried call already restored its own indicator in the arm above.
+                if self.state.indicator.kind() == IndicatorKind::Retry {
+                    if self.state.status.streaming {
+                        self.state.indicator.working();
+                    } else {
+                        self.state.indicator.idle();
+                    }
+                }
+            }
+            // Pi renders bash output from the execution callback, not from this event
+            // (`interactive-mode.ts:3075-3077`: "The bash execution callback handles TUI output
+            // rendering."). Kept as an explicit no-op so the parity is visible.
+            AgentSessionEvent::BashExecutionUpdate { .. } => {}
             AgentSessionEvent::AutoRetryEnd { success, .. } => {
                 if self.state.status.streaming {
                     self.state.indicator.working();

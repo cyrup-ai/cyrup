@@ -34,19 +34,18 @@ use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, HostServic
 use cyrup_ext_subagents::tui::intercom::{ClarifyChannel, DeliveryChannel, SteerChannel};
 
 use crate::config::{IntercomConfig, ask_timeout_ms, config_path, load_config};
+use crate::connect::{self, ConnectParams};
 use crate::identity::{
-    ChildOrchestratorMetadata, ENV_INTERCOM_SESSION_ID, preferred_supervisor_target,
-    presence_name, read_child_orchestrator_metadata,
+    ChildOrchestratorMetadata, preferred_supervisor_target, read_child_orchestrator_metadata,
 };
-use crate::inbound::{schedule_inbound_flush, spawn_inbound_loop};
-use crate::paths::{agent_dir_path, broker_socket_path, intercom_dir_path};
+use crate::inbound::schedule_inbound_flush;
+use crate::paths::{agent_dir_path, intercom_dir_path};
 use crate::seams::{IntercomClarifyChannel, IntercomDeliveryChannel, IntercomSteerChannel};
 use crate::session_state::SharedIntercomState;
 use crate::tools::contact_supervisor::ContactSupervisorTool;
 use crate::tools::intercom::IntercomTool;
 use crate::transport::client::IntercomClient;
-use crate::transport::protocol::{SessionInfo, SessionRegistration, now_ms};
-use crate::transport::spawn::ensure_broker;
+use crate::transport::protocol::{SessionInfo, now_ms};
 use crate::ui::compose::COMPOSE_MAX_WIDTH;
 use crate::ui::{ComposeOverlay, DefaultKeybindings, PlainTheme, SessionListOverlay, compose_send};
 
@@ -136,41 +135,15 @@ impl IntercomExtension {
         &self.state
     }
 
-    fn build_registration(&self, model: Option<&str>) -> SessionRegistration {
-        let session_id_env = std::env::var(ENV_INTERCOM_SESSION_ID).ok();
-        // The presence name is:
-        //   1. a subagent child's own deterministic label (`metadata.session_name`), else
-        //   2. (a top-level/plain orchestrator) the presence name derived from the LIVE `HostServices`
-        //      — `presence_name(session_name, session_id)` — matching pi `buildPresenceIdentity`
-        //      (`pi-intercom/index.ts:387-389`). This is REQUIRED so a spawned child can address this
-        //      orchestrator: the child's `CYRUP_SUBAGENT_ORCHESTRATOR_TARGET` is
-        //      `orchestrator_presence_target(session_name, session_id)` over the SAME session id/name,
-        //      so the two independently-produced strings match at the broker (before this, a top-level
-        //      orchestrator had no `CYRUP_INTERCOM_SESSION_ID` → registered `name: None` → unaddressable).
-        //   3. else the `CYRUP_INTERCOM_SESSION_ID`-derived alias (refined post-register).
-        let name = self
-            .metadata
-            .as_ref()
-            .and_then(|m| m.session_name.clone())
-            .or_else(|| {
-                self.state.host_services().and_then(|services| {
-                    services
-                        .session_id()
-                        .filter(|id| !id.is_empty())
-                        .map(|id| presence_name(services.session_name().as_deref(), &id))
-                })
-            })
-            .or_else(|| {
-                session_id_env.as_deref().map(|id| presence_name(None, id))
-            });
-        SessionRegistration {
-            name,
-            cwd: self.state.cwd.to_string_lossy().to_string(),
-            model: model.unwrap_or("cyrup").to_string(),
-            pid: std::process::id(),
-            started_at: now_ms(),
-            last_activity: now_ms(),
-            status: self.state.config.status.clone(),
+    /// The connect params every attempt (the startup one and every reconnect rung) rebuilds its
+    /// registration from — see [`crate::connect::build_registration`], which is where this
+    /// extension's former `build_registration` moved so a reconnect produces an IDENTICAL
+    /// registration instead of a stale snapshot captured once at `SessionStart`.
+    fn connect_params(&self, model: Option<&str>) -> ConnectParams {
+        ConnectParams {
+            agent_dir: self.agent_dir.clone(),
+            metadata: self.metadata.clone(),
+            model: model.map(str::to_string),
         }
     }
 
@@ -296,7 +269,10 @@ impl NativeExtension for IntercomExtension {
         if name != INTERCOM_COMMAND {
             return Err(ExtError::Component(format!("native extension has no handler for command `{name}`")));
         }
-        let Some(client) = self.state.client() else {
+        // pi's overlay opens through `ensureConnected("overlay")` (index.ts:1827,1864) rather than a
+        // bare `client` read: an overlay is a deliberate user action, so it is worth (re)spawning the
+        // broker and reconnecting for. A failure still degrades to the same text, never a hard error.
+        let Ok(client) = connect::ensure_connected(&self.state, connect::ConnectReason::Overlay).await else {
             return Ok(Some("Intercom is not connected in this session.".to_string()));
         };
         let output = self
@@ -313,27 +289,22 @@ impl NativeExtension for IntercomExtension {
                 // starts, so the inbound delivery policy (`inbound.rs`) can pick the interactive
                 // trigger-turn branch vs. the non-interactive busy auto-reply (index.ts:739-758).
                 self.state.set_has_ui(ctx.has_ui);
+                // `startSessionRuntime` (index.ts:926-951): publish the params every connect attempt
+                // rebuilds its registration from, clear the shutdown latch, bump the generation and
+                // reset the backoff ladder.
+                connect::begin_runtime(&self.state, self.connect_params(ctx.model()));
                 // Connect off the event path: `ensure_broker` may spawn the broker + wait up to 5s;
                 // blocking the SessionStart dispatch that long is unacceptable (the port doc §2 notes
                 // intercom must not stall the session), so the connect runs on a background task and
-                // stashes the live client into the shared state when ready.
+                // stashes the live client into the shared state when ready. pi does the same via a
+                // `setTimeout(…, 0)` (index.ts:952-965) — including the failure arm below, which is
+                // the whole point of ICOM-003: a broker that is not up YET must not disable intercom
+                // for the rest of the session, it must arm the reconnect ladder.
                 let state = self.state.clone();
-                let agent_dir = self.agent_dir.clone();
-                let registration = self.build_registration(ctx.model());
-                let session_id = std::env::var(ENV_INTERCOM_SESSION_ID).ok();
                 tokio::spawn(async move {
-                    if let Err(e) = ensure_broker(&agent_dir).await {
-                        tracing::warn!(error = %e, "intercom: broker unavailable; coordination disabled this session");
-                        return;
-                    }
-                    let socket = broker_socket_path(&intercom_dir_path(&agent_dir));
-                    match IntercomClient::connect(&socket, registration, session_id).await {
-                        Ok(client) => {
-                            let client = Arc::new(client);
-                            state.set_client(Some(client.clone()));
-                            spawn_inbound_loop(state, client);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "intercom: failed to register with the broker"),
+                    if let Err(e) = connect::ensure_connected(&state, connect::ConnectReason::Startup).await {
+                        tracing::warn!(error = %e, "intercom: startup connect failed; scheduling reconnect");
+                        connect::schedule_reconnect(&state);
                     }
                 });
                 HookOutcome::Noop
@@ -342,6 +313,11 @@ impl NativeExtension for IntercomExtension {
                 // `clearInboundFlushTimer()` (index.ts:1070): a pending debounce must not outlive the
                 // session and fire against a torn-down host.
                 self.state.set_flush_timer(None);
+                // `shuttingDown = true; disposed = true; clearReconnectTimer()` (index.ts:1060-1064)
+                // BEFORE the disconnect below, so the disconnect edge this triggers cannot arm a
+                // reconnect: a deliberate shutdown never reconnects.
+                connect::shutdown(&self.state);
+                self.state.waiter.fail_pending("Session shutting down");
                 if let Some(client) = self.state.client() {
                     client.disconnect();
                 }

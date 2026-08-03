@@ -35,7 +35,7 @@ use crate::compact::DynSummarizer;
 use crate::error::SessionServiceError;
 use crate::event::{
     core_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted, PromptOptions,
-    StreamingBehavior, UserInput,
+    StreamingBehavior, SummarizationRetrySource, UserInput,
 };
 use crate::host_services::InjectMessage;
 use crate::provider_swap::ProviderSwap;
@@ -1267,8 +1267,15 @@ impl AgentSession {
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
+        // (agent-session.ts:1859).
+        let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(
+            SummarizationRetrySource::Compaction { reason },
+        );
+        let retry_pump = self.spawn_event_pump(retry_rx);
         let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
+                .with_observer(retry_observer);
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
@@ -1369,6 +1376,10 @@ impl AgentSession {
             .map(cyrup_provider::estimate_message_tokens)
             .sum();
         drop(guard);
+        // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
+        // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
+        drop(compactor);
+        let _ = retry_pump.await;
         *Self::lock(&self.compaction_cancel) = None;
 
         match result {
@@ -1526,8 +1537,14 @@ impl AgentSession {
         user_wants_summary: bool,
     ) -> Result<Option<String>, SessionServiceError> {
         let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi: `this._summarizationRetryCallbacks({ source: "branchSummary" })`
+        // (agent-session.ts:2998).
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::BranchSummary);
+        let retry_pump = self.spawn_event_pump(retry_rx);
         let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
+                .with_observer(retry_observer);
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -1546,6 +1563,10 @@ impl AgentSession {
             )
             .await;
         drop(guard);
+        // Close + flush the retry queue with the manager guard already released (see
+        // `spawn_event_pump`).
+        drop(compactor);
+        let _ = retry_pump.await;
         *Self::lock(&self.branch_summary_cancel) = None;
         Ok(entry_opt?.map(|e| e.summary))
     }
@@ -1825,8 +1846,14 @@ impl AgentSession {
             _ => BRANCH_SUMMARY_PROMPT.to_string(),
         };
         let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
+        // Pi: `this._summarizationRetryCallbacks({ source: "branchSummary" })`
+        // (agent-session.ts:2998).
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::BranchSummary);
+        let retry_pump = self.spawn_event_pump(retry_rx);
         let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
+                .with_observer(retry_observer);
         let req = SummarizationRequest {
             system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
             prompt_text: prompt,
@@ -1841,7 +1868,12 @@ impl AgentSession {
             // `createSummarizationOptions`, so `reasoning` is never set for a branch summary.
             thinking: ModelThinkingLevel::Off,
         };
-        let resp = summarizer.complete(req, cancel).await?;
+        let resp = summarizer.complete(req, cancel).await;
+        // Close + flush the retry queue BEFORE the `?` early-returns on a failed summarization, so
+        // an exhausted retry still reports its `summarization_retry_finished`.
+        drop(summarizer);
+        let _ = retry_pump.await;
+        let resp = resp?;
         match resp.stop_reason {
             cyrup_core::StopReason::Error => Err(
                 cyrup_session::compaction::CompactionError::Summarization(
@@ -3072,6 +3104,38 @@ impl AgentSession {
         self.fanout.emit_external(ev).await;
     }
 
+    /// Forward events posted to `rx` onto the seam fan-out, from a DEDICATED task.
+    ///
+    /// Pi emits `summarization_retry_*` / `bash_execution_update` inline from synchronous callbacks
+    /// (`agent-session.ts:2645-2668` and `:2785-2787`); cyrup's fan-out is `async` (it awaits
+    /// per-subscriber backpressure) and those callbacks are not, so they post to an unbounded
+    /// channel that this task drains. Two properties are deliberate:
+    ///
+    /// * **A separate task, not an inline `select!`.** Every summarization-bearing operation runs
+    ///   while holding the session-manager lock, and [`Self::fanout_emit`] can block on a lagging
+    ///   subscriber's bounded channel. Emitting inline would mean awaiting that backpressure WITH
+    ///   the manager lock held — and a subscriber that is both lagging and waiting on the manager
+    ///   lock would deadlock the session. Every other emit site in this file drops the guard first
+    ///   for exactly that reason; this task keeps that invariant without serializing the operation
+    ///   behind the fan-out.
+    /// * **Ends when the last sender drops.** Callers close the queue by dropping the emitter (the
+    ///   compactor / bash sink that owns it) and then `await` the returned handle — AFTER releasing
+    ///   the manager guard — which flushes every queued event BEFORE the operation's own terminal
+    ///   event (`compaction_end`, the bash result), matching Pi's inline ordering. An early return
+    ///   that never awaits the handle still terminates the task, because the emitter is dropped at
+    ///   scope exit.
+    fn spawn_event_pump(
+        &self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentSessionEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        let fanout = Arc::clone(&self.fanout);
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                fanout.emit_external(ev).await;
+            }
+        })
+    }
+
     /// Persist a custom (non-LLM) message via the session tree (Pi `sendCustomMessage` durable path,
     /// agent-session.ts:1313). The agent transcript carries it as a `Custom` role for the next run.
     pub async fn append_custom_message(
@@ -3644,8 +3708,15 @@ impl AgentSession {
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         let model = { Self::lock(&self.compaction_model).clone() };
+        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
+        // threshold/overflow reason, not a literal (agent-session.ts:2133).
+        let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(
+            SummarizationRetrySource::Compaction { reason },
+        );
+        let retry_pump = self.spawn_event_pump(retry_rx);
         let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry());
+            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
+                .with_observer(retry_observer);
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
@@ -3710,16 +3781,22 @@ impl AgentSession {
                 cancel,
             )
             .await;
+        // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload. Hoisted
+        // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released
+        // on ONE path, before the retry queue is flushed.
+        let estimated_tokens_after: u64 = guard
+            .build_context()
+            .messages
+            .iter()
+            .map(cyrup_provider::estimate_message_tokens)
+            .sum();
+        drop(guard);
+        // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
+        // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
+        drop(compactor);
+        let _ = retry_pump.await;
         match result {
             Ok(Some(entry)) => {
-                // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload.
-                let estimated_tokens_after: u64 = guard
-                    .build_context()
-                    .messages
-                    .iter()
-                    .map(cyrup_provider::estimate_message_tokens)
-                    .sum();
-                drop(guard);
                 *Self::lock(&self.auto_compaction_cancel) = None;
                 let cr = crate::state::CompactionResult {
                     summary: entry.summary.clone(),
@@ -3755,7 +3832,6 @@ impl AgentSession {
                 Ok(true)
             }
             Ok(None) => {
-                drop(guard);
                 *Self::lock(&self.auto_compaction_cancel) = None;
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
@@ -3768,7 +3844,6 @@ impl AgentSession {
                 Ok(false)
             }
             Err(e) => {
-                drop(guard);
                 *Self::lock(&self.auto_compaction_cancel) = None;
                 let aborted = matches!(e, cyrup_session::compaction::CompactionError::Aborted);
                 // Pi agent-session.ts:2083-2097: on a non-abort failure, emit the reason-tagged
@@ -3863,6 +3938,24 @@ impl AgentSession {
             },
             None => self.shell.clone(),
         };
+        // Pi wraps the caller's `onChunk` and emits `bash_execution_update` for EVERY delta,
+        // whether or not a sink was supplied (agent-session.ts:2784-2787):
+        //   onChunk: (delta) => { onChunk?.(delta); this._emit({type:"bash_execution_update", …}) }
+        // so a front-end that only observes events still renders live output. The sync callback
+        // posts to a queue drained by `spawn_event_pump` (see its doc for why).
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bash_id = options.id.clone();
+        let mut caller_sink = on_chunk;
+        let sink: crate::bash::BashChunkSink = Some(Box::new(move |delta: &str| {
+            if let Some(cb) = caller_sink.as_mut() {
+                cb(delta);
+            }
+            let _ = chunk_tx.send(AgentSessionEvent::BashExecutionUpdate {
+                id: bash_id.clone(),
+                delta: delta.to_string(),
+            });
+        }));
+        let chunk_pump = self.spawn_event_pump(chunk_rx);
         let outcome = run_bash(
             &self.proc,
             &shell,
@@ -3870,9 +3963,12 @@ impl AgentSession {
             resolved_command,
             Some(bin_dir.as_path()),
             cancel,
-            on_chunk,
+            sink,
         )
         .await;
+        // `run_bash` consumed the sink, so its `chunk_tx` is already dropped: awaiting the pump
+        // flushes every delta before the caller sees the result.
+        let _ = chunk_pump.await;
         *Self::lock(&self.bash_cancel) = None;
         let result = outcome?;
         self.record_bash_result(command, &result, options).await;

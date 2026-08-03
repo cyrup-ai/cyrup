@@ -42,10 +42,12 @@ impl IntercomTool {
     }
 
     async fn dispatch(&self, params: IntercomParams, cancel: &CancelToken) -> Result<ToolResult, ToolError> {
-        let client = self
-            .state
-            .client()
-            .ok_or_else(|| ToolError::new("intercom is not connected to the broker"))?;
+        // pi routes every tool call through `ensureConnected("tool")` (`index.ts:1477`), not a bare
+        // `client` read: a tool call is worth (re)spawning the broker and reconnecting for, so a
+        // single earlier connection failure does not make this tool permanently useless.
+        let client = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Tool)
+            .await
+            .map_err(|e| ToolError::new(format!("intercom is not connected to the broker: {e}")))?;
 
         match params.action.as_str() {
             "list" => {

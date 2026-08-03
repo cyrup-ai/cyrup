@@ -41,6 +41,11 @@ pub struct SharedIntercomState {
     /// `inboundFlushTimer` + `clearInboundFlushTimer`, `index.ts:674-684`). Replacing it aborts the
     /// prior task, so a burst of inbound messages coalesces into ONE flush instead of N.
     flush_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The connection supervisor's state — pi's `reconnectTimer`/`reconnectAttempt`/`shuttingDown`/
+    /// `runtimeGeneration` closure vars (`index.ts:439-449`). Driven by [`crate::connect`]:
+    /// `ensure_connected`/`schedule_reconnect` recover the broker connection after a drop instead of
+    /// leaving [`Self::client`] empty for the rest of the session.
+    pub connect: crate::connect::ConnectSupervisor,
     /// Inbound ask tracking (`ReplyTracker`).
     pub tracker: Mutex<ReplyTracker>,
     /// The outbound single-slot reply waiter (`replyWaiter`).
@@ -62,6 +67,7 @@ impl SharedIntercomState {
             client: Mutex::new(None),
             host_services: Mutex::new(None),
             has_ui: AtomicBool::new(false),
+            connect: crate::connect::ConnectSupervisor::default(),
             pending_idle: Mutex::new(Vec::new()),
             flush_timer: Mutex::new(None),
             tracker: Mutex::new(ReplyTracker::new(ask_timeout_ms)),
@@ -245,7 +251,14 @@ impl SharedIntercomState {
                     // Inline the reply's attachments into the visible body, exactly as pi does
                     // (`replyText + formatAttachments(replyMessage.content.attachments)`,
                     // `index.ts:1646-1649,1354-1357`) — never silently drop them.
-                    Ok(message) => Ok(inline_reply_attachments(message.content.text, message.content.attachments.as_deref())),
+                    Ok(Ok(message)) => Ok(inline_reply_attachments(message.content.text, message.content.attachments.as_deref())),
+                    // The slot was FAILED out from under us — pi `rejectReplyWaiter` on the client
+                    // `disconnected` edge (`index.ts:783-784`) / session replace / shutdown. Surface
+                    // that reason verbatim instead of hanging until the ask timeout.
+                    Ok(Err(reason)) => {
+                        client.cancel_ask(&question_id);
+                        Err(IntercomError::Client(reason))
+                    }
                     Err(_) => {
                         // The slot's sender was dropped (cleared elsewhere).
                         self.waiter.clear_matching(&question_id);

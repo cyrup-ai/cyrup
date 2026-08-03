@@ -15,6 +15,7 @@
 
 pub mod broker;
 pub mod config;
+pub mod connect;
 pub mod error;
 pub mod extension;
 pub mod identity;

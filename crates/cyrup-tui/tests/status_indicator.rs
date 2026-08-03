@@ -150,3 +150,92 @@ fn compaction_band_renders_its_message() {
     assert!(!buf_text(&app).contains("Compacting context…"), "band should clear when idle");
     assert_eq!(app.state().indicator.kind(), IndicatorKind::Idle);
 }
+
+/// DRIFT-006 — a summarization retry must be VISIBLE and must restore the underlying indicator.
+///
+/// Pi `interactive-mode.ts:3222-3245`: `summarization_retry_scheduled` shows the retry countdown,
+/// `summarization_retry_attempt_start` clears it and RECREATES the compaction/branch indicator from
+/// the event's `source`, `summarization_retry_finished` clears the retry indicator. Before this
+/// change the events did not exist, so a compacting session showed "Compacting context…" frozen for
+/// the whole backoff with no indication anything was wrong.
+#[test]
+fn a_summarization_retry_shows_the_countdown_then_restores_the_compaction_band() {
+    use cyrup_session_svc::{CompactionReason, SummarizationRetrySource};
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+
+    app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Threshold });
+    app.draw().unwrap();
+    assert!(buf_text(&app).contains("Auto-compacting…"), "sanity: the compaction band is up");
+
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryScheduled {
+        attempt: 1,
+        max_attempts: 3,
+        delay_ms: 2000,
+        error_message: "terminated".into(),
+    });
+    app.draw().unwrap();
+    let out = buf_text(&app);
+    assert!(out.contains("Retrying (1/3) in 2s"), "retry countdown missing during backoff:\n{out}");
+    assert_eq!(app.state().indicator.kind(), IndicatorKind::Retry);
+
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryAttemptStart {
+        source: SummarizationRetrySource::Compaction { reason: CompactionReason::Threshold },
+    });
+    app.draw().unwrap();
+    let out = buf_text(&app);
+    assert_eq!(
+        app.state().indicator.kind(),
+        IndicatorKind::Compaction,
+        "the underlying indicator is recreated from `source` (interactive-mode.ts:3233-3238)"
+    );
+    assert!(out.contains("Auto-compacting…"), "compaction band not restored:\n{out}");
+}
+
+/// The branch-summary arm of the same event picks a DIFFERENT indicator — that is the whole reason
+/// Pi's `summarization_retry_attempt_start` carries a discriminated `source`.
+#[test]
+fn a_branch_summary_retry_restores_the_branch_summary_band_not_the_compaction_one() {
+    use cyrup_session_svc::SummarizationRetrySource;
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryScheduled {
+        attempt: 3,
+        max_attempts: 3,
+        delay_ms: 8000,
+        error_message: "terminated".into(),
+    });
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryAttemptStart {
+        source: SummarizationRetrySource::BranchSummary,
+    });
+    app.draw().unwrap();
+    assert_eq!(app.state().indicator.kind(), IndicatorKind::BranchSummary);
+    assert!(
+        buf_text(&app).contains("Summarizing branch…"),
+        "branch-summary band not restored:\n{}",
+        buf_text(&app)
+    );
+}
+
+/// `summarization_retry_finished` clears the retry band when the loop ended DURING a backoff
+/// (exhausted / aborted) — the only case where the retry indicator is still live, since a
+/// successful retried call already restored its own band via `attempt_start`.
+#[test]
+fn summarization_retry_finished_clears_a_still_live_retry_band() {
+    let mut app = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryScheduled {
+        attempt: 3,
+        max_attempts: 3,
+        delay_ms: 8000,
+        error_message: "terminated".into(),
+    });
+    app.draw().unwrap();
+    assert_eq!(app.state().indicator.kind(), IndicatorKind::Retry);
+
+    app.ingest_event(&AgentSessionEvent::SummarizationRetryFinished);
+    app.draw().unwrap();
+    assert_ne!(
+        app.state().indicator.kind(),
+        IndicatorKind::Retry,
+        "an exhausted retry must not leave the countdown spinning forever"
+    );
+}

@@ -350,7 +350,15 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                         InboundPolicy::SurfaceOnly => {}
                     }
                 }
-                Ok(InboundEvent::Disconnected(_)) => break,
+                Ok(InboundEvent::Disconnected(reason)) => {
+                    // pi's `client.on("disconnected", …)` handler (`index.ts:779-789`): fail the
+                    // in-flight outbound ask, drop the dead client, and arm the reconnect ladder
+                    // (unless this session is deliberately shutting down). Before this, the loop
+                    // just `break`ed and `state.client()` kept handing out a dead client for the
+                    // rest of the process — ONE drop disabled intercom permanently.
+                    crate::connect::handle_disconnect(&state, &client, &reason);
+                    break;
+                }
                 Ok(_) => {} // joined/left/presence/error — presence UI is a later phase.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
