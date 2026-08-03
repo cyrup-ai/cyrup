@@ -158,7 +158,7 @@ impl Tool for DescribedTool {
     ) -> Result<ToolResult, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen.lock().unwrap() = Some(params);
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
     }
 }
 
@@ -183,7 +183,7 @@ impl Tool for TerminateTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: true })
+        Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: true, ..Default::default() })
     }
 }
 

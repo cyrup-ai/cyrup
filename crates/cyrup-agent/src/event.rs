@@ -3,7 +3,7 @@
 //! tagged enums add `rename_all_fields = "camelCase"` so payload fields are camelCase for
 //! Pi-interop (R-00-013).
 
-use cyrup_core::{AssistantMessage, Content, ToolCallId};
+use cyrup_core::{AssistantMessage, Content, ToolCallId, Usage};
 use cyrup_provider::StreamEvent;
 use serde_json::Value;
 
@@ -52,6 +52,15 @@ pub struct ToolResultMessage {
     /// Structured app/extension metadata, NOT sent to the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Usage from the tool execution itself, if available. NOT part of main LLM context accounting
+    /// (Pi `ToolResultMessage.usage`, ai/src/types.ts:421-422). Absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Names of tools that became available from this transcript point onward (Pi
+    /// `ToolResultMessage.addedToolNames`, ai/src/types.ts:423-428). Absent when empty, matching
+    /// Pi's conditional spread (agent-loop.ts:783).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_tool_names: Vec<String>,
     #[serde(default)]
     pub is_error: bool,
     pub timestamp: i64,

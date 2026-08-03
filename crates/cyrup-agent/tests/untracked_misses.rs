@@ -114,7 +114,7 @@ impl Tool for EchoTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
     }
 }
 
@@ -510,7 +510,7 @@ impl Tool for UpdatingTool {
             details: None,
             terminate: None,
         });
-        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("done")], details: None, terminate: false, ..Default::default() })
     }
 }
 

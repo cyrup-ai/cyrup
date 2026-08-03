@@ -17,10 +17,27 @@ pub enum ExecMode {
 }
 
 /// A tool's final result (func-02 §4.3). `details` is app/extension metadata, NOT sent to the model.
+///
+/// Mirrors Pi's `AgentToolResult<T>` (agent/src/types.ts:354-368). Every field past
+/// `content`/`details` is optional upstream, so each Rust analogue has a `Default` that means
+/// "absent"; build with `..Default::default()` so a later widening stays source-compatible.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResult {
     pub content: Vec<Content>,
     pub details: Option<serde_json::Value>,
+    /// Usage from the tool execution itself, if available. NOT part of main LLM context accounting
+    /// (Pi `AgentToolResult.usage`, types.ts:360-361, upstream `2fd38684`). Reaches the transcript
+    /// as `ToolResultMessage.usage` and is patchable by `after_tool_call` (Pi
+    /// `AfterToolCallResult.usage`, types.ts:83-84).
+    pub usage: Option<crate::message::Usage>,
+    /// Names of tools introduced by this result and available from this transcript point onward
+    /// (Pi `AgentToolResult.addedToolNames`, types.ts:362-363, upstream `3d8f7435`).
+    ///
+    /// This does NOT by itself change the active tool set — that is driven by the runtime's tool
+    /// list. It is a cache-placement record telling a provider adapter with native deferred tool
+    /// loading WHERE in the transcript a tool definition first becomes available; adapters without
+    /// that capability ignore it and use the normal tool list. Empty = absent on the wire.
+    pub added_tool_names: Vec<String>,
     /// Hint to stop the loop after this batch (func-02 §7.7); runtime-only, never persisted.
     pub terminate: bool,
 }

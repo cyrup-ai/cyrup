@@ -325,6 +325,7 @@ impl Tool for BashTool {
                     content: vec![Content::text(body)],
                     details,
                     terminate: false,
+                    ..Default::default()
                 })
             }
             // Non-zero exit: `formatOutput(snapshot)` uses the `"(no output)"` default for empty

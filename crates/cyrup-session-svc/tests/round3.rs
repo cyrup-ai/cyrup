@@ -80,7 +80,7 @@ impl Tool for EchoTool {
         _cancel: cyrup_core::CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("echo")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("echo")], details: None, terminate: false, ..Default::default() })
     }
 }
 

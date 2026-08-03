@@ -8,9 +8,10 @@ use cyrup_ext_sdk::events::*;
 use serde_json::json;
 
 /// `tool_result` (Pi `ToolResultEventBase` + subtype, types.ts:883-929): the prior struct dropped
-/// `input` and `details`. Full shape: `{toolCallId, toolName, input, content, isError, details}`.
+/// `input` and `details`, and later `usage` (types.ts:919-921). Full shape:
+/// `{toolCallId, toolName, input, content, isError, details, usage?}`.
 #[test]
-fn tool_result_carries_input_and_details() {
+fn tool_result_carries_input_details_and_usage() {
     let ev = ToolResultEvent {
         call_id: "call_1".into(),
         name: "bash".into(),
@@ -18,6 +19,7 @@ fn tool_result_carries_input_and_details() {
         content: json!([{ "type": "text", "text": "ok" }]),
         is_error: false,
         details: Some(json!({ "exitCode": 0 })),
+        usage: Some(json!({ "input": 3, "output": 4 })),
     };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
@@ -27,15 +29,17 @@ fn tool_result_carries_input_and_details() {
             "input": { "command": "ls" },
             "content": [{ "type": "text", "text": "ok" }],
             "isError": false,
-            "details": { "exitCode": 0 }
+            "details": { "exitCode": 0 },
+            "usage": { "input": 3, "output": 4 }
         })
     );
 }
 
-/// `details` is `undefined`-optional (Pi `WriteToolResultEvent.details: undefined`, types.ts:908):
-/// `None` must be OMITTED, not serialized as `null`.
+/// `details` and `usage` are `undefined`-optional (Pi `WriteToolResultEvent.details: undefined`,
+/// types.ts:908; `ToolResultEventBase.usage?`, types.ts:921): `None` must be OMITTED, not
+/// serialized as `null`.
 #[test]
-fn tool_result_omits_absent_details() {
+fn tool_result_omits_absent_details_and_usage() {
     let ev = ToolResultEvent {
         call_id: "c".into(),
         name: "write".into(),
@@ -43,9 +47,11 @@ fn tool_result_omits_absent_details() {
         content: json!([]),
         is_error: false,
         details: None,
+        usage: None,
     };
     let v = serde_json::to_value(&ev).unwrap();
     assert!(!v.as_object().unwrap().contains_key("details"));
+    assert!(!v.as_object().unwrap().contains_key("usage"));
 }
 
 /// `input` (Pi `InputEvent`, types.ts:800-810): the prior struct dropped `images`, `source`, and

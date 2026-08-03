@@ -34,6 +34,7 @@ pub mod native;
 pub mod provider;
 pub mod registry;
 pub mod subscriber;
+pub mod wrapper;
 
 #[cfg(feature = "wasm-host")]
 pub mod caps;
@@ -74,6 +75,7 @@ pub use registry::{
     CommandDescriptor, ExecModeWire, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
 };
 pub use subscriber::ExtSubscriber;
+pub use wrapper::{wrap_registered_tool, ActiveToolNames, RegisteredTool};
 
 #[cfg(feature = "wasm-host")]
 pub use host::{

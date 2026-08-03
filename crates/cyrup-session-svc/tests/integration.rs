@@ -96,7 +96,7 @@ impl Tool for SleeperTool {
     ) -> Result<ToolResult, ToolError> {
         cancel.cancelled().await;
         *self.cancelled.lock().unwrap() = true;
-        Ok(ToolResult { content: vec![Content::text("aborted")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("aborted")], details: None, terminate: false, ..Default::default() })
     }
 }
 

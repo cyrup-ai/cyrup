@@ -4290,6 +4290,7 @@ impl Tool for WaitTool {
                 content: vec![cyrup_core::Content::text(text)],
                 details: Some(serde_json::json!({ "mode": "management" })),
                 terminate: false,
+                ..Default::default()
             }),
             Err(message) => Err(ToolError::new(message)),
         }
@@ -4488,6 +4489,7 @@ impl SubagentTool {
                     "asyncId": run_id.as_str(),
                 })),
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -4561,6 +4563,7 @@ impl SubagentTool {
                         content: vec![cyrup_core::Content::text(receipt)],
                         details: reduced_details,
                         terminate: false,
+                        ..Default::default()
                     })
                 };
             }
@@ -4576,6 +4579,7 @@ impl SubagentTool {
                 ))],
                 details,
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -4587,6 +4591,7 @@ impl SubagentTool {
                 ))],
                 details,
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -4612,6 +4617,7 @@ impl SubagentTool {
             content: vec![cyrup_core::Content::text(text)],
             details,
             terminate: false,
+            ..Default::default()
         })
     }
 
@@ -4637,6 +4643,7 @@ impl SubagentTool {
                     content: vec![cyrup_core::Content::text(report)],
                     details: None,
                     terminate: false,
+                    ..Default::default()
                 })
             }
             // `models` is the runtime builtin-agent -> model mapping (pi `handleModels`), the SAME
@@ -4648,6 +4655,7 @@ impl SubagentTool {
                     content: vec![cyrup_core::Content::text(report)],
                     details: None,
                     terminate: false,
+                    ..Default::default()
                 })
             }
             // SUBA-005: `eject`/`disable`/`enable`/`reset` join the CRUD arm — they are
@@ -4710,6 +4718,7 @@ impl SubagentTool {
                 content: vec![cyrup_core::Content::text(outcome.text)],
                 details: Some(serde_json::json!({ "mode": "management", "results": [] })),
                 terminate: false,
+                ..Default::default()
             }),
             Ok(outcome) => Err(ToolError::new(outcome.text)),
             Err(e) => Err(ToolError::new(e.to_string())),
@@ -4768,6 +4777,7 @@ impl SubagentTool {
                 content: vec![cyrup_core::Content::text(text)],
                 details: Some(serde_json::json!({ "mode": "management" })),
                 terminate: false,
+                ..Default::default()
             }),
             Err(message) => Err(ToolError::new(message)),
         }
@@ -4852,6 +4862,7 @@ impl SubagentTool {
                     "asyncId": run_id.as_str(),
                 })),
                 terminate: false,
+                ..Default::default()
             }),
             GraphRunOutcome::Foreground { run_id, groups, .. } => {
                 let (summary, details) = match groups.first() {
@@ -4917,6 +4928,7 @@ impl SubagentTool {
                     content: vec![cyrup_core::Content::text(summary)],
                     details: Some(details),
                     terminate: false,
+                    ..Default::default()
                 })
             }
         }
@@ -4989,6 +5001,7 @@ impl SubagentTool {
                     "asyncId": run_id.as_str(),
                 })),
                 terminate: false,
+                ..Default::default()
             }),
             GraphRunOutcome::Foreground {
                 run_id,
@@ -5057,6 +5070,7 @@ impl SubagentTool {
                     content: vec![cyrup_core::Content::text(text)],
                     details: Some(details),
                     terminate: false,
+                    ..Default::default()
                 })
             }
         }

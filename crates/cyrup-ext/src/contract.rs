@@ -30,8 +30,15 @@ pub struct HandledValue(pub Value);
 pub enum EventPatch {
     /// `tool_call`: rewrite the tool input (R-08-010).
     ToolInput(Value),
-    /// `tool_result`: replace-not-merge override of result fields (R-08-011).
-    ToolResult { content: Option<Vec<Content>>, details: Option<Value>, is_error: Option<bool> },
+    /// `tool_result`: replace-not-merge override of result fields (R-08-011). `usage` mirrors Pi
+    /// `ToolResultEventResult.usage` (types.ts:1085-1090): `Some` REPLACES the tool's usage in
+    /// full — there is no deep merge (types.ts:70-78).
+    ToolResult {
+        content: Option<Vec<Content>>,
+        details: Option<Value>,
+        is_error: Option<bool>,
+        usage: Option<cyrup_core::Usage>,
+    },
     /// `context`: filter/replace the message list.
     Context { messages: Vec<AgentMessage> },
     /// `message_end`: replace the message.
@@ -64,8 +71,8 @@ impl HostEvent {
         match (self, patch) {
             (HostEvent::ToolCall { input, .. }, EventPatch::ToolInput(v)) => *input = v,
             (
-                HostEvent::ToolResult { content, details, is_error, .. },
-                EventPatch::ToolResult { content: c, details: d, is_error: e },
+                HostEvent::ToolResult { content, details, is_error, usage, .. },
+                EventPatch::ToolResult { content: c, details: d, is_error: e, usage: u },
             ) => {
                 if let Some(c) = c {
                     *content = c;
@@ -75,6 +82,11 @@ impl HostEvent {
                 }
                 if let Some(e) = e {
                     *is_error = e;
+                }
+                // Pi `ToolResultEventResult.usage` (types.ts:1088): an omitted key keeps the
+                // current value, a present one REPLACES it in full (no deep merge, types.ts:70-78).
+                if u.is_some() {
+                    *usage = u;
                 }
             }
             (HostEvent::Context { messages }, EventPatch::Context { messages: m }) => *messages = m,

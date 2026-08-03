@@ -9,7 +9,7 @@ use crate::error::HookError;
 use crate::event::{AgentMessage, ToolResultMessage};
 use cyrup_core::{
     AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, Tool, ToolCall,
-    ToolCallId,
+    ToolCallId, Usage,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -61,6 +61,10 @@ pub struct AfterToolCall<'a> {
     pub args: &'a Value,
     pub content: &'a [Content],
     pub details: Option<&'a Value>,
+    /// Usage reported by the tool execution itself, if any (Pi `AfterToolCallContext.result.usage`,
+    /// types.ts:107 → `AgentToolResult.usage`, types.ts:360-361). Present on the READ side so a
+    /// hook can inspect what it is about to replace instead of overwriting blind.
+    pub usage: Option<&'a Usage>,
     pub is_error: bool,
     pub terminate: bool,
     /// The assistant message that requested this tool call (Pi `assistantMessage`, types.ts:102).
@@ -73,10 +77,19 @@ pub struct AfterToolCall<'a> {
 
 /// Replace-not-merge override returned by [`Hooks::after_tool_call`] (func-02 R-02-025): each
 /// `Some(_)` field replaces the whole corresponding result field; `None` keeps the original.
+///
+/// NB: there is deliberately NO `added_tool_names`. Pi's `AfterToolCallResult` has no such field
+/// (types.ts:79-90); `finalizeExecutedToolCall` carries the tool's own value through the
+/// `{...result, …}` spread (agent-loop.ts:736-742), so a hook can neither set nor clear it. Adding
+/// it here would be a divergence, not a convenience.
 #[derive(Clone, Debug, Default)]
 pub struct AfterOverride {
     pub content: Option<Vec<Content>>,
     pub details: Option<Value>,
+    /// Replaces the tool result's usage in full when `Some` (Pi `AfterToolCallResult.usage`,
+    /// types.ts:83-84: "if provided, replaces the tool result usage … There is no deep merge for
+    /// `content`, `details`, or `usage`").
+    pub usage: Option<Usage>,
     pub is_error: Option<bool>,
     pub terminate: Option<bool>,
 }
@@ -102,11 +115,47 @@ pub struct PostTurn<'a> {
 /// it persists as the default for EVERY later turn in the run (Pi `config = {...config, model,
 /// reasoning}` / `currentContext = snapshot.context ?? currentContext`, agent-loop.ts:226-239), not a
 /// one-shot. A `None` field keeps the current baseline. `context` replaces the working transcript.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TurnUpdate {
     pub context: Option<Vec<AgentMessage>>,
     pub model: Option<ModelRef>,
     pub thinking_level: Option<ModelThinkingLevel>,
+    /// Replacement tool set for the rest of the run (Pi `AgentContext.tools`, carried inside the
+    /// `context` this hook returns: `context: {...previousContext, systemPrompt, tools:
+    /// this.agent.state.tools.slice()}`, agent-session.ts:519-540).
+    ///
+    /// The loop snapshots the tool array ONCE at run start, the way Pi's `createContextSnapshot`
+    /// does. Without a per-turn refresh a tool that becomes active DURING a run — an extension
+    /// registering one from a live handler (EXT-004), or a tool calling `setActiveTools` and
+    /// reporting the difference as `ToolResult::added_tool_names` (DRIFT-001) — stays uncallable
+    /// until the next prompt, which would make a mid-run anchor point at a tool the model cannot
+    /// use. cyrup models it as its own field rather than folding it into `context` because
+    /// [`Self::context`] here is the message list only, not Pi's whole `AgentContext`.
+    pub tools: Option<Vec<Arc<dyn Tool>>>,
+    /// Replacement system prompt for the rest of the run (Pi `context.systemPrompt`, same return).
+    /// The tool-set rebuild rewrites the prompt (`_rebuildSystemPrompt`, agent-session.ts:2304), so
+    /// refreshing tools without it would leave the run advertising a tool whose guidance is missing.
+    pub system_prompt: Option<String>,
+}
+
+/// Hand-written because `Arc<dyn Tool>` is not `Debug` (`Tool: Send + Sync` only) — tools print as
+/// their names, which is the only part of them a diagnostic wants.
+impl std::fmt::Debug for TurnUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnUpdate")
+            .field("context", &self.context)
+            .field("model", &self.model)
+            .field("thinking_level", &self.thinking_level)
+            .field(
+                "tools",
+                &self
+                    .tools
+                    .as_ref()
+                    .map(|ts| ts.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()),
+            )
+            .field("system_prompt", &self.system_prompt)
+            .finish()
+    }
 }
 
 /// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`, drop `Custom`
@@ -124,6 +173,12 @@ pub fn default_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
                 content: t.content.clone(),
                 is_error: t.is_error,
                 details: t.details.clone(),
+                // Both must cross the agent→LLM boundary: `usage` so downstream accounting can see
+                // it, `added_tool_names` because a provider with native deferred tool loading reads
+                // it off the REQUEST transcript to place the definition (Pi keeps both on the single
+                // `ToolResultMessage` that IS the LLM message, ai/src/types.ts:415-431).
+                usage: t.usage.clone(),
+                added_tool_names: t.added_tool_names.clone(),
                 timestamp: t.timestamp,
             }),
             AgentMessage::Custom { .. } => None,

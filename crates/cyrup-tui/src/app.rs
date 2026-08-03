@@ -2593,6 +2593,13 @@ impl<B: Backend> App<B> {
             // `MessageEnd` so it commits once, not twice with `MessageStart`).
             AgentSessionEvent::MessageStart { .. } => {}
             AgentSessionEvent::MessageEnd { .. } => {
+                // A tool that reported usage for its own execution spends real tokens, so the
+                // cumulative footer totals must include it (`footer.ts:99-101`). Assistant usage
+                // arrives on the stream `Done` instead, via `add_usage` — this arm is the
+                // `toolResult` branch and, like upstream, must NOT restate the `CH` segment.
+                if let Some(u) = tool_result_usage_from_event(ev) {
+                    self.state.status.add_usage_totals(&u);
+                }
                 // The `AgentMessage` type lives in `cyrup-agent` (a dev-dep here, not a direct dep), so
                 // the `Custom` arm is detected via its serde projection (`tag = "role"`,
                 // `rename_all_fields = camelCase`) rather than a direct match — no dependency ripple.
@@ -3157,6 +3164,19 @@ fn flatten_children(items: &[serde_json::Value], depth: usize, sep: &str) -> Opt
         out.push(flatten_widget(item, depth.saturating_add(1))?);
     }
     Some(out.join(sep))
+}
+
+/// The `usage` a `toolResult` message carries, if any (Pi `entry.message.role === "toolResult" &&
+/// entry.message.usage`, `footer.ts:99-101`). Read through the same serde projection
+/// [`custom_message_from_event`] uses, for the same reason: the `AgentMessage` type lives in
+/// `cyrup-agent`, which is only a dev-dependency here.
+fn tool_result_usage_from_event(ev: &AgentSessionEvent) -> Option<cyrup_core::Usage> {
+    let value = serde_json::to_value(ev).ok()?;
+    let message = value.get("message")?;
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("toolResult") {
+        return None;
+    }
+    serde_json::from_value(message.get("usage")?.clone()).ok()
 }
 
 fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(String, String)> {

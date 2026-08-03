@@ -117,6 +117,7 @@ impl ContactSupervisorTool {
                     content: vec![Content::text(reply)],
                     details: Some(details),
                     terminate: false,
+                    ..Default::default()
                 })
             }
             other => Err(ToolError::new(format!(

@@ -15,5 +15,10 @@ use cyrup_core::{Content, ToolResult};
 
 /// Build a plain-text [`ToolResult`].
 pub(crate) fn text_result(text: impl Into<String>) -> ToolResult {
-    ToolResult { content: vec![Content::text(text.into())], details: None, terminate: false }
+    ToolResult {
+        content: vec![Content::text(text.into())],
+        details: None,
+        terminate: false,
+        ..Default::default()
+    }
 }

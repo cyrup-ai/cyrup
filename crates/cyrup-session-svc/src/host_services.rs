@@ -1008,6 +1008,21 @@ impl HostServices for LiveHostServices {
     }
 }
 
+/// The `getActiveTools` source the registered-tool wrapper diffs around every `execute` (Pi binds
+/// `runtime.getActiveTools` from the session's own actions, extensions/runner.ts:330, and
+/// `wrapRegisteredTool` calls it either side of the tool, extensions/wrapper.ts:23-25).
+///
+/// Deliberately the SAME read `HostServices::active_tools` performs — the authoritative
+/// `DynamicToolState`, which `set_active_tools` mutates SYNCHRONOUSLY. That synchronicity is what
+/// makes the diff observable: a tool that calls `setActiveTools` during its own `execute` has
+/// already widened this view by the time the wrapper takes its "after" snapshot.
+impl cyrup_ext::ActiveToolNames for LiveHostServices {
+    fn active_tool_names(&self) -> Option<Vec<String>> {
+        let dt = Self::lock(&self.dynamic_tools).clone()?;
+        Some(Self::lock(&dt).active_names())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]

@@ -2130,6 +2130,8 @@ mod tests {
                     is_error: false,
                     details: None,
                     timestamp: 0,
+                    usage: None,
+                    added_tool_names: Vec::new(),
                 },
                 Message::ToolResult {
                     tool_call_id: ToolCallId::from("toolu_2"),
@@ -2138,6 +2140,8 @@ mod tests {
                     is_error: false,
                     details: None,
                     timestamp: 0,
+                    usage: None,
+                    added_tool_names: Vec::new(),
                 },
             ],
             tools: Vec::new(),

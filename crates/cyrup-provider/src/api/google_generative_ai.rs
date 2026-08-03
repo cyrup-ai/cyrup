@@ -1543,6 +1543,8 @@ mod tests {
                     is_error: false,
                     details: None,
                     timestamp: 0,
+                    usage: None,
+                    added_tool_names: Vec::new(),
                 },
             ],
             tools: Vec::new(),

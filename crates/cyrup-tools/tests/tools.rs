@@ -959,6 +959,7 @@ impl Tool for EchoRead {
             content: vec![Content::text("overridden read")],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }

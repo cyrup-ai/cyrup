@@ -141,6 +141,11 @@ pub struct ExtensionHost {
     /// LIVE idle/trust/usage/model/system-prompt instead of `HostCtxRich::default()` (EXT-005).
     #[cfg(feature = "wasm-host")]
     services: RwLock<Option<Arc<dyn crate::host::HostServices>>>,
+    /// The live `getActiveTools` source the registered-tool wrapper diffs against (Pi
+    /// `ExtensionRunner.getActiveTools`, runner.ts:664-667). `None` until a session attaches one
+    /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
+    /// UNWRAPPED — there is no live agent whose tool set could change, so the diff has no meaning.
+    active_tool_source: RwLock<Option<Arc<dyn crate::wrapper::ActiveToolNames>>>,
 }
 
 impl Default for ExtensionHost {
@@ -167,6 +172,28 @@ impl ExtensionHost {
             bus: Arc::new(crate::host::SharedBus::new()),
             #[cfg(feature = "wasm-host")]
             services: RwLock::new(None),
+            active_tool_source: RwLock::new(None),
+        }
+    }
+
+    /// Attach the live `getActiveTools` source (Pi binds `runtime.getActiveTools` from the session's
+    /// actions, runner.ts:330). Every tool [`Self::active_tools`] returns from then on is wrapped
+    /// for `addedToolNames` derivation (Pi `wrapRegisteredTool`, extensions/wrapper.ts:17-36).
+    /// Idempotent; the last source wins.
+    pub fn set_active_tool_source(&self, source: Arc<dyn crate::wrapper::ActiveToolNames>) {
+        if let Ok(mut g) = self.active_tool_source.write() {
+            *g = Some(source);
+        }
+    }
+
+    /// Wrap one tool for `addedToolNames` derivation with the attached source, or return it as-is
+    /// when no live agent is attached. Public so the session builder can put the SDK-supplied
+    /// custom tools through the same wrapper Pi applies to its `_baseToolDefinitions`
+    /// (agent-session.ts:2507-2515) without reaching into the registry.
+    pub fn wrap_tool(&self, tool: Arc<dyn Tool>) -> Arc<dyn Tool> {
+        match self.active_tool_source.read().ok().and_then(|g| g.clone()) {
+            Some(src) => crate::wrapper::wrap_registered_tool(tool, src),
+            None => tool,
         }
     }
 
@@ -319,9 +346,23 @@ impl ExtensionHost {
     /// handler is model-visible on the next turn (`examples/extensions/dynamic-tools.ts`). Before
     /// EXT-004 the wrapping happened exactly once, immediately after `init`, so a post-`init`
     /// registration produced a descriptor no caller could ever execute.
+    ///
+    /// Every tool that comes back is put through the registered-tool wrapper
+    /// ([`Self::wrap_tool`]) — the built-ins in `base` as well as the extension-contributed ones,
+    /// exactly as Pi wraps BOTH halves of `_toolRegistry` (`wrapRegisteredTools(allCustomTools,
+    /// runner)` + `wrapRegisteredTools(baseToolDefinitions…)`, agent-session.ts:2506-2515). That
+    /// wrapper is the only producer of `ToolResult::added_tool_names`: a tool never sets the field
+    /// itself upstream, the host derives it from the active-set diff around `execute`.
     pub fn active_tools(&self, base: &[Arc<dyn Tool>]) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         self.refresh_tools()?;
-        self.registry.active_tools(base)
+        let merged = self.registry.active_tools(base)?;
+        let Some(src) = self.active_tool_source.read().ok().and_then(|g| g.clone()) else {
+            return Ok(merged);
+        };
+        Ok(merged
+            .into_iter()
+            .map(|t| crate::wrapper::wrap_registered_tool(t, src.clone()))
+            .collect())
     }
 
     /// Re-materialize guest tool descriptors registered after their extension's `init` into

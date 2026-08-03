@@ -127,16 +127,28 @@ impl StatusLine {
     /// Accumulate one finalized turn's `Usage` into the cumulative session totals and record that
     /// turn's cache-hit rate (`footer.ts:86-107`). Token sums saturate (never panic / wrap).
     pub fn add_usage(&mut self, turn: &Usage) {
+        self.add_usage_totals(turn);
+        // Latest-turn cache-hit rate over the turn's full prompt (`footer.ts:102-105`).
+        let prompt = turn.input.saturating_add(turn.cache_read).saturating_add(turn.cache_write);
+        self.latest_cache_hit =
+            if prompt > 0 { Some((turn.cache_read as f64 / prompt as f64) * 100.0) } else { None };
+    }
+
+    /// Accumulate usage that is NOT an assistant turn — today, the usage a tool reported for its own
+    /// execution (`footer.ts:99-101`: `else if (… role === "toolResult" && entry.message.usage)
+    /// addUsageToTotals(usageTotals, entry.message.usage)`).
+    ///
+    /// Deliberately does NOT touch [`latest_cache_hit`](Self::latest_cache_hit): upstream that
+    /// figure is written only inside the ASSISTANT branch, so a tool result must never restate the
+    /// footer's `CH` segment (and a tool's usage typically has no prompt tokens at all, which would
+    /// blank it).
+    pub fn add_usage_totals(&mut self, turn: &Usage) {
         self.usage.input = self.usage.input.saturating_add(turn.input);
         self.usage.output = self.usage.output.saturating_add(turn.output);
         self.usage.cache_read = self.usage.cache_read.saturating_add(turn.cache_read);
         self.usage.cache_write = self.usage.cache_write.saturating_add(turn.cache_write);
         self.usage.total_tokens = self.usage.total_tokens.saturating_add(turn.total_tokens);
         self.usage.cost.total += turn.cost.total;
-        // Latest-turn cache-hit rate over the turn's full prompt (`footer.ts:102-105`).
-        let prompt = turn.input.saturating_add(turn.cache_read).saturating_add(turn.cache_write);
-        self.latest_cache_hit =
-            if prompt > 0 { Some((turn.cache_read as f64 / prompt as f64) * 100.0) } else { None };
     }
     pub fn set_cwd(&mut self, cwd: impl Into<String>) {
         self.cwd = cwd.into();

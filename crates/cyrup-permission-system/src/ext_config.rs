@@ -247,6 +247,10 @@ mod tests {
 
     #[test]
     fn absent_is_defaults() {
+        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
+        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
+        // process, and without this the override leaks across tests intermittently.
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.json");
         assert_eq!(ExtensionConfig::load(&path), ExtensionConfig::default());
@@ -258,6 +262,10 @@ mod tests {
     // real, editable default-config template file at that path (mkdir -p'ing the parent first).
     #[test]
     fn absent_config_is_materialized_on_disk() {
+        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
+        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
+        // process, and without this the override leaks across tests intermittently.
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.json");
         assert!(!path.exists());
@@ -307,6 +315,10 @@ mod tests {
     // returned structurally (not only `eprintln!`ed) so a caller can surface it.
     #[test]
     fn malformed_present_config_warns_like_pi_and_falls_back_to_defaults() {
+        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
+        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
+        // process, and without this the override leaks across tests intermittently.
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, "{not json").unwrap();
@@ -330,6 +342,10 @@ mod tests {
     // instead of being silently swallowed like the pre-fix blanket `Ok(text) else return default`.
     #[test]
     fn present_but_unreadable_config_warns_instead_of_silent_default() {
+        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
+        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
+        // process, and without this the override leaks across tests intermittently.
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         // A directory at the config path exists (so `ensure_on_disk` does not try to create it)
         // but cannot be read as a file, giving a non-ENOENT `io::Error`.

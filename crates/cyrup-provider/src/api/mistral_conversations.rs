@@ -1497,6 +1497,8 @@ mod tests {
             is_error: false,
             details: None,
             timestamp: 0,
+            usage: None,
+            added_tool_names: Vec::new(),
         }];
         let out = to_chat_messages(&messages, false);
         assert_eq!(out[0]["role"], "tool");

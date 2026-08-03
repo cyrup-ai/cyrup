@@ -384,6 +384,11 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
             content: t.content.clone(),
             is_error: t.is_error,
             details: t.details.clone(),
+            // The PERSIST direction. `added_tool_names` is the deferred-tool anchor and is
+            // recomputed from the transcript on every request, so dropping it here would silently
+            // demote a resumed session back to prefix tool placement.
+            usage: t.usage.clone(),
+            added_tool_names: t.added_tool_names.clone(),
             timestamp: t.timestamp,
         }),
         AgentMessage::Custom { .. } => None,
@@ -398,15 +403,25 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
             AgentMessage::User { content: content.clone(), timestamp: Some(*timestamp) }
         }
         Message::Assistant(a) => AgentMessage::Assistant(a.clone()),
-        Message::ToolResult { tool_call_id, tool_name, content, is_error, details, timestamp } => {
-            AgentMessage::ToolResult(ToolResultMessage {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                content: content.clone(),
-                details: details.clone(),
-                is_error: *is_error,
-                timestamp: *timestamp,
-            })
-        }
+        Message::ToolResult {
+            tool_call_id,
+            tool_name,
+            content,
+            is_error,
+            details,
+            usage,
+            added_tool_names,
+            timestamp,
+        } => AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            content: content.clone(),
+            details: details.clone(),
+            // The RESUME direction — the counterpart of the persist copy above.
+            usage: usage.clone(),
+            added_tool_names: added_tool_names.clone(),
+            is_error: *is_error,
+            timestamp: *timestamp,
+        }),
     }
 }

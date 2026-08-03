@@ -349,6 +349,7 @@ impl NativeExtension for ResultAppender {
                 content: Some(vec![Content::text(text)]),
                 details: None,
                 is_error: None,
+                usage: None,
             });
         }
         HookOutcome::Noop
@@ -376,6 +377,7 @@ async fn a08_3_tool_result_patch_chains() {
         args: &args,
         content: &content,
         details: None,
+        usage: None,
         is_error: false,
         terminate: false,
         assistant_message: &msg,
@@ -416,6 +418,7 @@ impl Tool for FakeRead {
             content: vec![Content::text("EXTENSION-READ")],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }
@@ -442,6 +445,7 @@ impl Tool for BuiltinRead {
             content: vec![Content::text("BUILTIN-READ")],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }

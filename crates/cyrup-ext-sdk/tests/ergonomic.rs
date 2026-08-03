@@ -462,3 +462,67 @@ fn new_session_with_callback_is_command_tier_and_ok_on_host() {
     let out = ctx.switch_session_with_callback("s1", &SwitchSessionOptions::default(), |_rsc| Ok(()));
     assert!(out.is_ok());
 }
+
+/// AGENT-005 guest half: the host's `on-tool-result(..., details-json, usage-json)` export lowers to
+/// ordered string args, and the guest must decode arg 6 into `ToolResultEvent.usage` (Pi
+/// `ToolResultEventBase.usage?: Usage`, types.ts:919-921). Before this the parameter did not exist
+/// on the WIT function at all, so a guest could not observe tool-reported usage.
+#[test]
+fn tool_result_decodes_the_usage_argument() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let seen: Rc<RefCell<Option<serde_json::Value>>> = Rc::new(RefCell::new(None));
+    let sink = seen.clone();
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(move |ev, _| {
+        *sink.borrow_mut() = ev.usage.clone();
+        Outcome::noop()
+    });
+    api.dispatch(
+        1,
+        &["c1", "bash", "{}", "[]", "false", "", r#"{"input":11,"output":22}"#],
+        &Ctx::new(),
+    );
+    assert_eq!(
+        seen.borrow().clone(),
+        Some(serde_json::json!({ "input": 11, "output": 22 })),
+        "the guest decoded the usage argument"
+    );
+}
+
+/// The absent case (Pi `undefined`): the host lowers `None` to an empty string, which must decode to
+/// `None`, not to `Value::Null` or a zeroed object.
+#[test]
+fn tool_result_decodes_an_absent_usage_argument_as_none() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let seen: Rc<RefCell<Option<serde_json::Value>>> = Rc::new(RefCell::new(Some(
+        serde_json::json!("sentinel"),
+    )));
+    let sink = seen.clone();
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(move |ev, _| {
+        *sink.borrow_mut() = ev.usage.clone();
+        Outcome::noop()
+    });
+    api.dispatch(1, &["c1", "write", "{}", "[]", "false", "", ""], &Ctx::new());
+    assert_eq!(seen.borrow().clone(), None, "empty arg = Pi `undefined`");
+}
+
+/// The WRITE direction across the same seam: a guest's `ToolResultPatch` serializes `usage` so the
+/// host's `decode_patch` can read it back off the mutate JSON (Pi `ToolResultEventResult.usage`,
+/// types.ts:1085-1090). An omitted `usage` must not appear as a `null` key — that would read as an
+/// explicit clear on the host side.
+#[test]
+fn tool_result_patch_carries_usage_and_omits_it_when_absent() {
+    let patch = cyrup_ext_sdk::events::ToolResultPatch {
+        usage: Some(serde_json::json!({ "input": 5 })),
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&patch).unwrap();
+    assert_eq!(v, serde_json::json!({ "usage": { "input": 5 } }));
+
+    let empty = cyrup_ext_sdk::events::ToolResultPatch::default();
+    let v = serde_json::to_value(&empty).unwrap();
+    assert!(!v.as_object().unwrap().contains_key("usage"));
+}

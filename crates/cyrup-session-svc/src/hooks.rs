@@ -27,6 +27,10 @@ pub(crate) struct PolicyHooks {
     /// `blockImages` defense-in-depth: strip image content from converted LLM messages (Pi
     /// sdk.ts:254-289). Resolved once at build time from settings.
     block_images: bool,
+    /// The session's weak self-handle, shared with the persist+fan-out subscriber and the post-run
+    /// driver. The hooks are built BEFORE the session that owns them exists, so this is empty until
+    /// `AgentSession::into_shared` binds it — see [`Self::prepare_next_turn`].
+    session: Arc<crate::session::SessionHandle>,
 }
 
 impl PolicyHooks {
@@ -35,8 +39,9 @@ impl PolicyHooks {
         inner: Arc<dyn Hooks>,
         has_ui: bool,
         block_images: bool,
+        session: Arc<crate::session::SessionHandle>,
     ) -> Self {
-        Self { policy, inner, has_ui, block_images }
+        Self { policy, inner, has_ui, block_images, session }
     }
 }
 
@@ -83,6 +88,8 @@ impl Hooks for PolicyHooks {
                     content,
                     is_error,
                     details,
+                    usage,
+                    added_tool_names,
                     timestamp,
                 } if content.iter().any(is_image) => Message::ToolResult {
                     tool_call_id,
@@ -90,6 +97,10 @@ impl Hooks for PolicyHooks {
                     content: filter_images(&content),
                     is_error,
                     details,
+                    // Image stripping must not disturb anything else on the message; carrying
+                    // `added_tool_names` through keeps the deferred-tool anchor intact.
+                    usage,
+                    added_tool_names,
                     timestamp,
                 },
                 other => other,
@@ -136,11 +147,37 @@ impl Hooks for PolicyHooks {
         self.inner.after_tool_call(ctx, cancel).await
     }
 
+    /// Pi `_installAgentNextTurnRefresh` (agent-session.ts:519-540): run whatever
+    /// `prepareNextTurnWithContext` was already installed, then OVERWRITE the tool set with the
+    /// session's live one — every turn, unconditionally.
+    ///
+    /// Ordering matches Pi exactly: `previousSnapshot` is awaited first and its fields are spread,
+    /// then `context.tools` is assigned over the top. So an extension may still replace the
+    /// transcript, model or thinking level; it may not out-vote the session on which tools exist.
+    ///
+    /// Pi also re-pushes `context.systemPrompt` here. cyrup does not — see
+    /// [`crate::session::AgentSession::next_turn_tools`] for why (one prompt slot instead of Pi's
+    /// override/base pair, so re-pushing would undo a `before_agent_start` sanitization mid-run).
+    ///
+    /// This is the seam that makes a MID-RUN tool addition real. Without it the loop runs the whole
+    /// prompt on the tool array it snapshotted at run start, so a `ToolResult::added_tool_names`
+    /// anchor (DRIFT-001) named a tool the model could not call until the next prompt, and EXT-004's
+    /// late registration only landed after `handle.finished()`.
+    ///
+    /// On an UNBOUND session (a by-value `AgentSession` that never went through `into_shared`) there
+    /// is no self-handle to upgrade, so this degrades to the plain delegate — the same graceful
+    /// no-op the post-run driver and the inject sink take on an unbound session.
     async fn prepare_next_turn(
         &self,
         ctx: PostTurn<'_>,
     ) -> Result<Option<TurnUpdate>, HookError> {
-        self.inner.prepare_next_turn(ctx).await
+        let previous = self.inner.prepare_next_turn(ctx).await?;
+        let Some(session) = self.session.get() else {
+            return Ok(previous);
+        };
+        let mut update = previous.unwrap_or_default();
+        update.tools = Some(session.next_turn_tools().await);
+        Ok(Some(update))
     }
 
     async fn should_stop_after_turn(&self, ctx: PostTurn<'_>) -> Result<bool, HookError> {

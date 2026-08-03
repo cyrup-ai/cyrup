@@ -109,9 +109,31 @@ fn tool_calls(a: &AssistantMessage) -> Vec<ToolCall> {
 }
 
 /// The `tool_execution_end.result` payload — Pi emits the full `AgentToolResult`
-/// (`{content, details, terminate}`) including the early-termination hint (agent-loop.ts:723-731).
-fn result_value_of(content: &[Content], details: &Option<Value>, terminate: bool) -> Value {
-    serde_json::json!({ "content": content, "details": details, "terminate": terminate })
+/// (`{content, details, usage?, addedToolNames?, terminate}`) including the early-termination hint
+/// (agent-loop.ts:723-731). `usage`/`addedToolNames` are optional upstream, so — like Pi's
+/// `JSON.stringify`, which drops `undefined` — an absent/empty value produces NO key at all rather
+/// than a `null`.
+fn result_value_of(
+    content: &[Content],
+    details: &Option<Value>,
+    usage: Option<&Usage>,
+    added_tool_names: &[String],
+    terminate: bool,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("content".to_string(), serde_json::to_value(content).unwrap_or(Value::Null));
+    obj.insert("details".to_string(), details.clone().unwrap_or(Value::Null));
+    if let Some(u) = usage {
+        obj.insert("usage".to_string(), serde_json::to_value(u).unwrap_or(Value::Null));
+    }
+    if !added_tool_names.is_empty() {
+        obj.insert(
+            "addedToolNames".to_string(),
+            serde_json::to_value(added_tool_names).unwrap_or(Value::Null),
+        );
+    }
+    obj.insert("terminate".to_string(), Value::Bool(terminate));
+    Value::Object(obj)
 }
 
 /// The `tool_execution_update.partialResult` payload — Pi emits the tool's `AgentToolResult`
@@ -245,7 +267,9 @@ struct Finalized {
 }
 
 enum Prep {
-    Immediate(Finalized),
+    /// Boxed: `Finalized` embeds a whole `ToolResultMessage` and dwarfs the `Ready` arm, so an
+    /// unboxed variant makes every `Prep` (including the common prepared-call case) pay for it.
+    Immediate(Box<Finalized>),
     Ready { tool: Arc<dyn Tool>, args: Value },
 }
 
@@ -523,6 +547,19 @@ impl RunCtx {
                             // arrays distinct, agent.ts:519-522). Subsequent turns append onto the
                             // override here.
                             self.messages = ctx;
+                        }
+                        // The tool array and system prompt travel inside Pi's `context` on the same
+                        // return (`{...previousContext, systemPrompt, tools:
+                        // this.agent.state.tools.slice()}`, agent-session.ts:530-534) and are just as
+                        // sticky. Folding them here is what lets a tool that becomes active MID-RUN
+                        // be called on the very next turn — the precondition an `addedToolNames`
+                        // anchor asserts (DRIFT-001) and what EXT-004's late registration needs to
+                        // reach the model before the run ends.
+                        if let Some(tools) = u.tools {
+                            self.tools = tools;
+                        }
+                        if let Some(prompt) = u.system_prompt {
+                            self.system_prompt = prompt;
                         }
                     }
                     Ok(None) => {}
@@ -845,9 +882,9 @@ impl RunCtx {
         let tool = match self.find_tool(&call.name) {
             Some(t) => t,
             None => {
-                return Prep::Immediate(
+                return Prep::Immediate(Box::new(
                     self.immediate_error(call, format!("Tool '{}' not found", call.name)),
-                )
+                ))
             }
         };
         // Normalize the raw model-emitted arguments via the tool's `prepare_arguments` compat shim
@@ -859,10 +896,10 @@ impl RunCtx {
         // the next turn; the tool is NOT executed.
         let mut args = match validate_tool_call(tool.parameters(), prepared) {
             Ok(coerced) => coerced,
-            Err(e) => return Prep::Immediate(self.immediate_error(call, e.to_string())),
+            Err(e) => return Prep::Immediate(Box::new(self.immediate_error(call, e.to_string()))),
         };
         if self.cancel.is_cancelled() {
-            return Prep::Immediate(self.immediate_error(call, "Operation aborted"));
+            return Prep::Immediate(Box::new(self.immediate_error(call, "Operation aborted")));
         }
         let before = {
             let ctx = BeforeToolCall {
@@ -881,15 +918,15 @@ impl RunCtx {
             self.hooks.before_tool_call(ctx, self.cancel.child()).await
         };
         match before {
-            Err(_) => Prep::Immediate(self.immediate_error(call, "beforeToolCall failed")),
-            Ok(BeforeOutcome::Block { reason }) => Prep::Immediate(self.immediate_error(
+            Err(_) => Prep::Immediate(Box::new(self.immediate_error(call, "beforeToolCall failed"))),
+            Ok(BeforeOutcome::Block { reason }) => Prep::Immediate(Box::new(self.immediate_error(
                 call,
                 reason.unwrap_or_else(|| "Tool call blocked by beforeToolCall".to_string()),
-            )),
+            ))),
             // Args mutated in place are executed as-is, WITHOUT re-validation (R-02-022).
             Ok(BeforeOutcome::Proceed) => {
                 if self.cancel.is_cancelled() {
-                    Prep::Immediate(self.immediate_error(call, "Operation aborted"))
+                    Prep::Immediate(Box::new(self.immediate_error(call, "Operation aborted")))
                 } else {
                     Prep::Ready { tool, args }
                 }
@@ -903,6 +940,11 @@ impl RunCtx {
             tool_name: call.name.clone(),
             content: vec![Content::text(msg)],
             details: None,
+            // Pi's `createErrorToolResult` builds `{content, details:{}}` and nothing else
+            // (agent-loop.ts:754-759): a call that did not run reports no usage and cannot have
+            // introduced a tool, so an error result never anchors deferred tool loading.
+            usage: None,
+            added_tool_names: Vec::new(),
             is_error: true,
             // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
             // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
@@ -912,7 +954,7 @@ impl RunCtx {
             source_index: 0,
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
-            result_value: result_value_of(&message.content, &message.details, false),
+            result_value: result_value_of(&message.content, &message.details, None, &[], false),
             is_error: true,
             terminate: false,
             message,
@@ -933,9 +975,19 @@ impl RunCtx {
     ) -> Finalized {
         let call_id = call.id.clone();
         let tool_name = call.name.clone();
-        let (mut content, mut details, mut terminate, mut is_error) = match outcome {
-            Ok(r) => (r.content, r.details, r.terminate, false),
-            Err(e) => (vec![Content::text(e.to_string())], None, false, true),
+        // `added_tool_names` rides through untouched: Pi's `finalizeExecutedToolCall` spreads
+        // `{...result}` before applying the hook's explicit fields (agent-loop.ts:736-742) and
+        // `addedToolNames` is not one of them, so no hook can set or clear it.
+        let (
+            mut content,
+            mut details,
+            mut usage,
+            mut added_tool_names,
+            mut terminate,
+            mut is_error,
+        ) = match outcome {
+            Ok(r) => (r.content, r.details, r.usage, r.added_tool_names, r.terminate, false),
+            Err(e) => (vec![Content::text(e.to_string())], None, None, Vec::new(), false, true),
         };
 
         let hook_result = {
@@ -945,6 +997,7 @@ impl RunCtx {
                 args: &args,
                 content: &content,
                 details: details.as_ref(),
+                usage: usage.as_ref(),
                 is_error,
                 terminate,
                 assistant_message: assistant,
@@ -965,6 +1018,12 @@ impl RunCtx {
                 if let Some(d) = ov.details {
                     details = Some(d);
                 }
+                // Replace-not-merge, the same rule as `content`/`details` (Pi
+                // `usage: afterResult.usage ?? result.usage`, agent-loop.ts:738; types.ts:70-78:
+                // "There is no deep merge for `content`, `details`, or `usage`").
+                if let Some(u) = ov.usage {
+                    usage = Some(u);
+                }
                 if let Some(e) = ov.is_error {
                     is_error = e;
                 }
@@ -974,8 +1033,12 @@ impl RunCtx {
             }
             Ok(None) => {}
             Err(_) => {
+                // Pi discards the whole result for `createErrorToolResult(…)` when the hook throws
+                // (agent-loop.ts:744-747), and that carries neither usage nor added tool names.
                 content = vec![Content::text("afterToolCall failed")];
                 details = None;
+                usage = None;
+                added_tool_names = Vec::new();
                 is_error = true;
                 terminate = false;
             }
@@ -986,6 +1049,8 @@ impl RunCtx {
             tool_name: tool_name.clone(),
             content,
             details,
+            usage,
+            added_tool_names,
             is_error,
             // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
             // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
@@ -995,7 +1060,13 @@ impl RunCtx {
             source_index,
             tool_call_id: call_id,
             tool_name,
-            result_value: result_value_of(&message.content, &message.details, terminate),
+            result_value: result_value_of(
+                &message.content,
+                &message.details,
+                message.usage.as_ref(),
+                &message.added_tool_names,
+                terminate,
+            ),
             is_error,
             terminate,
             message,
@@ -1042,7 +1113,8 @@ impl RunCtx {
             })
             .await;
             match self.prepare(assistant, ctx_messages, call).await {
-                Prep::Immediate(mut fin) => {
+                Prep::Immediate(fin) => {
+                    let mut fin = *fin;
                     fin.source_index = idx;
                     self.emit(AgentEvent::ToolExecutionEnd {
                         tool_call_id: fin.tool_call_id.clone(),
@@ -1195,7 +1267,8 @@ impl RunCtx {
             .await;
 
             let fin = match self.prepare(assistant, ctx_messages, call).await {
-                Prep::Immediate(mut fin) => {
+                Prep::Immediate(fin) => {
+                    let mut fin = *fin;
                     fin.source_index = idx;
                     fin
                 }
@@ -1343,6 +1416,13 @@ impl Agent {
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
     pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         lock(&self.state).tools = tools;
+    }
+    /// The agent's CURRENT tool set (Pi `agent.state.tools`, read by `_installAgentNextTurnRefresh`
+    /// as `this.agent.state.tools.slice()`, agent-session.ts:533). `AgentStateSnapshot` reports only
+    /// `tool_count` because a tool is not serializable; a caller that must re-push the live array
+    /// onto a running loop — via [`crate::TurnUpdate::tools`] — needs the handles themselves.
+    pub async fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        lock(&self.state).tools.clone()
     }
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
     pub async fn set_messages(&self, msgs: Vec<AgentMessage>) {

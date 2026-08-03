@@ -36,6 +36,12 @@ pub struct ToolResultEvent {
     /// `None` (= Pi `undefined`) for tools that carry none (e.g. `write`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Usage from the tool execution itself, if available (Pi `ToolResultEventBase.usage`,
+    /// types.ts:919-921, upstream `2fd38684`). `None` (= Pi `undefined`) for every ordinary tool.
+    /// Open-shaped `{input, output, cacheRead, cacheWrite, cost, …}` — the guest SDK has no
+    /// dependency on the host's `Usage` type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
 }
 
 /// `context` (Pi types.ts:1144) — filter/replace the LLM message list.
@@ -274,6 +280,10 @@ pub struct ToolResultPatch {
     pub details: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// Replaces the tool result's usage in full when present (Pi `ToolResultEventResult.usage`,
+    /// types.ts:1089). There is no deep merge (types.ts:70-78); omitted = keep the tool's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
 }
 
 /// `before_agent_start` dual result (Pi `BeforeAgentStartEventResult`, types.ts:1053-1057): inject a

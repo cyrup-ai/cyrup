@@ -73,7 +73,7 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("executed")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("executed")], details: None, terminate: false, ..Default::default() })
     }
 }
 

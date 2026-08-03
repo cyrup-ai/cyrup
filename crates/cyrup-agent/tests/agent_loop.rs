@@ -133,6 +133,7 @@ impl Tool for EchoTool {
             content: vec![Content::text(format!("echo:{params}"))],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }
@@ -211,7 +212,7 @@ impl Tool for SpanTool {
         }
         let end = Instant::now();
         self.spans.lock().unwrap().push((self.name.clone(), start, end));
-        Ok(ToolResult { content: vec![Content::text(format!("done:{}", self.name))], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text(format!("done:{}", self.name))], details: None, terminate: false, ..Default::default() })
     }
 }
 
@@ -940,7 +941,7 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.executed.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("ran")], details: None, terminate: false, ..Default::default() })
     }
 }
 
@@ -1072,7 +1073,7 @@ impl Tool for RendezvousTool {
         if tokio::time::timeout(Duration::from_secs(5), self.rendezvous.wait()).await.is_ok() {
             self.log.lock().unwrap().push(format!("rendezvous:{}", self.name));
         }
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
     }
 }
 

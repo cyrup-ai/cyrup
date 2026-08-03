@@ -799,6 +799,8 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 content,
                 is_error,
                 details,
+                usage,
+                added_tool_names,
                 timestamp,
             } => Message::ToolResult {
                 tool_call_id: tool_call_id.clone(),
@@ -809,6 +811,12 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 ),
                 is_error: *is_error,
                 details: details.clone(),
+                // This transform only swaps image blocks for a placeholder; every other field must
+                // survive it. `added_tool_names` in particular is the deferred-tool anchor, and a
+                // request-path transform that silently dropped it would move the tool definition
+                // back to the prefix and wipe the prompt cache.
+                usage: usage.clone(),
+                added_tool_names: added_tool_names.clone(),
                 timestamp: *timestamp,
             },
             other => other.clone(),
@@ -835,6 +843,8 @@ fn insert_synthetic_tool_results(
                 is_error: true,
                 details: None,
                 timestamp: now_millis(),
+                usage: None,
+                added_tool_names: Vec::new(),
             });
         }
     }
@@ -884,6 +894,8 @@ pub(crate) fn transform_messages_with_source(
                 content,
                 is_error,
                 details,
+                usage,
+                added_tool_names,
                 timestamp,
             } => {
                 if let Some(norm) = tool_call_id_map.get(tool_call_id.as_str()).cloned()
@@ -895,6 +907,10 @@ pub(crate) fn transform_messages_with_source(
                         content: content.clone(),
                         is_error: *is_error,
                         details: details.clone(),
+                        // Only the tool-call id is being rewritten; carry the rest through
+                        // untouched (see `downgrade_unsupported_images`).
+                        usage: usage.clone(),
+                        added_tool_names: added_tool_names.clone(),
                         timestamp: *timestamp,
                     };
                 }
@@ -2114,6 +2130,8 @@ mod tests {
                 is_error: false,
                 details: None,
                 timestamp: 0,
+                usage: None,
+                added_tool_names: Vec::new(),
             });
         }
         Context {
@@ -2227,6 +2245,8 @@ mod tests {
                     is_error: false,
                     details: None,
                     timestamp: 0,
+                    usage: None,
+                    added_tool_names: Vec::new(),
                 },
             ],
             tools: vec![ToolDef {

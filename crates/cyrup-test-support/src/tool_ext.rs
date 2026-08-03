@@ -118,6 +118,7 @@ impl Tool for SyntheticTool {
             content: vec![Content::text(self.result_text.clone())],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }

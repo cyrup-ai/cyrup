@@ -138,7 +138,7 @@ impl Tool for EchoTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("echoed")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("echoed")], details: None, terminate: false, ..Default::default() })
     }
 }
 

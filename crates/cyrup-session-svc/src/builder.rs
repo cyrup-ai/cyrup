@@ -669,6 +669,13 @@ impl SessionBuilder {
         let host = ExtensionHost::with_wasm(host_config)?;
         #[cfg(not(feature = "wasm-host"))]
         let host = ExtensionHost::new(host_config);
+        // Attach the live `getActiveTools` source BEFORE any tool set is materialized, so every tool
+        // `active_tools` hands back is wrapped for `addedToolNames` derivation (Pi
+        // `wrapRegisteredTool`, extensions/wrapper.ts:17-36). The source reads the SAME
+        // `DynamicToolState` `setActiveTools` mutates, so a tool that widens the active set during its
+        // own `execute` is observed by the wrapper's "after" snapshot. It reads `None` until
+        // `attach_dynamic_tools` runs further down, which is correct: nothing executes before then.
+        host.set_active_tool_source(host_services.clone());
         // P-1 (reconciliation §2 item 1): late-bind the session's OWN `host_services` into every
         // native built-in — the SAME `LiveHostServices` the WASM path gets via `discover_and_load`
         // below — so a native extension can reach the live session id/file, dialogs, and
@@ -959,7 +966,11 @@ impl SessionBuilder {
         // must survive the rebuild rather than being replaced by the shadowed built-in. Extended LAST
         // so an override wins the `BTreeMap`-by-name dedup in `DynamicToolState::new`.
         let mut registry_tools = visible.clone();
-        registry_tools.extend(cfg.custom_tools.iter().cloned());
+        // The SDK-supplied custom tools go through the same registered-tool wrapper (Pi folds them
+        // into `_baseToolDefinitions` and wraps that whole map, agent-session.ts:2507-2515), so a
+        // custom tool that widens the active set also derives `addedToolNames`. `active_tools`
+        // above already returned WRAPPED handles for the built-ins + extension tools.
+        registry_tools.extend(cfg.custom_tools.iter().map(|t| ext_host.wrap_tool(t.clone())));
         registry_tools.extend(active_tools.iter().cloned());
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools
             .iter()
@@ -1003,11 +1014,18 @@ impl SessionBuilder {
         // content when the setting is on, deduping consecutive placeholders. Folded into PolicyHooks
         // so it rides the agent's single `convertToLlm` slot.
         let block_images = settings.effective().block_images();
+        // The shared self-handle: bound to the owning `Arc<AgentSession>` by `into_shared`, and read
+        // by the persist+fan-out subscriber (`_handleAgentEvent`), the post-run driver, and — since
+        // the turn-boundary tool refresh — `PolicyHooks::prepare_next_turn`. Declared HERE, ahead of
+        // the hooks, because the hooks are built before the session and must capture it; it is an
+        // empty `OnceLock` either way, so nothing observable moved with it.
+        let handle = Arc::new(crate::session::SessionHandle::default());
         let policy_hooks = Arc::new(crate::hooks::PolicyHooks::new(
             cfg.permission_policy.clone(),
             ext_hooks,
             has_ui,
             block_images,
+            handle.clone(),
         ));
         let eff = settings.effective();
         // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
@@ -1137,9 +1155,6 @@ impl SessionBuilder {
         // session's real tree (arch-08 §5.6; Pi appends synchronously, agent-session.ts:2265-2279).
         host_services.attach_session(manager.clone());
         let fanout = Arc::new(Fanout::new());
-        // The shared self-handle: bound to the owning `Arc<AgentSession>` by `into_shared`, and read by
-        // the persist+fan-out subscriber (`_handleAgentEvent`) + the post-run driver.
-        let handle = Arc::new(crate::session::SessionHandle::default());
 
         // Attach the extension notify seam, then the facade's persist+fan-out subscriber.
         agent.subscribe(ext_subscriber);

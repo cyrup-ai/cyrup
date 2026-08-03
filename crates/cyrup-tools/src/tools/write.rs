@@ -100,6 +100,7 @@ impl Tool for WriteTool {
             // (write.ts:223) — it never emits write details. Mirror that with `None`.
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }

@@ -89,6 +89,8 @@ fn tool_result_id(id: &str, name: &str, body: &str) -> AgentMessage {
         is_error: false,
         details: None,
         timestamp: 0,
+        usage: None,
+        added_tool_names: Vec::new(),
     })
 }
 

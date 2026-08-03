@@ -147,6 +147,7 @@ impl Tool for FindTool {
                 content: vec![Content::text("No files found matching pattern")],
                 details: None,
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -191,6 +192,7 @@ impl Tool for FindTool {
             content: vec![Content::text(text)],
             details,
             terminate: false,
+            ..Default::default()
         })
     }
 }

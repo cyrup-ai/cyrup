@@ -71,6 +71,7 @@ impl Tool for IntTool {
             content: vec![Content::text(format!("got:{params}"))],
             details: None,
             terminate: false,
+            ..Default::default()
         })
     }
 }

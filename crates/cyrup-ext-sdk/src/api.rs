@@ -509,6 +509,8 @@ impl ExtensionApi {
                 content: json(arg(a, 3)),
                 is_error: arg(a, 4) == "true",
                 details: opt_json(arg(a, 5)),
+                // Pi `ToolResultEventBase.usage` (types.ts:919-921); empty arg = Pi `undefined`.
+                usage: opt_json(arg(a, 6)),
             };
             f(ev, c).into_raw()
         }));

@@ -288,7 +288,7 @@ impl Tool for BlockTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.gate.notified().await;
-        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: false, ..Default::default() })
     }
 }
 struct BlockExt {

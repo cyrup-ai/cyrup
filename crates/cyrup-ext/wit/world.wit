@@ -164,10 +164,12 @@ interface events {
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
   // tool_result carries the FULL Pi `ToolResultEventBase` shape (types.ts:883-929): the executed
-  // tool `input` (the arguments) AND the per-tool `details` blob (`BashToolDetails | …`), not just
-  // content+isError — a `tool_result` handler inspects/patches both.
+  // tool `input` (the arguments), the per-tool `details` blob (`BashToolDetails | …`) AND the
+  // optional `usage` the tool execution itself reported (types.ts:919-921, upstream `2fd38684`) —
+  // not just content+isError. A `tool_result` handler inspects and patches all of them; the patch
+  // direction rides the `hook-outcome` mutate JSON, whose `usage` key is read back host-side.
   on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
-  on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>) -> hook-outcome;
+  on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>, usage-json: option<string>) -> hook-outcome;
 
   // --- 5.3 agent & turn ---
   // context [mutate] (types.ts:1144), message_end [mutate] (types.ts:1143),

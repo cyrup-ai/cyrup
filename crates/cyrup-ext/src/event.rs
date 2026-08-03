@@ -268,6 +268,10 @@ pub enum HostEvent {
         content: Vec<Content>,
         details: Option<Value>,
         is_error: bool,
+        /// Usage the tool execution itself reported (Pi `ToolResultEventBase.usage`,
+        /// types.ts:919-921, upstream `2fd38684`). `None` = absent, which is every ordinary tool.
+        /// Observable by a handler and patchable via [`crate::EventPatch::ToolResult::usage`].
+        usage: Option<cyrup_core::Usage>,
     },
     // 5.3 agent & turn — mutating + notify
     Context { messages: Vec<AgentMessage> },

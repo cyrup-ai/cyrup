@@ -14,11 +14,12 @@ pub struct SessionStats {
     pub user_message_count: usize,
     pub assistant_message_count: usize,
     pub tool_result_count: usize,
-    /// Summed input tokens across assistant turns.
+    /// Summed input tokens across assistant turns **and** tool results that reported usage.
     pub input_tokens: u64,
-    /// Summed output tokens across assistant turns.
+    /// Summed output tokens across assistant turns **and** tool results that reported usage.
     pub output_tokens: u64,
-    /// Summed cache-read + cache-write tokens across assistant turns.
+    /// Summed cache-read + cache-write tokens across assistant turns **and** tool results that
+    /// reported usage.
     pub cache_tokens: u64,
 }
 
@@ -29,7 +30,18 @@ impl SessionStats {
         for m in messages {
             match m {
                 Message::User { .. } => s.user_message_count += 1,
-                Message::ToolResult { .. } => s.tool_result_count += 1,
+                // A tool that reported usage for its OWN execution spends real tokens, so it is
+                // billed and must appear in the totals (Pi `if (message.usage)
+                // { addUsageToTotals(usageTotals, message.usage); }`, agent-session.ts:3129-3132).
+                // Before this a metering/summarizer tool was billed-but-invisible here.
+                Message::ToolResult { usage, .. } => {
+                    s.tool_result_count += 1;
+                    if let Some(u) = usage {
+                        s.input_tokens += u.input;
+                        s.output_tokens += u.output;
+                        s.cache_tokens += u.cache_read + u.cache_write;
+                    }
+                }
                 Message::Assistant(a) => {
                     s.assistant_message_count += 1;
                     s.input_tokens += a.usage.input;

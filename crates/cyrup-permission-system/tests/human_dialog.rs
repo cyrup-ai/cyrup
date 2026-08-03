@@ -67,7 +67,7 @@ impl Tool for RecordingBash {
         let command =
             params.get("command").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         self.executed.lock().unwrap_or_else(|e| e.into_inner()).push(command);
-        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: false })
+        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: false, ..Default::default() })
     }
 }
 

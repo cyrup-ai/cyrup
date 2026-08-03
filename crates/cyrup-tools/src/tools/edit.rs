@@ -232,6 +232,7 @@ impl Tool for EditTool {
             ))],
             details: serde_json::to_value(EditDetails { diff, patch, first_changed_line }).ok(),
             terminate: false,
+            ..Default::default()
         })
     }
 }

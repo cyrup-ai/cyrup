@@ -1018,7 +1018,7 @@ impl LiveExtension {
                 let details = out
                     .details_json
                     .and_then(|d| serde_json::from_str::<Value>(&d).ok());
-                Ok(ToolResult { content, details, terminate: out.terminate })
+                Ok(ToolResult { content, details, terminate: out.terminate, ..Default::default() })
             }
             Ok(Err(msg)) => Err(ToolError::new(msg)),
             Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
@@ -1423,9 +1423,12 @@ async fn invoke(
         HostEvent::ToolCall { call_id, name, input } => {
             api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string()).await
         }
-        HostEvent::ToolResult { call_id, name, input, content, details, is_error } => {
+        HostEvent::ToolResult { call_id, name, input, content, details, is_error, usage } => {
             let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".into());
             let details_json = details.as_ref().map(|d| d.to_string());
+            // Pi `ToolResultEventBase.usage` (types.ts:919-921): absent for every ordinary tool, so
+            // an unserializable value degrades to absent rather than to a bogus payload.
+            let usage_json = usage.as_ref().and_then(|u| serde_json::to_string(u).ok());
             api.call_on_tool_result(
                 store,
                 call_id.as_str(),
@@ -1434,6 +1437,7 @@ async fn invoke(
                 &content_json,
                 *is_error,
                 details_json.as_deref(),
+                usage_json.as_deref(),
             )
             .await
         }
@@ -1617,7 +1621,13 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .and_then(|c| serde_json::from_value::<Vec<Content>>(c).ok());
             let details = v.get("details").cloned();
             let is_error = v.get("isError").and_then(|b| b.as_bool());
-            Some(EventPatch::ToolResult { content, details, is_error })
+            // Pi `ToolResultEventResult.usage` (types.ts:1085-1090). A malformed value is dropped
+            // (treated as "not patched") rather than failing the whole patch.
+            let usage = v
+                .get("usage")
+                .cloned()
+                .and_then(|u| serde_json::from_value::<cyrup_core::Usage>(u).ok());
+            Some(EventPatch::ToolResult { content, details, is_error, usage })
         }
         EventKind::Context => {
             let messages = serde_json::from_value(v).ok()?;

@@ -63,6 +63,11 @@ impl Hooks for ExtHooks {
         let orig_content = ctx.content.to_vec();
         let orig_is_error = ctx.is_error;
         let orig_details = ctx.details.cloned();
+        // The tool's own reported usage (Pi `ToolResultEventBase.usage`, types.ts:919-921). Passed
+        // in so a handler can OBSERVE it, and diffed below so a handler can PATCH it — Pi wires both
+        // directions (`runner.emitToolResult({..., usage: result.usage})` then
+        // `usage: hookResult.usage`, agent-session.ts:490-516).
+        let orig_usage = ctx.usage.cloned();
         let ev = HostEvent::ToolResult {
             call_id: ctx.tool_call_id.clone(),
             name: ctx.tool_name.to_string(),
@@ -71,10 +76,11 @@ impl Hooks for ExtHooks {
             content: orig_content.clone(),
             details: orig_details.clone(),
             is_error: orig_is_error,
+            usage: orig_usage.clone(),
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => {
-                let HostEvent::ToolResult { content, details, is_error, .. } = *ev else {
+                let HostEvent::ToolResult { content, details, is_error, usage, .. } = *ev else {
                     return Ok(None);
                 };
                 let mut over = AfterOverride::default();
@@ -89,6 +95,14 @@ impl Hooks for ExtHooks {
                 }
                 if is_error != orig_is_error {
                     over.is_error = Some(is_error);
+                    changed = true;
+                }
+                // `AfterOverride::usage` is replace-not-merge and `None` means "keep", so only a
+                // handler-supplied CHANGE is forwarded. A handler that clears the usage cannot be
+                // expressed — neither can it upstream (`usage: afterResult.usage ?? result.usage`,
+                // agent-loop.ts:738).
+                if usage != orig_usage && usage.is_some() {
+                    over.usage = usage;
                     changed = true;
                 }
                 Ok(if changed { Some(over) } else { None })

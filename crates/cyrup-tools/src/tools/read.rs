@@ -161,6 +161,7 @@ impl Tool for ReadTool {
                 content: vec![Content::text(out)],
                 details: serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok(),
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -207,6 +208,7 @@ impl Tool for ReadTool {
             content: vec![Content::text(out)],
             details,
             terminate: false,
+            ..Default::default()
         })
     }
 }
@@ -249,6 +251,7 @@ impl ReadTool {
                         ],
                         details: None,
                         terminate: false,
+                        ..Default::default()
                     })
                 }
                 image_proc::Processed::Failed { message } => {
@@ -262,6 +265,7 @@ impl ReadTool {
                         content: vec![Content::text(note)],
                         details: None,
                         terminate: false,
+                        ..Default::default()
                     })
                 }
             }
@@ -284,6 +288,7 @@ impl ReadTool {
                 content: vec![Content::text(note)],
                 details: None,
                 terminate: false,
+                ..Default::default()
             })
         }
     }

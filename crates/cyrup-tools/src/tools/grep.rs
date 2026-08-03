@@ -260,6 +260,7 @@ impl Tool for GrepTool {
                 content: vec![Content::text("No matches found")],
                 details: None,
                 terminate: false,
+                ..Default::default()
             });
         }
 
@@ -313,6 +314,7 @@ impl Tool for GrepTool {
             content: vec![Content::text(text)],
             details,
             terminate: false,
+            ..Default::default()
         })
     }
 }

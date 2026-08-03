@@ -144,6 +144,7 @@ macro_rules! export_extension {
                     content_json: ::std::string::String,
                     is_error: bool,
                     details_json: ::core::option::Option<::std::string::String>,
+                    usage_json: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(
                         1,
@@ -154,6 +155,7 @@ macro_rules! export_extension {
                             &content_json,
                             $crate::guest::b(is_error),
                             details_json.as_deref().unwrap_or(""),
+                            usage_json.as_deref().unwrap_or(""),
                         ],
                     )
                 }

@@ -4177,6 +4177,45 @@ impl AgentSession {
         }
     }
 
+    /// The TURN-BOUNDARY tool refresh (Pi `_installAgentNextTurnRefresh`, agent-session.ts:519-540).
+    /// Returns the tool array the agent should run the NEXT turn of the current run with, for
+    /// `PolicyHooks::prepare_next_turn` to hand back as a [`cyrup_agent::TurnUpdate`].
+    ///
+    /// Pi's version is one line — `tools: this.agent.state.tools.slice()` — because `setActiveTools`
+    /// mutates `agent.state.tools` synchronously and the loop re-reads its context every turn.
+    /// cyrup's loop snapshots the array at run start, so the live value has to be pushed back in;
+    /// the value itself still comes from `agent.state`, which is the single authority every mutation
+    /// path already writes to ([`Self::push_active_tools`]).
+    ///
+    /// The two drains ahead of that read are the EXISTING EXT-004 mechanism, called at a new time
+    /// rather than reimplemented — and in the same order as the post-run drain in
+    /// [`Self::apply_pending_agent_control`]: the refresh runs first so an explicit `setActiveTools`
+    /// still has the last word. Both are cheap no-ops when nothing changed (a relaxed atomic load
+    /// and an `Option` take), which is the common case on every turn of every run.
+    ///
+    /// TOOL ARRAY ONLY — the rebuilt system prompt is deliberately NOT propagated into the running
+    /// turn. Pi can return one because it keeps `_systemPromptOverride` and `_baseSystemPrompt` in
+    /// separate slots and resolves `override ?? base` on every turn (agent-session.ts:531); cyrup
+    /// has a single slot, into which `assemble_run_messages` already wrote exactly that resolved
+    /// value — including a `before_agent_start` handler's SANITIZED prompt (the permission
+    /// companion's `shouldExposeTool` shaping). Pushing a `DynamicToolState`-rebuilt prompt over it
+    /// mid-run would silently undo that sanitization, which is the same clobber the in-turn drain at
+    /// [`Self::assemble_run_messages`] already refuses to perform. The cost is narrow and known: a
+    /// tool that becomes active mid-run is CALLABLE for the rest of the run but its `promptSnippet`
+    /// only joins the prompt at the next run.
+    pub(crate) async fn next_turn_tools(&self) -> Vec<Arc<dyn cyrup_core::Tool>> {
+        // EXT-004: a tool an extension registered from a LIVE handler during this run.
+        self.refresh_extension_tools().await;
+        // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook. Array only,
+        // prompt discarded — see above, and the identical rule in `assemble_run_messages`.
+        if let Some((tools, _rebuilt_prompt)) =
+            self.services.host_services.take_pending_active_tools()
+        {
+            self.agent.set_tools(tools).await;
+        }
+        self.agent.tools().await
+    }
+
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
