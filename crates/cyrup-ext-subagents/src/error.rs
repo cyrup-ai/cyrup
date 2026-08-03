@@ -64,6 +64,19 @@ pub enum SubagentError {
     #[error("malformed subagents settings: {0}")]
     MalformedSettings(String),
 
+    /// An EXPLICITLY requested model (tool-call `model`, `/run [model=…]`, a chain step's `model`)
+    /// fell outside the configured `subagents.modelScope` allow list, so the run was REFUSED
+    /// before any child process was spawned (SUBA-003; pi `resolveSubagentModelOverride`'s
+    /// `throw new Error(violation.message)`, `runs/shared/model-fallback.ts:207`).
+    ///
+    /// Carries pi's verbatim violation text (`Model '…' is outside the configured subagent model
+    /// scope. Allowed patterns: … .`) as the whole message, so the refusal — and the reason for it
+    /// — reaches the caller unaltered. Enforcement is deliberately fail-CLOSED: there is no
+    /// substitute-an-allowed-model path, because a silent downgrade would run a different model
+    /// than requested while reporting success.
+    #[error("{0}")]
+    ModelOutOfScope(String),
+
     /// Acceptance-gate evaluation rejected an otherwise-clean run (R-SA-011/033).
     #[error("acceptance rejected: {0}")]
     AcceptanceRejected(String),

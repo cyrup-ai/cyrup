@@ -118,6 +118,8 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
     }
 }
 

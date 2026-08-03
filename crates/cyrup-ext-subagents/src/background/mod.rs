@@ -94,6 +94,11 @@ pub mod tracker;
 /// `extension.rs`. See [`run_status`] for the full subsystem doc.
 pub mod run_status;
 
+/// The `wait` tool's blocking primitive (SUBA-004): block the current turn until outstanding
+/// background runs settle, with a timeout and a cancellation path. Port of pi-subagents'
+/// `runs/background/wait.ts`. See [`wait`] for the full subsystem doc.
+pub mod wait;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -171,6 +171,12 @@ pub struct SubagentExtensionConfig {
     /// `companion-suggestions.ts`'s `updateCompanionDismissal`/`isDismissed`), not a side marker file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub companion_suggestions: Option<CompanionSuggestionsSetting>,
+    /// The `wait` tool's config gate — pi `ExtensionConfig.waitTool?: WaitToolConfig`
+    /// (`extension/index.ts:260` `resolveWaitToolConfig(config.waitTool)`), accepting either a bare
+    /// boolean or `{ enabled?: boolean }`. `None` (the field omitted) = enabled, pi's default.
+    /// [`crate::background::wait::WAIT_TOOL_ENABLED_ENV`] overrides whatever this says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_tool: Option<crate::background::wait::WaitToolSetting>,
 }
 
 /// pi's hardcoded default for `parallel.maxTasks` (func-SA §4.7) — the cap applied when the nested
@@ -198,6 +204,7 @@ impl Default for SubagentExtensionConfig {
             worktree_setup_hook: None,
             worktree_setup_hook_timeout_ms: None,
             companion_suggestions: None,
+            wait_tool: None,
         }
     }
 }
@@ -1002,6 +1009,7 @@ mod tests {
             },
         );
         let settings = SubagentSettings {
+            model_scope: None,
             overrides,
             default_model: Some("claude-sonnet".to_string()),
             disable_builtins: Some(true),

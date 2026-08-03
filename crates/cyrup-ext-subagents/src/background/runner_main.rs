@@ -221,6 +221,22 @@ pub struct RunnerConfig {
     /// (the pre-inheritance behavior).
     #[serde(default)]
     pub inherited_session_model: Option<cyrup_core::ModelId>,
+    /// The effective `subagents.modelScope` policy in force for this run (SUBA-003), resolved ONCE
+    /// by the orchestrator from its own discovery pass
+    /// ([`crate::discovery::AgentDiscoveryResult::model_scope`]) and carried verbatim into the
+    /// detached runner.
+    ///
+    /// This is the ONLY channel by which the policy reaches hop 2: like
+    /// [`Self::inherited_session_model`] above, this process has no discovery/settings access by
+    /// design, and re-reading `settings.json` here would both violate that contract and risk
+    /// enforcing a *different* policy than the one that was on disk when the run was authorized.
+    /// pi has no analog to carry — its async path resolves models parent-side in
+    /// `async-execution.ts:457` and its own `subagent-runner.ts` never sees a `modelScope` — but
+    /// cyrup resolves each step's model inside the runner, so without this field a background run
+    /// would be an unpoliced hole in an otherwise-enforced policy. `#[serde(default)]` (`None`)
+    /// lets an older on-disk config still deserialize, leaving enforcement off for that run.
+    #[serde(default)]
+    pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:672,914`) —
     /// resolved ONCE by the orchestrator from its own inherited env
     /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
@@ -972,6 +988,10 @@ async fn run_inner(
         // captured at plan time, carried through the one-shot config (this detached process has no
         // host-services backend of its own), so an inheriting step resolves the parent's model.
         inherited_session_model: config.inherited_session_model.clone(),
+        // SUBA-003: the model-scope policy the orchestrator authorized this run under, carried in
+        // the one-shot config for the same reason as the two fields above — this process performs
+        // no discovery and reads no settings.
+        model_scope: config.model_scope.clone(),
     });
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
@@ -1490,6 +1510,12 @@ pub(crate) struct ExecSingleStepExecutor {
     /// through to its persona's own `model`/`fallback_models`, exactly as before this seam existed.
     /// Consumed by [`Self::run_single`] via [`crate::exec::fallback::resolve_model_inheritance`].
     pub(crate) inherited_session_model: Option<cyrup_core::ModelId>,
+    /// The effective `subagents.modelScope` policy for this run (SUBA-003), carried from the
+    /// orchestrator via [`RunnerConfig::model_scope`] (background) or handed directly by
+    /// [`Self::foreground`]. Consumed by [`Self::run_single`], where a per-step `model:` override
+    /// outside the scope FAILS the step (fail-closed, pi's `explicit` severity) rather than being
+    /// quietly replaced by an allowed model. `None` = enforcement off.
+    pub(crate) model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
 }
 
 impl ExecSingleStepExecutor {
@@ -1522,6 +1548,10 @@ impl ExecSingleStepExecutor {
     /// `## reviewer` step with no configured model runs the parent's live model rather than an empty
     /// ladder. `None` (headless / no live session) leaves each inheriting step on its persona's own
     /// `model`/`fallback_models`, unchanged.
+    ///
+    /// `model_scope` is the cwd's effective `subagents.modelScope` policy (SUBA-003), resolved by
+    /// the same orchestrator discovery pass that produced `resolved_agents`, so a foreground chain
+    /// step's `model:` override is policed by exactly the policy the single-run path enforces.
     #[must_use]
     pub(crate) fn foreground(
         depth: DepthEnvelope,
@@ -1529,6 +1559,7 @@ impl ExecSingleStepExecutor {
         orchestrator_intercom_target: Option<String>,
         run_id: Option<RunId>,
         inherited_session_model: Option<cyrup_core::ModelId>,
+        model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     ) -> Self {
         Self {
             depth,
@@ -1542,6 +1573,7 @@ impl ExecSingleStepExecutor {
             orchestrator_intercom_target,
             run_id,
             inherited_session_model,
+            model_scope,
         }
     }
 }
@@ -1600,12 +1632,23 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         if let Some(step_model) = &step.model {
             available_models.push(step_model.clone());
         }
-        let model_override = crate::exec::fallback::resolve_model_inheritance(
+        // SUBA-003 fail-closed gate, per step: a chain/parallel step's own `model:` is an EXPLICIT
+        // caller-supplied model (pi `chain-execution.ts:1118` passes `source: explicitStepModel ?
+        // "explicit" : "inherited"`), so one outside `subagents.modelScope` FAILS this step with
+        // pi's verbatim message rather than silently running some allowed model instead. A step
+        // failure — not a `SubagentError` — because that is how this executor reports every other
+        // pre-spawn rejection (`Unknown agent: …` directly above), keeping the run's own status
+        // record and the surrounding chain semantics intact.
+        let model_override = match crate::exec::fallback::resolve_model_inheritance(
             step.model.as_ref(),
             agent.model.as_ref(),
             self.inherited_session_model.as_ref(),
             &mut available_models,
-        );
+            self.model_scope.as_ref(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(violation) => return Ok(StepResult::failure(violation.message)),
+        };
 
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
@@ -1664,6 +1707,10 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // render the timed-out message) — the same two values for every step, never re-derived
             // per step.
             timeout_ms: ctx.timeout_ms,
+            // SUBA-003: carried into `run_sync` so this step's fallback ladder warns on out-of-scope
+            // entries, the same way the foreground single-run path does. The step's explicit
+            // `model:` was already hard-gated above.
+            model_scope: self.model_scope.clone(),
             output_path,
             output_mode: step
                 .output_mode
@@ -2093,6 +2140,7 @@ mod tests {
             orchestrator_intercom_target: None,
             run_id: None,
             inherited_session_model: None,
+            model_scope: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
@@ -2156,6 +2204,7 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            model_scope: None,
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
@@ -2197,6 +2246,7 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            model_scope: None,
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
@@ -2310,6 +2360,7 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            model_scope: None,
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
@@ -2610,6 +2661,7 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            model_scope: None,
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,

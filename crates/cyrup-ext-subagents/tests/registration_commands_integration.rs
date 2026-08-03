@@ -303,6 +303,8 @@ async fn subagents_check_profile_cross_references_the_real_static_seed_catalog()
             default_model: None,
             disable_builtins: None,
             disable_thinking: None,
+            // SUBA-003 added this field; a profile declares no model-scope policy of its own.
+            model_scope: None,
         },
     };
     tokio::fs::write(profiles_dir.join("mixed.json"), serde_json::to_vec_pretty(&profile).expect("serialize"))
@@ -325,6 +327,8 @@ async fn subagents_check_profile_cross_references_the_real_static_seed_catalog()
             default_model: None,
             disable_builtins: None,
             disable_thinking: None,
+            // SUBA-003 added this field; a profile declares no model-scope policy of its own.
+            model_scope: None,
         },
     };
     tokio::fs::write(

@@ -51,6 +51,10 @@ pub mod mcp_direct_tools;
 /// `run_fallback_ladder`) — R-SA-035/036/037/038/039/040/041/044.
 pub mod fallback;
 
+/// Optional `subagents.modelScope` enforcement (`check_model_scope`, `parse_model_scope_config`)
+/// — a 1:1 port of pi-subagents' `runs/shared/model-scope.ts`.
+pub mod model_scope;
+
 /// The NDJSON event-stream parser (`SubagentEvent`, `consume_stdout`) — R-SA-026/057/058.
 pub mod ndjson;
 
@@ -81,8 +85,7 @@ use crate::exec::acceptance::{
 };
 use crate::exec::completion_guard::evaluate_completion_mutation_guard;
 use crate::exec::fallback::{
-    AttemptRunner, AttemptSignal, ModelAttempt, ModelOverride, build_model_candidates,
-    run_fallback_ladder,
+    AttemptRunner, AttemptSignal, ModelAttempt, ModelOverride, run_fallback_ladder,
 };
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{
@@ -425,6 +428,15 @@ pub struct RunOptions {
     /// result vs. a live callback snapshot.
     pub include_progress: Option<bool>,
     pub agent_scope: Option<AgentReadScope>,
+    /// The effective `subagents.modelScope` policy for this run (SUBA-003), threaded down from the
+    /// orchestrator's own discovery pass — pi's `options.modelScope` (`execution.ts:1069`).
+    ///
+    /// Used here ONLY for the fallback ladder's warn-severity check on non-primary candidates; the
+    /// hard, fail-closed refusal of an EXPLICIT out-of-scope model has already happened upstream in
+    /// [`crate::exec::fallback::resolve_model_inheritance`], so by the time a `RunOptions` exists
+    /// its `model_override` is known to be in scope (or the scope is not armed). `None` = no
+    /// policy configured.
+    pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     /// Explicit acceptance-contract override for this task (func-SA §4.2 `acceptance`); `None`
     /// defers to [`AcceptanceContract::heuristic_default`] (R-SA-023).
     pub acceptance: Option<AcceptanceContract>,
@@ -766,6 +778,27 @@ pub fn apply_thinking_suffix(model: Option<&str>, thinking: Option<&str>) -> Opt
         return Some(model.to_string());
     }
     Some(format!("{model}:{thinking}"))
+}
+
+/// pi `splitKnownThinkingSuffix` (`shared/model-info.ts:39-47`): split a model id on its last `:`
+/// **only when the trailing segment is a recognized [`THINKING_LEVELS`] entry**, returning
+/// `(base_model, thinking_suffix_including_colon)`.
+///
+/// Distinct from `extension.rs`'s `split_thinking_suffix` (pi `splitThinkingSuffix`,
+/// `model-fallback.ts:13-19`), which splits on the last `:` unconditionally: a model id like
+/// `openai/gpt-5:preview` keeps its `:preview` here (it is part of the id, not a reasoning level)
+/// but would be truncated by the unconditional split. Scope matching MUST use this stricter form,
+/// exactly as `model-scope.ts` does.
+#[must_use]
+pub fn split_known_thinking_suffix(model: &str) -> (&str, &str) {
+    let Some(idx) = model.rfind(':') else {
+        return (model, "");
+    };
+    let suffix = model.get(idx + 1..).unwrap_or("");
+    if !THINKING_LEVELS.contains(&suffix) {
+        return (model, "");
+    }
+    (model.get(..idx).unwrap_or(model), model.get(idx..).unwrap_or(""))
 }
 
 /// Append `item` to `vec` only if not already present — the order-preserving de-duplication pi
@@ -1860,11 +1893,16 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .unwrap_or_else(|| AcceptanceContract::heuristic_default(&agent.name, task));
 
     // Step 3 (R-SA-038).
-    let candidates = build_model_candidates(
+    // SUBA-003: pi passes `{ scope: options.modelScope }` here (`execution.ts:1065-1070`), which
+    // warns (never filters) for out-of-scope FALLBACK candidates. The ladder returned is identical
+    // either way — an out-of-scope fallback is still attempted, exactly as upstream, because
+    // dropping it would silently change which model ran.
+    let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
         &opts.model_override,
         agent.model.as_ref(),
         &agent.fallback_models,
         &opts.available_models,
+        opts.model_scope.as_ref(),
     );
 
     if candidates.is_empty() {
@@ -2392,6 +2430,7 @@ mod tests {
 
     fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
         RunOptions {
+            model_scope: None,
             cwd: cwd.to_path_buf(),
             deadline_at: None,
             timeout_ms: None,
@@ -3030,13 +3069,15 @@ mod tests {
             agent.model.as_ref(),
             Some(&inherited),
             &mut available_models,
-        );
+            None, // no modelScope policy configured
+        )
+        .expect("with no scope configured, resolution can never be refused");
         assert!(
             available_models.contains(&inherited),
             "the inherited model must be added to available_models so the allowlist filter keeps it"
         );
 
-        let candidates = build_model_candidates(
+        let candidates = crate::exec::fallback::build_model_candidates(
             &ov,
             agent.model.as_ref(),
             &agent.fallback_models,

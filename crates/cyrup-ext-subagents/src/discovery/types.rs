@@ -514,6 +514,17 @@ pub struct SubagentSettings {
     pub disable_builtins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_thinking: Option<bool>,
+    /// pi's `subagents.modelScope` (`agents.ts:144/193/731`) — the optional allow-list policy
+    /// constraining which models a subagent may run on (SUBA-003).
+    ///
+    /// **`skip_deserializing` is load-bearing**: pi validates this block with a bespoke parser
+    /// (`parseModelScopeConfig`) whose diagnostics are part of R-SA-009's MUST-abort contract, so
+    /// the field is populated by [`crate::discovery::parse_subagent_settings`] from the raw
+    /// [`serde_json::Value`] rather than by serde's derived impl, which would report a generic
+    /// type error instead. Any hand-built [`SubagentSettings`] therefore starts with no scope,
+    /// which is the correct default (enforcement off).
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
 }
 
 /// The user- and project-scope [`SubagentSettings`] pair, each with its own on-disk
@@ -550,6 +561,17 @@ pub struct LayeredOverrideSettings {
     /// project-scope application branch and is recorded into [`AgentOverrideInfo::settings_path`]
     /// when a project-scope override applies.
     pub project_settings_path: Option<PathBuf>,
+}
+
+impl LayeredOverrideSettings {
+    /// The effective `subagents.modelScope` policy for this cwd — pi's
+    /// `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`): the project
+    /// scope wins outright when present (it is not merged field-by-field with the user scope),
+    /// else the user scope applies, else there is no policy and enforcement is off.
+    #[must_use]
+    pub fn model_scope(&self) -> Option<crate::exec::model_scope::ModelScopeConfig> {
+        self.project.model_scope.clone().or_else(|| self.user.model_scope.clone())
+    }
 }
 
 /// Provenance for how an [`AgentDefinition`]'s final resolved `model` field was determined

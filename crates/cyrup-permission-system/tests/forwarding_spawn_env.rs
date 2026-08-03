@@ -177,6 +177,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
     };
     let opts = RunOptions {
+        // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
+        model_scope: None,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

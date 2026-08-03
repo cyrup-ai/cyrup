@@ -192,6 +192,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     nested_route: None,
     nested_self: None,
     dynamic_fanout_max_items: None,
+    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+    model_scope: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -327,6 +329,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     nested_route: None,
     nested_self: None,
     dynamic_fanout_max_items: None,
+    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+    model_scope: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -386,6 +390,8 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
     }
 }
 
@@ -584,6 +590,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     nested_route: None,
     nested_self: None,
     dynamic_fanout_max_items: None,
+    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+    model_scope: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");

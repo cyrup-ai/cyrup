@@ -105,6 +105,13 @@ pub mod skills;
 /// no filesystem I/O of its own.
 pub mod merge;
 
+/// The settings-file **writer** side of `subagents.agentOverrides` (pi
+/// `mergeBuiltinAgentOverride`/`removeBuiltinAgentOverride`/`removeBuiltinAgentOverrideFields`,
+/// `agents/agents.ts:1033-1120`) — the read-modify-write half this module's reader-only
+/// [`load_layered_override_settings`] deliberately does not do. Backs the `disable`/`enable`/`reset`
+/// management actions (SUBA-005).
+pub mod settings_write;
+
 use std::path::{Path, PathBuf};
 
 use cyrup_resources::package::store::installed_dir;
@@ -387,6 +394,14 @@ pub fn parse_subagent_settings(
             settings.default_model = Some(trimmed.to_string());
         }
     }
+    // pi `parseModelScopeConfig(subagentsObject.modelScope, { filePath })` (`agents.ts:731`):
+    // `modelScope` is validated by its own parser (not serde's derive), so a malformed block
+    // ABORTS discovery per R-SA-009 with a field-naming diagnostic. `SubagentSettings` carries the
+    // field as `skip_deserializing`, so this is the ONLY place it is ever populated — before this,
+    // serde's tolerance of unknown keys meant a configured `modelScope` was silently discarded and
+    // the setting had no effect anywhere (SUBA-003).
+    settings.model_scope = crate::exec::model_scope::parse_model_scope_config(value.get("modelScope"))
+        .map_err(SubagentError::MalformedSettings)?;
     Ok(settings)
 }
 
@@ -507,6 +522,9 @@ fn resolve_layered_subagent_settings(
         default_model: project.default_model.or(user.default_model),
         disable_builtins: project.disable_builtins.or(user.disable_builtins),
         disable_thinking: project.disable_thinking.or(user.disable_thinking),
+        // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1404`) — the same
+        // project-wins-outright rule [`LayeredOverrideSettings::model_scope`] applies.
+        model_scope: project.model_scope.or(user.model_scope),
     }
 }
 
@@ -773,21 +791,34 @@ pub struct AgentDiscoveryResult {
     /// Non-fatal per-chain-file parse diagnostics (R-SA-009's diagnostic case) — never aborts
     /// discovery of sibling files.
     pub diagnostics: Vec<ChainDiscoveryDiagnostic>,
+    /// The effective `subagents.modelScope` policy for this discovery's cwd (pi `discoverAgents`'s
+    /// own returned `modelScope`, `agents.ts:1404/1446`): project scope wins over user, `None` =
+    /// no policy configured, so model-scope enforcement is off.
+    pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
 }
 
-/// Run the shared walk-and-merge pipeline once: four-tier agent scan + merge + overrides
-/// (R-SA-001/002/004/009/010/011/012/020/021), plus cross-scope chain discovery (R-SA-015). The
-/// `scope` parameter narrows the User-vs-Project axis **within the scan, before the merge** (see
-/// the tier-zeroing comment in the body): [`discover_agents_all`] always passes
-/// [`AgentReadScope::Both`] (the full management/introspection view), while [`discover_agents`]
-/// forwards its caller's `scope_override`. Both entry points share this one pipeline and otherwise
-/// differ only in which [`management::AgentVisibility`] filter they apply to the result afterward —
-/// so they can never diverge on anything except R-SA-013's disabled-visibility policy and the
-/// scope narrowing itself.
-fn run_discovery(
-    cfg: &AgentDiscoveryConfig,
-    scope: AgentReadScope,
-) -> Result<AgentDiscoveryResult, SubagentError> {
+/// The **raw, unmerged** four-tier agent scan — the shape pi's `discoverAgentsAll` hands back as
+/// its separate `d.builtin` / `d.package` / `d.user` / `d.project` arrays (`agents.ts:1325-1422`),
+/// BEFORE any cross-tier precedence merge or settings-override application.
+///
+/// [`discover_agents_all`] deliberately returns the *merged* view (one precedence-winner per name,
+/// R-SA-001), which is the right shape for `list`/`get`/`update`/`delete`. But four management
+/// actions are inherently **tier-aware** and cannot be expressed over the merged view at all:
+/// `eject` must find the *bundled* (builtin/package) source file even when a same-named user file
+/// shadows it out of the merged map, and must separately detect that shadowing user file to emit
+/// pi's distinct "already a custom &lt;scope&gt; agent" refusal instead of collapsing it into
+/// "not found or is not a bundled/package agent"; `reset` likewise needs the bundled default AND
+/// the custom file in the target scope at the same time. This entry point exists for exactly those
+/// callers — it is not a second discovery pipeline, it is [`run_discovery`]'s own tier-scan step
+/// exposed, so the two can never disagree about what is on disk.
+#[must_use]
+pub fn scan_agent_tiers(cfg: &AgentDiscoveryConfig) -> merge::TieredAgents {
+    scan_agent_tiers_scoped(cfg, AgentReadScope::Both)
+}
+
+/// The tier-scan step shared by [`run_discovery`] and [`scan_agent_tiers`] — see
+/// [`run_discovery`]'s doc for why `scope` narrows the User-vs-Project axis *inside* the scan.
+fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) -> merge::TieredAgents {
     let builtin = scan_builtin_agents(cfg);
     let package = scan_package_agents(cfg);
     // Scope-filtered discovery (R-SA-013; pi `discoverAgents` + `mergeAgentsForScope`,
@@ -810,13 +841,23 @@ fn run_discovery(
     } else {
         walk_agent_dirs(&cfg.project_agent_dirs, AgentSource::Project)
     };
+    merge::TieredAgents { builtin, package, user, project }
+}
 
-    let tiers = merge::TieredAgents {
-        builtin,
-        package,
-        user,
-        project,
-    };
+/// Run the shared walk-and-merge pipeline once: four-tier agent scan + merge + overrides
+/// (R-SA-001/002/004/009/010/011/012/020/021), plus cross-scope chain discovery (R-SA-015). The
+/// `scope` parameter narrows the User-vs-Project axis **within the scan, before the merge** (see
+/// the tier-zeroing comment in the body): [`discover_agents_all`] always passes
+/// [`AgentReadScope::Both`] (the full management/introspection view), while [`discover_agents`]
+/// forwards its caller's `scope_override`. Both entry points share this one pipeline and otherwise
+/// differ only in which [`management::AgentVisibility`] filter they apply to the result afterward —
+/// so they can never diverge on anything except R-SA-013's disabled-visibility policy and the
+/// scope narrowing itself.
+fn run_discovery(
+    cfg: &AgentDiscoveryConfig,
+    scope: AgentReadScope,
+) -> Result<AgentDiscoveryResult, SubagentError> {
+    let tiers = scan_agent_tiers_scoped(cfg, scope);
     let merged = merge::discover_and_merge(tiers, &cfg.override_settings)?;
 
     let mut agents: Vec<AgentDefinition> = merged.into_values().collect();
@@ -844,6 +885,10 @@ fn run_discovery(
         agents,
         chains,
         diagnostics,
+        // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1446`)
+        // — the effective policy travels WITH the discovery result so an execution path that
+        // already discovered the agent does not have to re-read settings to learn the scope.
+        model_scope: cfg.override_settings.model_scope(),
     })
 }
 

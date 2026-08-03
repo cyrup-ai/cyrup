@@ -551,6 +551,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     nested_route: None,
     nested_self: None,
     dynamic_fanout_max_items: None,
+    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+    model_scope: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -754,6 +756,8 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     nested_route: None,
     nested_self: None,
     dynamic_fanout_max_items: None,
+    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+    model_scope: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)

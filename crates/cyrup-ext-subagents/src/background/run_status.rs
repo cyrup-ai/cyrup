@@ -40,7 +40,7 @@ use super::{RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus
 
 /// The lowercase state string pi renders (`AsyncStatus.state`): `queued`/`running`/`paused`/
 /// `complete`/`failed`.
-fn run_state_label(state: RunState) -> &'static str {
+pub(crate) fn run_state_label(state: RunState) -> &'static str {
     match state {
         RunState::Queued => "queued",
         RunState::Running => "running",
@@ -389,6 +389,7 @@ pub async fn inspect_status_by_dir(
 // =================================================================================================
 
 /// One active-run summary row for the no-id list: its own run directory plus the reconciled status.
+#[derive(Clone, Debug)]
 pub struct ActiveRun {
     /// The run's own directory (`async_root/<run_id>`), rendered as the `dir` field.
     pub dir: PathBuf,

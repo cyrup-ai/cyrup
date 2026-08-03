@@ -72,6 +72,7 @@ use crate::discovery::types::{
 use crate::discovery::{discover_agents, AgentDiscoveryConfig};
 use crate::error::SubagentError;
 use crate::exec::fallback::resolve_model_inheritance;
+use crate::exec::model_scope::ModelScopeConfig;
 use crate::exec::{AgentConfig, ResolvedAgentPersona, RunOptions, SingleResult};
 use crate::fork_context::{
     resolve_effective_context, ContextMode, ForkContext, ForkContextResolver,
@@ -713,13 +714,53 @@ impl SubagentExecutor {
         name: &str,
         scope: AgentReadScope,
     ) -> Result<AgentDefinition, SubagentError> {
+        self.resolve_agent_with_model_scope(cwd, name, scope).map(|(agent, _)| agent)
+    }
+
+    /// [`Self::resolve_agent`] plus the effective `subagents.modelScope` policy this cwd's settings
+    /// declare (SUBA-003) — pi's `discoverAgents` hands back `{ agents, modelScope }` together
+    /// (`agents.ts:1446`), and an execution path needs BOTH: the persona to run, and the policy the
+    /// model it runs on must satisfy. Returned as one call so the run path does not walk discovery
+    /// twice (once for the agent, once for the settings) and can never see a scope read from a
+    /// different point in time than the persona it is gating.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::resolve_agent`]: [`SubagentError::AgentNotFound`], or a discovery-time
+    /// [`SubagentError::MalformedSettings`] — which now also covers a malformed `modelScope` block
+    /// (R-SA-009's MUST-abort, rather than silently ignoring an unenforceable policy).
+    pub fn resolve_agent_with_model_scope(
+        &self,
+        cwd: &Path,
+        name: &str,
+        scope: AgentReadScope,
+    ) -> Result<(AgentDefinition, Option<ModelScopeConfig>), SubagentError> {
         let cfg = Self::discovery_config(cwd)?;
         let result = discover_agents(&cfg, Some(scope))?;
-        result
+        let model_scope = result.model_scope.clone();
+        let agent = result
             .agents
             .into_iter()
             .find(|a| a.name == name)
-            .ok_or_else(|| SubagentError::AgentNotFound(name.to_string()))
+            .ok_or_else(|| SubagentError::AgentNotFound(name.to_string()))?;
+        Ok((agent, model_scope))
+    }
+
+    /// The effective `subagents.modelScope` policy for `cwd` on its own (SUBA-003), without
+    /// resolving any particular agent — for the multi-agent plan paths (`/chain`, `/parallel`,
+    /// background runs), which resolve their personas through
+    /// [`Self::resolve_plan_personas`] and need the policy as one value covering the whole plan.
+    ///
+    /// Reads only the two `settings.json` layers (via [`Self::discovery_config`]), not the agent
+    /// directory walk.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SubagentError::MalformedSettings`] (R-SA-009) when either scope's settings file
+    /// is unreadable/unparseable or carries a malformed `subagents.*` field — including a malformed
+    /// `modelScope` block, which MUST abort rather than degrade to unenforced.
+    pub fn resolve_model_scope(cwd: &Path) -> Result<Option<ModelScopeConfig>, SubagentError> {
+        Ok(Self::discovery_config(cwd)?.override_settings.model_scope())
     }
 
     /// Plan-time persona map (T0.1's C13 root-cause seam): resolve every DISTINCT agent named across
@@ -958,7 +999,11 @@ impl SubagentExecutor {
             });
         }
 
-        let agent = self.resolve_agent(cwd, agent_name, agent_scope)?;
+        // SUBA-003: the persona AND this cwd's effective `subagents.modelScope` policy come back
+        // from ONE discovery pass, so the scope gating this run's model is the scope on disk right
+        // now (pi `discoverAgents` -> `{ agents, modelScope }`, `agents.ts:1446`).
+        let (agent, model_scope) =
+            self.resolve_agent_with_model_scope(cwd, agent_name, agent_scope)?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
         // `context` (`None`) falls back to THIS agent's own `default_context` rather than being forced
         // to `Fresh`; an explicit call-site value still wins (`resolve_effective_context`).
@@ -993,12 +1038,21 @@ impl SubagentExecutor {
         // persona > inherited) and pushes the inherited id into `available_models` so it survives the
         // allowlist filter. `None` inherited (headless / no live session) degrades to the persona's
         // own `model`/`fallback_models` exactly as before.
+        //
+        // SUBA-003 fail-closed gate: when `subagents.modelScope.enforce` is armed and the caller
+        // asked for a model no `allow` pattern matches, this returns `Err` and the run is REFUSED
+        // here — before `deadline_at`, before the `RunId` is minted, and before any subprocess is
+        // spawned. The violation is mapped to `SubagentError::ModelOutOfScope`, whose `Display` is
+        // pi's verbatim message, so the caller (tool result / slash command) sees exactly WHY the
+        // run did not happen instead of silently getting a different model's output.
         let effective_override = resolve_model_inheritance(
             model_override.as_ref(),
             agent_config.model.as_ref(),
             self.inherited_session_model().as_ref(),
             &mut available_models,
-        );
+            model_scope.as_ref(),
+        )
+        .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
 
         // R-SA-035 / pi `resolveAttemptTimeout` (`execution.ts:91-99`): the orchestrator computes
         // the wall-clock `deadline_at` ONCE, here, from the nominal `timeout_ms` budget (pi
@@ -1019,6 +1073,10 @@ impl SubagentExecutor {
             output_mode: crate::discovery::types::OutputMode::Inline,
             structured_output_schema: None,
             model_override: effective_override,
+            // SUBA-003: the same policy that just gated the explicit override, carried into
+            // `run_sync` so the fallback ladder's own out-of-scope entries warn (pi
+            // `execution.ts:1069`).
+            model_scope,
             preferred_provider: None,
             available_models,
             // pi `execute(id, params, signal, ...)` threads the host's own `AbortSignal` into the
@@ -1376,6 +1434,11 @@ impl SubagentExecutor {
             // model rather than hard-failing on an empty ladder. `None` (headless / no live session)
             // leaves each inheriting step on its persona's own `model`/`fallback_models`.
             inherited_session_model: self.inherited_session_model(),
+            // SUBA-003: the model-scope policy in force at authorization time, baked into the
+            // one-shot config so the detached hop-2 runner enforces the SAME policy the foreground
+            // path does. Without it, `subagent({..., background: true})` would be an unpoliced way
+            // around an enforcing `modelScope`.
+            model_scope: Self::resolve_model_scope(cwd)?,
             // Nested-route inheritance (pi `config.nestedRoute`/`config.nestedSelf`,
             // `async-execution.ts:672-678,914-920`): carried verbatim so the detached runner (were it
             // ever to relay ITS OWN descendants further, a later unit's concern) inherits the SAME
@@ -1540,6 +1603,9 @@ impl SubagentExecutor {
             // an inheriting step (no persona `model:`, no per-step override) runs the parent's live
             // model, the SAME inheritance the foreground single-run path applies.
             self.inherited_session_model(),
+            // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
+            // step's own `model:` is policed exactly as a single run's `model` is.
+            Self::resolve_model_scope(cwd)?,
         ));
         let global_limit = GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
         // R-SA-035/036 (pi `chain-execution.ts:606`): the chain-wide deadline is computed ONCE here,
@@ -3240,7 +3306,12 @@ DIAGNOSTICS:
 /// (`fanout-child.ts:159-163`, joined with `\n`): tells the model up front which management/control
 /// actions remain available and which mutation actions are blocked in this mode, rather than only
 /// discovering the block via a runtime [`ToolError`] from [`SubagentTool::route_management_action`].
-const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, append-step, doctor.\nAgent config mutation actions create, update, and delete are blocked in this mode.";
+/// SUBA-005 updated the blocked list to pi's own seven-name parenthesized form
+/// (`fanout-child.ts:162` at v0.34.0) now that `eject`/`disable`/`enable`/`reset` exist and are on
+/// the denylist. The *allowed* list deliberately omits pi's `steer` — that action is deferred
+/// (SUBA-013, no control-channel inbox exists), and advertising a verb the dispatcher rejects would
+/// be a worse defect than omitting it.
+const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, append-step, doctor.\nAgent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.";
 
 /// The `subagent` tool's full discriminated-union parameter surface (R-SA-128, C8) — the Rust parse
 /// target for pi's `SubagentParamsSchema` (`src/extension/schemas.ts:195-265`). Every top-level pi
@@ -4008,7 +4079,7 @@ fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("task".to_string(), serde_json::json!({ "type": "string", "description": "Task (SINGLE mode, optional for self-contained agents)" }));
     props.insert("action".to_string(), serde_json::json!({
         "type": "string",
-        "enum": ["list", "get", "models", "create", "update", "delete", "status", "interrupt", "resume", "append-step", "doctor"],
+        "enum": ["list", "get", "models", "create", "update", "delete", "eject", "disable", "enable", "reset", "status", "interrupt", "resume", "append-step", "doctor"],
         "description": "Management/control action. Omit for execution mode."
     }));
     props.insert("id".to_string(), serde_json::json!({ "type": "string", "description": "Run id or prefix for action='status', action='interrupt', action='resume', or action='append-step'." }));
@@ -4074,6 +4145,155 @@ fn subagent_tool_parameters() -> serde_json::Value {
         "additionalProperties": true,
         "properties": serde_json::Value::Object(props),
     })
+}
+
+// =================================================================================================
+// The `wait` tool (SUBA-004; pi `extension/index.ts:509-527` + `runs/background/wait.ts`)
+// =================================================================================================
+
+/// The `wait` tool's registered name. Deliberately pi's v0.33/v0.34 name — upstream renamed it to
+/// `subagent_wait` in `9245034` (2026-07-14), eight days AFTER v0.34.0, which is post-baseline
+/// drift this port does not pull in.
+pub(crate) const WAIT_TOOL_NAME: &str = "wait";
+
+/// pi's `wait` tool description (`extension/index.ts:512-518`), rebranded to cyrup's binary/env
+/// names. The trailing sentence is appended only when the tool is configured off, exactly as
+/// upstream appends its own "Configured behavior:" note.
+fn wait_tool_description(enabled: bool) -> String {
+    let base = "Block until background (async) subagent runs started in this session finish, then \
+                return.\n\nUse this after launching async subagents when you have no independent \
+                work left and must not end your turn — for example inside a skill that has to run \
+                to completion, or any non-interactive run (`cyrup -p ...`) where the whole task is \
+                a single turn and ending it would abandon the still-running children.\n\n\
+                • { } — return as soon as the FIRST active run finishes (default). Ideal for a \
+                rolling fleet: launch N, wait, spawn a replacement for the one that finished, wait \
+                again — keeping N in flight.\n\
+                • { all: true } — block until EVERY active run in this session is finished.\n\
+                • { id: \"...\" } — wait for one specific run (id or prefix) to finish.\n\
+                • { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; \
+                default 30 min)\n\n\
+                wait also returns when a run needs attention (a child that went idle or blocked \
+                for a decision), not only on completion — so a stuck child never stalls the loop; \
+                the summary names the run(s) to inspect/nudge/resume/interrupt. It polls the \
+                authoritative on-disk run records (which also reconciles crashed runners), keeps \
+                the turn alive for normal notification delivery, and resolves early if the turn is \
+                aborted.";
+    if enabled {
+        base.to_string()
+    } else {
+        format!(
+            "{base}\n\nConfigured behavior: wait is disabled by config.waitTool or \
+             {} and returns immediately without blocking.",
+            crate::background::wait::WAIT_TOOL_ENABLED_ENV
+        )
+    }
+}
+
+/// JSON Schema for [`WaitTool`]'s parameters (pi `WaitParams`, `runs/background/wait.ts:104-116`).
+fn wait_tool_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Optional run id (or unambiguous prefix) to wait for. Omitted: wait across every active run."
+            },
+            "all": {
+                "type": "boolean",
+                "description": "Block until EVERY active run is finished. Default false: return as soon as the first one finishes."
+            },
+            "timeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Give up after this many milliseconds (default 1800000 = 30 minutes). The runs are detached and keep going."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// The `wait` tool (SUBA-004): the ONLY way an orchestrator can block on a background subagent run
+/// without ending its turn. See [`crate::background::wait`] for the loop itself, including the two
+/// escape hatches (timeout + cancellation) that keep a wedged child from hanging the orchestrator.
+///
+/// Registered alongside [`SubagentTool`] in the [`RegistrationMode::Full`] arm only: a fanout child
+/// has no business blocking on its parent's whole async root (the same reasoning that makes
+/// `control_status`'s no-id listing child-unsafe).
+pub struct WaitTool {
+    executor: Arc<SubagentExecutor>,
+    cwd: PathBuf,
+    parameters: serde_json::Value,
+    description: String,
+}
+
+impl WaitTool {
+    /// `enabled` is the already-resolved [`crate::background::wait::resolve_wait_tool_enabled`]
+    /// verdict, captured at registration time exactly as pi captures `waitToolConfig` at extension
+    /// load — so the advertised description and the runtime behavior can never disagree.
+    #[must_use]
+    pub fn new(executor: Arc<SubagentExecutor>, cwd: PathBuf, enabled: bool) -> Self {
+        Self {
+            executor,
+            cwd,
+            parameters: wait_tool_parameters(),
+            description: wait_tool_description(enabled),
+        }
+    }
+
+    /// The effective enabled verdict for this cwd: `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED` over
+    /// `config.waitTool` over pi's enabled-by-default. A malformed env value degrades to enabled
+    /// (and is surfaced when the tool actually runs) rather than failing extension registration.
+    pub(crate) async fn resolve_enabled(executor: &SubagentExecutor) -> bool {
+        let cfg = executor.config_snapshot().await;
+        let env = std::env::var(crate::background::wait::WAIT_TOOL_ENABLED_ENV).ok();
+        crate::background::wait::resolve_wait_tool_enabled(cfg.wait_tool.as_ref(), env.as_deref())
+            .unwrap_or(true)
+    }
+}
+
+#[async_trait]
+impl Tool for WaitTool {
+    fn name(&self) -> &str {
+        WAIT_TOOL_NAME
+    }
+
+    fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn label(&self) -> Option<&str> {
+        Some("Wait")
+    }
+
+    /// Blocks the calling turn. `cancel` is the host's own token for this tool call (pi's
+    /// `AbortSignal`) and is threaded straight into the wait loop — aborting the turn releases the
+    /// wait immediately instead of after the remaining poll interval.
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        params: serde_json::Value,
+        cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        let parsed: crate::background::wait::WaitParams = serde_json::from_value(params)
+            .map_err(|e| ToolError::new(format!("invalid wait tool call: {e}")))?;
+        // Re-resolved per call (not cached from registration) so a mid-session config/env change
+        // takes effect; the registration-time verdict only fixes the advertised description.
+        let enabled = Self::resolve_enabled(&self.executor).await;
+        let deps = crate::background::wait::WaitDeps::for_cwd(&self.cwd, enabled);
+        match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
+            Ok(text) => Ok(ToolResult {
+                content: vec![cyrup_core::Content::text(text)],
+                details: Some(serde_json::json!({ "mode": "management" })),
+                terminate: false,
+            }),
+            Err(message) => Err(ToolError::new(message)),
+        }
+    }
 }
 
 /// The `subagent` LLM-facing tool (R-SA-128). Dispatches over pi's full discriminated-union
@@ -4430,15 +4650,18 @@ impl SubagentTool {
                     terminate: false,
                 })
             }
-            "list" | "get" | "create" | "update" | "delete" => {
-                self.route_management_action(action, p, cwd).await
-            }
+            // SUBA-005: `eject`/`disable`/`enable`/`reset` join the CRUD arm — they are
+            // `handle_management_action` cases exactly as `create`/`update`/`delete` are, and go
+            // through the same child-safe denylist below.
+            "list" | "get" | "create" | "update" | "delete" | "eject" | "disable" | "enable"
+            | "reset" => self.route_management_action(action, p, cwd).await,
             "status" | "interrupt" | "resume" | "append-step" => {
                 self.route_control_action(action, p, cwd).await
             }
             other => Err(ToolError::new(format!(
                 "unknown subagent action '{other}'; valid actions are list, get, models, create, \
-                 update, delete, status, interrupt, resume, append-step, doctor."
+                 update, delete, eject, disable, enable, reset, status, interrupt, resume, \
+                 append-step, doctor."
             ))),
         }
     }
@@ -4456,12 +4679,18 @@ impl SubagentTool {
         p: &SubagentToolParams,
         cwd: &Path,
     ) -> Result<ToolResult, ToolError> {
-        // T6 child-safe restriction (pi `fanout-child.ts` `allowMutatingManagementActions: false`):
-        // a fanout child may inspect/delegate but must not rewrite the parent's agent config on disk.
-        if !self.allow_mutating_management && matches!(action, "create" | "update" | "delete") {
+        // T6 child-safe restriction (pi `fanout-child.ts` `allowMutatingManagementActions: false`,
+        // over `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:112`): a fanout child may
+        // inspect/delegate but must not rewrite the parent's agent config on disk — which since
+        // SUBA-005 also means it must not eject a builtin into the parent's user scope, nor
+        // disable/enable/reset an agent via the parent's `settings.json`.
+        if !self.allow_mutating_management
+            && crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS.contains(&action)
+        {
             return Err(ToolError::new(format!(
-                "subagent management action '{action}' is blocked in child-safe fanout mode; \
-                 create, update, and delete are not permitted here."
+                "subagent management action '{action}' is blocked in child-safe fanout mode; {} are \
+                 not permitted here.",
+                crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS.join(", ")
             )));
         }
         let cfg = SubagentExecutor::discovery_config(cwd).map_err(|e| ToolError::new(e.to_string()))?;
@@ -5415,6 +5644,20 @@ impl NativeExtension for SubagentsExtension {
                 );
 
                 api.register_tool(Arc::new(SubagentTool::new(self.executor.clone(), self.cwd.clone())));
+
+                // SUBA-004 (pi `extension/index.ts:519-527`): the `wait` tool registers alongside
+                // `subagent`, in the Full arm only. Without it an orchestrator has NO way to block
+                // on a background run — it can only end its turn and hope a completion notification
+                // arrives, which is impossible in a skill that must run to completion or in a
+                // single-turn `cyrup -p …` invocation. Registered even when configured off (pi does
+                // the same): the disabled tool returns immediately with an explanation, so the model
+                // is told why nothing was waited on instead of the tool silently vanishing.
+                let wait_enabled = WaitTool::resolve_enabled(&self.executor).await;
+                api.register_tool(Arc::new(WaitTool::new(
+                    self.executor.clone(),
+                    self.cwd.clone(),
+                    wait_enabled,
+                )));
 
                 for cmd in SLASH_COMMANDS {
                     api.register_command(
@@ -7870,8 +8113,11 @@ mod tests {
             );
         }
 
-        // The 11-value management/control action enum (schemas.ts:199-202 + SUBAGENT_ACTIONS,
-        // shared/types.ts:974), exact values AND order.
+        // The management/control action enum (schemas.ts:199-202 + SUBAGENT_ACTIONS,
+        // shared/types.ts:1121), exact values AND order. 15 of pi's 20: SUBA-005 added
+        // eject/disable/enable/reset; the five still missing (`steer` + the four `schedule*`) are
+        // explicitly deferred to SUBA-013/SUBA-016 and MUST NOT be advertised here until their
+        // subsystems exist — advertising a verb the dispatcher rejects is worse than omitting it.
         let action_enum = props
             .get("action")
             .and_then(|a| a.get("enum"))
@@ -7881,11 +8127,20 @@ mod tests {
         assert_eq!(
             action_values,
             vec![
-                "list", "get", "models", "create", "update", "delete", "status", "interrupt",
-                "resume", "append-step", "doctor"
+                "list", "get", "models", "create", "update", "delete", "eject", "disable",
+                "enable", "reset", "status", "interrupt", "resume", "append-step", "doctor"
             ],
-            "the action enum must be pi's exact 11-value SUBAGENT_ACTIONS union"
+            "the action enum must be pi's SUBAGENT_ACTIONS union minus the deferred steer/schedule* five"
         );
+        // Every advertised management verb must actually dispatch: an enum value the tool schema
+        // shows the model but `route_action` answers with "unknown subagent action" is a worse
+        // defect than the missing action was.
+        for action in crate::discovery::management::MANAGEMENT_ACTIONS {
+            assert!(
+                action_values.contains(&action),
+                "management action '{action}' is dispatched but not advertised in the tool schema"
+            );
+        }
         assert_eq!(props["action"]["type"], serde_json::json!("string"));
 
         // context fresh/fork enum.
@@ -7992,9 +8247,19 @@ mod tests {
             Tool::description(&child_safe),
             "Delegate to subagents from child-safe fanout mode.\n\
              Allowed management/control actions: list, get, status, interrupt, resume, append-step, doctor.\n\
-             Agent config mutation actions create, update, and delete are blocked in this mode.",
+             Agent config mutation actions (create, update, delete, eject, disable, enable, reset) are blocked in this mode.",
             "the child-safe tool must advertise pi's exact fanout-child.ts:159-163 text"
         );
+        // The advertised blocked list must name exactly the denylist the dispatcher enforces —
+        // a child told only about create/update/delete would discover the eject/disable/enable/reset
+        // block by runtime error instead, which is the whole failure this description exists to
+        // prevent.
+        for action in crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS {
+            assert!(
+                Tool::description(&child_safe).contains(action),
+                "child-safe description must name the blocked action '{action}'"
+            );
+        }
         assert_ne!(
             Tool::description(&child_safe),
             Tool::description(&full),
@@ -8449,6 +8714,86 @@ mod tests {
             .await
             .expect_err("an unknown action is rejected");
         assert!(unknown_err.to_string().contains("unknown subagent action 'frobnicate'"));
+        // The unknown-action message must enumerate the actions that DO dispatch, so a model that
+        // guessed wrong is told the real set (SUBA-005 widened it by four).
+        for action in crate::discovery::management::MANAGEMENT_ACTIONS {
+            assert!(
+                unknown_err.to_string().contains(action),
+                "the unknown-action error must list '{action}'; got: {unknown_err}"
+            );
+        }
+    }
+
+    /// SUBA-005 dispatch proof, separated from the omnibus test above because the assertion is on
+    /// the handler's own text: each new verb reaches `handle_eject`/`handle_disable`/`handle_enable`/
+    /// `handle_reset` and answers with pi's verbatim "Specify 'agent' for &lt;verb&gt;." validation —
+    /// which is only reachable through the real handler. Pre-fix, `route_action` had no arm for any
+    /// of the four and answered "unknown subagent action '&lt;verb&gt;'" instead.
+    #[tokio::test]
+    async fn tool_execute_routes_the_four_suba_005_actions_to_their_real_handlers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        for verb in ["eject", "disable", "enable", "reset"] {
+            let err = tool
+                .execute(
+                    ToolCallId::from("t"),
+                    serde_json::json!({ "action": verb }),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("a management action with no 'agent' is an error outcome");
+            assert_eq!(
+                err.to_string(),
+                format!("Specify 'agent' for {verb}."),
+                "action '{verb}' must be serviced by its own handler, not the unknown-action arm"
+            );
+        }
+    }
+
+    /// T6 regression (pi `MUTATING_MANAGEMENT_ACTIONS`, `subagent-executor.ts:112`): a fanout child
+    /// is refused ALL SEVEN mutating management actions — including the four SUBA-005 added — and
+    /// the refusal happens BEFORE any discovery or filesystem access, so a child cannot even probe
+    /// the parent's config through them. The read-only verbs are unaffected.
+    #[tokio::test]
+    async fn child_safe_tool_blocks_all_seven_mutating_management_actions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = SubagentTool::new_child_safe(
+            Arc::new(SubagentExecutor::new()),
+            dir.path().to_path_buf(),
+        );
+
+        for action in crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS {
+            let result = child
+                .execute(
+                    ToolCallId::from("t"),
+                    serde_json::json!({ "action": action, "agent": "scout" }),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await;
+            let err = result.err().unwrap_or_else(|| {
+                panic!("child-safe mode must refuse the mutating action '{action}'")
+            });
+            assert!(
+                err.to_string().contains("blocked in child-safe fanout mode"),
+                "action '{action}' must be refused by the T6 denylist; got: {err}"
+            );
+        }
+
+        // The read-only verbs still work in child-safe mode — the denylist is a denylist, not a
+        // blanket management block.
+        let listed = child
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "action": "list" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect("child-safe mode still permits the read-only 'list'");
+        assert!(!listed.content.is_empty());
     }
 
     /// pi-parity regression: a SINGLE-mode call setting one of the tool-advertised-but-not-yet-wired
@@ -10590,5 +10935,250 @@ mod tests {
         };
         let timeout_outcome = probe_model_with(&sleeper, "irrelevant/model", 50).await;
         assert_eq!(timeout_outcome.status, ProbeStatus::Timeout);
+    }
+
+    // =========================================================================================
+    // SUBA-003: `subagents.modelScope` enforcement
+    // (pi `runs/shared/model-scope.ts` + `model-fallback.ts:200-212`)
+    // =========================================================================================
+
+    /// Seed a cwd with one discoverable agent and (optionally) a `subagents` settings block.
+    fn seed_scope_fixture(cwd: &Path, agent: &str, settings_json: Option<&str>) {
+        let agents_dir = cwd.join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+        std::fs::write(
+            agents_dir.join(format!("{agent}.md")),
+            format!("---\nname: {agent}\ndescription: Model-scope fixture agent\n---\nBody.\n"),
+        )
+        .expect("write agent fixture");
+        if let Some(json) = settings_json {
+            std::fs::write(agents_dir.join("settings.json"), json).expect("write settings.json");
+        }
+    }
+
+    /// SUBA-003, the load-bearing observable behavior: with `subagents.modelScope.enforce` armed,
+    /// a run that EXPLICITLY asks for a model outside the `allow` list is REFUSED — the call
+    /// returns `Err(SubagentError::ModelOutOfScope)` carrying pi's verbatim violation message, and
+    /// no child process is ever spawned.
+    ///
+    /// Before this fix `modelScope` was not even a field on `SubagentSettings`, so serde dropped
+    /// the whole block silently and this call ran the out-of-scope model to completion.
+    #[tokio::test]
+    async fn an_explicit_out_of_scope_model_refuses_the_run_with_pis_verbatim_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_scope_fixture(
+            dir.path(),
+            "scoped",
+            Some(
+                r#"{"subagents":{"modelScope":{"enforce":true,"allow":["anthropic/*","together/*"]}}}"#,
+            ),
+        );
+
+        let executor = SubagentExecutor::new();
+        let err = executor
+            .run_foreground(
+                dir.path(),
+                "scoped",
+                "do something",
+                Some(ContextMode::Fresh),
+                Some(ModelId::from("openai/gpt-5-nano")),
+                None,
+            )
+            .await
+            .expect_err("an out-of-scope explicit model must REFUSE the run, not run it");
+
+        assert!(
+            matches!(err, SubagentError::ModelOutOfScope(_)),
+            "the refusal must be its own error kind, not folded into a generic failure: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
+             patterns: anthropic/*, together/*.",
+            "the caller must see pi's verbatim violation text, naming the model AND the patterns"
+        );
+    }
+
+    /// The thinking suffix must not defeat the policy: `<allowed>:max` is still the allowed model
+    /// (pi strips a KNOWN suffix before matching), while `<disallowed>:max` is still refused and is
+    /// REPORTED under its base id. `:max` is the 7th thinking level added by commit 6d29542.
+    #[tokio::test]
+    async fn a_thinking_suffix_neither_smuggles_a_model_in_nor_hides_one_from_the_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_scope_fixture(
+            dir.path(),
+            "scoped",
+            Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["anthropic/claude-opus-4"]}}}"#),
+        );
+        let executor = SubagentExecutor::new();
+
+        let err = executor
+            .run_foreground(
+                dir.path(),
+                "scoped",
+                "t",
+                Some(ContextMode::Fresh),
+                Some(ModelId::from("openai/gpt-5-nano:max")),
+                None,
+            )
+            .await
+            .expect_err("a thinking suffix must not smuggle an out-of-scope model past the gate");
+        assert_eq!(
+            err.to_string(),
+            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
+             patterns: anthropic/claude-opus-4.",
+            "the reported model must be the BASE id, with the thinking suffix stripped"
+        );
+
+        // The mirror case is asserted at the decision boundary rather than through `run_foreground`,
+        // because an ALLOWED model proceeds to a real subprocess spawn (this crate never fakes that).
+        let scope = SubagentExecutor::resolve_model_scope(dir.path())
+            .expect("settings parse")
+            .expect("a modelScope block is configured");
+        let mut available = Vec::new();
+        let allowed = ModelId::from("anthropic/claude-opus-4:max");
+        assert!(
+            crate::exec::fallback::resolve_model_inheritance(
+                Some(&allowed),
+                None,
+                None,
+                &mut available,
+                Some(&scope),
+            )
+            .is_ok(),
+            "an ALLOWED model carrying a known thinking suffix must pass the gate unchanged"
+        );
+    }
+
+    /// The refusal must be a REFUSAL, not a downgrade: the identical call with no `modelScope`
+    /// configured must not produce a scope error at all, and the armed policy must never rewrite
+    /// the requested model into an allowed one.
+    #[tokio::test]
+    async fn enforcement_is_off_without_a_policy_and_never_substitutes_an_allowed_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_scope_fixture(dir.path(), "scoped", None);
+        assert_eq!(
+            SubagentExecutor::resolve_model_scope(dir.path()).expect("settings parse"),
+            None,
+            "no settings block means no policy — enforcement stays off"
+        );
+
+        // With no policy, the exact model the caller asked for is what resolves.
+        let mut available = Vec::new();
+        let requested = ModelId::from("openai/gpt-5-nano");
+        let resolved = crate::exec::fallback::resolve_model_inheritance(
+            Some(&requested),
+            None,
+            None,
+            &mut available,
+            None,
+        )
+        .expect("no policy configured, so nothing can be refused");
+        assert_eq!(resolved, crate::exec::fallback::ModelOverride::Explicit(requested.clone()));
+
+        // With a policy that REFUSES it, the outcome is an error — never `Ok(<some other model>)`.
+        let scope = crate::exec::model_scope::ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(vec!["anthropic/*".to_string()]),
+        };
+        let refused = crate::exec::fallback::resolve_model_inheritance(
+            Some(&requested),
+            None,
+            None,
+            &mut available,
+            Some(&scope),
+        );
+        assert!(
+            refused.is_err(),
+            "fail closed: an out-of-scope explicit model may not resolve to ANY model, {refused:?}"
+        );
+        assert!(
+            available.is_empty(),
+            "a refused resolution must not have mutated the availability set"
+        );
+    }
+
+    /// R-SA-009: a malformed `modelScope` block ABORTS discovery rather than degrading to an
+    /// unenforced policy — the fail-closed posture applied to the settings read itself. Before the
+    /// fix, `SubagentSettings` had no such field and serde discarded every one of these silently.
+    #[test]
+    fn a_malformed_model_scope_block_aborts_discovery_instead_of_silently_disarming() {
+        for (label, json) in [
+            ("enforce without allow", r#"{"subagents":{"modelScope":{"enforce":true}}}"#),
+            ("non-object", r#"{"subagents":{"modelScope":[]}}"#),
+            ("non-boolean enforce", r#"{"subagents":{"modelScope":{"enforce":"yes"}}}"#),
+            (
+                "non-string allow entries",
+                r#"{"subagents":{"modelScope":{"enforce":true,"allow":[1]}}}"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            seed_scope_fixture(dir.path(), "scoped", Some(json));
+            let err = SubagentExecutor::resolve_model_scope(dir.path())
+                .expect_err(&format!("{label} must abort, not silently disarm the policy"));
+            assert!(
+                matches!(err, SubagentError::MalformedSettings(_)),
+                "{label}: expected MalformedSettings, got {err:?}"
+            );
+        }
+    }
+
+    /// A well-formed block is actually READ (the SUBA-003 root cause: it was parsed by nothing),
+    /// with project scope winning over user scope exactly as every other `subagents.*` scalar does.
+    #[test]
+    fn a_well_formed_model_scope_block_is_read_and_normalized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_scope_fixture(
+            dir.path(),
+            "scoped",
+            Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["  anthropic/*  "]}}}"#),
+        );
+        let scope = SubagentExecutor::resolve_model_scope(dir.path())
+            .expect("settings parse")
+            .expect("the configured block must be read, not dropped");
+        assert_eq!(scope.enforce, Some(true));
+        assert_eq!(scope.allow, Some(vec!["anthropic/*".to_string()]), "patterns are trimmed");
+        assert!(scope.is_armed());
+    }
+
+    /// The background path is not a hole in the policy: the resolved scope is baked into the
+    /// serialized `RunnerConfig` the detached hop-2 runner is handed over `--config`, which is the
+    /// only channel by which anything reaches that separate OS process.
+    #[test]
+    fn the_model_scope_reaches_the_detached_runner_through_the_serialized_config() {
+        let scope = crate::exec::model_scope::ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(vec!["anthropic/*".to_string()]),
+        };
+        let config = crate::background::runner_main::RunnerConfig {
+            run_id: RunId::new(),
+            mode: RunMode::Single,
+            steps: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            session_file: None,
+            global_concurrency_limit: 4,
+            worktree_base_dir: None,
+            max_subagent_depth: 2,
+            async_root: PathBuf::new(),
+            results_dir: PathBuf::new(),
+            resolved_agents: BTreeMap::new(),
+            original_task: String::new(),
+            chain_dir: None,
+            orchestrator_intercom_target: None,
+            inherited_session_model: None,
+            model_scope: Some(scope.clone()),
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
+        };
+        let json = serde_json::to_value(&config).expect("config serializes");
+        assert_eq!(
+            json.get("modelScope").and_then(|v| v.get("allow")),
+            Some(&serde_json::json!(["anthropic/*"])),
+            "the policy must be present in the on-disk config handed to the child: {json}"
+        );
+        let round_tripped: crate::background::runner_main::RunnerConfig =
+            serde_json::from_value(json).expect("config round-trips");
+        assert_eq!(round_tripped.model_scope, Some(scope));
     }
 }

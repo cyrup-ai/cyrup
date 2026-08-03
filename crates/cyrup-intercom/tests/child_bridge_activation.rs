@@ -127,6 +127,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
+        model_scope: None,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

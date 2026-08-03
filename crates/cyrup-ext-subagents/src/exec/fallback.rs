@@ -42,6 +42,11 @@
 
 use cyrup_core::{ModelId, Usage};
 
+use crate::exec::model_scope::{
+    ModelScopeConfig, ModelScopeSeverity, ModelScopeViolation, ModelSource, check_model_scope,
+    warn_violation,
+};
+
 // -------------------------------------------------------------------------------------------
 // R-SA-041: the inherit sentinel
 // -------------------------------------------------------------------------------------------
@@ -130,6 +135,54 @@ pub fn build_model_candidates(
     seen
 }
 
+/// [`build_model_candidates`] plus `subagents.modelScope` enforcement over the ladder's
+/// **non-primary** entries — pi `buildModelCandidates`'s `if (index > 0 && options?.scope?.enforce)`
+/// arm (`model-fallback.ts:229-237`).
+///
+/// Only entries AFTER the first raw candidate are checked here, and only ever at `warn` severity,
+/// because upstream splits the work exactly that way: candidate #0 is the already-resolved primary
+/// model, whose scope check (including the hard-error `explicit` case) belongs to
+/// [`resolve_model_inheritance`] / `resolveSubagentModelOverride`; everything after it is inherited
+/// agent config (`fallbackModels`), which warns rather than erroring so an existing agent file with
+/// an out-of-scope fallback keeps working.
+///
+/// A warn NEVER removes or substitutes a candidate — the returned ladder is byte-identical to
+/// [`build_model_candidates`]'. Filtering here would be a silent downgrade: the run would quietly
+/// proceed on a different model than configured with nothing surfaced to the caller.
+///
+/// Returns the ladder plus every violation observed, so a caller (and a test) can see the warnings
+/// rather than having to scrape a log.
+#[must_use]
+pub fn build_model_candidates_scoped(
+    model_override: &ModelOverride,
+    agent_primary_model: Option<&ModelId>,
+    agent_fallback_models: &[ModelId],
+    available_models: &[ModelId],
+    scope: Option<&ModelScopeConfig>,
+) -> (Vec<ModelId>, Vec<ModelScopeViolation>) {
+    let candidates = build_model_candidates(
+        model_override,
+        agent_primary_model,
+        agent_fallback_models,
+        available_models,
+    );
+    let mut violations = Vec::new();
+    if scope.is_some_and(ModelScopeConfig::is_armed) {
+        // pi indexes into the RAW `[primaryModel, ...fallbackModels]` list and skips index 0; the
+        // deduped/filtered ladder preserves that first-occurrence ordering, so skipping the first
+        // surviving candidate is the same set.
+        for candidate in candidates.iter().skip(1) {
+            if let Some(violation) =
+                check_model_scope(Some(candidate.as_str()), scope, ModelSource::Inherited)
+            {
+                warn_violation(&violation);
+                violations.push(violation);
+            }
+        }
+    }
+    (candidates, violations)
+}
+
 /// Resolve one subagent attempt's effective [`ModelOverride`], folding in the INHERITED parent
 /// session model — the cyrup analog of pi's `resolveSubagentModelOverride(requestedModel,
 /// parentModel, availableModels, preferredProvider)`
@@ -164,24 +217,70 @@ pub fn build_model_candidates(
 /// inherit rather than let the child default: pi issue #266 (`model-fallback.ts:32-45`) — without
 /// an explicit `provider/id`, the child falls back to the global cross-session default, so one
 /// session's model choice contaminates another session's subagents (exactly R-SA-041's concern).
-#[must_use]
+/// # `subagents.modelScope` enforcement (fail-closed)
+///
+/// This is pi's `resolveSubagentModelOverride` scope gate (`model-fallback.ts:200-212`), and it is
+/// the ONE place a model can be REFUSED. `scope` comes from `subagents.modelScope` (project wins
+/// over user, [`crate::discovery::types::LayeredOverrideSettings::model_scope`]); `None` — or a
+/// config that is not [`ModelScopeConfig::is_armed`] — leaves behavior exactly as it was.
+///
+/// The resolved model for each branch is checked with the branch's own [`ModelSource`]:
+///
+/// - branch 1 (`per_call_override`) is [`ModelSource::Explicit`] — a violation is
+///   [`ModelScopeSeverity::Error`] and is returned as `Err`, aborting the run before any child
+///   process is spawned. The caller surfaces it verbatim; there is deliberately no
+///   "pick the nearest allowed model instead" path, because a silent downgrade would run a
+///   different model than the caller asked for and hide the policy violation.
+/// - branches 2 and 3 (persona `model:`, inherited parent-session model) are
+///   [`ModelSource::Inherited`] — a violation only warns (pi's documented back-compat allowance)
+///   and the model is still used unchanged.
+///
+/// # Errors
+///
+/// Returns the [`ModelScopeViolation`] when an EXPLICIT caller-supplied model falls outside an
+/// armed scope. `available_models` is left untouched on that path (nothing was pushed yet), so a
+/// caller that retries with a different model sees an unpolluted allowlist.
 pub fn resolve_model_inheritance(
     per_call_override: Option<&ModelId>,
     persona_model: Option<&ModelId>,
     inherited_session_model: Option<&ModelId>,
     available_models: &mut Vec<ModelId>,
-) -> ModelOverride {
+    scope: Option<&ModelScopeConfig>,
+) -> Result<ModelOverride, ModelScopeViolation> {
     match (per_call_override, persona_model) {
-        (Some(explicit), _) => ModelOverride::Explicit(explicit.clone()),
-        (None, Some(_)) => ModelOverride::Inherit,
+        (Some(explicit), _) => {
+            if let Some(violation) =
+                check_model_scope(Some(explicit.as_str()), scope, ModelSource::Explicit)
+            {
+                // Fail closed: an explicitly requested out-of-scope model refuses the run.
+                if violation.severity == ModelScopeSeverity::Error {
+                    return Err(violation);
+                }
+                warn_violation(&violation);
+            }
+            Ok(ModelOverride::Explicit(explicit.clone()))
+        }
+        (None, Some(persona)) => {
+            if let Some(violation) =
+                check_model_scope(Some(persona.as_str()), scope, ModelSource::Inherited)
+            {
+                warn_violation(&violation);
+            }
+            Ok(ModelOverride::Inherit)
+        }
         (None, None) => match inherited_session_model {
             Some(inherited) => {
+                if let Some(violation) =
+                    check_model_scope(Some(inherited.as_str()), scope, ModelSource::Inherited)
+                {
+                    warn_violation(&violation);
+                }
                 if !available_models.contains(inherited) {
                     available_models.push(inherited.clone());
                 }
-                ModelOverride::Explicit(inherited.clone())
+                Ok(ModelOverride::Explicit(inherited.clone()))
             }
-            None => ModelOverride::Inherit,
+            None => Ok(ModelOverride::Inherit),
         },
     }
 }
@@ -896,7 +995,8 @@ mod tests {
         // available_models is built the way both call sites build it: fallbacks + persona model.
         let mut available_models: Vec<ModelId> =
             persona_fallbacks.iter().cloned().chain(persona_model.cloned()).collect();
-        let ov = resolve_model_inheritance(None, persona_model, Some(&inherited), &mut available_models);
+        let ov = resolve_model_inheritance(None, persona_model, Some(&inherited), &mut available_models, None)
+            .expect("no scope configured, so resolution cannot be refused");
 
         assert_eq!(ov, ModelOverride::Explicit(inherited.clone()));
         assert!(
@@ -919,7 +1019,8 @@ mod tests {
         // threaded through resolve_model_inheritance, the same persona now resolves a candidate.
         let inherited = model("anthropic/claude-opus-4-8");
         let mut available_models: Vec<ModelId> = Vec::new();
-        let ov = resolve_model_inheritance(None, None, Some(&inherited), &mut available_models);
+        let ov = resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
+            .expect("no scope configured");
         let candidates = build_model_candidates(&ov, None, &[], &available_models);
         assert!(!candidates.is_empty());
         assert_eq!(candidates, vec![inherited]);
@@ -932,7 +1033,8 @@ mod tests {
         let per_call = model("z");
         let mut available_models: Vec<ModelId> = vec![per_call.clone()];
         let ov =
-            resolve_model_inheritance(Some(&per_call), None, Some(&inherited), &mut available_models);
+            resolve_model_inheritance(Some(&per_call), None, Some(&inherited), &mut available_models, None)
+                .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Explicit(per_call.clone()));
         let candidates = build_model_candidates(&ov, None, &[], &available_models);
         assert_eq!(candidates.first(), Some(&per_call), "per-call override is candidate #0");
@@ -950,7 +1052,8 @@ mod tests {
         let persona = model("x");
         let mut available_models: Vec<ModelId> = vec![persona.clone()];
         let ov =
-            resolve_model_inheritance(None, Some(&persona), Some(&inherited), &mut available_models);
+            resolve_model_inheritance(None, Some(&persona), Some(&inherited), &mut available_models, None)
+                .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
         let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models);
         assert_eq!(candidates.first(), Some(&persona), "persona model is candidate #0");
@@ -966,7 +1069,8 @@ mod tests {
         // ladder falls through to the persona model + fallback_models exactly as before this seam.
         let fallbacks = vec![model("f1"), model("f2")];
         let mut available_models: Vec<ModelId> = fallbacks.clone();
-        let ov = resolve_model_inheritance(None, None, None, &mut available_models);
+        let ov = resolve_model_inheritance(None, None, None, &mut available_models, None)
+            .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
         assert_eq!(available_models, fallbacks, "no inherited model may be added when there is no host");
         let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models);
@@ -975,9 +1079,122 @@ mod tests {
         // ...and with neither a persona model nor fallbacks nor a host, the ladder stays empty (the
         // caller's genuine hard pre-spawn error) — never a spuriously-invented candidate.
         let mut empty_avail: Vec<ModelId> = Vec::new();
-        let ov = resolve_model_inheritance(None, None, None, &mut empty_avail);
+        let ov = resolve_model_inheritance(None, None, None, &mut empty_avail, None)
+            .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
         assert!(build_model_candidates(&ov, None, &[], &empty_avail).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-003: modelScope enforcement over the ladder (pi `model-fallback.ts:200-237`)
+    // ---------------------------------------------------------------------------------------
+
+    fn armed_scope(patterns: &[&str]) -> crate::exec::model_scope::ModelScopeConfig {
+        crate::exec::model_scope::ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(patterns.iter().map(|p| (*p).to_string()).collect()),
+        }
+    }
+
+    /// An out-of-scope FALLBACK entry warns but is NOT removed — pi's `index > 0` arm. Removing it
+    /// would be the silent downgrade this feature exists to prevent: the run would quietly attempt
+    /// a different model than the agent declared, with nothing surfaced anywhere.
+    #[test]
+    fn out_of_scope_fallback_candidates_warn_without_changing_the_ladder() {
+        let primary = model("anthropic/claude-opus-4");
+        let fallbacks = vec![model("openai/gpt-5-nano"), model("anthropic/claude-haiku-4")];
+        let available: Vec<ModelId> =
+            std::iter::once(primary.clone()).chain(fallbacks.iter().cloned()).collect();
+        let scope = armed_scope(&["anthropic/*"]);
+
+        let unpoliced =
+            build_model_candidates(&ModelOverride::Inherit, Some(&primary), &fallbacks, &available);
+        let (policed, violations) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&primary),
+            &fallbacks,
+            &available,
+            Some(&scope),
+        );
+
+        assert_eq!(policed, unpoliced, "enforcement must never rewrite or shorten the ladder");
+        assert_eq!(violations.len(), 1, "exactly the one out-of-scope fallback: {violations:?}");
+        assert_eq!(violations[0].model, "openai/gpt-5-nano");
+        assert_eq!(
+            violations[0].severity,
+            crate::exec::model_scope::ModelScopeSeverity::Warn,
+            "an inherited fallback warns; only an EXPLICIT model is a hard error"
+        );
+    }
+
+    /// Candidate #0 is NOT re-checked here: its scope decision (including the hard-error explicit
+    /// case) belongs to `resolve_model_inheritance`, exactly as pi splits the two.
+    #[test]
+    fn the_primary_candidate_is_not_double_reported_by_the_ladder_check() {
+        let primary = model("openai/gpt-5-nano");
+        let available = vec![primary.clone()];
+        let (candidates, violations) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&primary),
+            &[],
+            &available,
+            Some(&armed_scope(&["anthropic/*"])),
+        );
+        assert_eq!(candidates, vec![primary]);
+        assert!(violations.is_empty(), "index 0 is the other seam's business: {violations:?}");
+    }
+
+    /// The fail-closed half, at the decision boundary: an EXPLICIT out-of-scope model resolves to
+    /// no model at all, while an inherited one (persona `model:` / parent session) still resolves.
+    #[test]
+    fn an_explicit_out_of_scope_model_is_refused_while_an_inherited_one_only_warns() {
+        let scope = armed_scope(&["anthropic/*"]);
+        let out = model("openai/gpt-5-nano");
+
+        let mut avail = vec![out.clone()];
+        let refused =
+            resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope));
+        let violation = refused.expect_err("an explicit out-of-scope model must be refused");
+        assert_eq!(violation.severity, crate::exec::model_scope::ModelScopeSeverity::Error);
+        assert_eq!(
+            violation.message,
+            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
+             patterns: anthropic/*."
+        );
+
+        // Persona-declared model: warn only, resolution proceeds (pi's back-compat allowance).
+        let mut avail = vec![out.clone()];
+        assert_eq!(
+            resolve_model_inheritance(None, Some(&out), None, &mut avail, Some(&scope)),
+            Ok(ModelOverride::Inherit),
+            "an inherited persona model warns but still runs"
+        );
+
+        // Parent-session inheritance: likewise warn-only.
+        let mut avail: Vec<ModelId> = Vec::new();
+        assert_eq!(
+            resolve_model_inheritance(None, None, Some(&out), &mut avail, Some(&scope)),
+            Ok(ModelOverride::Explicit(out.clone())),
+            "an inherited session model warns but still runs"
+        );
+        assert_eq!(avail, vec![out]);
+    }
+
+    /// An IN-scope explicit model is unaffected — enforcement gates, it does not obstruct.
+    #[test]
+    fn an_in_scope_explicit_model_passes_the_gate_unchanged() {
+        let allowed = model("anthropic/claude-opus-4");
+        let mut avail = vec![allowed.clone()];
+        assert_eq!(
+            resolve_model_inheritance(
+                Some(&allowed),
+                None,
+                None,
+                &mut avail,
+                Some(&armed_scope(&["anthropic/*"])),
+            ),
+            Ok(ModelOverride::Explicit(allowed))
+        );
     }
 
     // ---------------------------------------------------------------------------------------
