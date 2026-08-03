@@ -7,7 +7,10 @@
 //!   * A.4  the queue-drain → `queue_update` branch fires from a real run (mirror emptied on delivery).
 //!   * check_compaction Case-2 (threshold, direct-usage) fires from a real run.
 //!   * B/user_bash the `user_bash` ext event fires with the LIVE `{command, excludeFromContext, cwd}`
-//!     from `execute_bash_interactive` only — never from the RPC-reachable bare `execute_bash`.
+//!     from `execute_bash_with_user_event` — the shared front-end wrapper BOTH the interactive
+//!     `!`/`!!` handler and the JSON-RPC `bash` command go through — while the bare `execute_bash`
+//!     executor stays emission-free, matching Pi's placement of `emitUserBash` at the callers
+//!     (`interactive-mode.ts:6010-6060`, `rpc-mode.ts:558-579`) and not inside `executeBash`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
@@ -402,14 +405,15 @@ impl NativeExtension for UserBashProbe {
     }
 }
 
-/// B/user_bash: `execute_bash_interactive` (the interactive `!`/`!!`-prefix entry point) fires the
-/// `user_bash` extension event from the submission pipeline with the LIVE `{command,
-/// excludeFromContext (the !!-prefix flag), cwd (agent cwd)}` (Pi `extensionRunner.emitUserBash`,
-/// `interactive-mode.ts:5663-5669`'s `handleBashCommand` / `types.ts:782-790`). The bare
-/// `execute_bash` (which the JSON-RPC `bash` command calls directly, `rpc-mode.ts:550-554`) fires no
-/// such event — see `execute_bash_never_emits_user_bash` below.
+/// B/user_bash: `execute_bash_with_user_event` — the shared user-initiated-bash entry point BOTH the
+/// interactive `!`/`!!`-prefix handler and the JSON-RPC `bash` command go through — fires the
+/// `user_bash` extension event with the LIVE `{command, excludeFromContext, cwd (session cwd)}` (Pi
+/// `extensionRunner.emitUserBash`, `interactive-mode.ts:6010-6060`'s `handleBashCommand` and
+/// `rpc-mode.ts:558-579`'s `case "bash"`; `extensions/types.ts:813-821`). The end-to-end RPC proof
+/// that an extension actually RECEIVES this from a wire `{"type":"bash"}` command lives in
+/// `cyrup-modes/tests/modes.rs::rpc_bash_delivers_user_bash_to_an_extension`.
 #[tokio::test]
-async fn execute_bash_interactive_emits_user_bash_with_live_values() {
+async fn execute_bash_with_user_event_emits_user_bash_with_live_values() {
     let fx = fixture();
     let probe: BashProbe = Arc::new(Mutex::new(Vec::new()));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
@@ -419,7 +423,11 @@ async fn execute_bash_interactive_emits_user_bash_with_live_values() {
         .expect("build");
 
     let _ = session
-        .execute_bash_interactive("echo hello", BashOptions { exclude_from_context: true, id: None }, None)
+        .execute_bash_with_user_event(
+            "echo hello",
+            BashOptions { exclude_from_context: true, id: None },
+            None,
+        )
         .await;
 
     let seen = probe.lock().unwrap().clone();
@@ -429,15 +437,20 @@ async fn execute_bash_interactive_emits_user_bash_with_live_values() {
     assert_eq!(seen[0].2, fx.cwd.display().to_string(), "the agent cwd is delivered");
 }
 
-/// B/user_bash (RPC path): the bare `execute_bash` — the exact method
-/// `crates/cyrup-modes/src/rpc.rs`'s `SessionCommand::Bash` arm calls for the JSON-RPC `bash`
-/// command — fires NO `user_bash` extension event. Pi's `executeBash` (`agent-session.ts:2582-
-/// 2684`) has zero `emitUserBash` emission, and `rpc-mode.ts:550-554`'s `case "bash"` calls
-/// `session.executeBash(...)` directly; only the interactive `!`/`!!`-prefix handler
-/// (`interactive-mode.ts:5663-5669`) emits the event, proven by
-/// `execute_bash_interactive_emits_user_bash_with_live_values` above.
+/// B/user_bash (executor placement): the bare `execute_bash` — the raw out-of-loop executor, NOT a
+/// user-facing entry point — fires no `user_bash` event of its own. Pi's `executeBash`
+/// (`agent-session.ts:2582-2684`) has zero `emitUserBash` even at HEAD: the emission lives at the
+/// front-end callers (`interactive-mode.ts:6014`, `rpc-mode.ts:559`), each of which emits and then
+/// calls the executor. Keeping the executor emission-free is what makes the shared
+/// `execute_bash_with_user_event` wrapper emit EXACTLY once per user command rather than twice, and
+/// what keeps non-user callers (the wrapper's own fall-through) from re-firing the event.
+///
+/// This test previously asserted that the JSON-RPC `bash` command therefore emits nothing either —
+/// which enshrined DRIFT-004. Pi `5d548ae9` (2026-07-28, "fix: rpc bash no longer bypass user_bash",
+/// #7214) made the RPC arm emit; cyrup's arm now calls `execute_bash_with_user_event`, proven by
+/// `cyrup-modes/tests/modes.rs::rpc_bash_delivers_user_bash_to_an_extension`.
 #[tokio::test]
-async fn execute_bash_never_emits_user_bash() {
+async fn bare_execute_bash_executor_emits_no_user_bash() {
     let fx = fixture();
     let probe: BashProbe = Arc::new(Mutex::new(Vec::new()));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
@@ -451,7 +464,11 @@ async fn execute_bash_never_emits_user_bash() {
         .await;
 
     let seen = probe.lock().unwrap().clone();
-    assert!(seen.is_empty(), "the RPC-reachable execute_bash must never fire user_bash: {seen:?}");
+    assert!(
+        seen.is_empty(),
+        "the bare execute_bash executor must not emit user_bash itself — Pi emits at the callers, \
+         so an executor-level emission would double-fire for every user command: {seen:?}"
+    );
 }
 
 // ============================================ L4 gap #5: session_before_compact typed override ====

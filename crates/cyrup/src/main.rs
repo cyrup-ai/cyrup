@@ -235,6 +235,18 @@ async fn run() -> anyhow::Result<i32> {
         Arc::new(file)
     };
 
+    // Runtime model-catalog overlay, phase 1 (DRIFT-007) — Pi's cache-only restore
+    // `await modelRuntime.refresh({ allowNetwork: false })` (agent-session-services.ts:180), which
+    // upstream performs inside `createAgentSessionRuntime` (main.ts:793). Disk only: it reads
+    // `<agent_dir>/models-store.json` and installs it as the overlay, with NO network I/O.
+    //
+    // It sits HERE, beside the `models.json` load and above the `--list-models` exit, because that
+    // is where Pi has it: the listing exit is main.ts:816, downstream of runtime creation, so
+    // `pi --list-models` renders the persisted pi.dev overlay. Phase 2 (the network revalidation)
+    // stays downstream at its own site, matching Pi's post-listing trigger at main.ts:863-866 — a
+    // listing run therefore shows the cache and issues no request.
+    cyrup::provider::restore_model_catalog(&dirs).await;
+
     // `--list-models` enumerates the FULL multi-provider registry (Pi `modelRegistry.getAvailable()`,
     // list-models.ts:35) — independent of `--provider`/`--model`, and resolved BEFORE provider
     // selection (so a `--provider <unknown>` does not gate the listing, matching Pi).
@@ -285,6 +297,40 @@ async fn run() -> anyhow::Result<i32> {
 
     let deprecation_warnings = migration.deprecation_warnings.clone();
     let settings_store = file_settings_store(&dirs);
+
+    // Runtime model-catalog overlay, phase 2 (DRIFT-007) — Pi's post-init `void modelRuntime.refresh()`
+    // (main.ts:863-866 / interactive-mode.ts `run()`): a DETACHED revalidation of the catalogs
+    // restored above, gated on the NetworkPolicy allowing outbound traffic. Nothing here is awaited,
+    // so startup is never blocked, and every failure mode leaves the compiled-in catalogs exactly as
+    // they are today. Like Pi's, this site is downstream of the `--list-models` exit, so a listing
+    // run renders the cache and issues no request.
+    //
+    // MODE-GATED, matching Pi's two — and only two — trigger sites: `main.ts:864` guards on
+    // `appMode === "rpc"` by name and interactive fires its own inside `InteractiveMode.run()`.
+    // Creation itself never fetches upstream (`allowModelNetwork: false` at `main.ts:158` and
+    // `package-manager-cli.ts:401`, consumed at `model-runtime.ts:163`), so `cyrup -p "…"` and
+    // `--mode json` must issue no catalog request either — the scripted/CI path stays offline and
+    // reads the disk-restored overlay only. `mode_refreshes_catalogs` also re-checks inside the
+    // spawn, so this outer guard is an optimization (it skips the settings/auth reads) rather than
+    // the gate itself.
+    if cyrup::provider::mode_refreshes_catalogs(mode) {
+        let startup_settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
+        let policy = cyrup_config::policy::NetworkPolicy::resolve(
+            startup_settings.effective(),
+            &env,
+            &overrides,
+        );
+        // Pi refreshes ONLY providers whose credential resolves (`models.ts:296`); without that a
+        // bare start would fan out one request per built-in provider.
+        let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
+        let configured: Vec<String> = cyrup_provider::all_providers()
+            .iter()
+            .filter(|p| auth.has_auth(p.id(), None))
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        cyrup::provider::spawn_model_catalog_refresh(&dirs, policy, mode, configured);
+    }
+
     let cancel = CancelToken::new();
 
     // Default-launch model (Pi `findInitialModel`, model-resolver.ts:527-607): when NEITHER

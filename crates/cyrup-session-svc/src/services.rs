@@ -81,6 +81,19 @@ pub struct AgentSessionServices {
     /// (CFG-002). Empty when the file is absent or unreadable; failures land in
     /// [`StartupDiagnostics::models`].
     pub model_config: Arc<cyrup_config::ModelFile>,
+    /// The persisted pi.dev model-catalog overlay for this session, loaded ONCE from
+    /// `<agent_dir>/models-store.json` at build time (DRIFT-007; Pi `ModelRuntime`'s
+    /// `modelsStore` + `withRemoteCatalog`, model-runtime.ts:139-151).
+    ///
+    /// Loaded from DISK ONLY — building a session never touches the network. `None` (no cache, no
+    /// agent dir, stale-vs-builtins, unreadable file) means "embedded catalogs only", i.e. exactly
+    /// the pre-DRIFT-007 behavior. The overlay can only add or replace models by id, so it is
+    /// structurally incapable of shrinking the registry
+    /// ([`cyrup_provider::remote_catalog::merge_models`]).
+    ///
+    /// Held as an `Arc` because [`crate::session::AgentSession::full_model_catalog`] is SYNC and hot:
+    /// it rebuilds the registry on every read, so the overlay must already be in memory.
+    pub catalog_overlay: Option<Arc<cyrup_provider::CatalogOverlay>>,
     /// Session-scoped context cache (context files + skill pointers).
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.

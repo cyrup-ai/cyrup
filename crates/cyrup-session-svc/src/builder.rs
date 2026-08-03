@@ -414,6 +414,32 @@ impl SessionBuilder {
         self
     }
 
+    /// Load `<agent_dir>/models-store.json` as a model-catalog overlay, WITHOUT any network access
+    /// (DRIFT-007).
+    ///
+    /// Infallible and disk-only. A missing/corrupt cache, an overlay no newer than the compiled-in
+    /// catalogs (the post-upgrade case, pi #7016), or an entry that mislabels its provider all yield
+    /// `None`, which is byte-identical to the pre-DRIFT-007 behavior. It can never remove a built-in
+    /// model, so a session built from a broken cache is never worse off than one built from none.
+    async fn load_persisted_catalog_overlay(
+        agent_dir: &std::path::Path,
+    ) -> Option<Arc<cyrup_provider::CatalogOverlay>> {
+        let store: Arc<dyn cyrup_provider::ModelsStore> = Arc::new(
+            cyrup_config::models_store::FileModelsStore::new(
+                agent_dir.join(cyrup_config::models_store::MODELS_STORE_FILE_NAME),
+            ),
+        );
+        let catalog = cyrup_provider::RemoteCatalog::new(store)
+            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at());
+        let ids: Vec<String> = cyrup_provider::all_providers()
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let overlay = catalog.load_overlay(&refs).await;
+        (!overlay.is_empty()).then(|| Arc::new(overlay))
+    }
+
     /// Assemble the wired [`AgentSession`] (arch-11 §3.3). Async: discovery + context load + native
     /// extension `init` run here.
     pub async fn build(self) -> Result<AgentSession, SessionServiceError> {
@@ -745,12 +771,19 @@ impl SessionBuilder {
         let (model_file, model_file_error) =
             cyrup_config::load_models_file_reporting(&cfg.agent_dir.join("models.json"));
         startup_diagnostics.models.extend(model_file_error);
+        // The persisted pi.dev catalog overlay (DRIFT-007), loaded from disk ONLY. This is the
+        // cache-only restore Pi performs at `agent-session-services.ts:180`
+        // (`refresh({ allowNetwork: false })`): a session build must never block on a network call,
+        // and an offline run must still see the catalogs it saw last time. A refresh that ADDS to
+        // this cache is the running mode's fire-and-forget job (Pi `main.ts:863-866`).
+        let catalog_overlay = Self::load_persisted_catalog_overlay(&cfg.agent_dir).await;
         // Surface composition errors (a provider block Pi would `throw` on) once, at startup, rather
         // than on every catalog read.
         {
             let base = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
                 credentials: None,
                 auth_context: None,
+                catalog_overlay: catalog_overlay.clone(),
             })
             .get_models(None);
             let (_, errors) = model_file.compose(&base);
@@ -1163,6 +1196,7 @@ impl SessionBuilder {
             resources,
             startup_diagnostics,
             model_config,
+            catalog_overlay,
             context: context_store,
             ext_host,
             guest_providers,

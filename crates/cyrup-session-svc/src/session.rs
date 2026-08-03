@@ -2372,6 +2372,9 @@ impl AgentSession {
         for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
             credentials: None,
             auth_context: None,
+            // The pi.dev overlay loaded once at session-build time (DRIFT-007). Already in memory,
+            // so this SYNC, hot registry read stays free of disk and network I/O.
+            catalog_overlay: self.services.catalog_overlay.clone(),
         })
         .get_models(None)
         {
@@ -3890,12 +3893,14 @@ impl AgentSession {
     /// transcript (or deferred while a run streams).
     ///
     /// Fires NO extension event of its own — Pi's `executeBash` (agent-session.ts:2582-2684) has zero
-    /// `emitUserBash` emission; the ONLY `emitUserBash` call site in Pi is `interactive-mode.ts:5663-
-    /// 5669`'s `handleBashCommand`, the interactive `!`/`!!`-prefix handler, which emits the event
-    /// itself and then calls into execution — see [`Self::execute_bash_interactive`] for that wrapped
-    /// path. The JSON-RPC `bash` command (`rpc-mode.ts:550-554`'s `case "bash"`) calls
-    /// `session.executeBash(...)` directly with no emission, matching this bare method — that is what
-    /// `crates/cyrup-modes/src/rpc.rs`'s `SessionCommand::Bash` arm calls.
+    /// `emitUserBash` emission even at HEAD; in Pi the emission lives at the two front-end CALLERS,
+    /// which each emit `user_bash` for themselves and only then call into this executor:
+    /// `interactive-mode.ts:6010-6060`'s `handleBashCommand` (the `!`/`!!`-prefix handler) and
+    /// `rpc-mode.ts:558-579`'s `case "bash"` (given its emission by pi `5d548ae9`, 2026-07-28,
+    /// "fix: rpc bash no longer bypass user_bash", #7214). cyrup shares one wrapper across both:
+    /// [`Self::execute_bash_with_user_event`] — that is what `crates/cyrup-modes/src/rpc.rs`'s
+    /// `SessionCommand::Bash` arm calls. Call this bare method only when the caller is NOT a
+    /// user-initiated bash front-end (it is also the fall-through of that wrapper).
     ///
     /// A genuine backend failure is returned as `Err` and NEVER recorded into history — Pi's
     /// `executeBash` only calls `recordBashResult` on the success path inside its `try` block
@@ -3975,16 +3980,25 @@ impl AgentSession {
         Ok(result)
     }
 
-    /// Execute a bash command from the interactive `!`/`!!`-prefix front-end (Pi
-    /// `handleBashCommand`, `interactive-mode.ts:5663-5669`). Unlike the bare [`Self::execute_bash`]
-    /// (which the JSON-RPC `bash` command calls directly with zero extension involvement), this
-    /// wrapper fires the `user_bash` extension event FIRST with the live `{command,
-    /// excludeFromContext, cwd}` — a handler that returns a full `result` override
-    /// (`UserBashEventResult.result`, types.ts:1043-1048) short-circuits local execution entirely
-    /// (Pi `handleBashCommand:5624-5651`); otherwise this falls through to [`Self::execute_bash`]
-    /// for normal execution. (Pi's `operations` remote-exec override is not honored here: cyrup has
-    /// no per-call bash-backend override seam — `self.proc` is the fixed backend.)
-    pub async fn execute_bash_interactive(
+    /// Execute a **user-initiated** bash command: the entry point every user-facing bash front-end
+    /// must call. Fires the `user_bash` extension event FIRST with the live `{command,
+    /// excludeFromContext, cwd}` (Pi `UserBashEvent`, `extensions/types.ts:813-821`); a handler that
+    /// returns a full `result` override (`UserBashEventResult.result`,
+    /// `extensions/types.ts:1078-1083`) short-circuits local execution entirely and its result is
+    /// still recorded through [`Self::record_bash_result`]; otherwise this falls through to the bare
+    /// [`Self::execute_bash`] for normal execution.
+    ///
+    /// Pi emits at both front-ends rather than inside `executeBash`: the interactive `!`/`!!`-prefix
+    /// handler (`interactive-mode.ts:6010-6060`, `handleBashCommand`) and the JSON-RPC `bash`
+    /// command (`rpc-mode.ts:558-579`, `case "bash"` — emission added by pi `5d548ae9`, 2026-07-28,
+    /// "fix: rpc bash no longer bypass user_bash", #7214, so an extension observing user bash no
+    /// longer misses RPC-issued commands). Both cyrup front-ends therefore share this one wrapper.
+    ///
+    /// (Pi's `operations` remote-exec override — the other half of `UserBashEventResult` — is NOT
+    /// honored here: cyrup has no per-call bash-backend override seam, `self.proc` is the fixed
+    /// backend. Only the `result` short-circuit is ported. This carve-out predates DRIFT-004 and is
+    /// unchanged by it.)
+    pub async fn execute_bash_with_user_event(
         &self,
         command: &str,
         options: BashOptions,
@@ -3998,10 +4012,17 @@ impl AgentSession {
     }
 
     /// Emit the `user_bash` extension event and, if a handler fully serviced the command (Pi
-    /// `UserBashEventResult.result`, types.ts:1043-1048), return its [`BashResult`] override so the
-    /// caller skips local execution. Returns `None` when nobody subscribed or no result override was
-    /// supplied. Carries the live `command`, the `!!`-prefix `exclude_from_context` flag, and the
-    /// agent cwd (Pi `UserBashEvent`, types.ts:782-790).
+    /// `UserBashEventResult.result`, `extensions/types.ts:1078-1083`), return its [`BashResult`]
+    /// override so the caller skips local execution. Returns `None` when nobody subscribed or no
+    /// result override was supplied. Carries the live `command`, the `exclude_from_context` flag
+    /// (the interactive `!!` prefix, or the RPC command's `excludeFromContext ?? false`,
+    /// `rpc-mode.ts:562`), and the session cwd (Pi `UserBashEvent`, `extensions/types.ts:813-821`).
+    ///
+    /// Matches Pi's `emitUserBash` (`extensions/runner.ts:955-981`) dispatch semantics: the FIRST
+    /// truthy handler result wins and short-circuits the remaining handlers, and a handler that
+    /// throws is caught and reported rather than being fatal — `dispatch_block_mutate` returning
+    /// `Reduced::Handled` is cyrup's equivalent of the former, and the dispatcher's per-extension
+    /// error isolation of the latter.
     async fn emit_user_bash_event(&self, command: &str, exclude_from_context: bool) -> Option<BashResult> {
         if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::UserBash) {
             return None;

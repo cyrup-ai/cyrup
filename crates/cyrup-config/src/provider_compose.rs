@@ -36,7 +36,7 @@ use cyrup_provider::wire::WireProvider;
 use cyrup_provider::{
     ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, CreateModelsOptions, Credential,
     CredentialStore, InMemoryCredentialStore, Model, ModelAuth, Models, ProviderAuth,
-    all_providers_with, builtin_registry, create_models,
+    all_providers_with_overlay, builtin_registry, create_models,
 };
 use cyrup_core::ProviderId;
 
@@ -410,9 +410,13 @@ pub fn compose_provider_registry(
         .clone()
         .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new()));
     let auth_context = options.auth_context.clone();
+    // The remote model-catalog overlay (DRIFT-007) is applied to the BUILT-INS, below
+    // `models.json` — a user's explicit config still wins over anything pi.dev serves, and the
+    // embedded catalogs still floor the result (the overlay only adds/replaces by model id).
+    let overlay = options.catalog_overlay.clone();
     let registry = Arc::new(builtin_registry());
     let mut models = create_models(options);
-    for provider in all_providers_with(store.clone(), registry.clone()) {
+    for provider in all_providers_with_overlay(store.clone(), registry.clone(), overlay.as_deref()) {
         models.set_provider(provider);
     }
     let errors = file.compose_providers(&mut models, store, registry, auth_context);

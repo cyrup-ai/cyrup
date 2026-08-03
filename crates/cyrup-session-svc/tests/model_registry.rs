@@ -50,7 +50,11 @@ fn two_model_faux() -> Arc<FauxProvider> {
 struct RegistryResolver;
 impl ProviderResolver for RegistryResolver {
     fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
-        cyrup_provider::default_models(CreateModelsOptions { credentials: None, auth_context: None })
+        cyrup_provider::default_models(CreateModelsOptions {
+            credentials: None,
+            auth_context: None,
+            catalog_overlay: None,
+        })
             .get_provider(provider_id)
             .ok_or_else(|| format!("no built-in provider '{provider_id}'"))
     }

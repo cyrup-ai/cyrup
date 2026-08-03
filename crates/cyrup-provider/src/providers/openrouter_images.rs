@@ -71,6 +71,7 @@ mod tests {
         let mut models = create_images_models(CreateModelsOptions {
             credentials: None,
             auth_context: Some(Arc::new(MapEnv(BTreeMap::new()))),
+            catalog_overlay: None,
         });
         models.set_provider(Arc::new(openrouter_images_provider()));
         let m = models

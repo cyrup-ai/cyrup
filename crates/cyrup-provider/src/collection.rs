@@ -27,12 +27,21 @@ use tokio_stream::wrappers::ReceiverStream;
 /// Channel buffer for the collection's lazy auth-applying stream bridge.
 const STREAM_BUFFER: usize = 64;
 
-/// Options for [`create_models`] (Pi `CreateModelsOptions`). Both default: an empty in-memory
-/// credential store and the real-env auth context.
+/// Options for [`create_models`] (Pi `CreateModelsOptions`). All default: an empty in-memory
+/// credential store, the real-env auth context, and no remote catalog overlay.
 #[derive(Clone, Default)]
 pub struct CreateModelsOptions {
     pub credentials: Option<Arc<dyn CredentialStore>>,
     pub auth_context: Option<Arc<dyn AuthContext>>,
+    /// The persisted pi.dev model-catalog overlay to merge over the compiled-in catalogs
+    /// (DRIFT-007; Pi threads its equivalent through `ModelRuntime`'s `modelsStore` +
+    /// `withRemoteCatalog`, `model-runtime.ts:139-151`).
+    ///
+    /// `None` — the default and what every pre-DRIFT-007 caller gets — means "embedded catalogs
+    /// only", which is exactly today's behavior. The overlay can only ADD or REPLACE models by id
+    /// (see [`crate::remote_catalog::merge_models`]); it can never remove one, so a failed, disabled
+    /// or offline refresh is indistinguishable from `None`.
+    pub catalog_overlay: Option<Arc<crate::remote_catalog::CatalogOverlay>>,
 }
 
 /// Runtime collection of providers plus auth application + stream convenience (Pi `MutableModels`).
@@ -555,6 +564,7 @@ mod tests {
                 "GROQ_API_KEY".to_string(),
                 "sk-groq".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let m = models
@@ -581,6 +591,7 @@ mod tests {
                 "GROQ_API_KEY".to_string(),
                 "env-key".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let m = models
@@ -615,6 +626,7 @@ mod tests {
                 "GROQ_API_KEY".to_string(),
                 "sk-groq".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let mut m = models
@@ -656,6 +668,7 @@ mod tests {
                 "GROQ_API_KEY".to_string(),
                 "sk-groq".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(Arc::new(fleet::GROQ.provider()));
         let mut m = models

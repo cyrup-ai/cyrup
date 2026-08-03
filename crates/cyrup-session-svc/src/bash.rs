@@ -13,19 +13,35 @@ use cyrup_tools::truncate::{TruncOpts, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use cyrup_tools::{ExecSpec, ExitStatus, ProcOps, ShellConfig};
 
 /// The outcome of an immediate bash execution (Pi `BashResult`, bash-executor.ts:29-40).
+///
+/// Every field is `#[serde(default)]` on read, and that is load-bearing rather than lax. This type
+/// doubles as the deserialization target for an extension-supplied `user_bash` override
+/// (`UserBashEventResult.result`), and Pi — being TypeScript with no runtime type enforcement —
+/// short-circuits on ANY truthy `result` regardless of which fields it carries
+/// (`runner.ts:955-981`, `rpc-mode.ts:566-571`; no completeness check anywhere).
+///
+/// If cyrup instead required every field, a sandbox or remote-exec extension returning the
+/// perfectly-valid-in-Pi `{"output": "...", "exitCode": 0}` would deserialize to `None`, the
+/// override would be discarded, and the caller would FALL THROUGH and run the command raw on the
+/// local shell — the exact outcome the extension existed to prevent. A strict deserializer here is
+/// a fail-open, so partial overrides must be accepted.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BashResult {
     /// Combined stdout+stderr — sanitized (ANSI-stripped, control/format-char-filtered, CR-
     /// normalized) and tail-truncated to `DEFAULT_MAX_BYTES`/`DEFAULT_MAX_LINES`, same as the real
     /// `BashResult.output` Pi returns (bash-executor.ts:107-108,138-139).
+    #[serde(default)]
     pub output: String,
     /// Process exit code (`None` when killed/signaled without a code).
+    #[serde(default)]
     pub exit_code: Option<i32>,
     /// Whether the command was cancelled via [`crate::AgentSession::abort_bash`].
+    #[serde(default)]
     pub cancelled: bool,
     /// Whether `output` was tail-truncated (Pi `BashResult.truncated`, bash-executor.ts:35;
     /// `truncateTail`'s `truncated` flag, bash-executor.ts:108/138).
+    #[serde(default)]
     pub truncated: bool,
     /// Path to a temp file holding the FULL (untruncated, sanitized) output, once the raw stream
     /// exceeds `DEFAULT_MAX_BYTES` (Pi `BashResult.fullOutputPath`, bash-executor.ts:37; lazily

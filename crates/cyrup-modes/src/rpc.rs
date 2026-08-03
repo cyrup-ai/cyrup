@@ -1021,18 +1021,32 @@ async fn handle(
             // A genuine backend failure (spawn error, missing cwd, …) must NOT be reported as a
             // success — Pi's `executeBashWithOperations` only catches the abort case; every other
             // error `throw`s (`bash-executor.ts:154`) straight through `executeBash` to the RPC
-            // dispatcher's `catch` (`rpc-mode.ts:756-772`), which emits an `error(...)` response
-            // with no history entry ever recorded. Mirror that via the same `Ok`/`Err` pattern every
-            // other fallible command here uses (e.g. `compact` above).
-            // Pi threads the JSON-RPC request id into `executeBash`'s options (`rpc-mode.ts:574`,
+            // dispatcher's `catch` (`rpc-mode.ts:787-796` at pi HEAD), which emits an `error(...)`
+            // response with no history entry ever recorded. Mirror that via the same `Ok`/`Err`
+            // pattern every other fallible command here uses (e.g. `compact` above).
+            // Pi threads the JSON-RPC request id into `executeBash`'s options (`rpc-mode.ts:575`,
             // `id`), so every `bash_execution_update` it emits carries the id of the request whose
             // output it belongs to. The wire id may be a string OR a number (see `raw_id`'s doc);
             // render a non-string id with its JSON spelling rather than dropping it.
             let bash_id = raw_id
                 .as_ref()
                 .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            // An RPC-issued bash is a USER bash: it must fire the `user_bash` extension event with
+            // `{command, excludeFromContext ?? false, cwd}` before executing, so an extension
+            // observing user bash sees RPC-issued commands too, and a handler returning a full
+            // `UserBashEventResult.result` short-circuits execution (Pi `rpc-mode.ts:558-579`'s
+            // `case "bash"`, given its `emitUserBash` by pi `5d548ae9`, 2026-07-28, "fix: rpc bash
+            // no longer bypass user_bash", #7214). `execute_bash_with_user_event` is the shared
+            // emit-then-execute wrapper the interactive `!`/`!!` front-end uses as well — calling
+            // the bare `execute_bash` here would bypass the event exactly as pre-#7214 Pi did.
+            // (Pi's sibling `operations` override is deliberately not honored: cyrup has no per-call
+            // bash-backend override seam — see `execute_bash_with_user_event`'s doc.)
             match session
-                .execute_bash(&command, BashOptions { exclude_from_context, id: bash_id }, None)
+                .execute_bash_with_user_event(
+                    &command,
+                    BashOptions { exclude_from_context, id: bash_id },
+                    None,
+                )
                 .await
             {
                 Ok(result) => RpcResponse::ok(

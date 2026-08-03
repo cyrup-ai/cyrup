@@ -33,5 +33,7 @@ bytes = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `net` is dev-only: the remote-catalog tests serve their fixtures off a raw loopback
+# `TcpListener` so nothing in this crate's test suite can reach a real network host.
+tokio = { workspace = true, features = ["net"] }
 tokio-stream = { workspace = true }

@@ -23,8 +23,10 @@ pub mod error;
 pub mod images;
 pub mod legacy_api_aliases;
 pub mod model;
+pub mod models_store;
 pub mod provider;
 pub mod providers;
+pub mod remote_catalog;
 pub mod session_resources;
 pub mod stream;
 pub mod usage;
@@ -70,9 +72,18 @@ pub use images::{
     openrouter_image_models, register_images_builtins,
 };
 pub use model::{Modality, Model, ModelCost, ModelCostTier};
+pub use models_store::{
+    InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ProviderModelsStore,
+};
+pub use remote_catalog::{
+    CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,
+    RemoteCatalog, RemoteCatalogProvider, merge_models, parse_catalog, remote_models,
+};
 pub use provider::Provider;
 pub use providers::all::{
-    all_images_providers, all_providers, all_providers_with, default_images_models, default_models,
+    BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
+    all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
+    default_models,
 };
 pub use providers::fleet::{FLEET, FleetSpec, fleet_providers_with, fleet_spec};
 pub use providers::{

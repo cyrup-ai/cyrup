@@ -17,13 +17,162 @@
 //! Hence every entry point takes the loaded [`ModelFile`]; pass `&ModelFile::default()` when there
 //! is deliberately no user config in play.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::bail;
 use cyrup_config::ModelFile;
+use cyrup_config::models_store::FileModelsStore;
+use cyrup_config::policy::NetworkPolicy;
 use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::{CreateModelsOptions, Credential, InMemoryCredentialStore, Models, Provider};
+use cyrup_provider::{
+    CatalogOverlay, CreateModelsOptions, Credential, InMemoryCredentialStore, ModelsStore, Models,
+    Provider, RefreshOptions, RemoteCatalog,
+};
 use cyrup_sdk::core::ProviderId;
+
+/// The process-wide runtime model-catalog overlay (DRIFT-007).
+///
+/// `None` — the value at process start and after any failure — means "embedded catalogs only",
+/// which is exactly the pre-DRIFT-007 behavior. A slot rather than a `OnceLock` because the
+/// background refresh re-installs a newer overlay when one arrives; every registry build here is
+/// already constructed fresh per call ([`composed_registry`]), so the next read simply picks it up
+/// with no live mutation and no lock on the streaming path.
+static CATALOG_OVERLAY: RwLock<Option<Arc<CatalogOverlay>>> = RwLock::new(None);
+
+fn active_catalog_overlay() -> Option<Arc<CatalogOverlay>> {
+    // A poisoned lock degrades to "no overlay" — never a panic, never fewer models than embedded.
+    CATALOG_OVERLAY.read().ok().and_then(|g| g.clone())
+}
+
+fn install_catalog_overlay(overlay: Option<Arc<CatalogOverlay>>) {
+    if let Ok(mut slot) = CATALOG_OVERLAY.write() {
+        *slot = overlay;
+    }
+}
+
+/// The disk-backed remote catalog: `<agent_dir>/models-store.json` behind the pi.dev fetcher, with
+/// the built-in manifest stamp installed so the staleness guard can discard an overlay that is not
+/// newer than the compiled-in catalogs.
+fn remote_catalog(dirs: &cyrup_config::ConfigDirs) -> Arc<RemoteCatalog> {
+    let store: Arc<dyn ModelsStore> = Arc::new(FileModelsStore::for_dirs(dirs));
+    Arc::new(
+        RemoteCatalog::new(store)
+            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at()),
+    )
+}
+
+fn all_provider_ids() -> Vec<String> {
+    cyrup_provider::all_providers()
+        .iter()
+        .map(|p| p.id().as_str().to_string())
+        .collect()
+}
+
+/// **Phase 1 of the runtime model catalog (DRIFT-007) — disk only, awaited, no network.**
+///
+/// `<agent_dir>/models-store.json` is loaded and installed, so the composed registry immediately
+/// reflects the catalogs the last run fetched — including when this run is offline. This is Pi's
+/// cache-only restore, `await modelRuntime.refresh({ allowNetwork: false })`
+/// (`agent-session-services.ts:180`), which runs inside `createAgentSessionRuntime`.
+///
+/// **Call-site ordering is load-bearing.** Pi performs this restore during runtime CREATION
+/// (`main.ts:793`), which is upstream of the `--list-models` exit at `main.ts:816`. So `pi
+/// --list-models` renders the persisted pi.dev overlay. cyrup must call this before its own
+/// `--list-models` early return for the same reason — that listing is the one entry point that
+/// never reaches the rest of startup. It is awaited because it is a single small local file read;
+/// it performs no network I/O of any kind, so awaiting it cannot block on a remote host.
+pub async fn restore_model_catalog(dirs: &cyrup_config::ConfigDirs) {
+    let catalog = remote_catalog(dirs);
+    let all_ids = all_provider_ids();
+    let refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
+    let overlay = catalog.load_overlay(&refs).await;
+    install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
+}
+
+/// **The modes that are allowed to touch the network for catalogs — and only those.**
+///
+/// Pi has exactly TWO catalog-refresh triggers and neither of them is a scripted run:
+///
+/// - RPC: `main.ts:863-866` — `if (!offlineMode && appMode === "rpc") { void modelRuntime.refresh() }`,
+///   guarded on the mode by name.
+/// - Interactive: `interactive-mode.ts` `run()` — `if (!process.env.PI_OFFLINE) { void
+///   this.session.modelRuntime.refresh()… }`, reached only from the interactive front-end.
+///
+/// Runtime CREATION never fetches: every `ModelRuntime.create` call in `coding-agent` passes
+/// `allowModelNetwork: false` (`main.ts:158`, `package-manager-cli.ts:401`) and `model-runtime.ts:163`
+/// computes `refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true`.
+/// So `pi -p "…"` and pi's JSON output mode issue no catalog request at all.
+///
+/// cyrup must land in the same place. A one-shot `cyrup -p "…"` or `--mode json` is the scripted /
+/// CI path; silently adding an outbound `https://pi.dev` request to it would be a network trigger
+/// upstream does not have. The catalog data those runs read is the persisted overlay restored by
+/// [`restore_model_catalog`], which is disk-only.
+pub fn mode_refreshes_catalogs(mode: cyrup_config::trust::AppMode) -> bool {
+    use cyrup_config::trust::AppMode;
+    matches!(mode, AppMode::Rpc | AppMode::Interactive)
+}
+
+/// **Phase 2 of the runtime model catalog (DRIFT-007) — fire and forget.**
+///
+/// When the mode is one Pi refreshes in ([`mode_refreshes_catalogs`]) AND
+/// [`NetworkPolicy::allow_model_catalog_refresh`] permits it, a DETACHED task revalidates the
+/// catalogs against pi.dev and re-installs the overlay if anything changed. This is Pi's post-init
+/// trigger (`main.ts:863-866`, `interactive-mode.ts` `run()`), moved off `ModelRuntime.create` by pi
+/// commit `c889eb88` precisely so that startup never blocks on it. Nothing awaits the task and every
+/// error is swallowed: the worst case is the embedded catalogs.
+///
+/// Like Pi's, this is deliberately NOT reached by a `--list-models` run: upstream's trigger is
+/// downstream of the `main.ts:816` listing exit, so a listing issues no request. Keeping this call
+/// at its post-startup-UI site preserves that.
+///
+/// `configured_providers` restricts the fetch to providers the user has actually configured, exactly
+/// as Pi's `Models.refresh` does by bailing when `resolveRefreshCredential` yields nothing
+/// (`models.ts:296`). Without it a bare `cyrup` would fan out one request per built-in provider on
+/// every start.
+pub fn spawn_model_catalog_refresh(
+    dirs: &cyrup_config::ConfigDirs,
+    policy: NetworkPolicy,
+    mode: cyrup_config::trust::AppMode,
+    configured_providers: Vec<String>,
+) {
+    spawn_model_catalog_refresh_with(remote_catalog(dirs), policy, mode, configured_providers);
+}
+
+/// [`spawn_model_catalog_refresh`] over an injected [`RemoteCatalog`].
+///
+/// The base URL is the only transport seam this subsystem has (Pi's `catalogBaseUrl` option), so
+/// this is what lets the mode/offline gating be proven against a loopback listener instead of
+/// `https://pi.dev`. Returns the [`JoinHandle`](tokio::task::JoinHandle) when a task was actually
+/// spawned and `None` when the gate declined — a test can then await the task rather than sleep,
+/// and can assert the gate fired without waiting on a socket that will never be opened.
+pub fn spawn_model_catalog_refresh_with(
+    catalog: Arc<RemoteCatalog>,
+    policy: NetworkPolicy,
+    mode: cyrup_config::trust::AppMode,
+    configured_providers: Vec<String>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Print/JSON stop here: Pi refreshes in rpc and interactive only, so a scripted run must issue
+    // no request. Offline / `--offline` / `CYRUP_OFFLINE` / `PI_OFFLINE` stops here too. So does
+    // having no configured provider: there is nothing whose catalog we are entitled to fetch.
+    if !mode_refreshes_catalogs(mode)
+        || !policy.allow_model_catalog_refresh()
+        || configured_providers.is_empty()
+    {
+        return None;
+    }
+    let all_ids = all_provider_ids();
+    Some(tokio::spawn(async move {
+        let refs: Vec<&str> = configured_providers.iter().map(String::as_str).collect();
+        // Best-effort: per-provider errors are collected, not propagated, and are deliberately not
+        // surfaced to the user — a catalog that could not be refreshed is simply the embedded one.
+        let _errors = catalog
+            .refresh_providers(&refs, RefreshOptions::network())
+            .await;
+        let all_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
+        let overlay = catalog.load_overlay(&all_refs).await;
+        install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
+    }))
+}
 
 /// The composed registry (built-ins + `models.json`) over an optional runtime `--api-key`
 /// credential. Composition errors are the caller's to surface —
@@ -49,6 +198,9 @@ fn composed_registry(
         CreateModelsOptions {
             credentials,
             auth_context: None,
+            // The runtime pi.dev overlay (DRIFT-007), applied UNDER `models.json`: a user's explicit
+            // config still wins, and the embedded catalogs still floor the result.
+            catalog_overlay: active_catalog_overlay(),
         },
     )
 }

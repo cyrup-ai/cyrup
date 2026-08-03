@@ -55,6 +55,8 @@ use crate::auth::{CredentialStore, InMemoryCredentialStore};
 use crate::collection::{CreateModelsOptions, Models, create_models};
 use crate::images::{ImagesModels, ImagesProvider, create_images_models};
 use crate::provider::Provider;
+use crate::remote_catalog::CatalogOverlay;
+use crate::utils::http_date::parse_iso8601_utc_ms;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
 use crate::providers::{
@@ -65,6 +67,29 @@ use crate::providers::{
     together_provider_with,
 };
 use std::sync::Arc;
+
+/// The generation manifest for the compiled-in catalogs under `providers/catalog/` (Pi
+/// `providers/data/.manifest.json`, imported by `all.ts:12`).
+pub const BUILTIN_CATALOG_MANIFEST_JSON: &str = include_str!("catalog_manifest.json");
+
+/// Generation timestamp shared by all built-in provider catalogs, in epoch milliseconds (1:1 port of
+/// Pi `getBuiltinModelDataGeneratedAt`, `all.ts:72-75`, including its `NaN` → `undefined` fold).
+///
+/// This is the staleness floor for the pi.dev overlay: [`crate::remote_catalog::remote_models`]
+/// discards a persisted remote catalog that is not STRICTLY newer than this, so an upgrade that
+/// refreshes the embedded JSON can never be shadowed by the pre-upgrade overlay (pi #7016). Before
+/// DRIFT-007 cyrup carried no machine-readable stamp at all — provenance lived only in the prose of
+/// `tests/catalog_data.rs`, which a program cannot compare against.
+pub fn builtin_model_data_generated_at() -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Manifest {
+        generated_at: String,
+    }
+    serde_json::from_str::<Manifest>(BUILTIN_CATALOG_MANIFEST_JSON)
+        .ok()
+        .and_then(|m| parse_iso8601_utc_ms(&m.generated_at))
+}
 
 /// Every built-in provider that is implemented in this crate, freshly constructed over a shared
 /// credential store + the built-in api registry (Pi `builtinProviders()`, `all.ts:70-108`).
@@ -82,6 +107,36 @@ pub fn all_providers() -> Vec<Arc<dyn Provider>> {
 /// shares one catalog-parsing api registry (Pi constructs each provider fresh; we additionally share
 /// the registry/store for cost).
 pub fn all_providers_with(
+    store: Arc<dyn CredentialStore>,
+    registry: Arc<ApiRegistry>,
+) -> Vec<Arc<dyn Provider>> {
+    all_providers_with_overlay(store, registry, None)
+}
+
+/// [`all_providers_with`] with an optional remote model-catalog overlay applied on top of each
+/// provider's embedded catalog (Pi `builtinProviders().map(withRemoteCatalog)`,
+/// `model-runtime.ts:145-151`; DRIFT-007).
+///
+/// The overlay is applied by wrapping, never by replacing: [`CatalogOverlay::apply`] merges by model
+/// id over the embedded catalog and returns the provider UNCHANGED when it has nothing to
+/// contribute. Passing `None` — which is what [`all_providers_with`] does — is byte-identical to the
+/// pre-DRIFT-007 behavior, so the embedded catalogs remain the floor in every configuration.
+pub fn all_providers_with_overlay(
+    store: Arc<dyn CredentialStore>,
+    registry: Arc<ApiRegistry>,
+    overlay: Option<&CatalogOverlay>,
+) -> Vec<Arc<dyn Provider>> {
+    let providers = builtin_providers_with(store, registry);
+    match overlay {
+        None => providers,
+        Some(overlay) => providers
+            .into_iter()
+            .map(|p| overlay.apply(p))
+            .collect::<Vec<_>>(),
+    }
+}
+
+fn builtin_providers_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
 ) -> Vec<Arc<dyn Provider>> {
@@ -165,9 +220,17 @@ pub fn all_providers_with(
 /// A [`Models`] collection with every implemented built-in provider registered (Pi `builtinModels`,
 /// `all.ts:111-117`). Takes the same [`CreateModelsOptions`] as [`create_models`]; the default
 /// (`CreateModelsOptions::default()`) uses the env-backed auth context so env API keys resolve.
+/// The remote model-catalog overlay in `options`, if any, is applied to every built-in provider
+/// (DRIFT-007). It defaults to `None`, so every existing caller keeps the embedded catalogs exactly
+/// as before.
 pub fn default_models(options: CreateModelsOptions) -> Models {
+    let overlay = options.catalog_overlay.clone();
     let mut models = create_models(options);
-    for provider in all_providers() {
+    for provider in all_providers_with_overlay(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+        overlay.as_deref(),
+    ) {
         models.set_provider(provider);
     }
     models

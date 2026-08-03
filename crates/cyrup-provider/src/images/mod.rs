@@ -759,6 +759,7 @@ mod tests {
                 "OPENROUTER_API_KEY".to_string(),
                 "sk-or".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(openrouter_provider_for_tests());
         assert_eq!(models.get_providers().len(), 1);
@@ -797,6 +798,7 @@ mod tests {
                 "OPENROUTER_API_KEY".to_string(),
                 "sk-or".to_string(),
             )])))),
+            catalog_overlay: None,
         });
         models.set_provider(openrouter_provider_for_tests());
         let mut m = sample_model();

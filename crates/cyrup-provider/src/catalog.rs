@@ -1,8 +1,14 @@
-//! Static model-catalog seam (arch-01 §3.1 / §12 deferred).
+//! Static model-catalog seam (arch-01 §3.1).
 //!
 //! Providers ship a seed catalog from embedded JSON (models.dev-shaped, in this crate's neutral
-//! [`Model`] serde form). Full models.dev generation/refresh is DEFERRED (arch-01 §12); this seam is
-//! the boundary it will plug into.
+//! [`Model`] serde form). The generation timestamp shared by every embedded catalog lives in
+//! [`crate::providers::all::BUILTIN_CATALOG_MANIFEST_JSON`].
+//!
+//! **The runtime refresh is no longer deferred** (DRIFT-007): [`crate::remote_catalog`] ports Pi's
+//! `withRemoteCatalog` — a persisted pi.dev overlay with `ETag` revalidation, a 4h freshness window
+//! and an `<agent_dir>/models-store.json` cache. It is strictly an OVERLAY: the embedded catalogs
+//! here remain the source of truth and the floor, and the overlay can only add or replace models by
+//! id, never remove one.
 
 use crate::model::Model;
 

@@ -24,6 +24,7 @@ pub mod env_keys;
 pub mod error;
 pub mod lock;
 pub mod model;
+pub mod models_store;
 pub mod policy;
 pub mod provider_compose;
 pub mod settings;

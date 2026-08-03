@@ -16,7 +16,9 @@ pub mod openrouter_images;
 pub mod together;
 
 pub use all::{
-    all_images_providers, all_providers, all_providers_with, default_images_models, default_models,
+    BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
+    all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
+    default_models,
 };
 pub use anthropic::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,

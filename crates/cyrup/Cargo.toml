@@ -63,3 +63,9 @@ serde_json = { workspace = true }
 # Dispatch integration tests build a real AgentSession over a scripted faux provider in a tempdir.
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+# `tests/catalog_refresh_modes.rs` proves the DRIFT-007 mode gate against a raw loopback listener
+# (`127.0.0.1:0`) instead of `https://pi.dev` — tests must never touch the real network. `net` is a
+# TEST-only feature addition; the binary's tokio surface is unchanged. `async-trait` is needed for
+# the empty `AuthContext` the same test injects so an ambient `HTTP_PROXY` cannot reroute it.
+tokio = { workspace = true, features = ["net"] }
+async-trait = { workspace = true }

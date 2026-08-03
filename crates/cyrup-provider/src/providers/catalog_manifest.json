@@ -1,0 +1,5 @@
+{
+  "generatedAt": "2026-07-10T16:34:43Z",
+  "source": "pi@91585d9a3829831b07560901c4b3e9bbe3b4e35a",
+  "note": "Machine-readable counterpart of the provenance prose in tests/catalog_data.rs. `generatedAt` is the commit timestamp of the pi revision the 31 embedded catalogs under providers/catalog/*.json were extracted from. It is the staleness floor for the pi.dev overlay (DRIFT-007): a persisted remote catalog whose Last-Modified is not strictly newer than this is discarded whole, so upgrading cyrup can never leave a pre-upgrade overlay shadowing freshly refreshed embedded data. Bump this in the same commit that refreshes the catalogs."
+}

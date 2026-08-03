@@ -137,6 +137,7 @@ fn composed(
     let mut models = create_models(CreateModelsOptions {
         credentials: Some(store.clone()),
         auth_context: Some(ctx.clone()),
+        catalog_overlay: None,
     });
     // No built-ins registered: this asserts the models.json provider stands entirely on its own,
     // exactly as Pi's `composeModelProvider(id, /* base */ undefined, ...)` does.
