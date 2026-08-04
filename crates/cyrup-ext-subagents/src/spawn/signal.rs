@@ -17,6 +17,13 @@
 //! real OS signal regardless of whether the token observation or the timer is what ended the
 //! wait.
 //!
+//! Every stage targets the child's process GROUP when the child leads one (which is always the
+//! case for a [`crate::spawn::SpawnedChild`], since `SpawnedChild::spawn` sets
+//! `Command::process_group(0)`), and only otherwise the bare pid — see [`send_signal`] for why
+//! that distinction is load-bearing rather than cosmetic: a pid-only ladder cannot reach the
+//! descendants a subagent is itself blocked on, which both defeats stage 1 and orphans the whole
+//! subtree at stage 3.
+//!
 //! On non-Unix targets there is no direct `SIGINT`/`SIGTERM` process-group equivalent; per
 //! R-SA-059's own fallback clause and the workspace convention already established by
 //! `cyrup_tools::ops::local::terminate_pid`/`send_sigterm_tree`, the "graceful" stages become
@@ -140,7 +147,8 @@ async fn race_wait(
     }
 }
 
-/// Send `SIGINT` to the child (R-SA-059 stage 1). Best-effort on non-Unix: there is no portable
+/// Send `SIGINT` to the child — and to its process group when it leads one, see [`send_signal`]
+/// — (R-SA-059 stage 1). Best-effort on non-Unix: there is no portable
 /// `SIGINT`-equivalent primitive for an arbitrary child process there, so this is a no-op and the
 /// escalation proceeds straight to the (also best-effort) `SIGTERM` stage after paying out its
 /// own grace period — a slightly longer overall wait than the Unix path, but never a skipped
@@ -155,8 +163,8 @@ fn send_sigint(child: &Child) {
     }
 }
 
-/// Send `SIGTERM` to the child (R-SA-059 stage 2). Best-effort on non-Unix, matching
-/// [`send_sigint`]'s rationale.
+/// Send `SIGTERM` to the child — and to its process group when it leads one, see [`send_signal`]
+/// — (R-SA-059 stage 2). Best-effort on non-Unix, matching [`send_sigint`]'s rationale.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn send_sigterm(child: &Child) {
     #[cfg(unix)]
@@ -171,7 +179,9 @@ fn send_sigterm(child: &Child) {
 /// start_kill`'s platform primitive — `TerminateProcess` — on non-Unix). Unlike the two graceful
 /// stages above, this one is NOT allowed to be a true no-op on any platform: it is the one
 /// escalation rung the whole ladder exists to guarantee eventually fires, so non-Unix falls back
-/// to tokio's own portable `start_kill` rather than another best-effort signal send.
+/// to tokio's own portable `start_kill` rather than another best-effort signal send. On Unix this
+/// too targets the process group when the child leads one ([`send_signal`]) — a pid-only `SIGKILL`
+/// here is what would otherwise leak the child's entire descendant subtree.
 fn send_sigkill(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -187,18 +197,52 @@ fn send_sigkill(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-/// Send `signal` to `pid` via `nix::sys::signal::kill`, swallowing the result.
+/// Send `signal` to the child via `nix::sys::signal::kill`, swallowing the result.
+///
+/// # Target selection: the child's process GROUP whenever the child leads one
+///
+/// [`crate::spawn::SpawnedChild::spawn`] puts every subagent child in its own process group
+/// (`Command::process_group(0)`), precisely so the ladder "can target exactly this child **and any
+/// of its own descendants**". Signalling only the direct pid does not honor that intent, and the
+/// gap is not academic — a subagent child is a re-exec'd `cyrup` binary that spends most of its
+/// life blocked in `wait(2)` on a descendant IT spawned (a bash-tool command, `cargo`/`npm`/`git`,
+/// a nested subagent). A pid-only `SIGINT` leaves that descendant running, so the child cannot
+/// finish its graceful shutdown inside [`SIGINT_GRACE`] and the ladder escalates for no reason;
+/// worse, a pid-only stage-3 `SIGKILL` reaps the direct child and ORPHANS the entire subtree into
+/// a process group nothing holds a handle to (and which `process_group(0)` has already detached
+/// from the terminal's foreground group, so the user's own Ctrl-C cannot reach it either).
+///
+/// So: if the child is genuinely its own process-group LEADER (`getpgid(pid) == pid`), signal the
+/// negated pid — POSIX `kill(-pgid, sig)`, i.e. every member of that group, which by construction
+/// is exactly this child plus the descendants it did not deliberately detach. Otherwise (the child
+/// shares its caller's group — [`terminate`]'s contract is a bare `tokio::process::Child`, and this
+/// module's own tests spawn such children) fall back to the single pid, which is also what upstream
+/// `pi-subagents`' `trySignalChild` → `child.kill(sig)` does. Upstream can afford single-pid kills
+/// because it never passes `detached`, so its children stay in pi's own group and a terminal signal
+/// reaches the whole tree anyway; cyrup's deliberate `process_group(0)` divergence is what makes
+/// group-targeting mandatory here.
+///
+/// Never negate a pid whose group we do not lead: `kill(-pgid, …)` against a group we merely belong
+/// to would signal the parent orchestrator (and, in tests, the test runner) as well.
 ///
 /// A send failure (overwhelmingly `ESRCH`: the process already exited in the race between our
 /// own liveness assumption and this syscall) must NOT abort the escalation — the next stage's
 /// own signal send is itself a no-op against an already-dead pid, and the FINAL `wait()` is what
 /// actually confirms termination, never this send. This mirrors `cyrup_ext::caps::proc::
 /// ProcCaps::kill`'s and `cyrup_tools::ops::local::terminate_pid`'s identical try-and-ignore
-/// convention for the same benign race.
+/// convention for the same benign race. `getpgid` failing is treated the same way: fall back to
+/// the single pid rather than skipping the send.
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: nix::sys::signal::Signal) {
-    let nix_pid = nix::unistd::Pid::from_raw(pid as nix::libc::pid_t);
-    let _ = nix::sys::signal::kill(nix_pid, signal);
+    let raw = pid as nix::libc::pid_t;
+    let nix_pid = nix::unistd::Pid::from_raw(raw);
+    // The pid cannot be recycled out from under this check: `terminate` still owns the
+    // `tokio::process::Child`, so an exited child is a zombie holding its pid until `wait()`.
+    let target = match nix::unistd::getpgid(Some(nix_pid)) {
+        Ok(pgid) if pgid.as_raw() == raw => nix::unistd::Pid::from_raw(-raw),
+        _ => nix_pid,
+    };
+    let _ = nix::sys::signal::kill(target, signal);
 }
 
 #[cfg(test)]

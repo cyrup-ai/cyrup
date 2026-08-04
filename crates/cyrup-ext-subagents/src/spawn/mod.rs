@@ -393,6 +393,14 @@ impl SpawnedChild {
             // subprocesses. `process_group` is an inherent method on `tokio::process::Command`
             // itself (not a `std::os::unix::process::CommandExt` extension trait method), so no
             // extra trait import is needed here.
+            //
+            // This makes the child a process-group LEADER (pgid == pid), which is exactly the
+            // condition `spawn::signal::send_signal` detects in order to signal `-pgid` rather
+            // than the bare pid. The two halves are a pair: detaching the group without also
+            // switching the kill target would leave every escalation stage unable to reach the
+            // descendants the subagent is blocked on, AND leave that subtree orphaned (detached
+            // from the terminal's foreground group, so not even the user's Ctrl-C reaches it)
+            // after stage 3. See `send_signal`'s docs for the full rationale.
             command.process_group(0);
         }
 
@@ -1223,5 +1231,118 @@ mod tests {
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 must fail after terminate() returns — the OS process is really gone"
         );
+    }
+
+    /// The escalation ladder must reach the child's DESCENDANTS, not only the direct child.
+    ///
+    /// `SpawnedChild::spawn` puts the child in its own process group precisely so this holds; a
+    /// pid-only ladder would SIGKILL the direct child at stage 3 and leave its whole subtree
+    /// running, orphaned into a detached process group nothing holds a handle to — a real process
+    /// leak on every subagent cancel/timeout, since a subagent child is a `cyrup` re-exec that is
+    /// normally blocked on a descendant it spawned itself (a bash-tool command, `cargo`, a nested
+    /// subagent). Asserts against the OS, not this crate's bookkeeping.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_reaches_the_childs_own_descendants_not_just_the_direct_child() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let pid_path = dir.path().join("grandchild.pid");
+        // A FOREGROUND descendant, matching the real subagent shape: the direct child sits in
+        // `wait(2)` on a process it spawned itself (a bash-tool command, `cargo`, a nested
+        // subagent). Deliberately not `sleep 300 &` — POSIX has a non-interactive shell set
+        // SIGINT/SIGQUIT to SIG_IGN in an ASYNCHRONOUS child, which would make the descendant
+        // immune to stage 1 for reasons that have nothing to do with signal targeting.
+        //
+        // The inner `sh` publishes its own pid via an atomic rename (so the file is never read
+        // half-written) and then `exec`s, keeping that same pid — the readiness-marker idiom
+        // `spawn::signal`'s own tests use, rather than a fixed sleep that CPU contention outruns.
+        let script = format!(
+            "sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300'",
+            path = pid_path.display()
+        );
+        let spec = ChildSpawnSpec {
+            command: sh_command(&script),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: Vec::new(),
+        };
+        let jsonl_path = dir.path().join("descendants.jsonl");
+        let child = SpawnedChild::spawn(spec, &jsonl_path)
+            .await
+            .expect("scripted sh child spawns");
+        let child_pid = child.id().expect("live child has a pid");
+
+        let grandchild_pid = read_published_pid(&pid_path, Duration::from_secs(10))
+            .await
+            .expect("the child script publishes its descendant's pid");
+        assert_ne!(
+            grandchild_pid, child_pid,
+            "the script must really have forked a separate descendant process"
+        );
+
+        let cancel = CancelToken::new();
+        let _outcome = child
+            .terminate(&cancel)
+            .await
+            .expect("terminate confirms real exit");
+
+        assert!(
+            pid_is_terminated(grandchild_pid, Duration::from_secs(10)).await,
+            "the child's own descendant (pid {grandchild_pid}) must be terminated by the \
+             escalation ladder too, not left running as an orphan after the direct child \
+             (pid {child_pid}) was signalled"
+        );
+    }
+
+    /// Poll for the pid published (via an atomic rename, so it is never read half-written) by a
+    /// test child script, up to `timeout`. `None` means it never appeared.
+    #[cfg(unix)]
+    async fn read_published_pid(path: &Path, timeout: Duration) -> Option<u32> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                return Some(pid);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Poll, up to `timeout`, until `pid` is confirmed terminated at the OS level.
+    ///
+    /// "Terminated" means gone from the process table OR an un-reaped zombie: this pid's parent
+    /// (the direct child) dies in the same escalation, so the zombie is awaiting reaping by
+    /// whatever it was reparented to, which is outside this test's control and is not the thing
+    /// under test — the thing under test is that it stopped running at all.
+    #[cfg(unix)]
+    async fn pid_is_terminated(pid: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // `kill(pid, None)` sends nothing; it only probes existence/permission. An error
+            // (ESRCH) means the pid is genuinely gone from the process table.
+            let nix_pid = nix::unistd::Pid::from_raw(pid as nix::libc::pid_t);
+            if nix::sys::signal::kill(nix_pid, None).is_err() {
+                return true;
+            }
+            // Still listed: on Linux that can be an un-reaped zombie. `/proc/<pid>/stat`'s state
+            // field is the one right after the `(comm)` field, which may itself contain spaces —
+            // hence splitting on the LAST ')' rather than on whitespace.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
