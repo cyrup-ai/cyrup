@@ -1522,18 +1522,26 @@ mod tests {
             MAX_SPAWNED_PROCESSES,
             "the registry must never overshoot the cap even under a concurrent race"
         );
-        // SOME of the 49 losers necessarily forked a real process before losing the atomic re-check
-        // (not all 49 — many instead lose the CHEAPER fast up-front check once the winner has already
-        // inserted, and are rejected before ever forking at all; which path each loser takes depends
-        // on real OS task scheduling, not something this test can pin down exactly) — every one that
-        // DID fork must be recorded for `Drop`'s second-chance sweep, not merely killed once and
-        // forgotten. See `orphaned_pid_from_a_lost_spawn_race_is_reaped_on_drop` for the end-to-end
-        // proof this recording actually matters.
+        // A loser takes one of two paths: it either forked a real process and then lost the atomic
+        // re-check (so its pid MUST be recorded for `Drop`'s second-chance sweep), or it lost the
+        // CHEAPER fast up-front check once the winner had already inserted and never forked at all.
+        // Which path each of the 49 takes is decided by real OS scheduling.
+        //
+        // So the only invariant this test can assert about the count is the UPPER bound. There is no
+        // lower bound: under load the winner's insert can land before any other task reaches its
+        // fork, in which case all 49 take the cheap path and `orphaned == 0` is perfectly correct.
+        // This assertion previously demanded `orphaned > 0` and consequently failed ~1 workspace run
+        // in 3 — asserting a scheduling outcome the test's own comment admitted it could not pin
+        // down.
+        //
+        // Dropping the lower bound costs no coverage: that a forked race-loser is recorded AND
+        // reaped is proven deterministically next door by
+        // `orphaned_pid_from_a_lost_spawn_race_is_reaped_on_drop`, which constructs the orphan
+        // directly instead of trying to win a race.
         let orphaned = caps.orphaned_pids.lock().expect("lock").len();
         assert!(
-            orphaned > 0 && orphaned <= 49,
-            "at least one (and at most all 49) race losers that forked a real process before losing \
-             the atomic re-check must be recorded in orphaned_pids, got {orphaned}"
+            orphaned <= 49,
+            "orphaned_pids must never exceed the 49 race losers, got {orphaned}"
         );
     }
 
