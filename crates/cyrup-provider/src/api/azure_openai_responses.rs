@@ -136,9 +136,12 @@ impl ApiImpl for AzureOpenAiResponsesApi {
 
         let deployment = resolve_deployment_name(model, env, azure);
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
-        let body =
-            crate::stream::apply_on_payload(opts, model, build_params(model, ctx, opts, &deployment))
-                .await;
+        let body = crate::stream::apply_on_payload(
+            opts,
+            model,
+            build_params(model, ctx, opts, &deployment),
+        )
+        .await;
         let headers = build_headers(model, opts, &api_key);
         let req = SseRequest {
             method: reqwest::Method::POST,
@@ -343,7 +346,11 @@ pub(crate) fn build_params(
     opts: &StreamOptions,
     deployment_name: &str,
 ) -> Value {
-    let messages = convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS);
+    // Azure gets NO deferred-tool loading: Pi's `azure-openai-responses.ts:280` calls
+    // `convertResponsesMessages` with options that omit `deferredTools` and never imports
+    // `splitDeferredTools`, so no `tool_search_call`/`tool_search_output` pair can ever be emitted
+    // on this path and every tool stays in the request prefix (DRIFT-001).
+    let messages = convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[]);
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(deployment_name));
@@ -369,7 +376,7 @@ pub(crate) fn build_params(
     if !ctx.tools.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&ctx.tools)),
+            Value::Array(convert_responses_tools(&ctx.tools, false)),
         );
     }
 
@@ -643,5 +650,82 @@ mod tests {
         let h = build_headers(&m, &StreamOptions::default(), "azkey");
         assert_eq!(h.get("api-key"), Some(&Some("azkey".to_string())));
         assert!(!h.contains_key("Authorization"));
+    }
+
+    #[test]
+    fn azure_never_defers_tools_even_with_the_compat_flag_on() {
+        // DRIFT-001: Pi's `azure-openai-responses.ts:280` calls `convertResponsesMessages` WITHOUT
+        // `deferredTools` and never imports `splitDeferredTools`, so this path cannot emit a
+        // `tool_search_call`/`tool_search_output` pair and every tool stays in `body.tools` —
+        // even when `compat.supportsToolSearch` is set, which on this api is simply not read.
+        let mut m = azure_model("gpt-4", false);
+        m.compat = Some(crate::api::compat::ModelCompat {
+            supports_tool_search: Some(true),
+            ..Default::default()
+        });
+        let tools = vec![
+            crate::context::ToolDef {
+                name: "base_tool".into(),
+                description: "The base_tool tool".into(),
+                parameters: json!({ "type": "object" }),
+            },
+            crate::context::ToolDef {
+                name: "late_tool".into(),
+                description: "The late_tool tool".into(),
+                parameters: json!({ "type": "object" }),
+            },
+        ];
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                cyrup_core::Message::Assistant(cyrup_core::AssistantMessage {
+                    content: vec![cyrup_core::Content::ToolCall(cyrup_core::ToolCall {
+                        id: cyrup_core::ToolCallId::from("call_1"),
+                        name: "base_tool".to_string(),
+                        arguments: serde_json::Map::new(),
+                        thought_signature: None,
+                    })],
+                    provider: "azure-openai-responses".into(),
+                    model: "gpt-4".to_string(),
+                    api: API_ID.into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    usage: cyrup_core::Usage::default(),
+                    stop_reason: cyrup_core::StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                cyrup_core::Message::ToolResult {
+                    tool_call_id: cyrup_core::ToolCallId::from("call_1"),
+                    tool_name: "base_tool".to_string(),
+                    content: vec![cyrup_core::Content::text("done")],
+                    is_error: false,
+                    details: None,
+                    usage: None,
+                    added_tool_names: vec!["late_tool".to_string()],
+                    timestamp: 3,
+                },
+            ],
+            tools,
+        };
+
+        let body = build_params(&m, &ctx, &StreamOptions::default(), "dep");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, ["base_tool", "late_tool"]);
+        let raw = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            !raw.contains("tool_search"),
+            "azure emitted tool search: {raw}"
+        );
+        assert!(
+            !raw.contains("defer_loading"),
+            "azure emitted defer_loading: {raw}"
+        );
     }
 }

@@ -26,6 +26,7 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
+use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::parse_streaming_json_object;
 use cyrup_core::{
@@ -34,7 +35,7 @@ use cyrup_core::{
 };
 use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The wire-protocol id this impl serves.
@@ -286,9 +287,37 @@ pub(crate) fn build_params(
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
 ) -> Value {
-    let messages = convert_responses_messages(model, ctx, OPENAI_TOOL_CALL_PROVIDERS);
-    let cache = resolve_cache_retention(opts.cache_retention, env);
     let compat = get_responses_compat(model);
+
+    // --- DRIFT-001 deferred-tool placement (Pi openai-responses.ts:267-274) ---
+    //
+    // The Responses rendering is the MIRROR IMAGE of the Anthropic one: there, deferred tools stay
+    // in `params.tools` carrying `defer_loading: true`; here they are omitted from `tools`
+    // ENTIRELY and reach the model only inside the synthetic `tool_search_output` anchored at
+    // their marker. Sending them in both places would re-inflate the cache-unstable prefix this
+    // feature exists to avoid; sending them in neither would hand the model tool calls it has no
+    // schema for.
+    //
+    // Two deliberate divergences from the Anthropic caller, both verified against Pi:
+    //  * the split runs over the RAW `ctx.messages` — Pi passes `context`, not a transformed list,
+    //    because `convertResponsesMessages` does its own `transformMessages` internally (:267);
+    //  * there is NO safety valve. Pi's "promote everything back when the prefix would be empty"
+    //    rule is Anthropic-only (anthropic-messages.ts:955-959); openai-responses.ts:301 guards on
+    //    `immediate.length > 0`, so an all-deferred request ships a body with no `tools` key at
+    //    all and the definitions live purely in the transcript.
+    // The name normalizer is identity: Pi calls `splitDeferredTools(context, enabled)` with the
+    // default `identityToolName`, so the deferred map is keyed by the raw tool name and
+    // `deferredTools.get(name)` at the anchor site matches on the raw `addedToolNames` entry.
+    let placement = split_deferred_tools(
+        &ctx.messages,
+        &ctx.tools,
+        compat.supports_tool_search,
+        &|name: &str| name.to_string(),
+    );
+
+    let messages =
+        convert_responses_messages(model, ctx, OPENAI_TOOL_CALL_PROVIDERS, &placement.deferred);
+    let cache = resolve_cache_retention(opts.cache_retention, env);
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(model.id.as_str()));
@@ -326,10 +355,13 @@ pub(crate) fn build_params(
         obj.insert("service_tier".to_string(), json!(tier));
     }
 
-    if !ctx.tools.is_empty() {
+    // Only the IMMEDIATE tools reach `body.tools` (Pi `if (toolPlacement.immediate.length > 0)`,
+    // openai-responses.ts:301-306). With tool search off the split is a pass-through, so this is
+    // byte-identical to the old `if !ctx.tools.is_empty()` for every model that does not opt in.
+    if !placement.immediate.is_empty() {
         obj.insert(
             "tools".to_string(),
-            Value::Array(convert_responses_tools(&ctx.tools)),
+            Value::Array(convert_responses_tools(&placement.immediate, false)),
         );
     }
 
@@ -439,10 +471,19 @@ fn build_foreign_responses_item_id(item_id: &str) -> String {
 }
 
 /// 1:1 port of Pi `convertResponsesMessages` (openai-responses-shared.ts:90-267).
+///
+/// `deferred_tools` is Pi's `options.deferredTools` map (`ConvertResponsesMessagesOptions`,
+/// openai-responses-shared.ts:118) in insertion order: the tools that [`build_params`] withheld
+/// from `body.tools` and that must instead be anchored at their `addedToolNames` marker as a
+/// synthetic client `tool_search_call`/`tool_search_output` pair. Pass an empty slice to disable
+/// the rendering entirely — that is what `azure-openai-responses` does (Pi
+/// `azure-openai-responses.ts:280` passes options WITHOUT `deferredTools` and never imports
+/// `splitDeferredTools`).
 pub(crate) fn convert_responses_messages(
     model: &Model,
     ctx: &Context,
     allowed_tool_call_providers: &[&str],
+    deferred_tools: &[(String, ToolDef)],
 ) -> Vec<Value> {
     let provider = model.provider.as_str().to_string();
     let api = model.api.clone();
@@ -475,6 +516,11 @@ pub(crate) fn convert_responses_messages(
     let transformed = transform_messages_with_source(&ctx.messages, model, normalize);
 
     let mut messages: Vec<Value> = Vec::new();
+    // Declared once per conversion so a deferred tool is loaded EXACTLY ONCE per request even when
+    // several tool results name it (Pi `const loadedToolNames = new Set<string>()`,
+    // openai-responses-shared.ts:143). Keys are RAW names — unlike the Anthropic path there is no
+    // normalizer on this side.
+    let mut loaded_tool_names: HashSet<String> = HashSet::new();
 
     if let Some(system) = &ctx.system_prompt {
         let compat = get_responses_compat(model);
@@ -602,6 +648,7 @@ pub(crate) fn convert_responses_messages(
             Message::ToolResult {
                 tool_call_id,
                 content,
+                added_tool_names,
                 ..
             } => {
                 let text_result = content
@@ -651,6 +698,64 @@ pub(crate) fn convert_responses_messages(
                     "call_id": call_id,
                     "output": output,
                 }));
+
+                // --- DRIFT-001 anchor: the Responses rendering (Pi
+                // openai-responses-shared.ts:304-332) ---
+                //
+                // Injected IMMEDIATELY AFTER the `function_call_output` at this transcript index,
+                // so the definitions land at the point in the conversation where the tools became
+                // available. A marked name that is absent from `deferred_tools` produces nothing:
+                // either the model can already see it (it was left immediate) or it is not in
+                // `Context.tools` at all.
+                let mut loaded: Vec<&ToolDef> = Vec::new();
+                for name in added_tool_names {
+                    if loaded_tool_names.contains(name) {
+                        continue;
+                    }
+                    // Pi `options?.deferredTools?.get(name)` — the map is keyed by the (identity-)
+                    // normalized name, so this is a raw-name lookup.
+                    let Some((_, tool)) = deferred_tools.iter().find(|(key, _)| key == name) else {
+                        continue;
+                    };
+                    loaded_tool_names.insert(name.clone());
+                    loaded.push(tool);
+                }
+                if !loaded.is_empty() {
+                    let names: Vec<&str> = loaded.iter().map(|t| t.name.as_str()).collect();
+                    // The hash input uses the FULL `tool_call_id`, INCLUDING any `|item_id`
+                    // suffix — NOT the `call_id` split off above for `function_call_output`
+                    // (Pi `${msg.toolCallId}:${names.join(",")}`, :306). Comma-joined for the
+                    // hash, SPACE-joined for the query.
+                    //
+                    // The `pi_tool_load_` prefix is kept VERBATIM despite cyrup's `pi` → `cyrup`
+                    // rebrand: this string is on the wire and is what the differential/golden
+                    // parity harnesses diff. Renaming it would be a silent wire divergence, so it
+                    // is deliberately NOT a `[CYRUP-DELTA]`.
+                    let search_call_id = format!(
+                        "pi_tool_load_{}",
+                        short_hash(&format!("{}:{}", tool_call_id.as_str(), names.join(",")))
+                    );
+                    messages.push(json!({
+                        "type": "tool_search_call",
+                        "call_id": search_call_id,
+                        "execution": "client",
+                        "status": "completed",
+                        "arguments": {
+                            "query": names.join(" "),
+                            "limit": names.len(),
+                        },
+                    }));
+                    let defs: Vec<ToolDef> = loaded.into_iter().cloned().collect();
+                    messages.push(json!({
+                        "type": "tool_search_output",
+                        "call_id": search_call_id,
+                        "execution": "client",
+                        "status": "completed",
+                        // `defer_loading: true` on every definition in the output (Pi
+                        // `{ ...options?.toolOptions, deferLoading: true }`, :330).
+                        "tools": Value::Array(convert_responses_tools(&defs, true)),
+                    }));
+                }
             }
         }
         msg_index += 1;
@@ -684,17 +789,26 @@ fn phase_wire(phase: TextPhase) -> &'static str {
 
 /// 1:1 port of Pi `convertResponsesTools` (openai-responses-shared.ts:273-282). `strict` defaults
 /// to `false`.
-pub(crate) fn convert_responses_tools(tools: &[ToolDef]) -> Vec<Value> {
+///
+/// `defer_loading` is Pi's `options.deferLoading` (`ConvertResponsesToolsOptions`, :127): set only
+/// for the definitions carried inside a `tool_search_output`, never for `body.tools`. Cyrup ports
+/// only Pi's function-tool branch (no grammar/custom tools), so there is a single emission site.
+pub(crate) fn convert_responses_tools(tools: &[ToolDef], defer_loading: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
-            json!({
-                "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-                "strict": false,
-            })
+            let mut o = Map::new();
+            o.insert("type".to_string(), json!("function"));
+            o.insert("name".to_string(), json!(t.name));
+            o.insert("description".to_string(), json!(t.description));
+            o.insert("parameters".to_string(), t.parameters.clone());
+            // Pi spreads `...(options?.deferLoading ? { defer_loading: true } : {})` — the key is
+            // ABSENT, not `false`, when the tool is part of the request prefix.
+            if defer_loading {
+                o.insert("defer_loading".to_string(), json!(true));
+            }
+            o.insert("strict".to_string(), json!(false));
+            Value::Object(o)
         })
         .collect()
 }
@@ -1708,5 +1822,491 @@ mod tests {
         let msg = collect_message(stream).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("rate_limit: slow down"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DRIFT-001: message-anchored tool loading, the openai-responses rendering
+    // (Pi `packages/ai/test/deferred-tools.test.ts`).
+    //
+    // Every assertion below reads the EMITTED WIRE JSON. The rule that makes this rendering the
+    // mirror image of the Anthropic one: a deferred tool is omitted from `body.tools` ENTIRELY and
+    // exists only inside the synthetic `tool_search_output`. Getting that backwards would ship the
+    // model tool calls whose schemas it never received.
+    // -----------------------------------------------------------------------
+
+    /// A real catalog model, so the default-OFF proof runs against shipped data, not a fixture.
+    fn catalog_model(id: &str) -> Model {
+        crate::providers::openai::openai_models()
+            .into_iter()
+            .find(|m| m.id.as_str() == id)
+            .unwrap_or_else(|| panic!("`{id}` missing from the embedded openai catalog"))
+    }
+
+    fn deferred_tool(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("The {name} tool"),
+            parameters: json!({
+                "type": "object",
+                "properties": { "value": { "type": "string" } },
+                "required": ["value"],
+            }),
+        }
+    }
+
+    /// Pi `makeAssistantToolCall` — a FOREIGN (anthropic-authored) assistant turn, exactly as the
+    /// upstream test builds it.
+    fn assistant_tool_call(id: &str, name: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![Content::ToolCall(ToolCall {
+                id: ToolCallId::from(id),
+                name: name.to_string(),
+                arguments: serde_json::Map::new(),
+                thought_signature: None,
+            })],
+            provider: "anthropic".into(),
+            model: "claude-opus-4-6".to_string(),
+            api: "anthropic-messages".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 2,
+        })
+    }
+
+    fn marked_tool_result(id: &str, added: &[&str]) -> Message {
+        Message::ToolResult {
+            tool_call_id: ToolCallId::from(id),
+            tool_name: "base_tool".to_string(),
+            content: vec![Content::text("done")],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: added.iter().map(|s| (*s).to_string()).collect(),
+            timestamp: 3,
+        }
+    }
+
+    /// Pi `makeContext(tools, addedToolNames)` — user / assistant toolCall / toolResult / user.
+    fn deferred_ctx(tools: Vec<ToolDef>, added: &[&str]) -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User {
+                    content: vec![Content::text("Hello")],
+                    timestamp: 1,
+                },
+                assistant_tool_call("call_1", "base_tool"),
+                marked_tool_result("call_1", added),
+                Message::User {
+                    content: vec![Content::text("Hello")],
+                    timestamp: 4,
+                },
+            ],
+            tools,
+        }
+    }
+
+    fn input_types(body: &Value) -> Vec<&str> {
+        body["input"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| i.get("type").and_then(Value::as_str).unwrap_or("role-item"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn tool_names(body: &Value) -> Vec<&str> {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.get("name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn loads_an_openai_responses_tool_through_client_tool_search() {
+        // Pi "loads an OpenAI Responses tool through client tool search".
+        let ctx = deferred_ctx(
+            vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+            &["late_tool"],
+        );
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+
+        // (1) The deferred tool is GONE from `body.tools` — not merely flagged there.
+        assert_eq!(tool_names(&body), ["base_tool"]);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert!(
+            body["tools"][0].get("defer_loading").is_none(),
+            "an immediate tool must not carry defer_loading"
+        );
+
+        // (2) The pair is injected IMMEDIATELY AFTER the function_call_output at that index.
+        assert_eq!(
+            input_types(&body),
+            [
+                "role-item",            // user "Hello"
+                "function_call",        // assistant tool call
+                "function_call_output", // the tool result
+                "tool_search_call",     // <- injected here
+                "tool_search_output",
+                "role-item", // trailing user "Hello"
+            ]
+        );
+
+        let items = body["input"].as_array().unwrap();
+        let call = &items[3];
+        let out = &items[4];
+
+        // (3) The exact `tool_search_call` shape, including the hash INPUT: the full toolCallId,
+        // a COMMA-joined name list for the hash and a SPACE-joined one for the query.
+        assert_eq!(
+            *call,
+            json!({
+                "type": "tool_search_call",
+                "call_id": "pi_tool_load_1co5fstaye10s",
+                "execution": "client",
+                "status": "completed",
+                "arguments": { "query": "late_tool", "limit": 1 },
+            })
+        );
+        assert_eq!(
+            call["call_id"],
+            json!(format!("pi_tool_load_{}", short_hash("call_1:late_tool"))),
+        );
+
+        // (4) The exact `tool_search_output` shape: same call id, and the definition carries
+        // `defer_loading: true`.
+        assert_eq!(
+            *out,
+            json!({
+                "type": "tool_search_output",
+                "call_id": "pi_tool_load_1co5fstaye10s",
+                "execution": "client",
+                "status": "completed",
+                "tools": [{
+                    "type": "function",
+                    "name": "late_tool",
+                    "description": "The late_tool tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "value": { "type": "string" } },
+                        "required": ["value"],
+                    },
+                    "defer_loading": true,
+                    "strict": false,
+                }],
+            })
+        );
+
+        // (5) Nothing was displaced or lost: the tool result's own output is untouched.
+        assert_eq!(
+            items[2],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "done",
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_openai_models_use_the_normal_tool_list() {
+        // Pi it.each(["gpt-5.2", "gpt-5.4-nano", "gpt-5.5-pro"]) — a version PREFIX is not the
+        // gate; the enabled set is an exact id list.
+        for id in ["gpt-5.2", "gpt-5.4-nano", "gpt-5.5-pro"] {
+            let ctx = deferred_ctx(
+                vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+                &["late_tool"],
+            );
+            let body = build_params(&catalog_model(id), &ctx, &StreamOptions::default(), None);
+            assert_eq!(tool_names(&body), ["base_tool", "late_tool"], "model {id}");
+            assert!(
+                !input_types(&body).contains(&"tool_search_output"),
+                "model {id} must not emit a tool_search_output"
+            );
+            assert!(
+                !input_types(&body).contains(&"tool_search_call"),
+                "model {id} must not emit a tool_search_call"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_compat_override_wins_in_both_directions() {
+        // Pi "uses the normal tool list when OpenAI tool search is explicitly disabled" — an
+        // enabled catalog model behind a proxy provider, turned off by hand.
+        let mut off = catalog_model("gpt-5.4");
+        off.provider = "openai-proxy".into();
+        off.compat = Some(crate::api::compat::ModelCompat {
+            supports_tool_search: Some(false),
+            ..Default::default()
+        });
+        let ctx = deferred_ctx(
+            vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+            &["late_tool"],
+        );
+        let body = build_params(&off, &ctx, &StreamOptions::default(), None);
+        assert_eq!(tool_names(&body), ["base_tool", "late_tool"]);
+        assert!(!input_types(&body).contains(&"tool_search_output"));
+
+        // And the override turns it ON for a provider the catalog never enables — the gate is
+        // `compat.supportsToolSearch ?? false`, with no provider predicate (Pi
+        // openai-responses.ts:74).
+        let mut on = model(); // provider "openai", id "gpt-5" — off by default
+        let body = build_params(&on, &ctx, &StreamOptions::default(), None);
+        assert_eq!(tool_names(&body), ["base_tool", "late_tool"]);
+        on.compat = Some(crate::api::compat::ModelCompat {
+            supports_tool_search: Some(true),
+            ..Default::default()
+        });
+        let body = build_params(&on, &ctx, &StreamOptions::default(), None);
+        assert_eq!(tool_names(&body), ["base_tool"]);
+        assert!(input_types(&body).contains(&"tool_search_output"));
+    }
+
+    #[test]
+    fn an_all_deferred_request_omits_the_tools_key_entirely() {
+        // There is NO safety valve on this path (Pi openai-responses.ts:301 guards on
+        // `immediate.length > 0`; the promote-everything-back rule is Anthropic-only). The body
+        // ships with no `tools` key at all and the definition lives purely in the transcript.
+        let ctx = deferred_ctx(vec![deferred_tool("late_tool")], &["late_tool"]);
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "expected no `tools` key, got {}",
+            body["tools"]
+        );
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items[4]["tools"][0]["name"], "late_tool");
+        assert_eq!(items[4]["tools"][0]["defer_loading"], true);
+    }
+
+    #[test]
+    fn a_deferred_name_is_loaded_at_most_once_per_request() {
+        // `loadedToolNames` is declared once per conversion (Pi openai-responses-shared.ts:143),
+        // so a second marker for the same tool anchors nothing.
+        let mut ctx = deferred_ctx(
+            vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages
+            .insert(3, assistant_tool_call("call_2", "base_tool"));
+        ctx.messages
+            .insert(4, marked_tool_result("call_2", &["late_tool"]));
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+        let types = input_types(&body);
+        assert_eq!(
+            types.iter().filter(|t| **t == "tool_search_call").count(),
+            1
+        );
+        assert_eq!(
+            types.iter().filter(|t| **t == "tool_search_output").count(),
+            1
+        );
+        // Both tool results still emitted their own output — nothing was swallowed.
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| **t == "function_call_output")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_search_call_id_hashes_the_full_tool_call_id_and_comma_joined_names() {
+        // Pi `shortHash(`${msg.toolCallId}:${names.join(",")}`)` — the FULL id, INCLUDING the
+        // `|item_id` suffix that `function_call_output.call_id` drops.
+        let mut ctx = deferred_ctx(
+            vec![
+                deferred_tool("base_tool"),
+                deferred_tool("late_tool"),
+                deferred_tool("later_tool"),
+            ],
+            &["late_tool", "later_tool"],
+        );
+        // A same-provider assistant turn so the `|item_id` survives normalization verbatim.
+        ctx.messages[1] = Message::Assistant(AssistantMessage {
+            content: vec![Content::ToolCall(ToolCall {
+                id: ToolCallId::from("call_1|fc_item_1"),
+                name: "base_tool".to_string(),
+                arguments: serde_json::Map::new(),
+                thought_signature: None,
+            })],
+            provider: "openai".into(),
+            model: "gpt-5.4".to_string(),
+            api: API_ID.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 2,
+        });
+        ctx.messages[2] = marked_tool_result("call_1|fc_item_1", &["late_tool", "later_tool"]);
+
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+        let items = body["input"].as_array().unwrap();
+        // The output item drops the suffix …
+        assert_eq!(items[2]["call_id"], "call_1");
+        // … while the search id hashes the id WITH it.
+        // Literal, cross-checked against Pi's JS `shortHash` for the exact input
+        // `call_1|fc_item_1:late_tool,later_tool` — dropping the `|fc_item_1` suffix or
+        // space-joining the names both change this string.
+        assert_eq!(items[3]["call_id"], "pi_tool_load_1u3lpgp10pr00m");
+        assert_eq!(
+            items[3]["call_id"],
+            json!(format!(
+                "pi_tool_load_{}",
+                short_hash("call_1|fc_item_1:late_tool,later_tool")
+            ))
+        );
+        // Comma for the hash, SPACE for the query; `limit` is the count.
+        assert_eq!(items[3]["arguments"]["query"], "late_tool later_tool");
+        assert_eq!(items[3]["arguments"]["limit"], 2);
+        assert_eq!(items[4]["tools"][0]["name"], "late_tool");
+        assert_eq!(items[4]["tools"][1]["name"], "later_tool");
+    }
+
+    #[test]
+    fn a_marked_name_absent_from_context_tools_anchors_nothing() {
+        let ctx = deferred_ctx(vec![deferred_tool("base_tool")], &["ghost_tool"]);
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+        assert_eq!(tool_names(&body), ["base_tool"]);
+        assert!(!input_types(&body).contains(&"tool_search_call"));
+    }
+
+    #[test]
+    fn a_tool_used_before_its_marker_stays_in_the_prefix() {
+        // The model already called it, so hiding it from the prefix would be a lie about what it
+        // could see (`splitDeferredTools` suppression rule).
+        let mut ctx = deferred_ctx(
+            vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages[1] = assistant_tool_call("call_1", "late_tool");
+        let body = build_params(
+            &catalog_model("gpt-5.4"),
+            &ctx,
+            &StreamOptions::default(),
+            None,
+        );
+        assert_eq!(tool_names(&body), ["base_tool", "late_tool"]);
+        assert!(!input_types(&body).contains(&"tool_search_output"));
+    }
+
+    #[test]
+    fn tool_search_is_off_for_every_openai_responses_model_but_the_seven() {
+        // CONSTRAINT: default OFF is load-bearing. Turning this on for a model that has never seen
+        // `tool_search_*` items changes its wire payload and would 400. Proven over the REAL
+        // embedded catalogs, every provider, not a fixture.
+        //
+        // Pi's enabled set is baked into the generated catalog by
+        // `ai/scripts/generate-models.ts:731-738` against `OPENAI_TOOL_SEARCH_MODEL_IDS` (:324-332);
+        // cyrup carries the same data as `compat.supportsToolSearch` in
+        // `providers/catalog/openai.json`. `openai-codex` contributes nothing — cyrup does not port
+        // `openai-codex-responses`.
+        const ENABLED: [&str; 7] = [
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-pro",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ];
+
+        let mut on: Vec<(String, String)> = Vec::new();
+        let mut total = 0usize;
+        for provider in crate::providers::all::all_providers() {
+            for m in provider.models() {
+                if m.api.as_str() != API_ID {
+                    continue;
+                }
+                total += 1;
+                if get_responses_compat(m).supports_tool_search {
+                    on.push((
+                        provider.id().as_str().to_string(),
+                        m.id.as_str().to_string(),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            total > 70,
+            "expected the real catalogs to carry many openai-responses models, saw {total}"
+        );
+        let mut got: Vec<String> = on
+            .iter()
+            .filter(|(p, _)| p == "openai")
+            .map(|(_, id)| id.clone())
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = ENABLED.iter().map(|s| (*s).to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "enabled set drifted from Pi's id list");
+        // No OTHER provider may enable it — every reseller shipping these ids stays off.
+        assert!(
+            on.iter().all(|(p, _)| p == "openai"),
+            "tool search leaked to non-openai providers: {on:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_model_emits_a_byte_identical_body_to_the_pre_drift_shape() {
+        // The regression guard for constraint 3: with the flag off, the split is a pass-through and
+        // `body.tools` is exactly `convert_responses_tools(ctx.tools, false)` — no `defer_loading`
+        // key anywhere in the payload.
+        let ctx = deferred_ctx(
+            vec![deferred_tool("base_tool"), deferred_tool("late_tool")],
+            &["late_tool"],
+        );
+        let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
+        assert_eq!(
+            body["tools"],
+            Value::Array(convert_responses_tools(&ctx.tools, false))
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("defer_loading"),
+            "a disabled model must not mention defer_loading: {body}"
+        );
     }
 }

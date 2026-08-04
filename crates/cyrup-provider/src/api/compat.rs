@@ -134,6 +134,14 @@ pub struct ModelCompat {
     /// instead of converting the thinking block to text.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub allow_empty_signature: Option<bool>,
+    /// Pi `supportsToolReferences` (types.ts:643-647): provider accepts client-side
+    /// `tool_reference` content blocks inside `tool_result`, so tools introduced mid-transcript can
+    /// be sent `defer_loading: true` and anchored at their marker instead of sitting in the
+    /// cache-stable prefix. Unset falls back to `defaultSupportsToolReferences` (first-party
+    /// Anthropic Opus/Sonnet/Fable >= 4.5, non-Haiku) — see
+    /// `crate::api::anthropic_messages::default_supports_tool_references`. DRIFT-001.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_tool_references: Option<bool>,
 
     // --- `openai-responses` subset (Pi `OpenAIResponsesCompat`, openai-responses.ts:57-63). Read
     // only by the openai-responses resolver. `supports_developer_role` and
@@ -142,6 +150,16 @@ pub struct ModelCompat {
     /// prompt-cache session affinity (openai-responses.ts:60 / `createClient` :212-215).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub send_session_id_header: Option<bool>,
+    /// Pi `supportsToolSearch` (types.ts:588-589, default **false**): provider accepts the
+    /// client-side `tool_search_call`/`tool_search_output` pair, the Responses rendering of the
+    /// same DRIFT-001 anchor `supports_tool_references` renders for Anthropic.
+    ///
+    /// Unlike `supports_tool_references` this has **no runtime predicate** — Pi's gate is flatly
+    /// `model.compat?.supportsToolSearch ?? false` (openai-responses.ts:74) and enablement is baked
+    /// into the generated catalog by `ai/scripts/generate-models.ts:731-738` against a hardcoded id
+    /// set. No cyrup catalog sets it today, so it resolves `false` everywhere.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_tool_search: Option<bool>,
 }
 
 /// The `openai-responses` view of [`ModelCompat`] (Pi `OpenAIResponsesCompat`,
@@ -149,16 +167,20 @@ pub struct ModelCompat {
 pub type OpenAiResponsesCompat = ModelCompat;
 
 /// Fully-resolved openai-responses compat (Pi `Required<OpenAIResponsesCompat>`,
-/// openai-responses.ts:57-63). Each flag defaults to `true` (Pi `?? true`).
+/// openai-responses.ts:57-63). Each flag defaults to `true` (Pi `?? true`) EXCEPT
+/// `supports_tool_search`, which is `?? false` (openai-responses.ts:74).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedResponsesCompat {
     pub supports_developer_role: bool,
     pub send_session_id_header: bool,
     pub supports_long_cache_retention: bool,
+    /// Pi `supportsToolSearch: model.compat?.supportsToolSearch ?? false`
+    /// (openai-responses.ts:74). Catalog-driven; no predicate.
+    pub supports_tool_search: bool,
 }
 
 /// Resolve the openai-responses compat for a model (1:1 port of Pi `getCompat`,
-/// openai-responses.ts:57-63): every flag defaults to `true`.
+/// openai-responses.ts:57-63): every flag defaults to `true` except `supportsToolSearch`.
 pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
     let c = model.compat.as_ref();
     ResolvedResponsesCompat {
@@ -167,6 +189,7 @@ pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
         supports_long_cache_retention: c
             .and_then(|c| c.supports_long_cache_retention)
             .unwrap_or(true),
+        supports_tool_search: c.and_then(|c| c.supports_tool_search).unwrap_or(false),
     }
 }
 

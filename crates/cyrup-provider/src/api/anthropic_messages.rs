@@ -21,6 +21,7 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
+use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::{
@@ -29,6 +30,7 @@ use cyrup_core::{
 };
 use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// The wire-protocol id this impl serves.
@@ -220,6 +222,9 @@ struct ResolvedAnthropicCompat {
     supports_cache_control_on_tools: bool,
     supports_temperature: bool,
     allow_empty_signature: bool,
+    /// DRIFT-001: emit `tool_reference` blocks + `defer_loading` tools. Defaults from
+    /// [`default_supports_tool_references`], NOT to a constant.
+    supports_tool_references: bool,
 }
 
 /// 1:1 port of Pi `getAnthropicCompat` (anthropic-messages.ts:170-181): every field defaults on,
@@ -241,7 +246,80 @@ fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
             .unwrap_or(true),
         supports_temperature: c.and_then(|c| c.supports_temperature).unwrap_or(true),
         allow_empty_signature: c.and_then(|c| c.allow_empty_signature).unwrap_or(false),
+        supports_tool_references: c
+            .and_then(|c| c.supports_tool_references)
+            .unwrap_or_else(|| default_supports_tool_references(model)),
     }
+}
+
+/// Default for `supportsToolReferences` (1:1 port of Pi `defaultSupportsToolReferences`,
+/// anthropic-messages.ts:193-199): first-party Anthropic models except Haiku (which rejects
+/// client-side `tool_reference` blocks) and models that predate tool search (Claude 3.x,
+/// Opus/Sonnet 4.0, Opus 4.1).
+///
+/// Pi's predicate is
+/// `/^claude-(?:opus|sonnet|fable)-(\d+)(?:-(\d+))?(?:-|$)/`. cyrup has no `regex` dependency
+/// (`utils/regexlite` is a case-insensitive substring matcher, not a capture engine), so the
+/// capture is hand-rolled. Greedy-only scanning is EXACT here: if the greedy `(\d+)` overruns,
+/// every backtracked position leaves a digit next, and a digit satisfies neither `-(\d+)` nor
+/// `(?:-|$)`, so backtracking can never rescue a match.
+///
+/// The `version[2].length < 8` guard is the DATE-SUFFIX gate and is load-bearing:
+/// `claude-sonnet-4-20250514` captures `"20250514"` (8 chars) → minor 0 → **false**, while
+/// `claude-opus-4-5-20251101` captures `"5"` → minor 5 → **true**.
+fn default_supports_tool_references(model: &Model) -> bool {
+    let id = model.id.as_str();
+    if model.provider.as_str() != "anthropic" || id.contains("haiku") {
+        return false;
+    }
+    let Some(rest) = id.strip_prefix("claude-") else {
+        return false;
+    };
+    // `(?:opus|sonnet|fable)-`
+    let Some(rest) = ["opus-", "sonnet-", "fable-"]
+        .iter()
+        .find_map(|p| rest.strip_prefix(p))
+    else {
+        return false;
+    };
+
+    // `(\d+)` — greedy.
+    let major_len = rest.chars().take_while(char::is_ascii_digit).count();
+    if major_len == 0 {
+        return false;
+    }
+    let (Some(major_digits), Some(after_major)) = (rest.get(..major_len), rest.get(major_len..))
+    else {
+        return false;
+    };
+    let Ok(major) = major_digits.parse::<u32>() else {
+        return false;
+    };
+
+    // `(?:-(\d+))?(?:-|$)`
+    let mut minor: u32 = 0;
+    if after_major.is_empty() {
+        // `$` matches; the optional minor group did not participate.
+    } else if let Some(tail) = after_major.strip_prefix('-') {
+        let minor_len = tail.chars().take_while(char::is_ascii_digit).count();
+        let minor_captured = tail.get(..minor_len).unwrap_or("");
+        let remainder = tail.get(minor_len..).unwrap_or("");
+        // The optional group participates only if it is followed by `-` or end of string;
+        // otherwise the regex backtracks and `(?:-|$)` consumes the `-` we just stripped.
+        if minor_len > 0 && (remainder.is_empty() || remainder.starts_with('-')) {
+            // `version[2] && version[2].length < 8 ? Number(version[2]) : 0`
+            minor = if minor_captured.len() < 8 {
+                minor_captured.parse::<u32>().unwrap_or(0)
+            } else {
+                0
+            };
+        }
+    } else {
+        // Neither `-` nor end of string after the major version → no match at all.
+        return false;
+    }
+
+    major > 4 || (major == 4 && minor >= 5)
 }
 
 /// `model.compat?.forceAdaptiveThinking === true` (Pi default false).
@@ -512,6 +590,37 @@ pub(crate) fn build_params(
     let compat = get_anthropic_compat(model);
     let cache_control = get_cache_control(model, opts.cache_retention, env);
 
+    // --- DRIFT-001 deferred-tool placement (Pi anthropic-messages.ts:947-960) ---
+    //
+    // The transform is HOISTED out of `convert_messages` because Pi splits over the TRANSFORMED
+    // list (`{ ...context, messages: transformedMessages }`, :949-953) and then hands that same
+    // list to `convertMessages` (:961). Splitting over the raw list would be a structural
+    // divergence even though today's transform only rewrites tool-call ids.
+    let transformed = transform_messages_with(&ctx.messages, model, normalize_tool_call_id);
+    let normalize_tool_name: &dyn Fn(&str) -> String = if is_oauth {
+        &|name: &str| to_claude_code_name(name)
+    } else {
+        &|name: &str| name.to_string()
+    };
+    let placement = split_deferred_tools(
+        &transformed,
+        &ctx.tools,
+        compat.supports_tool_references,
+        normalize_tool_name,
+    );
+    let mut deferred_tools = placement.deferred_tools();
+    let mut immediate_tools = placement.immediate;
+    // The SAFETY VALVE lives here and ONLY here (Pi :955-959). It is deliberately absent from
+    // `split_deferred_tools` and from the openai-responses caller, which ships no `tools` key at
+    // all when everything is deferred.
+    if immediate_tools.is_empty() && !deferred_tools.is_empty() {
+        immediate_tools = std::mem::take(&mut deferred_tools);
+    }
+    let deferred_tool_names: HashSet<String> = deferred_tools
+        .iter()
+        .map(|t| normalize_tool_name(&t.name))
+        .collect();
+
     let reasoning_on = opts.reasoning.is_on();
     let thinking_enabled = model.reasoning && reasoning_on;
     let adaptive = force_adaptive_thinking(model);
@@ -539,11 +648,12 @@ pub(crate) fn build_params(
     obj.insert(
         "messages".to_string(),
         Value::Array(convert_messages(
-            &ctx.messages,
-            model,
+            &transformed,
             is_oauth,
             cache_control.as_ref(),
             compat.allow_empty_signature,
+            &deferred_tool_names,
+            normalize_tool_name,
         )),
     );
     obj.insert("max_tokens".to_string(), json!(max_tokens));
@@ -580,21 +690,31 @@ pub(crate) fn build_params(
         obj.insert("temperature".to_string(), json!(temp));
     }
 
-    if !ctx.tools.is_empty() {
+    // Tools: immediate prefix, then the deferred tail (Pi anthropic-messages.ts:1007-1021).
+    // `cache_control` marks the last IMMEDIATE tool only — Pi passes `undefined` for the deferred
+    // call, so the cache breakpoint never lands on a definition that is not part of the stable
+    // prefix.
+    if !immediate_tools.is_empty() || !deferred_tools.is_empty() {
         let tool_cc = if compat.supports_cache_control_on_tools {
             cache_control.as_ref()
         } else {
             None
         };
-        obj.insert(
-            "tools".to_string(),
-            Value::Array(convert_tools(
-                &ctx.tools,
-                is_oauth,
-                compat.supports_eager_tool_input_streaming,
-                tool_cc,
-            )),
+        let mut tools = convert_tools(
+            &immediate_tools,
+            is_oauth,
+            compat.supports_eager_tool_input_streaming,
+            tool_cc,
+            false,
         );
+        tools.extend(convert_tools(
+            &deferred_tools,
+            is_oauth,
+            compat.supports_eager_tool_input_streaming,
+            None,
+            true,
+        ));
+        obj.insert("tools".to_string(), Value::Array(tools));
     }
 
     // Thinking configuration (Pi anthropic-messages.ts:957-986).
@@ -723,17 +843,104 @@ fn convert_content_blocks(content: &[Content]) -> Value {
     Value::Array(blocks)
 }
 
+/// The per-request deferred-tool anchoring state threaded through [`convert_messages`] (Pi keeps
+/// these as three separate parameters of `convertToolResult`, anthropic-messages.ts:1081-1086).
+struct ToolAnchors<'a> {
+    /// Normalized names that were split out of the request prefix and must be anchored.
+    deferred_tool_names: &'a HashSet<String>,
+    /// Names already referenced in THIS request — declared once per `convertMessages` call
+    /// (Pi :1125) so a tool is loaded exactly once even if several results mark it.
+    loaded_tool_names: HashSet<String>,
+    /// `toClaudeCodeName` under OAuth, identity otherwise (Pi :948).
+    normalize_tool_name: &'a dyn Fn(&str) -> String,
+}
+
+/// Convert ONE tool-result message into its `tool_result` block plus any content that had to be
+/// DISPLACED out of it (1:1 port of Pi `convertToolResult`, anthropic-messages.ts:1081-1112).
+///
+/// Anthropic **rejects** a `tool_result` whose `content` mixes `tool_reference` blocks with
+/// ordinary blocks, so when this result anchors a deferred tool the reference list REPLACES the
+/// content and the real content is returned separately, to be re-appended as a sibling of the
+/// `tool_result` in the same `user` message. Nothing is dropped — it is relocated.
+///
+/// A name is referenced at most once per request: `loaded_tool_names` is declared once per
+/// [`convert_messages`] call (Pi :1125) and is shared across every tool result in the transcript.
+fn convert_tool_result(
+    tool_call_id: &str,
+    content: &[Content],
+    is_error: bool,
+    added_tool_names: &[String],
+    is_oauth: bool,
+    anchors: &mut ToolAnchors<'_>,
+) -> (Value, Vec<Value>) {
+    let mut references: Vec<Value> = Vec::new();
+    for name in added_tool_names {
+        let normalized = (anchors.normalize_tool_name)(name);
+        if !anchors.deferred_tool_names.contains(&normalized)
+            || anchors.loaded_tool_names.contains(&normalized)
+        {
+            continue;
+        }
+        anchors.loaded_tool_names.insert(normalized);
+        let wire_name = if is_oauth {
+            to_claude_code_name(name)
+        } else {
+            name.clone()
+        };
+        references.push(json!({ "type": "tool_reference", "tool_name": wire_name }));
+    }
+
+    let converted = convert_content_blocks(content);
+    let has_refs = !references.is_empty();
+
+    let mut tr = Map::new();
+    tr.insert("type".to_string(), json!("tool_result"));
+    tr.insert("tool_use_id".to_string(), json!(tool_call_id));
+    tr.insert(
+        "content".to_string(),
+        if has_refs {
+            Value::Array(references)
+        } else {
+            converted.clone()
+        },
+    );
+    // `is_error` rides on the `tool_result` regardless of whether it carries references.
+    tr.insert("is_error".to_string(), json!(is_error));
+
+    // Pi `typeof convertedContent === "string" ? [{type:"text",text:…}] : convertedContent`. Pi
+    // has NO empty-string guard, so an empty tool result with a reference emits `text: ""`.
+    let siblings: Vec<Value> = if !has_refs {
+        Vec::new()
+    } else {
+        match converted {
+            Value::String(s) => vec![json!({ "type": "text", "text": s })],
+            Value::Array(a) => a,
+            other => vec![other],
+        }
+    };
+    (Value::Object(tr), siblings)
+}
+
 /// Map cyrup [`Message`]s to Anthropic `messages` (1:1 port of Pi `convertMessages`,
 /// anthropic-messages.ts:1011-1182).
+///
+/// Takes messages that have ALREADY been through `transform_messages_with` — [`build_params`]
+/// hoists that call so the deferred-tool split sees the same list this does (Pi :947-961).
 pub(crate) fn convert_messages(
-    messages: &[Message],
-    model: &Model,
+    transformed: &[Message],
     is_oauth: bool,
     cache_control: Option<&Value>,
     allow_empty_signature: bool,
+    deferred_tool_names: &HashSet<String>,
+    normalize_tool_name: &dyn Fn(&str) -> String,
 ) -> Vec<Value> {
-    let transformed = transform_messages_with(messages, model, normalize_tool_call_id);
     let mut params: Vec<Value> = Vec::new();
+    // Declared once per request so a deferred tool is referenced exactly once (Pi :1125).
+    let mut anchors = ToolAnchors {
+        deferred_tool_names,
+        loaded_tool_names: HashSet::new(),
+        normalize_tool_name,
+    };
 
     let mut i = 0;
     while let Some(msg) = transformed.get(i) {
@@ -751,23 +958,33 @@ pub(crate) fn convert_messages(
             Message::ToolResult { .. } => {
                 // Collect consecutive tool results into one `user` message of `tool_result` blocks.
                 let mut tool_results: Vec<Value> = Vec::new();
+                // Displaced content is accumulated across the WHOLE consecutive run and flushed
+                // once, AFTER every `tool_result` block of the batch (Pi :1226-1252) — not
+                // interleaved per block.
+                let mut sibling_content: Vec<Value> = Vec::new();
                 let mut j = i;
                 while let Some(Message::ToolResult {
                     tool_call_id,
                     content,
                     is_error,
+                    added_tool_names,
                     ..
                 }) = transformed.get(j)
                 {
-                    let mut tr = Map::new();
-                    tr.insert("type".to_string(), json!("tool_result"));
-                    tr.insert("tool_use_id".to_string(), json!(tool_call_id.as_str()));
-                    tr.insert("content".to_string(), convert_content_blocks(content));
-                    tr.insert("is_error".to_string(), json!(is_error));
-                    tool_results.push(Value::Object(tr));
+                    let (tr, siblings) = convert_tool_result(
+                        tool_call_id.as_str(),
+                        content,
+                        *is_error,
+                        added_tool_names,
+                        is_oauth,
+                        &mut anchors,
+                    );
+                    tool_results.push(tr);
+                    sibling_content.extend(siblings);
                     j += 1;
                 }
                 i = j;
+                tool_results.extend(sibling_content);
                 params.push(json!({ "role": "user", "content": Value::Array(tool_results) }));
                 continue;
             }
@@ -936,11 +1153,18 @@ fn apply_last_user_cache_control(params: &mut [Value], cc: &Value) {
 
 /// Map cyrup [`ToolDef`]s to Anthropic `tools` (Pi `convertTools`, anthropic-messages.ts:1188-1211).
 /// `cache_control` is applied to the last tool only; `eager_input_streaming` when supported.
+///
+/// `defer_loading` marks a tool as transcript-anchored (DRIFT-001): it still ships in
+/// `params.tools`, but the model only "sees" it at the `tool_reference` that names it. It is
+/// inserted where Pi spreads it — after `input_schema`, before `cache_control` (Pi :1315-1321) —
+/// though the workspace's `serde_json` has no `preserve_order` feature, so the serialized key
+/// order is alphabetical either way and only the key SET is observable on the wire.
 pub(crate) fn convert_tools(
     tools: &[ToolDef],
     is_oauth: bool,
     supports_eager: bool,
     cache_control: Option<&Value>,
+    defer_loading: bool,
 ) -> Vec<Value> {
     let last = tools.len().saturating_sub(1);
     tools
@@ -972,6 +1196,9 @@ pub(crate) fn convert_tools(
                 "input_schema".to_string(),
                 json!({ "type": "object", "properties": properties, "required": required }),
             );
+            if defer_loading {
+                o.insert("defer_loading".to_string(), json!(true));
+            }
             if let Some(cc) = cache_control
                 && index == last
             {
@@ -2481,5 +2708,750 @@ mod tests {
         let v = build_assistant(&am, false, true).expect("assistant");
         assert_eq!(v["content"][0]["type"], "thinking");
         assert_eq!(v["content"][0]["signature"], "");
+    }
+
+    // -----------------------------------------------------------------------
+    // DRIFT-001: message-anchored tool loading (Pi `deferred-tools.test.ts`)
+    //
+    // These assert the EMITTED WIRE JSON, not helper return values. The rule that makes them
+    // load-bearing: Anthropic REJECTS a `tool_result` whose content mixes `tool_reference` with
+    // ordinary blocks, so the real content must be DISPLACED into siblings — relocated, never
+    // dropped.
+    // -----------------------------------------------------------------------
+
+    fn tool_def(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("The {name} tool"),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        }
+    }
+
+    fn tc_assistant(calls: &[(&str, &str)]) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: calls
+                .iter()
+                .map(|(id, name)| {
+                    Content::ToolCall(ToolCall {
+                        id: ToolCallId::from(*id),
+                        name: (*name).to_string(),
+                        arguments: Map::new(),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            provider: ProviderId::from("anthropic"),
+            model: "claude-opus-4-6".into(),
+            api: API_ID.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 2,
+        })
+    }
+
+    fn tr(id: &str, content: Vec<Content>, added: &[&str]) -> Message {
+        Message::ToolResult {
+            tool_call_id: ToolCallId::from(id),
+            tool_name: "base_tool".to_string(),
+            content,
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: added.iter().map(|s| (*s).to_string()).collect(),
+            timestamp: 3,
+        }
+    }
+
+    /// Pi `makeContext`: user → assistant(toolCall base_tool) → toolResult(added) → user.
+    fn deferred_ctx(tools: Vec<ToolDef>, added: &[&str]) -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User {
+                    content: vec![Content::text("Hello")],
+                    timestamp: 1,
+                },
+                tc_assistant(&[("call_1", "base_tool")]),
+                tr("call_1", vec![Content::text("done")], added),
+                Message::User {
+                    content: vec![Content::text("Hello")],
+                    timestamp: 4,
+                },
+            ],
+            tools,
+        }
+    }
+
+    fn opus_4_6() -> Model {
+        Model {
+            id: "claude-opus-4-6".into(),
+            ..model()
+        }
+    }
+
+    /// The `content` array of the first `user` message that carries a `tool_result` block.
+    fn tool_result_content(body: &Value) -> Vec<Value> {
+        let msgs = body["messages"].as_array().expect("messages");
+        for m in msgs {
+            if let Some(arr) = m["content"].as_array()
+                && arr.iter().any(|b| b["type"] == "tool_result")
+            {
+                return arr.clone();
+            }
+        }
+        panic!("no tool_result in payload: {body:#}");
+    }
+
+    fn tool_names(body: &Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn deferred_tool_is_marked_defer_loading_and_anchored_by_a_tool_reference() {
+        // Pi "loads an Anthropic tool at its tool-result marker".
+        let ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let body = build_body(&opus_4_6(), &ctx, &opts);
+
+        // EXACT tools array. `defer_loading` sits AFTER `input_schema` (Pi key order) and the
+        // immediate tool carries no marker at all.
+        assert_eq!(
+            body["tools"],
+            json!([
+                {
+                    "name": "base_tool",
+                    "description": "The base_tool tool",
+                    "eager_input_streaming": true,
+                    "input_schema": { "type": "object", "properties": {}, "required": [] }
+                },
+                {
+                    "name": "late_tool",
+                    "description": "The late_tool tool",
+                    "eager_input_streaming": true,
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "defer_loading": true
+                }
+            ])
+        );
+
+        // EXACT tool-result user message: the reference REPLACES the content, and the displaced
+        // text follows the tool_result as a sibling.
+        assert_eq!(
+            tool_result_content(&body),
+            vec![
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{ "type": "tool_reference", "tool_name": "late_tool" }],
+                    "is_error": false
+                }),
+                json!({ "type": "text", "text": "done" }),
+            ]
+        );
+        // Constraint 5: the original content still EXISTS in the payload.
+        assert!(
+            serde_json::to_string(&body)
+                .expect("json")
+                .contains("\"done\""),
+            "displaced tool output must be relocated, never dropped"
+        );
+    }
+
+    #[test]
+    fn a_tool_reference_is_never_mixed_with_ordinary_content_in_one_tool_result() {
+        // Constraint 4, stated directly as an invariant over the whole payload: any tool_result
+        // whose content is an array is EITHER all tool_reference OR all ordinary blocks.
+        let mut ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        if let Some(Message::ToolResult { content, .. }) = ctx.messages.get_mut(2) {
+            *content = vec![
+                Content::text("work completed"),
+                Content::Image {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            ];
+        }
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+
+        let mut saw_reference = false;
+        for m in body["messages"].as_array().expect("messages") {
+            let Some(blocks) = m["content"].as_array() else {
+                continue;
+            };
+            for b in blocks {
+                if b["type"] != "tool_result" {
+                    continue;
+                }
+                let Some(inner) = b["content"].as_array() else {
+                    continue;
+                };
+                let refs = inner
+                    .iter()
+                    .filter(|x| x["type"] == "tool_reference")
+                    .count();
+                if refs > 0 {
+                    saw_reference = true;
+                    assert_eq!(
+                        refs,
+                        inner.len(),
+                        "tool_result mixes tool_reference with ordinary blocks — Anthropic 400s: {b:#}"
+                    );
+                }
+            }
+        }
+        assert!(saw_reference, "expected at least one tool_reference");
+    }
+
+    #[test]
+    fn displaced_content_is_flushed_after_every_tool_result_of_the_batch() {
+        // Pi "preserves tool output as sibling content after emitting references". The
+        // displacement of the FIRST result lands AFTER the SECOND result's block — siblings are
+        // accumulated across the whole consecutive run and flushed once. Per-block interleaving
+        // fails this.
+        let mut ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages[1] = tc_assistant(&[("call_1", "base_tool"), ("call_2", "base_tool")]);
+        if let Some(Message::ToolResult { content, .. }) = ctx.messages.get_mut(2) {
+            *content = vec![
+                Content::text("work completed"),
+                Content::Image {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            ];
+        }
+        ctx.messages
+            .insert(3, tr("call_2", vec![Content::text("second result")], &[]));
+
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let body = build_body(&opus_4_6(), &ctx, &opts);
+
+        assert_eq!(
+            tool_result_content(&body),
+            vec![
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{ "type": "tool_reference", "tool_name": "late_tool" }],
+                    "is_error": false
+                }),
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": "call_2",
+                    "content": "second result",
+                    "is_error": false
+                }),
+                json!({ "type": "text", "text": "work completed" }),
+                json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": "aW1hZ2U=" }
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deferred_name_is_referenced_at_most_once_per_request() {
+        // `loadedToolNames` is declared once per convertMessages call (Pi :1125), so a second
+        // marker for the same tool emits no reference and displaces nothing.
+        let mut ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages
+            .insert(3, tc_assistant(&[("call_2", "base_tool")]));
+        ctx.messages.insert(
+            4,
+            tr("call_2", vec![Content::text("again")], &["late_tool"]),
+        );
+
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+        let refs = serde_json::to_string(&body)
+            .expect("json")
+            .matches("\"tool_reference\"")
+            .count();
+        assert_eq!(refs, 1, "a deferred name must be referenced exactly once");
+        // The second result keeps its own content inline (no references → no displacement).
+        let second = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find_map(|m| {
+                m["content"]
+                    .as_array()?
+                    .iter()
+                    .find(|b| b["tool_use_id"] == "call_2")
+                    .cloned()
+            })
+            .expect("second tool_result");
+        assert_eq!(second["content"], json!("again"));
+    }
+
+    #[test]
+    fn a_tool_used_before_its_marker_stays_immediate() {
+        // Pi "keeps a tool immediate when it was used before its marker".
+        let mut ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages[1] = tc_assistant(&[("call_1", "late_tool")]);
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+
+        assert_eq!(tool_names(&body), ["base_tool", "late_tool"]);
+        assert!(
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .all(|t| t.get("defer_loading").is_none())
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .expect("json")
+                .contains("tool_reference")
+        );
+    }
+
+    #[test]
+    fn a_marked_tool_absent_from_the_active_set_is_not_resurrected() {
+        // Pi "does not resurrect a marked tool missing from Context.tools".
+        let ctx = deferred_ctx(vec![tool_def("base_tool")], &["late_tool"]);
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+        assert_eq!(tool_names(&body), ["base_tool"]);
+        assert!(
+            !serde_json::to_string(&body)
+                .expect("json")
+                .contains("tool_reference")
+        );
+    }
+
+    #[test]
+    fn the_safety_valve_promotes_every_tool_back_when_all_are_deferred() {
+        // Pi "keeps one immediate Anthropic tool when every current tool is marked"
+        // (anthropic-messages.ts:955-959). Anthropic rejects a request whose every tool is
+        // deferred, so the valve fires HERE — and only here; openai-responses has none.
+        let ctx = deferred_ctx(vec![tool_def("late_tool")], &["late_tool"]);
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+
+        assert_eq!(tool_names(&body), ["late_tool"]);
+        assert!(body["tools"][0].get("defer_loading").is_none());
+        assert!(
+            !serde_json::to_string(&body)
+                .expect("json")
+                .contains("tool_reference")
+        );
+    }
+
+    #[test]
+    fn cache_control_marks_the_last_immediate_tool_never_a_deferred_one() {
+        // Pi passes `undefined` cacheControl to the deferred convertTools call (:1015-1021), so
+        // the cache breakpoint stays inside the stable prefix.
+        let ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["tools"][1].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["defer_loading"], json!(true));
+    }
+
+    #[test]
+    fn cache_control_lands_on_the_displaced_sibling_not_the_reference_block() {
+        // The last block of a reference-bearing user message is now a displaced `text`, and
+        // `applyLastUserCacheControl` marks it there (Pi :1259-1268). Only true when the
+        // tool-result batch is the LAST message.
+        let mut ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        ctx.messages.pop(); // drop the trailing user turn
+        let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+        let content = tool_result_content(&body);
+        assert_eq!(
+            content.last().expect("last block"),
+            &json!({ "type": "text", "text": "done", "cache_control": { "type": "ephemeral" } })
+        );
+        assert!(content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn oauth_canonicalized_markers_match_active_tools() {
+        // Pi "matches OAuth-canonicalized markers to active tools": marker "Read", tool "read".
+        let ctx = deferred_ctx(vec![tool_def("base_tool"), tool_def("read")], &["Read"]);
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let body = build_params(&opus_4_6(), &ctx, &opts, None, true);
+
+        assert_eq!(tool_names(&body), ["base_tool", "Read"]);
+        assert_eq!(body["tools"][1]["defer_loading"], json!(true));
+        assert_eq!(
+            tool_result_content(&body)[0]["content"],
+            json!([{ "type": "tool_reference", "tool_name": "Read" }])
+        );
+    }
+
+    #[test]
+    fn oauth_names_are_normalized_before_the_prior_usage_check() {
+        // Pi "normalizes OAuth names before checking prior tool usage": the call is `Read`, the
+        // marker is `read` — same tool after canonicalization, so nothing defers.
+        let mut ctx = deferred_ctx(vec![tool_def("base_tool"), tool_def("read")], &["read"]);
+        ctx.messages[1] = tc_assistant(&[("call_1", "Read")]);
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true);
+
+        assert_eq!(tool_names(&body), ["base_tool", "Read"]);
+        assert!(
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .all(|t| t.get("defer_loading").is_none())
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .expect("json")
+                .contains("tool_reference")
+        );
+    }
+
+    #[test]
+    fn oauth_dedupe_collapses_case_variants_even_with_the_flag_off() {
+        // Pi "deduplicates active tools after OAuth canonicalization". The unique-map collapse in
+        // `splitDeferredTools` runs BEFORE the `!enabled` early return, so this lands on a model
+        // with tool references OFF too. It is the ONE behavior change that is not gated by the
+        // flag — and it is reachable only under OAuth, where the normalizer is not the identity.
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User {
+                content: vec![Content::text("Hello")],
+                timestamp: 1,
+            }],
+            tools: vec![
+                tool_def("read"),
+                ToolDef {
+                    name: "Read".to_string(),
+                    description: "Canonical definition".to_string(),
+                    parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+                },
+            ],
+        };
+        // Tool references ON (opus 4.6).
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true);
+        assert_eq!(tool_names(&body), ["Read"]);
+        assert_eq!(body["tools"][0]["description"], "Canonical definition");
+
+        // ...and OFF (haiku): still deduped.
+        let haiku = Model {
+            id: "claude-haiku-4-5".into(),
+            ..model()
+        };
+        let body = build_params(&haiku, &ctx, &StreamOptions::default(), None, true);
+        assert_eq!(tool_names(&body), ["Read"]);
+
+        // Non-OAuth normalizer is the identity, so both survive — no silent collapse.
+        let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, false);
+        assert_eq!(tool_names(&body), ["read", "Read"]);
+    }
+
+    #[test]
+    fn unsupported_models_emit_the_plain_tool_list() {
+        // Pi "uses the normal tool list when Anthropic tool references are unsupported". The
+        // second id is the date-suffix trap: `claude-sonnet-4-20250514` captures "20250514"
+        // (8 chars) as the minor group, which the `< 8` guard folds to 0.
+        let ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        for id in ["claude-haiku-4-5", "claude-sonnet-4-20250514"] {
+            let m = Model {
+                id: id.into(),
+                ..model()
+            };
+            let body = build_body(&m, &ctx, &StreamOptions::default());
+            assert_eq!(tool_names(&body), ["base_tool", "late_tool"], "{id}");
+            assert!(
+                body["tools"]
+                    .as_array()
+                    .expect("tools")
+                    .iter()
+                    .all(|t| t.get("defer_loading").is_none()),
+                "{id}"
+            );
+            assert!(
+                !serde_json::to_string(&body)
+                    .expect("json")
+                    .contains("tool_reference"),
+                "{id}"
+            );
+            // ...and the tool result keeps its content inline, exactly as before DRIFT-001.
+            assert_eq!(tool_result_content(&body)[0]["content"], json!("done"));
+        }
+    }
+
+    #[test]
+    fn an_explicit_compat_override_enables_a_non_anthropic_provider() {
+        // Pi "supports explicit Anthropic compatibility overrides": the override wins over the
+        // provider gate, so a proxy fronting Claude can opt in.
+        let m = Model {
+            id: "claude-opus-4-6".into(),
+            provider: ProviderId::from("anthropic-proxy"),
+            compat: Some(ModelCompat {
+                supports_tool_references: Some(true),
+                ..Default::default()
+            }),
+            ..model()
+        };
+        assert!(
+            !default_supports_tool_references(&m),
+            "the default gate says no"
+        );
+        let ctx = deferred_ctx(
+            vec![tool_def("base_tool"), tool_def("late_tool")],
+            &["late_tool"],
+        );
+        let body = build_body(&m, &ctx, &StreamOptions::default());
+        assert_eq!(body["tools"][1]["defer_loading"], json!(true));
+        assert_eq!(
+            tool_result_content(&body)[0]["content"],
+            json!([{ "type": "tool_reference", "tool_name": "late_tool" }])
+        );
+
+        // ...and the override can force it OFF on a model the default enables.
+        let off = Model {
+            compat: Some(ModelCompat {
+                supports_tool_references: Some(false),
+                ..Default::default()
+            }),
+            ..opus_4_6()
+        };
+        let body = build_body(&off, &ctx, &StreamOptions::default());
+        assert!(body["tools"][1].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn default_supports_tool_references_parses_versions_like_pis_regex() {
+        let probe = |id: &str, provider: &str| {
+            default_supports_tool_references(&Model {
+                id: id.into(),
+                provider: ProviderId::from(provider),
+                ..model()
+            })
+        };
+        // major > 4, or major == 4 && minor >= 5.
+        for id in [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-fable-5",
+        ] {
+            assert!(probe(id, "anthropic"), "expected ON: {id}");
+        }
+        for id in [
+            "claude-opus-4-1",            // minor 1 < 5
+            "claude-opus-4-1-20250805",   // minor 1 < 5
+            "claude-opus-4",              // minor absent → 0
+            "claude-sonnet-4-20250514",   // 8-char date captured as minor → folded to 0
+            "claude-haiku-4-5",           // haiku gate
+            "claude-haiku-5",             // haiku gate
+            "claude-3-5-sonnet-20241022", // family not at the anchored position
+            "claude-mythos-5",            // unknown family
+            "claude-opus-x-5",            // no major digits
+            "claude-opus-45x",            // major run not followed by `-` or end
+            "opus-5",                     // missing `claude-` prefix
+        ] {
+            assert!(!probe(id, "anthropic"), "expected OFF: {id}");
+        }
+        // The provider gate is exact-match: every reseller stays off on a byte-identical id.
+        for p in [
+            "vercel-ai-gateway",
+            "cloudflare-ai-gateway",
+            "fireworks",
+            "opencode",
+            "opencode-go",
+            "kimi-coding",
+            "minimax",
+            "minimax-cn",
+            "anthropic-proxy",
+        ] {
+            assert!(
+                !probe("claude-opus-4-6", p),
+                "expected OFF for provider {p}"
+            );
+        }
+    }
+
+    /// Constraint 3, proven against the REAL embedded catalogs rather than hand-built models.
+    #[test]
+    fn tool_references_default_off_across_every_embedded_catalog() {
+        use crate::providers::all::all_providers;
+
+        const EXPECTED_ON: [&str; 10] = [
+            "claude-fable-5",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ];
+
+        let mut on: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        let mut providers_with_on: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for provider in all_providers() {
+            for m in provider.models() {
+                if m.api.as_str() != API_ID {
+                    continue;
+                }
+                total += 1;
+                if get_anthropic_compat(m).supports_tool_references {
+                    on.push(m.id.as_str().to_string());
+                    providers_with_on.insert(m.provider.as_str().to_string());
+                }
+            }
+        }
+        on.sort();
+        on.dedup();
+
+        assert!(
+            total > 200,
+            "expected the real catalogs, saw {total} models"
+        );
+        assert_eq!(
+            on,
+            EXPECTED_ON,
+            "the wire-payload blast radius of DRIFT-001 changed; \
+             {} of {total} anthropic-messages models are ON",
+            on.len()
+        );
+        assert_eq!(
+            providers_with_on.into_iter().collect::<Vec<_>>(),
+            ["anthropic"],
+            "only the first-party Anthropic provider may enable tool references"
+        );
+    }
+
+    /// The Responses half of the same flag: catalog-driven, `?? false`, and enabled ONLY on the
+    /// seven first-party OpenAI ids Pi's generator marks (`generate-models.ts:324-332`). Asserted
+    /// here from the Anthropic side so that a catalog edit which leaked the flag onto an
+    /// `anthropic-messages` model — where nothing reads it and it would be pure confusion — fails
+    /// loudly. The exhaustive on/off partition lives with the rendering, in
+    /// `openai_responses::tests::tool_search_is_off_for_every_openai_responses_model_but_the_seven`.
+    #[test]
+    fn tool_search_is_confined_to_the_openai_responses_catalog() {
+        use crate::api::compat::get_responses_compat;
+        use crate::providers::all::all_providers;
+
+        let mut total = 0usize;
+        let mut on: Vec<String> = Vec::new();
+        for provider in all_providers() {
+            for m in provider.models() {
+                total += 1;
+                if !get_responses_compat(m).supports_tool_search {
+                    continue;
+                }
+                assert_ne!(
+                    m.api.as_str(),
+                    API_ID,
+                    "{}/{} sets supportsToolSearch on an anthropic-messages model, where it is \
+                     never read",
+                    m.provider.as_str(),
+                    m.id.as_str()
+                );
+                on.push(format!("{}/{}", m.provider.as_str(), m.id.as_str()));
+            }
+        }
+        on.sort();
+        assert_eq!(
+            on,
+            [
+                "openai/gpt-5.4",
+                "openai/gpt-5.4-mini",
+                "openai/gpt-5.4-pro",
+                "openai/gpt-5.5",
+                "openai/gpt-5.6-luna",
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-terra",
+            ],
+            "the tool-search blast radius changed"
+        );
+        assert!(
+            total > 600,
+            "expected the real catalogs, saw {total} models"
+        );
+        // ...and the flag is honored when a catalog/override does set it.
+        let m = Model {
+            compat: Some(ModelCompat {
+                supports_tool_search: Some(true),
+                ..Default::default()
+            }),
+            ..model()
+        };
+        assert!(get_responses_compat(&m).supports_tool_search);
+    }
+
+    /// Regression guard: with no `addedToolNames` anywhere, the payload must be byte-identical to
+    /// the pre-DRIFT-001 shape even on a model where the flag is ON.
+    #[test]
+    fn an_unmarked_transcript_is_byte_identical_on_a_flag_on_model() {
+        let ctx = deferred_ctx(vec![tool_def("base_tool"), tool_def("late_tool")], &[]);
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let on = build_body(&opus_4_6(), &ctx, &opts);
+        let off = build_body(
+            &Model {
+                id: "claude-haiku-4-5".into(),
+                ..model()
+            },
+            &ctx,
+            &opts,
+        );
+        assert_eq!(on["tools"], off["tools"]);
+        assert_eq!(on["messages"], off["messages"]);
+        let s = serde_json::to_string(&on).expect("json");
+        assert!(!s.contains("defer_loading"));
+        assert!(!s.contains("tool_reference"));
     }
 }
