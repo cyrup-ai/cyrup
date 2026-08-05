@@ -17,7 +17,7 @@ use cyrup_provider::faux::{
 };
 use cyrup_provider::Provider;
 use cyrup_session_svc::{
-    AgentSessionRuntime, InputSource, SessionBuilder, SessionConfig, SessionFactory, UserInput,
+    AgentSessionRuntime, InputSource, SessionConfig, SessionFactory, UserInput,
 };
 use cyrup_core::StopReason;
 use serde_json::Value;
@@ -46,14 +46,6 @@ fn base_config(fx: &Fixture) -> SessionConfig {
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true); // --approve: deterministic trusted project, no prompt
     cfg
-}
-
-async fn build_session(
-    fx: &Fixture,
-    faux: Arc<FauxProvider>,
-) -> cyrup_session_svc::AgentSession {
-    let provider: Arc<dyn Provider> = faux;
-    SessionBuilder::new(provider, base_config(fx)).build().await.expect("build session")
 }
 
 /// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
@@ -90,12 +82,12 @@ async fn print_mode_emits_final_assistant_text() {
         vec![faux_text("the final answer")],
         StopReason::Stop,
     )]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     run_print(
-        &session,
+        &runtime,
         [UserInput::text("what is the answer?", InputSource::Cli)],
         &mut out,
         &mut err,
@@ -122,12 +114,12 @@ async fn print_mode_prints_only_the_final_message_of_a_turn() {
         faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
     ]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     run_print(
-        &session,
+        &runtime,
         [
             UserInput::text("q1", InputSource::Cli),
             UserInput::text("q2", InputSource::Cli),
@@ -160,12 +152,12 @@ async fn print_mode_routes_a_failed_turn_to_stderr_and_suppresses_stdout() {
             ..Default::default()
         },
     )]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     run_print(
-        &session,
+        &runtime,
         [UserInput::text("q", InputSource::Cli)],
         &mut out,
         &mut err,
@@ -190,12 +182,12 @@ async fn print_mode_aborted_turn_without_message_uses_the_request_reason_fallbac
         vec![faux_text("half-written")],
         StopReason::Aborted,
     )]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     run_print(
-        &session,
+        &runtime,
         [UserInput::text("q", InputSource::Cli)],
         &mut out,
         &mut err,
@@ -228,10 +220,10 @@ async fn json_mode_emits_ordered_event_stream() {
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
     let mut out: Vec<u8> = Vec::new();
-    run_json(&session, UserInput::text("write a file", InputSource::Cli), &mut out)
+    run_json(&runtime, [UserInput::text("write a file", InputSource::Cli)], &mut out)
         .await
         .expect("json mode runs");
 
@@ -300,10 +292,12 @@ async fn json_mode_writes_session_header_as_first_line() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(vec![faux_text("done")], StopReason::Stop)]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
+
+    let session = runtime.session().await;
 
     let mut out: Vec<u8> = Vec::new();
-    run_json(&session, UserInput::text("hello", InputSource::Cli), &mut out)
+    run_json(&runtime, [UserInput::text("hello", InputSource::Cli)], &mut out)
         .await
         .expect("json mode runs");
 
@@ -348,14 +342,15 @@ async fn json_mode_writes_session_header_exactly_once_across_followups() {
         faux_assistant_message(vec![faux_text("first")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("second")], StopReason::Stop),
     ]);
-    let session = build_session(&fx, faux).await;
+    let runtime = build_runtime(&fx, faux).await;
 
-    // Replay the exact dispatch shape: initial prompt, then one follow-up, into ONE sink.
+    // Replay the exact dispatch shape: initial prompt, then one follow-up, into ONE sink — and
+    // additionally a SECOND `run_json` call on the same runtime, which must not re-emit the header.
     let mut out: Vec<u8> = Vec::new();
-    run_json(&session, UserInput::text("first", InputSource::Cli), &mut out)
+    run_json(&runtime, [UserInput::text("first", InputSource::Cli)], &mut out)
         .await
         .expect("initial json run");
-    run_json(&session, UserInput::text("second", InputSource::Cli), &mut out)
+    run_json(&runtime, [UserInput::text("second", InputSource::Cli)], &mut out)
         .await
         .expect("follow-up json run");
 
@@ -720,10 +715,46 @@ async fn rpc_extended_command_surface() {
     assert_eq!(resp("set_thinking_level")["success"], true);
     assert_eq!(resp("set_steering_mode")["success"], true);
 
-    // get_session_stats carries the aggregate counters.
+    // get_session_stats answers with Pi's `SessionStats` (agent-session.ts:260-277), which
+    // rpc-types.ts:183 names as this command's `data` verbatim. This assertion used to require
+    // `messageCount` — one of seven cyrup-invented keys (`messageCount`/`userMessageCount`/
+    // `assistantMessageCount`/`toolResultCount`/`inputTokens`/`outputTokens`/`cacheTokens`) that a
+    // Pi-contract client reads as `undefined`. It was pinning SEAM-031 and is rewritten, not
+    // deleted: the contract is now asserted key-for-key, including that the invented names are GONE.
     let stats = resp("get_session_stats");
     assert_eq!(stats["success"], true);
-    assert!(stats["data"]["messageCount"].is_number(), "stats missing messageCount: {stats}");
+    let data = &stats["data"];
+    for key in [
+        "sessionId",
+        "userMessages",
+        "assistantMessages",
+        "toolCalls",
+        "toolResults",
+        "totalMessages",
+        "tokens",
+        "cost",
+    ] {
+        assert!(!data[key].is_null(), "stats missing Pi key `{key}`: {stats}");
+    }
+    for key in ["input", "output", "cacheRead", "cacheWrite", "total"] {
+        assert!(
+            data["tokens"][key].is_number(),
+            "stats.tokens missing Pi key `{key}`: {stats}"
+        );
+    }
+    for gone in [
+        "messageCount",
+        "userMessageCount",
+        "assistantMessageCount",
+        "toolResultCount",
+        "inputTokens",
+        "outputTokens",
+        "cacheTokens",
+    ] {
+        assert!(data[gone].is_null(), "cyrup-invented key `{gone}` still on the wire: {stats}");
+    }
+    // `sessionFile` is `string | undefined` — this runtime IS persisted, so it must be present.
+    assert!(data["sessionFile"].is_string(), "stats missing sessionFile: {stats}");
 
     // set_session_name trims + persists ("f"), and rejects an empty/whitespace name ("g").
     let named: Vec<&Value> = lines.iter().filter(|l| l["command"] == "set_session_name").collect();

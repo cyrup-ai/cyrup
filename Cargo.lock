@@ -1066,6 +1066,7 @@ dependencies = [
  "base64",
  "clap",
  "cyrup-config",
+ "cyrup-ext",
  "cyrup-ext-subagents",
  "cyrup-intercom",
  "cyrup-modes",
@@ -1223,6 +1224,7 @@ name = "cyrup-modes"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-provider",
@@ -1307,6 +1309,7 @@ dependencies = [
  "async-trait",
  "cyrup-agent",
  "cyrup-core",
+ "cyrup-ext",
  "cyrup-modes",
  "cyrup-provider",
  "cyrup-session",

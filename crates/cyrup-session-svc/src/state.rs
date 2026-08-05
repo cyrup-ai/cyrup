@@ -1,56 +1,154 @@
 //! Serializable read-only state views the RPC/print front-ends snapshot (arch-11 §3.1; the
 //! `state.rs` module arch-11 §2.1 prescribes). These mirror Pi's `getSessionStats`
-//! (agent-session.ts:2932), the `state` getter (agent-session.ts:753), and `getContextUsage`
-//! (agent-session.ts:2977) — none of which mutate the session.
+//! (agent-session.ts:3112, interface at :260-277), the `state` getter (agent-session.ts:861), and
+//! `getContextUsage` (agent-session.ts:3164) — none of which mutate the session.
 
-use cyrup_core::{AssistantMessage, Message};
+use cyrup_core::{AssistantMessage, Content, Message, Usage};
+use cyrup_session::agent_message::AgentMessage;
+use cyrup_session::entry::{Entry, KnownEntry};
 
-/// Aggregate transcript counters for the current branch (Pi `SessionStats`, agent-session.ts:2932).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Aggregate session statistics (Pi `SessionStats`, agent-session.ts:260-277).
+///
+/// SEAM-031 — this is a byte-level port of Pi's interface, field for field:
+/// ```text
+/// interface SessionStats {
+///     sessionFile: string | undefined;
+///     sessionId: string;
+///     userMessages: number;
+///     assistantMessages: number;
+///     toolCalls: number;
+///     toolResults: number;
+///     totalMessages: number;
+///     tokens: { input; output; cacheRead; cacheWrite; total };
+///     cost: number;
+///     contextUsage?: ContextUsage;
+/// }
+/// ```
+/// cyrup previously answered `get_session_stats` with a cyrup-invented object
+/// (`{messageCount,userMessageCount,assistantMessageCount,toolResultCount,inputTokens,outputTokens,
+/// cacheTokens}`) — not one key of which a Pi-contract client can read — computed from the
+/// LLM-flattened, **post-compaction** context. Pi's docstring (agent-session.ts:3107-3111) is
+/// explicit that the aggregation runs over ALL session entries "including history that was compacted
+/// away, so token/cost totals reflect what was actually billed across the session"; recomputing from
+/// the rebuilt context silently DROPPED the reported spend at every compaction.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
-    /// Total persisted messages on the current branch.
-    pub message_count: usize,
-    pub user_message_count: usize,
-    pub assistant_message_count: usize,
-    pub tool_result_count: usize,
-    /// Summed input tokens across assistant turns **and** tool results that reported usage.
-    pub input_tokens: u64,
-    /// Summed output tokens across assistant turns **and** tool results that reported usage.
-    pub output_tokens: u64,
-    /// Summed cache-read + cache-write tokens across assistant turns **and** tool results that
-    /// reported usage.
-    pub cache_tokens: u64,
+    /// The on-disk session file, absent for an in-memory session (Pi `sessionFile: string |
+    /// undefined`, which `JSON.stringify` omits when undefined).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    pub session_id: String,
+    pub user_messages: usize,
+    pub assistant_messages: usize,
+    /// `toolCall` content blocks across all assistant messages (Pi agent-session.ts:3140-3143).
+    pub tool_calls: usize,
+    pub tool_results: usize,
+    /// Every `message` entry, whatever its role (Pi `totalMessages`, agent-session.ts:3126).
+    pub total_messages: usize,
+    pub tokens: StatsTokens,
+    /// Summed `usage.cost.total` (Pi `addUsageToTotals`, usage-totals.ts:22-28).
+    pub cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<StatsContextUsage>,
+}
+
+/// The `tokens` sub-object of [`SessionStats`] (Pi agent-session.ts:268-274). `cacheRead` and
+/// `cacheWrite` are separate — cyrup used to collapse them into one `cacheTokens`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// `input + output + cacheRead + cacheWrite` (Pi agent-session.ts:3157).
+    pub total: u64,
+}
+
+/// The optional `contextUsage` sub-object of [`SessionStats`], in Pi's shape (`ContextUsage`,
+/// extensions/types.ts:288-294): `{tokens: number|null, contextWindow: number, percent: number|null}`.
+///
+/// Deliberately NOT the same type as this module's [`ContextUsage`], which is cyrup's own
+/// `{usedTokens, contextWindow, fraction}` shape and is what `get_state`, the TUI footer and the
+/// guest `ctx.getContextUsage()` capability read. Converging those onto Pi's spelling is a separate
+/// divergence; this type exists so the `get_session_stats` wire is Pi-shaped today.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsContextUsage {
+    /// `null` when the occupied-token count is unknown (Pi returns `tokens: null` right after a
+    /// compaction, before the next LLM response, agent-session.ts:3188).
+    pub tokens: Option<u64>,
+    pub context_window: u64,
+    /// Percentage (0-100) of the window, `null` whenever `tokens` is (Pi agent-session.ts:3201).
+    pub percent: Option<f64>,
 }
 
 impl SessionStats {
-    /// Compute the stats from the current-branch messages (Pi `getSessionStats`).
-    pub fn from_messages(messages: &[Message]) -> Self {
-        let mut s = Self { message_count: messages.len(), ..Self::default() };
-        for m in messages {
-            match m {
-                Message::User { .. } => s.user_message_count += 1,
-                // A tool that reported usage for its OWN execution spends real tokens, so it is
-                // billed and must appear in the totals (Pi `if (message.usage)
-                // { addUsageToTotals(usageTotals, message.usage); }`, agent-session.ts:3129-3132).
-                // Before this a metering/summarizer tool was billed-but-invisible here.
-                Message::ToolResult { usage, .. } => {
-                    s.tool_result_count += 1;
+    /// Compute the stats from ALL session entries (Pi `getSessionStats`, agent-session.ts:3112-3161).
+    ///
+    /// Walks `sessionManager.getEntries()`, not the rebuilt LLM context, and folds
+    /// `branch_summary`/`compaction` `usage` back in (agent-session.ts:3120-3122) so a compaction
+    /// does not erase the tokens it already billed.
+    pub fn from_entries(
+        entries: &[Entry],
+        session_id: String,
+        session_file: Option<String>,
+        context_usage: Option<StatsContextUsage>,
+    ) -> Self {
+        let mut s = Self { session_id, session_file, context_usage, ..Self::default() };
+        for entry in entries {
+            let Entry::Known(known) = entry else { continue };
+            match known {
+                // `if ((entry.type === "branch_summary" || entry.type === "compaction") &&
+                // entry.usage) addUsageToTotals(...)` — counted even though the entry is not a
+                // message, because the summarization call spent real tokens (agent-session.ts:3120).
+                KnownEntry::Compaction { usage, .. } | KnownEntry::BranchSummary { usage, .. } => {
                     if let Some(u) = usage {
-                        s.input_tokens += u.input;
-                        s.output_tokens += u.output;
-                        s.cache_tokens += u.cache_read + u.cache_write;
+                        s.add_usage(u);
                     }
                 }
-                Message::Assistant(a) => {
-                    s.assistant_message_count += 1;
-                    s.input_tokens += a.usage.input;
-                    s.output_tokens += a.usage.output;
-                    s.cache_tokens += a.usage.cache_read + a.usage.cache_write;
+                // `if (entry.type !== "message") continue;` (agent-session.ts:3123).
+                KnownEntry::Message { message, .. } => {
+                    s.total_messages += 1;
+                    match message {
+                        AgentMessage::Core(Message::User { .. }) => s.user_messages += 1,
+                        AgentMessage::Core(Message::ToolResult { usage, .. }) => {
+                            s.tool_results += 1;
+                            if let Some(u) = usage {
+                                s.add_usage(u);
+                            }
+                        }
+                        AgentMessage::Core(Message::Assistant(a)) => {
+                            s.assistant_messages += 1;
+                            s.tool_calls += a
+                                .content
+                                .iter()
+                                .filter(|c| matches!(c, Content::ToolCall { .. }))
+                                .count();
+                            s.add_usage(&a.usage);
+                        }
+                        // `bashExecution`/`custom`/`branchSummary`/`compactionSummary` roles count
+                        // toward `totalMessages` and nothing else — Pi's role switch has no arm for
+                        // them either (agent-session.ts:3127-3145).
+                        _ => {}
+                    }
                 }
+                _ => {}
             }
         }
+        s.tokens.total =
+            s.tokens.input + s.tokens.output + s.tokens.cache_read + s.tokens.cache_write;
         s
+    }
+
+    /// Pi `addUsageToTotals` (usage-totals.ts:22-28).
+    fn add_usage(&mut self, u: &Usage) {
+        self.tokens.input += u.input;
+        self.tokens.output += u.output;
+        self.tokens.cache_read += u.cache_read;
+        self.tokens.cache_write += u.cache_write;
+        self.cost += u.cost.total;
     }
 }
 

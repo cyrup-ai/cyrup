@@ -103,7 +103,9 @@ impl AgentSession {
             C::Steer(input) => O::Accepted(self.steer(input).await?),
             C::FollowUp(input) => O::Accepted(self.follow_up(input).await?),
             C::Abort => {
-                self.abort();
+                // SEAM-024: Pi's command seam is `await session.abort()` (agent-session.ts:1542),
+                // i.e. the caller's `Ok` means the run has actually stopped.
+                self.abort_and_settle().await;
                 O::Unit
             }
             C::ClearQueue => {

@@ -26,4 +26,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
+# SEAM-026: the SDK lifecycle tests register a recording NATIVE extension to observe the
+# `session_start` / `session_shutdown` an embedder's extensions must receive. Test-only — the SDK
+# itself reaches extensions through `cyrup-session-svc`'s re-exported builder seam.
+cyrup-ext = { workspace = true }
 tempfile.workspace = true

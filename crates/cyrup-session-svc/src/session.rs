@@ -49,6 +49,14 @@ use crate::tools::{DynamicToolState, ToolInfo};
 /// indefinitely. The op is bounded and its expiry reported rather than hanging the drain.
 const WAIT_IDLE_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Upper bound on the `await this.waitForIdle()` tail of [`AgentSession::abort_and_settle`]
+/// (SEAM-024). Pi's `abort()` awaits unboundedly (agent-session.ts:1545), but its callers are a
+/// browser-style event loop; here the same await sits on `dispose`, i.e. on every `quit`, every
+/// session replacement and the RPC `abort` verb, so a tool wedged in an uninterruptible syscall
+/// would otherwise make the process unkillable-by-Ctrl-C. On expiry the caller continues exactly as
+/// the pre-SEAM-024 fire-and-forget `abort()` did — never worse than the old behaviour.
+const ABORT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The op's Pi-facing name, for the SEAM-003 failure diagnostic.
 fn control_op_name(op: &ControlOp) -> &'static str {
     match op {
@@ -1239,8 +1247,41 @@ impl AgentSession {
     }
 
     /// Interrupt the active run (idempotent, R-11-018 / func-02 R-02-045).
+    ///
+    /// SEAM-023 — the retry backoff is cancelled FIRST, exactly as Pi's `abort()` does
+    /// (`abortRetry(); this.agent.abort(); await this.waitForIdle();`, agent-session.ts:1542-1546).
+    /// `agent.abort()` cancels the PER-RUN token; the auto-retry backoff sleeps on a *separate*
+    /// child of `session_cancel` ([`Self::prepare_retry`]), so without this an Escape / SIGINT /
+    /// RPC `abort` landing during provider-retry backoff left the backoff running and the retry
+    /// fired later against a session the user had already aborted.
+    ///
+    /// This is the SYNCHRONOUS half (what a signal handler and `ctx.abort()` need). Callers that
+    /// must observe the run actually settle — teardown, compaction, the RPC `abort` verb — use
+    /// [`Self::abort_and_settle`], which adds Pi's `await this.waitForIdle()` tail.
     pub fn abort(&self) {
+        self.abort_retry();
         self.agent.abort();
+    }
+
+    /// Interrupt the active run **and await its settlement** — the full Pi `abort()`
+    /// (agent-session.ts:1542-1546: `this.abortRetry(); this.agent.abort(); await
+    /// this.waitForIdle();`), in that exact order.
+    ///
+    /// SEAM-024. The order is load-bearing and the reason this is not simply
+    /// `wait_for_idle().await` after a plain abort: the retry backoff sleeps on a child of
+    /// `session_cancel` that `agent.abort()` does not touch, so awaiting idle BEFORE cancelling it
+    /// would block for the whole remaining backoff (up to `retry.baseDelayMs * 2^attempt`).
+    ///
+    /// Pi's `teardownCurrent` states why teardown must await: "Settle any active response first so
+    /// the aborted turn (including tool results) is persisted to the outgoing session before it is
+    /// replaced" (agent-session-runtime.ts:167-169), and its RPC `abort` verb likewise replies only
+    /// after `await session.abort()` (rpc-mode.ts:427-430).
+    ///
+    /// Unlike Pi the wait is BOUNDED ([`ABORT_SETTLE_TIMEOUT`]): a wedged tool must not make `quit`
+    /// hang forever. On expiry the caller proceeds exactly as the old fire-and-forget `abort()` did.
+    pub async fn abort_and_settle(&self) {
+        self.abort();
+        let _ = tokio::time::timeout(ABORT_SETTLE_TIMEOUT, self.wait_for_idle()).await;
     }
 
     // ------------------------------------------------------------------- compaction ----
@@ -1260,8 +1301,12 @@ impl AgentSession {
         custom_instructions: Option<String>,
     ) -> Result<crate::state::CompactionResult, SessionServiceError> {
         let reason = CompactionReason::Manual;
-        // Disconnect/abort dance: stop the active run before compacting (agent-session.ts:1648-1649).
-        self.abort();
+        // Disconnect/abort dance: stop the active run before compacting AND wait for it to settle
+        // — Pi is `this._disconnectFromAgent(); await this.abort();` (agent-session.ts:1784-1785),
+        // and its `abort()` ends in `await this.waitForIdle()`. SEAM-024: compaction installs its
+        // own cancel token and rewrites the branch immediately below, so starting that while the
+        // aborted turn was still writing tool results raced the transcript it is about to compact.
+        self.abort_and_settle().await;
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
@@ -2160,10 +2205,21 @@ impl AgentSession {
     // ------------------------------------------------------------------- lifecycle ----
 
     /// Dispose the session (Pi `AgentSession.dispose` via runtime `dispose`,
-    /// agent-session-runtime.ts:390): abort any in-flight run, emit `session_shutdown`, and cancel
-    /// the long-lived session token so the extension subscriber unwinds.
+    /// agent-session-runtime.ts:390): abort any in-flight run **and wait for it to settle**, emit
+    /// `session_shutdown`, and cancel the long-lived session token so the extension subscriber
+    /// unwinds.
+    ///
+    /// SEAM-024 — the settle is not optional. Pi's `teardownCurrent` opens with
+    /// `await this.session.abort()` and the comment "Settle any active response first so the
+    /// aborted turn (including tool results) is persisted to the outgoing session before it is
+    /// replaced" (agent-session-runtime.ts:167-169), and only then emits `session_shutdown` and
+    /// disposes. cyrup collapses pi's `teardownCurrent` + `runtime.dispose` + `session.dispose`
+    /// into this one method, so the await belongs here: it is on EVERY teardown path (`run.rs`,
+    /// `main.rs`) and every replacement (`runtime.rs`). Previously the fire-and-forget `abort()`
+    /// let `session_shutdown` be announced — and `session_cancel` fired — while the aborted turn
+    /// was still writing its tool results.
     pub async fn dispose(&self, reason: &str) {
-        self.abort();
+        self.abort_and_settle().await;
         self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
         // Notify extensions, then release the long-lived token.
         let cancel = self.session_cancel.child_token();
@@ -2173,6 +2229,76 @@ impl AgentSession {
             .dispatch_notify(&HostEvent::SessionShutdown { reason: reason.to_string() }, &cancel)
             .await;
         self.session_cancel.cancel();
+    }
+
+    /// Resolve a fork anchor against the **live** session manager (SEAM-009).
+    ///
+    /// Pi resolves the anchor BEFORE it splits on persistence: `getEntry(entryId)` +
+    /// `throw new Error("Invalid entry ID for forking")` at agent-session-runtime.ts:275-276 and
+    /// :282-283, i.e. strictly above the `isPersisted()` branch at :290. cyrup used to resolve it
+    /// against a throwaway manager reopened from the session FILE, which meant an unsaved session
+    /// had no validation at all (a bogus entry id "succeeded") and no anchor to branch at.
+    ///
+    /// Reading the live manager is also strictly more correct for the persisted case: a branched
+    /// session defers its first file write until an assistant message exists
+    /// (`create_branched_session`), so the on-disk copy can legitimately lag the in-memory entries.
+    pub(crate) async fn fork_anchor_live(
+        &self,
+        entry: &EntryId,
+        position: ForkPosition,
+    ) -> Result<(Option<EntryId>, Option<String>), SessionServiceError> {
+        let mgr = self.manager.lock().await;
+        fork_anchor(&mgr, entry, position)
+    }
+
+    /// Branch the **live, non-persisted** session manager at `target_leaf`, IN PLACE (SEAM-009).
+    ///
+    /// Pi's in-memory fork branch mutates the very object the outgoing session still holds:
+    /// `const sessionManager = this.session.sessionManager; …
+    /// sessionManager.createBranchedSession(targetLeafId); await this.teardownCurrent("fork", …)`
+    /// (agent-session-runtime.ts:333-341). Branching first and tearing down second is not
+    /// incidental: the outgoing run is still writing, and everything it appends while it settles
+    /// lands in the *already-branched* manager — which is the manager the fork is built from. That
+    /// is how Pi honours its own teardown contract, "the aborted turn (including tool results) is
+    /// persisted to the outgoing session before it is replaced" (:167-169), on the fork path.
+    ///
+    /// So this method deliberately does NOT hand the manager over; [`Self::take_manager`] does, and
+    /// the caller must settle the outgoing run in between. Merging the two (branch + move in one
+    /// step, as this used to) re-opens the data loss from the other side: every append made between
+    /// the move and the teardown goes to the throwaway placeholder and is dropped with it.
+    ///
+    /// Before any of this, the in-memory arm built a `SessionTarget::New` session and the whole
+    /// transcript was silently discarded — unrecoverable, since a non-persisted session has no file
+    /// to recover it from.
+    pub(crate) async fn branch_live_manager(
+        &self,
+        target_leaf: &EntryId,
+    ) -> Result<(), SessionServiceError> {
+        let mut guard = self.manager.lock().await;
+        // `create_branched_session` returns early for a non-persisted manager (adopting the branch
+        // in memory and returning `None`), so the layout is unused here — pass the manager's own,
+        // which is what the persisted arm would use too.
+        let layout = branch_layout(&guard);
+        guard.create_branched_session(target_leaf, &layout)?;
+        Ok(())
+    }
+
+    /// Move this session's manager out from behind its lock, leaving a fresh empty in-memory
+    /// manager in its place, so `SessionFactory::build_from_manager` (which takes the manager by
+    /// value) can adopt it — cyrup's stand-in for Pi passing `this.session.sessionManager` straight
+    /// into `createRuntime` (agent-session-runtime.ts:341).
+    ///
+    /// **The caller must have settled this session's run first.** Anything the session writes after
+    /// this call lands in the placeholder and is lost when the session is dropped. The sole caller
+    /// (the runtime's non-persisted fork arm) awaits `abort_and_settle()` immediately before, then
+    /// disposes and replaces the session.
+    pub(crate) async fn take_manager(&self) -> Result<SessionManager, SessionServiceError> {
+        let mut guard = self.manager.lock().await;
+        let placeholder = SessionManager::in_memory(
+            guard.cwd(),
+            cyrup_session::manager::NewSessionOpts::default(),
+        )?;
+        Ok(std::mem::replace(&mut *guard, placeholder))
     }
 
     /// Invalidate every live subscription on replacement (R-11-021): emit the terminal
@@ -3057,10 +3183,96 @@ impl AgentSession {
 
     // -------------------------------------------------------------------- state views ----
 
-    /// Aggregate transcript stats for the current branch (Pi `getSessionStats`,
-    /// agent-session.ts:2932; RPC `get_session_stats`).
+    /// Aggregate session stats (Pi `getSessionStats`, agent-session.ts:3112; RPC
+    /// `get_session_stats`).
+    ///
+    /// SEAM-031: computed from `sessionManager.getEntries()` — ALL entries, including history a
+    /// compaction replaced — not from the rebuilt LLM context, so token/cost totals reflect what was
+    /// actually billed across the session (Pi's own docstring, agent-session.ts:3107-3111).
     pub async fn session_stats(&self) -> crate::state::SessionStats {
-        crate::state::SessionStats::from_messages(&self.messages().await)
+        let context_usage = self.stats_context_usage().await;
+        let mgr = self.manager.lock().await;
+        crate::state::SessionStats::from_entries(
+            mgr.entries(),
+            self.session_id.to_string(),
+            mgr.session_file().map(|p| p.display().to_string()),
+            context_usage,
+        )
+    }
+
+    /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
+    /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
+    /// no known context window — Pi's `getContextUsage` returns `undefined` there
+    /// (agent-session.ts:3165-3170).
+    async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
+        let usage = self.context_usage().await;
+        if usage.context_window == 0 {
+            return None;
+        }
+        // Pi's post-compaction guard (agent-session.ts:3175-3197). After a compaction the last
+        // assistant `usage` still describes the PRE-compaction context, so reporting it would show a
+        // stale — and much larger — occupancy as if it were current. Pi only trusts a usage from an
+        // assistant that responded AFTER the latest compaction on this branch, and where that
+        // assistant neither aborted nor errored and actually consumed context. With no such
+        // assistant the count is genuinely unknown, and Pi returns `{tokens: null, percent: null}`
+        // while still reporting the window.
+        //
+        // Without this branch `tokens`/`percent` were unconditionally `Some`, so the `null` case the
+        // struct's own doc comment describes was unreachable.
+        if !self.has_post_compaction_usage().await {
+            return Some(crate::state::StatsContextUsage {
+                tokens: None,
+                context_window: usage.context_window,
+                percent: None,
+            });
+        }
+        Some(crate::state::StatsContextUsage {
+            tokens: Some(usage.used_tokens),
+            context_window: usage.context_window,
+            percent: Some(usage.fraction * 100.0),
+        })
+    }
+
+    /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
+    /// on the branch, or an assistant has responded since the latest one (Pi
+    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3178-3195).
+    ///
+    /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
+    /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
+    /// accounts for a non-zero context.
+    async fn has_post_compaction_usage(&self) -> bool {
+        use cyrup_core::StopReason;
+        use cyrup_session::entry::{Entry, KnownEntry};
+        use cyrup_session::AgentMessage;
+
+        let guard = self.manager.lock().await;
+        let entries = guard.entries();
+        let Some(compaction_idx) = entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+        else {
+            // No compaction on this branch: the last assistant usage is current by construction.
+            return true;
+        };
+        entries
+            .iter()
+            .skip(compaction_idx + 1)
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Known(KnownEntry::Message {
+                    message: AgentMessage::Core(Message::Assistant(a)),
+                    ..
+                }) => Some(a),
+                _ => None,
+            })
+            .any(|a| {
+                // Same four-field sum `ContextUsage::from_last_assistant` uses, so "consumed
+                // context" means the same thing in both places (Pi `calculateContextTokens`).
+                let context_tokens =
+                    a.usage.input + a.usage.cache_read + a.usage.cache_write + a.usage.output;
+                !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error)
+                    && context_tokens > 0
+            })
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
@@ -3078,8 +3290,8 @@ impl AgentSession {
     /// A serializable snapshot of the session for RPC `get_state` (Pi `state` getter,
     /// agent-session.ts:753).
     pub async fn state_view(&self) -> crate::state::SessionStateView {
+        let stats = self.session_stats().await;
         let messages = self.messages().await;
-        let stats = crate::state::SessionStats::from_messages(&messages);
         let last = messages.iter().rev().find_map(|m| match m {
             Message::Assistant(a) => Some(a),
             _ => None,

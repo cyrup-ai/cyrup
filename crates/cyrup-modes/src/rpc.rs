@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
-    ForkPosition, InputSource, ModelThinkingLevel, NotifyKind, PromptAccepted, PromptOptions,
-    QueueMode, StreamingBehavior, UiEffect, UiKind, UiReply, UiRequest, UserInput,
+    EventStream, ForkPosition, InputSource, ModelThinkingLevel, NotifyKind, PromptAccepted,
+    PromptOptions, QueueMode, StreamingBehavior, UiEffect, UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -453,11 +453,47 @@ fn map_ui_response(pending: &PendingUi, body: &Value) -> UiReply {
     }
 }
 
-/// The disposition of a dispatched command: the correlated [`RpcResponse`] plus whether the active
-/// session was replaced (the loop must rebind: re-acquire the session + re-subscribe; R-11-021).
+/// The disposition of a dispatched command: just the correlated [`RpcResponse`].
+///
+/// It used to carry a `rebind: bool` derived from the command NAME. That is exactly SEAM-022: the
+/// active session is replaced by the RUNTIME, and only a fraction of the replacements are named by
+/// an RPC verb — a loaded extension calling `ctx.newSession()`/`ctx.fork()`/`ctx.switchSession()`/
+/// `ctx.reload()` arrives as an ordinary `{"type":"prompt","message":"/mycmd"}`. The loop now
+/// observes [`AgentSessionRuntime::watch_generation`] instead, which `install_inner` bumps on EVERY
+/// replacement path — the same signal `cyrup-tui`'s run loop already rebinds on.
 struct Dispatched {
     response: RpcResponse,
-    rebind: bool,
+}
+
+/// The host-side `rebindSession` (Pi rpc-mode.ts:316-360, registered at :312-314 and invoked by
+/// `finishSessionReplacement`, agent-session-runtime.ts:187-190).
+///
+/// Re-acquires the now-active session, re-subscribes its event stream (the prior subscription was
+/// terminated with `SessionReplaced`, R-11-021), and re-installs the three sinks Pi re-passes to
+/// `bindExtensions` on every rebind — the dialog channel, the fire-and-forget effect channel and
+/// the `onError` fault listener — because a replacement brings a fresh `LiveHostServices` +
+/// extension host. `in_flight` is cleared: the replaced session's run (if any) was disposed and its
+/// `agent_settled` will never arrive.
+async fn rebind_session(
+    runtime: &AgentSessionRuntime,
+    session: &mut Arc<AgentSession>,
+    events: &mut EventStream<AgentSessionEvent>,
+    sinks: &LoopSinks,
+    in_flight: &mut bool,
+) {
+    *session = runtime.session().await;
+    *events = session.subscribe();
+    session.services().host_services.set_ui_sink(sinks.ui.clone());
+    session.services().host_services.set_ui_effect_sink(sinks.ui_effect.clone());
+    session.services().ext_host.add_error_listener(error_listener(sinks.error.clone()));
+    *in_flight = false;
+}
+
+/// The three loop-owned channels every (re)bind installs onto the active session.
+struct LoopSinks {
+    ui: mpsc::UnboundedSender<UiRequest>,
+    ui_effect: mpsc::UnboundedSender<UiEffect>,
+    error: mpsc::UnboundedSender<Value>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -521,6 +557,16 @@ where
     // Pi re-binds `onError` inside `rebindSession()`.
     let (error_tx, mut error_rx) = mpsc::unbounded_channel::<Value>();
     session.services().ext_host.add_error_listener(error_listener(error_tx.clone()));
+    let sinks = LoopSinks { ui: ui_tx, ui_effect: ui_effect_tx, error: error_tx };
+
+    // SEAM-022: the replacement signal. `AgentSessionRuntime::install_inner` bumps this watch on
+    // EVERY path that swaps the active session — the RPC verbs `new_session`/`switch_session`/
+    // `fork`/`clone`, AND a loaded extension's `ctx.newSession()`/`ctx.fork()`/`ctx.switchSession()`/
+    // `ctx.reload()`, which arrive as an ordinary `prompt` line and therefore cannot be recognized
+    // from the command name. This is cyrup's spelling of Pi handing the runtime a `rebindSession`
+    // callback that `finishSessionReplacement` invokes (agent-session-runtime.ts:187-190); the TUI
+    // run loop already rebinds off this same watch (`cyrup-tui/src/app.rs`).
+    let mut gen_rx = runtime.watch_generation();
 
     // Dedicated reader task → mpsc of raw JSONL lines (strict LF framing; cancel-safe vs. events).
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
@@ -572,10 +618,24 @@ where
                             }
                             continue;
                         }
+                        // SEAM-022: a replacement may have landed since this arm last ran (the
+                        // generation arm below is one of several ready branches `select!` picks
+                        // between at random). Settle it BEFORE the line is serviced so the command
+                        // reaches the session the runtime is actually serving, never the disposed
+                        // one — Pi orders it the same way, awaiting `rebindSession` inside
+                        // `finishSessionReplacement` before the host handles anything else.
+                        if gen_rx.has_changed().unwrap_or(false) {
+                            gen_rx.mark_unchanged();
+                            rebind_session(
+                                runtime, &mut session, &mut events, &sinks, &mut in_flight,
+                            ).await;
+                        }
                         if is_inline_command(&line) {
                             // Run-control commands are fast (preflight/enqueue) and own `in_flight`;
-                            // dispatch inline so the flag is set before `events` is next polled. They
-                            // never replace the active session, so no rebind handling is needed here.
+                            // dispatch inline so the flag is set before `events` is next polled.
+                            // They can still REPLACE the session — a `/slash` extension command
+                            // arrives as a `prompt` and its handler may call `ctx.newSession()` —
+                            // which the generation check at the top of the next iteration settles.
                             let dispatched =
                                 dispatch(runtime, &session, &line, &mut in_flight).await;
                             write_out(writer, &RpcOut::Response(dispatched.response)).await?;
@@ -585,8 +645,9 @@ where
                             // Everything else — including the blocking `bash`/`compact`/`export_html`
                             // and the session-replacing `new_session`/`switch_session`/`fork`/`clone`
                             // — dispatches concurrently so a following `abort`/`abort_bash` is not
-                            // queued behind it. The response (and any rebind) is handled when the
-                            // future completes, in the `select_next_some` arm below.
+                            // queued behind it. The response is written when the future completes,
+                            // in the `select_next_some` arm below; any resulting replacement is
+                            // picked up by the generation arm.
                             dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
                         }
                     }
@@ -594,26 +655,22 @@ where
                 }
             }
             Some(dispatched) = dispatches.next(), if !dispatches.is_empty() => {
-                // A concurrent command finished: emit its correlated response, then rebind if it
-                // replaced the active session (Pi `rebindSession`, rpc-mode.ts:312-360). Responses are
-                // written only here + the inline arm, both on this single loop task, so the writer is
-                // never shared across the concurrent dispatch futures (they only compute a response).
+                // A concurrent command finished: emit its correlated response. Responses are written
+                // only here + the inline arm, both on this single loop task, so the writer is never
+                // shared across the concurrent dispatch futures (they only compute a response). If
+                // the command replaced the active session, the generation arm rebinds.
                 write_out(writer, &RpcOut::Response(dispatched.response)).await?;
                 // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786) — the
                 // concurrent-dispatch twin of the inline arm above.
                 shutdown_checkpoint = true;
-                if dispatched.rebind {
-                    // The active session was replaced — re-acquire it and re-subscribe (the prior
-                    // subscription was terminated, R-11-021).
-                    session = runtime.session().await;
-                    events = session.subscribe();
-                    // The replacement brought a fresh `LiveHostServices` + extension host; re-install
-                    // the ui sinks and the fault listener so a post-swap guest still reaches this loop.
-                    session.services().host_services.set_ui_sink(ui_tx.clone());
-                    session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
-                    session.services().ext_host.add_error_listener(error_listener(error_tx.clone()));
-                    in_flight = false;
-                }
+            }
+            Ok(()) = gen_rx.changed() => {
+                // SEAM-022: the runtime replaced the active session — Pi's `rebindSession()`
+                // (rpc-mode.ts:316-360), which its runtime invokes from `finishSessionReplacement`
+                // for all six replacement paths. Fires for an extension-triggered swap just as much
+                // as for an RPC verb, and is what keeps the loop from servicing later commands (and
+                // reading later events) through the disposed session.
+                rebind_session(runtime, &mut session, &mut events, &sinks, &mut in_flight).await;
             }
             Some(wire) = error_rx.recv() => {
                 // A dispatcher-contained extension fault: surface it as an `extension_error` line
@@ -777,7 +834,6 @@ async fn dispatch(
                     None,
                     format!("Failed to parse command: {e}"),
                 ),
-                rebind: false,
             }
         }
     };
@@ -793,42 +849,49 @@ async fn dispatch(
         Ok(SessionCommand::Unknown) => {
             let name = type_str.unwrap_or_default();
             let message = format!("Unknown command: {name}");
-            Dispatched { response: RpcResponse::err(name, raw_id, message), rebind: false }
+            Dispatched { response: RpcResponse::err(name, raw_id, message) }
         }
         Ok(cmd) => {
-            let response = handle(runtime, session, cmd, raw_id, in_flight).await;
-            // The session-replacing commands rebind on success (non-cancelled).
-            let rebind = response.success
-                && matches!(
-                    response.command.as_str(),
-                    "new_session" | "switch_session" | "fork" | "clone"
-                )
-                && response
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.get("cancelled"))
-                    .and_then(Value::as_bool)
-                    != Some(true);
-            Dispatched { response, rebind }
+            // Whether this command REPLACED the active session is deliberately not inferred here
+            // (SEAM-022): the runtime announces every replacement on its generation watch, which the
+            // run loop observes directly.
+            Dispatched { response: handle(runtime, session, cmd, raw_id, in_flight).await }
         }
         // A known `type` whose payload failed validation (missing/wrong-typed required field): echo
         // the real command name + the runtime error, NOT `"unknown"`. A missing/`null` `type` tag
         // (serde: "missing field `type`") has no command name to echo — fall back to Pi's default
         // `Unknown command` shaping so it still correlates.
         Err(e) => match type_str {
-            Some(name) => Dispatched {
-                response: RpcResponse::err(name, raw_id, e.to_string()),
-                rebind: false,
-            },
+            Some(name) => {
+                Dispatched { response: RpcResponse::err(name, raw_id, e.to_string()) }
+            }
             None => Dispatched {
-                response: RpcResponse::err(
-                    String::new(),
-                    raw_id,
-                    "Unknown command: undefined",
-                ),
-                rebind: false,
+                response: RpcResponse::err(String::new(), raw_id, "Unknown command: undefined"),
             },
         },
+    }
+}
+
+/// Set the loop's "a run is in flight" latch ONLY when the session really has work in flight
+/// (SEAM-021).
+///
+/// The latch exists so [`run_rpc`]'s EOF exit waits for the trailing `agent_settled` instead of
+/// cutting a live run (SEAM-005) — which means it may only be set when an `agent_settled` is
+/// actually coming. `steer`/`follow_up` do NOT start a run: [`AgentSession::steer`]/
+/// [`AgentSession::follow_up`] push onto the pending queues and emit `queue_update` (Pi
+/// `_queueSteer`/`_queueFollowUp`, agent-session.ts:1249/1266), and Pi's own `case "steer"` /
+/// `case "follow_up"` arms (rpc-mode.ts:417-425) carry no in-flight bookkeeping at all. Latching
+/// unconditionally there wedged the loop forever on an idle session: nothing would ever emit the
+/// `agent_settled` that clears it, so `!reader_open && !in_flight && …` never became true, `run_rpc`
+/// never returned, and `run_rpc_dispatch`'s `runtime.dispose()` — hence `session_shutdown` — never
+/// ran (SEAM-002's RPC leg).
+///
+/// [`AgentSession::is_idle`] is the same two-latch readback `wait_for_idle` waits on (the post-run
+/// driver plus the agent's own run, Pi `isIdle`, agent-session.ts:759), so a steer that lands ON a
+/// live run still holds the EOF exit open — which is the case the latch was written for.
+fn latch_if_running(session: &AgentSession, in_flight: &mut bool) {
+    if !session.is_idle() {
+        *in_flight = true;
     }
 }
 
@@ -860,22 +923,32 @@ async fn handle(
         }
         SessionCommand::Steer { message, images } => {
             let id = raw_id.clone();
-            *in_flight = true;
             match session.steer(user_input(message, images)).await {
-                Ok(_) => RpcResponse::ok("steer", id, None),
+                Ok(_) => {
+                    latch_if_running(session, in_flight);
+                    RpcResponse::ok("steer", id, None)
+                }
                 Err(e) => RpcResponse::err("steer", id, e.to_string()),
             }
         }
         SessionCommand::FollowUp { message, images } => {
             let id = raw_id.clone();
-            *in_flight = true;
             match session.follow_up(user_input(message, images)).await {
-                Ok(_) => RpcResponse::ok("follow_up", id, None),
+                Ok(_) => {
+                    latch_if_running(session, in_flight);
+                    RpcResponse::ok("follow_up", id, None)
+                }
                 Err(e) => RpcResponse::err("follow_up", id, e.to_string()),
             }
         }
         SessionCommand::Abort => {
-            session.abort();
+            // SEAM-024: Pi is `await session.abort(); return success(id, "abort")`
+            // (rpc-mode.ts:427-430) and its `abort()` ends in `await this.waitForIdle()`
+            // (agent-session.ts:1545) — so the success reply means "the run has stopped", not
+            // "the cancel was requested". Replying before settlement made a client that
+            // immediately re-prompts race the dying run. `abort` is dispatched CONCURRENTLY (it
+            // is not in `is_inline_command`), so this await never stops the loop pumping events.
+            session.abort_and_settle().await;
             // `abort` never touches an open dialog. Pi's `session.abort()` (agent-session.ts) only
             // cancels the run; `rpc-mode.ts`'s `case "abort"` never reaches into
             // `pendingExtensionRequests`. Dismissal of an open `confirm`/`input`/`select` dialog is

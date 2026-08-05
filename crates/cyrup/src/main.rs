@@ -30,7 +30,7 @@ use cyrup_config::{
 use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
-    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionBuilder, SessionConfig,
+    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionConfig,
     SessionFactory, SessionInfo, SessionLayout, SessionServiceError, SessionTarget, SessionsRoot,
     UserInput, list_all, list_in_dir,
 };
@@ -552,10 +552,17 @@ async fn run() -> anyhow::Result<i32> {
             Ok(0)
         }
         AppMode::Print | AppMode::Json => {
-            // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
+            // SEAM-006: print/json run on the RUNTIME host, exactly like interactive and RPC. Pi's
+            // entry point is `runPrintMode(runtimeHost: AgentSessionRuntime, options)`
+            // (print-mode.ts:32) — it has no bare-session host. Building a bare `AgentSession` here
+            // left every loaded extension's `ctx.newSession()`/`ctx.fork()`/`ctx.switchSession()`/
+            // `ctx.reload()` with nothing to act on (`SessionServiceError::NoRuntimeHost`, warned
+            // and swallowed), and since this arm is what a spawned subagent child re-execs into,
+            // EVERY subagent run inherited the missing host.
+            let target = config.target.clone();
             let fresh = is_fresh_target(&config.target);
             let session_cwd = config.cwd.clone();
-            let mut builder = SessionBuilder::new(provider, config)
+            let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
@@ -589,10 +596,10 @@ async fn run() -> anyhow::Result<i32> {
                 ),
             };
             if let Some(ext) = subagent_ext {
-                builder = builder.with_native_extension(ext);
+                factory_builder = factory_builder.with_native_extension(ext);
             }
             if let Some(ic) = intercom_ext {
-                builder = builder.with_native_extension(ic);
+                factory_builder = factory_builder.with_native_extension(ic);
             }
             // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + role selection.
             // The one-shot print/json mode is exactly what a spawned subagent child re-execs into, so
@@ -602,26 +609,40 @@ async fn run() -> anyhow::Result<i32> {
                 dirs.agent_dir.clone(),
                 session_cwd,
             ) {
-                builder = builder.with_native_extension(ext);
+                factory_builder = factory_builder.with_native_extension(ext);
             }
-            let session = match builder.build().await {
-                // Bind the self-handle (via `into_shared`) so the post-run loop — auto-retry,
-                // post-run auto-compaction, queued continuations — fires for one-shot print/json runs.
-                Ok(s) => s.into_shared(),
+            let factory = Arc::new(factory_builder);
+            // `create_unannounced` also binds the self-handle (via `into_shared`) so the post-run
+            // loop — auto-retry, post-run auto-compaction, queued continuations — fires for one-shot
+            // print/json runs.
+            //
+            // SEAM-033: it does NOT announce `session_start`. Pi's `createAgentSessionRuntime`
+            // doesn't either (agent-session-runtime.ts:414-432); the mode does, from
+            // `rebindSession()` → `bindExtensions()` at print-mode.ts:119 → :73, which is reached
+            // only after `main.ts` has applied `--name` (main.ts:650) and the scoped `--models`
+            // (main.ts:742-750). `apply_post_build` below is cyrup's analog of both, so announcing
+            // inside the constructor would show every `session_start` handler an unnamed, unscoped
+            // session — and this arm is what a spawned subagent child re-execs into, so every
+            // subagent run would inherit it. `run_print_dispatch`/`run_json_dispatch` announce.
+            let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
+                Ok(r) => r,
                 // Non-interactive no-models-available guard (Pi main.ts:795-798).
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),
-                Err(e) => return Err(anyhow::Error::new(e).context("building agent session")),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context("building agent session runtime"));
+                }
             };
+            let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
-            let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
+            let _signals = spawn_abort_on_signal(session, cancel.clone());
             let inputs = build_inputs(&cli, &dirs.cwd).await?;
             ensure_prompt(&inputs)?;
             let mut out = io::stdout();
             let dispatch = if let AppMode::Json = mode {
-                run_json_dispatch(&session, &inputs, &mut out).await
+                run_json_dispatch(&runtime, &inputs, &mut out).await
             } else {
-                run_print_dispatch(&session, &inputs, &mut out).await
+                run_print_dispatch(&runtime, &inputs, &mut out).await
             };
             // Restore stdout at teardown (Pi `finally { restoreStdout() }`, main.ts:848).
             cyrup::output_guard::restore_stdout();

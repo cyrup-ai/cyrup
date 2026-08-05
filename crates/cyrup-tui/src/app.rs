@@ -2401,19 +2401,30 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
             C::SessionInfo => {
+                // Pi's `/session` renderer (interactive-mode.ts:5724-5763) reads exactly these
+                // fields off `getSessionStats()`; cyrup renders them as its own markdown table.
                 let stats = session.session_stats().await;
                 let body = format!(
                     "| Field | Value |\n|-------|-------|\n\
+                     | file | {} |\n| id | {} |\n\
                      | messages | {} |\n| user | {} |\n| assistant | {} |\n\
-                     | tool results | {} |\n| input tokens | {} |\n| output tokens | {} |\n\
-                     | cache tokens | {} |\n",
-                    stats.message_count,
-                    stats.user_message_count,
-                    stats.assistant_message_count,
-                    stats.tool_result_count,
-                    stats.input_tokens,
-                    stats.output_tokens,
-                    stats.cache_tokens,
+                     | tool calls | {} |\n| tool results | {} |\n\
+                     | input tokens | {} |\n| output tokens | {} |\n\
+                     | cache read | {} |\n| cache write | {} |\n| total tokens | {} |\n\
+                     | cost | ${:.3} |\n",
+                    stats.session_file.as_deref().unwrap_or("In-memory"),
+                    stats.session_id,
+                    stats.total_messages,
+                    stats.user_messages,
+                    stats.assistant_messages,
+                    stats.tool_calls,
+                    stats.tool_results,
+                    stats.tokens.input,
+                    stats.tokens.output,
+                    stats.tokens.cache_read,
+                    stats.tokens.cache_write,
+                    stats.tokens.total,
+                    stats.cost,
                 );
                 self.state.transcript.push_block("Session", body);
             }
@@ -4475,25 +4486,46 @@ mod live_floor_tests {
 mod external_editor_tests {
     use super::*;
 
+    /// Write a shell script into `dir` and return the multi-token editor command that runs it.
+    ///
+    /// The command is `"/bin/sh <script>"`, NOT the script path alone, and the script is
+    /// deliberately left non-executable. Exec'ing a file this process itself just wrote is racy in
+    /// a multi-threaded test binary: `std::fs::write` opens the file for writing, and any OTHER
+    /// thread that forks (every `Command::spawn` in this binary) during that window hands its child
+    /// an inherited write-fd, which makes the later `execve` of that same path fail with `ETXTBSY`.
+    /// That surfaced as `run_editor_over_file` returning `None` about 9% of the time
+    /// (`Os { code: 26, kind: ExecutableFileBusy }`, observed by instrumenting the spawn). Handing
+    /// the script to `/bin/sh` as an ARGUMENT means only `/bin/sh` is exec'd and the script is
+    /// merely opened for reading, so there is no window at all.
+    ///
+    /// It also exercises `run_editor_over_file`'s `split_whitespace` on a genuinely multi-token
+    /// command (`sh`, the script, then the appended file), which is the realistic `$EDITOR` shape.
+    #[cfg(unix)]
+    fn sh_editor(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        format!("/bin/sh {}", script.display())
+    }
+
     /// F14: the RESOLVED editor command is exactly what runs over the temp file — proving
     /// `edit_in_external_editor` spawns the command it is handed (which `App::run` resolves via
     /// `resolve_external_editor` → `EffectiveSettings::external_editor`, honoring settings
-    /// `externalEditor` over `$VISUAL`/`$EDITOR`) rather than an inline env-only chain. A no-arg
-    /// executable script (so `split_whitespace` yields just the script path + the appended file arg)
+    /// `externalEditor` over `$VISUAL`/`$EDITOR`) rather than an inline env-only chain. The script
     /// rewrites the file; the reloaded text is the script's output.
     #[test]
     #[cfg(unix)]
     fn resolved_editor_command_is_the_one_that_runs() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-editor.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'REWRITTEN BY EDITOR' > \"$1\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = sh_editor(
+            dir.path(),
+            "fake-editor.sh",
+            "printf 'REWRITTEN BY EDITOR' > \"$1\"\n",
+        );
 
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "original text").unwrap();
 
-        let out = run_editor_over_file(script.to_str().unwrap(), &file);
+        let out = run_editor_over_file(&editor, &file);
         assert_eq!(
             out.as_deref(),
             Some("REWRITTEN BY EDITOR"),
@@ -4515,13 +4547,10 @@ mod external_editor_tests {
     #[test]
     #[cfg(unix)]
     fn trailing_newline_is_stripped_once() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("nl-editor.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'line one\\n' > \"$1\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = sh_editor(dir.path(), "nl-editor.sh", "printf 'line one\\n' > \"$1\"\n");
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(run_editor_over_file(script.to_str().unwrap(), &file).as_deref(), Some("line one"));
+        assert_eq!(run_editor_over_file(&editor, &file).as_deref(), Some("line one"));
     }
 }

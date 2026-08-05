@@ -1205,6 +1205,30 @@ mod tests {
         ext.init(&mut api).await.unwrap();
     }
 
+    /// Drive `body` to completion with the crate-wide env lock held for the WHOLE test.
+    ///
+    /// Any test that asserts on config it wrote into its own tempdir must take this lock.
+    /// `ExtensionConfig::load` resolves its path through `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`
+    /// first ([`crate::ext_config::ExtensionConfig::resolve_config_path`]), and
+    /// `ext_config::tests::env_var_overrides_default_config_path` sets that variable PROCESS-WIDE
+    /// while it runs. A concurrent test then loads the OTHER test's fixture instead of its own and
+    /// fails on an assertion that has nothing to do with the code under test. Measured on this
+    /// binary: 8 failures in 300 runs before this guard, 0 in 300 after; and exporting the variable
+    /// by hand reproduces the same failure 100% of the time.
+    ///
+    /// The lock is `crate::ext_config::env_lock` — the same one the mutator holds — and it is taken
+    /// in a SYNCHRONOUS frame around `block_on` rather than inside an `async` test body, so the
+    /// guard is never held across an `.await` point.
+    fn with_config_env_lock<F: std::future::Future>(body: F) -> F::Output {
+        let _lock =
+            crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body)
+    }
+
     fn bash_call(call_id: &str) -> HostEvent {
         HostEvent::ToolCall {
             call_id: cyrup_core::ToolCallId::from(call_id),
@@ -1217,8 +1241,12 @@ mod tests {
     /// invalidates the agent-start cache. BEFORE this fix, `EventKind::ResourcesDiscover` was never
     /// subscribed and `on_event` fell through to its catch-all `Noop` arm, so neither the config nor
     /// the cached skill-enforcement entries ever refreshed — this test fails against that behavior.
-    #[tokio::test]
-    async fn resources_discover_reloads_config_and_invalidates_skill_cache() {
+    #[test]
+    fn resources_discover_reloads_config_and_invalidates_skill_cache() {
+        with_config_env_lock(resources_discover_reloads_config_and_invalidates_skill_cache_body());
+    }
+
+    async fn resources_discover_reloads_config_and_invalidates_skill_cache_body() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
@@ -1461,8 +1489,12 @@ mod tests {
     /// back to "ask everything", which looks exactly like a policy that genuinely says ask. This
     /// test drives a real session lifecycle + tool call and asserts the messages actually arrive at
     /// the host boundary.
-    #[tokio::test]
-    async fn malformed_policy_and_config_files_notify_the_host() {
+    #[test]
+    fn malformed_policy_and_config_files_notify_the_host() {
+        with_config_env_lock(malformed_policy_and_config_files_notify_the_host_body());
+    }
+
+    async fn malformed_policy_and_config_files_notify_the_host_body() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         // Present, but truncated mid-object: exists (so it is not the silent ENOENT case) and does

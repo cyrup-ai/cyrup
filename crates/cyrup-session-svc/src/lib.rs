@@ -66,7 +66,10 @@ pub use session::{
     AgentSession, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult, NavigateTreeOptions,
     NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
 };
-pub use state::{CompactionResult, ContextUsage, SessionStateView, SessionStats};
+pub use state::{
+    CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage,
+    StatsTokens,
+};
 pub use tools::ToolInfo;
 // The compaction `reason` carried by `AgentSessionEvent::Compaction{Start,End}` (so a front-end can
 // branch its status copy on manual/threshold/overflow without depending on `cyrup-session` directly).

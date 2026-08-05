@@ -613,8 +613,8 @@ async fn runtime_fork_at_entry_and_fork_anchors() {
 
     // Stats reflect the round-trip.
     let stats = session.session_stats().await;
-    assert_eq!(stats.user_message_count, 1);
-    assert_eq!(stats.assistant_message_count, 1);
+    assert_eq!(stats.user_messages, 1);
+    assert_eq!(stats.assistant_messages, 1);
 
     // The fork anchors enumerate the user message(s) on the branch.
     let anchors = session.user_messages_for_forking().await;

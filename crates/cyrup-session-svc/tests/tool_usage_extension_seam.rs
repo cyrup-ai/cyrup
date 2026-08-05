@@ -272,14 +272,14 @@ async fn tool_reported_usage_reaches_the_session_stats_totals() {
     let (_seen, result, with_tool) = run_full(&fx, Some(usage(11, 22)), Act::Observe).await;
 
     assert_eq!(result.usage, Some(usage(11, 22)));
-    assert_eq!(with_tool.tool_result_count, baseline.tool_result_count, "same shape of run");
+    assert_eq!(with_tool.tool_results, baseline.tool_results, "same shape of run");
     assert_eq!(
-        with_tool.input_tokens - baseline.input_tokens,
+        with_tool.tokens.input - baseline.tokens.input,
         11,
         "the tool's input tokens joined the session totals"
     );
     assert_eq!(
-        with_tool.output_tokens - baseline.output_tokens,
+        with_tool.tokens.output - baseline.tokens.output,
         22,
         "the tool's output tokens joined the session totals"
     );
@@ -292,8 +292,8 @@ async fn the_patched_usage_is_what_the_session_totals_count() {
     let fx = fixture();
     let (_, _, baseline) = run_full(&fx, None, Act::Observe).await;
     let (_, _, patched) = run_full(&fx, Some(usage(11, 22)), Act::Patch(usage(700, 800))).await;
-    assert_eq!(patched.input_tokens - baseline.input_tokens, 700);
-    assert_eq!(patched.output_tokens - baseline.output_tokens, 800);
+    assert_eq!(patched.tokens.input - baseline.tokens.input, 700);
+    assert_eq!(patched.tokens.output - baseline.tokens.output, 800);
 }
 
 /// The common case: no tool reports usage, so two identical runs total identically — i.e. the new
@@ -303,8 +303,9 @@ async fn a_tool_without_usage_contributes_nothing_to_the_totals() {
     let fx = fixture();
     let (_, _, a) = run_full(&fx, None, Act::Observe).await;
     let (_, _, b) = run_full(&fx, None, Act::Observe).await;
-    assert_eq!(a.tool_result_count, 1);
-    assert_eq!(a.input_tokens, b.input_tokens);
-    assert_eq!(a.output_tokens, b.output_tokens);
-    assert_eq!(a.cache_tokens, b.cache_tokens);
+    assert_eq!(a.tool_results, 1);
+    assert_eq!(a.tokens.input, b.tokens.input);
+    assert_eq!(a.tokens.output, b.tokens.output);
+    assert_eq!(a.tokens.cache_read, b.tokens.cache_read);
+    assert_eq!(a.tokens.cache_write, b.tokens.cache_write);
 }
