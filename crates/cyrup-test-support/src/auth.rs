@@ -67,10 +67,13 @@ pub async fn resolve_api_key(provider: &ProviderId) -> Option<String> {
     }
 }
 
-fn now_secs() -> i64 {
+/// Wall clock in Unix **milliseconds** — the unit `Credential::Oauth.expires` is stored in on disk
+/// (Pi writes `Date.now() + expires_in * 1000`, ai/src/auth/oauth/anthropic.ts:225, and compares
+/// against `Date.now()`, ai/src/auth/resolve.ts:110).
+fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -126,7 +129,7 @@ pub async fn resolve_api_key_refreshing_in(
     match &current {
         Credential::ApiKey { key, .. } => return Ok(key.clone()),
         Credential::Oauth { access, expires, .. } => {
-            if now_secs() < *expires {
+            if now_millis() < *expires {
                 return Ok(Some(access.clone()));
             }
         }
@@ -141,7 +144,7 @@ pub async fn resolve_api_key_refreshing_in(
             };
             // Double-check: another request/process may have refreshed it already.
             if let Credential::Oauth { expires, .. } = &cur {
-                if now_secs() < *expires {
+                if now_millis() < *expires {
                     return Ok(None);
                 }
             } else {
@@ -189,7 +192,7 @@ mod tests {
             Ok(PCred::Oauth {
                 refresh: "new-refresh".into(),
                 access: self.new_access.clone(),
-                expires: now_secs() + 3600,
+                expires: now_millis() + 3_600_000,
                 ext: serde_json::Map::new(),
             })
         }
@@ -227,10 +230,39 @@ mod tests {
         match s.read(&provider).await.unwrap() {
             Some(Credential::Oauth { access, expires, .. }) => {
                 assert_eq!(access, "fresh-token");
-                assert!(expires > now_secs());
+                assert!(expires > now_millis());
             }
             other => panic!("expected refreshed oauth, got {other:?}"),
         }
+    }
+
+    /// `expires` is Unix MILLISECONDS (Pi `Date.now() + expires_in * 1000`,
+    /// ai/src/auth/oauth/anthropic.ts:225). Regression guard for CFG-011: a seconds clock is ~1000x
+    /// smaller than a real millisecond deadline, so a token that expired a minute ago was reported
+    /// as still valid and handed back verbatim instead of being refreshed.
+    #[tokio::test]
+    async fn recently_expired_millisecond_deadline_is_refreshed() {
+        let (s, _dir) = store();
+        let provider = ProviderId::from("anthropic");
+        s.modify(&provider, |_| async {
+            Ok(Some(Credential::Oauth {
+                refresh: "r".into(),
+                access: "stale-token".into(),
+                // Expired one minute ago, in the unit the file actually stores.
+                expires: now_millis() - 60_000,
+                ext: serde_json::Map::new(),
+            }))
+        })
+        .await
+        .unwrap();
+
+        let oauth = FreshOAuth { new_access: "fresh-token".into() };
+        let key = resolve_api_key_refreshing_in(&s, &provider, &oauth).await.unwrap();
+        assert_eq!(
+            key.as_deref(),
+            Some("fresh-token"),
+            "a millisecond deadline one minute in the past must be treated as expired"
+        );
     }
 
     #[tokio::test]
@@ -241,7 +273,7 @@ mod tests {
             Ok(Some(Credential::Oauth {
                 refresh: "r".into(),
                 access: "live-token".into(),
-                expires: now_secs() + 3600,
+                expires: now_millis() + 3_600_000,
                 ext: serde_json::Map::new(),
             }))
         })

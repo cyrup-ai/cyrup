@@ -122,10 +122,23 @@ impl Models {
 
     // ---- auth (Pi models.ts:216) ----
 
-    /// Resolve request auth for a model (Pi `getAuth`). `Ok(None)` when the provider is unknown or
-    /// unconfigured; `Err` carries the R-01-017 taxonomy (e.g. `oauth` on a failed token refresh —
-    /// the stored credential is preserved for re-login).
+    /// Resolve request auth for a model (Pi `getAuth(model)` with no overrides). `Ok(None)` when the
+    /// provider is unknown or unconfigured; `Err` carries the R-01-017 taxonomy (e.g. `oauth` on a
+    /// failed token refresh — the stored credential is preserved for re-login).
     pub async fn get_auth(&self, model: &Model) -> Result<Option<AuthResult>, ProviderError> {
+        self.get_auth_with(model, AuthOverrides::default()).await
+    }
+
+    /// [`Self::get_auth`] with per-request overrides (Pi `getAuth(model, overrides)`, models.ts:216
+    /// / `ModelRuntimeAuthOverrides`, model-runtime.ts:72-77). `min_oauth_validity_ms` is how a
+    /// caller that needs a token to survive past the request — Pi's bearer-token export,
+    /// credential-print.ts:122-125 — widens the OAuth refresh window and gets the post-refresh
+    /// contract enforced.
+    pub async fn get_auth_with(
+        &self,
+        model: &Model,
+        overrides: AuthOverrides<'_>,
+    ) -> Result<Option<AuthResult>, ProviderError> {
         let Some(provider) = self.providers.get(model.provider.as_str()) else {
             return Ok(None);
         };
@@ -138,7 +151,7 @@ impl Models {
             model,
             self.credentials.as_ref(),
             self.auth_context.as_ref(),
-            AuthOverrides::default(),
+            overrides,
         )
         .await?)
     }
@@ -349,6 +362,7 @@ impl AuthHelper {
             AuthOverrides {
                 api_key: options.api_key.as_deref(),
                 env: None,
+                min_oauth_validity_ms: None,
             },
         )
         .await?;
@@ -603,6 +617,48 @@ mod tests {
         // Stored credential owns the provider (env not consulted, R-01-012).
         assert_eq!(auth.auth.api_key.as_deref(), Some("stored-key"));
         assert_eq!(auth.source.as_deref(), Some("stored"));
+    }
+
+    /// `get_auth_with` really forwards its overrides (Pi `getAuth(model, overrides)`, models.ts:216)
+    /// — `get_auth` used to hard-code `AuthOverrides::default()`, so the whole override tier,
+    /// `min_oauth_validity_ms` included, was unreachable through this seam.
+    #[tokio::test]
+    async fn get_auth_with_forwards_per_request_overrides() {
+        let store = crate::auth::InMemoryCredentialStore::new()
+            .with_credential(ProviderId::from("groq"), Credential::api_key("stored-key"));
+        let mut models = create_models(CreateModelsOptions {
+            credentials: Some(Arc::new(store)),
+            auth_context: Some(Arc::new(MapCtx(BTreeMap::new()))),
+            catalog_overlay: None,
+        });
+        models.set_provider(Arc::new(fleet::GROQ.provider()));
+        let m = models
+            .get_models(Some("groq"))
+            .into_iter()
+            .next()
+            .expect("groq model");
+
+        let auth = models
+            .get_auth_with(
+                &m,
+                AuthOverrides {
+                    api_key: Some("explicit-key"),
+                    env: None,
+                    min_oauth_validity_ms: Some(30 * 60_000),
+                },
+            )
+            .await
+            .expect("ok")
+            .expect("configured");
+        assert_eq!(
+            auth.auth.api_key.as_deref(),
+            Some("explicit-key"),
+            "the per-request override must reach resolve_provider_auth, not be dropped"
+        );
+
+        // The no-override entry point is unchanged: the stored credential still owns the provider.
+        let auth = models.get_auth(&m).await.expect("ok").expect("configured");
+        assert_eq!(auth.auth.api_key.as_deref(), Some("stored-key"));
     }
 
     #[tokio::test]

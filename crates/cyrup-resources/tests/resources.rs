@@ -2841,3 +2841,316 @@ async fn cfg004_settings_declared_extension_entries_are_loaded_not_just_filtered
     assert!(roots.iter().any(|p| p.ends_with("glob-ext")), "{roots:?}");
     assert!(!roots.iter().any(|p| p.ends_with("proj-ext")), "{roots:?}");
 }
+
+// ===========================================================================
+// CFG-010 — `autoload: false` is a DELTA filter, not an include filter
+// ===========================================================================
+
+/// Pi's object-form package entry carries `autoload` (settings-manager.ts:79, documented at :73 as
+/// "start empty and only apply explicit resource patterns"). `collectPackageResources` branches on
+/// it (package-manager.ts:2084-2085) into `applyPackageDeltaFilter` (:2173-2189), which starts from
+/// an EMPTY set and returns immediately when the user gave no patterns for that resource type
+/// (:2180-2182) — contributing nothing.
+///
+/// cyrup modelled none of it: `autoload` was not a field, so serde dropped it, and
+/// `retain_by_package_filter` saw `patterns == None` for every type and kept the package's ENTIRE
+/// manifest. A package the user explicitly opted out of loaded in full.
+#[tokio::test]
+async fn cfg010_autoload_false_with_no_patterns_contributes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkgsrc");
+    make_package_tree(&pkg, true, false);
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter {
+            autoload: Some(false),
+            ..Default::default()
+        },
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "autoload=false with no `skills` patterns contributes NO skills"
+    );
+    assert!(!report.registry.prompts.contains("greet"), "…no prompts");
+    assert!(!report.registry.themes.contains("midnight"), "…no themes");
+    assert!(
+        !report
+            .registry
+            .ext_crate_paths
+            .iter()
+            .any(|p| p.ends_with("deploy")),
+        "…and no extensions"
+    );
+}
+
+/// The delta half: under `autoload: false` an explicit pattern list ADDS BACK exactly what it names
+/// (`applyAutoloadDisabledPatterns`, package-manager.ts:760-777 — start empty, each pattern sets its
+/// matches' enabled flag, later patterns winning). Contrast the ordinary include-filter meaning of
+/// the same list, which starts from everything.
+#[tokio::test]
+async fn cfg010_autoload_false_adds_back_only_the_named_patterns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkgsrc");
+    make_package_tree(&pkg, true, false);
+    write(
+        &pkg.join("skills/beta/SKILL.md"),
+        &skill_md("beta", "beta skill"),
+    );
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter {
+            autoload: Some(false),
+            skills: Some(vec!["skills/alpha/**".to_string()]),
+            ..Default::default()
+        },
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "the named skill is added back"
+    );
+    assert!(
+        !report.registry.skills.contains("beta"),
+        "an unnamed sibling stays out"
+    );
+    assert!(
+        !report.registry.prompts.contains("greet"),
+        "a resource type with no patterns is still empty — the delta is per-type"
+    );
+
+    // A `!`/`-` pattern under autoload=false names something to keep DISABLED, so it adds nothing
+    // (`enabled = !pattern.startsWith("-") && !pattern.startsWith("!")`, :766).
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter {
+            autoload: Some(false),
+            skills: Some(vec!["!skills/alpha/**".to_string()]),
+            ..Default::default()
+        },
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "a negative pattern under autoload=false adds nothing back"
+    );
+}
+
+/// `autoload: true` (and the absent case) must leave the ordinary include-filter path untouched —
+/// Pi only takes the delta branch on an explicit `=== false` (package-manager.ts:2084).
+#[tokio::test]
+async fn cfg010_autoload_true_keeps_the_ordinary_include_filter_meaning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkgsrc");
+    make_package_tree(&pkg, true, false);
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![cyrup_resources::ConfiguredPackage {
+        source: pkg.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: cyrup_resources::PackageFilter {
+            autoload: Some(true),
+            ..Default::default()
+        },
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(report.registry.skills.contains("alpha"));
+    assert!(report.registry.prompts.contains("greet"));
+    assert!(report.registry.themes.contains("midnight"));
+}
+
+/// CFG-010 (dedupe half) — a PROJECT `autoload: false` entry is a DELTA **over** the global entry
+/// for the same package, not a replacement of it.
+///
+/// Pi's `dedupePackages` says so in its own doc comment — "A project entry with autoload=false is
+/// a delta over the global entry, so both are kept (delta first)" (package-manager.ts:1676-1679) —
+/// and keeps both at :1691-1696. `resolvePackageSources` then processes the delta first, so under
+/// `addResource`'s first-writer-wins map (:2488-2490) the delta OWNS the verdict for every file it
+/// names and the global entry fills in everything else. Pi pins exactly this at
+/// package-manager.test.ts:1714-1738: `-extensions/foo.ts` stays disabled at project scope while
+/// its sibling loads at user scope.
+///
+/// cyrup dropped the second entry unconditionally, which inverted the feature: the project entry's
+/// patterns became the only thing that loaded.
+#[tokio::test]
+async fn cfg010_project_autoload_false_entry_is_a_delta_over_the_global_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkgsrc");
+    make_package_tree(&pkg, true, false);
+    write(
+        &pkg.join("skills/beta/SKILL.md"),
+        &skill_md("beta", "beta skill"),
+    );
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+    let source = pkg.to_string_lossy().into_owned();
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+
+    // --- negative delta: opt ONE skill out of an otherwise fully autoloaded global package ---
+    // `-p` matches exactly, and an exact pattern naming a skill DIRECTORY matches its `SKILL.md`
+    // (`matchesAnyExactPattern`, package-manager.ts:661-679).
+    cfg.configured_packages = vec![
+        cyrup_resources::ConfiguredPackage {
+            source: source.clone(),
+            scope: InstallScope::Project,
+            filter: cyrup_resources::PackageFilter {
+                autoload: Some(false),
+                skills: Some(vec!["-skills/alpha".to_string()]),
+                ..Default::default()
+            },
+        },
+        cyrup_resources::ConfiguredPackage {
+            source: source.clone(),
+            scope: InstallScope::Global,
+            filter: cyrup_resources::PackageFilter::default(),
+        },
+    ];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report.registry.skills.contains("beta"),
+        "the global entry still autoloads everything the delta did not name"
+    );
+    assert!(
+        report.registry.prompts.contains("greet"),
+        "…including resource types the delta says nothing about"
+    );
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "the project delta's `-` pattern keeps `alpha` off even though the global entry autoloads it"
+    );
+
+    // --- positive delta: the named resource loads at PROJECT scope, the rest at GLOBAL scope ---
+    cfg.configured_packages = vec![
+        cyrup_resources::ConfiguredPackage {
+            source: source.clone(),
+            scope: InstallScope::Project,
+            filter: cyrup_resources::PackageFilter {
+                autoload: Some(false),
+                skills: Some(vec!["skills/alpha/**".to_string()]),
+                ..Default::default()
+            },
+        },
+        cyrup_resources::ConfiguredPackage {
+            source,
+            scope: InstallScope::Global,
+            filter: cyrup_resources::PackageFilter::default(),
+        },
+    ];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    let alpha = report
+        .registry
+        .skills
+        .get_name("alpha")
+        .expect("the delta names `alpha`, and the global entry autoloads it anyway");
+    let beta = report
+        .registry
+        .skills
+        .get_name("beta")
+        .expect("the global entry contributes the rest of the package");
+    assert_eq!(
+        alpha.scope,
+        ResourceScope::ProjectPackage,
+        "a file the delta names is attributed to the PROJECT entry (Pi: scope \"project\")"
+    );
+    assert_eq!(
+        beta.scope,
+        ResourceScope::GlobalPackage,
+        "everything else is attributed to the global entry (Pi: scope \"user\")"
+    );
+    // Pi's accumulator is a Map keyed by path, so a delta pair can never double-list a file.
+    assert_eq!(
+        report
+            .registry
+            .skills
+            .all()
+            .iter()
+            .filter(|s| s.name == "alpha")
+            .count(),
+        1,
+        "the delta pair must not list the same file twice"
+    );
+}
+
+/// CFG-010 (dedupe half) — the project delta RESOLVES against the entry it deltas over.
+///
+/// Pi's `findAutoloadDeltaBase` (package-manager.ts:1285-1299) swaps in the user entry's source and
+/// scope (`resolvedSource`/`resolvedScope`, :1232-1234) before parsing, so the pair lands on ONE
+/// working tree. Without it the same relative source string resolves against `<cwd>/.cyrup` for the
+/// project entry and the agent dir for the global one — two different (usually non-existent)
+/// directories, and the delta would silently apply to nothing.
+#[tokio::test]
+async fn cfg010_project_delta_resolves_against_the_global_entrys_install_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    // The package lives ONLY under the global base dir — the project base dir has no such tree.
+    let pkg = global.join("shared-pack");
+    make_package_tree(&pkg, true, false);
+    write(
+        &pkg.join("skills/beta/SKILL.md"),
+        &skill_md("beta", "beta skill"),
+    );
+
+    let mut cfg = DiscoveryConfig::new(cwd, global);
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![
+        cyrup_resources::ConfiguredPackage {
+            source: "shared-pack".into(),
+            scope: InstallScope::Project,
+            filter: cyrup_resources::PackageFilter {
+                autoload: Some(false),
+                skills: Some(vec!["-skills/alpha".to_string()]),
+                ..Default::default()
+            },
+        },
+        cyrup_resources::ConfiguredPackage {
+            source: "shared-pack".into(),
+            scope: InstallScope::Global,
+            filter: cyrup_resources::PackageFilter::default(),
+        },
+    ];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|d| !d.message.contains("shared-pack")),
+        "the delta must resolve to the global entry's tree, not to a missing project path: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report.registry.skills.contains("beta"),
+        "the global entry autoloads the rest of the package"
+    );
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "the delta's `-` pattern reached the same tree and kept `alpha` off"
+    );
+}

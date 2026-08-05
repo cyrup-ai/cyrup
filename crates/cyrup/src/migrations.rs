@@ -92,11 +92,18 @@ fn migrate_auth_to_auth_json(agent_dir: &Path) -> Vec<String> {
         }
     }
 
-    if !migrated.is_empty() {
-        let _ = std::fs::create_dir_all(agent_dir);
-        if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(migrated)) {
-            let _ = std::fs::write(&auth_path, serialized);
-        }
+    if !migrated.is_empty()
+        && let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(migrated))
+    {
+        // `auth.json` carries OAuth access/refresh tokens and plaintext API keys, so it MUST be
+        // owner-only — Pi writes it with `{ mode: 0o600 }` (migrations.ts:69) and creates its dir
+        // 0700 (auth-storage.ts:55). A plain `fs::write` uses the ambient umask, which leaves the
+        // credentials group- or world-readable on a permissive umask. `write_atomic(secret=true)` is
+        // the same writer [`cyrup_config::AuthStore::save`] uses, so the migrated file lands with
+        // exactly the mode the store would have given it. This branch only ever CREATES the file —
+        // the fn returned early above when `auth.json` already existed — so no pre-existing file's
+        // permissions are read, relaxed, or otherwise touched.
+        let _ = cyrup_config::lock::write_atomic(&auth_path, serialized.as_bytes(), true);
     }
     providers
 }
@@ -345,6 +352,35 @@ mod tests {
         // Idempotent: a second run does nothing (auth.json already present).
         let again = run_migrations(&d);
         assert!(again.migrated_auth_providers.is_empty());
+    }
+
+    /// The migrated `auth.json` holds OAuth tokens and plaintext API keys, so it must land at 0600
+    /// regardless of the ambient umask (Pi `writeFileSync(authPath, …, { mode: 0o600 })`,
+    /// migrations.ts:69). Regression guard for CFG-032, which wrote it with the default umask.
+    #[cfg(unix)]
+    #[test]
+    fn migrated_auth_json_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        std::fs::create_dir_all(&d.agent_dir).unwrap();
+        std::fs::write(
+            d.agent_dir.join("oauth.json"),
+            r#"{"anthropic":{"access":"secret-access","refresh":"secret-refresh"}}"#,
+        )
+        .unwrap();
+
+        run_migrations(&d);
+
+        let auth_path = d.agent_dir.join("auth.json");
+        let mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auth.json holds credentials and must be owner-read/write only, got {mode:o}"
+        );
+        // And the credential really is in there, so the assertion is about a live secret.
+        assert!(std::fs::read_to_string(&auth_path).unwrap().contains("secret-refresh"));
     }
 
     #[test]

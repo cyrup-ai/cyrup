@@ -51,7 +51,7 @@ pub use auth::{
     EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn, OAuthAuth, ProviderAuth,
     ProviderEnv, env_key, keyless_local, resolve_provider_auth,
 };
-pub use catalog::{load_catalog, seed_catalog};
+pub use catalog::{builtin_catalog, load_catalog};
 pub use collection::{
     CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, clamp_thinking_level, create_models,
     get_supported_thinking_levels, has_api, models_are_equal,

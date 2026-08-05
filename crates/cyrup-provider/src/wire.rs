@@ -112,6 +112,7 @@ impl Provider for WireProvider {
             let overrides = AuthOverrides {
                 api_key: options.api_key.as_deref(),
                 env: options.env.as_ref(),
+                min_oauth_validity_ms: None,
             };
             let mut auth_result = match resolve_provider_auth(
                 &id,

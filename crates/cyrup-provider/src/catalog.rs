@@ -1,8 +1,9 @@
 //! Static model-catalog seam (arch-01 §3.1).
 //!
-//! Providers ship a seed catalog from embedded JSON (models.dev-shaped, in this crate's neutral
-//! [`Model`] serde form). The generation timestamp shared by every embedded catalog lives in
-//! [`crate::providers::all::BUILTIN_CATALOG_MANIFEST_JSON`].
+//! Providers ship their catalog from embedded JSON (models.dev-shaped, in this crate's neutral
+//! [`Model`] serde form); [`builtin_catalog`] is the union of all of them — the registry catalog
+//! any consumer that needs model METADATA should read. The generation timestamp shared by every
+//! embedded catalog lives in [`crate::providers::all::BUILTIN_CATALOG_MANIFEST_JSON`].
 //!
 //! **The runtime refresh is no longer deferred** (DRIFT-007): [`crate::remote_catalog`] ports Pi's
 //! `withRemoteCatalog` — a persisted pi.dev overlay with `ETag` revalidation, a 4h freshness window
@@ -17,10 +18,29 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-/// The embedded seed catalog (a hand-seeded subset; full models.dev generation is DEFERRED).
-/// Never panics: a malformed embed yields an empty catalog (R-01-001 sync, non-throwing reads).
-pub fn seed_catalog() -> Vec<Model> {
-    load_catalog(include_str!("catalog/seed.json")).unwrap_or_default()
+/// Every model the implemented built-in providers ship — the real, whole model registry catalog
+/// (Pi `Models.getModels()` over `builtinModels()`, `models.ts:130` / `all.ts:111-117`).
+///
+/// This is the credential-BLIND read: it is the complete synchronous catalog, exactly as Pi
+/// documents `getModels()` ("`getModels()` remains the complete synchronous catalog", `models.ts:108`),
+/// and it is what an embedder that only needs provider/model METADATA (cost, reasoning,
+/// `context_window`, `max_tokens`) should consult. Pi's credential-FILTERED
+/// `Models.getAvailable()` (`models.ts:394-408`, provider auth checked per provider) has no port in
+/// this crate yet; a caller that wants availability must layer its own auth check on top.
+///
+/// Composition matches [`crate::providers::all::default_models`] with default options: every
+/// built-in provider, no remote overlay, ordered by provider id (the collection holds providers in
+/// a `BTreeMap`) then by each provider's own catalog order. Parsed ONCE and cached — the embedded
+/// catalogs are compile-time constants, so nothing here can change between calls.
+///
+/// Never panics: a provider whose catalog fails to parse simply contributes no models (Pi's
+/// catch-and-skip contract, `models.ts:99-101`).
+pub fn builtin_catalog() -> &'static [Model] {
+    static CATALOG: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        crate::providers::all::default_models(crate::collection::CreateModelsOptions::default())
+            .get_models(None)
+    })
 }
 
 #[cfg(test)]
@@ -29,17 +49,46 @@ mod tests {
     use super::*;
     use crate::known_api;
 
+    /// The registry catalog is the WHOLE built-in registry, not a hand-seeded subset: every
+    /// registered provider contributes, and the metadata is the live embedded catalog's (so
+    /// Sonnet 4.5's context window is the real 1M, not the retired 200k of the old seed stub).
     #[test]
-    fn seed_catalog_parses() {
-        let catalog = seed_catalog();
-        assert!(catalog.len() >= 2);
-        let anthropic = catalog
+    fn builtin_catalog_is_the_whole_registry() {
+        let catalog = builtin_catalog();
+        let providers: std::collections::BTreeSet<&str> =
+            catalog.iter().map(|m| m.provider.as_str()).collect();
+        assert!(
+            providers.len() >= 25,
+            "every built-in provider must contribute, got {} providers",
+            providers.len()
+        );
+        // Providers that the retired 2-model seed stub could never answer for.
+        for expected in ["google", "mistral", "groq", "openrouter", "together"] {
+            assert!(providers.contains(expected), "{expected} missing from the registry catalog");
+        }
+        let sonnet = catalog
             .iter()
-            .find(|m| m.api.as_str() == known_api::ANTHROPIC_MESSAGES)
-            .expect("anthropic model present");
-        assert!(anthropic.reasoning);
-        assert!((anthropic.cost.cache_write - 3.75).abs() < 1e-9);
-        assert_eq!(anthropic.context_window, 200_000);
+            .find(|m| m.provider.as_str() == "anthropic" && m.id.as_str() == "claude-sonnet-4-5")
+            .expect("anthropic claude-sonnet-4-5 present");
+        assert_eq!(sonnet.api.as_str(), known_api::ANTHROPIC_MESSAGES);
+        assert!(sonnet.reasoning);
+        assert_eq!(
+            sonnet.context_window, 1_000_000,
+            "metadata comes from the live embedded catalog"
+        );
+        // A `baseUrl` is an ORIGIN, never a full endpoint path (the seed stub stored
+        // `https://api.anthropic.com/v1/messages`).
+        assert!(
+            !sonnet.base_url.ends_with("/v1/messages"),
+            "baseUrl must be an origin, got {}",
+            sonnet.base_url
+        );
+    }
+
+    /// Cached: the same slice is returned every call (no re-parse of ~470 KB of embedded JSON).
+    #[test]
+    fn builtin_catalog_is_parsed_once() {
+        assert!(std::ptr::eq(builtin_catalog(), builtin_catalog()));
     }
 
     #[test]

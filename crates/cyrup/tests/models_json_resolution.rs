@@ -21,7 +21,7 @@ use std::sync::Arc;
 use cyrup::provider::{
     BuiltinProviderResolver, all_available_models, default_launch_model, select_provider,
 };
-use cyrup_config::{ModelFile, load_models_file};
+use cyrup_config::{AuthStore, ModelFile, load_models_file};
 use cyrup_session_svc::ProviderResolver;
 
 fn model_file(json: &str) -> ModelFile {
@@ -87,17 +87,96 @@ fn a_models_json_model_is_listed_by_list_models() {
     assert!(all.iter().any(|m| m.provider.as_str() == "anthropic"));
 }
 
+/// The predicate `main.rs` installs for the default-launch path, over an `auth.json` that does not
+/// exist — i.e. a fresh install whose ONLY credential is the one written in `models.json`.
+fn launch_predicate<'a>(
+    auth: &'a AuthStore,
+    file: &'a ModelFile,
+) -> impl Fn(&cyrup_provider::Model) -> bool + 'a {
+    move |m: &cyrup_provider::Model| {
+        cyrup_config::provider_is_configured(auth, file, &m.provider, None)
+    }
+}
+
 /// A saved settings `defaultModel` naming a custom provider (Pi `findInitialModel` step 3,
-/// model-resolver.ts:600-609 — it searches the full composed registry).
+/// model-resolver.ts:620-630 — it searches the full composed registry).
+///
+/// REWRITTEN for CFG-022: this used to pass `|_| true` as the availability predicate, which made it
+/// pass identically with `|_| false` — step 3 never consults the predicate, so the file's only
+/// launch-path test could not fail on the predicate bug at all. It now drives the REAL predicate.
 #[test]
 fn a_settings_default_model_can_name_a_models_json_provider() {
     let file = model_file(MYCORP);
-    let configured = |_: &cyrup_provider::Model| true;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = AuthStore::at(dir.path().join("auth.json"));
+    let configured = launch_predicate(&auth, &file);
     let (provider, pattern) =
         default_launch_model(Some("mycorp"), Some("mycorp-large"), &configured, &file)
             .expect("the saved default must resolve against the composed registry");
     assert_eq!(provider, "mycorp");
     assert_eq!(pattern, "mycorp/mycorp-large");
+}
+
+/// CFG-022 — `findInitialModel` STEP 4 (model-resolver.ts:633-648), the ONLY step that consults the
+/// availability predicate: with no `defaultModel` saved, launch picks the first model whose provider
+/// `hasConfiguredAuth`. Pi builds that set from `configuredProviders`, which `models.checkAuth` fills
+/// for EVERY composed provider — including a models.json-only one, whose check is the presence-only
+/// closure at provider-composer.ts:314-332.
+///
+/// cyrup's launch predicate was `AuthStore::has_auth` alone, which knows only `--api-key`, an
+/// `auth.json` entry, and the `env_keys` table of KNOWN provider ids. A user-declared provider
+/// matches none of the three, so a fresh install whose only credential lives in `models.json`
+/// filtered its own provider out and fell back to the offline faux provider.
+#[test]
+fn a_models_json_provider_is_available_at_launch_with_no_auth_json() {
+    let file = model_file(MYCORP);
+    let dir = tempfile::tempdir().unwrap();
+    let auth_path = dir.path().join("auth.json");
+    assert!(!auth_path.exists(), "fresh install: nothing stored");
+    let auth = AuthStore::at(auth_path);
+    let configured = launch_predicate(&auth, &file);
+
+    // Step 4's input list: the composed registry filtered by the predicate.
+    let available: Vec<_> = all_available_models(&file)
+        .into_iter()
+        .filter(&configured)
+        .collect();
+    assert!(
+        available
+            .iter()
+            .any(|m| m.provider.as_str() == "mycorp" && m.id.as_str() == "mycorp-large"),
+        "a models.json provider carrying its own apiKey is configured auth; step 4 saw only {:?}",
+        available
+            .iter()
+            .map(|m| m.provider.as_str().to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    // …so step 4 always yields a real provider rather than leaving the caller on faux.
+    assert!(
+        default_launch_model(None, None, &configured, &file).is_some(),
+        "with an available model, step 4 must resolve a launch model"
+    );
+}
+
+/// The negative half, so the predicate cannot be "always true": a models.json block with NO `apiKey`
+/// (a `baseUrl`-only proxy overlay on a built-in) contributes no credential of its own.
+#[test]
+fn a_models_json_provider_without_an_api_key_is_not_configured() {
+    let file = model_file(
+        r#"{"providers":{"keyless":{"baseUrl":"https://keyless.example/v1","api":"openai-completions",
+             "models":[{"id":"k1"}]}}}"#,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let auth = AuthStore::at(dir.path().join("auth.json"));
+    let configured = launch_predicate(&auth, &file);
+    assert!(
+        !all_available_models(&file)
+            .iter()
+            .filter(|m| m.provider.as_str() == "keyless")
+            .any(&configured),
+        "no apiKey, no stored credential, no known env var — not configured"
+    );
 }
 
 /// An in-session `/model` swap onto the custom provider (`BuiltinProviderResolver` is what

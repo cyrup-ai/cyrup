@@ -382,6 +382,77 @@ pub(crate) fn apply_settings_patterns(
     apply_patterns_full(base, all, patterns)
 }
 
+/// Port of `applyAutoloadDisabledPatterns` (package-manager.ts:760-777) — the `autoload: false`
+/// DELTA rule, and the exact inverse of [`apply_settings_patterns`]'s starting point.
+///
+/// Pi builds a `Map<path, enabled>` that starts EMPTY: a file appears only because some pattern
+/// named it, and a later pattern overwrites an earlier verdict for the same file. Each pattern
+/// carries its own meaning rather than feeding four ordered phases:
+///
+/// - `+p` / `-p` match EXACTLY, `p` / `!p` match as globs (`exact`, :767);
+/// - `-p` and `!p` mark their matches DISABLED, everything else marks them enabled (`enabled`, :766).
+///
+/// So `["skills/a/**"]` yields exactly the files under `skills/a`, and `["!skills/a/**"]` yields
+/// nothing at all — under `autoload: false` a negative pattern names something to keep off, which
+/// was already the default.
+///
+/// Returned in first-named order, disabled entries dropped: cyrup's collection buffers hold only
+/// live resources, where Pi carries an `enabled` flag its consumers filter on later.
+pub(crate) fn apply_autoload_disabled_patterns(
+    base: &Path,
+    all: &[PathBuf],
+    patterns: &[String],
+) -> Vec<PathBuf> {
+    autoload_delta_verdicts(base, all, patterns)
+        .into_iter()
+        .filter_map(|(path, enabled)| enabled.then_some(path))
+        .collect()
+}
+
+/// Every path a `autoload: false` delta pattern list NAMED, with the verdict it left, in
+/// first-named order — Pi's `applyAutoloadDisabledPatterns` `Map<path, enabled>` before its
+/// consumers read the flag (package-manager.ts:760-777).
+///
+/// [`apply_autoload_disabled_patterns`] keeps only the `true` half (what the delta ADDS BACK).
+/// The paired-entry path needs the whole map: under Pi's first-writer-wins accumulator
+/// (`addResource`, :2488-2490) the delta entry claims the slot for every path it names — enabled or
+/// disabled — and the global entry it deltas over may only fill in the paths left over.
+pub(crate) fn autoload_delta_verdicts(
+    base: &Path,
+    all: &[PathBuf],
+    patterns: &[String],
+) -> Vec<(PathBuf, bool)> {
+    let mut verdicts: Vec<(PathBuf, bool)> = Vec::new();
+    for pattern in patterns {
+        let (target, exact, enabled) = if let Some(rest) = pattern.strip_prefix('+') {
+            (rest, true, true)
+        } else if let Some(rest) = pattern.strip_prefix('-') {
+            (rest, true, false)
+        } else if let Some(rest) = pattern.strip_prefix('!') {
+            (rest, false, false)
+        } else {
+            (pattern.as_str(), false, true)
+        };
+        let targets = [target.to_string()];
+        for path in all {
+            let hit = if exact {
+                matches_any_exact(base, path, &targets)
+            } else {
+                matches_any_pattern(base, path, &targets)
+            };
+            if !hit {
+                continue;
+            }
+            match verdicts.iter_mut().find(|(seen, _)| seen == path) {
+                // `Map.set` on an existing key keeps its slot and replaces the verdict.
+                Some(slot) => slot.1 = enabled,
+                None => verdicts.push((path.clone(), enabled)),
+            }
+        }
+    }
+    verdicts
+}
+
 fn apply_patterns_full(base: &Path, all: &[PathBuf], patterns: &[String]) -> Vec<PathBuf> {
     let mut includes: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();

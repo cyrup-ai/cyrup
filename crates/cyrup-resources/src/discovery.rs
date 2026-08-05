@@ -231,6 +231,10 @@ struct PackageTree {
     tier: ResourceScope,
     disabled: DisabledSet,
     filter: PackageFilter,
+    /// Set only on the USER/global half of a `dedupePackages` DELTA PAIR — the filter of the
+    /// project-scope `autoload: false` entry that deltas over this one. See
+    /// [`subtract_delta_shadow`].
+    delta_shadow: Option<PackageFilter>,
 }
 
 /// Borrowed view of a [`PackageTree`] used inside the collection loop.
@@ -238,18 +242,44 @@ struct PackageTreeRef<'a> {
     id: &'a cyrup_core::PackageId,
     disabled: &'a DisabledSet,
     filter: &'a PackageFilter,
+    delta_shadow: Option<&'a PackageFilter>,
 }
 
-/// Apply a settings-declared package's per-type include filter to a collected buffer (Pi
-/// `applyPackageFilter`, package-manager.ts:2147-2171). `None` keeps everything (the package's own
-/// manifest already selected it); an explicitly EMPTY list disables the whole resource type
-/// (:2156-2162); otherwise `applyPatterns` selects, relative to the package root.
+/// Apply a settings-declared package's per-type filter to a collected buffer, in whichever of Pi's
+/// two modes the entry selected (`collectPackageResources`, package-manager.ts:2079-2092).
+///
+/// `delta` is the entry's `autoload: false` (`filter.autoload === false`, :2084 — only an explicit
+/// `false`, so [`PackageFilter::is_delta`] is the exact test):
+///
+/// - `delta == false` — INCLUDE filter (`applyPackageFilter`, :2147-2171). `None` keeps everything
+///   (the package's own manifest already selected it); an explicitly EMPTY list disables the whole
+///   resource type (:2156-2162); otherwise `applyPatterns` narrows, relative to the package root.
+/// - `delta == true` — DELTA (`applyPackageDeltaFilter`, :2173-2189). The buffer starts EMPTY and
+///   only what the patterns name is added back. With no patterns for this type Pi returns straight
+///   away having added nothing (:2180-2182), so an entry that is just
+///   `{"source": …, "autoload": false}` contributes zero resources — the point of opting out.
 fn retain_by_package_filter<T>(
     buf: &mut Vec<T>,
     path_of: impl Fn(&T) -> PathBuf,
     package_root: &Path,
     patterns: Option<&[String]>,
+    delta: bool,
 ) {
+    if delta {
+        let patterns = patterns.unwrap_or_default();
+        if patterns.is_empty() {
+            buf.clear();
+            return;
+        }
+        let all: Vec<PathBuf> = buf.iter().map(&path_of).collect();
+        let enabled = crate::package::manifest::apply_autoload_disabled_patterns(
+            package_root,
+            &all,
+            patterns,
+        );
+        buf.retain(|item| enabled.contains(&path_of(item)));
+        return;
+    }
     let Some(patterns) = patterns else {
         return;
     };
@@ -262,6 +292,37 @@ fn retain_by_package_filter<T>(
     buf.retain(|item| enabled.contains(&path_of(item)));
 }
 
+/// Drop from a base entry's buffer everything the project-scope `autoload: false` entry that deltas
+/// over it NAMED — the second half of Pi's `dedupePackages` delta pair.
+///
+/// Pi keeps both entries and resolves the delta FIRST (`dedupePackages`, package-manager.ts:1691-1696,
+/// then `resolvePackageSources`, :1229), writing into an accumulator whose `addResource` is
+/// first-writer-wins (`if (!map.has(path))`, :2488-2490). So the delta entry claims the slot for
+/// every path its patterns name — whether it enabled or disabled it — and the base entry only fills
+/// in the paths left over. cyrup's buffers carry live resources instead of Pi's `enabled` flag, so
+/// the same net set is reached by SUBTRACTION: a path the delta enabled was already contributed by
+/// the delta tree (at project scope, which also wins the shared rank-4 tie), and a path it disabled
+/// must not reappear via the base.
+///
+/// `None`/empty patterns for a resource type name nothing, so the base contributes that type in
+/// full — matching `applyPackageDeltaFilter`'s early return (:2180-2182).
+fn subtract_delta_shadow<T>(
+    buf: &mut Vec<T>,
+    path_of: impl Fn(&T) -> PathBuf,
+    package_root: &Path,
+    patterns: Option<&[String]>,
+) {
+    let Some(patterns) = patterns.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let all: Vec<PathBuf> = buf.iter().map(&path_of).collect();
+    let named = crate::package::manifest::autoload_delta_verdicts(package_root, &all, patterns);
+    buf.retain(|item| {
+        let path = path_of(item);
+        !named.iter().any(|(named_path, _)| named_path == &path)
+    });
+}
+
 /// Resolve a settings-declared package entry to its on-disk working tree.
 ///
 /// Pi's `resolvePackageSources` (package-manager.ts:1224-1283) resolves a `local` source against the
@@ -270,16 +331,33 @@ fn retain_by_package_filter<T>(
 /// network install during session assembly — a non-local source resolves only through the existing
 /// install registry paths, and anything unresolvable becomes a loud [`ResourceDiagnostic`] instead of
 /// a silent drop or a failed session (constraint: malformed/missing declarations fail loudly + safely).
+///
+/// `all` is the full declared set, needed for Pi's `findAutoloadDeltaBase`
+/// (package-manager.ts:1285-1299): a project-scope `autoload: false` entry RESOLVES against the
+/// user-scope entry it deltas over (`resolvedSource`/`resolvedScope`, :1232-1234) so the pair lands
+/// on one working tree even where the two scopes resolve the same source string differently — a
+/// relative local path, or an npm install root. Its `tier` still comes from its own scope, exactly
+/// like Pi's `metadata` (`{ source: sourceStr, scope, … }`, :1235).
 fn resolve_configured_package(
     declared: &ConfiguredPackage,
+    all: &[ConfiguredPackage],
     cfg: &DiscoveryConfig,
 ) -> Result<PackageTree, Box<ResourceDiagnostic>> {
     let tier = declared.scope.package_resource_scope();
-    let base = match declared.scope {
+    let delta_base = if declared.scope == InstallScope::Project && declared.filter.is_delta() {
+        all.iter().find(|e| {
+            e.scope == InstallScope::Global && e.source.trim() == declared.source.trim()
+        })
+    } else {
+        None
+    };
+    let resolve_scope = delta_base.map_or(declared.scope, |e| e.scope);
+    let resolve_source = delta_base.map_or(declared.source.as_str(), |e| e.source.as_str());
+    let base = match resolve_scope {
         InstallScope::Project => cfg.cwd.join(".cyrup"),
         InstallScope::Global => cfg.global_dir.clone(),
     };
-    let source = crate::package::PackageSource::parse(declared.source.trim()).map_err(|e| {
+    let source = crate::package::PackageSource::parse(resolve_source.trim()).map_err(|e| {
         Box::new(ResourceDiagnostic::error(
             ResourceKind::Package,
             &base,
@@ -303,7 +381,7 @@ fn resolve_configured_package(
         // git/oci: use the tree a previous `cyrup install` materialized, if any.
         _ => installed_dir(
             &source,
-            declared.scope,
+            resolve_scope,
             &id,
             &cfg.package_global_dir,
             cfg.project_root.as_deref(),
@@ -337,6 +415,7 @@ fn resolve_configured_package(
         tier,
         disabled: DisabledSet::default(),
         filter: declared.filter.clone(),
+        delta_shadow: None,
     })
 }
 
@@ -593,12 +672,31 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         InstallScope::Project => 0u8,
         InstallScope::Global => 1u8,
     });
+    // Project-scope `autoload: false` entries that ACTUALLY resolved, in declaration order. The
+    // global entry each one deltas over carries it as its `delta_shadow` (Pi's `dedupePackages`
+    // keeps both halves of the pair, package-manager.ts:1691-1696). Recorded from the admitted
+    // trees, not from the raw settings, so an untrusted or unresolvable project entry cannot reach
+    // in and suppress resources from the global package it names.
+    let mut project_deltas: Vec<(String, PackageFilter)> = Vec::new();
     for declared in ordered_cfg {
         if declared.scope == InstallScope::Project && !cfg.trusted_project {
             continue; // fail-closed trust gate (Pi `assertProjectTrustedForScope`, 2055-2058)
         }
-        match resolve_configured_package(declared, cfg) {
-            Ok(tree) => trees.push(tree),
+        match resolve_configured_package(declared, &cfg.configured_packages, cfg) {
+            Ok(mut tree) => {
+                match declared.scope {
+                    InstallScope::Project if declared.filter.is_delta() => project_deltas
+                        .push((declared.source.trim().to_string(), declared.filter.clone())),
+                    InstallScope::Global => {
+                        tree.delta_shadow = project_deltas
+                            .iter()
+                            .find(|(source, _)| source == declared.source.trim())
+                            .map(|(_, filter)| filter.clone());
+                    }
+                    InstallScope::Project => {}
+                }
+                trees.push(tree);
+            }
             Err(diag) => diagnostics.push(*diag),
         }
     }
@@ -628,6 +726,7 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             tier: pkg.scope.package_resource_scope(),
             disabled: pkg.disabled.clone(),
             filter: PackageFilter::default(),
+            delta_shadow: None,
         });
     }
     let mut seen_trees: Vec<PathBuf> = Vec::new();
@@ -638,8 +737,13 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             tier,
             disabled,
             filter,
+            delta_shadow,
         } = tree;
-        if seen_trees.contains(&dir) {
+        // The base half of a delta pair intentionally revisits a tree the project delta already
+        // walked — Pi processes both entries (`dedupePackages`, package-manager.ts:1691-1696).
+        // Every other repeat is a genuine duplicate (the install registry re-declaring a settings
+        // package) and is skipped.
+        if seen_trees.contains(&dir) && delta_shadow.is_none() {
             continue;
         }
         seen_trees.push(dir.clone());
@@ -647,6 +751,7 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             id: &id,
             disabled: &disabled,
             filter: &filter,
+            delta_shadow: delta_shadow.as_ref(),
         };
         let manifest = match resolve_manifest(&dir) {
             Ok(m) => m,
@@ -683,6 +788,13 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     |s| s.skill_md.clone(),
                     &dir,
                     pkg.filter.skills.as_deref(),
+                    pkg.filter.is_delta(),
+                );
+                subtract_delta_shadow(
+                    &mut buf,
+                    |s| s.skill_md.clone(),
+                    &dir,
+                    pkg.delta_shadow.and_then(|f| f.skills.as_deref()),
                 );
                 for s in &mut buf {
                     s.origin = origin.clone();
@@ -718,6 +830,13 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     |p| p.path.clone(),
                     &dir,
                     pkg.filter.prompts.as_deref(),
+                    pkg.filter.is_delta(),
+                );
+                subtract_delta_shadow(
+                    &mut buf,
+                    |p| p.path.clone(),
+                    &dir,
+                    pkg.delta_shadow.and_then(|f| f.prompts.as_deref()),
                 );
                 for p in &mut buf {
                     p.origin = origin.clone();
@@ -753,6 +872,13 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
                     |t| t.origin_path.clone().unwrap_or_default(),
                     &dir,
                     pkg.filter.themes.as_deref(),
+                    pkg.filter.is_delta(),
+                );
+                subtract_delta_shadow(
+                    &mut buf,
+                    |t| t.origin_path.clone().unwrap_or_default(),
+                    &dir,
+                    pkg.delta_shadow.and_then(|f| f.themes.as_deref()),
                 );
                 for t in &mut buf {
                     t.origin = origin.clone();
@@ -776,6 +902,13 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             Clone::clone,
             &dir,
             pkg.filter.extensions.as_deref(),
+            pkg.filter.is_delta(),
+        );
+        subtract_delta_shadow(
+            &mut ext_buf,
+            Clone::clone,
+            &dir,
+            pkg.delta_shadow.and_then(|f| f.extensions.as_deref()),
         );
         for e in ext_buf {
             if !ext_paths.contains(&e) {

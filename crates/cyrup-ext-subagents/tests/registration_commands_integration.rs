@@ -1,7 +1,7 @@
 //! Integration test: closing gap R-SA-130 for the 5 registration-surface slash commands —
 //! `/subagents-models`, `/subagents-refresh-provider-models`, `/subagents-generate-profiles`,
 //! `/subagents-check-profile`, `/subagents-companions` — proving each now routes through REAL
-//! execution (the static seed catalog in `cyrup_provider::catalog`, and `registration::profiles`'
+//! execution (the built-in model registry in `cyrup_provider::catalog`, and `registration::profiles`'
 //! real on-disk profile read/write primitives) rather than the "recognized, not yet executing"
 //! stub arm `extension.rs::dispatch_slash` used to fall into.
 //!
@@ -25,9 +25,9 @@
 //! locally `#[allow(...)]`-ed away).
 //!
 //! No mocking: every dispatch below drives the REAL `SubagentsExtension::execute_command` (the
-//! `cyrup_ext::native::NativeExtension` trait method), which reads the REAL, already-built
-//! `cyrup_provider::catalog::seed_catalog()` static catalog and writes/reads REAL files under a
-//! temporary `CYRUP_HOME`.
+//! `cyrup_ext::native::NativeExtension` trait method), which reads the REAL built-in model
+//! registry (`cyrup_provider::catalog::builtin_catalog()` — every registered provider's embedded
+//! catalog, PROV-007) and writes/reads REAL files under a temporary `CYRUP_HOME`.
 
 #![cfg(feature = "test-fixtures")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -110,6 +110,19 @@ fn command_ctx(cwd: &std::path::Path) -> HostCtx {
     HostCtx::command(ExtMode::Tui, false, cwd.to_path_buf())
 }
 
+/// A registered built-in provider that the retired 2-model `seed_catalog()` stub could NOT serve
+/// (it held only `anthropic/claude-sonnet-4-5` and `openai/gpt-4o`), chosen small so the REAL
+/// per-model probe subprocess fan-out stays fast (PROV-007).
+const REGISTRY_ONLY_PROVIDER: &str = "deepseek";
+
+/// How many models the REAL built-in registry lists for `provider`.
+fn registry_model_count(provider: &str) -> usize {
+    cyrup_provider::catalog::builtin_catalog()
+        .iter()
+        .filter(|m| m.provider.as_str() == provider)
+        .count()
+}
+
 // =====================================================================================================
 // /subagents-models
 // =====================================================================================================
@@ -189,8 +202,15 @@ async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
     );
     let ctx = command_ctx(work_dir.path());
 
-    let catalog = cyrup_provider::catalog::seed_catalog();
-    let provider = catalog.first().expect("static seed catalog is non-empty").provider.as_str().to_string();
+    // PROV-007: a provider that is NEITHER anthropic NOR openai — i.e. one the retired 2-model
+    // seed stub could not answer for at all (it hard-errored "No models found in the current
+    // registry for provider '<p>'"). Every registered provider must now be servable.
+    let provider = REGISTRY_ONLY_PROVIDER.to_string();
+    let registry_count = registry_model_count(&provider);
+    assert!(
+        registry_count >= 2,
+        "the built-in registry must carry {provider}'s models, got {registry_count}"
+    );
 
     let output = ext
         .execute_command("subagents-refresh-provider-models", &provider, &ctx)
@@ -207,7 +227,13 @@ async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
         .expect("the refresh command must genuinely write the cache file");
     let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid json");
     assert_eq!(parsed["provider"], serde_json::json!(provider));
-    assert!(parsed["modelCount"].as_u64().unwrap_or(0) > 0, "got: {parsed}");
+    // Every model the registry lists for that provider was probed and written — pi's
+    // `availableModels` for the provider, not a hand-seeded subset (profiles.ts:505).
+    assert_eq!(
+        parsed["modelCount"].as_u64().unwrap_or(0),
+        registry_count as u64,
+        "got: {parsed}"
+    );
 }
 
 #[tokio::test]
@@ -248,8 +274,8 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
     );
     let ctx = command_ctx(work_dir.path());
 
-    let catalog = cyrup_provider::catalog::seed_catalog();
-    let provider = catalog.first().expect("static seed catalog is non-empty").provider.as_str().to_string();
+    // PROV-007: same non-seed provider — profile generation must work for the whole registry.
+    let provider = REGISTRY_ONLY_PROVIDER.to_string();
 
     let output = ext
         .execute_command("subagents-generate-profiles", &provider, &ctx)
@@ -274,15 +300,23 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
 // =====================================================================================================
 
 #[tokio::test]
-async fn subagents_check_profile_cross_references_the_real_static_seed_catalog() {
+async fn subagents_check_profile_cross_references_the_real_model_registry() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let (_home_guard, home) = CyrupHomeGuard::install();
     let _fixture_guard = FixtureBinaryGuard::install();
 
     let profiles_dir = home.join(".cyrup").join("subagents").join("profiles");
     tokio::fs::create_dir_all(&profiles_dir).await.expect("mkdir profiles dir");
-    let catalog = cyrup_provider::catalog::seed_catalog();
-    let known_model = catalog.first().expect("non-empty catalog").id.as_str().to_string();
+    // PROV-007: a model id from a provider the retired seed stub never carried, so this really
+    // exercises the whole-registry cross-reference (pi `findModelInfo` over
+    // `ctx.modelRegistry.getAvailable()`).
+    let known_model = cyrup_provider::catalog::builtin_catalog()
+        .iter()
+        .find(|m| m.provider.as_str() == REGISTRY_ONLY_PROVIDER)
+        .expect("the registry must carry the probe provider")
+        .id
+        .as_str()
+        .to_string();
 
     // pi `checkSubagentProfile`'s `entries` (profiles.ts:615-617) walks ONLY
     // `subagents.agentOverrides`, never `defaultModel` (this crate's own `render_profile_check_
@@ -356,7 +390,7 @@ async fn subagents_check_profile_cross_references_the_real_static_seed_catalog()
     assert!(ok_output.contains(&known_model), "got: {ok_output}");
     assert!(
         ok_output.contains("registry ok"),
-        "a model resolvable against the seed catalog must report `inRegistry: true`: {ok_output}"
+        "a model resolvable against the model registry must report `inRegistry: true`: {ok_output}"
     );
 
     let bogus_output = ext

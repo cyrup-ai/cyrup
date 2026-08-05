@@ -348,9 +348,17 @@ async fn run() -> anyhow::Result<i32> {
         && is_fresh_target(&config.target)
     {
         // Pi `hasConfiguredAuth`: the model's provider has a stored credential / known env var
-        // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds.
+        // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds —
+        // **or** a `models.json` block of its own that carries a configured `apiKey` (CFG-022). Pi's
+        // `configuredProviders` set is filled by running `checkAuth` over every COMPOSED provider
+        // (model-runtime.ts:372-374), so a user-declared provider counts with an empty `auth.json`;
+        // without the second tier a fresh custom-provider-only install filtered its own provider out
+        // of step 4 and launched on the offline faux provider instead.
         let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
-        let has_configured_auth = move |m: &cyrup_provider::Model| auth.has_auth(&m.provider, None);
+        let auth_models_json = models_json.clone();
+        let has_configured_auth = move |m: &cyrup_provider::Model| {
+            cyrup_config::provider_is_configured(&auth, &auth_models_json, &m.provider, None)
+        };
         // Saved settings default `(provider, model)` (Pi step 3), read from the same file store.
         let settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
         let eff = settings.effective();

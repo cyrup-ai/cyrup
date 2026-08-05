@@ -1570,22 +1570,49 @@ fn configured_packages_from_settings(
                 errors.push("settings `packages` entry has an empty `source`".to_string());
                 continue;
             }
-            // Pi's `dedupePackages` (package-manager.ts:1681): project scope wins for the same
-            // package identity, so a later (global) entry for an already-seen source is dropped.
-            if out.iter().any(|p| p.source == source) {
-                continue;
-            }
             let (extensions, skills, prompts, themes) = entry.filters();
-            out.push(ConfiguredPackage {
+            let built = ConfiguredPackage {
                 source,
                 scope,
                 filter: PackageFilter {
+                    // `autoload: false` flips the per-type lists from include filters to a delta
+                    // (Pi `collectPackageResources`, package-manager.ts:2084-2085).
+                    autoload: entry.autoload(),
                     extensions: extensions.map(<[String]>::to_vec),
                     skills: skills.map(<[String]>::to_vec),
                     prompts: prompts.map(<[String]>::to_vec),
                     themes: themes.map(<[String]>::to_vec),
                 },
-            });
+            };
+            // Pi's `dedupePackages` (package-manager.ts:1681-1703), all three branches:
+            //
+            // - first sighting of an identity — keep it;
+            // - the kept entry is PROJECT and this one is USER — normally drop this one, EXCEPT
+            //   when the project entry is `autoload: false`, which its doc comment (:1676-1679)
+            //   defines as "a delta over the global entry, so both are kept (delta first)". The
+            //   base entry has to survive or the delta has nothing to layer over and the project
+            //   patterns silently become the whole package;
+            // - otherwise, a PROJECT entry replaces whatever is in the slot (`result[index] =
+            //   entry`, :1698) — project wins, later project entry wins an intra-scope repeat.
+            //
+            // [CYRUP-DELTA] the identity is the trimmed source STRING, where Pi normalizes through
+            // `getPackageIdentity` (:1660-1674) so `npm:x@1` and `npm:x@2`, or an SSH and an HTTPS
+            // URL for one repo, collide. Tracked separately as CFG-026.
+            match out.iter().position(|p| p.source == built.source) {
+                None => out.push(built),
+                Some(index) => {
+                    let existing_is_project_delta = out
+                        .get(index)
+                        .is_some_and(|p| p.scope == InstallScope::Project && p.filter.is_delta());
+                    if existing_is_project_delta && built.scope == InstallScope::Global {
+                        out.push(built);
+                    } else if built.scope == InstallScope::Project
+                        && let Some(slot) = out.get_mut(index)
+                    {
+                        *slot = built;
+                    }
+                }
+            }
         }
     }
     (out, errors)
@@ -1610,6 +1637,62 @@ fn today() -> time::Date {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::http_proxy_overlay;
+
+    /// CFG-010 (dedupe half) — Pi's `dedupePackages` keeps BOTH entries, delta first, when a
+    /// PROJECT entry carrying `autoload: false` collides with a USER one for the same package
+    /// identity: "A project entry with autoload=false is a delta over the global entry, so both
+    /// are kept (delta first)" (package-manager.ts:1676-1679, code at :1691-1696). Dropping the
+    /// global entry turns the delta form inside out — the project entry's patterns become the
+    /// ONLY thing that loads instead of a layer over the full package.
+    #[test]
+    fn a_project_autoload_false_entry_is_a_delta_over_the_global_entry_not_a_replacement() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Project,
+            r#"{"packages":[{"source":"npm:pi-tools","autoload":false,"extensions":["-extensions/foo.ts"]}]}"#,
+        );
+        store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, errors) = super::configured_packages_from_settings(&mgr);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            pkgs.len(),
+            2,
+            "the global entry must survive so the project delta has something to layer over, got \
+             {pkgs:?}"
+        );
+        assert_eq!(pkgs[0].scope, InstallScope::Project, "delta first");
+        assert!(pkgs[0].filter.is_delta());
+        assert_eq!(pkgs[1].scope, InstallScope::Global);
+        assert!(pkgs[1].filter.is_empty(), "the base entry keeps no filter");
+    }
+
+    /// The other side of the same branch: without `autoload: false` a project entry still REPLACES
+    /// the global one outright (`else if (entry.scope === "project")` / the plain drop of a later
+    /// user entry, package-manager.ts:1694-1698).
+    #[test]
+    fn a_plain_project_entry_still_shadows_the_global_one() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Project,
+            r#"{"packages":[{"source":"npm:pi-tools","skills":["skills/a"]}]}"#,
+        );
+        store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, _) = super::configured_packages_from_settings(&mgr);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].scope, InstallScope::Project);
+    }
 
     /// PROV-002: the persisted session key for the `max` rung. Both directions go through serde,
     /// so this pins that the enum change actually reaches session replay + the `model:max`

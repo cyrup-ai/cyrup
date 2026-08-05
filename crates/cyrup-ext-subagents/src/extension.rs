@@ -1985,7 +1985,7 @@ impl SubagentExecutor {
             .and_then(|m| m.split_once('/'))
             .map(|(provider, _)| provider);
         let parent_model = current_model.and_then(|m| m.split_once('/'));
-        let available_models = seed_catalog_available_models();
+        let available_models = registry_available_models();
 
         let cfg = Self::discovery_config(cwd).unwrap_or_else(|_| Self::discovery_dirs_config(cwd));
         let default_model_scope = resolve_default_model_scope(&cfg.override_settings);
@@ -5986,7 +5986,7 @@ impl SubagentsExtension {
             // (`provider_catalog_path`). The honest, most-complete implementation available today:
             // validate the provider name (R-SA-142's path-traversal guard, since this name feeds
             // the SAME cache-file path `doctor.rs` stats), confirm it resolves against the real
-            // static seed catalog, and write/refresh a minimal, genuinely-real freshness-cache
+            // built-in model registry, and write/refresh a minimal, genuinely-real freshness-cache
             // marker file at the exact path `doctor.rs`'s own `check_provider_catalog_freshness`
             // reads — so `/subagents-doctor`'s freshness check (R-SA-131 item f) observes a REAL
             // effect of running this command, not a no-op. What remains explicitly OUT OF SCOPE
@@ -6008,7 +6008,7 @@ impl SubagentsExtension {
             // provider-catalog-driven profile GENERATION is the same deferred item as
             // `/subagents-refresh-provider-models` (func-SA §9 item 31). The honest, most-complete
             // implementation available today: validate the provider name (R-SA-142), confirm it
-            // resolves against the real static seed catalog, and WRITE the two named profiles
+            // resolves against the real built-in model registry, and WRITE the two named profiles
             // (`<provider>.quota`/`<provider>.quality`) this command's own usage string promises,
             // selecting the catalog's cheapest/highest-capability model for that provider as the
             // profile's `defaultModel` — a genuine, on-disk, load-through-`/subagents-load-profile`
@@ -6023,9 +6023,9 @@ impl SubagentsExtension {
             // -----------------------------------------------------------------------------------
             // /subagents-check-profile — R-SA-129/140/141/142. Loads the named profile through the
             // real `registration::profiles::load_profile` primitive and checks every
-            // `overrides.<agent>.model`/`defaultModel` value it declares against the real static
-            // seed catalog, reporting which model references are genuinely known vs. unresolvable
-            // — the honest, catalog-backed half of "still points to usable models" this command's
+            // `overrides.<agent>.model`/`defaultModel` value it declares against the real
+            // built-in model registry, reporting which model references are genuinely known vs.
+            // unresolvable — the honest, catalog-backed half of "still points to usable models" this command's
             // own usage string promises; a genuine LIVE reachability probe against the provider's
             // API is the same explicitly deferred item as the two commands above.
             // -----------------------------------------------------------------------------------
@@ -6124,7 +6124,7 @@ impl SubagentsExtension {
 
     // ---------------------------------------------------------------------------------------
     // /subagents-models, /subagents-refresh-provider-models, /subagents-generate-profiles,
-    // /subagents-check-profile: cyrup-provider seed-catalog backed, with REAL live-probe
+    // /subagents-check-profile: cyrup-provider model-registry backed, with REAL live-probe
     // subprocess classification (pi `probeModel`/`classifyModel`, profiles.ts:250-335) — see
     // the free functions just above [`SubagentsExtension::provider_ranked_full_ids`] for the
     // ported probe/classification pipeline.
@@ -6147,19 +6147,19 @@ impl SubagentsExtension {
     /// `derived.profileRank` ascending since [`write_provider_catalog_file`] already sorted
     /// `catalog.models` that way — profiles.ts:567). Cross-references each catalog entry's
     /// `probe_status`/`profile_rank` (computed once, by the real live-probe pass that wrote
-    /// `catalog`) against the seed catalog for the `cost`/`reasoning`/`context_window`/`max_tokens`
+    /// `catalog`) against the model registry for the `cost`/`reasoning`/`context_window`/`max_tokens`
     /// axes [`dominates`] needs, so a caller never re-probes.
     fn provider_ranked_full_ids_from_catalog(
         provider: &str,
         catalog: &crate::registration::profiles::ProviderModelCatalog,
     ) -> Vec<String> {
-        let seed = cyrup_provider::catalog::seed_catalog();
+        let registry = registry_models();
         let mut candidates: Vec<RankedCandidate> = Vec::new();
         for entry in &catalog.models {
             if !probe_status_is_usable(&entry.probe_status) {
                 continue;
             }
-            let Some(m) = seed
+            let Some(m) = registry
                 .iter()
                 .find(|sm| sm.provider.as_str() == provider && sm.id.as_str() == entry.id)
             else {
@@ -6182,15 +6182,14 @@ impl SubagentsExtension {
     }
 
     /// Build and persist a per-provider [`crate::registration::profiles::ProviderModelCatalog`]
-    /// from the seed catalog (this crate's registry stand-in — see the module doc comment above
-    /// [`probe_model`]), REAL-probing every candidate model via [`probe_model`] and classifying it
+    /// from the model registry ([`registry_models`], pi's `ctx.modelRegistry.getAvailable()`),
+    /// REAL-probing every candidate model via [`probe_model`] and classifying it
     /// via [`classify_model`] (pi `refreshProviderModelCatalog`, profiles.ts:510-566), sorted by
     /// `profileRank` ascending then `fullId` (pi profiles.ts:567), plus refreshing the shared
     /// doctor freshness marker. Returns the model count.
     async fn write_provider_catalog_file(&self, provider: &str) -> Result<usize, SubagentError> {
-        let catalog_models = cyrup_provider::catalog::seed_catalog();
         let matches: Vec<cyrup_provider::Model> =
-            catalog_models.into_iter().filter(|m| m.provider.as_str() == provider).collect();
+            registry_models().iter().filter(|m| m.provider.as_str() == provider).cloned().collect();
         let ctx = build_classification_context(&matches);
         let mut models: Vec<crate::registration::profiles::ProviderCatalogModel> =
             Vec::with_capacity(matches.len());
@@ -6282,9 +6281,7 @@ impl SubagentsExtension {
 
         // pi `if (availableModels.length === 0) throw new Error(...)` (profiles.ts:506-508) — a
         // command ERROR, not an informational success string.
-        let has_models = cyrup_provider::catalog::seed_catalog()
-            .iter()
-            .any(|m| m.provider.as_str() == provider);
+        let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
         if !has_models {
             return Err(SubagentError::MalformedSettings(format!(
                 "No models found in the current registry for provider '{provider}'."
@@ -6310,9 +6307,7 @@ impl SubagentsExtension {
         // pi's refreshProviderModelCatalog (called internally by generateProfilesForProvider,
         // profiles.ts:586) throws BEFORE any probing when the registry has zero models
         // (profiles.ts:506-508) — checked here, up front, so this mirrors that ordering exactly.
-        let has_models = cyrup_provider::catalog::seed_catalog()
-            .iter()
-            .any(|m| m.provider.as_str() == provider);
+        let has_models = registry_models().iter().any(|m| m.provider.as_str() == provider);
         if !has_models {
             return Err(SubagentError::MalformedSettings(format!(
                 "No models found in the current registry for provider '{provider}'."
@@ -6865,14 +6860,24 @@ struct AvailableModelEntry {
     full_id: String,
 }
 
-/// This crate's established live-model-registry stand-in (see `render_profile_check_report`'s
-/// identical use of `cyrup_provider::catalog::seed_catalog()`): pi reads
-/// `ctx.modelRegistry.getAvailable()`, a live list of models actually configured/available to the
-/// user; this crate has no such live registry (a documented P-1 gap), so the full seed catalog
-/// serves as the stand-in.
-fn seed_catalog_available_models() -> Vec<AvailableModelEntry> {
-    cyrup_provider::catalog::seed_catalog()
-        .into_iter()
+/// pi's `ctx.modelRegistry.getAvailable()` (`profiles.ts:505`, `agent-management.ts:169`) — the
+/// model registry every model-facing subagents command consults — bound here to the REAL built-in
+/// provider registry, [`cyrup_provider::catalog::builtin_catalog`], i.e. every model every
+/// registered provider ships.
+///
+/// [CYRUP-DELTA] pi's `getAvailable()` additionally filters to providers whose auth is configured
+/// (`ai/src/models.ts:394-408`); `cyrup-provider` has no `checkAuth`/`getAvailable` port yet
+/// (PROV-003 — cyrup ships no login flow at all), so this is the credential-BLIND registry:
+/// `getModels()`, pi's "complete synchronous catalog" (`models.ts:108`). That is a strictly wider
+/// list than pi's, never a narrower one, so no model pi would offer is hidden here.
+fn registry_models() -> &'static [cyrup_provider::Model] {
+    cyrup_provider::catalog::builtin_catalog()
+}
+
+/// [`registry_models`] projected onto the three fields `resolve_model_candidate` consults.
+fn registry_available_models() -> Vec<AvailableModelEntry> {
+    registry_models()
+        .iter()
         .map(|m| AvailableModelEntry {
             provider: m.provider.as_str().to_string(),
             id: m.id.as_str().to_string(),
@@ -6995,13 +7000,12 @@ fn format_model_source(
 // Live-probe + heuristic model classification (pi `probeModel`/`resolveProbeStatus`/`classifyModel`,
 // profiles.ts:150-335) — the ported real-subprocess probe + pure classification pipeline
 // `provider_ranked_full_ids`/`write_provider_catalog_file`/`render_profile_check_report` (below)
-// all build on. Unlike pi's live `ctx.modelRegistry.getAvailable()`, this crate's provider metadata
-// comes from `cyrup_provider::catalog::seed_catalog()` (per this crate's own established
-// "deferred-live-registry stand-in" convention, e.g. `provider_ranked_full_ids`'s prior doc
-// comment) — every seed-catalog `Model` always carries required (never-optional) `name`/`cost`/
-// `context_window`/`max_tokens`/`reasoning` fields, so `classify_model` always takes pi's
-// "official-metadata" branch (pi's heuristic-only fallback branch is unreachable here, a direct
-// consequence of the seed-catalog schema being fully populated rather than partial).
+// all build on. pi's live `ctx.modelRegistry.getAvailable()` is bound here to [`registry_models`],
+// the REAL built-in provider registry (`cyrup_provider::catalog::builtin_catalog()`) — every
+// registry `Model` carries required (never-optional) `name`/`cost`/`context_window`/`max_tokens`/
+// `reasoning` fields, so `classify_model` always takes pi's "official-metadata" branch (pi's
+// heuristic-only fallback branch is unreachable here, a direct consequence of the embedded-catalog
+// schema being fully populated rather than partial).
 // =================================================================================================
 
 /// pi `ProbeStatus` (profiles.ts:13).
@@ -7262,8 +7266,8 @@ fn infer_profile_band(model_name: &str) -> u8 {
 
 /// pi `combinedCost` (profiles.ts:199-204): the sum of every finite cost field. Since
 /// `cyrup_provider::ModelCost`'s fields are required (never `Option`), this always yields
-/// `Some(sum)` for a seed-catalog model (pi's `undefined` branch is reachable only when the
-/// registry omits cost metadata entirely, which the seed-catalog schema never does).
+/// `Some(sum)` for a registry model (pi's `undefined` branch is reachable only when the
+/// registry omits cost metadata entirely, which the embedded-catalog schema never does).
 fn combined_cost(cost: &cyrup_provider::ModelCost) -> Option<f64> {
     let values = [cost.input, cost.output, cost.cache_read, cost.cache_write];
     let filtered: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
@@ -7336,7 +7340,7 @@ struct ModelClassification {
 
 /// pi `classifyModel` (profiles.ts:250-308): the full heuristic + official-metadata blended
 /// classification, reduced to its `profileRank` output (see [`ModelClassification`]'s doc comment).
-/// See the module-level doc comment above for why this crate's seed-catalog input always has
+/// See the module-level doc comment above for why this crate's registry input always has
 /// "official metadata" (pi's `hasOfficialMetadata` is always `true` here).
 fn classify_model(model: &cyrup_provider::Model, ctx: &ClassificationContext) -> ModelClassification {
     let model_name = if model.name.trim().is_empty() { model.id.as_str() } else { model.name.as_str() };
@@ -7433,7 +7437,7 @@ fn filter_dominated(candidates: Vec<RankedCandidate>) -> Vec<RankedCandidate> {
 
 /// pi `catalogModelIsUsable` (profiles.ts:402-404): usable iff the probe did NOT come back
 /// unavailable/auth/timeout/error (`observed.availableInRegistry` is trivially always `true` here,
-/// since every candidate is already drawn from the seed catalog).
+/// since every candidate is already drawn from the model registry).
 fn probe_status_is_usable(status: &str) -> bool {
     !matches!(status, "unavailable" | "auth" | "timeout" | "error")
 }
@@ -7441,7 +7445,7 @@ fn probe_status_is_usable(status: &str) -> bool {
 /// Render `/subagents-check-profile`'s report (pi `checkSubagentProfile`, profiles.ts:608-637):
 /// for every `overrides.<agent>.model` the profile declares (pi does NOT check `defaultModel` —
 /// `entries` at profiles.ts:615-617 only ever walks `profile.subagents.agentOverrides`), resolve it
-/// against the seed catalog (this crate's registry stand-in) and REAL-probe the resolved full id
+/// against the model registry ([`registry_models`]) and REAL-probe the resolved full id
 /// (or the raw string when unresolved) via [`probe_model`], with a per-probed-id cache so the same
 /// model is never probed twice in one report (pi's `probeCache`, profiles.ts:618-628).
 async fn render_profile_check_report(
@@ -7465,9 +7469,8 @@ async fn render_profile_check_report(
 
     // Recognize BOTH bare ids (`gpt-4o`) and fully-qualified `provider/id` refs (`openai/gpt-4o`)
     // — pi's `findModelInfo` resolves either form against `ctx.modelRegistry.getAvailable()`.
-    let catalog = cyrup_provider::catalog::seed_catalog();
     let mut known: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for m in &catalog {
+    for m in registry_models() {
         let full_id = format!("{}/{}", m.provider.as_str(), m.id.as_str());
         known.entry(m.id.as_str().to_string()).or_insert_with(|| full_id.clone());
         known.entry(full_id.clone()).or_insert(full_id);
@@ -9825,6 +9828,60 @@ mod tests {
         );
     }
 
+    /// PROV-007: `/subagents-models` resolves a BARE model id against the real built-in model
+    /// registry (pi `resolveModelCandidate` over `ctx.modelRegistry.getAvailable()`,
+    /// model-fallback.ts:60-76), so a persona configured with a bare id from ANY registered
+    /// provider renders its `provider/id`. The retired 2-model seed stub could only ever resolve
+    /// `claude-sonnet-4-5`/`gpt-4o`; every other bare id fell through pi's "no match" fallback and
+    /// rendered verbatim.
+    ///
+    /// The subject model is picked from the registry itself — the first model whose bare id is
+    /// registry-unique and whose provider is neither `anthropic` nor `openai` — so a catalog
+    /// refresh cannot rot this test.
+    #[test]
+    fn run_models_report_resolves_a_bare_id_from_any_registered_provider() {
+        // Read the fixture straight from `cyrup-provider` (NOT through `registry_models`) so this
+        // test fails on the RENDERED REPORT when the binding regresses, not on fixture selection.
+        let registry = cyrup_provider::catalog::builtin_catalog();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in registry {
+            *counts.entry(m.id.as_str()).or_default() += 1;
+        }
+        let subject = registry
+            .iter()
+            .find(|m| {
+                counts.get(m.id.as_str()).copied() == Some(1)
+                    && !matches!(m.provider.as_str(), "anthropic" | "openai")
+            })
+            .expect("the registry must carry a unique bare id outside anthropic/openai");
+        let bare = subject.id.as_str();
+        let full = format!("{}/{}", subject.provider.as_str(), bare);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir settings dir");
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            format!(r#"{{"subagents":{{"defaultModel":"{bare}"}}}}"#),
+        )
+        .expect("write settings.json");
+
+        let executor = SubagentExecutor::new();
+        let report = executor.run_models_report(dir.path(), Some("scout"));
+        assert!(
+            report.contains(&format!("Effective model:\n  {full}")),
+            "a bare id from '{}' must resolve to its full provider/id against the real registry: \
+             {report}",
+            subject.provider.as_str()
+        );
+        // pi surfaces the raw declared setting once it differs from the resolved model
+        // (agent-management.ts:596-599) — proof the resolution really happened.
+        assert!(
+            report.contains(&format!("Requested model setting:\n  {bare}")),
+            "the raw bare id must still be surfaced alongside the resolved full id: {report}"
+        );
+    }
+
     // NOTE: `teardown_session_stops_the_tracker_and_clears_the_parent_session_anchor` (and its
     // `FixedSessionHost` double) moved to `tests/cyrup_home_env_sandboxed_tests.rs` — see that
     // file's module doc; it needs the `CYRUP_HOME` env-var sandbox that requires `unsafe`, which
@@ -10878,15 +10935,14 @@ mod tests {
 
     /// [`SubagentsExtension::provider_ranked_full_ids_from_catalog`] must drop a probed-unavailable
     /// model entirely (pi `catalogModelIsUsable`) rather than still ranking it — proven against the
-    /// REAL seed catalog so this exercises the actual seed-catalog cross-reference lookup, not just
+    /// REAL model registry so this exercises the actual registry cross-reference lookup, not just
     /// a synthetic fixture.
     #[test]
     fn provider_ranked_full_ids_from_catalog_drops_unusable_probe_results() {
-        let seed = cyrup_provider::catalog::seed_catalog();
-        let anthropic_model = seed
+        let anthropic_model = registry_models()
             .iter()
             .find(|m| m.provider.as_str() == "anthropic")
-            .expect("seed catalog must carry at least one anthropic model for this test");
+            .expect("the registry must carry at least one anthropic model for this test");
         let full_id = format!("anthropic/{}", anthropic_model.id.as_str());
 
         let usable_catalog = crate::registration::profiles::ProviderModelCatalog {

@@ -85,14 +85,22 @@ pub struct RetrySettings {
     pub base_delay_ms: i64,
 }
 
-/// A configured package source (Pi `PackageSource`, settings-manager.ts:70-78): either a bare
-/// source string, or an object naming the `source` plus optional per-resource include filters.
+/// A configured package source (Pi `PackageSource`, settings-manager.ts:74-85): either a bare
+/// source string, or an object naming the `source` plus `autoload` and optional per-resource
+/// filters. Pi documents the three forms at :70-73 — string = load everything, object = filter
+/// which resources load, and `autoload=false` = "start empty and only apply explicit resource
+/// patterns".
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum PackageSource {
     Name(String),
     Detailed {
         source: String,
+        /// `autoload` (Pi settings-manager.ts:79). `Some(false)` turns every per-type list from an
+        /// INCLUDE filter (start from everything, narrow) into a DELTA (start from nothing, add
+        /// back only what is named) — see [`PackageSource::autoload`].
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        autoload: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         extensions: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -113,9 +121,26 @@ impl PackageSource {
         }
     }
 
-    /// The per-resource include filters, `None` for a bare string entry (Pi
+    /// The entry's `autoload` flag, `None` for a bare string entry (Pi reads it off the object form
+    /// only, `filter.autoload === false`, package-manager.ts:2084).
+    ///
+    /// Only an explicit `false` changes anything: it selects `applyPackageDeltaFilter` (:2085) in
+    /// place of `applyPackageFilter`/`collectDefaultResources`, which starts from an EMPTY resource
+    /// set and adds back only what the per-type patterns name — so a bare
+    /// `{"source": …, "autoload": false}` contributes NOTHING (:2180-2182). `true` and absent are
+    /// identical and leave the ordinary include-filter path alone.
+    pub fn autoload(&self) -> Option<bool> {
+        match self {
+            PackageSource::Name(_) => None,
+            PackageSource::Detailed { autoload, .. } => *autoload,
+        }
+    }
+
+    /// The per-resource filters, `None` for a bare string entry (Pi
     /// `const filter = typeof pkg === "object" ? pkg : undefined`, package-manager.ts:1231).
     /// Order: `extensions`, `skills`, `prompts`, `themes` — Pi's `RESOURCE_TYPES` (:194).
+    /// Read alongside [`PackageSource::autoload`], which decides whether these are include filters
+    /// or delta patterns.
     #[allow(clippy::type_complexity)]
     pub fn filters(
         &self,
@@ -696,9 +721,16 @@ impl EffectiveSettings {
             .or_else(|| env.http_proxy.clone())
     }
 
-    /// `shellPath` (Pi `getShellPath`, :863-865).
+    /// `shellPath`, tilde-expanded (Pi `getShellPath` → `normalizePath`, settings-manager.ts:883-886).
+    ///
+    /// The key's own declaration documents the contract — settings-manager.ts:101 `shellPath?:
+    /// string; // Custom shell path (e.g., for Cygwin users on Windows); supports leading ~
+    /// expansion`. `getSessionDir` (:676-679) and `getShellPath` are the only two getters Pi runs
+    /// through `normalizePath`, so this uses the same [`expand_tilde`] as [`Self::session_dir`].
+    /// Without it a configured `~/bin/bash` reaches `ShellConfig::resolve` verbatim, fails its
+    /// existence check, and breaks every bash invocation.
     pub fn shell_path(&self) -> Option<String> {
-        self.merged.get_str("shellPath")
+        self.merged.get_str("shellPath").map(|s| expand_tilde(&s))
     }
 
     /// `shellCommandPrefix` (Pi `getShellCommandPrefix`, :894-896).
@@ -1555,6 +1587,54 @@ fn set_value_at_path(map: &mut Map<String, Value>, path: &[String], value: Value
 mod tests {
     use super::*;
 
+    /// `shellPath` supports a leading `~` (settings-manager.ts:101), which Pi honors by running the
+    /// getter through `normalizePath` (`getShellPath`, settings-manager.ts:883-886) exactly as it
+    /// does for `sessionDir`. Regression guard for CFG-031: the raw `~/bin/bash` reached
+    /// `ShellConfig::resolve`, failed `Path::exists`, and broke every bash command.
+    #[test]
+    fn shell_path_is_tilde_expanded_like_session_dir() {
+        let Some(home) = directories::BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        else {
+            return; // no home on this host; expansion is a no-op by contract
+        };
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "shellPath": "~/bin/bash", "sessionDir": "~/sessions" }"#,
+        );
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let effective = mgr.effective();
+
+        let shell = effective.shell_path().expect("shellPath is configured");
+        assert!(
+            !shell.starts_with('~'),
+            "shellPath must be tilde-expanded before it reaches the shell resolver, got {shell}"
+        );
+        assert_eq!(shell, home.join("bin/bash").to_string_lossy());
+        // Same treatment as the sibling getter Pi normalizes.
+        assert_eq!(
+            effective.session_dir().as_deref(),
+            Some(home.join("sessions").to_string_lossy().as_ref())
+        );
+
+        // A bare `~` expands to the home dir itself, and an absolute path is untouched.
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "shellPath": "~" }"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+        assert_eq!(
+            mgr.effective().shell_path().as_deref(),
+            Some(home.to_string_lossy().as_ref())
+        );
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "shellPath": "/bin/zsh" }"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+        assert_eq!(mgr.effective().shell_path().as_deref(), Some("/bin/zsh"));
+    }
+
     #[test]
     fn external_editor_blank_setting_falls_through() {
         // Pi `getExternalEditorCommand` (settings-manager.ts:846-848) only honors a configured
@@ -2135,6 +2215,7 @@ mod tests {
                 PackageSource::Name("pkg-a".to_string()),
                 PackageSource::Detailed {
                     source: "pkg-b".to_string(),
+                    autoload: None,
                     extensions: Some(vec!["x.ts".to_string()]),
                     skills: None,
                     prompts: None,
@@ -2149,6 +2230,40 @@ mod tests {
         );
         assert_eq!(s.prompt_template_paths(), vec!["/p".to_string()]);
         assert_eq!(s.theme_paths(), vec!["/theme/a".to_string()]);
+    }
+
+    /// CFG-010 — `autoload` is a real key on the object form (Pi `PackageSource`,
+    /// settings-manager.ts:79). `PackageSource` is `#[serde(untagged)]` with no
+    /// `deny_unknown_fields`, so before it was modelled the key deserialized into `Detailed` and was
+    /// silently discarded — the user's opt-out simply evaporated between settings.json and
+    /// discovery.
+    #[test]
+    fn a_package_entry_carries_its_autoload_flag() {
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(
+                r#"{"packages": [
+                     "plain",
+                     { "source": "opted-out", "autoload": false },
+                     { "source": "delta", "autoload": false, "skills": ["skills/a/**"] },
+                     { "source": "explicit-on", "autoload": true }
+                   ]}"#,
+            )
+            .unwrap(),
+        );
+        let pkgs = s.packages();
+        assert_eq!(
+            pkgs.iter().map(PackageSource::autoload).collect::<Vec<_>>(),
+            vec![None, Some(false), Some(false), Some(true)],
+            "a bare string entry has no autoload; the object form round-trips the flag verbatim"
+        );
+        assert_eq!(
+            pkgs.get(2).map(PackageSource::filters).and_then(|f| f.1),
+            Some(["skills/a/**".to_string()].as_slice()),
+            "the per-type patterns survive alongside it"
+        );
+        // Serializing back preserves the key (settings documents round-trip, R-07-004).
+        let json = serde_json::to_string(&pkgs).unwrap();
+        assert!(json.contains(r#""autoload":false"#), "{json}");
     }
 
     #[test]

@@ -2430,31 +2430,6 @@ impl AgentSession {
         if self.services.guest_providers.has_provider(model.provider.as_str()) {
             return true;
         }
-        // A `models.json` provider that supplies its own `apiKey` is configured, exactly as Pi's
-        // `hasConfiguredAuth` counts a provider request config that carries a key
-        // (model-registry.ts:659-662; `composeApiKeyAuth`, provider-composer.ts:439).
-        //
-        // PRESENCE ONLY — deliberately does NOT resolve the value. The key is written in cyrup's
-        // config-value language (`${env:...}`/`${cmd:...}`), and resolving a `${cmd:...}` here would
-        // execute a shell command out of `models.json` on a *status* query. Pi never does that on
-        // this path: `hasConfiguredAuth` is a pure set-membership test against a precomputed
-        // snapshot (model-runtime.ts:372-374), and the snapshot is built once per refresh
-        // (:257-261), not per call — while this predicate is called inside filter loops
-        // (model-resolver.ts:480). Resolution stays where it belongs, on the request path.
-        // Consequence, accepted: a provider whose template turns out to be unresolvable still counts
-        // as configured here and fails later at request time, which is also what Pi does.
-        //
-        // Credential *acquisition* (OAuth) is deliberately out of scope: an `oauth`-only
-        // models.json provider is not counted as configured.
-        if let Some(cfg) = self
-            .services
-            .model_config
-            .providers
-            .get(model.provider.as_str())
-            && cfg.api_key.is_some()
-        {
-            return true;
-        }
         self.provider
             .current()
             .models()
@@ -2462,12 +2437,25 @@ impl AgentSession {
             .any(|m| m.provider == model.provider && m.id == model.id)
     }
 
-    /// Whether `provider` has configured auth in the Pi sense (stored credential / runtime `--api-key`
-    /// / known env var), via `cyrup-config`'s [`cyrup_config::AuthStore::has_auth`] (which consults
-    /// `env_keys`, e.g. `together` → `TOGETHER_API_KEY`). Does NOT count the offline faux
-    /// accommodation — [`Self::has_configured_auth`] adds that separately.
+    /// Whether `provider` has configured auth in the Pi sense — a stored credential / runtime
+    /// `--api-key` / known env var (`env_keys`, e.g. `together` → `TOGETHER_API_KEY`), **or** a
+    /// `models.json` block of its own carrying a configured `apiKey`.
+    ///
+    /// Both tiers live in one place, [`cyrup_config::provider_is_configured`], shared with the
+    /// binary's default-launch predicate (`main.rs`) — the two used to be written out separately and
+    /// had drifted, which is CFG-022. The models.json tier stays PRESENCE-ONLY: it never resolves the
+    /// value, so a `!command` `apiKey` cannot execute a shell command on a status query; see that
+    /// function's docs for why Pi's own check (provider-composer.ts:320-329) is pure too.
+    ///
+    /// Does NOT count the offline faux accommodation or guest-registered providers —
+    /// [`Self::has_configured_auth`] adds those separately.
     fn provider_has_configured_auth(&self, provider: &ProviderId) -> bool {
-        self.services.auth.has_auth(provider, None)
+        cyrup_config::provider_is_configured(
+            &self.services.auth,
+            &self.services.model_config,
+            provider,
+            None,
+        )
     }
 
     /// Public view of [`Self::full_model_registry`] — every model the session can resolve, before

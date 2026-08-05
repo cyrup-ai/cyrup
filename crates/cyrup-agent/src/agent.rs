@@ -64,7 +64,7 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// An errored assistant transcript message matching Pi `handleRunFailure` (agent.ts:494-505): one
+/// An errored assistant transcript message matching Pi `handleRunFailure` (agent.ts:497-506): one
 /// EMPTY text block (`[{type:"text", text:""}]`, NOT empty content) plus a `Date.now()` timestamp.
 /// Both reach the wire payload via `convert_to_llm`, so they must mirror Pi byte-for-byte.
 /// `cyrup_core::AssistantMessage::errored` yields `content: []`/`timestamp: 0`; this overlays Pi's
@@ -151,7 +151,7 @@ fn update_value(u: &ToolUpdate) -> Value {
 }
 
 /// Emit one event without a [`RunCtx`] — the same reduce-then-await-subscribers path as
-/// [`RunCtx::emit`], used by the catch-all failure path (Pi `handleRunFailure`, agent.ts:476-492)
+/// [`RunCtx::emit`], used by the catch-all failure path (Pi `handleRunFailure`, agent.ts:496-511)
 /// after the run task has unwound and `RunCtx` is gone. Subscriber panics are contained.
 async fn emit_standalone(
     subscribers: &Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>>,
@@ -169,7 +169,7 @@ async fn emit_standalone(
 }
 
 /// Recover a human-readable message from a caught panic payload (Pi
-/// `error instanceof Error ? error.message : String(error)`, agent.ts:485). A `panic!`/`unwrap`
+/// `error instanceof Error ? error.message : String(error)`, agent.ts:505). A `panic!`/`unwrap`
 /// payload is typically a `&str` or `String`, which we downcast to recover the real text; any other
 /// payload type falls back to a generic label.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -388,6 +388,45 @@ impl RunCtx {
         }
     }
 
+    /// Pi `handleRunFailure` (agent.ts:496-511) reached from INSIDE the loop: the post-turn hooks
+    /// (`prepareNextTurn`, agent-loop.ts:231; `shouldStopAfterTurn`, agent-loop.ts:246-252) are
+    /// awaited with no try/catch, so a throw unwinds out of `runLoop` into `runWithLifecycle`'s
+    /// catch (agent.ts:489-490) and is reported as a run FAILURE: one synthetic errored assistant
+    /// message (empty text block, wall-clock timestamp, `stopReason` aborted-vs-error, the thrown
+    /// `error.message`) followed by `message_start` → `message_end` → `turn_end` (with NO tool
+    /// results) → `agent_end` carrying `[failureMessage]` and nothing else (agent.ts:508-511).
+    ///
+    /// The post-unwind twin of this path lives at [`Agent::run`]'s `catch_unwind` arm, which must
+    /// synthesize the same quartet through [`emit_standalone`] because its `RunCtx` is already gone;
+    /// here the live `RunCtx` is intact, so emission goes through the ordinary [`RunCtx::emit`] and
+    /// the reducer records `error_message`/`stop_reason` exactly as it does for a streamed message.
+    ///
+    /// `new_messages` is REPLACED by the failure message so the run's returned value matches
+    /// `agent_end.messages` — Pi's failed run resolves its promise without the loop-local
+    /// `newMessages` accumulator (the throw at agent.ts:488 never reaches `runLoop`'s return), and the
+    /// `catch_unwind` twin settles the same single-element vector.
+    async fn emit_run_failure(&mut self, error_message: String) {
+        // Pi reads `this._state.model` (agent.ts:500-502) — the agent's state model, not the loop's
+        // possibly-overridden running baseline.
+        let model = { lock(&self.state).model.clone() };
+        // Pi `stopReason: aborted ? "aborted" : "error"` (agent.ts:504).
+        let stop_reason =
+            if self.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
+        let failure = errored_assistant(
+            model.provider.clone(),
+            model.model.as_str(),
+            model.api.clone(),
+            stop_reason,
+            error_message,
+        );
+        let fm = AgentMessage::Assistant(failure);
+        self.emit(AgentEvent::MessageStart { message: fm.clone() }).await;
+        self.emit(AgentEvent::MessageEnd { message: fm.clone() }).await;
+        self.emit(AgentEvent::TurnEnd { message: fm.clone(), tool_results: Vec::new() }).await;
+        self.emit(AgentEvent::AgentEnd { messages: vec![fm.clone()] }).await;
+        self.new_messages = vec![fm];
+    }
+
     fn poll_steering(&self) -> Vec<AgentMessage> {
         lock(&self.steering).drain()
     }
@@ -563,8 +602,12 @@ impl RunCtx {
                         }
                     }
                     Ok(None) => {}
-                    Err(_) => {
-                        self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await;
+                    // A THROWING `prepareNextTurn` is not caught by `runLoop` (agent-loop.ts:231 has
+                    // no try/catch): the rejection escapes into `runWithLifecycle`'s catch
+                    // (agent.ts:489-490) and lands in `handleRunFailure` — a synthetic errored
+                    // assistant message plus the FULL closing quartet, not a bare `agent_end`.
+                    Err(e) => {
+                        self.emit_run_failure(e.to_string()).await;
                         return;
                     }
                 }
@@ -593,8 +636,11 @@ impl RunCtx {
                         return;
                     }
                     Ok(false) => {}
-                    Err(_) => {
-                        self.emit(AgentEvent::AgentEnd { messages: self.new_messages.clone() }).await;
+                    // Same as `prepareNextTurn` above: `shouldStopAfterTurn` is awaited bare
+                    // (agent-loop.ts:246-252), so a throw escapes to `handleRunFailure` rather than
+                    // ending the run with the ordinary `agent_end` of the `Ok(true)` arm.
+                    Err(e) => {
+                        self.emit_run_failure(e.to_string()).await;
                         return;
                     }
                 }
@@ -796,7 +842,7 @@ impl RunCtx {
 
     async fn emit_error_assistant(&self, msg: &str, model: &ModelRef) -> AssistantMessage {
         // Pi routes a `transformContext`/`convertToLlm` throw through `handleRunFailure`, whose
-        // failure message carries one empty text block + `Date.now()` (agent.ts:494-505).
+        // failure message carries one empty text block + `Date.now()` (agent.ts:497-506).
         let asst = errored_assistant(
             model.provider.clone(),
             model.model.as_str(),
@@ -1572,7 +1618,7 @@ impl Agent {
         *lock(&self.cancel_slot) = Some(cancel.clone());
         // A clone kept for the catch-all failure path so it can distinguish an aborted run from a
         // genuine error after `RunCtx` (which owns the run's `cancel`) has unwound (Pi
-        // `handleRunFailure(error, signal.aborted)`, agent.ts:470,476-492).
+        // `handleRunFailure(error, signal.aborted)`, agent.ts:490,496-511).
         let fail_cancel = cancel.clone();
 
         let (system_prompt, model, thinking_level, tools, messages) = {
@@ -1618,7 +1664,7 @@ impl Agent {
         let active = self.active.clone();
         let cancel_slot = self.cancel_slot.clone();
         // Independent handles for the catch-all failure path (Pi `handleRunFailure`,
-        // agent.ts:476-492): they must outlive the unwound `RunCtx`.
+        // agent.ts:496-511): they must outlive the unwound `RunCtx`.
         let fail_state = self.state.clone();
         let fail_subs = self.subscribers.clone();
 
@@ -1636,23 +1682,23 @@ impl Agent {
             // Run the loop; if its task UNWINDS (an uncontained panic in a hook/executor), synthesize
             // Pi's closing sequence — an error assistant message + `message_start/message_end/
             // turn_end/agent_end` — so subscribers always see a complete, well-formed termination
-            // (Pi `handleRunFailure`, agent.ts:476-492), then settle with that message.
+            // (Pi `handleRunFailure`, agent.ts:496-511), then settle with that message.
             match std::panic::AssertUnwindSafe(rc.run(entry)).catch_unwind().await {
                 Ok(new) => guard.complete(new),
                 Err(payload) => {
                     let model = { lock(&fail_state).model.clone() };
-                    // Pi: `stopReason = aborted ? "aborted" : "error"` (agent.ts:484). An aborted run
+                    // Pi: `stopReason = aborted ? "aborted" : "error"` (agent.ts:504). An aborted run
                     // that unwinds is reported as aborted, everything else as error.
                     let aborted = fail_cancel.is_cancelled();
                     let stop_reason =
                         if aborted { StopReason::Aborted } else { StopReason::Error };
                     // Pi: `errorMessage = error instanceof Error ? error.message : String(error)`
-                    // (agent.ts:485). Rust `catch_unwind` cannot recover an arbitrary error value,
+                    // (agent.ts:505). Rust `catch_unwind` cannot recover an arbitrary error value,
                     // but a `panic!`/`unwrap` payload is a `&str`/`String` we can downcast to recover
                     // the real message; otherwise fall back to a generic string.
                     let error_message = panic_message(payload.as_ref());
                     // Pi `handleRunFailure` failure message: one empty text block + `Date.now()`
-                    // (agent.ts:494-505), NOT empty content / a zero timestamp.
+                    // (agent.ts:497-506), NOT empty content / a zero timestamp.
                     let failure = errored_assistant(
                         model.provider.clone(),
                         model.model.as_str(),
