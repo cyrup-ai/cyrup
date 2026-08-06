@@ -529,11 +529,29 @@ impl SpawnedChild {
     /// signal-send failures are swallowed by [`crate::spawn::signal::terminate`] per that
     /// function's own documented contract.
     pub async fn terminate(
-        mut self,
+        self,
         cancel: &CancelToken,
     ) -> std::io::Result<signal::TerminationOutcome> {
+        self.terminate_with_graces(cancel, signal::EscalationGraces::default())
+            .await
+    }
+
+    /// [`SpawnedChild::terminate`] with the ladder's two inter-rung grace periods supplied
+    /// explicitly — see [`signal::EscalationGraces`]. Production goes through
+    /// [`SpawnedChild::terminate`]; this exists so a test can assert WHICH escalation rung ended
+    /// the child without that assertion secretly depending on the OS reaping it inside a
+    /// one-second wall clock.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`SpawnedChild::terminate`]'s.
+    pub async fn terminate_with_graces(
+        mut self,
+        cancel: &CancelToken,
+        graces: signal::EscalationGraces,
+    ) -> std::io::Result<signal::TerminationOutcome> {
         self.exited = true;
-        let outcome = signal::terminate(self.child, cancel).await;
+        let outcome = signal::terminate_with_graces(self.child, cancel, graces).await;
         cleanup_temp_files(&self.temp_files); // R-SA-067: cleaned up on this (failure/cancel) path too
         outcome
     }
@@ -1208,9 +1226,21 @@ mod tests {
         let pid = child.id().expect("live child has a pid");
 
         let cancel = CancelToken::new();
+        // A GENEROUS stage-1 grace, deliberately not the 1000ms production constant. The
+        // behavioural claim under test is "a plain `sh` loop dies to SIGINT alone, so the ladder
+        // stops at rung 1" — asserting that against `SIGINT_GRACE` silently also asserts "and the
+        // OS reaps it, and this task gets scheduled, inside one second", which is false on a loaded
+        // machine: with all cores pinned this test escalated to `Sigterm` after exactly 1.01s, i.e.
+        // it failed on the wall clock while the SIGINT it claims to test had worked perfectly.
+        // `SIGINT_GRACE` itself stays at 1000ms — it is the production value and it is correct;
+        // only the test's assumption that reaping always beats it was wrong.
+        let graces = signal::EscalationGraces {
+            sigint: std::time::Duration::from_secs(30),
+            ..signal::EscalationGraces::default()
+        };
         let started = tokio::time::Instant::now();
         let outcome = child
-            .terminate(&cancel)
+            .terminate_with_graces(&cancel, graces)
             .await
             .expect("terminate confirms real exit");
 
@@ -1220,7 +1250,7 @@ mod tests {
             "a plain sh loop (no signal traps) must die to SIGINT alone"
         );
         assert!(
-            started.elapsed() < signal::SIGINT_GRACE,
+            started.elapsed() < graces.sigint,
             "a SIGINT-obeying child must not require escalation past stage 1"
         );
 

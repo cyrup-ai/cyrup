@@ -72,6 +72,7 @@ use std::time::Duration;
 
 use crate::exec::completion_guard::CompletionMutationGuardResult;
 use crate::exec::output::looks_like_acceptance_report;
+use crate::spawn::signal::TIMEOUT_SIGTERM_GRACE;
 
 // ============================================================================================
 // The ordered provenance lattice (func-SA §4.3, arch-SA §3.4)
@@ -497,6 +498,15 @@ pub async fn run_verify_commands(
 /// (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0), which does exactly that —
 /// `child.kill("SIGTERM")` plus a 1000 ms `setTimeout` hard `child.kill("SIGKILL")` — and this
 /// function returns only once the OS process is confirmed reaped.
+///
+/// The `timeout` is an ABSOLUTE deadline over the whole call — process exit AND output collection —
+/// never just over `child.wait()`. Upstream's timer is armed once at spawn and its `finish(...)`
+/// resolves the promise unconditionally (`acceptance.ts:731-758`), so upstream returns within
+/// `timeoutMs + 1000ms` even though its own completion signal is Node's `"close"` event, which
+/// likewise waits for every stdio stream to reach EOF. Reproducing only the `wait()` half of that
+/// would hang here forever on a verify command that exits promptly while leaving a backgrounded
+/// descendant holding the inherited stdout/stderr write ends (`./server &`, `npm run dev &`) —
+/// `read_to_end` sees EOF only when the LAST holder closes. See [`drained_by`].
 async fn run_one_verify_command(
     command: &str,
     cwd: &Path,
@@ -539,10 +549,14 @@ async fn run_one_verify_command(
     let stdout_task = child.stdout.take().map(spawn_pipe_drain);
     let stderr_task = child.stderr.take().map(spawn_pipe_drain);
 
+    // ONE absolute deadline for the whole call, exactly like upstream's single `setTimeout` armed
+    // at spawn (`acceptance.ts:759`) — not a fresh timer per phase.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     let waited = tokio::select! {
         biased;
         result = child.wait() => Some(result),
-        () = tokio::time::sleep(timeout) => None,
+        () = tokio::time::sleep_until(deadline) => None,
     };
 
     let Some(waited) = waited else {
@@ -571,8 +585,27 @@ async fn run_one_verify_command(
         };
     };
 
-    let mut combined = drained(stdout_task).await;
-    combined.extend_from_slice(&drained(stderr_task).await);
+    // The process is reaped, but its pipes may still be held open by something it backgrounded.
+    // Bound the collection by the SAME deadline plus upstream's own hard-kill grace, and report the
+    // overrun as a timeout — which is precisely what upstream does, since its `"close"` event never
+    // fires either and only `abortVerification`'s `finish(...)` resolves the promise.
+    let Some((out_bytes, err_bytes)) =
+        drained_by(deadline + TIMEOUT_SIGTERM_GRACE, stdout_task, stderr_task).await
+    else {
+        return VerifyCommandResult {
+            command: command.to_string(),
+            exit_code: None,
+            passed: false,
+            output_tail: String::new(),
+            spawn_error: Some(format!(
+                "verify command exceeded its {}ms timeout: it exited, but a process it \
+                 backgrounded still holds its stdout/stderr",
+                timeout.as_millis()
+            )),
+        };
+    };
+    let mut combined = out_bytes;
+    combined.extend_from_slice(&err_bytes);
 
     match waited {
         Ok(status) => {
@@ -617,6 +650,59 @@ async fn drained(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     match task {
         Some(task) => task.await.unwrap_or_default(),
         None => Vec::new(),
+    }
+}
+
+/// Collect BOTH [`spawn_pipe_drain`] tasks, but never past `deadline` — returning `None` (and
+/// aborting both tasks, releasing this process's read ends) when the deadline passes first.
+///
+/// This is the single bound that keeps a verify command's own `timeoutMs` honest, and it is shared
+/// by both copies of the runner ([`run_one_verify_command`] and [`model::run_verify_command`]) so
+/// the two cannot drift apart again.
+///
+/// # Why an unbounded collect is a hang, not a slow path
+///
+/// `spawn_pipe_drain` reads to EOF, and a pipe reaches EOF only when the LAST write end closes —
+/// including the copies every descendant inherited. `child.wait()` returns as soon as the DIRECT
+/// child exits, so a routine `verify[]` entry like `./server &`, `npm run dev &` or any script that
+/// daemonises leaves the write end held for the descendant's whole lifetime. Awaiting the drain
+/// tasks after `wait()` with no bound therefore blocks `run_verify_commands` (which loops these
+/// sequentially, with no outer timeout) forever, silently — worse than the abandoned-child bug
+/// SUBA-027 fixed.
+///
+/// # Why the deadline is absolute rather than a fresh post-`wait()` grace
+///
+/// Upstream arms ONE `setTimeout(abortVerification, timeoutMs)` at spawn
+/// (`pi-subagents/src/runs/shared/acceptance.ts:759` @v0.34.0) and settles on Node's `"close"`
+/// event, which — exactly like `read_to_end` — waits for every stdio stream to close. When a
+/// descendant holds them open, upstream's `"close"` never fires and `abortVerification`'s
+/// `hardKill` `finish({status: "timed-out", …})` (`:742-758`) is what resolves the promise, 1000 ms
+/// after the deadline. So upstream reports such a command as TIMED OUT at `timeoutMs + 1000ms`
+/// regardless of the exit code it already observed, and this port does the same rather than
+/// inventing a separate, shorter grace with a different verdict.
+async fn drained_by(
+    deadline: tokio::time::Instant,
+    stdout_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let aborts: Vec<tokio::task::AbortHandle> = [stdout_task.as_ref(), stderr_task.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    let collect = async move {
+        let out = drained(stdout_task).await;
+        let err = drained(stderr_task).await;
+        (out, err)
+    };
+    match tokio::time::timeout_at(deadline, collect).await {
+        Ok(pair) => Some(pair),
+        Err(_elapsed) => {
+            for handle in aborts {
+                handle.abort();
+            }
+            None
+        }
     }
 }
 
@@ -1236,6 +1322,67 @@ mod tests {
             "the descendant pid {pid} the verify command spawned must die with it — the kill \
              targets the command's process GROUP, not just its direct pid"
         );
+    }
+
+    /// SUBA-027 regression: a verify command that EXITS PROMPTLY but leaves a backgrounded
+    /// descendant holding the inherited stdout/stderr must still return inside its own timeout.
+    ///
+    /// This is the exact shape of a routine `verify[]` entry (`./server &`, `npm run dev &`,
+    /// anything that daemonises): `child.wait()` resolves at once because the DIRECT child is gone,
+    /// but `read_to_end` on the pipes sees EOF only when the LAST write end closes — which is the
+    /// descendant's whole lifetime. Awaiting the drain tasks outside the deadline therefore hung
+    /// `run_verify_commands` (sequential, no outer timeout) forever, silently ignoring `timeoutMs`.
+    /// Upstream is always bounded: its `"close"` event has the same stdio-EOF requirement, so it is
+    /// `abortVerification`'s `finish({status: "timed-out", …})` that resolves the promise at
+    /// `timeoutMs + 1000ms` (`acceptance.ts:742-759` @v0.34.0), and this asserts the same verdict on
+    /// the same schedule.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verify_command_that_daemonizes_still_returns_within_its_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_pid_file = dir.path().join("descendant");
+        let started = tokio::time::Instant::now();
+
+        // The outer guard turns "hangs forever" into a real, reportable failure instead of a wedged
+        // test binary — the pre-fix code never returned here at all.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_one_verify_command(
+                "sleep 300 & echo $! > descendant; exit 0",
+                dir.path(),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect(
+            "run_one_verify_command must honor its own timeout even when a backgrounded \
+             grandchild still holds the stdout/stderr pipe — an unbounded post-wait drain hangs \
+             acceptance evaluation with no error, no log line and no kill",
+        );
+
+        assert!(
+            !result.passed,
+            "a command whose pipes outlive its own timeout is reported as a timeout, exactly as \
+             upstream's abortVerification does, never as a pass"
+        );
+        let error = result.spawn_error.unwrap_or_default();
+        assert!(
+            error.contains("timeout"),
+            "the timed-out verdict must say so: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the call must return on its own deadline (200ms + the 1000ms hard-kill grace), not \
+             the descendant's lifetime, got {:?}",
+            started.elapsed()
+        );
+
+        // The descendant is deliberately NOT killed by the production path (upstream leaves a
+        // deliberately daemonised process alone), so this test cleans up its own `sleep 300`.
+        let pid = wait_for_published_pid(&descendant_pid_file, Duration::from_secs(5)).await;
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
     }
 
     /// The hard `SIGKILL` rung really fires: a command that traps and ignores `SIGTERM` cannot be
@@ -3621,10 +3768,14 @@ pub mod model {
         let stdout_task = child.stdout.take().map(super::spawn_pipe_drain);
         let stderr_task = child.stderr.take().map(super::spawn_pipe_drain);
 
+        // ONE absolute deadline over exit AND output collection — see `super::drained_by` for why
+        // the post-`wait()` drain must be inside it (upstream `acceptance.ts:742-759`).
+        let deadline = tokio::time::Instant::now() + timeout;
+
         let waited = tokio::select! {
             biased;
             result = child.wait() => Some(result),
-            () = tokio::time::sleep(timeout) => None,
+            () = tokio::time::sleep_until(deadline) => None,
         };
 
         let Some(waited) = waited else {
@@ -3647,8 +3798,26 @@ pub mod model {
             };
         };
 
-        let out_bytes = super::drained(stdout_task).await;
-        let err_bytes = super::drained(stderr_task).await;
+        // Same bound as the enum-lattice copy: a command that exits while a descendant still holds
+        // its pipes is reported TIMED OUT at the deadline, never awaited unbounded.
+        let Some((out_bytes, err_bytes)) = super::drained_by(
+            deadline + super::TIMEOUT_SIGTERM_GRACE,
+            stdout_task,
+            stderr_task,
+        )
+        .await
+        else {
+            return AcceptanceVerifyResult {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: cwd_str,
+                exit_code: Option::None,
+                status: VerifyRunStatus::TimedOut,
+                stdout: Option::None,
+                stderr: Option::None,
+                duration_ms: started.elapsed().as_millis(),
+            };
+        };
 
         match waited {
             Ok(status_code) => {
@@ -4361,6 +4530,70 @@ pub mod model {
             assert!(err.contains("criteriaSatisfied[0].id: expected string; got number 7"));
             assert!(err.contains("criteriaSatisfied[0].status: expected one of \"satisfied\", \"not-satisfied\", \"not-applicable\"; got \"done\""));
             assert!(err.contains("criteriaSatisfied[0].evidence: expected non-empty string; got \"\""));
+        }
+
+        // ---- runVerifyCommand (acceptance.ts:713-767) — the SECOND copy of the runner ----
+
+        /// SUBA-027 regression, mirror of
+        /// `super::super::tests::a_verify_command_that_daemonizes_still_returns_within_its_timeout`.
+        ///
+        /// This module is the second copy of the verify runner, so it carried the identical
+        /// unbounded post-`wait()` drain and the identical hang. Both copies now share
+        /// [`super::super::drained_by`], and this test is what keeps them from drifting apart
+        /// again: a command that exits 0 while a backgrounded descendant still holds its
+        /// stdout/stderr must settle as [`VerifyRunStatus::TimedOut`] on its own deadline, exactly
+        /// as upstream's `abortVerification` → `finish({status: "timed-out", …})` does
+        /// (`acceptance.ts:742-759` @v0.34.0).
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_daemonizing_verify_command_times_out_instead_of_hanging_the_model_copy() {
+            let dir = temp_dir();
+            let command = AcceptanceVerifyCommand {
+                id: "daemonizes".into(),
+                command: "sleep 300 & echo $! > descendant; exit 0".into(),
+                timeout_ms: Some(200),
+                cwd: Option::None,
+                env: Option::None,
+                allow_failure: Option::None,
+            };
+
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                run_verify_command(&command, dir.path()),
+            )
+            .await
+            .expect(
+                "run_verify_command must honor timeoutMs even when a backgrounded grandchild \
+                 still holds the stdout/stderr pipe",
+            );
+
+            assert_eq!(
+                result.status,
+                VerifyRunStatus::TimedOut,
+                "upstream resolves this shape through abortVerification's finish(), i.e. as \
+                 timed-out, never as a pass"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the call must return on its own deadline, not the descendant's lifetime, got {:?}",
+                started.elapsed()
+            );
+
+            // Clean up the deliberately-daemonised descendant this test created.
+            let pid_path = dir.path().join("descendant");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(raw) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
 
         // ---- evaluateAcceptance (async, real subprocess / real git) ----

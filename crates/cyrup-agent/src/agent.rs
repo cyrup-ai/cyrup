@@ -1383,11 +1383,19 @@ impl RunCtx {
 /// the happy path AND any unwind (e.g. an uncontained panic on the run task) — so `wait_for_idle()`
 /// can NEVER deadlock. The happy path records the run's new messages via [`SettlementGuard::complete`];
 /// on an unwind the oneshot resolves to an empty `Vec`.
+///
+/// The run-active flag it clears is `running_tx` ITSELF, and deliberately not a second bool beside
+/// it: `wait_for_idle()` releases on `running_tx` going false, so any separate "is a run in flight"
+/// latch cleared AFTERWARDS opens a window in which a caller that has just been woken by this very
+/// send is told the agent is idle and is then rejected with [`AgentError::RunActive`] by
+/// [`Agent::start_run`]. That window is exactly two statements wide but a preemption between them
+/// (routine under a loaded machine) stretches it to milliseconds — long enough for a woken caller
+/// to run a full `prompt` preflight — which is how a `prompt(); wait_for_idle(); prompt()` sequence
+/// could fail non-deterministically under parallel load.
 struct SettlementGuard {
     state: Arc<Mutex<StateInner>>,
     cancel_slot: Arc<Mutex<Option<RunCancel>>>,
     running_tx: watch::Sender<bool>,
-    active: Arc<Mutex<bool>>,
     result_tx: Option<oneshot::Sender<Vec<AgentMessage>>>,
     new_messages: Vec<AgentMessage>,
 }
@@ -1405,8 +1413,10 @@ impl Drop for SettlementGuard {
             st.is_streaming = false;
         }
         *lock(&self.cancel_slot) = None;
+        // The ONE settlement write. Everything a waiter can observe about "is a run in flight" is
+        // this channel, so the instant it reads `false` a fresh `start_run` is guaranteed to be
+        // accepted — there is no second flag left set behind it.
         let _ = self.running_tx.send(false);
-        *lock(&self.active) = false;
         if let Some(tx) = self.result_tx.take() {
             let _ = tx.send(std::mem::take(&mut self.new_messages));
         }
@@ -1427,7 +1437,10 @@ pub struct Agent {
     stream_fn: Arc<dyn StreamFn>,
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
     cancel_slot: Arc<Mutex<Option<RunCancel>>>,
-    active: Arc<Mutex<bool>>,
+    /// The SINGLE run-in-flight latch (R-02-045..048). `start_run` claims it with an atomic
+    /// compare-and-set (`watch::Sender::send_if_modified`), [`SettlementGuard`] releases it, and
+    /// both [`Agent::wait_for_idle`] and [`Agent::is_running`] read it — so "the waiter observed
+    /// idle" and "a new run may start" are the same fact, never two facts written in sequence.
     running_tx: watch::Sender<bool>,
     running_rx: watch::Receiver<bool>,
     tool_execution: ToolExecution,
@@ -1607,12 +1620,24 @@ impl Agent {
         entry: EntryStart,
         skip_initial_steering_poll: bool,
     ) -> Result<RunHandle, AgentError> {
-        {
-            let mut a = lock(&self.active);
-            if *a {
-                return Err(AgentError::RunActive);
+        // Claim the run-in-flight latch with an atomic compare-and-set on the very channel
+        // `wait_for_idle`/`is_running` observe (Pi's `_isAgentRunActive` guard, agent.ts:398-400 —
+        // single-threaded JS gets this atomicity for free; Rust has to ask for it). `send_if_modified`
+        // runs the closure under the channel's own write lock and notifies receivers only when it
+        // returns `true`, so this both rejects a concurrent second run and publishes "running" in
+        // one indivisible step. Using a SEPARATE bool here (as this did) meant a caller woken by
+        // `SettlementGuard`'s `send(false)` could reach this guard before the guard's next statement
+        // cleared that bool, and get a spurious `RunActive`.
+        let claimed = self.running_tx.send_if_modified(|running| {
+            if *running {
+                false
+            } else {
+                *running = true;
+                true
             }
-            *a = true;
+        });
+        if !claimed {
+            return Err(AgentError::RunActive);
         }
         let cancel = RunCancel::new();
         *lock(&self.cancel_slot) = Some(cancel.clone());
@@ -1636,7 +1661,6 @@ impl Agent {
                 st.messages.clone(),
             )
         };
-        let _ = self.running_tx.send(true);
 
         let mut rc = RunCtx::new(
             self.state.clone(),
@@ -1661,7 +1685,6 @@ impl Agent {
         let (tx, rx) = oneshot::channel();
         let state = self.state.clone();
         let running_tx = self.running_tx.clone();
-        let active = self.active.clone();
         let cancel_slot = self.cancel_slot.clone();
         // Independent handles for the catch-all failure path (Pi `handleRunFailure`,
         // agent.ts:496-511): they must outlive the unwound `RunCtx`.
@@ -1675,7 +1698,6 @@ impl Agent {
                 state,
                 cancel_slot,
                 running_tx,
-                active,
                 result_tx: Some(tx),
                 new_messages: Vec::new(),
             };
@@ -1921,7 +1943,6 @@ impl AgentBuilder {
             stream_fn: self.stream_fn,
             key_resolver: self.key_resolver,
             cancel_slot: Arc::new(Mutex::new(None)),
-            active: Arc::new(Mutex::new(false)),
             running_tx,
             running_rx,
             tool_execution: self.tool_execution,

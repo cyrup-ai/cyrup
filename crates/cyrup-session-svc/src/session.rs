@@ -527,8 +527,15 @@ impl AgentSession {
     /// `shutdownHandler` setting `shutdownRequested = true`, rpc-mode.ts:344-346). A host checks
     /// this at its settle point — see `AgentSessionEvent::AgentSettled` (SEAM-005), which is where
     /// Pi checks it (rpc-mode.ts:355-358).
+    /// ORs two latches on purpose. The backend's is set SYNCHRONOUSLY inside
+    /// `HostServices::control(ControlOp::Shutdown)` (Pi's `shutdownHandler`, rpc-mode.ts:344-346);
+    /// this session's own is set by the turn-boundary control drain. Reading only the latter made
+    /// the answer depend on whether a turn boundary happened to follow the request — a shutdown
+    /// asked for from a background task on an idle session, or in the window after the in-flight
+    /// run's drain had already run, stayed queued forever and the host never exited.
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+            || self.services.host_services.shutdown_requested()
     }
 
     /// Wrap a freshly-built session in its owning `Arc` and bind the self-handle so the persist+fan-out

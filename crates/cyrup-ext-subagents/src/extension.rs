@@ -4410,9 +4410,35 @@ fn sj_control_overrides() -> serde_json::Value {
 /// unions) with per-node descriptions pruned to keep the provider payload compact, exactly as pi
 /// ships it.
 ///
-/// The invariant SUBA-041 pins: this schema must never advertise a parameter [`SubagentTool::route_single`]
-/// refuses. A param either reaches [`RunOptions`] or it is absent here — never both advertised and
-/// rejected.
+/// # The SUBA-041 invariant, stated accurately
+///
+/// This schema must never advertise a parameter [`SubagentTool::route_single`] refuses
+/// UNCONDITIONALLY. `includeProgress` and `control` are refused on every path, so they are absent
+/// here; the other seven SINGLE-mode overrides (`output`, `outputMode`, `skill`, `acceptance`,
+/// `share`, `sessionDir`, `artifacts`) reach [`RunOptions`] on the FOREGROUND path and are
+/// advertised for that reason.
+///
+/// Those seven are still refused — loudly and by name — when the same call resolves to a BACKGROUND
+/// run (`async: true`, or `asyncByDefault`/`forceTopLevelAsync` making a top-level call background).
+/// That is a MODE-CONDITIONAL refusal of an honoured parameter, which is a shape upstream itself
+/// ships: `timeoutMs`/`maxRuntimeMs` are advertised and then refused for async runs at
+/// `pi-subagents/src/runs/foreground/subagent-executor.ts:3022` @v0.34.0, and this crate mirrors
+/// that refusal directly above the seven-param one.
+///
+/// # Known parity debt this comment must not paper over
+///
+/// Upstream DOES honour all seven on the async path — `executeAsyncSingle`
+/// (`subagent-executor.ts:2845-2874` @v0.34.0) threads `artifactConfig`, `shareEnabled`,
+/// `sessionRoot`, `skills`, `output`, `outputMode` and `outputBaseDir` into the background run.
+/// cyrup's background hop hands a `RunnerConfig` to a detached second-hop runner that has no fields
+/// for share/sessionDir/artifacts, no `skill` on [`crate::spawn::chain_graph::SingleStepSpec`], and
+/// drops `SingleStepSpec::acceptance` on the floor in BOTH walkers
+/// (`background/runner_main.rs` and `spawn/chain_graph.rs`), so closing it is a real port, not a
+/// tweak. Until then the refusal is the honest behaviour — an advertised-and-silently-dropped param
+/// is the defect SUBA-041 names; an advertised-and-loudly-refused-in-one-mode param is upstream's
+/// own `timeoutMs` precedent. The refusal is pinned by
+/// `tests::a_background_single_run_refuses_the_seven_foreground_only_overrides_by_name`, so this
+/// contract cannot drift silently in either direction.
 fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
     // `json!` object overflows the macro's default `recursion_limit` at expansion time. Each insert
@@ -9809,6 +9835,88 @@ mod tests {
         assert!(
             !bad_acceptance.contains("agent not found"),
             "acceptance validation must precede agent resolution: {bad_acceptance}"
+        );
+    }
+
+    /// SUBA-041, the OTHER half of the contract — previously asserted nowhere at all.
+    ///
+    /// The seven overrides above are advertised because the FOREGROUND path honours them. The same
+    /// call resolved to a BACKGROUND run refuses them by name, because cyrup's second-hop
+    /// `RunnerConfig` has nowhere to put them (upstream's `executeAsyncSingle`,
+    /// `subagent-executor.ts:2845-2874` @v0.34.0, does — that plumbing is unported parity debt,
+    /// recorded on [`subagent_tool_parameters`]). The refusal is deliberate and mirrors upstream's
+    /// own `timeoutMs` + async refusal (`subagent-executor.ts:3022`); what was NOT acceptable was
+    /// leaving it untested, so a future change could silently turn it into an accepted-and-dropped
+    /// param — precisely the defect SUBA-041 exists to prevent.
+    ///
+    /// Every one of the seven is asserted individually, and the message must name the offender, so
+    /// this test also fails the day one of them starts being honoured without being removed from
+    /// the refusal list.
+    #[tokio::test]
+    async fn a_background_single_run_refuses_the_seven_foreground_only_overrides_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        let cases = [
+            ("output", serde_json::json!({ "output": "report.md" })),
+            ("outputMode", serde_json::json!({ "outputMode": "inline" })),
+            ("skill", serde_json::json!({ "skill": "rust" })),
+            ("acceptance", serde_json::json!({ "acceptance": "checked" })),
+            ("share", serde_json::json!({ "share": true })),
+            ("sessionDir", serde_json::json!({ "sessionDir": "~/x" })),
+            ("artifacts", serde_json::json!({ "artifacts": false })),
+        ];
+
+        for (name, extra) in &cases {
+            let mut params =
+                serde_json::json!({ "agent": "ghost", "task": "do it", "async": true });
+            for (key, value) in extra.as_object().expect("object literal") {
+                params
+                    .as_object_mut()
+                    .expect("object literal")
+                    .insert(key.clone(), value.clone());
+            }
+            let message = tool
+                .execute(
+                    ToolCallId::from(format!("bg-{name}").as_str()),
+                    params.clone(),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("a background run must refuse a foreground-only override")
+                .to_string();
+            assert!(
+                message.contains("only supported for foreground SINGLE runs"),
+                "{params} must be refused with the foreground-only message: {message}"
+            );
+            assert!(
+                message.contains(name),
+                "the refusal must NAME the offending param '{name}', never drop it silently: \
+                 {message}"
+            );
+            assert!(
+                !message.contains("agent not found"),
+                "the refusal must fire BEFORE agent resolution: {message}"
+            );
+        }
+
+        // The complement: a background SINGLE call carrying NONE of the seven is not refused by
+        // this gate at all — it proceeds to agent resolution like any other background run. Without
+        // this, the test above would still pass if the gate rejected every background call.
+        let clean = tool
+            .execute(
+                ToolCallId::from("bg-clean"),
+                serde_json::json!({ "agent": "ghost", "task": "do it", "async": true }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("the agent is unresolvable, so the call still errors")
+            .to_string();
+        assert!(
+            !clean.contains("only supported for foreground SINGLE runs"),
+            "a background call carrying none of the seven must not trip the gate: {clean}"
         );
     }
 
