@@ -239,12 +239,56 @@ impl Default for SubagentExecutor {
     }
 }
 
+/// SUBA-041 — the per-call SINGLE-mode override surface pi's `runSinglePath` honors
+/// (`subagent-executor.ts:2788-2791` output/outputMode/skill, `:2962` acceptance, `:2874` share,
+/// `:3387-3401` artifacts/sessionDir), carried as ONE owned bundle so
+/// [`ForegroundRunRequest`] stays within the field budget and every non-tool caller (the `/run`
+/// slash surface, tests) can keep saying [`Default::default`] for "no overrides at all".
+///
+/// The values here are the RAW tool params, not resolved paths: pi resolves an `output` string
+/// against `resolveSingleRunOutputBaseDir(deps, artifactsDir, runId)`
+/// (`subagent-executor.ts:2203-2207,2882`), a base directory that only exists once the run id has
+/// been minted and the artifacts dir computed — i.e. inside `run_foreground_impl`, not at the
+/// dispatch site.
+#[derive(Debug, Clone, Default)]
+pub struct SingleRunOverrides {
+    /// pi `params.output` (`OutputOverride`, `schemas.ts:42-48`): a path string, `false`/`"false"`
+    /// to disable, or `true`/`"true"` to mean "the persona's own declared output". `None` = the
+    /// param was omitted, which defers to the persona's `output:` exactly as pi's
+    /// `params.output !== undefined ? params.output : agentConfig.output` does.
+    pub output: Option<serde_json::Value>,
+    /// pi `params.outputMode` (`schemas.ts:50-53`): `"inline"` (pi's own default) or `"file-only"`.
+    pub output_mode: Option<String>,
+    /// pi `params.skill` (`SkillOverride`, `schemas.ts:33-40`), already normalized through
+    /// [`normalize_skill_input`]: `Some(names)` replaces the persona's own `skills:`, `Some(vec![])`
+    /// is the explicit `skill: false` "no skills" form, `None` inherits the persona's list.
+    pub skills: Option<Vec<String>>,
+    /// pi `params.acceptance` (`AcceptanceOverride`, `schemas.ts:69-76`), already validated and
+    /// lowered by [`parse_single_acceptance`]. `None` defers to
+    /// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] (R-SA-023), which is
+    /// exactly what pi's `acceptance: "auto"` / omitted means.
+    pub acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
+    /// pi `params.share` (`subagent-executor.ts:3354` `shareEnabled`).
+    pub share: Option<bool>,
+    /// pi `params.sessionDir` (`subagent-executor.ts:3393-3401`), still the RAW string: it is
+    /// tilde-expanded and `path.resolve`d, then suffixed with pi's own `<runId>/run-0` layout once
+    /// the run id exists.
+    pub session_dir: Option<String>,
+    /// pi `params.artifacts` (`subagent-executor.ts:3387-3390`): `enabled = artifacts !== false`, so
+    /// only an explicit `Some(false)` turns the artifact quadruple off.
+    pub artifacts: Option<bool>,
+}
+
 /// The seven inputs one foreground single run needs, bundled into one borrowed request so
 /// [`SubagentExecutor::run_foreground_streaming`] and the shared `run_foreground_impl` stay within
 /// the argument-count budget (the non-streaming [`SubagentExecutor::run_foreground`] keeps its
 /// original flat signature for backward compatibility and builds this internally). All fields
 /// borrow for the duration of the one `run_foreground*` call they are passed to.
 pub struct ForegroundRunRequest<'a> {
+    /// SUBA-041: the per-call SINGLE-mode override bundle (`output`/`outputMode`/`skill`/
+    /// `acceptance`/`share`/`sessionDir`/`artifacts`). [`SingleRunOverrides::default`] is
+    /// "no overrides", which reproduces this entry point's pre-SUBA-041 behavior exactly.
+    pub overrides: SingleRunOverrides,
     /// The task's working directory (also the discovery root for the named persona).
     pub cwd: &'a Path,
     /// The persona name to resolve and run (func-SA §5.2).
@@ -386,6 +430,26 @@ impl SubagentExecutor {
     /// `SessionStart`). A change of session id resets the counter in place, exactly as pi's
     /// `if (state.subagentSpawns?.sessionId !== sessionId)` guard does, so a long-lived process that
     /// starts a second session starts that session with a fresh budget.
+    ///
+    /// # Call sites (SUBA-002)
+    /// EVERY route into execution charges here, so the budget cannot be walked around by picking a
+    /// different surface — upstream gets that property structurally (every slash handler funnels
+    /// back through `executor.execute`, `slash/slash-commands.ts` `runSlashSubagent` ->
+    /// `requestSlashRun` -> `extension/index.ts:396-401` -> `executeSubagentCollapsed`), this crate
+    /// gets it by charging at each independent entry point exactly once:
+    ///
+    /// * the `subagent` TOOL — [`SubagentTool::execute`], after the dispatch guard and the
+    ///   mode-exclusivity gate, covering its SINGLE/PARALLEL/CHAIN routes
+    ///   ([`count_requested_subagent_spawns`]);
+    /// * `/run` — [`SubagentsExtension::dispatch_slash`]'s `Run` arm, billed `1` for both the
+    ///   foreground and the `--background` shape;
+    /// * `/chain`, `/parallel`, `/run-chain` — [`SubagentsExtension::run_or_background_chain`], the
+    ///   single wrapper all three share, billed over the lowered graph
+    ///   ([`count_graph_requested_spawns`]).
+    ///
+    /// The tool path never re-enters the slash wrapper (it reaches
+    /// [`Self::run_or_background_graph`] via `route_chain_mode`/`route_parallel_mode`), so no
+    /// dispatch is billed twice.
     ///
     /// # Errors
     /// The over-limit notice (pi's verbatim string) when `used + requested` exceeds `max_spawns`.
@@ -923,6 +987,9 @@ impl SubagentExecutor {
         // (`SubagentTool::execute` -> `route_single`).
         self.run_foreground_impl(
             ForegroundRunRequest {
+                // The flat entry point (`/run`, this crate's own tests) exposes no per-call override
+                // surface at all, so SUBA-041's bundle is empty here — identical to pre-SUBA-041.
+                overrides: SingleRunOverrides::default(),
                 cwd,
                 agent_name,
                 task,
@@ -981,6 +1048,7 @@ impl SubagentExecutor {
         on_update: Option<ToolUpdateSink>,
     ) -> Result<(SingleResult, RunId), SubagentError> {
         let ForegroundRunRequest {
+            overrides,
             cwd,
             agent_name,
             task,
@@ -1065,12 +1133,84 @@ impl SubagentExecutor {
         // context (R-SA-037/119/120) below; it doubles as the artifact-quadruple run id further down.
         let run_id = RunId::new();
 
+        // T6 artifact quadruple config + root (pi `subagent-executor.ts:3387-3391`). Resolved HERE,
+        // ahead of `run_options`, because pi derives the single-run output base directory from the
+        // artifacts dir (`resolveSingleRunOutputBaseDir`, `:2203-2207`). SUBA-041: an explicit
+        // `artifacts: false` turns the quadruple off — pi's `enabled: params.artifacts !== false`.
+        let art_cfg = crate::artifacts::ArtifactConfig {
+            enabled: overrides.artifacts != Some(false),
+            ..crate::artifacts::ArtifactConfig::foreground()
+        };
+        let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
+
+        // SUBA-041 / pi `resolveSingleRunOutputBaseDir` (`subagent-executor.ts:2203-2207`): the
+        // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
+        // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
+        // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
+        let output_base_dir = match cfg.single_run_output_base_dir.as_deref() {
+            Some(configured) => {
+                let expanded = expand_tilde(&configured.to_string_lossy());
+                resolve_against_process_cwd(&expanded).unwrap_or(expanded)
+            }
+            None => art_dir.join("outputs").join(run_id.as_str()),
+        };
+        // pi `runSinglePath` (`subagent-executor.ts:2789-2791,2882`): the persona's own `output:` is
+        // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
+        // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
+        let output_path = resolve_single_output_path(
+            normalize_single_output_override(
+                overrides.output.as_ref(),
+                agent
+                    .output
+                    .as_ref()
+                    .and_then(|spec| spec.path.as_deref())
+                    .and_then(Path::to_str),
+            )
+            .as_deref(),
+            &output_base_dir,
+        );
+        let output_mode = parse_tool_output_mode(overrides.output_mode.as_deref())
+            .unwrap_or(crate::discovery::types::OutputMode::Inline);
+
+        // SUBA-041 / pi `subagent-executor.ts:3393-3401`: an explicit `sessionDir` is tilde-expanded
+        // and `path.resolve`d and becomes the session ROOT verbatim; a configured
+        // `default_session_dir` is instead scoped per run (`path.join(base, runId)`); the child's own
+        // directory is then `<root>/run-0` (pi's `sessionDirForIndex(0)`).
+        //
+        // **[CYRUP-DELTA]** pi's third rung — `deps.getSubagentSessionRoot(parentSessionFile)`, an
+        // always-present default derived from the PARENT session file — has no analog at this seam
+        // (no parent-session-file plumbing reaches the extension), so with neither an explicit
+        // `sessionDir` nor a configured default this stays `None` and
+        // [`crate::exec::build_attempt_spawn_plan`] falls to pi's own `--no-session` branch
+        // (`pi-args.ts:105-106`). The isolation outcome is the same one pi's scoped root buys: the
+        // child never writes into the orchestrator's session store.
+        let session_dir = overrides
+            .session_dir
+            .as_deref()
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| {
+                let expanded = expand_tilde(raw);
+                resolve_against_process_cwd(&expanded).unwrap_or(expanded)
+            })
+            .or_else(|| {
+                cfg.default_session_dir
+                    .as_deref()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|path| {
+                        let expanded = expand_tilde(&path.to_string_lossy());
+                        resolve_against_process_cwd(&expanded)
+                            .unwrap_or(expanded)
+                            .join(run_id.as_str())
+                    })
+            })
+            .map(|root| root.join("run-0"));
+
         let run_options = RunOptions {
             cwd: cwd.to_path_buf(),
             deadline_at,
             timeout_ms,
-            output_path: None,
-            output_mode: crate::discovery::types::OutputMode::Inline,
+            output_path,
+            output_mode,
             structured_output_schema: None,
             model_override: effective_override,
             // SUBA-003: the same policy that just gated the explicit override, carried into
@@ -1086,16 +1226,23 @@ impl SubagentExecutor {
             // never fire.
             cancel,
             interrupt: CancelToken::new(),
-            share: None,
-            session_dir: None,
-            // Skills default to the agent's own `skills` list (`run_sync` reads `opts.skills ??
-            // agent.skills`); the foreground single-run path resolves against `cwd` alone (no
-            // distinct orchestrator/runtime fallback cwd).
-            skills: None,
+            // SUBA-041: pi's `shareEnabled` (`subagent-executor.ts:3354`) and `sessionDir`
+            // (`:3393-3401`), both consumed by `build_attempt_spawn_plan`'s session branch.
+            share: overrides.share,
+            session_dir,
+            // SUBA-041: the per-call `skill` override (pi `normalizeSkillInput(params.skill)`,
+            // `subagent-executor.ts:2788`) replaces the agent's own `skills` list; `None` keeps the
+            // pre-existing fallthrough (`run_sync` reads `opts.skills ?? agent.skills`). The
+            // foreground single-run path still resolves against `cwd` alone (no distinct
+            // orchestrator/runtime fallback cwd).
+            skills: overrides.skills,
             runtime_cwd: None,
             include_progress: None,
             agent_scope: None,
-            acceptance: None,
+            // SUBA-041: the per-call `acceptance` policy (pi `acceptance: params.acceptance`,
+            // `subagent-executor.ts:2962`); `None` (an omitted param, or the explicit `"auto"`)
+            // defers to `AcceptanceContract::heuristic_default` inside `run_sync` (R-SA-023).
+            acceptance: overrides.acceptance,
             fork_context,
             live_events: None,
             // R-SA-P1: the EXPLICIT anchor — this root orchestrator session's own id, captured at
@@ -1151,10 +1298,9 @@ impl SubagentExecutor {
         // BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
         // the run settles. Written into the scoped-temp artifacts root for `cwd` (the Rust analog of
         // pi's `tempArtifactsDir = getArtifactsDir(null)`, `extension/index.ts:263`). Best-effort: a
-        // failed artifact write never alters the `SingleResult` the caller observes. (`run_id` was
-        // minted above so it also identifies the clarify dispatch context.)
-        let art_cfg = crate::artifacts::ArtifactConfig::foreground();
-        let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
+        // failed artifact write never alters the `SingleResult` the caller observes. (`run_id`,
+        // `art_cfg` and `art_dir` were all resolved above — `art_cfg.enabled` already honors
+        // SUBA-041's `artifacts: false`, and `art_dir` doubles as the relative-output base root.)
         let art_paths =
             crate::artifacts::artifact_paths(&art_dir, run_id.as_str(), &agent.name, None);
         if art_cfg.enabled {
@@ -3746,6 +3892,190 @@ fn parse_tool_acceptance(raw: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// SUBA-041: the SINGLE-mode override normalizers (`output`/`outputMode`/`skill`/`acceptance`).
+//
+// pi's `runSinglePath` runs each raw tool param through one small shared normalizer before it ever
+// reaches `runSync` (`single-output.ts:11-34`, `skills.ts:684-708`, `acceptance.ts:138-249`); these
+// are those normalizers, ported 1:1 so the top-level SINGLE surface and the `tasks[]`/`chain[]` item
+// surface agree on what a given value means.
+// -------------------------------------------------------------------------------------------------
+
+/// pi `normalizeSingleOutputOverride` (`runs/shared/single-output.ts:11-19`) composed with
+/// `runSinglePath`'s own `rawOutput = params.output !== undefined ? params.output :
+/// agentConfig.output` (`subagent-executor.ts:2789`).
+///
+/// Returns the effective output FILE name/path, or `None` for every "no output file" form: an
+/// explicit `false`/`"false"`, an empty string, a non-string/non-boolean value, and — for
+/// `true`/`"true"` — a persona that declares no `output:` of its own. `true`/`"true"` means "use the
+/// persona's own declared output", which is why `default_output` is threaded in.
+fn normalize_single_output_override(
+    output: Option<&serde_json::Value>,
+    default_output: Option<&str>,
+) -> Option<String> {
+    // pi's `params.output !== undefined ? params.output : agentConfig.output`: an OMITTED param
+    // falls back to the persona's own declared output path, which then re-enters the same
+    // normalizer as a plain string.
+    let Some(raw) = output else {
+        return default_output.filter(|s| !s.is_empty()).map(str::to_string);
+    };
+    match raw {
+        serde_json::Value::Bool(false) => None,
+        serde_json::Value::Bool(true) => {
+            default_output.filter(|s| !s.is_empty()).map(str::to_string)
+        }
+        serde_json::Value::String(s) if s == "false" => None,
+        serde_json::Value::String(s) if s == "true" => {
+            default_output.filter(|s| !s.is_empty()).map(str::to_string)
+        }
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// pi `resolveSingleOutputPath` (`runs/shared/single-output.ts:21-34`), specialized to the one call
+/// shape `runSinglePath` uses (`subagent-executor.ts:2882`): a `relativeBaseDir` is ALWAYS supplied
+/// there — `resolveSingleRunOutputBaseDir`'s configured `singleRunOutputBaseDir` or
+/// `<artifactsDir>/outputs/<runId>` (`:2203-2207`) — so the runtime-cwd / requested-cwd fallback
+/// rungs of the upstream function are unreachable on this path and are not reproduced. An ABSOLUTE
+/// output is used verbatim; a relative one resolves against `base_dir`, NOT against the run cwd.
+fn resolve_single_output_path(output: Option<&str>, base_dir: &Path) -> Option<PathBuf> {
+    let output = output.filter(|s| !s.is_empty() && *s != "false" && *s != "true")?;
+    let candidate = Path::new(output);
+    if candidate.is_absolute() {
+        Some(candidate.to_path_buf())
+    } else {
+        Some(base_dir.join(candidate))
+    }
+}
+
+/// pi `normalizeSkillInput` (`agents/skills.ts:684-708`): `false` → the explicit "no skills at all"
+/// form (`Some(vec![])`, which `runSinglePath` spells `effectiveSkills = []`,
+/// `subagent-executor.ts:2889-2893`); `true`/absent → `None` (inherit the persona's own `skills:`);
+/// an array or a comma-separated string → the trimmed, non-empty, order-preserving de-duplicated
+/// names. A string that opens on `[` is first tried as JSON (models routinely serialize the array
+/// form as a string, and a naive comma-split would embed brackets and quotes into the names).
+fn normalize_skill_input(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    fn dedup(names: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in names {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
+    }
+    match raw {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(true)) => None,
+        Some(serde_json::Value::Bool(false)) => Some(Vec::new()),
+        Some(serde_json::Value::Array(items)) => Some(dedup(
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[')
+                && let Ok(serde_json::Value::Array(items)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+            {
+                return Some(dedup(
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            Some(dedup(s.split(',').map(str::to_string)))
+        }
+        // Any other JSON shape is not a skill selector at all — pi's TypeBox union would have
+        // rejected it; degrade to "inherit the persona's list" rather than inventing names.
+        Some(_) => None,
+    }
+}
+
+/// SUBA-041 — lower the SINGLE-mode `acceptance` param (pi `AcceptanceOverride`, `schemas.ts:69-76`)
+/// onto this crate's [`crate::exec::acceptance::AcceptanceContract`], after running pi's own
+/// `validateAcceptanceInput` (`runs/shared/acceptance.ts:138-249`, applied at
+/// `subagent-executor.ts:1418`) so a malformed policy is refused BEFORE any child spawns with pi's
+/// verbatim messages.
+///
+/// Level mapping (pi `AcceptanceLevel` -> [`crate::exec::acceptance::AcceptanceStatus`]): `auto`
+/// yields `None`, i.e. pi's own "omitted means auto-inferred" — `run_sync` then falls through to
+/// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] (R-SA-023), which is this
+/// crate's `inferLevel`. Every other level (and the `false` shorthand, pi's `level: "none"`) becomes
+/// an EXPLICIT contract, which is what arms R-SA-033's post-hoc exit-code correction.
+///
+/// **[CYRUP-DELTA]** pi's richer `AcceptanceConfig` fields (`criteria`/`evidence`/`review`/
+/// `stopRules`/`reason`) are validated here but carry no [`crate::exec::acceptance::AcceptanceContract`]
+/// home — that shape lives in the parallel, not-yet-wired `exec::acceptance::model` port. Only
+/// `level` and `verify[].command` are lowered; the rest are accepted-and-ignored rather than
+/// rejected, matching pi's own tolerance for a config that declares more than a given run consumes.
+fn parse_single_acceptance(
+    raw: &serde_json::Value,
+) -> Result<Option<crate::exec::acceptance::AcceptanceContract>, String> {
+    use crate::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
+
+    let errors = crate::exec::acceptance::model::validate_acceptance_input(raw, "acceptance");
+    if !errors.is_empty() {
+        return Err(errors.join(" "));
+    }
+
+    fn level_to_status(level: &str) -> Option<AcceptanceStatus> {
+        match level {
+            "none" => Some(AcceptanceStatus::NotRequired),
+            "attested" => Some(AcceptanceStatus::Attested),
+            "checked" => Some(AcceptanceStatus::Checked),
+            "verified" => Some(AcceptanceStatus::Verified),
+            "reviewed" => Some(AcceptanceStatus::Reviewed),
+            // "auto" (and anything `validate_acceptance_input` already let through) infers.
+            _ => None,
+        }
+    }
+
+    match raw {
+        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`).
+        serde_json::Value::Bool(false) => Ok(Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            Vec::new(),
+        ))),
+        serde_json::Value::String(level) => Ok(level_to_status(level)
+            .map(|status| AcceptanceContract::explicit(status, Vec::new()))),
+        serde_json::Value::Object(config) => {
+            let verify: Vec<String> = config
+                .get("verify")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let level = config.get("level").and_then(serde_json::Value::as_str);
+            match level.and_then(level_to_status) {
+                Some(status) => Ok(Some(AcceptanceContract::explicit(status, verify))),
+                // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
+                // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
+                // still inferred — but declared `verify[]` commands must not be dropped, so an
+                // object carrying any is lowered as an explicit `verified` contract.
+                None if !verify.is_empty() => Ok(Some(AcceptanceContract::explicit(
+                    AcceptanceStatus::Verified,
+                    verify,
+                ))),
+                None => Ok(None),
+            }
+        }
+        // `null`/absent is pi's `undefined`.
+        _ => Ok(None),
+    }
+}
+
 /// Translate the tool's `chain[]` array into a `Vec<RunnerStep>`: a sequential step for a
 /// `{agent, task, …}` element, a [`RunnerStep::ParallelGroup`] for a `{parallel: [...]}` element
 /// (with per-task `count` expanded), or a [`RunnerStep::DynamicGroup`] for an `{expand, parallel:
@@ -4048,6 +4378,13 @@ fn sj_chain_item() -> serde_json::Value {
 }
 
 /// `ControlOverrides` (`schemas.ts:180-193`): per-run subagent-control attention thresholds.
+///
+/// SUBA-041 unhooked this fragment from [`subagent_tool_parameters`]: cyrup ports the control CONFIG
+/// shape ([`crate::registration::ControlConfig`]) but not pi's `resolveControlConfig` /
+/// control-notice pipeline, so a per-call `control` override has nothing to override and the
+/// dispatcher refuses it. The fragment is kept — not deleted — as the schema-shape record for
+/// whichever tier lands that subsystem, at which point it is re-inserted and the refusal is dropped.
+#[allow(dead_code)]
 fn sj_control_overrides() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -4066,10 +4403,16 @@ fn sj_control_overrides() -> serde_json::Value {
 
 /// The complete LLM-facing JSON Schema for the `subagent` tool (C8) — a faithful port of pi's
 /// exported `SubagentParams` (`schemas.ts:195-265`, after `keepTopLevelParameterDescriptions`
-/// pruning). Every top-level parameter pi advertises is present with its top-level description; the
-/// nested `tasks[]`/`chain[]` element shapes carry their full structural detail (types, enums,
-/// `minimum`s, `items`, `anyOf` unions) with per-node descriptions pruned to keep the provider
-/// payload compact, exactly as pi ships it.
+/// pruning). Every top-level parameter pi advertises is present with its top-level description
+/// EXCEPT the two SUBA-041 withholds (`includeProgress`, `control`) whose subsystems this port does
+/// not have — see the inline notes at their former insertion points. The nested `tasks[]`/`chain[]`
+/// element shapes carry their full structural detail (types, enums, `minimum`s, `items`, `anyOf`
+/// unions) with per-node descriptions pruned to keep the provider payload compact, exactly as pi
+/// ships it.
+///
+/// The invariant SUBA-041 pins: this schema must never advertise a parameter [`SubagentTool::route_single`]
+/// refuses. A param either reaches [`RunOptions`] or it is absent here — never both advertised and
+/// rejected.
 fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
     // `json!` object overflows the macro's default `recursion_limit` at expansion time. Each insert
@@ -4116,11 +4459,25 @@ fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
     props.insert("cwd".to_string(), serde_json::json!({ "type": "string" }));
     props.insert("artifacts".to_string(), serde_json::json!({ "type": "boolean", "description": "Write debug artifacts (default: true)" }));
-    props.insert("includeProgress".to_string(), serde_json::json!({ "type": "boolean", "description": "Include full progress in result (default: false)" }));
+    // SUBA-041: `includeProgress` is deliberately NOT advertised. pi uses it to gate the
+    // `details.progress` array of `AgentProgress` snapshots (`subagent-executor.ts:3008`); cyrup's
+    // `details` is the deliberately compacted `SingleResult` (R-SA-043), which has no progress array
+    // to include or omit. Advertising a knob the dispatcher must refuse is the SUBA-041 defect
+    // itself, so the schema stays silent until that shape exists.
     props.insert("share".to_string(), serde_json::json!({ "type": "boolean", "description": "Upload session to GitHub Gist for sharing (default: false)" }));
     props.insert("sessionDir".to_string(), serde_json::json!({ "type": "string", "description": "Directory to store session logs (default: temp; enables sessions even if share=false)" }));
     props.insert("clarify".to_string(), serde_json::json!({ "type": "boolean", "description": "Show TUI to preview/edit before execution. Explicit clarify: true keeps the run foreground for the clarify UI; omitted clarify can still run in the background when async: true is set." }));
-    props.insert("control".to_string(), sj_control_overrides());
+    // SUBA-041: `control` is deliberately NOT advertised. pi feeds it to `resolveControlConfig`
+    // (`shared/subagent-control.ts`) which drives the live attention/notice pipeline; this crate
+    // ports only that config's SHAPE ([`crate::registration::ControlConfig`]) — no resolver, no
+    // notice emission, no notify channels — so there is nothing for a per-call override to override.
+    // See [`sj_control_overrides`], kept for the schema-fragment record.
+    // pi's own description (`schemas.ts:286`) is kept VERBATIM, including its stale
+    // "Relative paths resolve against cwd" clause: pi's `resolveSingleOutputPath`
+    // (`single-output.ts:21-34`) only falls back to a cwd when no `relativeBaseDir` is supplied, and
+    // `runSinglePath` always supplies one (`resolveSingleRunOutputBaseDir`, `:2882`). Both sides
+    // therefore resolve a relative `output` against the run's scoped output dir; the sentence is
+    // upstream's inaccuracy, reproduced rather than silently corrected (parity over prose).
     props.insert("output".to_string(), serde_json::json!({
         "anyOf": [ { "type": "string" }, { "type": "boolean" } ],
         "description": "Output file for single agent (string), or false to disable. Relative paths resolve against cwd."
@@ -4395,6 +4752,13 @@ impl SubagentTool {
     /// through real discovery and drives [`SubagentExecutor::run_foreground`]/[`spawn_background`]
     /// (`async: true`), each a genuine child OS process. `context` selects fork/fresh (an omitted
     /// value is `Fresh` in this tier); `model` is the per-call override.
+    ///
+    /// SUBA-041 — the per-call override surface pi's `runSinglePath` honors
+    /// (`subagent-executor.ts:2788-2791` output/outputMode/skill, `:2962` acceptance, `:2874` share,
+    /// `:3387-3401` artifacts/sessionDir) now reaches [`RunOptions`] through
+    /// [`SingleRunOverrides`] instead of being rejected wholesale. The two params with no subsystem
+    /// behind them (`includeProgress`, `control`) were removed from the tool schema and are still
+    /// refused here, so the schema never promises what this dispatcher declines.
     async fn route_single(
         &self,
         p: &SubagentToolParams,
@@ -4412,36 +4776,52 @@ impl SubagentTool {
         let context = p.context_override();
         let model = p.model.clone().map(ModelId::from);
 
-        // The tool advertises pi's full SINGLE-mode override surface in its schema/description
-        // (`sessionDir`/`share`/`artifacts`/`includeProgress`/`control`/`output`/`outputMode`/
-        // `skill`/`acceptance`), but this dispatch arm does not yet wire any of them into
-        // `RunOptions`/the executor (that plumbing is later-tier work). Rather than silently
-        // dropping a caller's explicit override on the floor — no behavior change AND no error,
-        // which a caller has no way to detect — reject the call loudly and name exactly which
-        // unsupported param(s) were set. `chainDir` is CHAIN-mode-only in pi (it resolves `{chain_dir}`
-        // for chain steps) so it is not gated here for SINGLE mode.
-        let unsupported_single_overrides: Vec<&'static str> = [
-            ("sessionDir", p.session_dir.is_some()),
-            ("share", p.share.is_some()),
-            ("artifacts", p.artifacts.is_some()),
-            ("includeProgress", p.include_progress.is_some()),
-            ("control", p.control.is_some()),
-            ("output", p.output.is_some()),
-            ("outputMode", p.output_mode.is_some()),
-            ("skill", p.skill.is_some()),
-            ("acceptance", p.acceptance.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(name, present)| present.then_some(name))
-        .collect();
+        // SUBA-041: the two SINGLE-mode params the tool schema NO LONGER advertises, because this
+        // port has no subsystem for either — `control` needs pi's `resolveControlConfig` +
+        // control-notice pipeline (`shared/subagent-control.ts`), of which this crate ports only the
+        // config shape, and `includeProgress` gates pi's `details.progress` array, which cyrup's
+        // deliberately compacted [`SingleResult`] (R-SA-043) has no home for. They are still parsed
+        // (the tool schema is `additionalProperties: true`, so a caller can still send them) and are
+        // still rejected LOUDLY here, so no override is ever silently dropped — but nothing promises
+        // them any more, which is the defect SUBA-041 actually names. `chainDir` is CHAIN-mode-only
+        // in pi (it resolves `{chain_dir}` for chain steps) so it is not gated here for SINGLE mode.
+        let unsupported_single_overrides: Vec<&'static str> =
+            [("includeProgress", p.include_progress.is_some()), ("control", p.control.is_some())]
+                .into_iter()
+                .filter_map(|(name, present)| present.then_some(name))
+                .collect();
         if !unsupported_single_overrides.is_empty() {
             return Err(ToolError::new(format!(
-                "subagent SINGLE mode does not yet support the following param(s): {}. Omit them \
-                 (they are advertised for a later wire-up but currently have no effect on a SINGLE \
+                "subagent SINGLE mode does not support the following param(s): {}. Omit them (they \
+                 are not advertised in this tool's schema and have no effect on a SINGLE \
                  {{agent, task}} call).",
                 unsupported_single_overrides.join(", ")
             )));
         }
+
+        // SUBA-041: the seven SINGLE-mode overrides pi's `runSinglePath` honors, resolved here and
+        // carried into `run_foreground_impl` as one bundle. `acceptance` is validated up front
+        // through pi's own `validateAcceptanceInput` (`subagent-executor.ts:1418`) so a malformed
+        // policy is refused BEFORE agent resolution and before any child spawns.
+        let overrides = SingleRunOverrides {
+            output: p.output.clone(),
+            output_mode: p.output_mode.clone(),
+            skills: normalize_skill_input(p.skill.as_ref()),
+            acceptance: match p.acceptance.as_ref() {
+                Some(raw) => parse_single_acceptance(raw).map_err(ToolError::new)?,
+                None => None,
+            },
+            share: p.share,
+            session_dir: p.session_dir.clone(),
+            artifacts: p.artifacts,
+        };
+
+        // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:85-90`, applied at
+        // `subagent-executor.ts:2883-2886`) fires AFTER the persona is resolved, because a persona's
+        // own `output:` can satisfy `outputMode: "file-only"` on its own. cyrup already enforces the
+        // identical invariant one layer down at the same point in the sequence — `run_sync`'s
+        // R-SA-025 `validate_file_only_requires_path` fail-fast, ahead of any spawn — so it is
+        // deliberately NOT duplicated here where the persona default is not yet known.
 
         // pi `resolveForegroundTimeout` (`subagent-executor.ts:1327-1341`): `timeoutMs`/
         // `maxRuntimeMs` are aliases; validate up front (positive, and consistent when both given).
@@ -4460,6 +4840,30 @@ impl SubagentTool {
                     "timeoutMs/maxRuntimeMs are only supported for foreground runs; set \
                      async: false or omit the timeout for background runs.",
                 ));
+            }
+            // SUBA-041: the seven wired overrides ride on `RunOptions`, which only the FOREGROUND
+            // path builds — `spawn_background` hands a `RunnerConfig` to a detached second-hop
+            // runner (pi's `executeAsyncSingle`, a separate options plumbing this crate has not
+            // ported). Same rule as the `timeoutMs` refusal directly above: name them and refuse,
+            // rather than accept a param the background hop would drop on the floor.
+            let foreground_only: Vec<&'static str> = [
+                ("output", p.output.is_some()),
+                ("outputMode", p.output_mode.is_some()),
+                ("skill", p.skill.is_some()),
+                ("acceptance", p.acceptance.is_some()),
+                ("share", p.share.is_some()),
+                ("sessionDir", p.session_dir.is_some()),
+                ("artifacts", p.artifacts.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, present)| present.then_some(name))
+            .collect();
+            if !foreground_only.is_empty() {
+                return Err(ToolError::new(format!(
+                    "the following param(s) are only supported for foreground SINGLE runs: {}. \
+                     Set async: false to use them.",
+                    foreground_only.join(", ")
+                )));
             }
             let run_id = self
                 .executor
@@ -4500,6 +4904,8 @@ impl SubagentTool {
             .executor
             .run_foreground_streaming(
                 ForegroundRunRequest {
+                    // SUBA-041: the seven wired SINGLE-mode overrides.
+                    overrides,
                     cwd,
                     agent_name: agent,
                     task: &task,
@@ -5238,6 +5644,44 @@ fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtension
         .map_or(1, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX))
 }
 
+/// The SAME charge as [`count_requested_subagent_spawns`], counted over an ALREADY-LOWERED
+/// [`RunnerStep`] graph — the shape this crate's slash surface (`/chain`, `/parallel`,
+/// `/run-chain`) hands to [`SubagentExecutor::run_or_background_graph`] (SUBA-002).
+///
+/// pi needs no lowered-form counter because every slash handler funnels back into the very same
+/// `executor.execute` the tool uses (`slash/slash-commands.ts` `runSlashSubagent` ->
+/// `requestSlashRun` -> the bridge wired at `extension/index.ts:396-401` ->
+/// `executeSubagentCollapsed` -> `executor.execute`), so its single `reserveSubagentSpawns`
+/// (`subagent-executor.ts:266-282`, called at `:3434-3441`) always sees the RAW `SubagentParamsLike`
+/// and counts it with `countRequestedSubagentSpawns` (`:284-292`). This crate's slash surface parses
+/// and lowers to [`RunnerStep`] before it reaches execution, so pi's per-step rule is applied to the
+/// lowered form instead — arm for arm:
+///
+/// * [`RunnerStep::SingleStep`] → `1` (pi `getStepAgents(step).length` for a sequential step).
+/// * [`RunnerStep::ParallelGroup`] → its static width (pi's `parallel[]` array length).
+/// * [`RunnerStep::DynamicGroup`] → its worst case, `max_items` else
+///   `config.chain.dynamicFanout.maxItems`, else `0` — pi's `isDynamicParallelStep` arm.
+/// * [`RunnerStep::ImportAsyncRoot`] → `0`. [CYRUP-DELTA, no upstream analog] R-SA-097's
+///   chain-root attachment POLLS an already-launched async run and never spawns a child of its own,
+///   so billing it would charge a spawn that provably cannot happen.
+///
+/// Saturating throughout, exactly like [`count_requested_subagent_spawns`].
+fn count_graph_requested_spawns(graph: &[RunnerStep], cfg: &SubagentExtensionConfig) -> u32 {
+    graph.iter().fold(0u32, |total, step| {
+        let step_charge = match step {
+            RunnerStep::SingleStep(_) => 1,
+            RunnerStep::ParallelGroup(group) => {
+                u32::try_from(group.steps.len()).unwrap_or(u32::MAX)
+            }
+            RunnerStep::DynamicGroup(group) => {
+                group.max_items.or_else(|| cfg.dynamic_fanout_max_items()).unwrap_or(0)
+            }
+            RunnerStep::ImportAsyncRoot(_) => 0,
+        };
+        total.saturating_add(step_charge)
+    })
+}
+
 /// pi `duplicateSubagentCallResult` (`subagent-executor.ts:2770-2779`)'s content text, verbatim.
 /// (pi also attaches `details: { mode: inferExecutionMode(params), results: [] }`; this crate's
 /// `ToolError` carries no `details` channel, matching every other `isError: true` -> `Err`
@@ -5826,6 +6270,24 @@ impl SubagentsExtension {
                     .map_err(|e| SubagentError::MalformedSettings(e.message))?;
                 let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
                 let model = parsed.config.model.clone().map(ModelId::from);
+                // SUBA-002 — charge the per-SESSION spawn budget on the SLASH surface too. Upstream
+                // gets this for free: `/run`'s handler calls `runSlashSubagent` -> `requestSlashRun`
+                // -> the bridge wired at `extension/index.ts:396-401` -> `executeSubagentCollapsed`
+                // -> the SAME `executor.execute` the tool uses, whose `reserveSubagentSpawns`
+                // (`subagent-executor.ts:266-282`, called at `:3434-3441`) therefore covers both
+                // surfaces. Here `dispatch_slash` is an independent entry point into
+                // `SubagentExecutor`, so without this the budget would be enforced on the tool path
+                // ONLY and a session that had exhausted it could keep fanning out via `/run`.
+                //
+                // `/run` is pi's SINGLE shape (`params.agent` set, no `tasks`/`chain`), so
+                // `countRequestedSubagentSpawns` bills it exactly `1` — the same `1` whether the run
+                // goes foreground or background, which is why the charge sits after parsing and
+                // ahead of the mode branch below rather than inside either arm (charging once, never
+                // twice, and never a count that differs from what actually gets spawned).
+                let run_cfg = self.executor.config_snapshot().await;
+                self.executor
+                    .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
+                    .map_err(SubagentError::SpawnLimitExceeded)?;
                 if parsed.flags.background {
                     let run_id = self
                         .executor
@@ -6082,6 +6544,29 @@ impl SubagentsExtension {
         if graph.is_empty() {
             return Ok("chain has no steps to run".to_string());
         }
+
+        // SUBA-002 — charge the per-SESSION spawn budget for the chain-shaped SLASH surfaces
+        // (`/chain`, `/parallel`, `/run-chain`), which all funnel through this one wrapper. Upstream
+        // needs no charge here because those handlers call `runSlashSubagent` -> `requestSlashRun`
+        // -> the bridge at `extension/index.ts:396-401` -> `executeSubagentCollapsed` -> the SAME
+        // `executor.execute` the tool uses, so its `reserveSubagentSpawns`
+        // (`subagent-executor.ts:266-282`, called at `:3434-3441`) already covers them; this crate
+        // reaches `run_or_background_graph` directly from here, so the reserve has to be repeated.
+        //
+        // Placed AFTER the empty-graph short-circuit and after the caller has fully resolved the
+        // mode into a concrete `RunnerStep` list, so the number billed is exactly the number of
+        // children this run can spawn (pi's own "count the settled mode, not the request shape"
+        // ordering). It is NOT double-charged with the tool path: the `subagent` tool's own
+        // `chain[]`/`tasks[]` shapes reserve once in `SubagentTool::execute` and then reach
+        // `run_or_background_graph` via `route_chain_mode`/`route_parallel_mode`, never through this
+        // slash-only wrapper.
+        let budget_cfg = self.executor.config_snapshot().await;
+        self.executor
+            .reserve_subagent_spawns(
+                count_graph_requested_spawns(&graph, &budget_cfg),
+                budget_cfg.max_subagent_spawns_per_session,
+            )
+            .map_err(SubagentError::SpawnLimitExceeded)?;
 
         // R-SA-130: delegate to the ONE shared plan-execution path `SubagentExecutor` exposes (the
         // identical method the `subagent` tool's `chain[]`/`tasks[]` shapes route through), then
@@ -8099,6 +8584,133 @@ mod tests {
         );
     }
 
+    // ---- SUBA-041: the SINGLE-mode override normalizers ----
+
+    /// pi `normalizeSingleOutputOverride` (`single-output.ts:11-19`) + `runSinglePath`'s persona
+    /// fallback (`subagent-executor.ts:2789`), rule by rule.
+    #[test]
+    fn normalize_single_output_override_ports_pis_five_cases() {
+        // Omitted param → the persona's own declared output.
+        assert_eq!(
+            normalize_single_output_override(None, Some("persona.md")),
+            Some("persona.md".to_string())
+        );
+        assert_eq!(normalize_single_output_override(None, None), None);
+        // Explicit disable, both spellings.
+        assert_eq!(
+            normalize_single_output_override(Some(&serde_json::json!(false)), Some("persona.md")),
+            None
+        );
+        assert_eq!(
+            normalize_single_output_override(Some(&serde_json::json!("false")), Some("persona.md")),
+            None
+        );
+        // `true`/`"true"` means "the persona's own output".
+        assert_eq!(
+            normalize_single_output_override(Some(&serde_json::json!(true)), Some("persona.md")),
+            Some("persona.md".to_string())
+        );
+        assert_eq!(
+            normalize_single_output_override(Some(&serde_json::json!("true")), None),
+            None
+        );
+        // A real path wins over the persona default.
+        assert_eq!(
+            normalize_single_output_override(
+                Some(&serde_json::json!("report.md")),
+                Some("persona.md")
+            ),
+            Some("report.md".to_string())
+        );
+        // An empty string is "no output".
+        assert_eq!(normalize_single_output_override(Some(&serde_json::json!("")), None), None);
+    }
+
+    /// pi `resolveSingleOutputPath` (`single-output.ts:21-34`) as `runSinglePath` calls it: a
+    /// RELATIVE output resolves against the run's own scoped base dir, never the run cwd; an
+    /// absolute one is used verbatim; the disable sentinels never produce a path.
+    #[test]
+    fn resolve_single_output_path_resolves_relative_against_the_run_output_base_dir() {
+        let base = Path::new("/scoped/outputs/run123");
+        assert_eq!(
+            resolve_single_output_path(Some("report.md"), base),
+            Some(PathBuf::from("/scoped/outputs/run123/report.md"))
+        );
+        assert_eq!(
+            resolve_single_output_path(Some("/abs/report.md"), base),
+            Some(PathBuf::from("/abs/report.md"))
+        );
+        assert_eq!(resolve_single_output_path(None, base), None);
+        assert_eq!(resolve_single_output_path(Some("false"), base), None);
+        assert_eq!(resolve_single_output_path(Some(""), base), None);
+    }
+
+    /// pi `normalizeSkillInput` (`agents/skills.ts:684-708`) — including the JSON-encoded-array
+    /// guard models routinely trip, and the `false` → "no skills at all" form.
+    #[test]
+    fn normalize_skill_input_ports_pis_union() {
+        assert_eq!(normalize_skill_input(None), None);
+        assert_eq!(normalize_skill_input(Some(&serde_json::json!(true))), None);
+        assert_eq!(normalize_skill_input(Some(&serde_json::json!(false))), Some(Vec::new()));
+        assert_eq!(
+            normalize_skill_input(Some(&serde_json::json!(["a", " b ", "", "a"]))),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            normalize_skill_input(Some(&serde_json::json!("rust, testing ,rust"))),
+            Some(vec!["rust".to_string(), "testing".to_string()])
+        );
+        // A JSON-encoded array arriving as a string must NOT be comma-split into `["a"` / `"b"]`.
+        assert_eq!(
+            normalize_skill_input(Some(&serde_json::json!(r#"["a","b"]"#))),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    /// SUBA-041: the `acceptance` param lowers onto a real [`crate::exec::acceptance::AcceptanceContract`]
+    /// (never the heuristic fallback) for every explicit level, defers for `"auto"`, and refuses a
+    /// malformed policy with pi's own `validateAcceptanceInput` text.
+    #[test]
+    fn parse_single_acceptance_lowers_levels_and_validates() {
+        use crate::exec::acceptance::AcceptanceStatus;
+
+        // "auto" is pi's "omitted means auto-inferred" — defer to the heuristic default.
+        assert_eq!(parse_single_acceptance(&serde_json::json!("auto")), Ok(None));
+
+        let checked = parse_single_acceptance(&serde_json::json!("checked"))
+            .expect("valid level")
+            .expect("an explicit level yields a contract");
+        assert_eq!(checked.required_level, AcceptanceStatus::Checked);
+        assert!(checked.explicit, "an explicit param arms R-SA-033's exit-code correction");
+
+        // `false` is pi's `level: "none"` shorthand: explicit, but nothing to gate.
+        let disabled = parse_single_acceptance(&serde_json::json!(false))
+            .expect("valid")
+            .expect("a contract");
+        assert_eq!(disabled.required_level, AcceptanceStatus::NotRequired);
+        assert!(disabled.explicit);
+        assert!(disabled.is_no_op());
+
+        // The object form carries `verify[].command` onto the contract.
+        let verified = parse_single_acceptance(&serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "t", "command": "cargo test" }]
+        }))
+        .expect("valid")
+        .expect("a contract");
+        assert_eq!(verified.required_level, AcceptanceStatus::Verified);
+        assert_eq!(verified.verify, vec!["cargo test".to_string()]);
+
+        // pi's verbatim validation failures (`acceptance.ts:143,152`).
+        assert_eq!(
+            parse_single_acceptance(&serde_json::json!("nope")),
+            Err("acceptance has invalid level 'nope'.".to_string())
+        );
+        assert!(parse_single_acceptance(&serde_json::json!({ "bogus": 1 }))
+            .expect_err("an unsupported key is rejected")
+            .contains("acceptance.bogus is not supported."));
+    }
+
     /// C8: the LLM-facing `subagent` tool schema exposes pi's FULL parameter union
     /// (`schemas.ts:195-265`), not just the pre-C8 5-property single-task shape. Asserts every
     /// top-level pi property name is present, the 11-value management/control `action` enum is
@@ -8106,6 +8718,12 @@ mod tests {
     /// per-task `output`/`outputMode`/`reads`/`progress` fields exist, and the numeric bounds pi
     /// pins (`concurrency`/`timeoutMs`/`maxRuntimeMs` minimum, `index` minimum 0) are carried — the
     /// Rust analog of pi's own `test/unit/schemas.test.ts`.
+    ///
+    /// SUBA-041 re-scoped the property list: `includeProgress` and `control` were dropped from the
+    /// expected set and are now asserted ABSENT, because this port has no subsystem behind either
+    /// and [`SubagentTool::route_single`] refuses them. See
+    /// [`single_mode_wires_the_seven_supported_overrides_and_refuses_only_the_two_unadvertised`]
+    /// for the other half of that invariant.
     #[test]
     fn subagent_tool_schema_exposes_the_full_pi_parameter_union() {
         let schema = subagent_tool_parameters();
@@ -8114,19 +8732,29 @@ mod tests {
             .and_then(|p| p.as_object())
             .expect("schema has a properties object");
 
-        // Every top-level pi `SubagentParamsSchema` property (schemas.ts:195-263), in source order.
+        // Every top-level pi `SubagentParamsSchema` property (schemas.ts:195-263), in source order,
+        // minus SUBA-041's two withholds.
         let expected_properties = [
             "agent", "task", "action", "id", "runId", "dir", "index", "message", "chainName",
             "config", "tasks", "concurrency", "worktree", "chain", "context", "chainDir", "async",
-            "timeoutMs", "maxRuntimeMs", "agentScope", "cwd", "artifacts", "includeProgress",
-            "share", "sessionDir", "clarify", "control", "output", "outputMode", "skill", "model",
-            "acceptance",
+            "timeoutMs", "maxRuntimeMs", "agentScope", "cwd", "artifacts", "share", "sessionDir",
+            "clarify", "output", "outputMode", "skill", "model", "acceptance",
         ];
         for name in expected_properties {
             assert!(
                 props.contains_key(name),
                 "schema must advertise the pi parameter '{name}'; got keys: {:?}",
                 props.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // SUBA-041's core invariant: a param the dispatcher refuses must not be advertised. These
+        // two have no subsystem in this port (`control` → no `resolveControlConfig`/notice pipeline;
+        // `includeProgress` → no `details.progress` array on the compacted `SingleResult`).
+        for withheld in ["includeProgress", "control"] {
+            assert!(
+                !props.contains_key(withheld),
+                "'{withheld}' is rejected at dispatch, so the schema must NOT advertise it"
             );
         }
 
@@ -8206,8 +8834,12 @@ mod tests {
         assert!(props["skill"].get("anyOf").is_some(), "skill must be an anyOf union");
         assert!(props["acceptance"].get("anyOf").is_some(), "acceptance must be an anyOf union");
 
-        // control carries the nested attention thresholds + notify enums.
-        let control_props = props["control"]["properties"]
+        // SUBA-041: the control fragment is no longer inserted into the advertised schema (no
+        // `resolveControlConfig`/notice pipeline in this port), but it is KEPT as the shape record
+        // for whichever tier lands that subsystem — so its nested attention thresholds + notify
+        // enums are still pinned here, against the fragment rather than against `props`.
+        let control_fragment = sj_control_overrides();
+        let control_props = control_fragment["properties"]
             .as_object()
             .expect("control has a properties object");
         assert_eq!(control_props["needsAttentionAfterMs"]["minimum"], serde_json::json!(1));
@@ -8660,6 +9292,275 @@ mod tests {
         assert!(configured.contains("(0/1 used, 8 requested)"), "got: {configured}");
     }
 
+    /// A [`SingleStepSpec`](crate::spawn::chain_graph::SingleStepSpec) with nothing set beyond the
+    /// agent + task the lowered slash graphs below need, so the spawn-budget assertions stay about
+    /// the COUNT and not about step configuration.
+    fn bare_single_step(agent: &str, task: &str) -> crate::spawn::chain_graph::SingleStepSpec {
+        crate::spawn::chain_graph::SingleStepSpec {
+            agent: agent.to_string(),
+            task: task.to_string(),
+            cwd: None,
+            model: None,
+            tools: None,
+            extensions: None,
+            session_file: None,
+            max_depth_override: None,
+            structured_output_schema: None,
+            output: None,
+            output_path: None,
+            output_mode: None,
+            reads: None,
+            acceptance: None,
+            context: None,
+            agent_scope: None,
+        }
+    }
+
+    /// SUBA-002 regression: the per-SESSION spawn budget covers the SLASH surface, not the
+    /// `subagent` tool alone. Upstream gets this structurally — `/run`'s handler goes
+    /// `runSlashSubagent` -> `requestSlashRun` -> the bridge at `extension/index.ts:396-401` ->
+    /// `executeSubagentCollapsed` -> the SAME `executor.execute` whose `reserveSubagentSpawns`
+    /// (`subagent-executor.ts:266-282`, called at `:3434-3441`) charges the tool — so the cap is
+    /// unbypassable there. In this crate `dispatch_slash` is an independent entry into
+    /// `SubagentExecutor`, and pre-fix it reached `run_foreground`/`spawn_background` with no charge
+    /// at all: this test's `/run` calls all sailed past an exhausted budget and failed downstream on
+    /// the unresolvable agent instead.
+    ///
+    /// Drives the REAL production surface end to end (`dispatch_slash(SlashCommandName::Run, …)`,
+    /// i.e. the argument string a user types), for both the foreground and the `--bg` shape, and
+    /// pins the notice to the byte-identical text the tool path emits.
+    #[tokio::test]
+    async fn slash_run_is_charged_against_the_same_session_spawn_budget_as_the_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        // Spend the session's single spawn through the TOOL. It is admitted past the budget and so
+        // fails only on the unresolvable agent — and the reservation is never refunded.
+        let spent = ext
+            .subagent_tool()
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "agent": "ghost", "task": "a" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("an unresolvable agent still fails after the reservation is granted");
+        assert!(
+            spent.to_string().contains("agent not found: ghost"),
+            "the tool call must be ADMITTED past the budget: {spent}"
+        );
+
+        // The slash surface now sees an exhausted budget and must refuse — foreground AND `--bg`,
+        // since pi bills the SINGLE shape exactly 1 either way.
+        for args in ["ghost do the thing", "ghost do the thing --bg"] {
+            let err = ext
+                .dispatch_slash(SlashCommandName::Run, args, dir.path())
+                .await
+                .expect_err("the session's spawn budget is exhausted");
+            assert!(
+                matches!(err, SubagentError::SpawnLimitExceeded(_)),
+                "`/run {args}` must be refused by the budget, got: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "Subagent spawn limit reached for this session (1/1 used, 1 requested). \
+                 Complete the work directly or start a new session.",
+                "pi's verbatim over-limit notice, identical to the tool path's"
+            );
+            assert!(
+                !err.to_string().contains("agent not found"),
+                "the refusal must fire BEFORE agent resolution / any spawn: {err}"
+            );
+        }
+
+        // A fresh session zeroes the budget (pi `resetSessionState`), so the very same `/run` is
+        // admitted again afterwards and fails only on the agent — proving the refusal above was the
+        // budget, not a blanket slash-path rejection.
+        ext.executor().reset_spawn_budget();
+        let after_reset = ext
+            .dispatch_slash(SlashCommandName::Run, "ghost do the thing", dir.path())
+            .await
+            .expect_err("post-reset the call is admitted and fails only on the agent");
+        assert!(
+            matches!(after_reset, SubagentError::AgentNotFound(_)),
+            "a session reset must restore the slash surface's budget, got: {after_reset:?}"
+        );
+    }
+
+    /// SUBA-002 regression, chain-shaped slash surfaces: `/chain`, `/parallel` and `/run-chain` all
+    /// funnel through [`SubagentsExtension::run_or_background_chain`], which pre-fix reached
+    /// `run_or_background_graph` with no spawn charge whatsoever. Each is now billed over the
+    /// LOWERED graph by [`count_graph_requested_spawns`], applying pi's per-step rule
+    /// (`countRequestedSubagentSpawns`, `subagent-executor.ts:284-292`) arm for arm — asserted
+    /// through the `N requested` field of the refusal notice, and for both `background: false` and
+    /// `background: true`, since the charge sits ahead of that split.
+    #[tokio::test]
+    async fn slash_chain_surfaces_bill_the_lowered_graph_against_the_session_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                chain: Some(crate::registration::ExtensionChainConfig {
+                    dynamic_fanout: Some(crate::registration::DynamicFanoutConfig {
+                        max_items: Some(7),
+                    }),
+                }),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let dynamic = |max_items: Option<u32>| {
+            RunnerStep::DynamicGroup(crate::spawn::chain_graph::DynamicGroupSpec {
+                expand: "{outputs.targets}/items".to_string(),
+                template: Box::new(bare_single_step("ghost", "Handle {item}")),
+                collect: "gathered".to_string(),
+                concurrency: 2,
+                item: None,
+                key: None,
+                max_items,
+                on_empty: crate::spawn::chain_graph::OnEmpty::Skip,
+                collect_schema: None,
+            })
+        };
+
+        // (graph, expected `N requested`) — two sequential steps bill 1 each; a static parallel
+        // group bills its width; a dynamic group bills `expand.maxItems` when it has one, else the
+        // configured `chain.dynamicFanout.maxItems` (7 here).
+        let cases: Vec<(Vec<RunnerStep>, u32)> = vec![
+            (
+                vec![
+                    RunnerStep::SingleStep(bare_single_step("ghost", "a")),
+                    RunnerStep::SingleStep(bare_single_step("ghost", "b")),
+                ],
+                2,
+            ),
+            (
+                vec![RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+                    steps: vec![
+                        bare_single_step("ghost", "a"),
+                        bare_single_step("ghost", "b"),
+                        bare_single_step("ghost", "c"),
+                    ],
+                    concurrency: 3,
+                    fail_fast: false,
+                    worktree: false,
+                })],
+                3,
+            ),
+            (vec![dynamic(Some(5))], 5),
+            (vec![dynamic(None)], 7),
+            (
+                vec![
+                    RunnerStep::SingleStep(bare_single_step("ghost", "a")),
+                    dynamic(Some(5)),
+                ],
+                6,
+            ),
+        ];
+
+        for (graph, expected) in cases {
+            for background in [false, true] {
+                ext.executor().reset_spawn_budget();
+                let err = ext
+                    .run_or_background_chain(
+                        dir.path(),
+                        graph.clone(),
+                        RunMode::Chain,
+                        None,
+                        background,
+                        None,
+                    )
+                    .await
+                    .expect_err("the graph is over the 1-spawn budget");
+                assert!(
+                    matches!(err, SubagentError::SpawnLimitExceeded(_)),
+                    "background={background}: expected a spawn-budget refusal, got: {err:?}"
+                );
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Subagent spawn limit reached for this session (0/1 used, {expected} \
+                         requested). Complete the work directly or start a new session."
+                    ),
+                    "background={background}: the lowered graph must bill pi's per-step count"
+                );
+            }
+        }
+
+        // An EMPTY graph short-circuits ahead of the charge and never touches the counter (pi's
+        // `if (input.requested <= 0) return undefined`), so the budget is still untouched after it.
+        ext.executor().reset_spawn_budget();
+        let empty = ext
+            .run_or_background_chain(dir.path(), vec![], RunMode::Chain, None, false, None)
+            .await
+            .expect("an empty graph is not an error");
+        assert_eq!(empty, "chain has no steps to run");
+        assert!(
+            ext.executor().reserve_subagent_spawns(1, 1).is_ok(),
+            "an empty graph must not have consumed the session's spawn"
+        );
+    }
+
+    /// SUBA-002's no-double-charge invariant: the `subagent` TOOL's chain/parallel shapes reserve
+    /// exactly ONCE (in [`SubagentTool::execute`]) and then reach
+    /// [`SubagentExecutor::run_or_background_graph`] through
+    /// `route_chain_mode`/`route_parallel_mode` — never through the slash-only
+    /// [`SubagentsExtension::run_or_background_chain`] wrapper that carries the second charge. A
+    /// 3-wide tool fan-out under a 3-spawn budget must therefore bill 3, not 6.
+    #[tokio::test]
+    async fn tool_chain_dispatch_is_billed_exactly_once_not_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 3,
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let admitted = ext
+            .subagent_tool()
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "chain": [
+                    { "agent": "ghost", "task": "a" },
+                    { "parallel": [
+                        { "agent": "ghost", "task": "b" },
+                        { "agent": "ghost", "task": "c" }
+                    ] }
+                ]}),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("an unresolvable agent still fails after the reservation is granted");
+        assert!(
+            !admitted.to_string().contains("Subagent spawn limit reached"),
+            "a 3-wide chain must fit exactly inside a 3-spawn budget: {admitted}"
+        );
+
+        // Exactly 3 charged, so `used` reads 3/3 (a double charge would have overflowed the cap
+        // during the dispatch above and reported 6 requested against it).
+        let exhausted = ext
+            .dispatch_slash(SlashCommandName::Run, "ghost do the thing", dir.path())
+            .await
+            .expect_err("the session's spawn budget is now exactly exhausted");
+        assert_eq!(
+            exhausted.to_string(),
+            "Subagent spawn limit reached for this session (3/3 used, 1 requested). \
+             Complete the work directly or start a new session.",
+            "the tool's chain dispatch must have been billed once (3), not twice (6)"
+        );
+    }
+
     /// Dispatch discrimination: management/control/parallel/chain modes are each RECOGNIZED and
     /// routed to their own arm rather than mis-parsed as a broken SINGLE call. Management/control
     /// still short-circuit at their P1 stubs; parallel/chain now route to REAL execution, proven
@@ -8813,53 +9714,102 @@ mod tests {
         assert!(!listed.content.is_empty());
     }
 
-    /// pi-parity regression: a SINGLE-mode call setting one of the tool-advertised-but-not-yet-wired
-    /// override params (`sessionDir`/`share`/`artifacts`/`includeProgress`/`control`/`output`/
-    /// `outputMode`/`skill`/`acceptance`) must be rejected LOUDLY, naming the param, rather than
-    /// silently ignored with no error and no behavior change. Uses an unresolvable agent name
-    /// (`"ghost"`) so a pre-fix run would instead have proceeded straight to agent resolution and
-    /// failed with `"agent not found: ghost"` — a DIFFERENT error than this test asserts on, so this
-    /// test would fail against the pre-fix code (which surfaced no rejection for the override at
-    /// all).
+    /// SUBA-041 (re-scoped from `single_mode_rejects_unwired_override_params_before_any_agent_resolution`,
+    /// which pinned the pre-fix behavior of rejecting all NINE schema-advertised SINGLE-mode
+    /// overrides): the seven params pi's `runSinglePath` honors must now be ACCEPTED — a call
+    /// carrying them proceeds past dispatch into agent resolution, so the only error left is the
+    /// unresolvable agent — while the two the schema no longer advertises must still be refused
+    /// LOUDLY by name, never silently dropped.
+    ///
+    /// The `"ghost"` agent makes the two outcomes trivially distinguishable: `agent not found:
+    /// ghost` proves the param got through dispatch; the named refusal proves it did not. Against
+    /// pre-SUBA-041 code every one of the seven produced the refusal instead, so this fails there.
     #[tokio::test]
-    async fn single_mode_rejects_unwired_override_params_before_any_agent_resolution() {
+    async fn single_mode_wires_the_seven_supported_overrides_and_refuses_only_the_two_unadvertised()
+    {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
+        // The seven SUBA-041 wired the schema's promise back onto: each must reach agent resolution.
+        let accepted = [
+            serde_json::json!({ "share": true }),
+            serde_json::json!({ "sessionDir": "~/x" }),
+            serde_json::json!({ "artifacts": false }),
+            serde_json::json!({ "output": "report.md" }),
+            serde_json::json!({ "output": "report.md", "outputMode": "file-only" }),
+            serde_json::json!({ "skill": "rust,testing" }),
+            serde_json::json!({ "acceptance": "checked" }),
+        ];
+        for (i, extra) in accepted.iter().enumerate() {
+            let mut params = serde_json::json!({ "agent": "ghost", "task": "do it" });
+            for (key, value) in extra.as_object().expect("object literal") {
+                params
+                    .as_object_mut()
+                    .expect("object literal")
+                    .insert(key.clone(), value.clone());
+            }
+            let err = tool
+                .execute(
+                    ToolCallId::from(format!("accepted-{i}").as_str()),
+                    params.clone(),
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("the agent is unresolvable, so the call still errors");
+            let message = err.to_string();
+            assert!(
+                message.contains("agent not found"),
+                "{params} must be ACCEPTED at dispatch and fail only on agent resolution: {message}"
+            );
+            assert!(
+                !message.contains("does not support"),
+                "{params} must not be refused as an unsupported param: {message}"
+            );
+        }
+
+        // The two the schema no longer advertises are still named and refused, before any
+        // agent resolution — an override is never silently dropped.
         let err = tool
             .execute(
-                ToolCallId::from("t"),
-                serde_json::json!({ "agent": "ghost", "task": "do it", "share": true }),
-                CancelToken::new(),
-                Box::new(|_u: cyrup_core::ToolUpdate| {}),
-            )
-            .await
-            .expect_err("an unwired SINGLE-mode override param must be rejected");
-        let message = err.to_string();
-        assert!(
-            message.contains("share"),
-            "the rejection must name the unsupported param 'share': {message}"
-        );
-        assert!(
-            !message.contains("agent not found"),
-            "the override rejection must fire BEFORE agent resolution ever runs: {message}"
-        );
-
-        // Multiple unwired overrides are all named together, not just the first.
-        let multi_err = tool
-            .execute(
-                ToolCallId::from("t2"),
+                ToolCallId::from("refused"),
                 serde_json::json!({
-                    "agent": "ghost", "task": "do it", "sessionDir": "~/x", "outputMode": "inline"
+                    "agent": "ghost", "task": "do it",
+                    "includeProgress": true, "control": { "enabled": true }
                 }),
                 CancelToken::new(),
                 Box::new(|_u: cyrup_core::ToolUpdate| {}),
             )
             .await
-            .expect_err("multiple unwired overrides are still rejected");
-        let multi_message = multi_err.to_string();
-        assert!(multi_message.contains("sessionDir"), "got: {multi_message}");
-        assert!(multi_message.contains("outputMode"), "got: {multi_message}");
+            .expect_err("a param with no subsystem behind it must be refused");
+        let message = err.to_string();
+        assert!(message.contains("includeProgress"), "got: {message}");
+        assert!(message.contains("control"), "got: {message}");
+        assert!(
+            !message.contains("agent not found"),
+            "the refusal must fire BEFORE agent resolution ever runs: {message}"
+        );
+
+        // A malformed `acceptance` policy is refused up front with pi's own
+        // `validateAcceptanceInput` message (`acceptance.ts:143`), not swallowed.
+        let bad_acceptance = tool
+            .execute(
+                ToolCallId::from("bad-acceptance"),
+                serde_json::json!({ "agent": "ghost", "task": "do it", "acceptance": "nonsense" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("an invalid acceptance level must be refused")
+            .to_string();
+        assert!(
+            bad_acceptance.contains("acceptance has invalid level 'nonsense'."),
+            "pi's verbatim validation message: {bad_acceptance}"
+        );
+        assert!(
+            !bad_acceptance.contains("agent not found"),
+            "acceptance validation must precede agent resolution: {bad_acceptance}"
+        );
     }
 
     /// R-SA-069 (pi `executeWithSingleDispatchGuard`, `subagent-executor.ts:3227-3242`): a second

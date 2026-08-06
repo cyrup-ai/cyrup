@@ -1734,11 +1734,22 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             acceptance: None,
             fork_context,
             live_events,
-            // R-SA-P1: the detached hop-2 runner is a separate process that inherited
-            // `CYRUP_SUBAGENT_PARENT_SESSION` in its OWN env from the hop-1 spawn; defer to that
-            // INHERITED value (`None` here → the spawn site reads `std::env::var`), never overwriting
-            // it with a value this headless runner has no live session id to supply.
-            parent_session_id: None,
+            // R-SA-P1 / PERM-001: the anchor the hop-1 spawn injected into THIS runner's own
+            // environment (`background::spawn_detached`'s `env_overlay`, sourced from
+            // `background::parent_anchor::detached_runner_env_overlay`), resolved explicitly here
+            // and threaded on rather than left to the spawn site's fallback.
+            //
+            // The comment this replaces asserted that the runner "inherited
+            // `CYRUP_SUBAGENT_PARENT_SESSION` in its OWN env from the hop-1 spawn" — which was
+            // simply untrue: until PERM-001 the hop-1 spawn added NO env overlay whatsoever, and
+            // the only writer of that variable anywhere in the workspace is
+            // `exec::build_attempt_spawn_plan`, which no process ever runs against itself. A root
+            // orchestrator's background run therefore reached here with no anchor in scope, every
+            // hop-3 child was spawned without one, and `cyrup-permission-system`'s child gate
+            // fail-closed denied every `ask` against a null forwarding target with no prompt ever
+            // shown to the operator. Hop 1 now really does inject it, so the claim is finally true
+            // — and this call site states the dependency instead of assuming it.
+            parent_session_id: crate::background::parent_anchor::resolve_parent_session_anchor(),
             // The detached hop-2 runner has no live orchestrator human session to surface a clarify
             // ask to; a child's blocking `contact_supervisor` ask routes over the broker to whichever
             // supervisor its intercom metadata names, not through this headless runner's exec loop.

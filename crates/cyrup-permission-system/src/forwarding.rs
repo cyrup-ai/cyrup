@@ -34,7 +34,7 @@
 //! `watch_control_inbox` `notify::PollWatcher` pattern. The spool MECHANISM is pi's own.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -648,36 +648,75 @@ async fn resolve_forwarded_decision(
 
 // ---------------------------------------------------------------------------- parent watcher task
 
-/// The parent-side forwarding watcher (pi `startForwardedPermissionPolling`, `index.ts:1904-2031`): a
+/// A LIVE handle on the extension's `config.json` snapshot, shared between the extension and the
+/// spawned forwarding watcher.
+///
+/// PERM-005: the watcher used to capture an `ExtensionConfig` BY VALUE at spawn time, so a
+/// mid-session `yoloMode` / `forwardedPromptTimeoutSeconds` change (pi `refreshExtensionConfig`,
+/// `index.ts:1600-1608`, re-run from `refreshSessionRuntimeState` and `before_agent_start`) never
+/// reached the running task. Upstream has no such staleness: its polling closure reads the module
+/// scope's `extensionConfig` binding on every scan (`index.ts:1427`, `:1443-1452`), which
+/// `refreshExtensionConfig` reassigns in place. Sharing the mutex reproduces that — the watcher
+/// snapshots it once per poll iteration (`snapshot_config`) instead of once per spawn.
+pub type SharedExtensionConfig = Arc<Mutex<ExtensionConfig>>;
+
+/// Read the current [`ExtensionConfig`] out of a [`SharedExtensionConfig`], never holding the lock
+/// across an `await` (the clone is taken and the guard dropped inside this call).
+fn snapshot_config(config: &SharedExtensionConfig) -> ExtensionConfig {
+    config.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// The parent-side forwarding watcher (pi `startForwardedPermissionPolling`, `index.ts:1983-2031`): a
 /// detached `tokio` task the parent session installs on `SessionStart` (running OUTSIDE any live
 /// `HostCtx`, reachable via the captured `HostServices` Arc). It watches its OWN request inbox with a
 /// `notify::PollWatcher` (mirroring `control.rs::watch_control_inbox`) PLUS a
 /// [`CONTROL_INBOX_POLL_INTERVAL`] fallback tick, and runs [`process_forwarded_requests`] on every
 /// wake (with a mandatory startup scan). Returns the [`tokio::task::JoinHandle`] so the extension can
 /// `abort()` it on `SessionShutdown` (pi teardown, `index.ts:2131`).
+///
+/// PERM-005 — the ATTACH phase RETRIES instead of terminating. Upstream is re-entered on four hooks
+/// (`refreshSessionRuntimeState`/`session_start` `:2084`, `before_agent_start` `:2137`, `input`
+/// `:2194`, `tool_call` `:2210`), so its `if (!location) return;` (`index.ts:1991-1993`) is a
+/// *retry on the next hook*, not a permanent give-up. Cyrup spawns ONE long-lived task instead of a
+/// per-hook timer, so the equivalent of that re-entry is an in-task retry loop: an unresolvable
+/// session id or an underivable forwarding location parks the watcher on the
+/// [`CONTROL_INBOX_POLL_INTERVAL`] tick and it tries again, rather than returning and leaving the
+/// spool unserviced for the whole session (the `is_finished()` idempotence check in
+/// `PermissionSystemExtension::maybe_start_forwarding_watcher` would respawn it, but only if some
+/// later hook called in — which, pre-fix, none did).
 #[must_use]
 pub fn spawn_forwarding_watcher(
     agent_dir: PathBuf,
     services: Arc<dyn HostServices>,
-    config: ExtensionConfig,
+    config: SharedExtensionConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(session_id) = services.session_id().and_then(|s| normalize_session_id(&s)) else {
-            return; // no live session id yet ⇒ nothing to address.
+        let mut ticker = tokio::time::interval(CONTROL_INBOX_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // ATTACH, with retry (pi's per-hook re-entry). The session id is late-bound — the host
+        // publishes it after the extension's `SessionStart` hook returns in some wirings — and the
+        // location can fail to derive transiently; neither is terminal.
+        let (session_id, location) = loop {
+            ticker.tick().await;
+            let Some(sid) = services.session_id().and_then(|s| normalize_session_id(&s)) else {
+                continue; // no live session id YET ⇒ nothing to address; try again next tick.
+            };
+            match forwarding_location(&agent_dir, &sid) {
+                Ok(loc) => break (sid, loc),
+                // pi `if (!location) return;` — a per-hook give-up, re-entered on the next hook.
+                Err(_) => continue,
+            }
         };
-        let location = match forwarding_location(&agent_dir, &session_id) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
+
         // Create the inbox so the watch target exists for the run's lifetime (pi ensures on demand).
         let _ = ensure_location(&location);
 
         // Mandatory startup re-scan (a request may have landed before the watcher attached).
-        process_forwarded_requests(&agent_dir, &session_id, &services, &config).await;
+        process_forwarded_requests(&agent_dir, &session_id, &services, &snapshot_config(&config))
+            .await;
 
         let mut watcher = watch_dir(&location.requests_dir).ok();
-        let mut ticker = tokio::time::interval(CONTROL_INBOX_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             match watcher.as_mut() {
                 Some((_w, rx)) => {
@@ -690,7 +729,15 @@ pub fn spawn_forwarding_watcher(
                     ticker.tick().await;
                 }
             }
-            process_forwarded_requests(&agent_dir, &session_id, &services, &config).await;
+            // Re-read the LIVE config every iteration (pi reads the reassigned module binding on
+            // every scan), so a mid-session yolo / prompt-timeout change takes effect here.
+            process_forwarded_requests(
+                &agent_dir,
+                &session_id,
+                &services,
+                &snapshot_config(&config),
+            )
+            .await;
         }
     })
 }
@@ -812,5 +859,185 @@ mod tests {
             let js = serde_json::to_string(&state).unwrap();
             assert_eq!(js, format!("\"{wire}\""));
         }
+    }
+
+    // =============================================================================================
+    // PERM-005 — the watcher's ATTACH phase retries, and it reads the LIVE config every iteration.
+    // =============================================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `HostServices` whose `session_id()` is `None` for the first `blank_for` calls and
+    /// `Some(id)` afterwards — the "session id not resolved yet at SessionStart" case. `select()`
+    /// counts calls so a test can prove no human was consulted.
+    struct LateSessionHost {
+        id: String,
+        blank_for: usize,
+        calls: AtomicUsize,
+        selects: Arc<AtomicUsize>,
+    }
+
+    impl HostServices for LateSessionHost {
+        fn session_id(&self) -> Option<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.blank_for {
+                None
+            } else {
+                Some(self.id.clone())
+            }
+        }
+        fn select(
+            &self,
+            _prompt: &str,
+            _options: &serde_json::Value,
+            _opts: &cyrup_ext::DialogOptions,
+        ) -> Option<String> {
+            self.selects.fetch_add(1, Ordering::SeqCst);
+            Some("Reject".to_string())
+        }
+    }
+
+    /// Drop a well-formed forwarded request into `parent`'s inbox and return its id.
+    fn seed_request(agent_dir: &Path, parent: &str) -> String {
+        let loc = forwarding_location(agent_dir, parent).unwrap();
+        assert!(ensure_location(&loc), "the spool dirs must be creatable");
+        let req = ForwardedPermissionRequest {
+            id: "req-perm005".to_string(),
+            response_nonce: create_nonce(),
+            created_at: now_millis(),
+            requester_session_id: "child-1".to_string(),
+            target_session_id: parent.to_string(),
+            requester_agent_name: "worker".to_string(),
+            message: "run `bash rm -rf /`?".to_string(),
+        };
+        write_json_atomic(&loc.requests_dir.join("req-perm005.json"), &req).unwrap();
+        req.id
+    }
+
+    /// Wait up to `bound` for `f` to hold, polling on the watcher's own tick granularity.
+    async fn eventually(bound: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + bound;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        f()
+    }
+
+    /// PERM-005 failure mode (1): the session id is not resolvable when the watcher spawns.
+    ///
+    /// Pre-fix this was a TERMINAL `return` — the task ended immediately and, because nothing but
+    /// `SessionStart` ever called `maybe_start_forwarding_watcher`, the session ran its whole life
+    /// with no watcher and every forwarded child ask sat in the spool until it failed closed.
+    /// Upstream's `if (!location) return;` (`index.ts:1991-1993`) is a give-up for THAT hook only —
+    /// the next `before_agent_start`/`input`/`tool_call` re-enters. The port's equivalent is an
+    /// in-task retry on the poll tick.
+    #[tokio::test]
+    async fn watcher_retries_attach_until_the_session_id_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let parent = "perm005-late-session";
+        let selects = Arc::new(AtomicUsize::new(0));
+
+        let services: Arc<dyn HostServices> = Arc::new(LateSessionHost {
+            id: parent.to_string(),
+            // Blank for the first three attach attempts (~2 poll intervals of retry).
+            blank_for: 3,
+            calls: AtomicUsize::new(0),
+            selects: Arc::clone(&selects),
+        });
+
+        let config = Arc::new(Mutex::new(ExtensionConfig::default()));
+        let watcher =
+            spawn_forwarding_watcher(agent_dir.clone(), Arc::clone(&services), Arc::clone(&config));
+
+        let request_path = forwarding_location(&agent_dir, parent)
+            .unwrap()
+            .requests_dir
+            .join("req-perm005.json");
+        seed_request(&agent_dir, parent);
+
+        let serviced =
+            eventually(Duration::from_secs(10), || selects.load(Ordering::SeqCst) > 0).await;
+        watcher.abort();
+
+        assert!(
+            serviced,
+            "the watcher must retry its attach and eventually service the spool; pre-fix it \
+             returned on the first blank session id and the request at {} was never read",
+            request_path.display()
+        );
+    }
+
+    /// A `HostServices` with a fixed session id that FAILS the test if a dialog is ever surfaced —
+    /// under yolo mode pi auto-approves without prompting (`index.ts:1427-1429`).
+    struct NoDialogHost {
+        id: String,
+        selects: Arc<AtomicUsize>,
+    }
+
+    impl HostServices for NoDialogHost {
+        fn session_id(&self) -> Option<String> {
+            Some(self.id.clone())
+        }
+        fn select(
+            &self,
+            _prompt: &str,
+            _options: &serde_json::Value,
+            _opts: &cyrup_ext::DialogOptions,
+        ) -> Option<String> {
+            self.selects.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// PERM-005 failure mode (4): a mid-session config change must reach the RUNNING watcher.
+    ///
+    /// The watcher used to take `config: ExtensionConfig` BY VALUE, so `refresh_config_and_manager`
+    /// (pi `refreshExtensionConfig`, `index.ts:1600-1608`) could flip `yoloMode` and the running
+    /// task would keep prompting. Here the watcher starts non-yolo, `yolo_mode` is flipped through
+    /// the shared handle BEFORE any request exists, and the request that lands afterwards must be
+    /// auto-approved with NO dialog.
+    #[tokio::test]
+    async fn watcher_reads_the_live_config_on_every_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let parent = "perm005-live-config";
+        let selects = Arc::new(AtomicUsize::new(0));
+
+        let services: Arc<dyn HostServices> =
+            Arc::new(NoDialogHost { id: parent.to_string(), selects: Arc::clone(&selects) });
+        let config = Arc::new(Mutex::new(ExtensionConfig::default()));
+        assert!(!snapshot_config(&config).yolo_mode, "the watcher starts in non-yolo mode");
+
+        let watcher =
+            spawn_forwarding_watcher(agent_dir.clone(), Arc::clone(&services), Arc::clone(&config));
+
+        // The mid-session `refreshExtensionConfig`. This lands strictly AFTER the pre-fix code took
+        // its by-value snapshot (that snapshot was the `config: ExtensionConfig` argument itself,
+        // frozen at the call above, before the task's first poll), so a by-value port cannot see it.
+        config.lock().unwrap_or_else(PoisonError::into_inner).yolo_mode = true;
+
+        seed_request(&agent_dir, parent);
+        let loc = forwarding_location(&agent_dir, parent).unwrap();
+        let response_path = loc.responses_dir.join("req-perm005.json");
+
+        let answered = eventually(Duration::from_secs(10), || response_path.exists()).await;
+        watcher.abort();
+
+        assert!(answered, "the watcher must have written a response for the seeded request");
+        let body = std::fs::read_to_string(&response_path).unwrap();
+        let response: ForwardedPermissionResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            response.approved,
+            "yolo flipped mid-session must auto-APPROVE (pi `shouldAutoApprovePermissionState`, \
+             `index.ts:1427-1429`); a by-value config snapshot would have kept the old mode"
+        );
+        assert_eq!(
+            selects.load(Ordering::SeqCst),
+            0,
+            "yolo auto-approval surfaces no dialog at all"
+        );
     }
 }

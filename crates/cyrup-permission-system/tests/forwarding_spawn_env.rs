@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyrup_core::{CancelToken, ModelId, ToolCallId};
@@ -365,7 +365,7 @@ async fn spawn_env_alone_lets_the_parents_human_answer_a_child_ask() {
     let watcher = spawn_forwarding_watcher(
         agent_dir.path().to_path_buf(),
         services,
-        ExtensionConfig::default(),
+        Arc::new(Mutex::new(ExtensionConfig::default())),
     );
 
     let child = spawn_child(agent_dir.path(), &parent_id, &sentinel, 20_000);

@@ -16,7 +16,12 @@ impl CacheKey {
 }
 
 /// Compute the cache key from a normalized source-tree hash, the toolchain id, and the WIT world
-/// version (arch-08 §4.2). The same inputs always yield the same key; any change busts the cache.
+/// identity (arch-08 §4.2). The same inputs always yield the same key; any change busts the cache.
+///
+/// Callers pass [`super::world_abi_id`], NOT the bare [`crate::HOST_WORLD`] string: the world
+/// version alone only moves when someone remembers to bump it, and [`hash_source_tree`] cannot see
+/// the `world.wit` copies or the `cyrup-ext-sdk` guest crate that live outside the extension crate
+/// directory (EXT-028).
 pub fn cache_key(source_tree_hash: &[u8], toolchain_id: &str, world_version: &str) -> CacheKey {
     let mut hasher = blake3::Hasher::new();
     hasher.update(source_tree_hash);

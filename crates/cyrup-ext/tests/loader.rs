@@ -20,9 +20,11 @@ fn unique_dir(tag: &str) -> PathBuf {
 fn write_ext(base: &Path, name: &str, with_wasm: bool) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let manifest = format!(
-        r#"{{ "id": "{name}", "version": "1.0.0", "world": "cyrup:ext@0.2" }}"#
-    );
+    // EXT-028: interpolate `HOST_WORLD` rather than a literal — a fixture pinned to a stale world
+    // string silently stops exercising the load path the moment the world is bumped.
+    let world = cyrup_ext::HOST_WORLD;
+    let manifest =
+        format!(r#"{{ "id": "{name}", "version": "1.0.0", "world": "{world}" }}"#);
     std::fs::write(dir.join("extension.json"), manifest).unwrap();
     if with_wasm {
         // a stand-in component artifact (discovery does not validate bytes).

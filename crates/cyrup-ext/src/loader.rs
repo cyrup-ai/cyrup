@@ -179,6 +179,12 @@ fn push_dir(
         Err(_) => {
             // Synthesize a minimal manifest for a bare prebuilt `.wasm` (Pi's "direct file" rule):
             // id from the artifact/dir stem, host world. No manifest + no wasm => skip.
+            //
+            // EXT-028 caveat: claiming [`HOST_WORLD`] makes `check_world` a tautology for this path,
+            // so a prebuilt artifact built against an older world is NOT caught by the version gate
+            // and still surfaces as a wasmtime link error at instantiation. There is nothing to
+            // check — the bytes carry no declared world — and refusing every manifest-less `.wasm`
+            // would drop Pi's direct-file rule. Ship an `extension.json` to get the typed error.
             let Some(w) = &wasm else { return };
             let id = w
                 .file_stem()

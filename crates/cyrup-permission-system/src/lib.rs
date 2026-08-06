@@ -74,7 +74,7 @@ pub use extension::{
 pub use forwarding::{
     process_forwarded_requests, resolve_child_wait_timeout, spawn_forwarding_watcher,
     wait_for_forwarded_approval, ForwardedPermissionRequest, ForwardedPermissionResponse,
-    ForwardingLocation, PERMISSION_FORWARDING_TIMEOUT,
+    ForwardingLocation, SharedExtensionConfig, PERMISSION_FORWARDING_TIMEOUT,
 };
 pub use manager::{ManagerPaths, PermissionManager};
 pub use types::{

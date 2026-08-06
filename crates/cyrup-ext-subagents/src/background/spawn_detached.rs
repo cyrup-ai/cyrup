@@ -40,6 +40,24 @@
 //! (`background/runner_main.rs`'s R-SA-075 initial-status write is not instantaneous — these log
 //! files are the fallback diagnostic surface for the sliver of time before that write lands).
 //!
+//! # The one thing it DOES put in the child's environment (PERM-001)
+//!
+//! R-SA-073 routes all runner *configuration* through the one-shot config file, never env blobs,
+//! and that is still true. The single exception is the R-SA-P1 parent-session ANCHOR
+//! ([`crate::exec::PARENT_SESSION_ENV_VAR`]), which is not runner configuration at all — it is
+//! ambient process identity that pi propagates purely by environment INHERITANCE
+//! (`pi-subagents/src/extension/index.ts:555` publishes it into the orchestrator's own
+//! `process.env`, so every descendant at every hop simply inherits it). cyrup's orchestrator cannot
+//! write its own `process.env` (`#![forbid(unsafe_code)]` + 2024-edition `unsafe std::env::set_var`),
+//! so this module writes that ONE entry explicitly onto the hop-1 child instead, resolved by
+//! [`super::parent_anchor::detached_runner_env_overlay`].
+//!
+//! Without it the whole background half of permission ask-forwarding was dead: the hop-2 runner had
+//! no anchor in its environment, so `exec::build_attempt_spawn_plan`'s "explicit → inherited env →
+//! empty" ladder resolved EMPTY for every hop-3 child, so a background subagent that hit an `ask`
+//! addressed a null forwarding target and `cyrup-permission-system` fail-closed denied it with no
+//! prompt ever reaching the operator.
+//!
 //! # What this module does NOT do
 //!
 //! - It does not write `runner-config.json` itself — the caller (a later phase's background-run
@@ -55,6 +73,7 @@
 //!   (`background/runner_main.rs`), executing inside the detached second process, not this
 //!   (orchestrator-side) spawn call.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::error::SubagentError;
@@ -102,11 +121,12 @@ mod windows_flags {
 ///   called, so a failure to create either surfaces as a clean [`SubagentError::Spawn`] rather
 ///   than a partially-launched child.
 ///
-/// This function never adds anything to the child's environment beyond what
-/// [`tokio::process::Command`] inherits by default from this process (no `env_clear()`, matching
-/// [`crate::spawn::SpawnedChild::spawn`]'s identical inherit-only-unless-overlaid convention) —
-/// R-SA-073 routes ALL runner configuration through the one-shot config file (`cfg_path`), never
-/// env blobs, so this function has no env-overlay parameter to begin with.
+/// The child's environment is INHERITED from this process (no `env_clear()`, matching
+/// [`crate::spawn::SpawnedChild::spawn`]'s identical inherit-only-unless-overlaid convention) and
+/// then overlaid with [`super::parent_anchor::detached_runner_env_overlay`] — in practice the one
+/// R-SA-P1 parent-session anchor entry, and nothing else (PERM-001; see the module docs for why
+/// that single entry is not an R-SA-073 violation). Everything that is genuinely runner
+/// CONFIGURATION still travels through the one-shot config file (`cfg_path`), never env.
 ///
 /// # Detachment mechanism
 ///
@@ -148,6 +168,12 @@ pub fn spawn_detached_runner(
         cfg_path,
         stdout_log_path,
         stderr_log_path,
+        // PERM-001: the R-SA-P1 anchor this orchestrator should hand downward — INHERITED (this
+        // process is itself a subagent child launching a nested background run) → PUBLISHED (the
+        // root orchestrator's live session id, put in the register by the permission companion's
+        // PARENT-role `SessionStart`) → none. Resolved HERE, in the env-reading wrapper, for the
+        // same reason `spawn::resolve_spawn_command` is: the injectable core below stays pure.
+        &super::parent_anchor::detached_runner_env_overlay(),
     )
 }
 
@@ -161,8 +187,13 @@ pub fn spawn_detached_runner(
 /// directly-testable function.
 ///
 /// See [`spawn_detached_runner`] for the full parameter/return/detachment/error contract — this
-/// function's behavior is identical, it merely accepts `command` explicitly instead of resolving
-/// it internally.
+/// function's behavior is identical, it merely accepts `command` and `env_overlay` explicitly
+/// instead of resolving them from this process's own environment internally.
+///
+/// `env_overlay` is applied on TOP of the inherited environment (never `env_clear`), exactly as
+/// [`crate::spawn::SpawnedChild::spawn`] applies its own overlay. Production passes
+/// [`super::parent_anchor::detached_runner_env_overlay`]; an empty map reproduces the historical
+/// inherit-only behavior verbatim.
 ///
 /// # Errors
 ///
@@ -172,6 +203,7 @@ pub fn spawn_detached_runner_with_command(
     cfg_path: &Path,
     stdout_log_path: &Path,
     stderr_log_path: &Path,
+    env_overlay: &BTreeMap<String, String>,
 ) -> Result<u32, SubagentError> {
     let stdout_file = std::fs::File::create(stdout_log_path).map_err(SubagentError::Spawn)?;
     let stderr_file = std::fs::File::create(stderr_log_path).map_err(SubagentError::Spawn)?;
@@ -186,7 +218,11 @@ pub fn spawn_detached_runner_with_command(
         // orchestrator (see module docs for why inheriting would undermine R-SA-071).
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout_file))
-        .stderr(std::process::Stdio::from(stderr_file));
+        .stderr(std::process::Stdio::from(stderr_file))
+        // PERM-001: overlay (never `env_clear`) — the R-SA-P1 anchor pi would have propagated by
+        // plain `process.env` inheritance, written explicitly here because cyrup's orchestrator
+        // cannot mutate its own environment. Empty in every no-anchor case.
+        .envs(env_overlay);
 
     #[cfg(unix)]
     {
@@ -264,8 +300,13 @@ mod tests {
             binary: std::path::PathBuf::from("does-not-matter-stdio-setup-fails-first"),
             base_args: Vec::new(),
         };
-        let result =
-            spawn_detached_runner_with_command(&command, &cfg_path, &stdout_log, &stderr_log);
+        let result = spawn_detached_runner_with_command(
+            &command,
+            &cfg_path,
+            &stdout_log,
+            &stderr_log,
+            &BTreeMap::new(),
+        );
         assert!(
             matches!(result, Err(SubagentError::Spawn(_))),
             "a missing log directory must fail cleanly as SubagentError::Spawn, never panic: \
@@ -274,15 +315,25 @@ mod tests {
     }
 
     /// [`spawn_detached_runner_with_command`] builds argv in the exact `SUBAGENT_RUNNER_SUBCOMMAND
-    /// CONFIG_FLAG cfg_path` order this module's docs promise, and includes `command.base_args`
-    /// ahead of both — verified by spawning a real (trivial, always-available) `true`-equivalent
-    /// command wrapped so it echoes its own argv, without depending on the scripted
-    /// `cyrup-subagent-fixture` binary at all. `sh` is resolved to its absolute path via this
-    /// test's own real `PATH`, exactly mirroring `spawn::mod::tests::sh_command`'s established
-    /// convention for a real-but-always-present stand-in binary.
+    /// CONFIG_FLAG cfg_path` order this module's docs promise, includes `command.base_args` ahead
+    /// of both, AND applies `env_overlay` to the spawned process (PERM-001) — verified by spawning
+    /// a real (trivial, always-available) `sh` wrapper that dumps its own argv and the anchor it
+    /// received, without depending on the scripted `cyrup-subagent-fixture` binary at all. `sh` is
+    /// resolved to its absolute path via this test's own real `PATH`, exactly mirroring
+    /// `spawn::mod::tests::sh_command`'s established convention for a real-but-always-present
+    /// stand-in binary.
+    ///
+    /// REWRITTEN for PERM-001. The previous version never called the function under test: it
+    /// hand-built an equivalent `tokio::process::Command` and asserted on THAT, because (its own
+    /// comment said) "`spawn_detached_runner_with_command` itself does not expose an env-overlay
+    /// parameter (by design)" and the argv dump needed one env var. That premise is now false —
+    /// the function takes the overlay — so the test calls the real thing, which additionally makes
+    /// it a genuine regression test for the anchor entry: against the pre-fix code the
+    /// `CYRUP_SUBAGENT_PARENT_SESSION` assertion below cannot pass, because nothing the hop-1
+    /// spawn did could put it in the child's environment.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn argv_is_subcommand_then_config_flag_then_path_after_base_args() {
+    async fn argv_order_and_env_overlay_reach_the_detached_process() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         std::fs::write(&cfg_path, "{}").expect("write placeholder config");
@@ -300,46 +351,123 @@ mod tests {
             binary: sh_path,
             base_args: vec![
                 "-c".to_string(),
-                r#"for a in "$@"; do printf '%s\n' "$a" >> "$CYRUP_TEST_ARGV_OUT"; done"#
-                    .to_string(),
+                // Dump argv, then the anchor the overlay was supposed to deliver, then a DONE
+                // sentinel so the poll below never reads a half-written file.
+                concat!(
+                    r#"for a in "$@"; do printf '%s\n' "$a" >> "$CYRUP_TEST_ARGV_OUT"; done; "#,
+                    r#"printf 'ANCHOR=%s\n' "$CYRUP_SUBAGENT_PARENT_SESSION" >> "$CYRUP_TEST_ARGV_OUT"; "#,
+                    r#"printf 'DONE\n' >> "$CYRUP_TEST_ARGV_OUT""#
+                )
+                .to_string(),
                 "--".to_string(),
             ],
         };
 
         let argv_out = dir.path().join("argv.txt");
-        // This one test DOES need the child to see an extra env var (where to write the argv
-        // dump) — achieved via a `sh -c` wrapper reading it from `base_args`' own literal script
-        // text is awkward, so instead the script reads `$CYRUP_TEST_ARGV_OUT` which we set on the
-        // spawned COMMAND directly below (child-only env, no process-global mutation, no
-        // `unsafe`). `spawn_detached_runner_with_command` itself does not expose an env-overlay
-        // parameter (by design — see this module's doc comment on
-        // [`spawn_detached_runner`]), so this test reaches into `tokio::process::Command`
-        // manually via the identical mechanism to prove the argv CONTRACT independent of that
-        // function, then separately re-derives the same ordering by calling the function under
-        // test and inspecting the file it produces.
-        let mut probe = tokio::process::Command::new(&command.binary);
-        probe
-            .args(&command.base_args)
-            .arg(SUBAGENT_RUNNER_SUBCOMMAND)
-            .arg(CONFIG_FLAG)
-            .arg(&cfg_path)
-            .env("CYRUP_TEST_ARGV_OUT", &argv_out)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(
-                std::fs::File::create(&stdout_log).expect("create stdout log"),
-            ))
-            .stderr(std::process::Stdio::from(
-                std::fs::File::create(&stderr_log).expect("create stderr log"),
-            ));
-        let status = probe.status().await.expect("probe command runs");
-        assert!(status.success());
+        let mut overlay = BTreeMap::new();
+        overlay.insert("CYRUP_TEST_ARGV_OUT".to_string(), argv_out.display().to_string());
+        overlay.insert(
+            crate::exec::PARENT_SESSION_ENV_VAR.to_string(),
+            "session-detached-anchor".to_string(),
+        );
 
-        let contents = std::fs::read_to_string(&argv_out).expect("argv dump file written");
+        let pid = spawn_detached_runner_with_command(
+            &command,
+            &cfg_path,
+            &stdout_log,
+            &stderr_log,
+            &overlay,
+        )
+        .expect("detached sh spawns");
+        assert!(pid > 0, "a confirmed spawn must report a real pid");
+
+        // The child is deliberately never awaited (that is this module's whole contract), so poll
+        // for its own DONE sentinel instead of `wait()`ing on it.
+        let mut contents = String::new();
+        for _ in 0..200 {
+            contents = std::fs::read_to_string(&argv_out).unwrap_or_default();
+            if contents.contains("DONE") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(
             lines,
-            vec![SUBAGENT_RUNNER_SUBCOMMAND, CONFIG_FLAG, cfg_path.display().to_string().as_str()],
-            "argv must be exactly [subcommand, config flag, config path] after base_args"
+            vec![
+                SUBAGENT_RUNNER_SUBCOMMAND,
+                CONFIG_FLAG,
+                cfg_path.display().to_string().as_str(),
+                "ANCHOR=session-detached-anchor",
+                "DONE",
+            ],
+            "argv must be [subcommand, config flag, config path] after base_args, and the \
+             env overlay must reach the detached process (PERM-001)"
+        );
+    }
+
+    /// PERM-001 regression, the negative direction: an EMPTY overlay must leave the child's
+    /// environment exactly as inherited — no `CYRUP_SUBAGENT_PARENT_SESSION=""` entry that would
+    /// MASK an anchor the process legitimately inherited (a spawn env is an overlay, never a
+    /// replacement).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_overlay_writes_no_masking_anchor_entry() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let cfg_path = dir.path().join("runner-config.json");
+        std::fs::write(&cfg_path, "{}").expect("write placeholder config");
+        let stdout_log = dir.path().join("runner.stdout.log");
+        let stderr_log = dir.path().join("runner.stderr.log");
+        let probe_out = dir.path().join("env.txt");
+
+        let sh_path = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("sh"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"));
+        // The probe path is baked into the script text (not the overlay) precisely because this
+        // test must pass an EMPTY overlay to the function under test.
+        let script = format!(
+            "printf 'SET=%s\\n' \"${{{var}+yes}}\" >> {out}; printf 'DONE\\n' >> {out}",
+            var = crate::exec::PARENT_SESSION_ENV_VAR,
+            out = probe_out.display(),
+        );
+        let command = SpawnCommand {
+            binary: sh_path,
+            base_args: vec!["-c".to_string(), script, "--".to_string()],
+        };
+
+        spawn_detached_runner_with_command(
+            &command,
+            &cfg_path,
+            &stdout_log,
+            &stderr_log,
+            &BTreeMap::new(),
+        )
+        .expect("detached sh spawns");
+
+        let mut contents = String::new();
+        for _ in 0..200 {
+            contents = std::fs::read_to_string(&probe_out).unwrap_or_default();
+            if contents.contains("DONE") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // `${VAR+yes}` expands to `yes` only when VAR is SET (even to ""), so this distinguishes
+        // "absent" from "present but empty" — exactly the masking case being ruled out. The
+        // ambient test environment normally has no anchor; if it somehow does, inheritance (not
+        // the overlay) is what set it, and the assertion is skipped.
+        if std::env::var(crate::exec::PARENT_SESSION_ENV_VAR).is_ok() {
+            return;
+        }
+        assert_eq!(
+            contents, "SET=\nDONE\n",
+            "an empty overlay must add no anchor entry at all"
         );
     }
 }

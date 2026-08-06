@@ -1,11 +1,15 @@
 //! [`InlineMessage`] — a port of `pi-intercom/ui/inline-message.ts` `InlineMessageComponent`.
 //!
-//! Two roles, both WIRED from [`crate::inbound::surface_incoming_message`] on every real inbound
-//! broker message:
-//! - [`InlineMessage::content_markdown`] builds the human-readable body pi's `sendIncomingMessage`
+//! Two roles, both WIRED on every real inbound broker message:
+//! - [`InlineMessage::content_markdown`] builds the attributed message pi's `sendIncomingMessage`
 //!   passes to `pi.sendMessage({customType:"intercom_message", content, …})` (`index.ts:654-666`).
-//!   In cyrup this becomes the `content` field of `append_entry("intercom_message", …)` (the port doc
-//!   §4.2/§7.2 surface — the card degrades to a custom entry, §4.3).
+//!   Upstream this ONE string is both what the human sees and what the model receives; cyrup splits
+//!   the two surfaces (the port doc §4.2/§7.2 divergence) but sends the SAME string down both:
+//!   [`crate::inbound::surface_incoming_message`] puts it in the `content` field of
+//!   `append_entry("intercom_message", …)` (the card degrades to a custom entry, §4.3), and
+//!   [`crate::inbound::trigger_turn_over_inbound`] / [`crate::inbound::send_incoming_message`] pass
+//!   it to `HostServices::inject_message` — so the model always gets the `📨 From …` attribution,
+//!   the sender's cwd and the reply instruction, never the bare body.
 //!
 //!   NOTE (EXT-006): the reason for that degradation is gone. `InitApi::register_message_renderer`
 //!   now exists for native built-ins and `ExtensionHost::render_message_call` routes a custom type

@@ -409,7 +409,17 @@ pub struct RunOptions {
     /// under its own `interrupted` flag on [`SingleResult`] rather than conflating it with
     /// `timed_out`.
     pub interrupt: CancelToken,
+    /// pi `options.share` (`execution.ts:1027`, the tool's SINGLE-mode `share` param). Its ONE
+    /// effect at this port's baseline is pi's `sessionEnabled` term (`execution.ts:1039`): a
+    /// `Some(true)` keeps the child's session store ON even without an explicit
+    /// [`Self::session_dir`], so `--no-session` is not emitted (see
+    /// [`build_attempt_spawn_plan`]). pi v0.34.0 has no gist upload of its own — the tool schema's
+    /// legacy "Upload session to GitHub Gist" wording describes a capability neither side ships.
     pub share: Option<bool>,
+    /// pi `options.sessionDir` (`pi-args.ts:107-111`): the directory the child persists its session
+    /// under, passed through as `--session-dir <dir>` and created up front. Ignored when
+    /// [`ForkContext::session_file_path`] resolved a concrete session FILE (pi's `sessionFile` wins
+    /// that branch outright).
     pub session_dir: Option<PathBuf>,
     /// Per-call skill-name override (pi `options.skills`, `execution.ts:935`): when `Some`, these
     /// names are resolved and injected into the child prompt INSTEAD of the agent's own
@@ -820,9 +830,11 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
 /// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
 /// `--append-system-prompt=<persona body>` per `agent.system_prompt_mode` when the body is
-/// non-empty (ONE argv element, `=`-joined — see below); an optional `--session <path>` (when
-/// `opts.fork_context` resolved a session file path); then the task prompt last (via
-/// [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
+/// non-empty (ONE argv element, `=`-joined — see below); pi's full session branch
+/// (`pi-args.ts:100-112`) — either `--session <path>` when `opts.fork_context` resolved a session
+/// file path, or else `--no-session` unless [`RunOptions::session_dir`]/[`RunOptions::share`]
+/// enable sessions plus `--session-dir <dir>` for an explicit directory; then the task prompt last
+/// (via [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
 ///
 /// Env overlay carries the child-ROLE pair
 /// ([`crate::spawn::nested_events::child_role_env`] — pi `pi-args.ts:329-330`), the incremented
@@ -983,9 +995,38 @@ pub fn build_attempt_spawn_plan(
         args.push(format!("{flag}={persona_body}"));
     }
 
+    // Session threading (pi `buildPiArgs`, `pi-args.ts:100-112`) — the FULL branch, both halves:
+    //
+    // * a resolved fork-context session FILE wins outright: its parent directory is created
+    //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
+    //   pins the child to it;
+    // * otherwise the child is spawned `--no-session` UNLESS this run enables sessions at all, and
+    //   an explicit `--session-dir <dir>` (directory likewise created up front) points the child's
+    //   session store at the caller's directory.
+    //
+    // `session_enabled` is pi's `execution.ts:1039` `Boolean(sessionFile || sessionDir) || share`:
+    // an explicit `sessionDir` OR `share: true` keeps sessions on; neither means the child must not
+    // persist a session at all. Pre-SUBA-041 only the `--session` half existed, so
+    // [`RunOptions::share`]/[`RunOptions::session_dir`] were inert fields no argv ever read and every
+    // session-less child silently persisted a session the orchestrator never asked for.
     if let Some(session_path) = &opts.fork_context.session_file_path {
+        if let Some(parent) = session_path.parent() {
+            // Best-effort, exactly like pi's own un-guarded `mkdirSync`: a failure here surfaces as
+            // the child's own session error rather than aborting the spawn plan.
+            let _ = std::fs::create_dir_all(parent);
+        }
         args.push("--session".to_string());
         args.push(session_path.display().to_string());
+    } else {
+        let session_enabled = opts.session_dir.is_some() || opts.share == Some(true);
+        if !session_enabled {
+            args.push("--no-session".to_string());
+        }
+        if let Some(session_dir) = &opts.session_dir {
+            let _ = std::fs::create_dir_all(session_dir);
+            args.push("--session-dir".to_string());
+            args.push(session_dir.display().to_string());
+        }
     }
 
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
@@ -2796,6 +2837,84 @@ mod tests {
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--session").expect("--session present");
         assert!(argv[idx + 1].contains("parent-branch.jsonl"));
+        // pi's `sessionFile` branch (`pi-args.ts:101-103`) emits ONLY `--session`: never the
+        // `--no-session`/`--session-dir` pair from the else arm.
+        assert!(!argv.contains(&"--no-session".to_string()));
+        assert!(!argv.contains(&"--session-dir".to_string()));
+    }
+
+    /// SUBA-041 prerequisite (pi `buildPiArgs`, `pi-args.ts:104-112`): with NO fork-context session
+    /// file, no `session_dir` and no `share`, pi's `sessionEnabled` is false and the child is spawned
+    /// `--no-session`. Pre-fix this arm emitted nothing at all, so every session-less subagent child
+    /// silently persisted a session into the orchestrator's own store.
+    #[test]
+    fn build_attempt_spawn_plan_emits_no_session_when_nothing_enables_a_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
+        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+    }
+
+    /// SUBA-041 prerequisite: an explicit `session_dir` both ENABLES sessions (no `--no-session`)
+    /// and reaches the child as `--session-dir <dir>`, with the directory created up front — pi's
+    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`pi-args.ts:108-110`).
+    #[test]
+    fn build_attempt_spawn_plan_emits_session_dir_and_creates_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        let session_dir = dir.path().join("sessions").join("run-0");
+        opts.session_dir = Some(session_dir.clone());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv
+            .iter()
+            .position(|a| a == "--session-dir")
+            .expect("--session-dir present");
+        assert_eq!(argv[idx + 1], session_dir.display().to_string());
+        assert!(
+            !argv.contains(&"--no-session".to_string()),
+            "an explicit session dir enables sessions: {argv:?}"
+        );
+        assert!(session_dir.is_dir(), "the session dir must be created up front");
+    }
+
+    /// SUBA-041 prerequisite: `share: true` alone is pi's other `sessionEnabled` term
+    /// (`execution.ts:1039`) — it suppresses `--no-session` without naming a directory.
+    #[test]
+    fn build_attempt_spawn_plan_share_alone_enables_sessions_without_a_session_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.share = Some(true);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(!argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
+        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+    }
+
+    /// SUBA-041 prerequisite: `share: false` is NOT an enabling value — pi's term is
+    /// `options.share === true` (`execution.ts:1027`), so an explicit `false` still yields
+    /// `--no-session`.
+    #[test]
+    fn build_attempt_spawn_plan_share_false_still_disables_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.share = Some(false);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+            .expect("plan builds");
+        assert!(plan.spec.build_argv().contains(&"--no-session".to_string()));
     }
 
     #[test]

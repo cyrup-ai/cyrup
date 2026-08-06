@@ -8,6 +8,14 @@
 //! against a real child process (arch-SA §1.1 item 3) — never a cooperative in-process token
 //! standing in for termination.
 //!
+//! [`terminate_on_timeout`] is the same module's *timeout* counterpart: `SIGTERM`, then a hard
+//! `SIGKILL` [`TIMEOUT_SIGTERM_GRACE`] later, matching upstream `abortVerification`
+//! (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0) and the kill-on-expiry
+//! semantics of `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
+//! (`pi-subagents/src/runs/shared/worktree.ts:290-296`). Both entry points share the one
+//! group-aware [`send_signal`] target-selection rule below; there is deliberately no second
+//! signalling path in this crate.
+//!
 //! Each grace-period wait is ALSO raced against the caller's `cyrup_core::CancelToken`
 //! (`tokio_util::sync::CancellationToken`) so that an already-cancelled run does not sit out a
 //! grace period it no longer needs to honor precisely — a cancellation firing mid-wait advances
@@ -127,6 +135,56 @@ pub async fn terminate(
         status,
         stage: EscalationStage::Sigkill,
     })
+}
+
+/// Grace period between the timeout-triggered `SIGTERM` and the unconditional hard `SIGKILL` that
+/// follows it — upstream `abortVerification`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0) sends `child.kill("SIGTERM")`
+/// and immediately arms a `setTimeout(… , 1000)` that sends `child.kill("SIGKILL")`, so 1000ms is
+/// the ported constant, not a cyrup invention.
+pub const TIMEOUT_SIGTERM_GRACE: Duration = Duration::from_millis(1000);
+
+/// Hard-stop a child that blew through its OWN timeout: `SIGTERM`, then `SIGKILL` after
+/// [`TIMEOUT_SIGTERM_GRACE`], returning only once the OS process is CONFIRMED reaped.
+///
+/// This is the two-rung sibling of [`terminate`]'s three-rung ladder, and it exists because
+/// upstream draws the same distinction: a *cancellation* walks the polite
+/// `SIGINT -> SIGTERM -> SIGKILL` escalation, but a *timeout* is already the caller's declared
+/// patience running out, so upstream's `abortVerification` skips straight to `SIGTERM` + a 1s hard
+/// `SIGKILL` (`acceptance.ts:742-758`), and `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
+/// (`worktree.ts:290-296`) likewise kills on expiry rather than escalating gently.
+///
+/// Callers MUST still own the `Child` when they call this — the bug this function exists to make
+/// unrepresentable is racing `tokio::time::timeout(…, child.wait_with_output())`, whose
+/// `self`-consuming future swallows the only handle to the process, so the timeout arm drops it
+/// and (with no `kill_on_drop`) leaves the whole process group running for the machine's uptime.
+/// Take the child's pipes out and drain them separately, keep the `Child` binding, race
+/// `child.wait()`, and call this on expiry.
+///
+/// Signal delivery goes through [`send_signal`], so a child that leads its own process group
+/// (every `verify[]` command does — `exec::acceptance` sets `Command::process_group(0)`) is
+/// signalled as `kill(-pgid, …)`, reaching the descendants it spawned. A child that does not lead
+/// a group (the worktree setup hook) gets the bare pid, exactly as upstream's `spawnSync` timeout
+/// does.
+///
+/// # Errors
+///
+/// Returns `Err` only if `child.wait()` itself fails at the OS/tokio level. Signal-send failures
+/// (`ESRCH` for a process that exited in the race window) are swallowed, per [`send_signal`].
+pub async fn terminate_on_timeout(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    // Rung 1: SIGTERM, raced against the 1000ms hard-kill timer only — a timeout path has no
+    // grace period left to honor beyond the one upstream itself arms.
+    send_sigterm(child);
+    tokio::select! {
+        biased;
+        result = child.wait() => return result,
+        () = tokio::time::sleep(TIMEOUT_SIGTERM_GRACE) => {}
+    }
+
+    // Rung 2: SIGKILL — unconditional, and its `wait()` is never raced, so this function's
+    // "confirmed gone" contract is bounded by the OS's own guarantee rather than another timer.
+    send_sigkill(child);
+    child.wait().await
 }
 
 /// Race `child.wait()` against a grace-period timer and `cancel` becoming cancelled.
@@ -440,6 +498,73 @@ mod tests {
             started.elapsed() < SIGINT_GRACE,
             "an already-cancelled token must short-circuit both grace waits, not pay either out \
              in full: got {:?}",
+            started.elapsed()
+        );
+        assert_pid_gone(pid);
+    }
+
+    /// SUBA-027: the timeout path's own two-rung ladder. A child that does not trap anything dies
+    /// to the first `SIGTERM`, well inside [`TIMEOUT_SIGTERM_GRACE`] — the hard-kill timer must
+    /// not be paid out for a cooperative child.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_timeout_stops_at_sigterm_for_a_normal_child() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("sleep spawns");
+        let pid = child.id().expect("live child has a pid");
+
+        let started = tokio::time::Instant::now();
+        terminate_on_timeout(&mut child)
+            .await
+            .expect("terminate_on_timeout confirms a real exit");
+
+        assert!(
+            started.elapsed() < TIMEOUT_SIGTERM_GRACE,
+            "a SIGTERM-obeying child must not cost the hard-kill grace period, got {:?}",
+            started.elapsed()
+        );
+        assert_pid_gone(pid);
+    }
+
+    /// SUBA-027: a child that traps and ignores `SIGTERM` still dies, via the unconditional
+    /// `SIGKILL` rung armed [`TIMEOUT_SIGTERM_GRACE`] later — this is the rung whose absence let a
+    /// hung `verify[]` command survive its own timeout indefinitely.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_timeout_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let marker = tempfile::NamedTempFile::new()
+            .expect("real tempfile for the trap-installed marker")
+            .into_temp_path();
+        let marker_path = marker.to_path_buf();
+        std::fs::remove_file(&marker_path).ok();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "trap '' TERM; touch '{}'; while true; do sleep 1; done",
+                marker_path.display()
+            ),
+        ]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("the SIGTERM-trapping shell spawns");
+        let pid = child.id().expect("live child has a pid");
+        wait_for_marker(&marker_path, Duration::from_secs(10)).await;
+
+        let started = tokio::time::Instant::now();
+        terminate_on_timeout(&mut child)
+            .await
+            .expect("terminate_on_timeout still confirms a real exit via SIGKILL");
+
+        assert!(
+            started.elapsed() >= TIMEOUT_SIGTERM_GRACE,
+            "the hard-kill grace period must be genuinely waited out before SIGKILL, got {:?}",
             started.elapsed()
         );
         assert_pid_gone(pid);

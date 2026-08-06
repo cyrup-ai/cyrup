@@ -50,6 +50,14 @@ pub mod control;
 /// "never awaited" is the entire point, not an oversight.
 pub mod spawn_detached;
 
+/// The process-wide parent-session anchor register (R-SA-P1, PERM-001) — cyrup's `unsafe`-free
+/// stand-in for pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
+/// (`pi-subagents/src/extension/index.ts:555`, cleared at `:584`), and the source of the one env
+/// entry [`spawn_detached`] overlays onto the hop-1 `__subagent-runner` process so a BACKGROUND
+/// subagent's forwarded permission ask can still address its root's inbox. See [`parent_anchor`]
+/// for the full why.
+pub mod parent_anchor;
+
 /// Stale-run liveness reconciliation (`reconcile`, R-SA-088..092): given a run id's resolved
 /// [`RunPaths`], applies the exact five-step algorithm — `ResultFile` presence is always
 /// authoritative; a missing `status.json` is provisional within the R-SA-090 spawn grace window

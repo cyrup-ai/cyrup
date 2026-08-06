@@ -185,8 +185,9 @@ pub fn flush_idle_messages(state: &Arc<SharedIntercomState>) {
 
 /// Deliver an inbound message through the live `HostServices`, optionally driving/steering an agent
 /// turn OVER it (the interactive `has_ui` branch of [`decide_inbound_policy`], pi's
-/// `sendIncomingMessage(entry, "trigger")` gated by `shouldTriggerInboundMessage`): build the message
-/// body and `inject_message(trigger_turn = trigger)` — the live host runs a fresh turn when idle and
+/// `sendIncomingMessage(entry, "trigger")` gated by `shouldTriggerInboundMessage`): build the
+/// attributed message content ([`InlineMessage::content_markdown`], pi's `content` template at
+/// `index.ts:660-666`) and `inject_message(trigger_turn = trigger)` — the live host runs a fresh turn when idle and
 /// steers onto the active run when busy, or (when `trigger` is `false`, `config.inbound_trigger`
 /// having declined it) delivers the message as a non-triggering follow-up entry (pi's
 /// `{ deliverAs: "followUp" }`). `display = false` because the durable card was ALREADY surfaced via
@@ -214,8 +215,14 @@ pub fn trigger_turn_over_inbound(
         message: message.clone(),
         received_at: now_ms(),
     });
-    let body = build_inline_message(state, from, message).body().to_string();
-    if let Err(e) = services.inject_message(&body, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, trigger) {
+    // pi `sendIncomingMessage` (`index.ts:652-672`) injects ONE string — the attribution header, the
+    // sender's cwd, the reply instruction and the body — and the human sees that same string. Inject
+    // `content_markdown()`, not the bare `body()`: without it the model cannot tell an intercom
+    // message from a user turn, cannot tell WHICH peer asked, and is never told the reply command.
+    let content = build_inline_message(state, from, message).content_markdown();
+    if let Err(e) =
+        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, trigger)
+    {
         tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
     true
@@ -244,9 +251,13 @@ pub fn send_incoming_message(
             let Some(services) = state.host_services() else {
                 return false;
             };
-            let body = build_inline_message(state, from, message).body().to_string();
+            // Same one-string shape as the `"trigger"` arm — pi's `sendIncomingMessage` builds the
+            // `content` identically for both deliveries, only the second argument to `pi.sendMessage`
+            // differs (`index.ts:663-670`). A flushed backlog must therefore carry N separately
+            // attributed messages, not N concatenated header-less bodies.
+            let content = build_inline_message(state, from, message).content_markdown();
             if let Err(e) =
-                services.inject_message(&body, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, false)
+                services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), false, false)
             {
                 tracing::warn!(error = %e, "intercom: failed to deliver a follow-up inbound message");
             }
@@ -730,5 +741,99 @@ mod tests {
         assert_eq!(injected.len(), 1, "the message reaches the agent: {injected:?}");
         assert!(injected[0].0.contains("ping"));
         assert!(injected[0].3, "an idle session gets a real turn-driving delivery");
+    }
+
+    /// ICOM-022 regression (pi `sendIncomingMessage`, `index.ts:652-672`): the string the model
+    /// receives IS the string the human sees — `**📨 From {sender}** ({cwd}){replyInstruction}` then
+    /// a blank line then the body. Pre-fix the injected content was
+    /// `build_inline_message(..).body()`, i.e. the body ALONE: no sender attribution, no cwd, and no
+    /// `intercom({action:"reply"})` guidance even though the hint was already computed and shown on
+    /// the `append_entry` surface. The model could not tell an intercom message from a user turn.
+    #[tokio::test]
+    async fn injected_inbound_message_carries_the_pi_attribution_header_and_reply_instruction() {
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("Which DB?"), true));
+
+        let injected = host.injected();
+        assert_eq!(injected.len(), 1, "one delivery: {injected:?}");
+        let content = &injected[0].0;
+        assert!(
+            content.starts_with("**📨 From subagent-chat-1** (/w)"),
+            "attribution header + sender cwd lead the injected content: {content:?}"
+        );
+        assert!(
+            content.contains("To reply, use the intercom tool: intercom({ action: \"reply\", message: \"...\" })"),
+            "the reply instruction reaches the MODEL, not just the append_entry surface: {content:?}"
+        );
+        assert!(content.ends_with("\n\nWhich DB?"), "body last, after a blank line: {content:?}");
+        // The injected string is byte-identical to the one the human surface carries — pi builds it
+        // exactly once (`index.ts:660-666`).
+        assert_eq!(content, &build_inline_message(&s, &from(), &ask("Which DB?")).content_markdown());
+        assert_eq!(injected[0].1.as_deref(), Some(INBOUND_MESSAGE_CUSTOM_TYPE));
+    }
+
+    /// ICOM-022's flush half: a drained backlog must be N separately attributed messages, not N
+    /// concatenated header-less bodies. Pre-fix a busy session's backlog reached the model as a run
+    /// of bare bodies, so several peers' messages were indistinguishable from each other and from
+    /// the user's own turn.
+    #[tokio::test]
+    async fn every_flushed_backlog_message_carries_its_own_attribution_header() {
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(false)); // a run is in flight
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+
+        // Two DIFFERENT peers ask while this session is busy.
+        let mut peer_b = from();
+        peer_b.id = "child-9999".to_string();
+        peer_b.name = Some("subagent-chat-2".to_string());
+        peer_b.cwd = "/other".to_string();
+        queue_idle_message(&s, from(), ask("first"));
+        queue_idle_message(&s, peer_b, ask("second"));
+
+        host.set_idle(true);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            INBOUND_FLUSH_DELAY_MS + INBOUND_IDLE_RETRY_MS + 300,
+        ))
+        .await;
+
+        let injected = host.injected();
+        assert_eq!(injected.len(), 2, "the whole backlog drains: {injected:?}");
+        assert!(
+            injected[0].0.starts_with("**📨 From subagent-chat-1** (/w)"),
+            "the trigger delivery is attributed: {injected:?}"
+        );
+        assert!(
+            injected[1].0.starts_with("**📨 From subagent-chat-2** (/other)"),
+            "the followUp delivery is attributed to ITS OWN sender: {injected:?}"
+        );
+        for call in &injected {
+            assert!(
+                call.0.contains("To reply, use the intercom tool: intercom("),
+                "each flushed message keeps its reply instruction: {call:?}"
+            );
+        }
+    }
+
+    /// A peer with no `name` falls back to the first 8 chars of its session id (pi
+    /// `entry.from.name || entry.from.id.slice(0, 8)`, `index.ts:659`) — asserted on the INJECTED
+    /// string so the fallback is proven on the model-facing path.
+    #[tokio::test]
+    async fn injected_attribution_falls_back_to_the_session_id_slice() {
+        let s = Arc::new(state(false)); // reply hint off → no reply instruction at all
+        let host = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(host.clone());
+        let mut anon = from();
+        anon.name = None;
+
+        assert!(trigger_turn_over_inbound(&s, &anon, &ask("hi"), false));
+
+        let injected = host.injected();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "**📨 From child-12** (/w)\n\nhi");
     }
 }

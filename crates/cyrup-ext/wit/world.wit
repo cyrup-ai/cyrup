@@ -1,13 +1,21 @@
-// cyrup:ext@0.1.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.3.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface mirrors Pi's 30-event catalog 1:1 (extensions/types.ts:1133-1171):
-// the host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
-package cyrup:ext@0.1.0;
+// The `events` interface exports 31 `on-*` event hooks, mirroring Pi's `pi.on(...)` catalog
+// (extensions/types.ts:1198-1239, 33 overloads — `session_info_changed` and
+// `before_provider_headers` have no export here). The host calls only the exports a guest
+// subscribed to (the subscription gate, R-08-034).
+//
+// VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
+// change to an EXPORT — added, removed, or RE-SIGNED — bumps the MINOR. A guest built against an
+// older MINOR either lacks the export or has it at the old signature, so it must be refused by
+// `ExtensionManifest::check_world` before instantiation rather than trapping inside wasmtime.
+// `crates/cyrup-ext/tests/wit_world_sync.rs` enforces that tie, in BOTH copies.
+package cyrup:ext@0.3.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).

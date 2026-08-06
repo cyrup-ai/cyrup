@@ -490,6 +490,13 @@ pub async fn run_verify_commands(
 
 /// The single-command core [`run_verify_commands`] loops over, factored out so tests can inject a
 /// shorter timeout without waiting out [`DEFAULT_VERIFY_TIMEOUT`].
+///
+/// On expiry the command is KILLED, never abandoned: `crate::spawn::signal::terminate_on_timeout`
+/// sends `SIGTERM` and then a hard `SIGKILL` a second later, targeting the command's own process
+/// group. This ports upstream `runVerifyCommand`'s `abortVerification`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0), which does exactly that —
+/// `child.kill("SIGTERM")` plus a 1000 ms `setTimeout` hard `child.kill("SIGKILL")` — and this
+/// function returns only once the OS process is confirmed reaped.
 async fn run_one_verify_command(
     command: &str,
     cwd: &Path,
@@ -508,7 +515,7 @@ async fn run_one_verify_command(
         cmd.process_group(0);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return VerifyCommandResult {
@@ -521,12 +528,56 @@ async fn run_one_verify_command(
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let exit_code = output.status.code();
+    // Drain both pipes on their own tasks rather than via `Child::wait_with_output`. That
+    // convenience method takes `self` BY VALUE, so racing it against `tokio::time::timeout`
+    // consumed the only handle to the process: the elapsed arm dropped the future, `kill_on_drop`
+    // was never set, and a hung `cargo test`/`npm run e2e` survived its own timeout for the
+    // machine's uptime — inside a process group `process_group(0)` above has deliberately detached
+    // from the terminal, so the user's Ctrl-C could not reach it either. Keeping the `Child`
+    // binding is what makes the timeout arm able to actually kill (upstream `abortVerification`,
+    // acceptance.ts:742-758 @v0.34.0).
+    let stdout_task = child.stdout.take().map(spawn_pipe_drain);
+    let stderr_task = child.stderr.take().map(spawn_pipe_drain);
+
+    let waited = tokio::select! {
+        biased;
+        result = child.wait() => Some(result),
+        () = tokio::time::sleep(timeout) => None,
+    };
+
+    let Some(waited) = waited else {
+        // Timed out: SIGTERM, then a hard SIGKILL 1s later, targeting the child's process GROUP
+        // (it leads one — see `process_group(0)` above), so the descendants the command spawned
+        // die with it. `terminate_on_timeout` returns only once the process is CONFIRMED reaped.
+        let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
+        // The drains would normally end on their own now that the writers are dead, but a pipe
+        // could still be held by something that escaped the group; abort rather than risk hanging
+        // acceptance evaluation. The tail was already empty on this path before the fix.
+        if let Some(task) = stdout_task {
+            task.abort();
+        }
+        if let Some(task) = stderr_task {
+            task.abort();
+        }
+        return VerifyCommandResult {
+            command: command.to_string(),
+            exit_code: None,
+            passed: false,
+            output_tail: String::new(),
+            spawn_error: Some(format!(
+                "verify command exceeded its {}ms timeout and was terminated",
+                timeout.as_millis()
+            )),
+        };
+    };
+
+    let mut combined = drained(stdout_task).await;
+    combined.extend_from_slice(&drained(stderr_task).await);
+
+    match waited {
+        Ok(status) => {
+            let exit_code = status.code();
             let passed = exit_code == Some(0);
-            let mut combined = output.stdout;
-            combined.extend_from_slice(&output.stderr);
             VerifyCommandResult {
                 command: command.to_string(),
                 exit_code,
@@ -535,23 +586,37 @@ async fn run_one_verify_command(
                 spawn_error: None,
             }
         }
-        Ok(Err(err)) => VerifyCommandResult {
+        Err(err) => VerifyCommandResult {
             command: command.to_string(),
             exit_code: None,
             passed: false,
             output_tail: String::new(),
             spawn_error: Some(format!("failed to wait on verify command: {err}")),
         },
-        Err(_elapsed) => VerifyCommandResult {
-            command: command.to_string(),
-            exit_code: None,
-            passed: false,
-            output_tail: String::new(),
-            spawn_error: Some(format!(
-                "verify command exceeded its {}ms timeout and was abandoned",
-                timeout.as_millis()
-            )),
-        },
+    }
+}
+
+/// Read one of a child's piped streams to EOF on its own task, so neither stream can fill its
+/// kernel pipe buffer and deadlock the `child.wait()` the timeout races against.
+fn spawn_pipe_drain<R>(mut pipe: R) -> tokio::task::JoinHandle<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf).await;
+        buf
+    })
+}
+
+/// Collect a [`spawn_pipe_drain`] task's bytes, treating an absent pipe or a join failure as
+/// "no output" — output capture is diagnostic detail here, never a reason to fail a command whose
+/// real exit code was already observed.
+async fn drained(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
@@ -1072,6 +1137,138 @@ mod tests {
         .await;
         assert!(!result.passed);
         assert!(result.spawn_error.as_deref().unwrap_or_default().contains("timeout"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-027 regression: a timed-out verify[] command must be KILLED, never abandoned.
+    //
+    // Before the fix, `run_one_verify_command` raced `tokio::time::timeout` against
+    // `child.wait_with_output()`, whose `self`-consuming future swallowed the only `Child`
+    // handle; the elapsed arm dropped it with no `kill_on_drop`, so a hung `cargo test` survived
+    // its own timeout for the machine's uptime — in a process group `process_group(0)` had
+    // deliberately detached from the terminal, so Ctrl-C could not reach it either. Every
+    // assertion below probes the OS directly with `kill(pid, 0)`, never this crate's bookkeeping.
+    // ---------------------------------------------------------------------------------------
+
+    /// Poll `kill(pid, 0)` until it reports ESRCH (the pid no longer exists), up to `timeout`.
+    /// Polling rather than probing once because a killed GRANDchild is reparented to init and
+    /// stays a zombie for the few microseconds before init reaps it.
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32, timeout: Duration) -> bool {
+        let target = nix::unistd::Pid::from_raw(pid);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if nix::sys::signal::kill(target, None).is_err() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll for `path` to contain a parseable pid, up to `timeout`.
+    #[cfg(unix)]
+    async fn wait_for_published_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fixture never published its pid to {} within {timeout:?}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The headline SUBA-027 assertion: after the timeout elapses, the command's own OS process
+    /// is gone. `exec` is load-bearing in the fixture — a shell that merely *forks* `sleep` would
+    /// let the pid we publish differ from the pid the shell holds, so the test would prove
+    /// nothing about which process actually got signalled.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_is_killed_not_abandoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let result = run_one_verify_command(
+            "echo $$ > pid; exec sleep 300",
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!result.passed);
+        let pid = wait_for_published_pid(&pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "verify command pid {pid} must be gone once run_one_verify_command returns — a \
+             timed-out command has to be killed, not abandoned"
+        );
+    }
+
+    /// Group targeting is the whole reason `send_signal` negates the pid: the command's own
+    /// descendants must die with it. Here the shell stays alive in `wait` while a background
+    /// `sleep` (a grandchild of this test process, in the same group thanks to
+    /// `process_group(0)`) holds the real work. A pid-only kill would reap the shell and orphan
+    /// the sleep into a detached group nothing holds a handle to.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_kills_its_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_pid_file = dir.path().join("descendant");
+        let result = run_one_verify_command(
+            "sleep 300 & echo $! > descendant; wait",
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(!result.passed);
+        let pid = wait_for_published_pid(&descendant_pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "the descendant pid {pid} the verify command spawned must die with it — the kill \
+             targets the command's process GROUP, not just its direct pid"
+        );
+    }
+
+    /// The hard `SIGKILL` rung really fires: a command that traps and ignores `SIGTERM` cannot be
+    /// stopped by upstream's first `child.kill(\"SIGTERM\")`, only by the 1000 ms-later
+    /// `child.kill(\"SIGKILL\")` (`acceptance.ts:742-758`). Also pins that this function does not
+    /// return until the process is CONFIRMED reaped, so the elapsed time covers the hard-kill
+    /// grace period rather than returning early and leaving the kill in flight.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_that_ignores_sigterm_is_sigkilled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let started = tokio::time::Instant::now();
+        let result = run_one_verify_command(
+            "trap '' TERM; echo $$ > pid; while true; do sleep 1; done",
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(!result.passed);
+        assert!(
+            elapsed >= crate::spawn::signal::TIMEOUT_SIGTERM_GRACE,
+            "a SIGTERM-ignoring command must cost the full hard-kill grace period before the \
+             SIGKILL rung fires, got {elapsed:?}"
+        );
+        let pid = wait_for_published_pid(&pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "a SIGTERM-ignoring verify command pid {pid} must still be gone — SIGKILL cannot be \
+             trapped"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3395,7 +3592,7 @@ pub mod model {
         }
 
         let cwd_str = Some(cwd.display().to_string());
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 return AcceptanceVerifyResult {
@@ -3416,9 +3613,46 @@ pub mod model {
         };
 
         let timeout = Duration::from_millis(command.timeout_ms.unwrap_or(DEFAULT_VERIFY_TIMEOUT_MS));
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code();
+
+        // Same shape as the enum-lattice API's `run_one_verify_command`: never race a
+        // `self`-consuming `wait_with_output()` against the timeout, because the elapsed arm then
+        // drops the only handle and abandons a live process group. Drain the pipes separately,
+        // keep the `Child`, and kill on expiry (`abortVerification`, acceptance.ts:742-758).
+        let stdout_task = child.stdout.take().map(super::spawn_pipe_drain);
+        let stderr_task = child.stderr.take().map(super::spawn_pipe_drain);
+
+        let waited = tokio::select! {
+            biased;
+            result = child.wait() => Some(result),
+            () = tokio::time::sleep(timeout) => None,
+        };
+
+        let Some(waited) = waited else {
+            let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
+            if let Some(task) = stdout_task {
+                task.abort();
+            }
+            if let Some(task) = stderr_task {
+                task.abort();
+            }
+            return AcceptanceVerifyResult {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: cwd_str,
+                exit_code: Option::None,
+                status: VerifyRunStatus::TimedOut,
+                stdout: Option::None,
+                stderr: Option::None,
+                duration_ms: started.elapsed().as_millis(),
+            };
+        };
+
+        let out_bytes = super::drained(stdout_task).await;
+        let err_bytes = super::drained(stderr_task).await;
+
+        match waited {
+            Ok(status_code) => {
+                let exit_code = status_code.code();
                 let passed = exit_code == Some(0);
                 let status = if passed {
                     VerifyRunStatus::Passed
@@ -3433,12 +3667,12 @@ pub mod model {
                     cwd: cwd_str,
                     exit_code,
                     status,
-                    stdout: trim_output(&String::from_utf8_lossy(&output.stdout)),
-                    stderr: trim_output(&String::from_utf8_lossy(&output.stderr)),
+                    stdout: trim_output(&String::from_utf8_lossy(&out_bytes)),
+                    stderr: trim_output(&String::from_utf8_lossy(&err_bytes)),
                     duration_ms: started.elapsed().as_millis(),
                 }
             }
-            Ok(Err(err)) => AcceptanceVerifyResult {
+            Err(err) => AcceptanceVerifyResult {
                 id: command.id.clone(),
                 command: command.command.clone(),
                 cwd: cwd_str,
@@ -3450,16 +3684,6 @@ pub mod model {
                 },
                 stdout: Option::None,
                 stderr: Some(err.to_string()),
-                duration_ms: started.elapsed().as_millis(),
-            },
-            Err(_elapsed) => AcceptanceVerifyResult {
-                id: command.id.clone(),
-                command: command.command.clone(),
-                cwd: cwd_str,
-                exit_code: Option::None,
-                status: VerifyRunStatus::TimedOut,
-                stdout: Option::None,
-                stderr: Option::None,
                 duration_ms: started.elapsed().as_millis(),
             },
         }

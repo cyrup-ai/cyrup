@@ -52,9 +52,15 @@ async fn discover_trust_load_command_reload() {
     let cwd = temp_project("proj");
     let ext_dir = cwd.join(".cyrup").join("extensions").join("demo");
     std::fs::create_dir_all(&ext_dir).unwrap();
+    // EXT-028: interpolate `HOST_WORLD` rather than a literal — a fixture pinned to a stale world
+    // string stops reaching the real load path the moment the world is bumped (`check_world` would
+    // refuse it first, and this test would silently stop proving anything about instantiation).
     std::fs::write(
         ext_dir.join("extension.json"),
-        r#"{ "id": "demo", "version": "1.0.0", "world": "cyrup:ext@0.2" }"#,
+        format!(
+            r#"{{ "id": "demo", "version": "1.0.0", "world": "{}" }}"#,
+            cyrup_ext::HOST_WORLD
+        ),
     )
     .unwrap();
     std::fs::write(ext_dir.join("demo.wasm"), &bytes).unwrap();

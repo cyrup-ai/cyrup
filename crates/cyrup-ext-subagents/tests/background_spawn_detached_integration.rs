@@ -879,3 +879,80 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         "a paused run is not a success: {result_file:?}"
     );
 }
+
+// =================================================================================================
+// PERM-001: the hop-1 detached spawn carries the R-SA-P1 parent-session anchor
+// =================================================================================================
+
+/// End-to-end proof of the PERM-001 repair, probed at the OS level rather than through this
+/// crate's own bookkeeping: with a published parent-session anchor (what
+/// `cyrup-permission-system`'s PARENT-role `SessionStart` installs — pi's
+/// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`,
+/// `pi-subagents/src/extension/index.ts:555`), the REAL detached `__subagent-runner` process
+/// spawned by the production entry point [`spawn_detached_runner`] has
+/// `CYRUP_SUBAGENT_PARENT_SESSION` in its own environment — read straight out of
+/// `/proc/<pid>/environ`, i.e. the kernel's copy, not ours.
+///
+/// This is the whole background half of permission ask-forwarding. Against the pre-fix code the
+/// assertion below cannot pass: `spawn_detached_runner` applied no env overlay at all, so the
+/// runner had no anchor, so `exec::build_attempt_spawn_plan`'s "explicit → inherited env → empty"
+/// ladder resolved EMPTY for every child the runner went on to spawn, so a background subagent
+/// that hit an `ask` addressed a null forwarding target and was fail-closed denied with no prompt
+/// ever reaching the operator.
+///
+/// Linux-only because `/proc/<pid>/environ` is the probe; the platform-independent halves of the
+/// same contract are pinned by `background::spawn_detached`'s own unit tests.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_runner_process_inherits_the_published_parent_session_anchor() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // Sleep long enough that `/proc/<pid>/environ` is still readable when this test probes it.
+    let script = serde_json::json!({
+        "steps": [{"kind": "sleep_ms", "ms": 3000}],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let cfg_path = dir.path().join("runner-config.json");
+    std::fs::write(&cfg_path, "{}").expect("write placeholder config");
+    let stdout_log = dir.path().join("runner.stdout.log");
+    let stderr_log = dir.path().join("runner.stderr.log");
+
+    // The register is process-global; it is mutated only here, under the same lock that guards
+    // this file's env mutations, and cleared before the lock is released.
+    cyrup_ext_subagents::publish_parent_session_anchor("session-perm001-e2e");
+    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
+    cyrup_ext_subagents::clear_parent_session_anchor();
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+
+    let pid = spawn_result.expect("detached spawn succeeds");
+
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
+    let entries: Vec<String> = environ
+        .split(|b| *b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+
+    kill_pid_for_cleanup(pid);
+
+    assert!(
+        entries.iter().any(|e| e == "CYRUP_SUBAGENT_PARENT_SESSION=session-perm001-e2e"),
+        "the detached runner's own environment must carry the published R-SA-P1 anchor so every \
+         child it spawns can address the root's ask-forwarding inbox; got: {entries:?}"
+    );
+}

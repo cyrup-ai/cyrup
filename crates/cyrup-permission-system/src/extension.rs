@@ -30,10 +30,22 @@
 //! nonce-bound request into the PARENT's spool (addressed by the `CYRUP_SUBAGENT_PARENT_SESSION`
 //! anchor `cyrup-ext-subagents` emits, `exec/mod.rs` `PARENT_SESSION_ENV_VAR`) and BLOCKS on the bound
 //! response under the P-3 `begin_human_wait` guard. The PARENT ([`Self::new_forwarding_parent`])
-//! installs a spawned [`forwarding::spawn_forwarding_watcher`] task on `SessionStart` that surfaces
+//! installs a spawned [`forwarding::spawn_forwarding_watcher`] task — on `SessionStart` AND, from
+//! PERM-005, re-entrantly on `BeforeAgentStart` / `Input` / `ToolCall`, matching pi's four
+//! `startForwardedPermissionPolling` call sites (`index.ts:2084,2137,2194,2210`) — that surfaces
 //! each forwarded prompt to its human (the SAME `select`/`input` dialog + C3 human-interaction lock a
 //! local ask uses) and writes the decision back; the child's `apply_decision` then persists an
 //! "Allow Always" into the child's session store exactly like a local ask (pi `index.ts:905`).
+//!
+//! Two PERM-001 repairs sit on that path. (1) The parent role now PUBLISHES its own session id as
+//! the process-wide anchor at `SessionStart` and clears it at `SessionShutdown`
+//! (`PermissionSystemExtension::publish_parent_session_anchor`) — cyrup's placement of pi's
+//! `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId` / `delete`
+//! (`pi-subagents/src/extension/index.ts:555,584`), which `cyrup-ext-subagents` cannot do itself
+//! (`#![forbid(unsafe_code)]`). Without it the DETACHED background hop carried no anchor and every
+//! background child's ask fail-closed denied against a null target. (2) The child-role predicate is
+//! pi's `hasSubagentEnvHint` (`index.ts:93-103`) — ANY of [`SUBAGENT_ENV_HINT_KEYS`] non-empty —
+//! not a strict `== "1"` on one key.
 //!
 //! FOUR SUPPLEMENTARY LAYERS (all wired + enforcing, pi `index.ts:2208-2499`): [`Self::decide`] runs
 //! the agent + projectAgent policy layers (keyed by [`resolve_agent_name_from_env`], the
@@ -99,6 +111,30 @@ const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 /// bought nothing and could silently drift out of agreement with the writer — which is exactly the
 /// failure mode PERM-001 was: the gate read a name nothing on the spawn path ever wrote.
 pub const CHILD_ENV_VAR: &str = cyrup_ext_subagents::spawn::nested_events::CHILD_ENV;
+
+/// pi `SUBAGENT_ENV_HINT_KEYS` (`permission-forwarding.ts:9`) — the env keys whose presence means
+/// "this process is running as a subagent child", ORed on any NON-EMPTY value by
+/// [`is_subagent_child`] (pi `hasSubagentEnvHint`, `index.ts:93-103`).
+///
+/// The cyrup analogs, in upstream order, all three written into every child's spawn overlay by the
+/// single chokepoint `cyrup_ext_subagents::exec::build_attempt_spawn_plan` (and aliased from that
+/// crate rather than re-typed, for the same anti-drift reason as [`CHILD_ENV_VAR`]):
+///
+/// | pi | cyrup | what writes it |
+/// |---|---|---|
+/// | `PI_IS_SUBAGENT` | `CYRUP_SUBAGENT_CHILD` | `nested_events::child_role_env`, on EVERY spawn |
+/// | `PI_SUBAGENT_SESSION_ID` | `CYRUP_SUBAGENT_RUN_ID` | the run-identity overlay, when the spawn belongs to a run |
+/// | `PI_AGENT_ROUTER_SUBAGENT` | `CYRUP_SUBAGENT_AGENT_NAME` | the resolved persona name, when non-blank |
+///
+/// A ROOT orchestrator has none of them; the detached hop-2 `__subagent-runner` process has none
+/// of them either (its hop-1 spawn overlays only the R-SA-P1 anchor), so it correctly keeps the
+/// PARENT role and can host the forwarding watcher.
+pub const SUBAGENT_ENV_HINT_KEYS: [&str; 3] = [
+    CHILD_ENV_VAR,
+    cyrup_ext_subagents::spawn::nested_events::RUN_ID_ENV,
+    cyrup_ext_subagents::AGENT_NAME_ENV_VAR,
+];
+
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
 
@@ -175,7 +211,12 @@ pub struct PermissionSystemExtension {
     /// P-4) — the public fields carry them without any callerless primitive. `Mutex`-wrapped because
     /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
     /// `resources_discover` reload (pi `refreshExtensionConfig`, `index.ts:1600-1608`).
-    config: Mutex<ExtensionConfig>,
+    ///
+    /// PERM-005: `Arc`-wrapped so the spawned forwarding watcher holds the SAME mutex and re-reads
+    /// it once per poll iteration, the way pi's polling closure reads the module-scope
+    /// `extensionConfig` binding `refreshExtensionConfig` reassigns. Handing the watcher a snapshot
+    /// by value froze `yoloMode` / `forwardedPromptTimeoutSeconds` at spawn time.
+    config: crate::forwarding::SharedExtensionConfig,
     /// The fail-closed FALLBACK ask channel ([`NoOpAskChannel`] in production; a scripted channel in
     /// unit tests via [`Self::from_parts`]). Used when no live UI is reachable — the live in-session
     /// dialog goes through [`LocalAskChannel`] over [`Self::host_services`] instead.
@@ -242,8 +283,9 @@ impl PermissionSystemExtension {
     }
 
     /// The wired PARENT (root, `CYRUP_SUBAGENT_DEPTH == 0`) constructor: like [`Self::new`] but marks
-    /// `install_watcher` so `on_event(SessionStart)` spawns the [`forwarding::spawn_forwarding_watcher`]
-    /// task that services subagent children's forwarded asks.
+    /// `install_watcher` so `on_event` spawns the [`forwarding::spawn_forwarding_watcher`] task that
+    /// services subagent children's forwarded asks — from `SessionStart`, `BeforeAgentStart`, `Input`
+    /// and `ToolCall` alike (PERM-005; idempotently, so the per-turn hooks do not stack watchers).
     #[must_use]
     pub fn new_forwarding_parent(agent_dir: PathBuf, cwd: PathBuf) -> Self {
         let (paths, permanent_path, config) = Self::derive_parts(&agent_dir, cwd);
@@ -398,7 +440,7 @@ impl PermissionSystemExtension {
             session_approvals: Mutex::new(SessionApprovalStore::new()),
             permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
-            config: Mutex::new(config),
+            config: Arc::new(Mutex::new(config)),
             ask_channel,
             host_services,
             agent_dir,
@@ -840,12 +882,31 @@ impl PermissionSystemExtension {
         false
     }
 
-    /// pi `startForwardedPermissionPolling` (`index.ts:1904-2031`): in the PARENT role (`install_watcher`),
-    /// on a session WITH a UI and a captured live backend, spawn the forwarding watcher ONCE. No-op for a
-    /// child, a headless session (pi's `!ctx.hasUI` early return, `:1361`/`:1912`), a missing backend, or
-    /// when a watcher is already running (a session rebuild must not double-spawn).
+    /// pi `startForwardedPermissionPolling` (`index.ts:1983-2031`): in the PARENT role
+    /// (`install_watcher`), on a session WITH a UI and a captured live backend, ensure the forwarding
+    /// watcher is running.
+    ///
+    /// **IDEMPOTENT** — this is the crux of PERM-005. Upstream re-enters this function on FOUR hooks
+    /// (`refreshSessionRuntimeState`/`session_start` `:2084`, `before_agent_start` `:2137`, `input`
+    /// `:2194`, `tool_call` `:2210`), and cyrup now calls it from the same four places, so it fires on
+    /// every turn. The `is_finished()` check below makes N calls yield exactly ONE live watcher — pi's
+    /// analog is `if (permissionForwardingWatcher && watchedPermissionForwardingRequestsDir ===
+    /// location.requestsDir) { …; return; }` (`index.ts:1996-2000`), which likewise keeps the existing
+    /// watcher rather than re-arming one per hook.
+    ///
+    /// **STOPS on the disqualifying branch** (PERM-005): pi's early return is
+    /// `if (!ctx.hasUI || isSubagentExecutionContext(ctx)) { stopForwardedPermissionPolling(); return; }`
+    /// (`index.ts:1984-1987`) — it TEARS DOWN a live watcher rather than leaving one orphaned. Cyrup's
+    /// guard used to return without stopping, so a UI that detached mid-session left the watcher
+    /// prompting into a dead backend.
+    ///
+    /// A missing `host_services` backend is NOT a disqualifier — it is the "cannot attach yet" case
+    /// (pi's `if (!location) return;`, `:1991-1993`), which upstream leaves running for the next hook.
     fn maybe_start_forwarding_watcher(&self, ctx: &HostCtx) {
         if !self.install_watcher || !ctx.has_ui {
+            // pi `:1985`: a non-parent / headless context tears the watcher DOWN, it does not merely
+            // decline to start one.
+            self.stop_forwarding_watcher();
             return;
         }
         let Some(services) = self.host_services.get() else {
@@ -859,14 +920,75 @@ impl PermissionSystemExtension {
         *slot = Some(forwarding::spawn_forwarding_watcher(
             self.agent_dir.clone(),
             services.clone(),
-            guard(&self.config).clone(),
+            Arc::clone(&self.config),
         ));
     }
 
-    /// pi watcher teardown (`index.ts:2131`): abort the forwarding watcher task on session shutdown.
+    /// pi `stopForwardedPermissionPolling` (`index.ts:1970-1981`, called from `session_shutdown`
+    /// `:2131` and from the disqualified branch of `startForwardedPermissionPolling` `:1985`): abort
+    /// the forwarding watcher task. Idempotent — a no-op when no watcher is installed.
     fn stop_forwarding_watcher(&self) {
         if let Some(handle) = guard(&self.watcher).take() {
             handle.abort();
+        }
+    }
+
+    /// Test seam: is a live (unfinished) forwarding-watcher task currently installed? Used by the
+    /// PERM-005 idempotence regression tests to assert that N `maybe_start_forwarding_watcher` calls
+    /// yield exactly one watcher.
+    #[cfg(test)]
+    fn has_live_forwarding_watcher(&self) -> bool {
+        guard(&self.watcher).as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Test seam (PERM-005): how many watcher TASKS currently exist, counted independently of the
+    /// `watcher` slot.
+    ///
+    /// Every spawned watcher moves its own clone of the shared `config` handle into the task future,
+    /// synchronously at `tokio::spawn` time, so `Arc::strong_count - 1` (the extension's own handle)
+    /// is the number of watcher futures still alive. This is the assertion that would catch a
+    /// non-idempotent start: the slot only ever holds ONE `JoinHandle`, so overwriting it would hide
+    /// a leaked task, whereas the leaked task's `Arc` clone cannot hide.
+    #[cfg(test)]
+    fn live_watcher_task_count(&self) -> usize {
+        Arc::strong_count(&self.config).saturating_sub(1)
+    }
+
+    /// PERM-001 — publish this PARENT session's own id as the process-wide parent-session anchor
+    /// (`cyrup_ext_subagents::publish_parent_session_anchor`), the address a subagent child's
+    /// forwarded ask writes to.
+    ///
+    /// This is the cyrup placement of pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
+    /// (`pi-subagents/src/extension/index.ts:555`). Upstream, the SUBAGENTS extension does it, into
+    /// the real process environment, so every descendant — foreground, background, detached, at any
+    /// hop — inherits the anchor for free. `cyrup-ext-subagents` cannot: it is
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition 2024, so it keeps
+    /// the captured anchor in a private executor field and threads it explicitly — which reaches
+    /// only the FOREGROUND spawn path. A background run crosses two OS process boundaries, and
+    /// neither carried the anchor, so a background child's `ask` addressed a null target and
+    /// `forwarding::wait_for_forwarded_approval` fail-closed DENIED it with no prompt ever reaching
+    /// the operator.
+    ///
+    /// This crate is the anchor's sole consumer and, unlike `cyrup-ext-subagents`, sits in the root
+    /// process with the live session id in hand at exactly pi's moment (`SessionStart`), so it is
+    /// the natural publisher of the memory-safe register that stands in for pi's `process.env`
+    /// slot. `cyrup_ext_subagents::background::spawn_detached` reads it back when it builds the
+    /// hop-1 env overlay, restoring the inheritance chain pi gets for free.
+    ///
+    /// PARENT role only (`install_watcher`). A CHILD must never publish its own id: a depth-2
+    /// grandchild would then address its immediate parent's spool instead of continuing to thread
+    /// the root's anchor, which is the direct-parent depth-1 semantics
+    /// `cyrup_ext_subagents::PARENT_SESSION_ENV_VAR` documents. Publishing is also unconditional in
+    /// `has_ui` (pi's `index.ts:555` is), so a UI-less parent that later gains one still has a
+    /// correctly-addressed anchor in place; the watcher, not the anchor, is what `has_ui` gates.
+    fn publish_parent_session_anchor(&self) {
+        if !self.install_watcher {
+            return;
+        }
+        if let Some(services) = self.host_services.get()
+            && let Some(id) = services.session_id()
+        {
+            cyrup_ext_subagents::publish_parent_session_anchor(&id);
         }
     }
 }
@@ -968,6 +1090,11 @@ impl NativeExtension for PermissionSystemExtension {
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::ToolCall { call_id, name, input } => {
+                // PERM-005 / pi `tool_call` (`index.ts:2210`): every tool call re-enters
+                // `startForwardedPermissionPolling`, so a watcher that could not attach at session
+                // start (unresolved session id, UI attached late) is armed here instead of never.
+                // Idempotent — see `maybe_start_forwarding_watcher`.
+                self.maybe_start_forwarding_watcher(ctx);
                 self.decide(call_id.as_str(), name, input, ctx).await
             }
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
@@ -976,9 +1103,17 @@ impl NativeExtension for PermissionSystemExtension {
                 // bullets, and hide ask/deny skills while caching the enforcement entries the skill-read
                 // gate reads at every `tool_call`), and sync the yolo status pill — returning the
                 // sanitized prompt as a `[mutate]`.
+                //
+                // PERM-005 / pi `before_agent_start` (`index.ts:2137`): re-enter
+                // `startForwardedPermissionPolling` first, so each turn re-arms the forwarding
+                // watcher (and tears it down if the UI has gone away). Idempotent.
+                self.maybe_start_forwarding_watcher(ctx);
                 self.on_before_agent_start(system_prompt, ctx)
             }
             HostEvent::Input { text, .. } => {
+                // PERM-005 / pi `input` (`index.ts:2194`): re-enter `startForwardedPermissionPolling`
+                // on every user turn. Idempotent.
+                self.maybe_start_forwarding_watcher(ctx);
                 // pi `index.ts:2192-2206`: a `/skill:<name>` slash command is a direct user action —
                 // remember it so its skill-file reads bypass the skill-read ask/deny (pi `:2243`).
                 if let Some(name) = skill::extract_skill_name_from_input(text) {
@@ -1003,9 +1138,17 @@ impl NativeExtension for PermissionSystemExtension {
                 // the one the extension was constructed with. Also invalidates the agent-start cache
                 // (clears `active_skill_entries`), superseding the plain clear this arm did before.
                 self.refresh_config_and_manager(&ctx.cwd);
-                // pi `startForwardedPermissionPolling` (`index.ts:1904-2031`): in the PARENT role, on a
-                // session WITH a UI, spawn the forwarding watcher (a detached tokio task, OUTSIDE the 5s
-                // dispatch budget) that services subagent children's forwarded asks.
+                // PERM-001 / pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
+                // (`pi-subagents/src/extension/index.ts:555`): publish this parent session's id as
+                // the process-wide anchor a subagent child's forwarded ask addresses, BEFORE the
+                // watcher that services those asks starts. Without it the detached background hop
+                // spawns children with no anchor and every one of their asks fail-closed denies.
+                self.publish_parent_session_anchor();
+                // pi `startForwardedPermissionPolling` via `refreshSessionRuntimeState`
+                // (`index.ts:2084`): in the PARENT role, on a session WITH a UI, spawn the forwarding
+                // watcher (a detached tokio task, OUTSIDE the 5s dispatch budget) that services
+                // subagent children's forwarded asks. This is the FIRST of four re-entry points
+                // (PERM-005) — see the `BeforeAgentStart` / `Input` / `ToolCall` arms.
                 self.maybe_start_forwarding_watcher(ctx);
                 // pi `syncPermissionSystemStatus` (`index.ts:2091` via `refreshSessionRuntimeState`):
                 // reflect the yolo pill on the live status bar at session start.
@@ -1039,6 +1182,15 @@ impl NativeExtension for PermissionSystemExtension {
                 // pi `resetShownWarnings()` (`index.ts:2125`).
                 self.warnings.reset();
                 self.stop_forwarding_watcher();
+                // PERM-001 / pi `delete process.env[SUBAGENT_PARENT_SESSION_ENV]`
+                // (`pi-subagents/src/extension/index.ts:584`): drop the published anchor so a stale
+                // id from the session that just ended never addresses a subsequently-started
+                // session's spool on this same long-lived process. PARENT role only, symmetric with
+                // `publish_parent_session_anchor` — a CHILD never published and must not clear the
+                // anchor its own descendants still need.
+                if self.install_watcher {
+                    cyrup_ext_subagents::clear_parent_session_anchor();
+                }
                 HookOutcome::Noop
             }
             _ => HookOutcome::Noop,
@@ -1048,8 +1200,48 @@ impl NativeExtension for PermissionSystemExtension {
 
 // ================================================================================= binary wiring
 
+/// pi `hasSubagentEnvHint` (`index.ts:93-103`, over
+/// `permission-forwarding.ts:9`'s `SUBAGENT_ENV_HINT_KEYS`): this process is running AS a subagent
+/// child if ANY of the hint keys is set to a non-empty (post-trim) value.
+///
+/// Three deliberate points of fidelity to upstream:
+///
+/// - **Any of three keys, not one.** pi ORs `PI_IS_SUBAGENT` / `PI_SUBAGENT_SESSION_ID` /
+///   `PI_AGENT_ROUTER_SUBAGENT`; [`SUBAGENT_ENV_HINT_KEYS`] is the cyrup analog set, all three
+///   written by the same spawn chokepoint (`exec::build_attempt_spawn_plan`).
+/// - **Non-empty, not `== "1"`.** pi tests `entry.length > 0`. The old strict `== Some("1")`
+///   silently classified a child spawned by any path that wrote a different truthy value (or by an
+///   external router setting only the persona/run keys) as a ROOT — which selected the LOCAL ask
+///   dialog in a process with no human attached, so its `ask` died instead of forwarding.
+/// - **Trimmed.** pi's `process.env[key]?.trim() ?? ""`.
+///
+/// Not ported: pi's `subagent-sessions` session-directory containment fallback
+/// (`index.ts:696-709`). That branch keys on pi's in-process subagent sessions living under a
+/// dedicated directory of the agent dir; cyrup's subagent is always a separate OS process carrying
+/// these env keys (`lib.rs`'s non-negotiable process-per-subagent mechanism), so there is no
+/// same-process session-dir signal to test. Note also that pi's `isSubagentExecutionContext` is a
+/// per-`ctx` RUNTIME predicate while this is consulted both at wiring time
+/// ([`permission_extension_for_env`]) and per call — the env keys are process-lifetime constants in
+/// cyrup, so the two coincide.
 fn is_subagent_child() -> bool {
-    std::env::var(CHILD_ENV_VAR).ok().as_deref() == Some("1")
+    has_subagent_env_hint(|key| std::env::var(key).ok())
+}
+
+/// The injectable core of [`is_subagent_child`] — pi `hasSubagentEnvHint`'s body
+/// (`index.ts:100`, `values.some((entry) => entry.length > 0)` over the trimmed values).
+///
+/// Parameterized over the env reader so the predicate is directly testable without
+/// `unsafe { std::env::set_var }` and the cross-test races a process-global mutation brings, the
+/// same injectable-core convention `cyrup-ext-subagents`' `spawn::depth`/`spawn::mod` use.
+///
+/// Not ported: pi caches the answer keyed on a `\0`-joined signature of the values
+/// (`index.ts:94-102`). That cache exists because pi re-evaluates this on every `ctx` predicate
+/// call inside a hot per-tool-call path; cyrup consults it at wiring time plus once per ask, over
+/// three `getenv`s, so a cache would be pure complexity — and a stale one is a correctness hazard.
+fn has_subagent_env_hint(get: impl Fn(&str) -> Option<String>) -> bool {
+    SUBAGENT_ENV_HINT_KEYS
+        .iter()
+        .any(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1542,5 +1734,301 @@ mod tests {
             "a new session must re-report a still-broken file; got {:?}",
             host.warnings()
         );
+    }
+    // ------------------------------------------------------------ PERM-001: subagent env hints
+
+    /// PERM-001 (second gap). pi ORs the three [`SUBAGENT_ENV_HINT_KEYS`] on ANY non-empty value
+    /// (`index.ts:93-103`, `permission-forwarding.ts:9`). The pre-fix predicate was a strict
+    /// `std::env::var(CHILD_ENV_VAR) == Some("1")` on ONE key, so every case below except the very
+    /// first classified a real subagent child as a ROOT — which wires the LOCAL ask dialog into a
+    /// process with no human attached, and its `ask` dies there instead of forwarding to the
+    /// parent's spool.
+    #[test]
+    fn subagent_env_hint_ors_any_non_empty_value_across_all_three_keys() {
+        let hint = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> =
+                pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            has_subagent_env_hint(|key| {
+                owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            })
+        };
+
+        // The one case the old strict `== Some("1")` predicate already got right.
+        assert!(hint(&[(CHILD_ENV_VAR, "1")]));
+
+        // pi tests `entry.length > 0`, not equality with "1" — any non-empty value is a hint.
+        assert!(hint(&[(CHILD_ENV_VAR, "0")]));
+        assert!(hint(&[(CHILD_ENV_VAR, "true")]));
+        assert!(hint(&[(CHILD_ENV_VAR, "yes")]));
+
+        // ...and either of the two sibling keys alone is enough (pi's OR over three keys).
+        assert!(hint(&[(SUBAGENT_ENV_HINT_KEYS[1], "run-abc123")]));
+        assert!(hint(&[(SUBAGENT_ENV_HINT_KEYS[2], "reviewer")]));
+
+        // Negatives: nothing set, and set-but-blank (pi trims before the length test).
+        assert!(!hint(&[]));
+        assert!(!hint(&[(CHILD_ENV_VAR, "")]));
+        assert!(!hint(&[(CHILD_ENV_VAR, "   ")]));
+        assert!(!hint(&[
+            (CHILD_ENV_VAR, ""),
+            (SUBAGENT_ENV_HINT_KEYS[1], "  "),
+            (SUBAGENT_ENV_HINT_KEYS[2], "\t"),
+        ]));
+
+        // An unrelated var is never a hint.
+        assert!(!hint(&[("CYRUP_SOMETHING_ELSE", "1")]));
+    }
+
+    /// The hint keys are exactly the strings `cyrup-ext-subagents` writes into a child's spawn
+    /// overlay. Pinned so a rename on either side fails here rather than silently producing a gate
+    /// that never recognizes a child (aliasing already prevents drift for two of the three; this
+    /// pins the resulting VALUES, which are also the cross-crate contract).
+    #[test]
+    fn subagent_env_hint_keys_match_the_spawn_overlay_contract() {
+        assert_eq!(
+            SUBAGENT_ENV_HINT_KEYS,
+            ["CYRUP_SUBAGENT_CHILD", "CYRUP_SUBAGENT_RUN_ID", "CYRUP_SUBAGENT_AGENT_NAME"]
+        );
+        assert_eq!(CHILD_ENV_VAR, SUBAGENT_ENV_HINT_KEYS[0]);
+    }
+
+    /// PERM-001 (first gap), the publisher half: a PARENT-role extension publishes its live session
+    /// id into `cyrup-ext-subagents`' process-wide anchor register on `SessionStart` (pi
+    /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `pi-subagents/src/extension/
+    /// index.ts:555`) and clears it on `SessionShutdown` (`:584`), so the hop-1 detached spawn has
+    /// an anchor to overlay onto the background runner. Before this, nothing in the workspace ever
+    /// published the root's id anywhere a spawn could read it, and the detached path resolved an
+    /// empty target on every hop.
+    ///
+    /// One test, not several: the register is process-global, so parallel tests mutating it would
+    /// race.
+    /// A [`HostServices`] whose only override is a fixed `session_id` — the single input
+    /// `publish_parent_session_anchor` reads.
+    struct AnchorHost(&'static str);
+    impl HostServices for AnchorHost {
+        fn session_id(&self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_role_publishes_and_clears_the_process_parent_session_anchor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        let ext = PermissionSystemExtension::new_forwarding_parent(
+            agent_dir.clone(),
+            dir.path().to_path_buf(),
+        );
+        ext.set_host_services(Arc::new(AnchorHost("session-root-perm001")));
+        let ctx = event_ctx(dir.path().to_path_buf());
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
+                .as_deref(),
+            Some("session-root-perm001"),
+            "a PARENT-role SessionStart must publish the live session id as the spawn anchor"
+        );
+
+        let _ = ext
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
+            None,
+            "SessionShutdown must clear the anchor (pi's `delete process.env[...]`)"
+        );
+    }
+
+    // ============================================================================================
+    // PERM-005 — the forwarding watcher must be (re)armed on EVERY hook pi arms it on, idempotently,
+    // and torn down when the context stops qualifying.
+    //
+    // Upstream calls `startForwardedPermissionPolling(ctx)` from four places —
+    // `refreshSessionRuntimeState` (`index.ts:2084`, reached from `session_start`),
+    // `before_agent_start` (`:2137`), `input` (`:2194`) and `tool_call` (`:2210`) — and calls
+    // `stopForwardedPermissionPolling()` from `session_shutdown` (`:2131`) AND from the
+    // disqualified branch of the start function itself (`:1985`).
+    //
+    // Cyrup had exactly ONE caller (`SessionStart`) and a guard that returned without stopping.
+    // ============================================================================================
+
+    /// A [`HostServices`] with a fixed session id, standing in for a live parent backend.
+    struct WatcherHost(String);
+    impl HostServices for WatcherHost {
+        fn session_id(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn ui_ctx(cwd: &Path) -> HostCtx {
+        HostCtx::event(cyrup_ext::ExtMode::Tui, true, cwd.to_path_buf())
+    }
+
+    fn headless_ctx(cwd: &Path) -> HostCtx {
+        HostCtx::event(cyrup_ext::ExtMode::Tui, false, cwd.to_path_buf())
+    }
+
+    fn parent_ext(dir: &Path, session: &str) -> PermissionSystemExtension {
+        let agent_dir = dir.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let ext = PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.to_path_buf());
+        ext.set_host_services(Arc::new(WatcherHost(session.to_string())));
+        ext
+    }
+
+    /// PERM-005, the crux: the three per-turn hooks fire on EVERY turn, so a non-idempotent start
+    /// would spawn one watcher per turn. N calls must yield exactly ONE live watcher task.
+    #[tokio::test]
+    async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = parent_ext(dir.path(), "perm005-idem");
+        let ctx = ui_ctx(dir.path());
+
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        assert!(ext.has_live_forwarding_watcher(), "SessionStart must arm the watcher");
+
+        // Ten more turns' worth of hooks — the exact re-entry pi performs.
+        for _ in 0..10 {
+            let _ = ext
+                .on_event(
+                    &HostEvent::BeforeAgentStart {
+                        prompt: String::new(),
+                        images: json!(null),
+                        system_prompt: String::new(),
+                        options: json!(null),
+                        injected: Vec::new(),
+                    },
+                    &ctx,
+                )
+                .await;
+            let _ = ext
+                .on_event(&HostEvent::Input {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                }, &ctx)
+                .await;
+            let _ = ext
+                .on_event(
+                    &HostEvent::ToolCall {
+                        call_id: cyrup_core::ToolCallId::from("c1"),
+                        name: "read".into(),
+                        input: json!({}),
+                    },
+                    &ctx,
+                )
+                .await;
+        }
+
+        assert!(ext.has_live_forwarding_watcher(), "the watcher must still be live");
+        assert_eq!(
+            ext.live_watcher_task_count(),
+            1,
+            "31 hook re-entries must leave EXACTLY one watcher task — a non-idempotent start would \
+             have leaked one per turn (pi `index.ts:1996-2000` keeps the existing watcher)"
+        );
+
+        ext.stop_forwarding_watcher();
+    }
+
+    /// PERM-005 failure mode (2): a UI that attaches AFTER `SessionStart` must still get a watcher.
+    /// Pre-fix, `SessionStart` was the only caller, so a session that was headless at start never
+    /// armed one for its whole life and every forwarded child ask sat in the spool until it failed
+    /// closed.
+    #[tokio::test]
+    async fn a_later_hook_arms_the_watcher_a_headless_session_start_could_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = parent_ext(dir.path(), "perm005-late-ui");
+
+        let _ = ext
+            .on_event(
+                &HostEvent::SessionStart { reason: "startup".into() },
+                &headless_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            !ext.has_live_forwarding_watcher(),
+            "a headless SessionStart must not arm a watcher (pi `:1726`)"
+        );
+
+        // The UI attaches; the very next turn's `tool_call` re-enters the start function.
+        let _ = ext
+            .on_event(
+                &HostEvent::ToolCall {
+                    call_id: cyrup_core::ToolCallId::from("c1"),
+                    name: "read".into(),
+                    input: json!({}),
+                },
+                &ui_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            ext.has_live_forwarding_watcher(),
+            "pi re-enters `startForwardedPermissionPolling` from `tool_call` (`index.ts:2210`), so \
+             a late-attaching UI must arm the watcher"
+        );
+
+        ext.stop_forwarding_watcher();
+    }
+
+    /// PERM-005 failure mode (3): a UI that DETACHES mid-session must tear the watcher down. pi's
+    /// disqualified branch calls `stopForwardedPermissionPolling()` before returning
+    /// (`index.ts:1984-1987`); cyrup's guard used to `return` and leave the task prompting into a
+    /// backend with no human behind it.
+    #[tokio::test]
+    async fn a_detaching_ui_tears_the_forwarding_watcher_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = parent_ext(dir.path(), "perm005-detach");
+
+        let _ = ext
+            .on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ui_ctx(dir.path()))
+            .await;
+        assert!(ext.has_live_forwarding_watcher(), "SessionStart with a UI arms the watcher");
+
+        let _ = ext
+            .on_event(
+                &HostEvent::Input {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                },
+                &headless_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            !ext.has_live_forwarding_watcher(),
+            "a hook on a no-UI context must STOP the watcher, not merely decline to start one"
+        );
+    }
+
+    /// PERM-005 failure mode (4): the watcher must observe a mid-session `config.json` change.
+    /// It now shares the extension's `config` mutex instead of capturing a snapshot by value, so
+    /// `refresh_config_and_manager` (pi `refreshExtensionConfig`, `index.ts:1600-1608`) reaches the
+    /// running task. Asserted structurally — the running watcher and the extension must be looking
+    /// at the SAME `ExtensionConfig`.
+    #[tokio::test]
+    async fn the_running_watcher_shares_the_extensions_live_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = parent_ext(dir.path(), "perm005-config");
+        let ctx = ui_ctx(dir.path());
+
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        assert_eq!(ext.live_watcher_task_count(), 1, "one watcher, holding the shared handle");
+
+        // The watcher's handle IS the extension's handle: a write here is visible to the task.
+        assert!(!guard(&ext.config).yolo_mode);
+        guard(&ext.config).yolo_mode = true;
+        assert!(
+            guard(&ext.config).yolo_mode,
+            "the config the watcher reads per poll iteration is the one the extension mutates"
+        );
+
+        ext.stop_forwarding_watcher();
     }
 }
