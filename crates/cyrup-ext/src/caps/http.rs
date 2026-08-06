@@ -965,25 +965,58 @@ mod tests {
         assert_eq!(resp.body, body);
     }
 
-    /// Pipe `input` through a real system compressor binary (`gzip -c` / `zstd -c`), no canned
-    /// bytes.
-    fn compress_with(binary: &str, args: &[&str], input: &[u8]) -> Vec<u8> {
-        use std::io::Write;
-        let mut child = std::process::Command::new(binary)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn the system `{binary}` binary: {e}"));
-        child
-            .stdin
-            .take()
-            .expect("child stdin")
-            .write_all(input)
-            .expect("write plaintext to the compressor");
-        let out = child.wait_with_output().expect("compressor runs");
-        assert!(out.status.success(), "`{binary}` must succeed");
-        out.stdout
+    /// Compress `input` with the REAL reference codec for `coding` — no canned bytes.
+    ///
+    /// Reached through the same `async-compression` 0.4.33 façade this file already vendors for
+    /// decoding, which wraps the reference implementations themselves: `flate2` for gzip/deflate,
+    /// Google's `brotli`, and upstream's `zstd` C library. The bytes are therefore as genuine as a
+    /// system compressor's, and the round-trip still proves the decoder against real-world output
+    /// rather than a fixture.
+    ///
+    /// This previously shelled out to system `gzip`/`brotli`/`zstd` binaries and `panic!`ed on a
+    /// missing one, so three of these tests failed permanently on any machine without `brotli` and
+    /// `zstd` installed — an environment dependency masquerading as an assertion, and the reason
+    /// the workspace carried a standing "3 failed" baseline. The codecs were linked into this very
+    /// crate the whole time.
+    async fn compress(coding: Coding, input: &[u8]) -> Vec<u8> {
+        compress_at(coding, async_compression::Level::Default, input).await
+    }
+
+    /// [`compress`] at an explicit level. `Level::Best` is the `-9` the decompression-bomb test
+    /// needs to build a genuinely small wire form.
+    async fn compress_at(
+        coding: Coding,
+        level: async_compression::Level,
+        input: &[u8],
+    ) -> Vec<u8> {
+        use async_compression::tokio::write::{
+            BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        match coding {
+            Coding::Gzip => {
+                let mut enc = GzipEncoder::with_quality(&mut out, level);
+                enc.write_all(input).await.expect("gzip-encode the plaintext");
+                enc.shutdown().await.expect("finish the gzip stream");
+            }
+            Coding::Br => {
+                let mut enc = BrotliEncoder::with_quality(&mut out, level);
+                enc.write_all(input).await.expect("brotli-encode the plaintext");
+                enc.shutdown().await.expect("finish the brotli stream");
+            }
+            Coding::Deflate => {
+                let mut enc = DeflateEncoder::with_quality(&mut out, level);
+                enc.write_all(input).await.expect("deflate-encode the plaintext");
+                enc.shutdown().await.expect("finish the deflate stream");
+            }
+            Coding::Zstd => {
+                let mut enc = ZstdEncoder::with_quality(&mut out, level);
+                enc.write_all(input).await.expect("zstd-encode the plaintext");
+                enc.shutdown().await.expect("finish the zstd stream");
+            }
+        }
+        assert!(!out.is_empty(), "the encoder must produce bytes");
+        out
     }
 
     /// The real consumer's `fetch()` (`streamableHttp.js:89,306,443`, `@modelcontextprotocol/sdk
@@ -1001,7 +1034,7 @@ mod tests {
         let plaintext = b"hello decompression world, repeated for a real ratio: \
             hello decompression world, hello decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
         assert_ne!(gzipped, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
 
         let headers = format!(
@@ -1047,7 +1080,7 @@ mod tests {
         let plaintext = b"case-insensitive decompression world, repeated: \
             case-insensitive decompression world, case-insensitive decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
 
         let headers = format!(
             "Content-Type: text/plain\r\nContent-Encoding: GZIP\r\nContent-Length: {}\r\n",
@@ -1081,7 +1114,7 @@ mod tests {
         let plaintext = b"x-gzip legacy alias decompression world, repeated: \
             x-gzip legacy alias decompression world, x-gzip legacy alias decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
 
         let headers = format!(
             "Content-Type: text/plain\r\nContent-Encoding: x-gzip\r\nContent-Length: {}\r\n",
@@ -1105,7 +1138,7 @@ mod tests {
         let plaintext = b"streaming x-gzip legacy alias world, repeated: \
             streaming x-gzip legacy alias world, streaming x-gzip legacy alias world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
 
         let headers = format!(
             "Content-Type: text/plain\r\nContent-Encoding: x-gzip\r\nContent-Length: {}\r\n",
@@ -1213,8 +1246,8 @@ mod tests {
         let plaintext = b"chained decompression world, repeated for a real ratio: \
             chained decompression world, chained decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
-        let double_compressed = compress_with("brotli", &["-c"], &gzipped);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
+        let double_compressed = compress(Coding::Br, &gzipped).await;
         assert_ne!(
             double_compressed, plaintext,
             "sanity: the double-compressed wire bytes differ from the plaintext"
@@ -1253,8 +1286,8 @@ mod tests {
         let plaintext = b"streaming chained decompression world, repeated for a real ratio: \
             streaming chained decompression world, streaming chained decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
-        let double_compressed = compress_with("brotli", &["-c"], &gzipped);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
+        let double_compressed = compress(Coding::Br, &gzipped).await;
         assert_ne!(
             double_compressed, plaintext,
             "sanity: the double-compressed wire bytes differ from the plaintext"
@@ -1298,7 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn request_with_an_unrecognized_content_encoding_token_discards_the_whole_chain_not_just_that_stage() {
         let plaintext = b"this must NOT be gzip-decoded when an unknown token poisons the chain";
-        let gzipped = compress_with("gzip", &["-c"], plaintext);
+        let gzipped = compress(Coding::Gzip, plaintext).await;
 
         let headers = format!(
             "Content-Type: application/octet-stream\r\nContent-Encoding: bogus, gzip\r\nContent-Length: {}\r\n",
@@ -1325,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn request_with_a_trailing_unrecognized_content_encoding_token_also_discards_the_whole_chain() {
         let plaintext = b"an outermost unknown coding must poison the chain before gzip is even seen";
-        let gzipped = compress_with("gzip", &["-c"], plaintext);
+        let gzipped = compress(Coding::Gzip, plaintext).await;
 
         let headers = format!(
             "Content-Type: application/octet-stream\r\nContent-Encoding: gzip, bogus\r\nContent-Length: {}\r\n",
@@ -1349,7 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn request_stream_with_an_unrecognized_content_encoding_token_discards_the_whole_chain() {
         let plaintext = b"streaming: this must NOT be gzip-decoded when an unknown token is present";
-        let gzipped = compress_with("gzip", &["-c"], plaintext);
+        let gzipped = compress(Coding::Gzip, plaintext).await;
 
         let headers = format!(
             "Content-Type: application/octet-stream\r\nContent-Encoding: bogus, gzip\r\nContent-Length: {}\r\n",
@@ -1533,7 +1566,7 @@ mod tests {
         let plaintext = b"streaming zstd decompression world, repeated for a real ratio: \
             streaming zstd decompression world, streaming zstd decompression world"
             .to_vec();
-        let compressed = compress_with("zstd", &["-c"], &plaintext);
+        let compressed = compress(Coding::Zstd, &plaintext).await;
         assert_ne!(compressed, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
 
         let headers = format!(
@@ -1585,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn request_lenient_decodes_a_truncated_gzip_body_recovering_most_of_the_plaintext() {
         let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
         let truncated = gzipped[..gzipped.len() - 8].to_vec(); // strip the trailing CRC32+ISIZE
 
         let headers = format!(
@@ -1624,7 +1657,7 @@ mod tests {
         let plaintext = b"hello decompression world, repeated for a real ratio: \
             hello decompression world, hello decompression world"
             .to_vec();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
         let truncated = gzipped[..gzipped.len() - 8].to_vec();
 
         let headers = format!(
@@ -1656,7 +1689,7 @@ mod tests {
     async fn request_stream_lenient_decodes_a_truncated_gzip_body_recovering_most_of_the_plaintext()
     {
         let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let gzipped = compress_with("gzip", &["-c"], &plaintext);
+        let gzipped = compress(Coding::Gzip, &plaintext).await;
         let truncated = gzipped[..gzipped.len() - 8].to_vec();
 
         let headers = format!(
@@ -1734,7 +1767,7 @@ mod tests {
     async fn request_rejects_a_decompression_bomb_over_the_cap() {
         // Highly compressible: one repeated byte, decompressed size deliberately over the cap.
         let huge = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
-        let gzipped = compress_with("gzip", &["-9", "-c"], &huge);
+        let gzipped = compress_at(Coding::Gzip, async_compression::Level::Best, &huge).await;
         assert!(
             gzipped.len() < MAX_RESPONSE_BODY_BYTES / 4,
             "sanity: the compressed wire form must be small (a real bomb), got {} bytes",
