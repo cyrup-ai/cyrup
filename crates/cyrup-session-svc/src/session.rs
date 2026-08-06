@@ -282,6 +282,12 @@ pub(crate) struct SessionExtras {
     pub dynamic_tools: Arc<Mutex<DynamicToolState>>,
     /// The shared self-handle the builder also handed to the persist+fan-out subscriber.
     pub handle: Arc<SessionHandle>,
+    /// The live session metadata the `bash` tool publishes to every child as `CYRUP_*`
+    /// (Pi `resolveSpawnContext`, bash.ts:171-181). Shared with the `bash` tool the builder
+    /// registered; [`AgentSession`] mutates it whenever the model or the thinking level changes, so
+    /// the NEXT command sees the new values without a rebuild
+    /// (Pi docs/environment-variables.md:27).
+    pub bash_session_env: cyrup_tools::config::SessionEnvHandle,
 }
 
 /// A settable, weak self-reference so the persist+fan-out subscriber (which the agent owns) and the
@@ -387,6 +393,15 @@ pub struct AgentSession {
     bash_cancel: Mutex<Option<CancelToken>>,
     /// Bash messages deferred while a run streams, flushed after the turn (Pi `_pendingBashMessages`).
     pending_bash: Mutex<Vec<AgentMessage>>,
+    /// The live session metadata the `bash` TOOL publishes to every child as `CYRUP_*` (Pi
+    /// `resolveSpawnContext`, bash.ts:171-181). The same handle the builder gave the registered
+    /// `BashTool`; Pi reads these off a per-call `ExtensionContext`, so they track the session
+    /// automatically. cyrup's `Tool::execute` takes no context, so the values are PUSHED here
+    /// whenever the model or the thinking level changes — which is what makes "the values are
+    /// resolved when each command starts. Switching models or changing the reasoning level
+    /// therefore affects the next bash command" (docs/environment-variables.md:27) true of cyrup
+    /// too, rather than only of the tool in isolation.
+    bash_session_env: cyrup_tools::config::SessionEnvHandle,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
     /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
@@ -488,6 +503,7 @@ impl AgentSession {
             shell_command_prefix: extras.shell_command_prefix,
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
+            bash_session_env: extras.bash_session_env,
             dynamic_tools: extras.dynamic_tools,
             handle: extras.handle,
             last_assistant: Mutex::new(None),
@@ -1740,10 +1756,17 @@ impl AgentSession {
             }
         }
 
-        // Phase 3 (guard re-held): summarize the abandoned branch (unless the extension supplied the
-        // summary) + apply the navigation, threading the (possibly overridden) instructions/label.
-        let mut guard = self.manager.lock().await;
-
+        // Phase 3 (STILL no guard): summarize the abandoned branch (unless the extension supplied
+        // the summary), threading the (possibly overridden) instructions.
+        //
+        // The manager mutex is deliberately NOT held across this leg. Branch summarization is a full
+        // provider round-trip plus its retry backoff — holding `self.manager` across it would stall
+        // every other session-manager consumer (the tree/DAG readers a TUI polls, an extension's
+        // `getEntries`, a concurrent `compact`) for the whole call. `AgentSession::compact` already
+        // scopes its guard for exactly this reason; this path used to take the guard first and hold
+        // it through the `.await`, which was invisible only because no front end could reach the
+        // summarize branch (SESS-023). Pi has no equivalent hazard: its session manager is not
+        // mutex-guarded.
         let mut from_extension_summary = false;
         // (text, details, usage) — `usage` is the summarization call's token spend, persisted on the
         // appended `branch_summary` entry (Pi `BranchSummaryEntry.usage`). An extension-supplied
@@ -1794,7 +1817,8 @@ impl AgentSession {
             }
         }
 
-        // Apply the navigation + summary/label (agent-session.ts:2845-2868).
+        // Phase 4 (guard re-held): apply the navigation + summary/label (agent-session.ts:2845-2868).
+        let mut guard = self.manager.lock().await;
         let summary_entry = match &summary_payload {
             Some((text, details, usage)) => {
                 let id = guard.branch_with_summary(
@@ -1952,6 +1976,22 @@ impl AgentSession {
         }
     }
 
+    /// Republish `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` from the LIVE manager for the next `bash`
+    /// child.
+    ///
+    /// Pi never needs this: `resolveSpawnContext` calls `ctx.sessionManager.getSessionId()` /
+    /// `getSessionFile()` at spawn time (bash.ts:172-174), so a `createBranchedSession` that mutates
+    /// the manager in place is picked up automatically. cyrup's `Tool::execute` has no session
+    /// context, so the branching paths — `fork`, `clone_at`, `fork_at_entry` — push instead.
+    /// Without this a `bash` child run after `/fork` would report the PRE-fork session id and a
+    /// session file that is no longer the one being appended to.
+    fn republish_session_identity(&self, guard: &SessionManager) {
+        let mut info = self.bash_session_env.get();
+        info.session_id = Some(guard.session_id().to_string());
+        info.session_file = guard.session_file().map(Path::to_path_buf);
+        self.bash_session_env.set(info);
+    }
+
     /// Fork the current persisted session into a new file under the same cwd (R-04-020/021).
     pub async fn fork(&self) -> Result<SessionId, SessionServiceError> {
         // A fork clones the active path through the current leaf into a new file.
@@ -1966,6 +2006,7 @@ impl AgentSession {
             )
         })?;
         guard.create_branched_session(&leaf, &layout)?;
+        self.republish_session_identity(&guard);
         let id = guard.session_id().clone();
         Ok(id)
     }
@@ -1992,6 +2033,7 @@ impl AgentSession {
         };
         let layout = branch_layout(&guard);
         guard.create_branched_session(&leaf, &layout)?;
+        self.republish_session_identity(&guard);
         Ok(guard.session_id().clone())
     }
 
@@ -2013,6 +2055,7 @@ impl AgentSession {
             Some(leaf) => {
                 let layout = branch_layout(&guard);
                 guard.create_branched_session(&leaf, &layout)?;
+                self.republish_session_identity(&guard);
                 let id = guard.session_id().clone();
                 Ok(ForkOutcome { session_id: Some(id), selected_text })
             }
@@ -2569,6 +2612,7 @@ impl AgentSession {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
         self.agent.set_model(model_ref.clone()).await;
         *Self::lock(&self.model) = model_ref;
+        self.bash_session_env.set_model(provider.to_string(), model.to_string());
         self.manager.lock().await.append_model_change(provider, model)?;
         Ok(())
     }
@@ -2869,6 +2913,11 @@ impl AgentSession {
         let effective = cyrup_provider::clamp_thinking_level(&model, level);
         let previous = self.agent.snapshot().await.thinking_level;
         self.agent.set_thinking_level(effective).await;
+        // Republish `CYRUP_REASONING_LEVEL` for the NEXT `bash` child (Pi re-reads `ctx.thinkingLevel`
+        // on every `resolveSpawnContext`, bash.ts:180). Pushed BEFORE the no-change early return so
+        // the handle is authoritative even when this call is a clamp-to-the-same-value no-op.
+        self.bash_session_env
+            .set_reasoning_level(crate::builder::thinking_level_to_str(effective));
         if effective == previous {
             return Ok(effective);
         }
@@ -3564,6 +3613,9 @@ impl AgentSession {
         *Self::lock(&self.model) = model_ref.clone();
         *Self::lock(&self.compaction_model) = next.clone();
         self.services.host_services.update_model(model_ref, next.context_window, None);
+        // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
+        // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
+        self.bash_session_env.set_model(next.provider.to_string(), next.id.to_string());
         self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model (explicit override or current session level).
         let level = match explicit_thinking {

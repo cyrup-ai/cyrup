@@ -71,6 +71,7 @@ mod tree_selector;
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
     should_honor_extension_shutdown, App, AppAction, AppCommand, AppState, RebuildBackend,
+    TreeNavMsg,
 };
 pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{

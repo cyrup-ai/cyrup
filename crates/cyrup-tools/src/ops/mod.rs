@@ -209,11 +209,18 @@ pub struct WalkItem {
 }
 
 /// What to run, where, and how (transport) for [`ProcOps::exec`].
+///
+/// `env` is ADDITIVE over the inherited parent environment; `env_remove` names keys to UNSET in the
+/// child and is applied FIRST, so a key present in both is deleted and then set — the order Pi's
+/// `resolveSpawnContext` uses when it deletes the five session keys and repopulates them
+/// (bash.ts:165-181). Pi can express deletion implicitly because it materializes the whole
+/// environment; cyrup inherits it, so the removal has to be named.
 #[derive(Clone, Debug)]
 pub struct ExecSpec {
     pub command: String,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
     pub shell: ShellConfig,
 }
 
@@ -268,7 +275,29 @@ pub enum ExitStatus {
 #[async_trait::async_trait]
 pub trait FsOps: Send + Sync {
     async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError>;
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError>;
+
+    /// Write `bytes` to `path` **through the existing inode**, creating the file if it is absent —
+    /// the single mutation seam both `write` and `edit` use.
+    ///
+    /// This is Pi's one injected write op: `defaultWriteOperations.writeFile` (write.ts:32-35) and
+    /// `defaultEditOperations.writeFile` (edit.ts:83-87) are both
+    /// `(path, content) => fsWriteFile(path, content, "utf-8")`, i.e. `fs/promises`' `writeFile`
+    /// with the default `{ mode: 0o666, flag: "w" }` — `open(2)` with `O_WRONLY|O_CREAT|O_TRUNC`,
+    /// then `write(2)`, then `close(2)`. Implementations MUST preserve that contract's observable
+    /// consequences: an existing file's mode/owner is untouched (the creation mode applies only
+    /// when `O_CREAT` actually creates), symlinks are FOLLOWED (no `O_NOFOLLOW`), hard links keep
+    /// sharing the inode, and a target the caller cannot write fails rather than being replaced.
+    ///
+    /// **Not atomic, by construction.** Truncation happens at `open`, before any new byte is
+    /// written, so a crash / `ENOSPC` / `EIO` mid-write leaves a truncated or partial file with no
+    /// rollback, and there is no `fsync`. Pi accepts that trade for metadata fidelity: preserving
+    /// inode identity and writing atomically are mutually exclusive at the syscall level. Callers
+    /// that need durable, all-or-nothing config writes must use a different primitive
+    /// (`cyrup_config::lock::write_atomic`), not this seam. Concurrency is provided one level up by
+    /// [`crate::FileMutationLocks`] (Pi `withFileMutationQueue`, write.ts:9 / edit.ts:22), never by
+    /// this method.
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError>;
+
     async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError>;
     async fn metadata(&self, path: &Path) -> Result<Meta, ToolError>;
     async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError>;

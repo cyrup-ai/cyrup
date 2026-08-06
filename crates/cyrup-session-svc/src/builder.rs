@@ -616,6 +616,22 @@ impl SessionBuilder {
             fs = Arc::new(ProtectedFs::with_defaults(fs));
         }
         let backend = Backend { fs, proc: base.proc.clone() };
+        // The live session metadata every `bash` child gets as `CYRUP_*` (Pi's `resolveSpawnContext`
+        // reads the same five values off the per-call `ExtensionContext`, bash.ts:171-181). Pi's
+        // values are "resolved when each command starts" (docs/environment-variables.md:27), so this
+        // is a shared HANDLE the session mutates on `set_model` / `set_thinking_level`, never a
+        // snapshot baked into the tool.
+        let bash_session_env = cyrup_tools::config::SessionEnvHandle::new(
+            cyrup_tools::config::SessionEnvInfo {
+                session_id: Some(session_id.to_string()),
+                // `None` for an ephemeral/in-memory session — Pi leaves `PI_SESSION_FILE` unset
+                // rather than empty in that case (bash.ts:173-174).
+                session_file: manager.session_file().map(std::path::Path::to_path_buf),
+                provider: Some(model_ref.provider.to_string()),
+                model: Some(model_ref.model.to_string()),
+                reasoning_level: Some(thinking_level_to_str(thinking)),
+            },
+        );
         let registry = ToolRegistry::with_builtins(
             cwd.clone(),
             backend,
@@ -623,6 +639,7 @@ impl SessionBuilder {
                 bash: BashOpts {
                     command_prefix: shell_command_prefix_setting.clone(),
                     shell_path: shell_path_setting.clone(),
+                    session_env: Some(bash_session_env.clone()),
                     ..BashOpts::default()
                 },
                 ..ToolsOptions::default()
@@ -1199,6 +1216,7 @@ impl SessionBuilder {
             shell_command_prefix: shell_command_prefix_setting,
             dynamic_tools,
             handle,
+            bash_session_env,
         };
 
         let services = AgentSessionServices {

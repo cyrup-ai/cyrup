@@ -373,6 +373,15 @@ async fn write_creates_dirs_and_serializes() {
     assert_eq!(std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(), "hello");
 
     // Concurrent writes to the same path: no corruption (final == one full content).
+    //
+    // The two payloads have DIFFERENT LENGTHS on purpose. They used to be `"AAAA"`/`"BBBB"`, which
+    // made this half vacuous: two same-length writes can interleave arbitrarily and still land on a
+    // 4-byte file, and the temp-file+rename backend made the outcome atomic for free anyway. The
+    // backend is now an in-place `O_TRUNC` write (TOOL-004, matching pi's `fsWriteFile`), so the
+    // whole exclusion property rests on [`FileMutationLocks`] alone — pi's `withFileMutationQueue`
+    // (write.ts:9) plays the identical role. With unequal lengths any interleaving is observable:
+    // a lost lock leaves a short read (`"AAAA"` where `B` was last), a tail (`"AAAABBBB…"`), or a
+    // truncated prefix — none of which match either payload exactly.
     let w = Arc::new(WriteTool::new(fs(), locks, cwd.clone(), Default::default()));
     let a = {
         let w = w.clone();
@@ -391,7 +400,7 @@ async fn write_creates_dirs_and_serializes() {
         tokio::spawn(async move {
             w.execute(
                 cid(),
-                serde_json::json!({ "path": "race.txt", "content": "BBBB" }),
+                serde_json::json!({ "path": "race.txt", "content": "BBBBBBBBBBBBBBBB" }),
                 CancelToken::new(),
                 noop_sink(),
             )
@@ -401,7 +410,10 @@ async fn write_creates_dirs_and_serializes() {
     a.await.unwrap().unwrap();
     b.await.unwrap().unwrap();
     let final_content = std::fs::read_to_string(cwd.join("race.txt")).unwrap();
-    assert!(final_content == "AAAA" || final_content == "BBBB", "got: {final_content}");
+    assert!(
+        final_content == "AAAA" || final_content == "BBBBBBBBBBBBBBBB",
+        "the two concurrent writes interleaved; got: {final_content:?}"
+    );
 }
 
 // ---------------------------------------------------------------- A-03-5 bash
@@ -1100,8 +1112,8 @@ impl FsOps for CountingFs {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(path).await
     }
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-        self.inner.write_atomic(path, bytes).await
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        self.inner.write_in_place(path, bytes).await
     }
     async fn access(&self, path: &Path, mode: cyrup_tools::ops::Access) -> Result<(), ToolError> {
         self.inner.access(path, mode).await

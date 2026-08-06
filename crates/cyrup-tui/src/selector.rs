@@ -95,6 +95,14 @@ pub enum SelectorKind {
     Session,
     /// Session-tree navigator (`/tree`, `tree-selector.ts`).
     Tree,
+    /// The three-option "Summarize branch?" prompt shown after a `/tree` row is confirmed — Pi's
+    /// `showExtensionSelector("Summarize branch?", ["No summary", "Summarize", "Summarize with
+    /// custom prompt"])` (`interactive-mode.ts:4755-4760`). Escape re-shows the tree selector.
+    BranchSummary,
+    /// The custom-instructions editor opened by [`Self::BranchSummary`]'s third option — Pi's
+    /// `showExtensionEditor("Custom summarization instructions")` (`interactive-mode.ts:4769`).
+    /// Escape loops back to the [`Self::BranchSummary`] prompt (Pi's `continue`, `:4772`).
+    BranchSummaryInstructions,
     /// Project-trust picker (`/trust`, `trust-selector.ts`).
     Trust,
     /// Fork-from-message picker (`/fork`, `user-message-selector.ts`).
@@ -150,6 +158,9 @@ impl SelectorKind {
             SelectorKind::ScopedModels => "Scoped Models",
             SelectorKind::Session => "Resume Session",
             SelectorKind::Tree => "Session Tree",
+            // Pi's exact prompt string (`interactive-mode.ts:4755`).
+            SelectorKind::BranchSummary => "Summarize branch?",
+            SelectorKind::BranchSummaryInstructions => "Custom summarization instructions",
             SelectorKind::Trust => "Project Trust",
             SelectorKind::UserMessage => "Fork from Message",
             SelectorKind::Login => "Login",

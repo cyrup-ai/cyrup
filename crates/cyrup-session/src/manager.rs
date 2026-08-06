@@ -495,7 +495,7 @@ impl SessionManager {
         self.push_entry(Entry::known(KnownEntry::Compaction {
             base: self.make_base(),
             summary,
-            first_kept_entry_id: first_kept,
+            first_kept_entry_id: Some(first_kept),
             tokens_before,
             details,
             usage,

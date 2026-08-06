@@ -224,6 +224,19 @@ impl TreeSelector {
         visible.get(self.selected).and_then(|&i| self.nodes.get(i)).map(|n| n.id.clone())
     }
 
+    /// Move the highlight to `id` if it is currently visible — Pi's `showTreeSelector(entryId)`
+    /// re-show with the same selection (`interactive-mode.ts:4763,4807`). A no-op when the id is
+    /// filtered out, folded away, or gone (the selection stays wherever it was), never a panic.
+    pub fn select_id(&mut self, id: &str) {
+        if let Some(pos) = self
+            .visible_indices()
+            .into_iter()
+            .position(|i| self.nodes.get(i).is_some_and(|n| n.id == id))
+        {
+            self.selected = pos;
+        }
+    }
+
     /// The current filter mode (inspection/tests).
     pub fn filter(&self) -> FilterMode {
         self.filter

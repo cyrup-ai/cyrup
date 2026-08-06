@@ -55,28 +55,43 @@ impl FsOps for LocalFs {
         tokio::fs::read(path).await.map_err(|e| error::io(&error::show(path), &e))
     }
 
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:33 / edit.ts:85):
+    /// `O_WRONLY|O_CREAT|O_TRUNC` with creation mode `0o666` (umask applies), write, close.
+    ///
+    /// [CYRUP-DELTA] The parent-directory creation is Pi's SEPARATE `ops.mkdir(dirname(path),
+    /// {recursive:true})` step, which `write` runs immediately before its `writeFile`
+    /// (write.ts:32-35, :215-218). It is folded in here rather than exposed as a second trait
+    /// method so the protected-path decorator still gets exactly one chance to deny BEFORE any
+    /// directory is created. `edit` reaches this after its own `access(R_OK|W_OK)` precheck has
+    /// already proven the file exists, so the `create_dir_all` is a no-op on that path.
+    ///
+    /// This deliberately does NOT write a temp file and rename it into place. Doing so replaces the
+    /// target inode and so silently drops the file's mode (a `0600` secrets file becomes
+    /// `0666 & ~umask`), its ownership, its hard-link set, and its identity as a symlink; it also
+    /// lets a write succeed on a read-only file, because `rename(2)` checks the parent directory
+    /// rather than the file. See [`FsOps::write_in_place`] for the durability trade this accepts.
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| error::io(&format!("create dir {}", error::show(parent)), &e))?;
             }
-        let tmp = match path.file_name() {
-            Some(name) => {
-                let mut t = name.to_os_string();
-                t.push(format!(".cyrup-tmp-{}", unique_suffix()));
-                path.with_file_name(t)
-            }
-            None => return Err(error::invalid(format!("invalid path: {}", error::show(path)))),
-        };
-        tokio::fs::write(&tmp, bytes)
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(&tmp)), &e))?;
-        tokio::fs::rename(&tmp, path).await.map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            error::io(&format!("rename to {}", error::show(path)), &e)
-        })?;
+            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+        // `tokio::fs::File` buffers; flush pushes the bytes to the OS. Node's `writeFile` likewise
+        // only loops `write(2)` and closes the fd — there is no `fsync` on either side.
+        file.flush()
+            .await
+            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
         Ok(())
     }
 
@@ -233,6 +248,11 @@ fn build_command(spec: &ExecSpec) -> std::process::Command {
         std_cmd.arg(&spec.command);
     }
     std_cmd.current_dir(&spec.cwd);
+    // Removals FIRST, then the overrides — Pi deletes the session keys and only then repopulates
+    // them (bash.ts:165-181), so a key in both lists ends up set, not unset.
+    for k in &spec.env_remove {
+        std_cmd.env_remove(k);
+    }
     for (k, v) in &spec.env {
         std_cmd.env(k, v);
     }
@@ -722,6 +742,7 @@ mod tests {
             command: command.to_string(),
             cwd: std::env::temp_dir(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             shell: ShellConfig::detect(),
         }
     }

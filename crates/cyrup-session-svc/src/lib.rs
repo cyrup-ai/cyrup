@@ -87,6 +87,9 @@ pub use cyrup_config::trust::{TrustDecision, TrustEntry, TrustOption};
 /// Re-exported so the TUI `/settings` selector can read the merged config + the default-trust enum
 /// for its grid rows without a direct `cyrup-config` dependency.
 pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
+/// Re-exported because it is the argument type of [`SessionBuilder::cli_settings`] — an embedder (or
+/// a front-end test) cannot name that seam's input without a direct `cyrup-config` dependency.
+pub use cyrup_config::Settings;
 /// Re-exported so the TUI `/resume` selector can name the session-list rows
 /// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
 pub use cyrup_session::listing::SessionInfo;

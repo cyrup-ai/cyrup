@@ -82,9 +82,9 @@ impl FsOps for TraversalFs {
         self.inner.read(&p).await
     }
 
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         let p = self.confine(path)?;
-        self.inner.write_atomic(&p, bytes).await
+        self.inner.write_in_place(&p, bytes).await
     }
 
     async fn access(&self, path: &Path, mode: super::Access) -> Result<(), ToolError> {

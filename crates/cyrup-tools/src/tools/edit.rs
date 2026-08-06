@@ -218,7 +218,7 @@ impl Tool for EditTool {
         // Restore line endings + BOM (R-03-018).
         let restored = edit_diff::restore_line_endings(&new_body, ending);
         let final_text = if had_bom { format!("\u{feff}{restored}") } else { restored };
-        self.fs.write_atomic(&abs, final_text.as_bytes()).await?;
+        self.fs.write_in_place(&abs, final_text.as_bytes()).await?;
 
         let (diff, first_changed_line) =
             edit_diff::generate_diff_string(&applied.base_content, &new_body);

@@ -58,7 +58,25 @@ pub enum KnownEntry {
         #[serde(flatten)]
         base: EntryBase,
         summary: String,
-        first_kept_entry_id: EntryId,
+        /// The first entry KEPT by this compaction, or `None` when it could not be resolved.
+        ///
+        /// Pi declares this `string` (`session-manager.ts:72`) but leaves it genuinely `undefined`
+        /// on one live path: `migrateV1ToV2` (`session-manager.ts:245-255`) deletes a v1 entry's
+        /// `firstKeptEntryIndex` UNCONDITIONALLY and only assigns `firstKeptEntryId` when the
+        /// index resolves to a non-`session` entry — so index `0` (the session header) or an
+        /// out-of-range index leaves the key absent. Pi parses session JSONL without validation, so
+        /// the entry stays a compaction and `buildContextEntries`' `entry.id === firstKeptEntryId`
+        /// test simply never matches (`session-manager.ts:445`): NOTHING before the compaction is
+        /// re-admitted. The harness fork states the same contract explicitly —
+        /// `firstKeptEntryId?: string` (`agent/src/harness/types.ts:406`) guarded by
+        /// `if (compaction.firstKeptEntryId)` (`agent/src/harness/session/session.ts:80`).
+        ///
+        /// Declaring it non-optional made `from_value::<KnownEntry>` FAIL on such an entry,
+        /// demoting it to [`Entry::Unknown`] — which contributes no summary AND defeats
+        /// `latest_compaction`, re-admitting the entire pre-compaction history. Optional here is a
+        /// read-time reinterpretation only; the JSONL is never rewritten.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_kept_entry_id: Option<EntryId>,
         tokens_before: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,

@@ -27,7 +27,8 @@ use cyrup_session_svc::{
     UserInput,
 };
 use cyrup_session_svc::{
-    AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
+    AgentSessionRuntime, ForkPosition, NavigateTreeOptions, NavigateTreeOutcome, SessionDagKind,
+    SessionDagNode,
 };
 use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use futures::StreamExt;
@@ -99,6 +100,12 @@ pub enum AppAction {
     /// dropped. The run loop drains ([`AgentSession::drain_queue`]), hands the result to
     /// [`App::restore_queued_to_editor`], and only then aborts.
     InterruptRestoreQueued,
+    /// Esc pressed **while a `/tree` branch summarization is in flight** — Pi's rebound
+    /// `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
+    /// (`interactive-mode.ts:4792-4795`). Distinct from [`Self::Interrupt`] because it must NOT tear
+    /// down streaming state or kill a bash child: the only effect is cancelling the summarization,
+    /// which resolves the spawned navigation with `aborted: true` and re-shows the tree.
+    AbortBranchSummary,
     /// The user requested to quit the session.
     Quit,
     /// The user requested to suspend the process to the background (Ctrl+Z / SIGTSTP). The run loop
@@ -291,6 +298,33 @@ pub struct AppState {
     /// [`App::handle_selector_key`]'s `Cancel` arm take + resolve it. `None` whenever no extension
     /// dialog is open (including every ordinary first-party selector).
     pending_ui_reply: Option<PendingUiReply>,
+    /// The `/tree` target the user confirmed, held while the "Summarize branch?" prompt (and, on its
+    /// third option, the custom-instructions editor) is open — Pi keeps the same values in the
+    /// `entryId` / `wantsSummary` / `customInstructions` locals of its `while (true)` prompt loop
+    /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
+    /// prompt is escaped back to the tree.
+    pending_tree_nav: Option<PendingTreeNav>,
+    /// Whether a branch summarization spawned by [`App::begin_tree_navigation`] is still in flight.
+    /// While set, `Esc` routes to `AgentSession::abort_branch_summary` instead of the turn abort —
+    /// Pi's `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
+    /// (`interactive-mode.ts:4792-4795`), restored in its `finally`.
+    branch_summary_in_flight: bool,
+}
+
+/// Row values of the "Summarize branch?" prompt. Pi compares the returned LABELS
+/// (`summaryChoice !== "No summary"`, `=== "Summarize with custom prompt"`,
+/// `interactive-mode.ts:4767,4769`); cyrup's [`ListSelector`] carries a separate value column, so
+/// the labels stay Pi-exact for display while the routing keys stay stable.
+const BRANCH_SUMMARY_NONE: &str = "none";
+const BRANCH_SUMMARY_YES: &str = "summarize";
+const BRANCH_SUMMARY_CUSTOM: &str = "custom";
+
+/// The `/tree` navigation awaiting the "Summarize branch?" answer (see
+/// [`AppState::pending_tree_nav`]).
+#[derive(Clone, Debug)]
+struct PendingTreeNav {
+    /// The confirmed tree row's entry id.
+    target: String,
 }
 
 impl AppState {
@@ -328,7 +362,15 @@ impl AppState {
                 hyperlinks: false,
             },
             pending_ui_reply: None,
+            pending_tree_nav: None,
+            branch_summary_in_flight: false,
         }
+    }
+
+    /// Whether a `/tree` branch summarization is still running (test/inspection access; drives the
+    /// `Esc`→`abort_branch_summary` routing).
+    pub fn branch_summary_in_flight(&self) -> bool {
+        self.branch_summary_in_flight
     }
 
     /// Install the extension-registered keyboard shortcuts (R-08-017): each raw key-id is parsed to a
@@ -497,6 +539,33 @@ pub struct App<B: Backend> {
     /// repaint, eliminating the per-tool-call FLICKER. Reset to `0` the instant the turn goes idle so
     /// the region collapses back to the compact editor/footer (the void-fix is preserved).
     live_floor: u16,
+    /// Where a spawned `/tree` navigation posts its outcome back to the run loop. Installed by
+    /// [`App::install_tree_nav_channel`], which [`App::run`] calls once at startup. `None` when no
+    /// run loop is present (an embedder or a test driving `execute_command` directly), in which case
+    /// [`App::begin_tree_navigation`] falls back to awaiting the navigation inline — correct for a
+    /// non-summarizing navigation (no model call, so no abort to deliver and nothing to keep the
+    /// loop free for) and the only thing a caller without a loop can do.
+    tree_nav_tx: Option<tokio::sync::mpsc::UnboundedSender<TreeNavMsg>>,
+}
+
+/// A spawned `/tree` navigation's outcome, posted back to [`App::run`]'s `select!` so the summarize
+/// leg never runs on the loop task (the `bash_rx` / `shortcut_status_rx` channel-back pattern).
+/// Keeping it off-task is what makes Pi's Escape→`abortBranchSummary` binding deliverable at all:
+/// awaited inline, the loop would service no key events for the whole provider round-trip.
+#[derive(Debug)]
+pub struct TreeNavMsg {
+    /// The navigated-to entry id, so an aborted summarization can re-show the tree there.
+    target: String,
+    outcome: Result<NavigateTreeOutcome, String>,
+}
+
+impl TreeNavMsg {
+    /// Pair a settled navigation with the entry it targeted. `pub` so `tests/*.rs` can hand
+    /// [`App::apply_tree_nav_outcome`] a synthetic outcome (notably the abort case, which is
+    /// otherwise a race to provoke) — the crate's established run-loop-only testing seam.
+    pub fn new(target: impl Into<String>, outcome: Result<NavigateTreeOutcome, String>) -> Self {
+        TreeNavMsg { target: target.into(), outcome }
+    }
 }
 
 impl<B: Backend> App<B> {
@@ -515,7 +584,7 @@ impl<B: Backend> App<B> {
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
         // `Terminal` is top-anchored at the backend's initial cursor; the rebuild fixes the anchor).
-        Ok(App { terminal, state, viewport_height: 0, live_floor: 0 })
+        Ok(App { terminal, state, viewport_height: 0, live_floor: 0, tree_nav_tx: None })
     }
 
     /// Immutable state access.
@@ -1240,6 +1309,14 @@ impl<B: Backend> App<B> {
                 AppAction::Quit
             }
             Action::Interrupt => {
+                // Pi REBINDS `defaultEditor.onEscape` to `() => this.session.abortBranchSummary()`
+                // for the duration of a `/tree` branch summarization (`interactive-mode.ts:4792-4795`,
+                // restored in the `finally` at `:4832`), so Escape cancels the summarization and
+                // nothing else — no stream teardown, no bash kill. Checked FIRST for the same reason
+                // Pi's rebind shadows the default handler.
+                if self.state.branch_summary_in_flight {
+                    return AppAction::AbortBranchSummary;
+                }
                 // A running `!`/`!!` bash block is cancelled first (the run loop kills the child),
                 // mirroring Pi's `tui.select.cancel` on the bash component.
                 if self.state.transcript.bash_running() {
@@ -1561,6 +1638,158 @@ impl<B: Backend> App<B> {
         self.state.selector.as_ref().map(|s| s.kind)
     }
 
+    /// Install the off-task `/tree` navigation channel and hand back its receiver.
+    ///
+    /// [`App::run`] calls this once at startup; without it [`Self::begin_tree_navigation`] falls
+    /// back to awaiting the navigation inline, which is only ever correct for a NON-summarizing
+    /// navigation. `pub` so `tests/*.rs` can exercise the spawned path (and therefore the
+    /// Escape→abort routing and the live `IndicatorKind::BranchSummary` indicator) without standing
+    /// up a whole run loop.
+    pub fn install_tree_nav_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<TreeNavMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TreeNavMsg>();
+        self.tree_nav_tx = Some(tx);
+        rx
+    }
+
+    /// Open Pi's three-option "Summarize branch?" prompt (`interactive-mode.ts:4755-4760`). Pi uses
+    /// its generic `showExtensionSelector`; cyrup renders the same three options through a
+    /// first-party [`ListSelector`] so the answer arrives as an ordinary
+    /// [`AppCommand::ConfirmSelection`] rather than occupying the single extension-dialog reply slot.
+    pub fn open_branch_summary_prompt(&mut self) {
+        let rows = vec![
+            (BRANCH_SUMMARY_NONE.to_string(), "No summary".to_string(), None),
+            (BRANCH_SUMMARY_YES.to_string(), "Summarize".to_string(), None),
+            (
+                BRANCH_SUMMARY_CUSTOM.to_string(),
+                "Summarize with custom prompt".to_string(),
+                None,
+            ),
+        ];
+        let title = SelectorKind::BranchSummary.title().to_string();
+        self.open_boxed_selector(
+            SelectorKind::BranchSummary,
+            Box::new(ListSelector::prompt(title, rows, 0)),
+        );
+    }
+
+    /// Open the custom-instructions editor (Pi `showExtensionEditor("Custom summarization
+    /// instructions")`, `interactive-mode.ts:4769`) — the same INLINE editor component Pi's default
+    /// `ExtensionEditorComponent` provides, never a teardown to `$EDITOR`.
+    fn open_branch_summary_instructions(&mut self) {
+        let title = SelectorKind::BranchSummaryInstructions.title().to_string();
+        self.open_boxed_selector(
+            SelectorKind::BranchSummaryInstructions,
+            Box::new(ExtensionEditorSelector::new(title, "")),
+        );
+    }
+
+    /// Dispatch the `/tree` navigation the user committed to (Pi `interactive-mode.ts:4781-4820`).
+    ///
+    /// Pi aborts an in-flight response FIRST — "the user committed to navigating: stop the active
+    /// response" (`:4781-4785`), restoring the queued messages to the editor on the way — then runs
+    /// `navigateTree`. cyrup did neither before SESS-023.
+    ///
+    /// The navigation itself is SPAWNED whenever a run loop is present, never awaited on the loop
+    /// task. A summarizing navigation is a provider round-trip plus retry backoff; awaited inline in
+    /// `App::run`'s `select!` it would freeze the loop for the whole call, so no keystroke could
+    /// reach `abort_branch_summary` and no `IndicatorKind::BranchSummary` frame could ever render —
+    /// exactly the residual `execute_command`'s own doc comment flags. The outcome comes back over
+    /// [`Self::tree_nav_tx`] and is applied by [`Self::apply_tree_nav_outcome`].
+    async fn begin_tree_navigation(
+        &mut self,
+        session: &Arc<AgentSession>,
+        target: String,
+        summarize: bool,
+        custom_instructions: Option<String>,
+    ) {
+        // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
+        if session.is_streaming().await {
+            let (steering, follow_up) = session.drain_queue().await;
+            let queued: Vec<String> = steering.into_iter().chain(follow_up).collect();
+            self.restore_queued_to_editor(&queued);
+            session.abort();
+        }
+        let opts = NavigateTreeOptions {
+            summarize,
+            custom_instructions,
+            ..NavigateTreeOptions::default()
+        };
+        let entry = cyrup_core::EntryId::from(target.as_str());
+        let Some(tx) = self.tree_nav_tx.clone() else {
+            // No run loop (unit/embedder driving `execute_command` directly): await inline. Safe
+            // for the non-summarizing path, which makes no model call.
+            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            self.apply_tree_nav_outcome(TreeNavMsg { target, outcome });
+            return;
+        };
+        if summarize {
+            // Pi shows the `BranchSummaryStatusIndicator` and rebinds Escape for the duration
+            // (`:4796-4799`, `:4792-4795`); both are torn down in `apply_tree_nav_outcome`.
+            self.state.branch_summary_in_flight = true;
+            self.state
+                .indicator
+                .set(IndicatorKind::BranchSummary, Some("Summarizing branch…".to_string()));
+        }
+        let session = session.clone();
+        tokio::spawn(async move {
+            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            let _ = tx.send(TreeNavMsg { target, outcome });
+        });
+    }
+
+    /// Apply a settled `/tree` navigation (Pi `interactive-mode.ts:4805-4820`).
+    ///
+    /// The arm ORDER is load-bearing and was wrong before SESS-023: cyrup returns
+    /// `{cancelled: true, aborted: true}` on an aborted summarization (matching Pi
+    /// `agent-session.ts:3000-3001`), and the old code tested `cancelled` first — so aborting a
+    /// summarization printed "tree navigation cancelled" and silently swallowed the tree. Pi tests
+    /// `result.aborted` first (`:4805`) and re-shows the tree at the same entry, then `cancelled`
+    /// (`:4809`).
+    ///
+    /// `pub` so `tests/*.rs` can drive the settle half without a live run loop, the same reason
+    /// [`Self::open_extension_dialog`] is public.
+    pub fn apply_tree_nav_outcome(&mut self, msg: TreeNavMsg) -> Option<AppCommand> {
+        let TreeNavMsg { target, outcome } = msg;
+        // Pi's `finally` (`:4830-4833`): clear the indicator and restore the Escape binding
+        // regardless of how the navigation ended.
+        if self.state.branch_summary_in_flight {
+            self.state.branch_summary_in_flight = false;
+            if self.state.indicator.kind() == IndicatorKind::BranchSummary
+                || self.state.indicator.kind() == IndicatorKind::Retry
+            {
+                if self.state.status.streaming {
+                    self.state.indicator.working();
+                } else {
+                    self.state.indicator.idle();
+                }
+            }
+        }
+        match outcome {
+            Ok(o) if o.aborted => {
+                // Pi `:4805-4808` — status, then re-show the tree at the same entry.
+                self.state.transcript.push_status("Branch summarization cancelled");
+                self.state.pending_tree_nav = Some(PendingTreeNav { target });
+                return Some(AppCommand::OpenSelector(SelectorKind::Tree));
+            }
+            Ok(o) if o.cancelled => {
+                self.state.transcript.push_status("Navigation cancelled");
+            }
+            Ok(o) => {
+                if let Some(text) = o.editor_text {
+                    self.state.editor.set_text(&text);
+                }
+                // A summarized branch navigation records a branch-summary message
+                // (`branch-summary-message.ts`) into the transcript.
+                if let Some(entry) = o.summary_entry {
+                    self.state.transcript.push_branch_summary(entry.summary);
+                }
+                self.state.transcript.push_status("navigated session tree");
+            }
+            Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+        }
+        None
+    }
+
     /// Render a loaded extension's `ui.{confirm,select,input}` dialog request in the input slot (L4
     /// review §2.1; `ui.editor` is handled synchronously by the caller, never reaching here — see
     /// [`App::run`]'s `ui_rx` arm). Mirrors Pi's `createExtensionUIContext`
@@ -1766,6 +1995,23 @@ impl<B: Backend> App<B> {
                     let _ = pending.reply.send(default_ui_reply(pending.kind));
                 }
                 self.close_selector(true);
+                // The two `/tree` summarization prompts each have their OWN Escape destination in Pi
+                // (`interactive-mode.ts:4761-4765`, `:4770-4773`), not a plain dismiss:
+                match kind {
+                    // "Summarize branch?" → back to the tree selector, same selection (`:4763`).
+                    // `pending_tree_nav` is deliberately LEFT SET: the tree-open arm consumes it as
+                    // the initial selection, which is what `showTreeSelector(entryId)` means.
+                    SelectorKind::BranchSummary => {
+                        return AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree));
+                    }
+                    // The custom-instructions editor → back to the prompt (Pi's `continue`, `:4772`),
+                    // NOT out of the flow: the pending target is deliberately kept.
+                    SelectorKind::BranchSummaryInstructions => {
+                        self.open_branch_summary_prompt();
+                        return AppAction::Redraw;
+                    }
+                    _ => {}
+                }
                 AppAction::Redraw
             }
             // A `/settings` submenu row (Pi `SettingItem.submenu`, settings-selector.ts:603-610):
@@ -1921,6 +2167,12 @@ impl<B: Backend> App<B> {
                         dag.iter().map(tree_node_from_dag).collect();
                     let mut tree = TreeSelector::new(nodes);
                     tree.set_keymap(self.state.tree_keymap.clone());
+                    // Pi re-shows the tree AT THE SAME ENTRY after an escaped summarize prompt or an
+                    // aborted summarization (`showTreeSelector(entryId)`,
+                    // `interactive-mode.ts:4763,4807`); both paths park the id here.
+                    if let Some(pending) = self.state.pending_tree_nav.take() {
+                        tree.select_id(&pending.target);
+                    }
                     self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
                 }
             }
@@ -2049,27 +2301,41 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
             }
             C::ConfirmSelection { kind: SelectorKind::Tree, value } => {
-                // Confirming a tree row navigates the leaf to that entry (Pi `navigateTree`,
-                // agent-session.ts:2704). A user/custom target re-roots at its parent and yields the
-                // target text as re-editable `editor_text`; cancel/no-op is surfaced as a status line.
-                let entry = cyrup_core::EntryId::from(value.as_str());
-                match session.navigate_tree(entry, NavigateTreeOptions::default()).await {
-                    Ok(outcome) if outcome.cancelled => {
-                        self.state.transcript.push_status("tree navigation cancelled");
-                    }
-                    Ok(outcome) => {
-                        if let Some(text) = outcome.editor_text {
-                            self.state.editor.set_text(&text);
-                        }
-                        // A summarized branch navigation records a branch-summary message
-                        // (`branch-summary-message.ts`) into the transcript.
-                        if let Some(entry) = outcome.summary_entry {
-                            self.state.transcript.push_branch_summary(entry.summary);
-                        }
-                        self.state.transcript.push_status("navigated session tree");
-                    }
-                    Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+                // Confirming a tree row ASKS ABOUT SUMMARIZATION FIRST (Pi
+                // `interactive-mode.ts:4744-4779`), then navigates. Before SESS-023 this arm called
+                // `navigate_tree(.., NavigateTreeOptions::default())` — `summarize` hard-false — so
+                // the entire branch-summary stack was unreachable from the shipped binary and
+                // `branchSummary.skipPrompt` was a no-op.
+                //
+                // Pi's `getBranchSummarySkipPrompt()` gate (`:4753`) is a FRONT-END decision: when
+                // set, skip the prompt entirely and navigate with `wantsSummary = false`.
+                if session.services().settings.effective().branch_summary_skip_prompt() {
+                    self.begin_tree_navigation(session, value, false, None).await;
+                } else {
+                    self.state.pending_tree_nav = Some(PendingTreeNav { target: value });
+                    self.open_branch_summary_prompt();
                 }
+            }
+            C::ConfirmSelection { kind: SelectorKind::BranchSummary, value } => {
+                // The three-option answer (Pi `:4755-4777`). `custom` opens the instructions editor
+                // and keeps the pending target; the other two dispatch the navigation directly.
+                // `wantsSummary = summaryChoice !== "No summary"` (`:4767`).
+                if value == BRANCH_SUMMARY_CUSTOM {
+                    self.open_branch_summary_instructions();
+                } else {
+                    let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                    let summarize = value != BRANCH_SUMMARY_NONE;
+                    self.begin_tree_navigation(session, pending.target, summarize, None).await;
+                }
+            }
+            C::ConfirmSelection { kind: SelectorKind::BranchSummaryInstructions, value } => {
+                // Pi `showExtensionEditor` returned a string (`:4769`): a complete choice, so the
+                // prompt loop breaks and the navigation runs with `summarize: true`. An EMPTY string
+                // is still a value (only `undefined`/Escape loops back), so it is forwarded as
+                // `None` custom instructions rather than an empty override.
+                let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                let instructions = (!value.trim().is_empty()).then_some(value);
+                self.begin_tree_navigation(session, pending.target, true, instructions).await;
             }
             C::ConfirmSelection { kind: SelectorKind::Model, value } => {
                 match session.set_model(&value).await {
@@ -3900,6 +4166,12 @@ impl App<CrosstermBackend<Stdout>> {
         // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
         // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
         let (shortcut_status_tx, mut shortcut_status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // A `/tree` navigation runs on its OWN task (see `App::begin_tree_navigation`) and posts its
+        // outcome back here, so a branch summarization's provider round-trip never blocks this loop
+        // — the same channel-back shape as `bash_rx` / `shortcut_status_rx`. Installing the sender is
+        // what makes the spawned path (and therefore Escape→abort and the live
+        // `IndicatorKind::BranchSummary` spinner) reachable at all.
+        let mut tree_nav_rx = self.install_tree_nav_channel();
         loop {
             let theme_changed = async {
                 match theme_rx.as_mut() {
@@ -3967,6 +4239,12 @@ impl App<CrosstermBackend<Stdout>> {
                             if let Some(c) = bash_cancel.take() {
                                 c.cancel();
                             }
+                        }
+                        AppAction::AbortBranchSummary => {
+                            // Pi `:4793` — cancel the summarization only. The spawned navigation
+                            // resolves with `{cancelled: true, aborted: true}`, and the `tree_nav_rx`
+                            // arm re-shows the tree; the indicator/Escape rebind are torn down there.
+                            session.abort_branch_summary();
                         }
                         AppAction::RunBash { command, .. } => {
                             // Replace any prior job (its token is dropped → child orphaned-but-exits).
@@ -4124,6 +4402,15 @@ impl App<CrosstermBackend<Stdout>> {
                 }
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
+                    self.draw_synchronized()?;
+                }
+                Some(msg) = tree_nav_rx.recv() => {
+                    // A spawned `/tree` navigation settled (Pi `interactive-mode.ts:4805-4820`). An
+                    // ABORTED summarization asks for the tree to be re-shown at the same entry, which
+                    // needs the session (`session_dag`), so it comes back as a follow-up command.
+                    if let Some(cmd) = self.apply_tree_nav_outcome(msg) {
+                        self.execute_command(cmd, &session, runtime.as_ref()).await;
+                    }
                     self.draw_synchronized()?;
                 }
                 maybe_ev = events.next() => {

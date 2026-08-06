@@ -86,7 +86,7 @@ impl Tool for WriteTool {
         }
 
         let bytes = input.content.as_bytes();
-        self.fs.write_atomic(&abs, bytes).await?;
+        self.fs.write_in_place(&abs, bytes).await?;
 
         // Pi reports `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte
         // count, and uses the verb "Successfully wrote" (write.ts:222). Match both exactly.
