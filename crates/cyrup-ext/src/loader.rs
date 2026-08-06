@@ -76,6 +76,17 @@ pub struct DiscoveryRoots {
 pub struct LoadError {
     pub path: PathBuf,
     pub error: String,
+    /// Whether this failure is one Pi would also have recorded — i.e. a genuine load fault, which
+    /// Pi's bin turns into `Failed to load extension "<path>": <err>` and `process.exit(1)`
+    /// (main.ts:735-738, :843-849).
+    ///
+    /// `false` for [`crate::ExtError::Untrusted`] ONLY: cyrup applies the project-trust gate
+    /// *inside* the load (`load_discovered`, R-ARCH-EXT-017) and records the skip in this same
+    /// vector, whereas Pi filters untrusted project resources out **before** `loadExtensions` runs,
+    /// so an untrusted project-local extension never reaches Pi's `errors[]` at all. Treating it as
+    /// a load failure would make merely opening an untrusted project a fatal startup — the exact
+    /// opposite of the trust gate's intent. It is still reported in the `[Extension issues]` panel.
+    pub fatal: bool,
 }
 
 /// The aggregate result of a discover+load pass (Pi `LoadExtensionsResult`).

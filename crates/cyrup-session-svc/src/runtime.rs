@@ -76,9 +76,13 @@ struct RuntimeInner {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-/// Collect the build-time diagnostics for `session` (Pi `result.diagnostics`,
-/// agent-session-services.ts:176). Today the only tier-available source is the model-restore
-/// fallback; extension provider-registration diagnostics (`#23`) join here once that lands.
+/// Collect the build-time diagnostics for `session` (Pi `runtime.diagnostics`, main.ts:730-740).
+/// Three tier-available sources today: the model-restore fallback, the CLI extension-flag
+/// reconciliation errors (SEAM-S01), and the contained extension LOAD failures (EXT-S01).
+/// Extension provider-registration diagnostics (`#23`) join here once that lands.
+///
+/// Order matches Pi's array construction: `services.diagnostics` (model + flags) first, then the
+/// mapped `resourceLoader.getExtensions().errors` (main.ts:735-738).
 fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
     let mut out = Vec::new();
     if let Some(msg) = session.model_fallback_message() {
@@ -86,6 +90,33 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
             severity: "warning".to_string(),
             message: msg.to_string(),
             source: Some("model".to_string()),
+        });
+    }
+    // SEAM-S01: `Unknown option(s): --foo` / `Extension flag "--foo" requires a value`. Pi pushes
+    // these onto the SAME `services.diagnostics` array (agent-session-services.ts:182) that becomes
+    // `runtime.diagnostics`, and the bin reports them + exits 1 (main.ts:843-848).
+    for message in &session.services().startup_diagnostics.flags {
+        out.push(RuntimeDiagnostic {
+            severity: "error".to_string(),
+            message: message.clone(),
+            source: Some("extension-flag".to_string()),
+        });
+    }
+    // EXT-S01: a CONTAINED extension load failure is still an ERROR. Pi maps every entry of
+    // `resourceLoader.getExtensions().errors` onto `runtime.diagnostics` as
+    // `{type:"error", message:'Failed to load extension "<path>": <err>'}` (main.ts:735-738) and the
+    // bin exits 1 on it (main.ts:843-849) — in every mode, not just interactive. Without this the
+    // `[Extension issues]` panel is the ONLY consumer, and that panel is built solely by
+    // `run_interactive`, so `cyrup -p …` would drop a failed security built-in silently at exit 0.
+    for ext in &session.services().startup_diagnostics.extensions {
+        if !ext.fatal {
+            // The project-trust skip: Pi never records it as a load error (see `LoadError::fatal`).
+            continue;
+        }
+        out.push(RuntimeDiagnostic {
+            severity: "error".to_string(),
+            message: format!("Failed to load extension \"{}\": {}", ext.path.display(), ext.error),
+            source: Some("extension".to_string()),
         });
     }
     out

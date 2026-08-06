@@ -30,7 +30,7 @@ use cyrup_session_svc::{
     AgentSessionRuntime, ForkPosition, NavigateTreeOptions, NavigateTreeOutcome, SessionDagKind,
     SessionDagNode,
 };
-use cyrup_session_svc::{UiKind, UiReply, UiRequest};
+use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
@@ -64,6 +64,7 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
+use crate::stray_reply::StrayReplyFilter;
 use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
 use crate::transcript::{content_text, entry_lines, thinking_text, TranscriptView};
@@ -304,6 +305,22 @@ pub struct AppState {
     /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
     /// prompt is escaped back to the tree.
     pending_tree_nav: Option<PendingTreeNav>,
+    /// The last window title an extension asked for (Pi `setTitle` → `ui.terminal.setTitle`,
+    /// `interactive-mode.ts:2238` → `terminal.ts:504-507`). Retained so the value is observable in
+    /// tests and after a redraw; the crossterm run loop is what actually writes the OSC 0 sequence.
+    pub terminal_title: Option<String>,
+    /// The custom header content an extension published (Pi `setHeader`, `interactive-mode.ts:2237`).
+    /// Delivered (no longer dropped) and retained here — cyrup's TUI has no extension chrome slot to
+    /// render it in yet, which is TUI-014's remaining half.
+    pub extension_header: Option<String>,
+    /// The custom footer content an extension published (Pi `setFooter`, `interactive-mode.ts:2236`).
+    /// Same status as [`Self::extension_header`].
+    pub extension_footer: Option<String>,
+    /// The most recent extension widget payload (Pi `setWidget`, `interactive-mode.ts:2235`). Cyrup's
+    /// WIT collapses Pi's `{key, content, options}` into one opaque JSON blob, so there is no key to
+    /// map by; the latest payload wins. Same "delivered, not rendered" status as the header/footer —
+    /// this is exactly TUI-014, which the sink wiring alone does NOT close.
+    pub extension_widget: Option<serde_json::Value>,
     /// Whether a branch summarization spawned by [`App::begin_tree_navigation`] is still in flight.
     /// While set, `Esc` routes to `AgentSession::abort_branch_summary` instead of the turn abort —
     /// Pi's `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
@@ -363,6 +380,10 @@ impl AppState {
             },
             pending_ui_reply: None,
             pending_tree_nav: None,
+            terminal_title: None,
+            extension_header: None,
+            extension_footer: None,
+            extension_widget: None,
             branch_summary_in_flight: false,
         }
     }
@@ -1888,6 +1909,96 @@ impl<B: Backend> App<B> {
         }
         self.open_boxed_selector(selector_kind, inner);
         self.state.pending_ui_reply = Some(PendingUiReply { kind, reply, base_title, deadline });
+    }
+
+    /// Bind BOTH extension-UI seams of a session's host services to this run loop — the single place
+    /// [`App::run`] and its session-swap arm attach the TUI, mirroring `cyrup-modes`' `run_rpc` /
+    /// `rebind_session`, which install the same pair for RPC mode.
+    ///
+    /// The pair is not optional: [`UiSink`] carries the request/reply dialogs
+    /// (`ui.{confirm,input,select,editor}`) and [`UiEffectSink`] carries the fire-and-forget mutators
+    /// (`ui.{notify,set-status,set-widget,set-header,set-footer,set-title,set-editor-text,
+    /// paste-editor-text,set-tools-expanded}`). `LiveHostServices` drops an effect outright when the
+    /// effect sink is `None` — its headless (print/json) policy, Pi's `noOpUIContext`
+    /// (`extensions/runner.ts:230-265`). Interactive is not headless in Pi: it passes a real
+    /// `uiContext` (`interactive-mode.ts:2223-2268`), so installing only the dialog half made every
+    /// fire-and-forget extension UI call vanish in the DEFAULT mode while working over RPC (TUI-S01).
+    ///
+    /// Must be re-run against every swapped-in session (`/new`, `/resume`, `/fork`, `/reload`,
+    /// `/import`, or a runtime-side `SessionReplaced`): a replacement session brings a fresh
+    /// `LiveHostServices` whose sinks are both `None`.
+    pub fn install_ui_sinks(
+        services: &cyrup_session_svc::LiveHostServices,
+        ui: cyrup_session_svc::UiSink,
+        effects: cyrup_session_svc::UiEffectSink,
+    ) {
+        services.set_ui_sink(ui);
+        services.set_ui_effect_sink(effects);
+    }
+
+    /// Apply one fire-and-forget extension UI effect — the interactive-TUI half of the
+    /// [`UiEffectSink`] seam `cyrup-modes`' `run_rpc` already drives for RPC mode.
+    ///
+    /// Pi builds a real `uiContext` for interactive mode (`interactive-mode.ts:2223-2268`) whose
+    /// mutators land on concrete TUI state; only headless modes get `noOpUIContext`
+    /// (`extensions/runner.ts:230-265`). Cyrup installed the request/reply [`UiSink`] here but never
+    /// the effect sink, so every `notify`/`setStatus`/`setTitle`/`setEditorText`/`pasteToEditor`/
+    /// `setToolsExpanded`/`setWidget`/`setHeader`/`setFooter` call was dropped by
+    /// `LiveHostServices::emit_ui_effect` in the DEFAULT mode while working over RPC.
+    ///
+    /// Per-variant mapping (each cites the Pi interactive handler it ports):
+    /// * `Notify` → `showExtensionNotify` (`:2518-2526`): `error` → `showError`, `warning` →
+    ///   `showWarning`, otherwise `showStatus`.
+    /// * `SetStatus` → `setExtensionStatus` (`:1920-1923`) → the footer's extension-status line.
+    /// * `SetEditorText` → `this.editor.setText(text)` (`:2241`); `is_paste` (`pasteToEditor`,
+    ///   `:2240`, which wraps the text in bracketed-paste markers and re-feeds the editor) → the
+    ///   editor's real paste path, so the same sanitization applies.
+    /// * `SetToolsExpanded` → `setToolsExpanded` (`:3887-3903`), including its no-op early-out and
+    ///   its `Tool output: expanded|collapsed` status echo.
+    /// * `SetTitle` → retained on [`AppState::terminal_title`]; the crossterm run loop writes the
+    ///   OSC 0 sequence (`terminal.ts:504-507`), which a `TestBackend` app must not do.
+    /// * `SetWidget`/`SetHeader`/`SetFooter` → retained on [`AppState`]. These now ARRIVE (they used
+    ///   to be discarded before leaving `LiveHostServices`) but cyrup's TUI has no extension chrome
+    ///   slot to draw them in, so TUI-014 stays open — see those fields' docs.
+    ///
+    /// `pub` for the same reason [`Self::open_extension_dialog`] is: `tests/*.rs` drive it directly.
+    pub fn apply_ui_effect(&mut self, effect: UiEffect) {
+        match effect {
+            UiEffect::Notify { message, kind } => match kind {
+                NotifyKind::Error => {
+                    // Pi `showError` prefixes the copy (`interactive-mode.ts:3952`).
+                    self.state.transcript.push_error(format!("Error: {message}"));
+                }
+                NotifyKind::Warning => {
+                    self.state.transcript.push_warning(format!("Warning: {message}"));
+                }
+                NotifyKind::Info => self.state.transcript.push_status(message),
+            },
+            UiEffect::SetStatus { key, text } => {
+                // `text: None` clears the key — `StatusLine::set_extension_status` already treats an
+                // empty value as a removal (Pi `footer.ts:233`).
+                self.state.status.set_extension_status(key, text.unwrap_or_default());
+            }
+            UiEffect::SetEditorText { text, is_paste } => {
+                if is_paste {
+                    self.state.editor.handle_paste(&text);
+                } else {
+                    self.state.editor.set_text(&text);
+                }
+            }
+            UiEffect::SetToolsExpanded { expanded } => {
+                if self.state.transcript.set_tool_expanded(expanded) {
+                    self.state.transcript.push_status(format!(
+                        "Tool output: {}",
+                        if expanded { "expanded" } else { "collapsed" }
+                    ));
+                }
+            }
+            UiEffect::SetTitle { title } => self.state.terminal_title = Some(title),
+            UiEffect::SetHeader { content } => self.state.extension_header = Some(content),
+            UiEffect::SetFooter { content } => self.state.extension_footer = Some(content),
+            UiEffect::SetWidget { widget } => self.state.extension_widget = Some(widget),
+        }
     }
 
     /// Advance the open extension-UI dialog's countdown by one tick (Pi's `CountdownTimer`'s 1s
@@ -4124,7 +4235,20 @@ impl App<CrosstermBackend<Stdout>> {
         // (only when a TUI is present — `App::run` is never invoked headless) and re-installed on every
         // session swap below, since a replacement session brings a fresh `LiveHostServices`.
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
-        session.services().host_services.set_ui_sink(ui_tx.clone());
+        // The FIRE-AND-FORGET sibling of `ui_tx` (TUI-S01). `LiveHostServices::emit_ui_effect` drops
+        // every `ui.{notify,set-status,set-widget,set-header,set-footer,set-title,set-editor-text,
+        // paste-editor-text,set-tools-expanded}` call when this sink is unset, which is exactly Pi's
+        // headless `noOpUIContext` policy (`extensions/runner.ts:230-265`) — but interactive is NOT
+        // headless in Pi: it passes a real `uiContext` (`interactive-mode.ts:2223-2268`). Cyrup's RPC
+        // mode already installs this (`crates/cyrup-modes/src/rpc.rs`'s `run_rpc`); without the same
+        // install here every fire-and-forget extension UI call vanished in the DEFAULT mode. Also
+        // re-installed on session swap below, for the same reason `ui_tx` is.
+        let (ui_effect_tx, mut ui_effect_rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        Self::install_ui_sinks(
+            &session.services().host_services,
+            ui_tx.clone(),
+            ui_effect_tx.clone(),
+        );
         // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
         // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
         // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
@@ -4400,6 +4524,20 @@ impl App<CrosstermBackend<Stdout>> {
                     self.open_extension_dialog(req);
                     self.draw_synchronized()?;
                 }
+                Some(effect) = ui_effect_rx.recv() => {
+                    // The fire-and-forget counterpart of the `ui_rx` arm above: a loaded guest pushed
+                    // a `ui.*` mutator and did NOT block on a reply, so there is nothing to answer —
+                    // just apply it and redraw (Pi's mutators end in `this.ui.requestRender()`).
+                    if let UiEffect::SetTitle { title } = &effect {
+                        // Pi `setTitle` reaches the terminal, not a component
+                        // (`interactive-mode.ts:2238` → `terminal.ts:504-507`), so it is written here
+                        // on the crossterm path rather than inside the backend-generic
+                        // `apply_ui_effect`.
+                        write_terminal_title(title);
+                    }
+                    self.apply_ui_effect(effect);
+                    self.draw_synchronized()?;
+                }
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
                     self.draw_synchronized()?;
@@ -4453,7 +4591,11 @@ impl App<CrosstermBackend<Stdout>> {
                         // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from
                         // `crates/cyrup-modes/src/rpc.rs`'s `run_rpc`).
-                        session.services().host_services.set_ui_sink(ui_tx.clone());
+                        Self::install_ui_sinks(
+                            &session.services().host_services,
+                            ui_tx.clone(),
+                            ui_effect_tx.clone(),
+                        );
                         // `rebind_session` reset the transcript to Pi's default pad; re-read the
                         // swapped-in session's `outputPad` so a configured value survives the swap.
                         self.state.transcript.set_output_pad(
@@ -4568,26 +4710,63 @@ fn spawn_bash(command: String) -> (tokio::sync::mpsc::UnboundedReceiver<BashMsg>
     (rx, cancel)
 }
 
+/// Write the OSC 0 window-title sequence — Pi `ProcessTerminal.setTitle`
+/// (`pi/packages/tui/src/terminal.ts:504-507`, `\x1b]0;${title}\x07`).
+///
+/// `[CYRUP-DELTA]`: control characters are stripped first. Pi interpolates the extension-supplied
+/// string verbatim, so a title containing `BEL`/`ESC` would close the OSC early and let the rest of
+/// the string be interpreted as terminal commands. Stripping keeps an extension from driving the
+/// terminal through a title.
+pub fn write_terminal_title(title: &str) {
+    use std::io::Write;
+    let safe: String = title.chars().filter(|c| !c.is_control()).collect();
+    let mut out = io::stdout();
+    let _ = out.write_all(format!("\x1b]0;{safe}\x07").as_bytes());
+    let _ = out.flush();
+}
+
+/// How long the reader thread idles between `event::poll` rounds when nothing is held.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The much shorter poll used while [`StrayReplyFilter`] is holding events. A held opener (a bare
+/// `Esc`, or `Alt+]`) is released after at most this long, so a real `Escape` press costs one
+/// imperceptible tick rather than a full [`INPUT_POLL_INTERVAL`] — the standard escape-timeout
+/// trade every terminal app makes to tell `ESC` from an escape *sequence*.
+const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+
 /// A terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
 /// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
 /// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
+///
+/// Every event first passes through [`StrayReplyFilter`], the port of Pi's
+/// `consumeOsc11BackgroundResponse` guard (`tui/src/tui.ts:788-794`): a terminal that answers the
+/// boot-time OSC 11 probe *after* [`crate::terminal_query`]'s deadline would otherwise have its
+/// reply decoded by crossterm into keystrokes and typed into the prompt. The filter only ever
+/// removes a complete, terminated OSC 11 frame; anything it holds is replayed the moment the match
+/// fails or the input goes idle — see that module's safety contract.
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
-        while !cancel.is_cancelled() {
-            match event::poll(Duration::from_millis(100)) {
+        let mut filter = StrayReplyFilter::new();
+        let mut released: Vec<Event> = Vec::new();
+        'reader: while !cancel.is_cancelled() {
+            let wait =
+                if filter.is_holding() { HELD_FLUSH_INTERVAL } else { INPUT_POLL_INTERVAL };
+            match event::poll(wait) {
                 Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if let Some(mapped) = map_event(ev)
-                            && tx.send(mapped).is_err()
-                        {
-                            break;
-                        }
-                    }
+                    Ok(ev) => filter.push(ev, &mut released),
                     Err(_) => break,
                 },
-                Ok(false) => {}
+                // Idle: nothing more is coming, so release whatever the filter is holding.
+                Ok(false) => filter.flush(&mut released),
                 Err(_) => break,
+            }
+            for ev in released.drain(..) {
+                if let Some(mapped) = map_event(ev)
+                    && tx.send(mapped).is_err()
+                {
+                    break 'reader;
+                }
             }
         }
     });
@@ -4604,6 +4783,82 @@ fn map_event(ev: Event) -> Option<InputEvent> {
         Event::FocusGained => Some(InputEvent::FocusGained),
         Event::FocusLost => Some(InputEvent::FocusLost),
         Event::Mouse(_) => None,
+    }
+}
+
+/// The production input pipeline end-to-end: what [`crossterm_input_stream`]'s reader thread does
+/// to a burst of raw crossterm events, i.e. [`StrayReplyFilter`] followed by [`map_event`], with the
+/// idle flush at the end of the burst.
+#[cfg(test)]
+fn input_pipeline(raw: Vec<Event>) -> Vec<InputEvent> {
+    let mut filter = StrayReplyFilter::new();
+    let mut released: Vec<Event> = Vec::new();
+    let mut out: Vec<InputEvent> = Vec::new();
+    for ev in raw {
+        filter.push(ev, &mut released);
+        out.extend(released.drain(..).filter_map(map_event));
+    }
+    // Input has gone quiet: the reader thread's `Ok(false)` poll arm.
+    filter.flush(&mut released);
+    out.extend(released.drain(..).filter_map(map_event));
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod stray_reply_pipeline_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ch(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// A user launched cyrup and got `11;rgb:0c0c/0b0b/1313` typed into their prompt: the terminal
+    /// answered the boot OSC 11 probe after `terminal_query`'s 100 ms deadline, so the reply reached
+    /// the crossterm reader and was shredded into keys. Drive the exact shredded burst through the
+    /// real reader-thread pipeline and then through the real editor, and assert the prompt is empty.
+    #[test]
+    fn a_late_osc11_reply_never_reaches_the_editor() {
+        let mut raw = vec![Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT))];
+        raw.extend("11;rgb:0c0c/0b0b/1313".chars().map(ch));
+        // BEL (0x07) reaches crossterm's C0 arm as Ctrl+G.
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+
+        let delivered = input_pipeline(raw);
+        assert!(delivered.is_empty(), "no input event may survive the frame, got {delivered:?}");
+
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        for ev in &delivered {
+            app.handle_input(ev);
+        }
+        assert_eq!(app.state().editor.text(), "", "the prompt must be untouched");
+    }
+
+    /// The safety half: the same pipeline must deliver ordinary typing byte-for-byte, including the
+    /// two keys the filter is allowed to hold (`Escape` and `Alt+]`).
+    #[test]
+    fn ordinary_typing_survives_the_pipeline_intact() {
+        let mut raw: Vec<Event> = "hello 11; world".chars().map(ch).collect();
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT)));
+
+        let delivered = input_pipeline(raw.clone());
+        assert_eq!(delivered.len(), raw.len(), "every key must be delivered: {delivered:?}");
+        for (i, (got, want)) in delivered.iter().zip(raw.iter()).enumerate() {
+            match (got, want) {
+                (InputEvent::Key(a), Event::Key(b)) => assert_eq!(a, b, "event {i} differs"),
+                other => panic!("event {i} changed shape: {other:?}"),
+            }
+        }
+
+        // And it lands in the editor as the literal text the user typed.
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        for ev in &delivered {
+            app.handle_input(ev);
+        }
+        assert_eq!(app.state().editor.text(), "hello 11; world");
     }
 }
 

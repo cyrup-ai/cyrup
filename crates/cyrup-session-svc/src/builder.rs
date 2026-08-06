@@ -700,8 +700,32 @@ impl SessionBuilder {
         // calls `NativeExtension::set_host_services` before `init`; the manager / ui sink / inject sink
         // attach later (steps 6/10 + the mode entry point) and the captured `Arc` observes them.
         let native_services: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
+        // EXT-S01: CONTAIN a native extension's load/`init` failure. This loop used to propagate the
+        // first error with a bare `?`, so one built-in (permission-system, intercom, subagents)
+        // failing `init` took the ENTIRE session down — no session at all, and the remaining natives
+        // were never even attempted. Pi records a per-extension load failure and keeps building
+        // (`LoadExtensionsResult.errors`, surfaced as `Failed to load extension "<path>": <err>`,
+        // main.ts:735-738). Collected here and folded into `startup_diagnostics.extensions` below
+        // (the same channel the wasm/disk path at step 4c already uses), so a contained failure
+        // reaches BOTH the `[Extension issues]` startup panel AND — because it is marked `fatal` —
+        // `AgentSessionRuntime::diagnostics()`, where the bin reports it on stderr and exits 1 in
+        // every mode (Pi main.ts:843-849). Containment is per-extension, NOT forgiveness: Pi keeps
+        // building past the failure and then refuses to run. The natives are cyrup's security
+        // built-ins (permission-system, intercom), so anything short of a non-zero exit would turn
+        // a failed permission gate into a fail-OPEN session.
+        let mut native_load_errors: Vec<crate::services::ExtensionLoadDiagnostic> = Vec::new();
         for ext in self.native_extensions {
-            host.load_native_with_services(ext, native_services.clone()).await?;
+            let id = ext.id();
+            if let Err(e) = host.load_native_with_services(ext, native_services.clone()).await {
+                tracing::error!(extension = %id, error = %e, "native extension failed to load");
+                native_load_errors.push(crate::services::ExtensionLoadDiagnostic {
+                    // A native built-in has no on-disk path; its id is the display key the panel
+                    // shows (Pi's per-extension diagnostics are keyed by the loader's path).
+                    path: PathBuf::from(id.as_str()),
+                    error: e.to_string(),
+                    fatal: true,
+                });
+            }
         }
         let ext_host = Arc::new(host);
 
@@ -771,9 +795,12 @@ impl SessionBuilder {
         // floor here. Pi shows them at startup even under `quietStartup`
         // (`showDiagnosticsWhenQuiet: true`, interactive-mode.ts:1769), so they now travel on
         // `AgentSessionServices::startup_diagnostics` for the front-end to render.
-        #[cfg_attr(not(feature = "wasm-host"), allow(unused_mut))]
-        let mut startup_diagnostics =
-            crate::services::StartupDiagnostics { resources: report.diagnostics.clone(), ..Default::default() };
+        let mut startup_diagnostics = crate::services::StartupDiagnostics {
+            resources: report.diagnostics.clone(),
+            // EXT-S01: the native built-ins that failed to load at step 4b, contained above.
+            extensions: native_load_errors,
+            ..Default::default()
+        };
         // A malformed `packages` entry never takes the settings document (or the session) down; it
         // is reported alongside the discovery diagnostics.
         for message in package_errors {
@@ -835,13 +862,16 @@ impl SessionBuilder {
             let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
             // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
             // diagnostics, main.ts:679-682) are retained on `startup_diagnostics` so the TUI can
-            // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here.
+            // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here. Each
+            // carries its `fatal` flag through unchanged, so a genuine load fault also reaches the
+            // bin's exit-1 checkpoint while the project-trust skip does not (`LoadError::fatal`).
             let load_result =
                 ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
             startup_diagnostics.extensions.extend(load_result.errors.iter().map(|e| {
                 crate::services::ExtensionLoadDiagnostic {
                     path: e.path.clone(),
                     error: e.error.clone(),
+                    fatal: e.fatal,
                 }
             }));
         }
@@ -869,7 +899,13 @@ impl SessionBuilder {
                     (name.clone(), ov)
                 })
                 .collect();
-            ext_host.apply_extension_flag_values(&overrides)?;
+            // SEAM-S01: the reconciliation diagnostics — `Unknown option(s): --foo` and
+            // `Extension flag "--foo" requires a value` (Pi agent-session-services.ts:98-125) — are
+            // retained here. They used to be `continue`d away inside the ext-host, so a mistyped
+            // `--flag` produced no message and no non-zero exit. Pi merges them into
+            // `services.diagnostics` (:182), which becomes `runtime.diagnostics` and is reported +
+            // `process.exit(1)`-ed at main.ts:843-848.
+            startup_diagnostics.flags.extend(ext_host.apply_extension_flag_values(&overrides)?);
         }
 
         // Bind the shared model-registry sink and FLUSH any provider registrations queued while native

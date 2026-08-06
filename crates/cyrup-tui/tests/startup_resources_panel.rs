@@ -190,6 +190,8 @@ fn extension_load_errors_map_from_the_session_services_shape() {
     let errors = vec![ExtensionLoadDiagnostic {
         path: PathBuf::from("/home/u/.cyrup/extensions/broken"),
         error: "untrusted project-local extension".to_string(),
+        // The trust skip is reported in the panel but is NOT the fatal load-failure class.
+        fatal: false,
     }];
     let home = PathBuf::from("/home/u");
     let report = StartupReport {
@@ -201,4 +203,29 @@ fn extension_load_errors_map_from_the_session_services_shape() {
     assert!(out.contains("[Extension issues]"), "{out}");
     assert!(out.contains("~/.cyrup/extensions/broken"), "{out}");
     assert!(out.contains("untrusted project-local extension"), "{out}");
+}
+
+/// EXT-S01: a NATIVE built-in whose `init()` failed is now contained by the session builder and
+/// recorded on the same channel — but keyed by its extension ID, not an on-disk path (a native has
+/// none). The panel must still name it and its error. Without this the containment fix would be a
+/// silent swallow, which is strictly worse than the abort it replaced.
+#[test]
+fn a_contained_native_init_failure_renders_under_extension_issues() {
+    let errors = vec![ExtensionLoadDiagnostic {
+        path: PathBuf::from("permission-system"),
+        error: "extension panicked: policy file unreadable".to_string(),
+        fatal: true,
+    }];
+    let report = StartupReport {
+        // Under `quietStartup` the LISTING is suppressed but the diagnostics are not
+        // (`showDiagnosticsWhenQuiet: true`, interactive-mode.ts:1769) — the case that matters,
+        // since a user who never sees the inventory must still see the failure.
+        quiet_startup: true,
+        extension_diagnostics: extension_diagnostics(&errors, Some(&PathBuf::from("/home/u"))),
+        ..Default::default()
+    };
+    let (_app, out) = commit(&report);
+    assert!(out.contains("[Extension issues]"), "{out}");
+    assert!(out.contains("permission-system"), "the failing extension must be named:\n{out}");
+    assert!(out.contains("policy file unreadable"), "{out}");
 }

@@ -62,6 +62,7 @@ mod startup;
 mod startup_selector;
 mod status;
 mod status_indicator;
+mod stray_reply;
 mod terminal_query;
 mod text_input;
 mod theme;

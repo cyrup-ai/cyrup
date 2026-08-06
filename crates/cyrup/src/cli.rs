@@ -2,8 +2,11 @@
 //! (arch-11 §3.7/§6.1; R-11-001/024). A 1:1 port of Pi `cli/args.ts`: every flag Pi's hand-rolled
 //! parser accepts is present here, with Pi's short aliases (incl. the multi-char `-nt`/`-nbt`/`-xt`/
 //! `-ne`/`-ns`/`-np`/`-nc`/`-na` forms, which clap cannot express as native shorts — they are
-//! rewritten to their long forms by [`normalize_short_aliases`] before parsing). Kept free of I/O so
-//! the mapping is unit-testable.
+//! rewritten to their long forms by [`normalize_short_aliases`] before parsing). The mapping is
+//! otherwise free of I/O so it stays unit-testable; the ONE exception is
+//! [`resolve_prompt_input`], Pi's `resolvePromptInput` (resource-loader.ts:53-68), which must stat
+//! and read the `--system-prompt`/`--append-system-prompt` token to decide path-vs-literal. It takes
+//! its `cwd` explicitly so a test can point it at a tempdir.
 
 use std::path::PathBuf;
 
@@ -13,6 +16,8 @@ use cyrup_sdk::core::ModelThinkingLevel;
 use cyrup_session_svc::{
     ExtensionFlagValue as SvcExtensionFlagValue, NoTools, SessionConfig, SessionTarget,
 };
+
+use crate::diagnostics::Diagnostic;
 
 /// Pi's primary output selector `--mode <text|json|rpc>` (args.ts:78-82).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -356,22 +361,50 @@ impl Cli {
         }
     }
 
-    /// The `--append-system-prompt` parts joined (Pi keeps a `string[]`; the builder takes one
-    /// blob). `None` when empty.
-    pub fn append_system_prompt_joined(&self) -> Option<String> {
+    /// The `--append-system-prompt` parts, each run through [`resolve_prompt_input`] and then joined
+    /// (Pi keeps a `string[]` and resolves EVERY entry independently — resource-loader.ts:536-538 —
+    /// then joins with a BLANK LINE at agent-session.ts:1039-1040; the builder takes one blob).
+    /// `None` when empty. Any per-entry read warning is returned alongside.
+    pub fn append_system_prompt_resolved(
+        &self,
+        cwd: &std::path::Path,
+    ) -> (Option<String>, Vec<Diagnostic>) {
         if self.append_system_prompt.is_empty() {
-            None
-        } else {
-            Some(self.append_system_prompt.join("\n"))
+            return (None, Vec::new());
         }
+        let mut diags = Vec::new();
+        let parts: Vec<String> = self
+            .append_system_prompt
+            .iter()
+            .map(|raw| {
+                let (text, warn) = resolve_prompt_input(cwd, raw, "append system prompt");
+                diags.extend(warn);
+                text
+            })
+            .collect();
+        (Some(parts.join("\n\n")), diags)
     }
 
-    /// Map the CLI + resolved directories + runtime mode onto a [`SessionConfig`] (arch-11 §3.7).
+    /// Map the CLI + resolved directories + runtime mode onto a [`SessionConfig`] (arch-11 §3.7),
+    /// discarding the prompt-file read warnings. Use [`Self::to_session_config_with_diagnostics`]
+    /// on the production path so the warnings reach the user.
+    pub fn to_session_config(&self, dirs: &ConfigDirs, mode: AppMode) -> SessionConfig {
+        self.to_session_config_with_diagnostics(dirs, mode).0
+    }
+
+    /// Map the CLI + resolved directories + runtime mode onto a [`SessionConfig`] (arch-11 §3.7),
+    /// plus any diagnostics produced while mapping (today: the `--system-prompt` /
+    /// `--append-system-prompt` file-read warnings, Pi `resolvePromptInput`).
     ///
     /// Persistence (R-11-008): one-shot PRINT/JSON default to an ephemeral in-memory session unless a
     /// session is explicitly resumed/continued; interactive always persists. `--no-session` forces
     /// ephemeral in every mode (Pi `noSession`, args.ts:104).
-    pub fn to_session_config(&self, dirs: &ConfigDirs, mode: AppMode) -> SessionConfig {
+    pub fn to_session_config_with_diagnostics(
+        &self,
+        dirs: &ConfigDirs,
+        mode: AppMode,
+    ) -> (SessionConfig, Vec<Diagnostic>) {
+        let mut prompt_diagnostics: Vec<Diagnostic> = Vec::new();
         let mut config = SessionConfig::new(dirs.cwd.clone(), dirs.agent_dir.clone());
         // Thread the REAL user home (not the agent dir) so the resources ancestor-walk dedup
         // (`~/.agents/skills`) and the trust-requiring-resource walk resolve against `$HOME`, exactly
@@ -416,8 +449,18 @@ impl Cli {
         config.extra_skill_paths = resolve_cli_paths(&dirs.cwd, &self.skill);
         config.extra_prompt_paths = resolve_cli_paths(&dirs.cwd, &self.prompt_template);
         config.extra_theme_paths = resolve_cli_paths(&dirs.cwd, &self.theme);
-        config.system_prompt = self.system_prompt.clone();
-        config.append_system_prompt = self.append_system_prompt_joined();
+        // CFG-S01: `--system-prompt`/`--append-system-prompt` take EITHER literal text or a path,
+        // decided purely by existence (Pi `resolvePromptInput`, resource-loader.ts:53-68, applied at
+        // :526 and :536-538). cyrup used to thread the raw token straight through, so a path became
+        // the literal system prompt text.
+        config.system_prompt = self.system_prompt.as_deref().map(|raw| {
+            let (text, warn) = resolve_prompt_input(&dirs.cwd, raw, "system prompt");
+            prompt_diagnostics.extend(warn);
+            text
+        });
+        let (append, append_diags) = self.append_system_prompt_resolved(&dirs.cwd);
+        prompt_diagnostics.extend(append_diags);
+        config.append_system_prompt = append;
         config.no_tools = self.no_tools_mode();
         if !self.tools.is_empty() {
             config.tools = Some(self.tools.clone());
@@ -443,7 +486,7 @@ impl Cli {
             SessionTarget::Resume(_) | SessionTarget::Continue
         );
         config.persist = !self.no_session && (explicit_session || mode == AppMode::Interactive);
-        config
+        (config, prompt_diagnostics)
     }
 
     /// Trim each comma-split segment of the delimited list flags, matching Pi's own post-split
@@ -560,6 +603,48 @@ pub fn assert_valid_session_id(id: &str) -> Result<(), String> {
         Err("Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', \
              and start and end with an alphanumeric character"
             .to_string())
+    }
+}
+
+/// Port of Pi `resolvePromptInput` (`coding-agent/src/core/resource-loader.ts:53-68`) — the
+/// path-or-literal rule behind `--system-prompt` / `--append-system-prompt` (whose own help text
+/// says "Append text or file contents", args.ts:261).
+///
+/// The decision is made **purely by existence**, not by a prefix, an extension, or a `@` sigil:
+///
+/// * `input` names something that exists ⇒ read it and use the CONTENTS;
+/// * it exists but cannot be read (a directory, a permissions error) ⇒ warn and fall back to the
+///   literal string — Pi's `console.error(chalk.yellow("Warning: Could not read <description> file
+///   <path>: <err>"))` + `return input`. It is deliberately NOT fatal;
+/// * it does not exist ⇒ the literal string, with no diagnostic.
+///
+/// `cwd` anchors a relative token, which is what Pi's bare `existsSync(input)`/`readFileSync(input)`
+/// does against `process.cwd()`; passing it explicitly keeps the function testable. Contents are
+/// decoded lossily to mirror Node's `readFileSync(path, "utf-8")` (which substitutes U+FFFD rather
+/// than failing), so a non-UTF-8 file is not silently turned back into its own path.
+pub fn resolve_prompt_input(
+    cwd: &std::path::Path,
+    input: &str,
+    description: &str,
+) -> (String, Vec<Diagnostic>) {
+    // Pi's `if (!input) return undefined` guard: an empty token is never probed as a path (joining it
+    // onto `cwd` would otherwise "exist" as the cwd itself and warn).
+    if input.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let candidate = std::path::Path::new(input);
+    let path = if candidate.is_absolute() { candidate.to_path_buf() } else { cwd.join(candidate) };
+    if !path.exists() {
+        return (input.to_string(), Vec::new());
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), Vec::new()),
+        Err(e) => (
+            input.to_string(),
+            vec![Diagnostic::warning(format!(
+                "Could not read {description} file {input}: {e}"
+            ))],
+        ),
     }
 }
 
@@ -942,6 +1027,7 @@ Built-in Tool Names:
 )]
 mod tests {
     use super::*;
+    use crate::diagnostics::DiagnosticLevel;
 
     fn parse(args: &[&str]) -> Cli {
         let mut full = vec!["cyrup".to_string()];
@@ -1372,9 +1458,11 @@ mod tests {
         assert_eq!(config.cwd, PathBuf::from("/work"));
         assert_eq!(config.model_pattern.as_deref(), Some("faux/faux-1"));
         assert_eq!(config.system_prompt.as_deref(), Some("be terse"));
+        // CFG-S01: Pi joins the `--append-system-prompt` entries with a BLANK LINE
+        // (`loaderAppendSystemPrompt.join("\n\n")`, agent-session.ts:1039-1040); cyrup used `\n`.
         assert_eq!(
             config.append_system_prompt.as_deref(),
-            Some("cite sources\nstay calm")
+            Some("cite sources\n\nstay calm")
         );
         assert_eq!(config.thinking_level, Some(ModelThinkingLevel::Low));
         assert_eq!(config.no_tools, Some(NoTools::All));
@@ -1581,5 +1669,100 @@ mod tests {
             Some("together/moonshotai/Kimi-K2.6")
         );
         assert_eq!(after.positionals, vec!["Reply with pong".to_string()]);
+    }
+
+    // ===================================================== CFG-S01: --system-prompt is path-or-text
+
+    /// Build a `ConfigDirs` whose `cwd` is a real tempdir, so relative-path resolution can be
+    /// exercised exactly the way Pi's `existsSync(input)` resolves against `process.cwd()`.
+    fn dirs_at(cwd: &std::path::Path) -> ConfigDirs {
+        ConfigDirs { cwd: cwd.to_path_buf(), ..dirs() }
+    }
+
+    /// THE bug: `--system-prompt <path>` used the PATH as the prompt text. Pi
+    /// (`resolvePromptInput`, resource-loader.ts:53-68 → applied at :526) reads the file when the
+    /// token names something that exists.
+    #[test]
+    fn system_prompt_reads_the_file_when_the_token_is_an_existing_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("persona.md");
+        std::fs::write(&file, "You are a rigorous reviewer.\n").unwrap();
+
+        // Absolute form.
+        let cli = parse(&["--system-prompt", file.to_str().unwrap()]);
+        let cfg = cli.to_session_config(&dirs_at(tmp.path()), AppMode::Print);
+        assert_eq!(cfg.system_prompt.as_deref(), Some("You are a rigorous reviewer.\n"));
+
+        // Relative form, resolved against the cwd (Pi's bare `existsSync(input)`).
+        let cli = parse(&["--system-prompt", "persona.md"]);
+        let cfg = cli.to_session_config(&dirs_at(tmp.path()), AppMode::Print);
+        assert_eq!(cfg.system_prompt.as_deref(), Some("You are a rigorous reviewer.\n"));
+    }
+
+    /// The other half of the rule, and the reason the fix cannot be "always treat it as a path":
+    /// a token that does not exist is LITERAL prompt text, with no diagnostic.
+    #[test]
+    fn system_prompt_keeps_literal_text_when_no_such_file_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cli = parse(&["--system-prompt", "be terse and never apologise"]);
+        let (cfg, diags) =
+            cli.to_session_config_with_diagnostics(&dirs_at(tmp.path()), AppMode::Print);
+        assert_eq!(cfg.system_prompt.as_deref(), Some("be terse and never apologise"));
+        assert!(diags.is_empty(), "a non-path token is not a failure: {diags:?}");
+    }
+
+    /// Pi resolves EVERY `--append-system-prompt` entry independently (resource-loader.ts:536-538),
+    /// mixing files and literals freely, then joins with a BLANK LINE (agent-session.ts:1039-1040).
+    /// cyrup joined with a single `\n` — a second, smaller divergence folded into the same fix.
+    #[test]
+    fn each_append_system_prompt_entry_resolves_independently_and_joins_with_a_blank_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("rules.md"), "Always cite sources.").unwrap();
+
+        let cli = parse(&[
+            "--append-system-prompt",
+            "rules.md",
+            "--append-system-prompt",
+            "stay calm",
+        ]);
+        let cfg = cli.to_session_config(&dirs_at(tmp.path()), AppMode::Print);
+        assert_eq!(
+            cfg.append_system_prompt.as_deref(),
+            Some("Always cite sources.\n\nstay calm"),
+        );
+    }
+
+    /// An EXISTING but unreadable token (here: a directory) warns and falls back to the literal —
+    /// Pi's `catch` arm returns `input` rather than throwing (resource-loader.ts:60-63). This is the
+    /// case that must NOT be fatal.
+    #[test]
+    fn an_unreadable_prompt_file_warns_and_falls_back_to_the_literal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+
+        let cli = parse(&["--system-prompt", "a-directory"]);
+        let (cfg, diags) =
+            cli.to_session_config_with_diagnostics(&dirs_at(tmp.path()), AppMode::Print);
+
+        assert_eq!(cfg.system_prompt.as_deref(), Some("a-directory"), "literal fallback");
+        assert_eq!(diags.len(), 1, "expected one warning, got {diags:?}");
+        assert_eq!(diags[0].level, DiagnosticLevel::Warning, "never fatal");
+        assert!(
+            diags[0].message.starts_with("Could not read system prompt file a-directory: "),
+            "message: {}",
+            diags[0].message
+        );
+    }
+
+    /// An empty `--system-prompt ""` must not be probed as a path (joining `""` onto the cwd would
+    /// "exist" as the cwd itself and produce a bogus unreadable-file warning). Pi's
+    /// `if (!input) return undefined` guard.
+    #[test]
+    fn an_empty_prompt_token_is_never_probed_as_a_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (text, diags) = resolve_prompt_input(tmp.path(), "", "system prompt");
+        assert_eq!(text, "");
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

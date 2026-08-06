@@ -271,8 +271,11 @@ async fn run() -> anyhow::Result<i32> {
         report_diagnostics(&[Diagnostic::warning(warning)]);
     }
 
-    // Map CLI → SessionConfig.
-    let mut config = cli.to_session_config(&dirs, mode);
+    // Map CLI → SessionConfig. The diagnostics half is Pi's `resolvePromptInput` warning channel
+    // (resource-loader.ts:60-63): a `--system-prompt`/`--append-system-prompt` token that names an
+    // EXISTING but unreadable file warns and falls back to being used as literal text — never fatal.
+    let (mut config, prompt_diagnostics) = cli.to_session_config_with_diagnostics(&dirs, mode);
+    report_diagnostics(&prompt_diagnostics);
 
     // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
     // `--session`/`--fork` partial-UUID prefix match, a global cross-project search, a
@@ -448,6 +451,12 @@ async fn run() -> anyhow::Result<i32> {
         let runtime = AgentSessionRuntime::create(factory, target)
             .await
             .context("building agent session runtime")?;
+        // Pi main.ts:843-848 — report the runtime's build diagnostics and exit 1 on any error
+        // (today: the extension-flag reconciliation errors, SEAM-S01).
+        if report_runtime_diagnostics(&runtime).await {
+            runtime.dispose().await;
+            return Ok(1);
+        }
         let session = runtime.session().await;
         apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
         // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
@@ -548,6 +557,12 @@ async fn run() -> anyhow::Result<i32> {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
+            // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
+            if report_runtime_diagnostics(&runtime).await {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return Ok(1);
+            }
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
@@ -640,6 +655,12 @@ async fn run() -> anyhow::Result<i32> {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
+            // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
+            if report_runtime_diagnostics(&runtime).await {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return Ok(1);
+            }
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
@@ -1268,6 +1289,10 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
             ResourceKind::Prompt,
             home,
         ),
+        // The whole extension vector, Pi-faithfully (`:1660-1665` maps every recorded error into the
+        // block). In practice only the NON-fatal entries — the project-trust skips — are reachable
+        // here: a genuine load failure is reported and exits 1 at `report_runtime_diagnostics`, well
+        // before this panel is built, exactly as Pi's `main.ts:843-849` precedes `InteractiveMode`.
         extension_diagnostics: cyrup_tui::extension_diagnostics(
             &services.startup_diagnostics.extensions,
             home,
@@ -1520,6 +1545,44 @@ fn report_diagnostics(diagnostics: &[Diagnostic]) {
         }
     }
 }
+
+/// Pi's SECOND `reportDiagnostics` checkpoint — `reportDiagnostics(runtime.diagnostics)` +
+/// `process.exit(1)` on any error (main.ts:843-848). Returns `true` when the caller must exit 1.
+///
+/// SEAM-S01: `AgentSessionRuntime::diagnostics()` had NO production consumer, which is why a
+/// mistyped `--flag` (captured as an extension flag, then owned by no loaded extension) was
+/// swallowed with no message and exit 0. Runs in every mode, exactly like Pi's single call site,
+/// which sits after runtime creation and before the mode dispatch.
+///
+/// EXT-S01: extension LOAD failures ride this channel too. Containment (one built-in's failing
+/// `init()` no longer aborts the whole build) is Pi's `loader.ts:537-540` `errors.push(...); continue`
+/// — but Pi then LIFTS those errors onto `runtime.diagnostics` (`main.ts:735-738`) and exits 1 on
+/// them, including Pi's `EXTENSION_LOAD_FAILURE_HINT` (`main.ts:61`, `:844-846`), reproduced below.
+/// Routing them to the interactive-only `[Extension issues]` panel alone would leave print/json/rpc
+/// silent at exit 0 — and cyrup's natives include the permission gate, so that would be fail-OPEN.
+async fn report_runtime_diagnostics(runtime: &AgentSessionRuntime) -> bool {
+    let diagnostics = runtime.diagnostics().await;
+    let mut fatal = false;
+    for d in &diagnostics {
+        if d.severity == "error" {
+            fatal = true;
+            eprintln!("Error: {}", d.message);
+        } else {
+            eprintln!("Warning: {}", d.message);
+        }
+    }
+    // Pi `main.ts:844-846`: matched on the message text, over ALL diagnostics, not just the errors.
+    if fatal && diagnostics.iter().any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER)) {
+        eprintln!("{EXTENSION_LOAD_FAILURE_HINT}");
+    }
+    fatal
+}
+
+/// Pi `main.ts:844` — the substring that selects the extension-load hint.
+const EXTENSION_LOAD_FAILURE_MARKER: &str = "Failed to load extension";
+
+/// Pi `EXTENSION_LOAD_FAILURE_HINT` (main.ts:61), rebranded to cyrup's own `-ne` short flag.
+const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"cyrup -ne\".";
 
 /// Drain settings load/parse errors into warning diagnostics (Pi `collectSettingsDiagnostics`,
 /// main.ts:77-85): `(<context>, <scope> settings) <message>`. Builds a throwaway `SettingsManager`

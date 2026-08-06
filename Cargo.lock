@@ -1432,6 +1432,7 @@ dependencies = [
  "cyrup-provider",
  "cyrup-resources",
  "cyrup-session-svc",
+ "cyrup-tools",
  "futures",
  "image",
  "pulldown-cmark",

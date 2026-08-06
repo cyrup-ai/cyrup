@@ -42,9 +42,22 @@
 //!    before that reader exists is correct — and `std::io::Stdin`'s own buffer is still untouched at
 //!    this point, so nothing is stranded inside it either.)
 //!
-//! Residual risk, stated plainly: a terminal that answers OSC 11 but *not* DA1, more than `timeout`
-//! late, will have its reply reach crossterm and be decoded as stray key events. Pi has the same
-//! exposure (its `setTimeout` also just gives up). The window is one 100 ms boot-time slice.
+//! Residual risk, and how it is now covered: a terminal that answers OSC 11 but *not* DA1, more than
+//! `timeout` late, has its reply reach crossterm and decoded as stray key events. That is a real,
+//! user-reported failure (`11;rgb:0c0c/0b0b/1313` typed into the prompt at launch). Pi is not exposed
+//! to it because its `setTimeout` giving up is only its FIRST line of defence — `handleTerminalInput`
+//! (`tui/src/tui.ts:788-794`) also swallows an OSC 11 / colour-scheme reply arriving at ANY later
+//! time, before any input listener sees it. [`crate::stray_reply`] is the port of that second
+//! mechanism, operating over crossterm's already-parsed key events rather than raw bytes; it is
+//! installed in [`crate::app::crossterm_input_stream`]'s reader thread. A longer `timeout` here would
+//! only narrow the window and would cost every user that latency at every launch, so it is unchanged.
+//!
+//! The DSR `?996` reply has a different exposure that a key-level filter cannot reach: crossterm's
+//! `parse_csi` `?` arm terminates only on a final `u` or `c`, so a late `CSI ? 997 ; 1 n` emits ZERO
+//! events and leaves the sequence wedged in crossterm's buffer until some later `c` flushes it —
+//! destroying the keystrokes in between. The DA1 sentinel appended to every probe here is what makes
+//! that unreachable in practice: a terminal answering the DSR late answers DA1 late too, and the DA1
+//! reply's trailing `c` flushes the buffer in the same read.
 
 use std::time::Duration;
 

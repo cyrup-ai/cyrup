@@ -18,6 +18,15 @@ use cyrup_session::prompt::ContextStore;
 pub struct ExtensionLoadDiagnostic {
     pub path: PathBuf,
     pub error: String,
+    /// Whether this is a genuine LOAD FAILURE — the class Pi lifts onto `runtime.diagnostics` as
+    /// `{type:"error", message:'Failed to load extension "<path>": <err>'}` (main.ts:735-738) and
+    /// then exits 1 on, in EVERY mode (main.ts:843-849). Read by
+    /// [`crate::AgentSessionRuntime::diagnostics`]; the `[Extension issues]` panel shows the whole
+    /// vector regardless.
+    ///
+    /// `false` only for the project-trust skip, which Pi filters out before its loader ever runs
+    /// (see [`cyrup_ext::LoadError::fatal`]).
+    pub fatal: bool,
 }
 
 /// Everything that went wrong (or was shadowed) while this session's resources were discovered and
@@ -36,6 +45,12 @@ pub struct StartupDiagnostics {
     /// `ResourceDiagnostic::resource_type` at render time.
     pub resources: Vec<ResourceDiagnostic>,
     /// Extensions that did not load (world-version mismatch, untrusted project-local, load fault).
+    ///
+    /// Two consumers, both required (EXT-S01): the `[Extension issues]` startup panel renders the
+    /// whole vector, and [`crate::AgentSessionRuntime::diagnostics`] republishes the
+    /// [`ExtensionLoadDiagnostic::fatal`] subset as `type: "error"` so the bin reports it on stderr
+    /// and exits 1 in every mode, exactly as Pi does (main.ts:735-738 → :843-849). The panel alone
+    /// is not enough: it is interactive-only, so a print/json/rpc run would exit 0 in silence.
     pub extensions: Vec<ExtensionLoadDiagnostic>,
     /// `models.json` problems: a load/parse failure, or a provider block rejected during
     /// composition. Pi keeps the exact same channel — `ModelConfig.getError()` for the whole file
@@ -43,12 +58,24 @@ pub struct StartupDiagnostics {
     /// (model-runtime.ts:104) — and starts normally with the built-in registry either way
     /// (CFG-002).
     pub models: Vec<String>,
+    /// CLI extension-flag reconciliation ERRORS (SEAM-S01): `Unknown option(s): --foo` and
+    /// `Extension flag "--foo" requires a value`, produced once the loaded extensions' registered
+    /// flag specs are known (Pi `applyExtensionFlagValues`, agent-session-services.ts:98-125).
+    ///
+    /// Unlike every other field here these are `type: "error"` in Pi and are FATAL at the bin tier:
+    /// they merge into `services.diagnostics` (:182) → `runtime.diagnostics` → `reportDiagnostics` +
+    /// `process.exit(1)` (main.ts:843-848). Surfaced through
+    /// [`crate::AgentSessionRuntime::diagnostics`] rather than the `[Extension issues]` panel.
+    pub flags: Vec<String>,
 }
 
 impl StartupDiagnostics {
     /// Whether there is anything at all to report.
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty() && self.extensions.is_empty() && self.models.is_empty()
+        self.resources.is_empty()
+            && self.extensions.is_empty()
+            && self.models.is_empty()
+            && self.flags.is_empty()
     }
 }
 

@@ -237,8 +237,29 @@ impl ExtensionHost {
     /// whether they first late-bind the host-services slot (P-1).
     async fn load_native_inner(&self, ext: Arc<dyn NativeExtension>) -> Result<(), ExtError> {
         let id = ext.id();
+        // A DUPLICATE id is rejected here and must NOT release: the reservation belongs to the
+        // extension that is already loaded.
         self.reserve_id(&id)?;
+        // EXT-S01: every failure PAST the reservation releases it again. Otherwise a native whose
+        // `init()` returned `Err` stays in `loaded_ids()` — the startup listing reports it as
+        // loaded, and a later legitimate load of the same id fails with a spurious `DuplicateId`.
+        // Pi's `LoadExtensionsResult.extensions` only ever holds extensions that loaded; failures
+        // live in the sibling `errors` array. (Registrations already written to the registry before
+        // the failing step are left in place — a native `init` builds its whole `InitApi` before any
+        // of them run, so in practice `init` is the only failing step this can reach.)
+        let result = self.load_native_body(ext, id.clone()).await;
+        if result.is_err() {
+            self.release_id(&id);
+        }
+        result
+    }
 
+    /// The body of [`Self::load_native_inner`], run under its id reservation.
+    async fn load_native_body(
+        &self,
+        ext: Arc<dyn NativeExtension>,
+        id: ExtensionId,
+    ) -> Result<(), ExtError> {
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
         let (subs, tools, commands, tool_renderers, message_renderers) = api.into_parts();
@@ -804,39 +825,61 @@ impl ExtensionHost {
     }
 
     /// Apply CLI-captured extension-flag overrides (Pi `applyExtensionFlagValues`,
-    /// agent-session-services.ts:84-113). Called AFTER extensions load (so their `registerFlag`
+    /// agent-session-services.ts:84-125). Called AFTER extensions load (so their `registerFlag`
     /// specs are known). For each captured `(name, value)`:
-    /// - no loaded extension registered `name` ⇒ ignored (Pi records an "Unknown option" diagnostic
-    ///   and skips — cyrup drops it silently, the same no-effect outcome);
+    /// - no loaded extension registered `name` ⇒ collected into ONE `Unknown option(s): --a, --b`
+    ///   error (Pi :100-103,:118-124);
     /// - the registered flag's `type` is `boolean` ⇒ the stored value is `true` regardless of the
-    ///   token's value (Pi agent-session-services.ts:109);
+    ///   token's value (Pi :105-108);
     /// - the registered flag's `type` is `string` and the token carried a value ⇒ that string (Pi
-    ///   :113); a bare `--flag` on a string flag is skipped (Pi's "requires a value" diagnostic).
+    ///   :109-112);
+    /// - a bare `--flag` on a string-typed flag ⇒ an `Extension flag "--foo" requires a value` error
+    ///   and the registered default stands (Pi :113-116).
     ///
     /// The resolved value lands in the shared flag store so a guest's `getFlag(name)` reads the CLI
     /// value AHEAD of its registered default (gap-08 §5.6 — the step that was missing, so the
     /// 1:1-ported CLI capture used to be dropped one call short of `getFlag`).
+    ///
+    /// SEAM-S01: the two error classes used to be a bare `continue`, so a mistyped `--flag` was
+    /// swallowed with no message and no exit code. They are returned here in Pi's exact order —
+    /// every per-flag "requires a value" in iteration order, then the single aggregated "Unknown
+    /// option(s)" last — for the caller to surface (the bin reports them and exits 1, Pi
+    /// main.ts:843-848).
     pub fn apply_extension_flag_values(
         &self,
         flags: &[(String, ExtensionFlagOverride)],
-    ) -> Result<(), ExtError> {
+    ) -> Result<Vec<String>, ExtError> {
+        let mut diagnostics: Vec<String> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
         for (name, value) in flags {
             let spec = match self.registry.get_flag(name)? {
                 Some(s) => s,
-                // Unregistered flag: no extension owns it — ignored (Pi unknownFlags diagnostic).
-                None => continue,
+                // Unregistered flag: no extension owns it (Pi `unknownFlags.push(name)`, :101-102).
+                None => {
+                    unknown.push(name.clone());
+                    continue;
+                }
             };
             let is_boolean = spec.get("type").and_then(|t| t.as_str()) == Some("boolean");
             let resolved = match (is_boolean, value) {
                 (true, _) => Value::Bool(true),
                 (false, ExtensionFlagOverride::Str(s)) => Value::String(s.clone()),
                 // A string-typed flag passed with no value: Pi emits "requires a value" and does not
-                // set it — skip so the registered default stands.
-                (false, ExtensionFlagOverride::Bool(_)) => continue,
+                // set it, so the registered default stands (:113-116).
+                (false, ExtensionFlagOverride::Bool(_)) => {
+                    diagnostics.push(format!("Extension flag \"--{name}\" requires a value"));
+                    continue;
+                }
             };
             self.registry.set_flag_value(name.clone(), resolved)?;
         }
-        Ok(())
+        if !unknown.is_empty() {
+            // Pi pluralizes on the COUNT and joins with ", " (:120-123).
+            let plural = if unknown.len() == 1 { "" } else { "s" };
+            let names: Vec<String> = unknown.iter().map(|n| format!("--{n}")).collect();
+            diagnostics.push(format!("Unknown option{plural}: {}", names.join(", ")));
+        }
+        Ok(diagnostics)
     }
 
     /// Fan out every queued inter-extension bus event to its subscribers (gap-08 §5.3). Drains the
@@ -967,7 +1010,12 @@ impl ExtensionHost {
         for disc in self.discover(roots) {
             match self.load_discovered(&disc, project_trusted, services.clone()).await {
                 Ok(id) => result.loaded.push(id),
-                Err(e) => result.errors.push(LoadError { path: disc.dir.clone(), error: e.to_string() }),
+                Err(e) => result.errors.push(LoadError {
+                    path: disc.dir.clone(),
+                    // The trust-gate skip is NOT a load failure (see `LoadError::fatal`).
+                    fatal: !matches!(e, ExtError::Untrusted),
+                    error: e.to_string(),
+                }),
             }
         }
         result
@@ -1148,6 +1196,14 @@ impl ExtensionHost {
         }
         g.push(id.clone());
         Ok(())
+    }
+
+    /// Undo a [`Self::reserve_id`] after the load that claimed it failed (EXT-S01). Silent on a
+    /// poisoned lock — the load is already reporting its own error.
+    fn release_id(&self, id: &ExtensionId) {
+        if let Ok(mut g) = self.loaded.write() {
+            g.retain(|e| e != id);
+        }
     }
 }
 
