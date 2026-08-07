@@ -1052,6 +1052,37 @@ pub struct StepResult {
     /// Empty for every step whose control config was disabled, whose `notifyOn` excluded both
     /// classes, or that simply never tripped a threshold.
     pub control_events: Vec<crate::exec::control::ControlEvent>,
+    /// The child's REAL process exit code ([`crate::exec::SingleResult::exit_code`], pi
+    /// `result.exitCode` assigned at `runs/foreground/execution.ts:847` @v0.34.0), `None` for a
+    /// step whose executor did not run a child at all (every mock/test executor, and both
+    /// [`StepResult::success`]/[`StepResult::failure`] constructors).
+    ///
+    /// Carried for the same declared reason `control_events` is — something one layer OUT needs it
+    /// and there is no other channel. pi's `collectDynamicResults` copies the child's real code
+    /// straight onto each collect record (`runs/shared/dynamic-fanout.ts:278`:
+    /// `exitCode: result?.exitCode ?? null`), so a `2` or a `137` reaches a downstream
+    /// `{outputs.<collect.as>}` consumer; deriving the field from `success` instead collapses every
+    /// failure to exactly `1`.
+    pub exit_code: Option<i32>,
+    /// The child was killed by the run deadline ([`crate::exec::SingleResult::timed_out`], pi
+    /// `result.timedOut`, `execution.ts:274`/`:712`) — the flag `collectDynamicResults` spreads as
+    /// `timedOut: true` (`dynamic-fanout.ts:283`), which is the ONLY thing distinguishing a
+    /// deadline kill from an ordinary failure in a collect record. `false` for every step that
+    /// finished within its budget and for every executor that runs no child.
+    pub timed_out: bool,
+    /// The file the step's R-SA-031 output-path handoff persisted the child's delivered output to
+    /// ([`crate::exec::SingleResult::saved_output_path`], pi `result.savedOutputPath`,
+    /// `execution.ts:963`) — pi emits it as a collect record's `outputPath`
+    /// (`dynamic-fanout.ts:283`) so a later chain step can locate the file each fanned-out sibling
+    /// wrote. `None` when the step declared no `output_path`, did not complete cleanly, or wrote
+    /// nothing.
+    pub saved_output_path: Option<String>,
+    /// The step's artifact quadruple (pi `result.artifactPaths`, `shared/types.ts:488`, stamped on
+    /// the result at `execution.ts:1114`), serialized to pi's camelCase JSON object and carried
+    /// opaquely — pi spreads it verbatim onto a collect record's `artifactPaths`
+    /// (`dynamic-fanout.ts:284`). `None` when artifact writing was disabled or no artifacts dir was
+    /// configured, which is exactly pi's own `result.artifactPaths ? … : {}` gate.
+    pub artifact_paths: Option<Value>,
 }
 
 impl StepResult {
@@ -1065,6 +1096,10 @@ impl StepResult {
             error: None,
             interrupted: false,
             control_events: Vec::new(),
+            exit_code: None,
+            timed_out: false,
+            saved_output_path: None,
+            artifact_paths: None,
         }
     }
 
@@ -1078,6 +1113,10 @@ impl StepResult {
             error: Some(error.into()),
             interrupted: false,
             control_events: Vec::new(),
+            exit_code: None,
+            timed_out: false,
+            saved_output_path: None,
+            artifact_paths: None,
         }
     }
 }
@@ -1475,11 +1514,15 @@ pub async fn walk_chain(
                             .await;
 
                     // Fold the per-child results into the ordered collect-record array (pi
-                    // `collectDynamicResults`). The narrow [`StepResult`] seam supplies
-                    // text/structured/error/agent; `exit_code` is mapped from success (`0`) /
-                    // failure (`1`); `timedOut`/`outputPath`/`artifactPaths` are not visible at
-                    // this walker layer (the fuller `exec::SingleResult` this crate does not carry
-                    // here) and are therefore omitted, not fabricated.
+                    // `collectDynamicResults`, `dynamic-fanout.ts:263-287` @v0.34.0). Every field
+                    // pi copies is copied: the child's REAL `exit_code` (`:278`
+                    // `result?.exitCode ?? null` — never derived from success, which would collapse
+                    // a `2` or a `137` to exactly `1`), plus `timed_out` / `saved_output_path` /
+                    // `artifact_paths` (`:282-284`), all carried out of `exec::SingleResult` on the
+                    // widened [`StepResult`] seam by `ExecSingleStepExecutor::run_single`. An
+                    // executor that runs no real child (the mock executors in tests) leaves
+                    // `exit_code` at `None`, so this falls back to the success/failure mapping and
+                    // pi's `?? null` shape is preserved for a never-dispatched slot.
                     //
                     // A child that fail-fast SKIPPED is not a hole in the array: pi returns a
                     // synthetic `SingleResult` for it (`chain-execution.ts:238-246` — `task:
@@ -1497,12 +1540,15 @@ pub async fn walk_chain(
                         .map(|(index, child)| match child.as_ref() {
                             Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
                                 agent: Some(spec.template.agent.clone()),
-                                exit_code: Some(i64::from(!sr.success)),
+                                exit_code: Some(
+                                    sr.exit_code
+                                        .map_or_else(|| i64::from(!sr.success), i64::from),
+                                ),
                                 error: sr.error.clone(),
-                                timed_out: false,
+                                timed_out: sr.timed_out,
                                 structured_output: sr.structured_output.clone(),
-                                artifact_paths: None,
-                                saved_output_path: None,
+                                artifact_paths: sr.artifact_paths.clone(),
+                                saved_output_path: sr.saved_output_path.clone(),
                                 output: None,
                                 final_output: sr.final_output.clone(),
                             }),
@@ -1855,6 +1901,14 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             error,
             interrupted: false,
             control_events: aggregate_control_events,
+            // A GROUP aggregate has no single child of its own; the per-child exit codes /
+            // deadline flags / paths live on `children` below (which is exactly where the dynamic
+            // collect-record fold reads them from). Nothing is lost by leaving the aggregate's
+            // copies unset — pi has no aggregate-level analogue of these fields either.
+            exit_code: None,
+            timed_out: false,
+            saved_output_path: None,
+            artifact_paths: None,
         },
         children,
         fail_fast_skipped,

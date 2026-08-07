@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use cyrup_core::{Content, Message, SessionId};
+use serde_json::Value;
 
 use crate::agent_message::AgentMessage;
 use crate::entry::{Entry, KnownEntry};
@@ -204,37 +205,52 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
         if line.trim().is_empty() {
             continue;
         }
-        // Latest session_info wins, including explicit clears (Pi `session-manager.ts:616-618`).
-        if let Ok(Entry::Known(KnownEntry::SessionInfo { name: n, .. })) =
-            serde_json::from_str::<Entry>(line)
-        {
-            name = n.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            continue;
-        }
-        let Ok(Entry::Known(KnownEntry::Message { message, base })) =
-            serde_json::from_str::<Entry>(line)
-        else {
+        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
             continue;
         };
-        // Pi increments messageCount for EVERY message entry, before any role filter.
+        // Latest session_info wins, including explicit clears (Pi `session-manager.ts:616-618`).
+        if let Entry::Known(KnownEntry::SessionInfo { name: n, .. }) = &entry {
+            name = n.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            continue;
+        }
+        // Pi's scan is UNTYPED: `parseSessionEntryLine` is a bare `JSON.parse`
+        // (`session-manager.ts:503-511`), so `if (entry.type !== "message") continue; messageCount++`
+        // (`:717-718`) counts on the TAG alone — before any role filter and before any body
+        // validation. cyrup's `Entry` deserializer demotes a known tag whose body does not fit the
+        // typed `AgentMessage` to `Entry::Unknown` (`entry.rs:277-279`) — a legacy pre-v3
+        // `hookMessage` role (`migrate.rs:29-32`), an unknown content-block type, a missing
+        // `timestamp` — so that shape is matched here too rather than silently skipped.
+        let (typed, raw, entry_ts) = match &entry {
+            Entry::Known(KnownEntry::Message { message, base }) => {
+                (Some(message), None, base.timestamp.as_str())
+            }
+            Entry::Unknown(v) if v.get("type").and_then(Value::as_str) == Some("message") => (
+                None,
+                Some(v),
+                v.get("timestamp").and_then(Value::as_str).unwrap_or_default(),
+            ),
+            _ => continue,
+        };
         message_count += 1;
 
-        // Only core user/assistant messages contribute activity time + text (Pi:566-588,628-638).
-        let (role_text, is_user, msg_ts) = match &message {
-            AgentMessage::Core(Message::User { content, timestamp }) => {
+        // Only core user/assistant messages contribute activity time + text (Pi:566-588,628-638);
+        // an untyped body is read field-by-field exactly as Pi's `isMessageWithContent` +
+        // `extractTextContent` read the raw JSON (`:658-671`).
+        let (role_text, is_user, msg_ts) = match (typed, raw) {
+            (Some(AgentMessage::Core(Message::User { content, timestamp })), _) => {
                 (core_text(content), true, *timestamp)
             }
-            AgentMessage::Core(Message::Assistant(a)) => {
+            (Some(AgentMessage::Core(Message::Assistant(a))), _) => {
                 (core_text(&a.content), false, a.timestamp)
             }
+            (None, Some(v)) => match raw_core_message(v) {
+                Some(parts) => parts,
+                None => continue,
+            },
             _ => continue,
         };
 
-        let activity_ms = if msg_ts != 0 {
-            msg_ts
-        } else {
-            rfc3339_to_ms(&base.timestamp).unwrap_or(0)
-        };
+        let activity_ms = if msg_ts != 0 { msg_ts } else { rfc3339_to_ms(entry_ts).unwrap_or(0) };
         last_activity_ms = Some(last_activity_ms.unwrap_or(0).max(activity_ms));
 
         if role_text.is_empty() {
@@ -272,6 +288,34 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
         },
         all_messages_text: all_messages.join(" "),
     })
+}
+
+/// The `(text, is_user, message-timestamp-ms)` of a raw `message` entry whose body cyrup could not
+/// type ([`Entry::Unknown`]) — Pi's listing never types it either, it just reads the fields:
+/// `isMessageWithContent` requires a string `role` and a present `content`
+/// (`session-manager.ts:658-660`), the role filter keeps only `user`/`assistant` (`:726-727`),
+/// `extractTextContent` takes a bare string content as is or joins its `type:"text"` blocks with
+/// `" "` (`:662-671`), and `getMessageActivityTime` reads a numeric `message.timestamp`
+/// (`:673-684`). `None` = not a core-role message, i.e. contributes neither text nor activity time
+/// (a pre-v3 `hookMessage`, a `bashExecution`, …) — it is still COUNTED by the caller.
+fn raw_core_message(entry: &Value) -> Option<(String, bool, i64)> {
+    let msg = entry.get("message")?;
+    let is_user = match msg.get("role").and_then(Value::as_str)? {
+        "user" => true,
+        "assistant" => false,
+        _ => return None,
+    };
+    let text = match msg.get("content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    Some((text, is_user, msg.get("timestamp").and_then(Value::as_i64).unwrap_or(0)))
 }
 
 /// Join the text blocks of a core message with `" "` (Pi `extractTextContent`,

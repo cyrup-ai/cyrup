@@ -1283,6 +1283,14 @@ async fn run_inner(
                 // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
                 // here (matching pi's `runSingleStep`, `subagent-runner.ts:695-709`).
                 control_events: Vec::new(),
+                // Same reasoning for the per-child detail fields: an imported root's real exit code
+                // is carried on `ImportedAsyncRootResult` and reproduced by
+                // `imported_root_to_single_result`; an `ImportAsyncRoot` step can never be a
+                // dynamic-fanout child, so no collect record ever reads these.
+                exit_code: None,
+                timed_out: false,
+                saved_output_path: None,
+                artifact_paths: None,
             };
             // Register the imported output under its named key (pi's `outputName`/`as`) so a later
             // `{outputs.name}` reference in this chain resolves to it — a validated structured
@@ -1525,7 +1533,14 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
     SingleResult {
         agent,
         task,
-        exit_code: i32::from(!result.success),
+        // The child's real code when the executor ran one; the success/failure mapping only as the
+        // fallback for a step whose executor spawned nothing (mocks, and every group aggregate).
+        // pi's async runner records the real code too (`subagent-runner.ts` stores the
+        // `SingleResult` its step produced, exit code and all), so a `ResultFile` reader sees `2`
+        // or `137` rather than a flattened `1`.
+        exit_code: result
+            .exit_code
+            .unwrap_or_else(|| i32::from(!result.success)),
         usage: cyrup_core::Usage::default(),
         model: None,
         attempted_models: Vec::new(),
@@ -1538,8 +1553,12 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // `SingleResult` (pi's `interrupted` field), so a `ResultFile` reader sees which step was
         // the pause point rather than a hard-coded `false`.
         interrupted: result.interrupted,
-        timed_out: false,
+        // Same rationale as `interrupted` above, one field over: a deadline kill is now visible on
+        // the terminal per-step `SingleResult` instead of being flattened into an anonymous
+        // non-zero exit.
+        timed_out: result.timed_out,
         error: result.error.clone(),
+        saved_output_path: result.saved_output_path.clone(),
         tool_calls: Vec::new(),
         output_truncated: false,
         // SUBA-N05: the step's raised control events, carried through `StepResult` rather than
@@ -1575,6 +1594,7 @@ fn imported_root_to_single_result(
         interrupted: false,
         timed_out: false,
         error: imported.error.clone(),
+        saved_output_path: None,
         tool_calls: Vec::new(),
         output_truncated: false,
         control_events: Vec::new(),
@@ -2125,6 +2145,24 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             }))
         };
         step_result.interrupted = result.interrupted;
+        // Carry the per-child detail pi's `collectDynamicResults` copies verbatim onto a dynamic
+        // fan-out's collect records (`runs/shared/dynamic-fanout.ts:278-284` @v0.34.0). All four
+        // are known HERE and nowhere upstream of here: the walker sees only `StepResult`, so
+        // without this hop a timed-out child is indistinguishable from an ordinary failure, every
+        // failure reports exactly `1` rather than its real code, and a later chain step cannot
+        // locate the files its fanned-out siblings wrote.
+        step_result.exit_code = Some(result.exit_code);
+        step_result.timed_out = result.timed_out;
+        step_result.saved_output_path = result.saved_output_path;
+        // pi stamps `result.artifactPaths` from the quadruple it computed for this same step
+        // (`runs/foreground/execution.ts:1114`, gated on the run having an artifacts dir at all).
+        // `artifact_paths` above is precisely that quadruple, under precisely pi's gate
+        // (`artifactsDir && artifactConfig?.enabled !== false`), so reuse it rather than
+        // recomputing — a second `artifact_paths()` call would have to re-read `current_flat_index`
+        // after it has already advanced.
+        step_result.artifact_paths = artifact_paths
+            .as_ref()
+            .and_then(|(paths, _)| serde_json::to_value(paths).ok());
         // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
         // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
         // hop the whole async control path is inert: the thresholds are honoured, the events are
@@ -2365,6 +2403,7 @@ async fn finish_run(
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
             error: Some(error.clone()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),
@@ -2825,6 +2864,7 @@ mod tests {
                 interrupted: false,
                 timed_out: false,
                 error: None,
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
                 control_events: Vec::new(),
@@ -3018,6 +3058,7 @@ mod tests {
                 interrupted: false,
                 timed_out: false,
                 error: None,
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
                 control_events: Vec::new(),

@@ -396,35 +396,74 @@ impl AcceptanceContract {
     /// name/task text" half of R-SA-023's resolution rule), used only when the caller supplied no
     /// explicit `acceptance` param at all.
     ///
-    /// The heuristic itself: an implementation-expecting task (per
-    /// [`crate::exec::completion_guard::expects_implementation_mutation`] — this module
-    /// deliberately reuses that already-built, already-tested classifier rather than inventing a
-    /// second, competing "does this task look like it needs verification" heuristic; the two
-    /// questions ("does this need a mutation" and "does this need acceptance evidence") are
-    /// answered by materially the same signal) defaults to requiring [`AcceptanceStatus::Checked`]
-    /// with no `verify[]` commands (nothing was explicitly declared to run); a task that does not
-    /// read as implementation-expecting defaults to [`AcceptanceStatus::NotRequired`] — there is
-    /// nothing to gate on a pure research/review task by default.
+    /// This IS pi's `inferLevel` (`runs/shared/acceptance.ts:69-125` @v0.34.0), reached through the
+    /// [`model`] port's faithful line-for-line copy of it, so the four-way decision tree, the
+    /// criteria strings and the per-branch evidence sets are upstream's rather than a second,
+    /// drifting approximation:
+    ///
+    /// | branch | level | evidence |
+    /// |---|---|---|
+    /// | risky / dynamic / async write (`:88-96`) | `reviewed` | the full `reviewed` set + a required `reviewer` gate |
+    /// | write-capable worker or task (`:98-105`) | `checked` | the full `checked` set |
+    /// | read-only agent or read-only task wording (`:107-116`) | `attested` | `review-findings`, `residual-risks` |
+    /// | everything else (`:118-124`) | `attested` | `manual-notes`, `residual-risks` |
+    ///
+    /// **`inferLevel` has no `"none"` branch**, which is the property that matters here: upstream
+    /// appends a `## Acceptance Contract` block to essentially every child task
+    /// (`formatAcceptancePrompt` returns `""` only for `level === "none"`, `acceptance.ts:305`, and
+    /// `execution.ts:1037-1038` appends it unconditionally) and always produces a real ledger.
+    /// Before this change this function ran the enum-lattice
+    /// [`crate::exec::completion_guard::expects_implementation_mutation`] classifier instead and
+    /// returned [`AcceptanceStatus::NotRequired`] for anything that did not read as
+    /// implementation-expecting — so a reviewer/scout/researcher/summariser child was sent a
+    /// materially different prompt from pi's (no criteria, no required evidence, no
+    /// `acceptance-report` instruction at all: [`inject_acceptance_contract`] returns the task
+    /// verbatim for an [`is_no_op`](Self::is_no_op) contract) and its result carried
+    /// `acceptance: not-required` where pi reports `attested` or `rejected`.
+    ///
+    /// A heuristically-inferred contract is NOT explicit ([`Self::explicit`] stays `false`), so its
+    /// rejection is recorded on the ledger and never flips an otherwise-clean exit code — pi gates
+    /// that correction on `result.acceptance.explicit` too (`execution.ts:1229`), which is what
+    /// makes always-inferring safe rather than a mass run-failure.
+    ///
+    /// **[CYRUP-DELTA]** the `async`/`dynamic`/`dynamicGroup`/`mode` inputs to `inferLevel` are
+    /// left at their defaults: this signature classifies on agent name + task text alone, which is
+    /// all its callers have. A dynamic step's own group gate is resolved separately, through
+    /// [`lower_acceptance_input`] on the declared policy (`spawn/chain_graph.rs`), so the
+    /// `dynamic fanout context` escalation is reachable there rather than lost outright.
     #[must_use]
     pub fn heuristic_default(agent_local_name: &str, task: &str) -> Self {
-        let expects_mutation = crate::exec::completion_guard::expects_implementation_mutation(
-            agent_local_name,
-            task,
-        );
-        let required_level = if expects_mutation {
-            AcceptanceStatus::Checked
-        } else {
-            AcceptanceStatus::NotRequired
-        };
+        let inferred = model::resolve_effective_acceptance(&model::AcceptanceResolveInput {
+            explicit: None,
+            agent_name: agent_local_name.to_string(),
+            task: Some(task.to_string()),
+            mode: None,
+            is_async: false,
+            dynamic: false,
+            dynamic_group: false,
+        });
         Self {
-            required_level,
+            // `resolve_effective_acceptance` with no explicit input returns `inferred.level`
+            // verbatim, and `infer_level` only ever yields `attested`/`checked`/`reviewed` — the
+            // `Auto`/`None` arms below are unreachable and map to the nearest real level rather
+            // than reintroducing a silent no-op contract.
+            required_level: match inferred.level {
+                model::AcceptanceLevel::Reviewed => AcceptanceStatus::Reviewed,
+                model::AcceptanceLevel::Verified => AcceptanceStatus::Verified,
+                model::AcceptanceLevel::Checked => AcceptanceStatus::Checked,
+                model::AcceptanceLevel::Attested
+                | model::AcceptanceLevel::Auto
+                | model::AcceptanceLevel::None => AcceptanceStatus::Attested,
+            },
+            // Nothing was explicitly declared to run: `inferLevel` never produces `verify[]`
+            // commands (only an authored policy can), and `stopRules` is likewise explicit-only.
             verify: Vec::new(),
             explicit: false,
             reviewer_result: None,
             disables_gate: false,
-            criteria: Vec::new(),
-            evidence: Vec::new(),
-            review: None,
+            criteria: inferred.criteria,
+            evidence: inferred.evidence,
+            review: inferred.review,
             stop_rules: Vec::new(),
         }
     }
@@ -453,11 +492,19 @@ impl AcceptanceContract {
     /// inferred contract unchanged.
     ///
     /// **[CYRUP-DELTA]** upstream also feeds `async`/`dynamic`/`dynamicGroup` into `inferLevel`
-    /// and downgrades `review.required` when a `reviewed` level was inferred rather than asked
-    /// for (`acceptance.ts:286-289`); neither has an input here, because
-    /// [`AcceptanceContract::heuristic_default`] classifies on agent name + task text alone and
-    /// can never infer [`AcceptanceStatus::Reviewed`]. Both are tracked separately from this
-    /// function's own concern, which is strictly the combination rule.
+    /// and downgrades `review.required` when a `reviewed` level was inferred rather than asked for
+    /// (`acceptance.ts:286-289`); neither has an input here, because
+    /// [`AcceptanceContract::heuristic_default`] classifies on agent name + task text alone. That
+    /// still leaves the `reviewed` rung reachable — `inferLevel`'s risky branch also fires on task
+    /// WORDING (`release`/`migration`/`security`/…, `acceptance.ts:86`), which this signature does
+    /// see — so what is missing is only the three boolean escalations and the review downgrade,
+    /// both tracked separately from this function's own concern, which is strictly the combination
+    /// rule.
+    ///
+    /// This function combines LEVELS only. The inferred contract's `criteria`/`evidence`/`review`
+    /// are dropped whenever an explicit contract is present, where upstream merges them
+    /// (`acceptance.ts:282-292`); an explicit policy that declares none of the three therefore
+    /// gates on nothing rather than on `requiredEvidenceForLevel(level)`.
     #[must_use]
     pub fn resolve_effective(
         explicit: Option<Self>,
@@ -501,9 +548,12 @@ impl AcceptanceContract {
     /// [`AcceptanceStatus::Rejected`] is clamped away by [`AcceptanceContract::explicit`]. Both are
     /// mapped to their nearest declarable neighbour rather than silently dropping the whole prompt.
     ///
-    /// `inferred_reason` is empty because this crate's level inference is the enum-lattice
-    /// [`AcceptanceContract::heuristic_default`], which records no reasons; the field is
-    /// prompt-irrelevant (`formatAcceptancePrompt` never reads it).
+    /// `inferred_reason` is empty because [`AcceptanceContract`] carries no reasons field of its
+    /// own — [`AcceptanceContract::heuristic_default`] does now produce upstream's reason strings
+    /// (via [`model::resolve_effective_acceptance`]) but drops them at this seam. The field is
+    /// prompt-irrelevant (`formatAcceptancePrompt` never reads it); it surfaces upstream only on
+    /// the LEDGER's `inferredReason`, which this crate's narrower [`AcceptanceLedger`] does not
+    /// have either.
     #[must_use]
     pub fn to_resolved_config(&self) -> model::ResolvedAcceptanceConfig {
         let level = match self.required_level {
@@ -1829,12 +1879,63 @@ mod tests {
         assert!(contract.verify.is_empty());
     }
 
+    /// pi `inferLevel`'s read-only branch (`acceptance.ts:107-116` @v0.34.0): read-only TASK
+    /// WORDING infers `attested` with the findings criterion and the review-findings evidence
+    /// pair — never `none`, which `inferLevel` has no branch for at all. (This test previously
+    /// asserted `NotRequired`/`is_no_op`, the divergence.)
     #[test]
-    fn heuristic_default_is_not_required_for_review_only_tasks() {
+    fn heuristic_default_attests_review_only_tasks_rather_than_disarming() {
         let contract =
             AcceptanceContract::heuristic_default("worker", "Review only: return findings");
-        assert_eq!(contract.required_level, AcceptanceStatus::NotRequired);
-        assert!(contract.is_no_op());
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert!(!contract.is_no_op(), "there is always something to attest");
+        assert_eq!(contract.criteria.len(), 1);
+        assert_eq!(
+            contract.criteria[0].must,
+            "Return concrete findings with file paths and severity when applicable"
+        );
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ReviewFindings,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
+    }
+
+    /// The read-only AGENT branch of the same tree — `reviewer|scout|context-builder|researcher|
+    /// analyst` (`acceptance.ts:80`) — reached by agent name alone, with no read-only wording in
+    /// the task.
+    #[test]
+    fn heuristic_default_attests_a_research_agent_on_neutral_task_wording() {
+        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ReviewFindings,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
+    }
+
+    /// `inferLevel`'s final fallthrough (`acceptance.ts:118-124`): an agent and a task that match
+    /// no branch at all still attest, with the lightweight manual-notes evidence pair.
+    #[test]
+    fn heuristic_default_falls_through_to_lightweight_attestation() {
+        let contract = AcceptanceContract::heuristic_default("helper", "Say hello");
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert_eq!(
+            contract.criteria[0].must,
+            "Return a concise result and residual risks when applicable"
+        );
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ManualNotes,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
     }
 
     #[test]
@@ -1994,11 +2095,31 @@ mod tests {
     // inject_acceptance_contract (R-SA-023)
     // ---------------------------------------------------------------------------------------
 
+    /// A contract that genuinely disables the gate (pi's `{ level: "none", reason: … }` /
+    /// `false` shorthand, the only shapes `explicitAcceptanceCanDisable` accepts,
+    /// `acceptance.ts:134-136`) still appends nothing. The INFERRED contract no longer reaches
+    /// this state — `inferLevel` has no `none` branch — so the fixture is now an explicit one.
     #[test]
-    fn no_op_contract_leaves_task_text_unchanged() {
-        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+    fn a_gate_disabling_contract_leaves_task_text_unchanged() {
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        assert!(contract.is_no_op());
         let out = inject_acceptance_contract("Investigate the bug", &contract);
         assert_eq!(out, "Investigate the bug");
+    }
+
+    /// The converse, and the actual regression this pairs with: a research/read-only child DOES
+    /// get pi's `## Acceptance Contract` block, naming the criterion it will be judged on and the
+    /// evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
+    /// `acceptance.ts:304-348`, appended at `execution.ts:1037-1038`).
+    #[test]
+    fn a_research_child_still_receives_the_acceptance_contract_block() {
+        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+        let out = inject_acceptance_contract("Investigate the bug", &contract);
+        assert!(out.starts_with("Investigate the bug"));
+        assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
+        assert!(out.contains("acceptance-report"));
+        assert!(out.contains("Return concrete findings with file paths and severity"));
+        assert!(out.contains("review-findings"));
     }
 
     #[test]

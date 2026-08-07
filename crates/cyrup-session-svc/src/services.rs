@@ -87,6 +87,15 @@ pub struct AgentSessionServices {
     /// Pi `EnvVars::trustPath`) and the sessions root for `/trust` and `/resume` without re-resolving
     /// config (an additive L6↔L5 data seam — read-only).
     pub agent_dir: PathBuf,
+    /// The directory THIS session's `.jsonl` files live in — Pi's `SessionManager.sessionDir`,
+    /// exposed as `getSessionDir()` (session-manager.ts:999-1001) and fixed once at manager
+    /// construction: an explicit `--session-dir` verbatim, else the resumed file's own parent, else
+    /// the cwd-encoded default `<agent_dir>/sessions/--<encoded-cwd>--`. It is therefore NOT always
+    /// derivable from `agent_dir` + `cwd`, which is why it is carried rather than recomputed — the
+    /// `/resume` listing seam ([`crate::session::AgentSession::list_sessions`]) reads exactly this
+    /// directory, mirroring Pi's `SessionManager.list(getCwd(), getSessionDir())`
+    /// (interactive-mode.ts:4867).
+    pub session_dir: PathBuf,
     /// The home dir used for trust-requiring-resource detection (defaults to `agent_dir`).
     pub home: PathBuf,
     /// Layered settings (global ◁ project ◁ cli), reflecting the resolved trust decision.

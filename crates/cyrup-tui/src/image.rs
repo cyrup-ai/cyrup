@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::{Image, Resize};
+use ratatui_image::{FontSize, Image, Resize};
 
 use crate::theme::UiTheme;
 
@@ -62,15 +62,57 @@ impl ImageRenderer {
     }
 
     /// Build a renderer for a resolved [`TerminalCapabilities`] set (the env-sniff result). `Kitty`/
-    /// `Iterm2` force the matching `ratatui-image` protocol; `None` keeps the half-block raster.
+    /// `Iterm2` force the matching `ratatui-image` protocol; `None` keeps the half-block raster. The
+    /// font cell stays at the library default — see
+    /// [`from_capabilities_with_cell_size`](Self::from_capabilities_with_cell_size) for the measured
+    /// one.
     pub fn from_capabilities(caps: TerminalCapabilities) -> Self {
-        let mut picker = Picker::halfblocks();
-        match caps.images {
-            Some(ImageProtocol::Kitty) => picker.set_protocol_type(ProtocolType::Kitty),
-            Some(ImageProtocol::Iterm2) => picker.set_protocol_type(ProtocolType::Iterm2),
-            None => {}
-        }
+        Self::from_capabilities_with_cell_size(caps, None)
+    }
+
+    /// The same, with the terminal's **measured** cell size in pixels (`(width, height)`) — Pi's
+    /// `queryCellSize` → `setCellDimensions` (`tui.ts:679-686`, `:877-890`), whose whole purpose is
+    /// to replace the guessed `{widthPx: 9, heightPx: 18}` of `terminal-image.ts:37`.
+    ///
+    /// This is what makes an image occupy the right number of cells: [`Self::cell_size`] divides the
+    /// image's pixel dimensions by the font cell, and the protocol encoders multiply back by it, so a
+    /// guessed cell mis-sizes every image that is not width-clamped. cyrup's guess came from
+    /// `Picker::halfblocks()` (`10x20`), which is neither Pi's default nor any real terminal's.
+    ///
+    /// `None` (no answer, or a terminal with no image protocol, which Pi never asks — `tui.ts:681`)
+    /// keeps that default, exactly as Pi keeps its own.
+    pub fn from_capabilities_with_cell_size(
+        caps: TerminalCapabilities,
+        cell_size: Option<(u16, u16)>,
+    ) -> Self {
+        let mut picker = match cell_size {
+            // `Picker` exposes no `set_font_size`, and its fields are private: `from_fontsize` is the
+            // only constructor that takes one. It is deprecated in favour of `from_query_stdio`,
+            // which is precisely the blocking APC round-trip cyrup replaced with the env-sniff above
+            // (feature #7) — so the deprecation's suggested replacement is the thing this crate
+            // deliberately does not do, and the attribute is scoped to this one call.
+            #[allow(deprecated)]
+            Some((width, height)) if width > 0 && height > 0 => {
+                Picker::from_fontsize(FontSize::new(width, height))
+            }
+            _ => Picker::halfblocks(),
+        };
+        // Set the protocol on EVERY path, not just the two `Some` arms: `from_fontsize` guesses one
+        // from the environment (tmux/iTerm2), and the negotiated capability is authoritative.
+        picker.set_protocol_type(match caps.images {
+            Some(ImageProtocol::Kitty) => ProtocolType::Kitty,
+            Some(ImageProtocol::Iterm2) => ProtocolType::Iterm2,
+            None => ProtocolType::Halfblocks,
+        });
         ImageRenderer { picker }
+    }
+
+    /// The font cell the geometry is computed against, in pixels (`(width, height)`) — the measured
+    /// value when the terminal answered `CSI 16 t`, the library default otherwise. Test/`/debug`
+    /// visibility for what is otherwise an invisible input to every image's size.
+    pub fn cell_pixels(&self) -> (u16, u16) {
+        let font = self.picker.font_size();
+        (font.width, font.height)
     }
 
     /// The negotiated protocol (`Kitty`/`Iterm2`/`Sixel`/`Halfblocks`) — drives the `/debug` report and

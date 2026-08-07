@@ -3151,13 +3151,32 @@ impl AgentSession {
         self.services.agent_dir.join("sessions")
     }
 
-    /// List the persisted sessions for this session's cwd, newest-first (Pi `SessionManager.list`,
-    /// session-manager.ts:1507 → the `/resume` selector). Reads the cwd-scoped layout dir under the
-    /// sessions root; an absent/empty dir yields an empty list (never an error).
+    /// The directory THIS session's files live in — Pi `sessionManager.getSessionDir()`
+    /// (session-manager.ts:999). Under an explicit `--session-dir`, or after resuming a file from
+    /// somewhere else, this is NOT `<sessions_root>/--<encoded-cwd>--`.
+    pub fn session_dir(&self) -> &Path {
+        &self.services.session_dir
+    }
+
+    /// List the persisted sessions for this session, newest-first (Pi `SessionManager.list`,
+    /// session-manager.ts:1638 → the `/resume` selector). Reads the session's OWN directory, exactly
+    /// as Pi's picker does — `SessionManager.list(this.sessionManager.getCwd(),
+    /// this.sessionManager.getSessionDir())` (interactive-mode.ts:4867) — so an explicit
+    /// `--session-dir` (or a session resumed from elsewhere) lists the sessions actually next to
+    /// this one rather than the cwd-encoded default dir, which may be empty or hold an unrelated set.
+    ///
+    /// A custom directory may pool SEVERAL projects' sessions in one flat dir, so Pi filters it by
+    /// cwd — `filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd)`
+    /// (session-manager.ts:1639-1643); the picker always passes `getSessionDir()`, so the predicate
+    /// reduces to "not the cwd-encoded default". The default dir already isolates by cwd and so is
+    /// never filtered. Same predicate the CLI `--resume` path computes (`session_list_cwd_filter`,
+    /// crates/cyrup/src/main.rs:1132-1138). An absent/empty dir yields an empty list, never an error.
     pub fn list_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
-        let layout =
-            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone());
-        cyrup_session::listing::list(&layout)
+        let dir = &self.services.session_dir;
+        let default_dir =
+            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone()).dir();
+        let cwd_filter = (*dir != default_dir).then_some(self.services.cwd.as_path());
+        cyrup_session::listing::list_in_dir(dir, cwd_filter, None)
     }
 
     /// Delete a persisted session **file** by path (Pi `/resume` in-list delete → `app.session.delete`

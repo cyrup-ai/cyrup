@@ -49,6 +49,7 @@ mod export;
 mod extension_editor;
 mod fuzzy;
 mod image;
+mod keyboard_protocol;
 mod keymap;
 mod markdown;
 mod model_selector;
@@ -65,8 +66,10 @@ mod status;
 mod status_indicator;
 mod stray_reply;
 mod terminal_query;
+mod terminal_title;
 mod text_input;
 mod theme;
+mod tmux;
 mod transcript;
 mod tree_selector;
 
@@ -101,6 +104,12 @@ pub use image::{
     detect_capabilities, detect_capabilities_from, image_fallback_text, ImageBlock, ImageProtocol,
     ImageRenderer, TerminalCapabilities,
 };
+pub use keyboard_protocol::{
+    current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
+    is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
+    set_current as set_keyboard_protocol, KeyboardProtocol, NegotiationSequence,
+    KITTY_FLAGS_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT,
+};
 pub use keymap::{
     Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
     ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, TreeAction, TreeKeymap,
@@ -131,15 +140,22 @@ pub use startup::{
     StartupRole, StartupSpan,
 };
 pub use terminal_query::{
-    find_color_scheme_report, find_osc11_background_color, parse_color_scheme_report,
-    parse_osc11_background_color, saw_device_attributes, NoTerminalProbe, StdinTerminalProbe,
-    TerminalProbe, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
+    find_cell_size_report, find_color_scheme_report, find_osc11_background_color,
+    parse_cell_size_report, parse_color_scheme_report, parse_osc11_background_color,
+    saw_device_attributes, NoTerminalProbe, StdinTerminalProbe, TerminalProbe, CELL_SIZE_QUERY,
+    CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
 };
+pub use terminal_title::{session_terminal_title, APP_TITLE};
 pub use theme::{
     color_of, detect_terminal_background_from_env, detect_terminal_background_theme,
     detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb, BackgroundTheme, ColorMode,
     DetectionConfidence, TerminalTheme, TerminalThemeDetection, TerminalThemeSource,
     ThemeController, ThinkingTheme, UiTheme,
+};
+pub use tmux::{
+    check_keyboard_setup as check_tmux_keyboard_setup, in_tmux,
+    keyboard_warning as tmux_keyboard_warning, EXTENDED_KEYS_FORMAT_WARNING,
+    EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,
 };
 pub use transcript::{
     content_text, parse_skill_block, thinking_text, Entry, ParsedSkillBlock, ResultImage,

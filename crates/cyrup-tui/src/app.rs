@@ -12,6 +12,7 @@
 //! touches real I/O, so tests draw into a `TestBackend` buffer and assert on cells.
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +64,7 @@ use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
 use crate::stray_reply::StrayReplyFilter;
+use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
 use crate::transcript::{content_text, entry_lines, thinking_text, TranscriptView};
@@ -303,10 +305,17 @@ pub struct AppState {
     /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
     /// prompt is escaped back to the tree.
     pending_tree_nav: Option<PendingTreeNav>,
-    /// The last window title an extension asked for (Pi `setTitle` → `ui.terminal.setTitle`,
-    /// `interactive-mode.ts:2238` → `terminal.ts:504-507`). Retained so the value is observable in
-    /// tests and after a redraw; the crossterm run loop is what actually writes the OSC 0 sequence.
+    /// The window title currently asked for — either by an extension (Pi `setTitle` →
+    /// `ui.terminal.setTitle`, `interactive-mode.ts:2238` → `terminal.ts:504-507`) or by the
+    /// automatic session/cwd title ([`App::update_terminal_title`], Pi `updateTerminalTitle`,
+    /// `interactive-mode.ts:818-826`). Retained so the value is observable in tests and after a
+    /// redraw; the crossterm run loop is what actually writes the OSC 0 sequence.
     pub terminal_title: Option<String>,
+    /// The working directory whose basename goes into the automatic terminal title — Pi
+    /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Seeded from the process cwd and
+    /// re-pointed at the live session's cwd by [`App::run`] (and on every session swap), since a
+    /// `/resume` of a session recorded elsewhere moves it.
+    pub title_cwd: PathBuf,
     /// The custom header content an extension published (Pi `setHeader`, `interactive-mode.ts:2237`).
     /// Delivered (no longer dropped) and retained here — cyrup's TUI has no extension chrome slot to
     /// render it in yet, which is TUI-014's remaining half.
@@ -379,6 +388,9 @@ impl AppState {
             pending_ui_reply: None,
             pending_tree_nav: None,
             terminal_title: None,
+            // Pi reads `sessionManager.getCwd()` at title time; the process cwd is the same value
+            // until a session with a recorded cwd is bound, which re-points it ([`App::run`]).
+            title_cwd: std::env::current_dir().unwrap_or_default(),
             extension_header: None,
             extension_footer: None,
             extension_widget: None,
@@ -748,7 +760,24 @@ impl<B: Backend> App<B> {
     pub fn detect_image_support(&mut self) {
         let caps = crate::image::detect_capabilities();
         self.state.capabilities = caps;
-        self.state.image_renderer = ImageRenderer::from_capabilities(caps);
+        // …and, when the terminal HAS an image protocol, measure its font cell instead of guessing
+        // it (Pi `queryCellSize`, `tui.ts:647`/`:679-686`, gated on `getCapabilities().images` at
+        // `:681`). Without this every inline image is laid out against `ratatui-image`'s `10x20`
+        // placeholder cell, so a Kitty/iTerm2 image that is not width-clamped reserves the wrong
+        // number of rows and is drawn at the wrong scale.
+        //
+        // Called by the binary from the SAME pre-reader-thread window as the theme probe (see
+        // `crate::terminal_query`'s module docs for the timeout / input-safety contract); off a real
+        // terminal `stdin_is_queryable` short-circuits it to `None` in microseconds, which is what
+        // keeps this callable from tests.
+        let cell_size = if caps.images.is_some() {
+            use crate::terminal_query::TerminalProbe as _;
+            crate::terminal_query::StdinTerminalProbe
+                .query_cell_size(crate::terminal_query::CELL_SIZE_TIMEOUT)
+        } else {
+            None
+        };
+        self.state.image_renderer = ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is
@@ -774,6 +803,39 @@ impl<B: Backend> App<B> {
     /// The app's active color mode (test/inspection).
     pub fn color_mode(&self) -> ColorMode {
         self.state.color_mode
+    }
+
+    /// Point the automatic terminal title at the live session's working directory — Pi's
+    /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Does NOT write anything on its own;
+    /// [`Self::update_terminal_title`] is what recomputes the title.
+    pub fn set_title_cwd(&mut self, cwd: PathBuf) {
+        self.state.title_cwd = cwd;
+    }
+
+    /// Recompute the automatic window title from the session name + cwd — Pi `updateTerminalTitle`
+    /// (`interactive-mode.ts:818-826`) — and store it on [`AppState::terminal_title`].
+    ///
+    /// Returns the new title **only when it changed**, so a caller writes the OSC 0 sequence no more
+    /// often than Pi calls `setTitle`. Pi's four call sites are startup (`:860`), a session
+    /// (re-)bind (`:1761`), unbinding the extension set (`:1995`) and `session_info_changed`
+    /// (`:2901`); [`App::run`] drives the first, second and fourth — the third has no cyrup
+    /// counterpart, since extension chrome here is not torn down per session. Never per stream
+    /// event. The write itself is the crossterm run loop's job
+    /// ([`write_terminal_title`]), for the same reason the extension `SetTitle` effect is written
+    /// there: a `TestBackend` app must not emit escape sequences onto the real stdout.
+    ///
+    /// The session name is read from the footer's [`StatusLine::session_name`], which is where the
+    /// live value already lands (Pi reads the same value the footer does, `footer.ts:116-130`).
+    pub fn update_terminal_title(&mut self) -> Option<String> {
+        let title = session_terminal_title(
+            self.state.status.session_name.as_deref(),
+            &self.state.title_cwd,
+        );
+        if self.state.terminal_title.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.state.terminal_title = Some(title.clone());
+        Some(title)
     }
 
     /// Re-bind the UI to a freshly-installed runtime session (arch-11 §3.4 replacement; Pi's
@@ -3162,6 +3224,13 @@ impl<B: Backend> App<B> {
                 // Pi `interactive-mode.ts:2784` mirrors the renamed session into the header/status.
                 let label = name.clone().unwrap_or_default();
                 self.state.transcript.push_status(format!("session renamed → {label}"));
+                // Pi's `session_info_changed` arm (`interactive-mode.ts:2900-2903`) is
+                // `updateTerminalTitle()` + `footer.invalidate()`: the new name reaches BOTH the
+                // footer's location line (` • {name}`, footer.ts:116-130) and the window title. The
+                // recomputed title is written by the crossterm run loop (see
+                // [`Self::update_terminal_title`]).
+                self.state.status.set_session_name(name.clone());
+                let _ = self.update_terminal_title();
             }
             AgentSessionEvent::EntryAppended { entry } => {
                 // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
@@ -4085,6 +4154,14 @@ impl App<CrosstermBackend<Stdout>> {
             out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+        // …and then ASK whether the push took, instead of assuming it did (Pi
+        // `queryAndEnableKittyProtocol`, `tui/src/terminal.ts:213-226`). The query has to follow the
+        // push — `CSI ? u` reports the top of the terminal's flag stack — and it has to run HERE:
+        // this is the one window where raw mode is on and no crossterm reader thread is competing
+        // for the reply (see `crate::keyboard_protocol`'s module docs, and
+        // `crate::terminal_query`'s for the read's timeout/input-safety contract). The recorded
+        // outcome is what the re-entry paths below re-apply and what the startup diagnostics read.
+        let _ = crate::keyboard_protocol::negotiate();
         App::new(CrosstermBackend::new(out), theme)
     }
 
@@ -4131,7 +4208,10 @@ impl App<CrosstermBackend<Stdout>> {
             let pid = std::process::id().to_string();
             let _ = std::process::Command::new("kill").args(["-s", "TSTP", &pid]).status();
         }
-        // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region.
+        // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region. The flags
+        // are re-pushed unconditionally, exactly as Pi's `start()` does (`terminal.ts:164-166`) —
+        // NOT re-negotiated: the crossterm reader thread is live by now, so a `CSI ? u` reply would
+        // race it (`crate::keyboard_protocol` module docs). The startup decision still stands.
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
@@ -4214,7 +4294,8 @@ impl App<CrosstermBackend<Stdout>> {
         let result = run_editor_over_file(editor_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
 
-        // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws.
+        // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws. Re-pushed, never
+        // re-negotiated — same reason as `suspend` above.
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
@@ -4296,6 +4377,20 @@ impl App<CrosstermBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // The automatic window title (Pi `updateTerminalTitle`, interactive-mode.ts:818-826, called
+        // at `:860` right after `init()`): `cyrup - <session name> - <cwd basename>`. Both inputs are
+        // read from the LIVE session here — the name Pi reads via `sessionManager.getSessionName()`
+        // and the cwd via `getCwd()` (the runtime's, which a `/resume` of a session recorded
+        // elsewhere moves; the process cwd is the fallback seeded in `AppState::new`). Refreshed on
+        // `session_info_changed` (`ingest_event`) and on every session swap (the `session_swapped`
+        // arm below), which is exactly Pi's `:2901` / `:1761` call sites.
+        if let Some(rt) = runtime.as_ref() {
+            self.state.title_cwd = rt.cwd().to_path_buf();
+        }
+        self.state.status.set_session_name(session.session_name().await);
+        if let Some(title) = self.update_terminal_title() {
+            write_terminal_title(&title);
+        }
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -4317,6 +4412,22 @@ impl App<CrosstermBackend<Stdout>> {
         // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
         // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
         let (shortcut_status_tx, mut shortcut_status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // The tmux keyboard-setup diagnostic (Pi `checkTmuxKeyboardSetup`, interactive-mode.ts:940-988,
+        // wired at `:865-869`). Spawned, never awaited: Pi starts it alongside the version/package
+        // checks and shows the warning whenever it settles, so a wedged `tmux show` (bounded at 2 s)
+        // delays no frame. The sender is kept alive HERE, as a run-loop local, for the same reason
+        // `shortcut_status_tx` is: a closed channel would make its `select!` arm's `Some(..)` pattern
+        // fail on every iteration.
+        let (tmux_warning_tx, mut tmux_warning_rx) =
+            tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        {
+            let tx = tmux_warning_tx.clone();
+            tokio::spawn(async move {
+                if let Some(warning) = crate::tmux::check_keyboard_setup().await {
+                    let _ = tx.send(warning);
+                }
+            });
+        }
         // A `/tree` navigation runs on its OWN task (see `App::begin_tree_navigation`) and posts its
         // outcome back here, so a branch summarization's provider round-trip never blocks this loop
         // — the same channel-back shape as `bash_rx` / `shortcut_status_rx`. Installing the sender is
@@ -4569,6 +4680,13 @@ impl App<CrosstermBackend<Stdout>> {
                     self.state.transcript.push_status(msg);
                     self.draw_synchronized()?;
                 }
+                Some(warning) = tmux_warning_rx.recv() => {
+                    // Pi `:866-868` — `showWarning`, whose copy is `Warning: {message}`
+                    // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
+                    // path uses in `apply_ui_effect`.
+                    self.state.transcript.push_warning(format!("Warning: {warning}"));
+                    self.draw_synchronized()?;
+                }
                 Some(msg) = tree_nav_rx.recv() => {
                     // A spawned `/tree` navigation settled (Pi `interactive-mode.ts:4805-4820`). An
                     // ABORTED summarization asks for the tree to be re-shown at the same entry, which
@@ -4585,6 +4703,14 @@ impl App<CrosstermBackend<Stdout>> {
                     // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
                     let ext_host = session.services().ext_host.clone();
                     self.ingest_event_with_extensions(&ev, &ext_host).await;
+                    // A rename recomputed the window title inside `ingest_event`; the OSC 0 write is
+                    // this loop's (Pi `session_info_changed` → `updateTerminalTitle`, `:2900-2903`).
+                    // Gated on the event kind so no other event pays for a title recomputation.
+                    if matches!(ev, AgentSessionEvent::SessionInfoChanged { .. })
+                        && let Some(title) = self.state.terminal_title.clone()
+                    {
+                        write_terminal_title(&title);
+                    }
                     // SEAM-005 / EXT-005: a guest's `ctx.shutdown()` is honored at the settle point
                     // (Pi interactive-mode.ts:3137-3138 `case "agent_settled": await
                     // this.checkShutdownRequested()`), and only there — `agent_end` cannot tell us
@@ -4614,6 +4740,15 @@ impl App<CrosstermBackend<Stdout>> {
                         events = new_session.subscribe();
                         session = new_session;
                         self.rebind_session();
+                        // Pi re-titles the window from the newly bound session (`bindSession` →
+                        // `updateTerminalTitle`, interactive-mode.ts:1761): a `/new`, `/resume` or
+                        // `/fork` almost always changes the name, and a swap must never leave the
+                        // previous session's name in the tab. The cwd is the runtime's factory base
+                        // and does not move with the swap, so only the name is re-read.
+                        self.state.status.set_session_name(session.session_name().await);
+                        if let Some(title) = self.update_terminal_title() {
+                            write_terminal_title(&title);
+                        }
                         // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
                         // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from

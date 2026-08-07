@@ -5839,6 +5839,13 @@ impl SubagentTool {
                 // and the terminal `ResultFile` on the async one — and are deliberately not
                 // duplicated into the result relay.
                 control_events: Vec::new(),
+                // Likewise the per-child detail fields: `IntercomPayload::from_group_children`
+                // reads only success/output/error, so nothing downstream of this relay observes
+                // them.
+                exit_code: None,
+                timed_out: false,
+                saved_output_path: None,
+                artifact_paths: None,
             };
             let payload = crate::tui::intercom::IntercomPayload::from_group_children(
                 run_id.clone(),

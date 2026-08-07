@@ -1280,6 +1280,24 @@ impl SessionBuilder {
             manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
         }
 
+        // The directory THIS session's files live in — Pi's `SessionManager.sessionDir`, exposed as
+        // `getSessionDir()` (session-manager.ts:999-1001) and fixed once at construction. Pi resolves
+        // it as `sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd)` when a session is
+        // created (`create`, :1519-1520) and as `sessionDir ?? resolve(path, "..")` — the OPEN FILE's
+        // own parent — when one is resumed (`open`, :1547-1548). The interactive `/resume` picker
+        // lists exactly this directory (`SessionManager.list(getCwd(), getSessionDir())`,
+        // interactive-mode.ts:4867), so it is carried on the services instead of being re-derived
+        // from the cwd-encoded default, which is wrong under `--session-dir` and after a resume from
+        // elsewhere. An in-memory session has no file, so the resolved layout dir stands in.
+        let session_dir = match &cfg.session_dir {
+            Some(dir) => dir.clone(),
+            None => manager
+                .session_file()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| layout.dir()),
+        };
+
         let manager = Arc::new(AsyncMutex::new(manager));
         // Attach the live tree manager to the (already control-wired) host-services backend so a
         // loaded guest's `append_entry`/`set_session_name`/`set_label` capability mutates THIS
@@ -1337,6 +1355,7 @@ impl SessionBuilder {
         let services = AgentSessionServices {
             cwd,
             agent_dir: cfg.agent_dir.clone(),
+            session_dir,
             home: cfg.home.clone(),
             settings,
             project_trusted: trusted,

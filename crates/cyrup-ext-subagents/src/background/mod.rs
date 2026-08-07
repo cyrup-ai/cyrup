@@ -2397,6 +2397,7 @@ mod tests {
             interrupted: false,
             timed_out: false,
             error: None,
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),

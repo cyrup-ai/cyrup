@@ -50,7 +50,14 @@ const ONE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_CLEANUP_DAYS: u64 = 7;
 
 /// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `types.ts:464-469`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Serialize` (camelCase, matching pi's own field names) because pi carries this bundle onto a
+/// result as `SingleResult.artifactPaths` (`shared/types.ts:488`) and spreads it verbatim into a
+/// dynamic fan-out's collect records (`runs/shared/dynamic-fanout.ts:284`), where a chain author
+/// reads it through `{outputs.<collect.as>}`. Only serialization is derived: nothing reads one of
+/// these back off the wire, and pi's fifth field (`transcriptPath`) has no analogue in this port.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArtifactPaths {
     /// `<base>_input.md` — the task the child was given.
     pub input_path: PathBuf,

@@ -651,6 +651,22 @@ pub struct SingleResult {
     pub interrupted: bool,
     pub timed_out: bool,
     pub error: Option<String>,
+    /// pi `result.savedOutputPath` (`shared/types.ts:492`, assigned at
+    /// `runs/foreground/execution.ts:963` from `resolveSingleOutput(...).savedPath`): the concrete
+    /// file the R-SA-031 output-path handoff actually persisted this run's delivered output to,
+    /// `None` when no `output_path` was requested, the run did not complete cleanly, or nothing
+    /// was written.
+    ///
+    /// This is the SAME value the saved-output reference message folded into `final_output` is
+    /// built from — carried as its own field because consumers need the bare path, not the prose:
+    /// pi's `collectDynamicResults` emits it as a dynamic collect record's `outputPath`
+    /// (`runs/shared/dynamic-fanout.ts:283`) so a later chain step can locate the file each
+    /// fanned-out sibling wrote.
+    ///
+    /// `#[serde(default)]` + omit-when-absent so a `status.json`/result file written before this
+    /// field existed still round-trips (the same discipline `control_events` below follows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_output_path: Option<String>,
     /// Summarized `{text, expandedText}` tool-call previews observed across the winning attempt's
     /// transcript — R-SA-043's "only summarized `tool_calls`" compaction requirement (pi's
     /// `ToolCallSummary[]`, `utils.ts:368-373`). Each carries a short and an expanded argument
@@ -2396,6 +2412,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(err.to_string()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),
@@ -2421,6 +2438,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(err.to_string()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),
@@ -2463,6 +2481,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 "no candidate model available for this subagent run (empty fallback ladder)"
                     .to_string(),
             ),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),
@@ -2522,6 +2541,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                     "Skills not found: {}",
                     crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL
                 )),
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
                 control_events: Vec::new(),
@@ -2555,6 +2575,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(format!("failed to prepare subagent scratch directory: {err}")),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
             control_events: Vec::new(),
@@ -2969,6 +2990,13 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         interrupted,
         timed_out,
         error,
+        // pi `result.savedOutputPath = resolvedOutput.savedPath` (`execution.ts:963`) — the SAME
+        // path the saved-output reference message above was built from, published as its own field
+        // so callers that need the bare location (dynamic-fanout collect records) do not have to
+        // re-parse it out of `final_output`.
+        saved_output_path: saved_output_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         tool_calls: progress.summarized_tool_calls(),
         output_truncated,
         progress: progress_snapshot,

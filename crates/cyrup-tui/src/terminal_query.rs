@@ -1,11 +1,16 @@
 //! Terminal background / color-scheme **queries** — the port of Pi's two escape-sequence probes and
 //! their reply parsers (`tui/src/tui.ts:1174-1220`, `tui/src/terminal-colors.ts`).
 //!
-//! Pi asks the terminal two questions before it picks a theme:
+//! Pi asks the terminal three questions at boot — two before it picks a theme, one before it lays
+//! out an image:
 //!
 //! * **OSC 11** — `ESC ] 11 ; ? BEL` (`queryTerminalBackgroundColor`, `tui.ts:1174-1194`). The reply
 //!   is `ESC ] 11 ; <color> BEL` (or `ST`-terminated), where `<color>` is `#rrggbb`,
 //!   `#rrrrggggbbbb`, or `rgb:RRRR/GGGG/BBBB` — [`parse_osc11_background_color`].
+//! * **`CSI 16 t`** — the cell-size query (`queryCellSize`, `tui.ts:679-686`), asked only of a
+//!   terminal that has an image protocol. The reply is `CSI 6 ; height ; width t` —
+//!   [`parse_cell_size_report`] — and it is what stops inline images being laid out against a
+//!   guessed font cell ([`crate::image::ImageRenderer::from_capabilities_with_cell_size`]).
 //! * **DSR `?996`** — `ESC [ ? 996 n` (`queryTerminalColorScheme`, `tui.ts:1202-1220`). A terminal
 //!   that implements the color-palette notification protocol replies `CSI ? 997 ; 1 n` (dark) or
 //!   `CSI ? 997 ; 2 n` (light) — [`parse_color_scheme_report`]. Note the **query** is `996` and the
@@ -58,6 +63,13 @@
 //! destroying the keystrokes in between. The DA1 sentinel appended to every probe here is what makes
 //! that unreachable in practice: a terminal answering the DSR late answers DA1 late too, and the DA1
 //! reply's trailing `c` flushes the buffer in the same read.
+//!
+//! The `CSI 16 t` reply sits in the same bucket as the DSR and is covered the same way. crossterm's
+//! numeric-parameter arm accepts any final byte in `64..=126` and routes an unrecognized one to
+//! `parse_csi_modifier_key_code` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:184-207`), so a
+//! *late* `CSI 6 ; 18 ; 9 t` would be decoded as some arbitrary key rather than dropped. The DA1
+//! sentinel is again what keeps it from being late: a terminal that answers `CSI 16 t` answers DA1
+//! after it, and both are consumed here.
 
 use std::time::Duration;
 
@@ -68,6 +80,16 @@ pub const OSC11_BACKGROUND_QUERY: &str = "\x1b]11;?\x07";
 
 /// `CSI ? 996 n` — Pi's color-scheme DSR (`tui.ts:1219`).
 pub const COLOR_SCHEME_QUERY: &str = "\x1b[?996n";
+
+/// `CSI 16 t` — Pi's terminal cell-size query (`tui.ts:679-686`, `queryCellSize`). The reply is
+/// `CSI 6 ; <height_px> ; <width_px> t` ([`parse_cell_size_report`]). Pi issues it only when the
+/// terminal has an image protocol (`:681`), because the cell size is used for nothing else.
+pub const CELL_SIZE_QUERY: &str = "\x1b[16t";
+
+/// The cell-size probe's budget. Pi needs none (its reply is consumed by the input handler whenever
+/// it arrives, `tui.ts:791`); cyrup's probe is synchronous, so it is bounded like the two above —
+/// Pi's own 100 ms figure (`theme-controller.ts:41,53`).
+pub const CELL_SIZE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// `CSI c` — Primary Device Attributes, appended to every query as the ordering sentinel (see the
 /// module docs). Not a Pi sequence: Pi's event-loop lets it settle a promise instead.
@@ -86,6 +108,15 @@ pub trait TerminalProbe {
     /// DSR `?996` → the terminal's declared color scheme. Optional upstream (`queryTerminalColorScheme?`,
     /// `theme.ts:708`), so the default is "unsupported".
     fn query_color_scheme(&self, timeout: Duration) -> Option<TerminalTheme> {
+        let _ = timeout;
+        None
+    }
+
+    /// `CSI 16 t` → the terminal's cell size in pixels as `(width, height)` — Pi `queryCellSize`
+    /// (`tui.ts:679-686`) feeding `setCellDimensions` (`:890`). Optional, like the DSR above: a
+    /// terminal that does not answer leaves the image layer on its default cell
+    /// (`terminal-image.ts:37`'s `{widthPx: 9, heightPx: 18}`; ratatui-image's is `10x20`).
+    fn query_cell_size(&self, timeout: Duration) -> Option<(u16, u16)> {
         let _ = timeout;
         None
     }
@@ -199,6 +230,37 @@ pub fn find_osc11_background_color(buffer: &str) -> Option<(u8, u8, u8)> {
     parse_osc11_background_color(rest.get(..end + term_len)?)
 }
 
+/// Pi `consumeCellSizeResponse` (`tui.ts:877-890`) over an exact `CSI 6 ; <height> ; <width> t`
+/// frame, returning `(width_px, height_px)` — note the reply's order is height-then-width and Pi's
+/// `setCellDimensions({widthPx, heightPx})` swaps them back.
+///
+/// Pi's `heightPx <= 0 || widthPx <= 0` guard (`:885`) becomes a `None` here rather than Pi's
+/// "consumed but ignored": a zero cell would divide the image geometry by zero.
+pub fn parse_cell_size_report(data: &str) -> Option<(u16, u16)> {
+    let body = data.strip_prefix("\x1b[6;")?.strip_suffix('t')?;
+    let (height, width) = body.split_once(';')?;
+    // Pi's `(\d+)` — digits only, no sign, no empty field.
+    if height.is_empty()
+        || width.is_empty()
+        || !height.bytes().all(|b| b.is_ascii_digit())
+        || !width.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let height: u16 = height.parse().ok()?;
+    let width: u16 = width.parse().ok()?;
+    (height > 0 && width > 0).then_some((width, height))
+}
+
+/// Locate a `CSI 6 ; H ; W t` report anywhere inside a raw read (which also carries the DA1 sentinel
+/// reply) and parse it into `(width_px, height_px)`.
+pub fn find_cell_size_report(buffer: &str) -> Option<(u16, u16)> {
+    let start = buffer.find("\x1b[6;")?;
+    let rest = buffer.get(start..)?;
+    let end = rest.find('t')?;
+    parse_cell_size_report(rest.get(..=end)?)
+}
+
 /// Locate a `CSI ? 997 ; N n` report anywhere inside a raw read and parse it.
 pub fn find_color_scheme_report(buffer: &str) -> Option<TerminalTheme> {
     let start = buffer.find("\x1b[?997;")?;
@@ -261,6 +323,10 @@ impl TerminalProbe for StdinTerminalProbe {
     fn query_color_scheme(&self, timeout: Duration) -> Option<TerminalTheme> {
         find_color_scheme_report(&exchange(COLOR_SCHEME_QUERY, timeout)?)
     }
+
+    fn query_cell_size(&self, timeout: Duration) -> Option<(u16, u16)> {
+        find_cell_size_report(&exchange(CELL_SIZE_QUERY, timeout)?)
+    }
 }
 
 /// Both preconditions for a query to be answerable at all: stdin/stdout are a terminal, and raw mode
@@ -273,7 +339,11 @@ fn stdin_is_queryable() -> bool {
 }
 
 /// Write `request` (plus the DA1 sentinel) and collect whatever comes back within `timeout`.
-fn exchange(request: &str, timeout: Duration) -> Option<String> {
+///
+/// `pub(crate)` so [`crate::keyboard_protocol`]'s Kitty-flags negotiation reuses the SAME bounded,
+/// sentinel-terminated exchange rather than opening a second hand-rolled read of stdin — the
+/// safety contract in this module's docs is per-read, and one implementation is one contract.
+pub(crate) fn exchange(request: &str, timeout: Duration) -> Option<String> {
     use std::io::Write;
     if !stdin_is_queryable() {
         return None;
@@ -374,6 +444,31 @@ mod tests {
     }
 
     #[test]
+    fn cell_size_report_forms() {
+        // Pi's `/^\x1b\[6;(\d+);(\d+)t$/` is HEIGHT then WIDTH; the tuple here is (width, height),
+        // the order `setCellDimensions({widthPx, heightPx})` restores.
+        assert_eq!(parse_cell_size_report("\x1b[6;18;9t"), Some((9, 18)));
+        assert_eq!(parse_cell_size_report("\x1b[6;40;20t"), Some((20, 40)));
+        // Pi's `heightPx <= 0 || widthPx <= 0` guard (`tui.ts:885`).
+        assert_eq!(parse_cell_size_report("\x1b[6;0;9t"), None);
+        assert_eq!(parse_cell_size_report("\x1b[6;18;0t"), None);
+        // Shape rejections: not a `6` report, a missing field, a non-numeric field, no terminator.
+        assert_eq!(parse_cell_size_report("\x1b[4;18;9t"), None, "CSI 4 t is the pixel SIZE report");
+        assert_eq!(parse_cell_size_report("\x1b[6;18t"), None);
+        assert_eq!(parse_cell_size_report("\x1b[6;18;xt"), None);
+        assert_eq!(parse_cell_size_report("\x1b[6;18;9"), None);
+        assert_eq!(parse_cell_size_report("\x1b[16t"), None, "the QUERY is not a report");
+    }
+
+    #[test]
+    fn cell_size_is_found_alongside_the_sentinel_answer() {
+        // What a Kitty-class terminal sends back for `CSI 16 t` + `CSI c`, in one read.
+        assert_eq!(find_cell_size_report("\x1b[6;18;9t\x1b[?62;1;2c"), Some((9, 18)));
+        assert_eq!(find_cell_size_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no cell size");
+        assert_eq!(find_cell_size_report(""), None);
+    }
+
+    #[test]
     fn color_scheme_report_forms() {
         assert_eq!(parse_color_scheme_report("\x1b[?997;1n"), Some(TerminalTheme::Dark));
         assert_eq!(parse_color_scheme_report("\x1b[?997;2n"), Some(TerminalTheme::Light));
@@ -410,6 +505,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(StdinTerminalProbe.query_background_color(Duration::from_secs(30)), None);
         assert_eq!(StdinTerminalProbe.query_color_scheme(Duration::from_secs(30)), None);
+        assert_eq!(StdinTerminalProbe.query_cell_size(Duration::from_secs(30)), None);
         assert!(started.elapsed() < Duration::from_secs(1), "the probe must not block");
     }
 }

@@ -3,14 +3,15 @@
 //! Classifies whether a failed (or silently-truncated) assistant turn was caused by the input
 //! exceeding the model's context window. Compaction depends on this signal. The provider-specific
 //! regex set, the non-overflow exclusions, and the three detection cases below are a faithful port
-//! of Pi `overflow.ts:35-155`.
+//! of Pi `overflow.ts:37-161` (pi v0.83.0).
 
 use crate::utils::regexlite::Regex;
 use cyrup_core::{AssistantMessage, StopReason};
 use std::sync::OnceLock;
 
-/// Provider-specific overflow error patterns (Pi `OVERFLOW_PATTERNS`, overflow.ts:35-59). Each entry
-/// is the exact Pi source pattern (the `/i` flag is implicit — [`Regex`] is always case-insensitive).
+/// Provider-specific overflow error patterns (Pi `OVERFLOW_PATTERNS`, overflow.ts:37-62). Each entry
+/// is the exact Pi source pattern, in Pi's order (the `/i` flag is implicit — [`Regex`] is always
+/// case-insensitive).
 const OVERFLOW_PATTERNS: &[&str] = &[
     r"prompt is too long",                    // Anthropic token overflow
     r"request_too_large",                     // Anthropic request byte-size overflow (HTTP 413)
@@ -29,8 +30,10 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     r"context window exceeds limit",       // MiniMax
     r"exceeded model token limit",         // Kimi For Coding
     r"too large for model with \d+ maximum context length", // Mistral
+    r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?", // DS4 server
     r"model_context_window_exceeded",      // z.ai non-standard finish_reason as error text
     r"prompt too long; exceeded (?:max )?context length", // Ollama explicit overflow error
+    r"range of input length should be",    // DashScope / Qwen Token Plan
     r"context[_ ]length[_ ]exceeded",      // Generic fallback
     r"too many tokens",                    // Generic fallback
     r"token limit exceeded",               // Generic fallback
@@ -61,7 +64,7 @@ fn non_overflow_regexes() -> &'static [Regex] {
 }
 
 /// Check if an assistant message represents a context-overflow error (Pi `isContextOverflow`,
-/// overflow.ts:126-155).
+/// overflow.ts:132-161).
 ///
 /// Handles three cases, in order:
 /// 1. **Error-based** — `stopReason == error` with a message matching an overflow pattern (and not a
@@ -109,7 +112,7 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
     false
 }
 
-/// Get the overflow patterns (Pi `getOverflowPatterns`, overflow.ts:160-162) — for testing.
+/// Get the overflow patterns (Pi `getOverflowPatterns`, overflow.ts:166-168) — for testing.
 pub fn overflow_patterns() -> &'static [&'static str] {
     OVERFLOW_PATTERNS
 }
