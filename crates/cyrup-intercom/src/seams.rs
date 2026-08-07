@@ -40,9 +40,21 @@ use cyrup_ext_subagents::tui::intercom::{ClarifyChannel, ClarifyRequest, Deliver
 use crate::relay::format_result_relay;
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::SendOptions;
+use crate::transport::protocol::{Message, MessageContent, SessionInfo, now_ms};
 
 /// The placeholder shown in the clarify input dialog (pi's supervisor reply prompt).
 const CLARIFY_INPUT_PLACEHOLDER: &str = "Reply to the subagent";
+
+/// The synthetic sender id/name/model pi stamps on a locally-delivered subagent-result relay
+/// (`deliverLocalSubagentRelayMessage`'s `sender` argument, bound to `"subagent-result"` at the
+/// `SUBAGENT_RESULT_INTERCOM_EVENT` subscription, `index.ts:1042-1049` @v0.7.0). It is the string
+/// the attribution header renders (`**📨 From subagent-result** (cwd)`), so the model can tell a
+/// relayed subagent result from a peer session's message and from a human turn.
+const LOCAL_RELAY_SENDER: &str = "subagent-result";
+
+/// The presence `status` pi stamps on that synthetic sender (`status: "result"`,
+/// `index.ts:1045` @v0.7.0).
+const LOCAL_RELAY_STATUS: &str = "result";
 
 /// Broker-backed out-of-band result delivery (closes R-SA-123/124/125). Relays an allowlisted
 /// [`IntercomPayload`] to this orchestrator's own supervisor over the broker (`index.ts:969-1027`).
@@ -50,8 +62,8 @@ pub struct IntercomDeliveryChannel {
     state: Arc<SharedIntercomState>,
     /// This orchestrator's supervisor target (its own `orchestrator_target`), when it is itself a
     /// child. `None` for a top-level orchestrator — which surfaces the result LOCALLY instead
-    /// (`deliverLocalSubagentRelayMessage`, `index.ts:889-910`) via the live `HostServices`
-    /// (`append_entry` + a `inject_message` trigger-turn), see [`IntercomDeliveryChannel::send`].
+    /// (`deliverLocalSubagentRelayMessage`, `index.ts:896-917` @v0.7.0) via the live `HostServices`,
+    /// see [`IntercomDeliveryChannel::send`].
     supervisor_target: Option<String>,
 }
 
@@ -70,24 +82,55 @@ impl DeliveryChannel for IntercomDeliveryChannel {
             let text = format_result_relay(&payload);
             let Some(target) = self.supervisor_target.clone() else {
                 // Top-level orchestrator: no supervisor to relay to, so surface the result LOCALLY
-                // (`deliverLocalSubagentRelayMessage`, `index.ts:889-910` → `sendIncomingMessage(entry,
-                // "trigger", …, true)`) through the live `HostServices` bound via P-1 — append a visible
-                // transcript entry (matching the inbound surface) AND inject a turn-triggering message
-                // over it. When no `HostServices` is bound (headless/degraded), degrade to `Ok(false)`
-                // so `cyrup-ext-subagents` keeps the full inline payload.
-                let Some(services) = self.state.host_services() else {
+                // (`deliverLocalSubagentRelayMessage`, `index.ts:896-917` @v0.7.0) through the live
+                // `HostServices` bound via P-1. When no `HostServices` is bound (headless/degraded),
+                // degrade to `Ok(false)` so `cyrup-ext-subagents` keeps the full inline payload.
+                if self.state.host_services().is_none() {
                     return Ok(false);
+                }
+                // ICOM-022 (third site): upstream does NOT hand this delivery a bare body. It builds a
+                // SYNTHETIC `SessionInfo` for the relay (`id`/`name`/`model` = `"subagent-result"`,
+                // `cwd` = the live session's cwd, `status` = `"result"`, `index.ts:900-909`) and hands
+                // the whole entry to the SAME `sendIncomingMessage` a peer message goes through
+                // (`index.ts:916`, with `delivery = "trigger"` and `forceTrigger = true`). That
+                // function is what stamps the attribution header, so a locally-delivered subagent
+                // result reaches the model as `**📨 From subagent-result** (<cwd>)\n\n<body>` — not as
+                // an unattributed string indistinguishable from a human turn.
+                //
+                // cyrup's port of `sendIncomingMessage` is `inbound::{surface_incoming_message,
+                // trigger_turn_over_inbound}` (pi's single `pi.sendMessage(display:true, triggerTurn)`
+                // splits into cyrup's durable `append_entry` surface + the model-facing
+                // `inject_message`), so this site calls THOSE rather than re-deriving the header —
+                // which also restores the `queueTurnContext` leg (`index.ts:657-659`) this site
+                // previously skipped, so a bare `intercom({action:"reply"})` in the triggered turn
+                // resolves against the entry that actually drove it.
+                //
+                // `forceTrigger = true` bypasses `shouldTriggerInboundMessage` upstream, so the
+                // trigger is unconditional here too (never `config.inbound_trigger`-gated).
+                let now = now_ms();
+                let from = SessionInfo {
+                    id: LOCAL_RELAY_SENDER.to_string(),
+                    name: Some(LOCAL_RELAY_SENDER.to_string()),
+                    cwd: self.state.cwd.display().to_string(),
+                    model: LOCAL_RELAY_SENDER.to_string(),
+                    pid: std::process::id(),
+                    started_at: now,
+                    last_activity: now,
+                    status: Some(LOCAL_RELAY_STATUS.to_string()),
+                    peer_uid: None,
+                    trusted_local: None,
                 };
-                let entry = serde_json::json!({
-                    "content": text,
-                    "runId": payload.run_id.as_str(),
-                    "agent": &payload.agent,
-                    "success": payload.success,
-                });
+                let message = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    reply_to: None,
+                    expects_reply: None,
+                    content: MessageContent { text, attachments: None },
+                };
                 // Best-effort surface + trigger-turn: neither leg's failure changes "delivered
                 // locally" (a bound live session IS the local delivery target, pi's own semantics).
-                let _ = services.append_entry("subagent-result", &entry);
-                let _ = services.inject_message(&text, Some("subagent-result"), true, true);
+                let _ = crate::inbound::surface_incoming_message(&self.state, &from, &message);
+                let _ = crate::inbound::trigger_turn_over_inbound(&self.state, &from, &message, true);
                 return Ok(true);
             };
             // pi's relay path uses `ensureConnected("background")` (`index.ts:1000`), so a relay that
@@ -413,8 +456,20 @@ mod tests {
         }
     }
 
+    /// REWRITTEN for ICOM-022 (third injection site). The previous version asserted only that a
+    /// local relay produced one `append_entry` typed `"subagent-result"` and one turn-triggering
+    /// `inject_message` whose content contained the output — which the pre-fix code satisfied while
+    /// injecting `format_result_relay(..)` VERBATIM: no sender attribution, no cwd, and a custom
+    /// type that did not match the durable surface. The model could not tell a relayed subagent
+    /// result from a human turn.
+    ///
+    /// Upstream never had that gap: `deliverLocalSubagentRelayMessage` (`index.ts:896-917`
+    /// @v0.7.0) builds a synthetic `subagent-result` sender and routes the entry through the SAME
+    /// `sendIncomingMessage` (`index.ts:653-673`) a peer message uses, which stamps
+    /// `**📨 From {sender}** ({cwd})\n\n{body}` and `customType: "intercom_message"`. The
+    /// assertions below pin exactly that, so they FAIL against the pre-fix body-only injection.
     #[tokio::test]
-    async fn top_level_delivery_surfaces_locally_and_reports_delivered() {
+    async fn top_level_delivery_surfaces_locally_with_pi_attribution() {
         // D: a top-level orchestrator (no supervisor_target) with a live HostServices surfaces the
         // relay LOCALLY (append_entry + a trigger-turn inject_message) and reports delivered=true.
         let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
@@ -435,12 +490,78 @@ mod tests {
 
         let entries = rec.entries.lock().unwrap();
         assert_eq!(entries.len(), 1, "the relay is appended locally once");
-        assert_eq!(entries[0].0, "subagent-result");
-        assert_eq!(entries[0].1["runId"], "run00000000000002");
+        assert_eq!(
+            entries[0].0, "intercom_message",
+            "pi's local relay goes through `sendIncomingMessage`, whose `customType` is \
+             `intercom_message` (`index.ts:664`) — the SAME kind the inbound surface uses"
+        );
+        assert_eq!(
+            entries[0].1["from"]["name"], "subagent-result",
+            "the synthetic sender pi stamps (`index.ts:901-902`) reaches the durable surface"
+        );
+        assert_eq!(entries[0].1["from"]["status"], "result", "pi `status: \"result\"`, `index.ts:1045`");
+        assert!(
+            entries[0].1["bodyText"].as_str().is_some_and(|b| b.contains("run00000000000002")),
+            "the appended body still carries the run id: {:?}",
+            entries[0].1["bodyText"]
+        );
 
         let injected = rec.injected.lock().unwrap();
         assert_eq!(injected.len(), 1, "a turn is triggered over the relay");
-        assert!(injected[0].0.contains("the answer"), "the relay body carries the output");
-        assert!(injected[0].3, "trigger_turn is true (pi's sendIncomingMessage(entry, \"trigger\"))");
+        let content = &injected[0].0;
+        assert!(content.contains("the answer"), "the relay body carries the output: {content:?}");
+        // THE ICOM-022 ASSERTION: the MODEL sees the attribution header, not a bare body.
+        assert!(
+            content.starts_with("**📨 From subagent-result** (/w)\n\n"),
+            "the injected content must carry pi's attribution header \
+             (`**📨 From {{sender}}** ({{cwd}})`, `index.ts:665`), not the bare relay body: \
+             {content:?}"
+        );
+        assert_eq!(
+            injected[0].1.as_deref(),
+            Some("intercom_message"),
+            "injected under the same custom type as the durable surface (pi `customType`)"
+        );
+        assert!(
+            !injected[0].2,
+            "display=false: the durable `append_entry` above IS the visible surface (this crate's \
+             established split of pi's single `sendMessage(display:true)`)"
+        );
+        assert!(injected[0].3, "trigger_turn is true (pi's `forceTrigger = true`, `index.ts:916`)");
+    }
+
+    /// ICOM-022 (third site), the second half of pi's `sendIncomingMessage` contract: a
+    /// `"trigger"`-mode delivery ALSO queues the turn context (`index.ts:657-659`), so a bare
+    /// `intercom({ action: "reply" })` issued during the triggered turn resolves against the entry
+    /// that drove it. The pre-fix site called `inject_message` directly and skipped that leg
+    /// entirely, so this test fails against it.
+    #[tokio::test]
+    async fn top_level_delivery_queues_the_turn_context_like_pi() {
+        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        state.set_host_services(Arc::new(SurfaceRecorder::default()));
+        let channel = IntercomDeliveryChannel::new(Arc::clone(&state), None);
+        let payload = IntercomPayload {
+            run_id: cyrup_ext_subagents::background::RunId::from_token("run00000000000003"),
+            agent: "researcher".to_string(),
+            success: true,
+            outputs: vec!["the answer".to_string()],
+            total_tokens: 7,
+            status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
+        };
+        assert_eq!(channel.send(payload).await, Ok(true));
+
+        // `begin_turn` shifts the queued context into the current-turn slot, exactly as the
+        // extension's `TurnStart` arm does in production; a bare `reply` (no `to`, no `reply_to`)
+        // then resolves against it.
+        let now = now_ms();
+        let mut tracker = state.tracker.lock().unwrap();
+        tracker.begin_turn(now);
+        let ctx = tracker
+            .resolve_reply_target(None, None, now)
+            .expect("the relay queued a turn context a bare reply resolves against");
+        assert_eq!(ctx.from.id, "subagent-result");
+        assert!(ctx.message.content.text.contains("run00000000000003"));
     }
 }

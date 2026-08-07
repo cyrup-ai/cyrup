@@ -235,6 +235,8 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
@@ -329,6 +331,8 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = orchestrator_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config)
@@ -463,6 +467,8 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
 
     let async_root = dir.path().join("async");
@@ -572,6 +578,8 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
@@ -682,6 +690,8 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -799,6 +809,8 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -933,6 +945,8 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -1050,6 +1064,8 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -1153,6 +1169,8 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -1219,5 +1237,99 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         result_file.results[0].final_output.as_deref(),
         Some("SHOULD-NOT-REACH"),
         "the child's post-sleep emit must never have run — it was torn down mid-sleep"
+    );
+}
+
+/// SUBA-N05, the hop-2 half: [`RunnerConfig::control`] must reach every dispatched step's
+/// `exec::RunOptions::control_config`, so an ASYNC run's `control` override genuinely changes the
+/// thresholds the child's stream is judged against — and the raised events travel back to the
+/// orchestrator on the terminal `ResultFile`.
+///
+/// Upstream: the async runner reads `const controlConfig = config.controlConfig ??
+/// DEFAULT_CONTROL_CONFIG` (`subagent-runner.ts:1802` @v0.34.0) and drives its per-child attention
+/// tracking from it. Before this, cyrup's `ExecSingleStepExecutor::run_single` hard-coded
+/// `control_config: None`, so a background run could only ever use the stock 60 s window no matter
+/// what the caller (or `subagents.control`) said.
+///
+/// Both directions are asserted in ONE run pair against the SAME child script, so the only
+/// independent variable is the config: with `needsAttentionAfterMs: 1` the child's ~1.8 s silent
+/// window raises `needs_attention`; with the config absent (pi's `?? DEFAULT_CONTROL_CONFIG`) the
+/// identical child is far inside the stock 60 s window and raises nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_config_control_reaches_every_step_and_raises_real_events() {
+    // A child that says nothing for longer than one 1 s activity tick, then answers cleanly.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 1_800},
+            {"kind": "emit", "line": message_end_line("done after a long silence")},
+        ],
+        "exit_code": 0
+    });
+
+    fn config_for(dir: &Path, token: &str, control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>) -> RunnerConfig {
+        RunnerConfig {
+            run_id: RunId::from_token(token),
+            mode: RunMode::Single,
+            steps: vec![RunnerStep::SingleStep(single_step("worker", "idle a while"))],
+            cwd: dir.to_path_buf(),
+            session_file: None,
+            global_concurrency_limit: 20,
+            worktree_base_dir: None,
+            max_subagent_depth: 2,
+            async_root: dir.join("async"),
+            results_dir: dir.join("results"),
+            resolved_agents: all_personas(),
+            original_task: String::new(),
+            chain_dir: None,
+            orchestrator_intercom_target: None,
+            inherited_session_model: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
+            model_scope: None,
+            control,
+            include_progress: None,
+        }
+    }
+
+    let armed_dir = tempfile::tempdir().expect("real tempdir");
+    let (_status, armed) = run_against_fixture(
+        armed_dir.path(),
+        &script,
+        config_for(
+            armed_dir.path(),
+            "ctrlarmed",
+            Some(cyrup_ext_subagents::exec::control::ResolvedControlConfig {
+                needs_attention_after_ms: 1,
+                ..cyrup_ext_subagents::exec::control::ResolvedControlConfig::default()
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(armed.results.len(), 1);
+    let events = &armed.results[0].control_events;
+    assert!(
+        events.iter().any(|e| {
+            e.event_type == cyrup_ext_subagents::registration::ControlEventType::NeedsAttention
+        }),
+        "RunnerConfig::control must reach the step's RunOptions and make the idle window trip; \
+         got {events:?}"
+    );
+    assert_eq!(
+        events[0].agent, "worker",
+        "the event must be attributed to the step's real persona"
+    );
+
+    // The discriminator: same child, no config => pi's `?? DEFAULT_CONTROL_CONFIG` (60 s window).
+    let stock_dir = tempfile::tempdir().expect("real tempdir");
+    let (_status, stock) =
+        run_against_fixture(stock_dir.path(), &script, config_for(stock_dir.path(), "ctrlstock", None))
+            .await;
+    assert!(
+        stock.results[0].control_events.is_empty(),
+        "with no control config the stock 60s attention window applies, so the same ~1.8s idle \
+         must raise nothing; got {:?}",
+        stock.results[0].control_events
     );
 }

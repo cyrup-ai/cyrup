@@ -21,7 +21,8 @@
 //!    dropped, not delivered stale (per DI-SA-10: a "needs attention" heuristic must never override
 //!    or outlive the live state it was diagnosing).
 //! 3. **At-most-once delivery dedup, surviving hot-reload (R-SA-115/122).** `delivered` is keyed on
-//!    `(run_id, notice_kind)` (via [`super::ControlNoticeKey`]) and is checked immediately before
+//!    [`super::ControlNoticeKey`] — `(run_id, notice_kind, pi's own
+//!    `controlNotificationKey(event, childIntercomTarget)`)` — and is checked immediately before
 //!    any delivery — both the async-immediate and the foreground-debounced-and-revalidated paths
 //!    fold through the exact same [`ControlNoticeState::deliver`] choke point, so there is exactly
 //!    one place dedup is enforced, not two independently-maintained sets. Per R-SA-122 this set
@@ -137,6 +138,68 @@ where
     }
 }
 
+/// pi `SUBAGENT_CONTROL_MESSAGE_TYPE` (`extension/control-notices.ts:5`): the `customType` a
+/// delivered control notice is injected under, so a transcript renderer can style it as its own
+/// entry class rather than as ordinary assistant prose (R-SA-121).
+pub const SUBAGENT_CONTROL_MESSAGE_TYPE: &str = "subagent_control_notice";
+
+/// The graceful-degradation delivery sink: writes the notice to stderr. Used when no live host
+/// message channel is bound (headless / SDK embedder), so the pipeline stays observable instead of
+/// silently discarding notices — the same shape (and rationale) as
+/// [`crate::background::watch::LoggingCompletionSink`].
+#[derive(Debug, Default)]
+pub struct LoggingControlNoticeSink;
+
+impl ControlNoticeSink for LoggingControlNoticeSink {
+    fn emit_control_notice(&self, notice: ControlNotice, trigger_turn: bool) {
+        eprintln!(
+            "[subagent-control] (trigger_turn={trigger_turn}) {}",
+            notice.message
+        );
+    }
+}
+
+/// The REAL transcript-injecting sink: pi's `pi.sendMessage({customType, content, display}, {
+/// triggerTurn})` (`extension/control-notices.ts:47-56`), routed through the P-1
+/// [`cyrup_ext::host::HostServices::inject_message`] backend — the identical hand-off
+/// [`crate::background::watch::HostServicesCompletionSink`] already uses for background-completion
+/// notifications.
+///
+/// `inject_message` is a synchronous host round-trip, and this trait method is synchronous and
+/// called from inside the notice state machine's lock, so the injection is handed to a blocking
+/// task rather than performed inline: a slow turn loop must never stall the debounce machinery or
+/// the run whose child raised the notice.
+pub struct HostServicesControlNoticeSink {
+    services: Arc<dyn cyrup_ext::host::HostServices>,
+}
+
+impl HostServicesControlNoticeSink {
+    /// Build a sink over the late-bound live capability backend (P-1).
+    #[must_use]
+    pub fn new(services: Arc<dyn cyrup_ext::host::HostServices>) -> Self {
+        Self { services }
+    }
+}
+
+impl ControlNoticeSink for HostServicesControlNoticeSink {
+    fn emit_control_notice(&self, notice: ControlNotice, trigger_turn: bool) {
+        let services = Arc::clone(&self.services);
+        let content = notice.message;
+        // Fire-and-forget: a failed injection is logged by the host, and — unlike a completion
+        // notification, which gates deletion of a result file on delivery — a dropped control
+        // notice has nothing to retry against, since the dedup set has already claimed its key
+        // (which is pi's behaviour too: `sendMessage` is not awaited or checked there either).
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = services.inject_message(
+                &content,
+                Some(SUBAGENT_CONTROL_MESSAGE_TYPE),
+                true,
+                trigger_turn,
+            );
+        }));
+    }
+}
+
 // =================================================================================================
 // ControlNoticeState
 // =================================================================================================
@@ -212,12 +275,28 @@ impl ControlNoticeState {
     }
 
     /// Removes `run_id` from the live-state projection entirely — e.g. once a run's tracked
-    /// lifetime ends and the caller no longer wants it consulted for actionability re-checks. A
-    /// pending foreground timer for a key naming this run will observe an absent entry at fire
-    /// time and drop (the first of the three R-SA-116 checks: "if the tracked state no longer
-    /// exists").
+    /// lifetime ends and the caller no longer wants it consulted for actionability re-checks.
+    ///
+    /// Also ABORTS every pending foreground debounce timer keyed to this run, which is pi's own
+    /// run-teardown sequence verbatim: `clearPendingForegroundControlNotices(deps.state, runId)`
+    /// immediately followed by `deps.state.foregroundControls.delete(runId)`
+    /// (`subagent-executor.ts:3579-3581` @v0.34.0; the timer map is keyed
+    /// `"{runId}:{controlNotificationKey}"` precisely so it can be filtered by run id,
+    /// `control-notices.ts:23-35`). The abort is not merely hygiene: without it a timer for a
+    /// finished run stays armed for the rest of its window holding an `Arc` to the state and the
+    /// sink, and — if anything ever re-registers that run id — would fire against the NEW
+    /// registration's live view. Dropping the live entry alone already makes such a timer
+    /// non-actionable (R-SA-116 check 1), so this is belt-and-braces in the same order upstream
+    /// applies it.
     pub fn forget_run(&mut self, run_id: &RunId) {
         self.live_runs.remove(run_id);
+        self.pending.retain(|key, timer| {
+            if &key.run_id == run_id {
+                timer.abort();
+                return false;
+            }
+            true
+        });
     }
 
     /// Returns `true` if a notice with this exact `(run_id, kind)` key has already been delivered
@@ -237,6 +316,23 @@ impl ControlNoticeState {
         self.pending.contains_key(key)
     }
 
+    /// The live-state projection currently recorded for `run_id`, or `None` if the run is not
+    /// tracked at all — R-SA-116's check 1, exposed for inspection.
+    ///
+    /// This is the third of the same family as [`Self::was_delivered`]/[`Self::has_pending`]:
+    /// a read-only window onto one of the three maps this state machine owns, so a caller (in
+    /// practice a test) can assert the machine's own view rather than inferring it from delivery
+    /// side effects. Production dispatch never needs it — [`Self::handle`] consults `live_runs`
+    /// itself, at fire time.
+    ///
+    /// It is what makes the "a control event raised in a run's dying moments must never be applied
+    /// AFTER teardown" property directly observable: `forget_run` must leave this `None`, and no
+    /// later hand-off may resurrect it.
+    #[must_use]
+    pub fn live_view(&self, run_id: &RunId) -> Option<&LiveRunView> {
+        self.live_runs.get(run_id)
+    }
+
     /// Dispatches `ev` per its [`RunSource`] (R-SA-116/117):
     ///
     /// - [`RunSource::Async`] notices are delivered immediately, with no debounce (R-SA-117).
@@ -253,7 +349,7 @@ impl ControlNoticeState {
     /// supplying the `Arc<Mutex<_>>` wrapper) — so this is a plain associated function over an
     /// explicit shared handle instead, matching call sites as `notices::handle(&state, ev,
     /// sink).await`.
-    pub async fn handle<S: ControlNoticeSink>(
+    pub async fn handle<S: ControlNoticeSink + ?Sized>(
         state: &Arc<AsyncMutex<Self>>,
         ev: ControlNotice,
         sink: Arc<S>,
@@ -273,7 +369,7 @@ impl ControlNoticeState {
     /// pending for this exact key, it is aborted and replaced (coalescing repeated pings into a
     /// single re-armed wait, per arch-SA §6.7 step 1) rather than left to race a second timer for
     /// the same key.
-    async fn debounce_then_check<S: ControlNoticeSink>(
+    async fn debounce_then_check<S: ControlNoticeSink + ?Sized>(
         state: &Arc<AsyncMutex<Self>>,
         ev: ControlNotice,
         sink: Arc<S>,
@@ -346,7 +442,7 @@ impl ControlNoticeState {
     /// and-revalidated) folds through. Performs the at-most-once dedup check (R-SA-115/122) and,
     /// only on first delivery for this key, invokes the sink with R-SA-118's source-dependent
     /// `trigger_turn` flag.
-    fn deliver<S: ControlNoticeSink>(&mut self, ev: ControlNotice, sink: &S) {
+    fn deliver<S: ControlNoticeSink + ?Sized>(&mut self, ev: ControlNotice, sink: &S) {
         if !self.delivered.insert(ev.key.clone()) {
             return; // R-SA-115/122: already delivered for this (run_id, kind) — never re-notify.
         }
@@ -412,6 +508,7 @@ mod tests {
             key: ControlNoticeKey {
                 run_id: run_id.clone(),
                 kind: ControlNoticeKind::NeedsAttention,
+                notification_key: format!("{run_id}:needs_attention:idle"),
             },
             source,
             agent: agent.map(str::to_string),
@@ -816,6 +913,7 @@ mod tests {
             assert!(guard.has_pending(&ControlNoticeKey {
                 run_id: run_id.clone(),
                 kind: ControlNoticeKind::NeedsAttention,
+                notification_key: format!("{run_id}:needs_attention:idle"),
             }));
         }
 
@@ -846,6 +944,7 @@ mod tests {
         let key = ControlNoticeKey {
             run_id: run_id.clone(),
             kind: ControlNoticeKind::NeedsAttention,
+            notification_key: format!("{run_id}:needs_attention:idle"),
         };
 
         assert!(!state.lock().await.was_delivered(&key));

@@ -41,7 +41,7 @@
 //! the process-wide anchor at `SessionStart` and clears it at `SessionShutdown`
 //! (`PermissionSystemExtension::publish_parent_session_anchor`) — cyrup's placement of pi's
 //! `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId` / `delete`
-//! (`pi-subagents/src/extension/index.ts:555,584`), which `cyrup-ext-subagents` cannot do itself
+//! (`pi-subagents/src/extension/index.ts:599,619` @v0.34.0), which `cyrup-ext-subagents` cannot do itself
 //! (`#![forbid(unsafe_code)]`). Without it the DETACHED background hop carried no anchor and every
 //! background child's ask fail-closed denied against a null target. (2) The child-role predicate is
 //! pi's `hasSubagentEnvHint` (`index.ts:93-103`) — ANY of [`SUBAGENT_ENV_HINT_KEYS`] non-empty —
@@ -959,7 +959,7 @@ impl PermissionSystemExtension {
     /// forwarded ask writes to.
     ///
     /// This is the cyrup placement of pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
-    /// (`pi-subagents/src/extension/index.ts:555`). Upstream, the SUBAGENTS extension does it, into
+    /// (`pi-subagents/src/extension/index.ts:599` @v0.34.0). Upstream, the SUBAGENTS extension does it, into
     /// the real process environment, so every descendant — foreground, background, detached, at any
     /// hop — inherits the anchor for free. `cyrup-ext-subagents` cannot: it is
     /// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition 2024, so it keeps
@@ -979,7 +979,7 @@ impl PermissionSystemExtension {
     /// grandchild would then address its immediate parent's spool instead of continuing to thread
     /// the root's anchor, which is the direct-parent depth-1 semantics
     /// `cyrup_ext_subagents::PARENT_SESSION_ENV_VAR` documents. Publishing is also unconditional in
-    /// `has_ui` (pi's `index.ts:555` is), so a UI-less parent that later gains one still has a
+    /// `has_ui` (pi's `index.ts:599` is), so a UI-less parent that later gains one still has a
     /// correctly-addressed anchor in place; the watcher, not the anchor, is what `has_ui` gates.
     fn publish_parent_session_anchor(&self) {
         if !self.install_watcher {
@@ -1139,7 +1139,7 @@ impl NativeExtension for PermissionSystemExtension {
                 // (clears `active_skill_entries`), superseding the plain clear this arm did before.
                 self.refresh_config_and_manager(&ctx.cwd);
                 // PERM-001 / pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
-                // (`pi-subagents/src/extension/index.ts:555`): publish this parent session's id as
+                // (`pi-subagents/src/extension/index.ts:599` @v0.34.0): publish this parent session's id as
                 // the process-wide anchor a subagent child's forwarded ask addresses, BEFORE the
                 // watcher that services those asks starts. Without it the detached background hop
                 // spawns children with no anchor and every one of their asks fail-closed denies.
@@ -1183,7 +1183,7 @@ impl NativeExtension for PermissionSystemExtension {
                 self.warnings.reset();
                 self.stop_forwarding_watcher();
                 // PERM-001 / pi `delete process.env[SUBAGENT_PARENT_SESSION_ENV]`
-                // (`pi-subagents/src/extension/index.ts:584`): drop the published anchor so a stale
+                // (`pi-subagents/src/extension/index.ts:619` @v0.34.0): drop the published anchor so a stale
                 // id from the session that just ended never addresses a subsequently-started
                 // session's spool on this same long-lived process. PARENT role only, symmetric with
                 // `publish_parent_session_anchor` — a CHILD never published and must not clear the
@@ -1795,13 +1795,26 @@ mod tests {
     /// PERM-001 (first gap), the publisher half: a PARENT-role extension publishes its live session
     /// id into `cyrup-ext-subagents`' process-wide anchor register on `SessionStart` (pi
     /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `pi-subagents/src/extension/
-    /// index.ts:555`) and clears it on `SessionShutdown` (`:584`), so the hop-1 detached spawn has
+    /// index.ts:599` @v0.34.0) and clears it on `SessionShutdown` (`:619`), so the hop-1 detached spawn has
     /// an anchor to overlay onto the background runner. Before this, nothing in the workspace ever
     /// published the root's id anywhere a spawn could read it, and the detached path resolved an
     /// empty target on every hop.
     ///
-    /// One test, not several: the register is process-global, so parallel tests mutating it would
-    /// race.
+    /// The anchor register (`cyrup_ext_subagents::background::parent_anchor`) is PROCESS-global and
+    /// cargo runs this crate's unit tests as parallel threads of one process, so every test that
+    /// mutates it must hold this lock for its whole body. (This module used to carry a single
+    /// anchor test for exactly that reason — "one test, not several". A lock is the honest version
+    /// of that constraint, and lets the CHILD-role gate below be its own test rather than an
+    /// appendix to the PARENT-role one. Mirrors `parent_anchor.rs`'s own `REGISTER_LOCK`.)
+    ///
+    /// A `tokio::sync::Mutex`, not a `std` one: every holder below is an `async` test that awaits
+    /// `on_event` while holding the guard, and a `std::sync::MutexGuard` held across an await point
+    /// is `clippy::await_holding_lock`. (`parent_anchor.rs`'s `REGISTER_LOCK` can be a `std` mutex
+    /// because its tests are synchronous.) It also drops the poison handling `std` would force at
+    /// every call site — a tokio mutex has no poisoning, so a panicking test releases the lock
+    /// cleanly instead of leaving siblings to recover from a `PoisonError`.
+    static ANCHOR_REGISTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A [`HostServices`] whose only override is a fixed `session_id` — the single input
     /// `publish_parent_session_anchor` reads.
     struct AnchorHost(&'static str);
@@ -1813,6 +1826,7 @@ mod tests {
 
     #[tokio::test]
     async fn parent_role_publishes_and_clears_the_process_parent_session_anchor() {
+        let _guard = ANCHOR_REGISTER_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -1841,6 +1855,88 @@ mod tests {
             None,
             "SessionShutdown must clear the anchor (pi's `delete process.env[...]`)"
         );
+    }
+
+    /// PERM-001 follow-up — the CHILD half of the publisher gate, and the cross-crate invariant the
+    /// published-first anchor ladder rests on.
+    ///
+    /// `cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor` resolves
+    /// PUBLISHED before INHERITED, emulating pi's single-cell ASSIGNMENT
+    /// (`process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `pi-subagents/src/extension/
+    /// index.ts:599` @v0.34.0). That ordering is safe for a NESTED orchestrator — one that was
+    /// itself spawned as a subagent and must keep threading the ROOT's anchor downward rather than
+    /// substituting its own id — for exactly ONE reason: such a process never publishes, so its
+    /// register stays empty and the inherited root anchor wins regardless of rung order.
+    ///
+    /// Upstream enforces that with `if (!process.env[SUBAGENT_CHILD_ENV])` wrapped around the
+    /// assignment (`index.ts:596-601` @v0.34.0). Cyrup's analog is `install_watcher`, which
+    /// [`PermissionSystemExtension::new_forwarding_child`] sets to `false` and which
+    /// `publish_parent_session_anchor` early-returns on — and `permission_extension_for_env` builds
+    /// exactly that role whenever [`is_subagent_child`] sees a [`SUBAGENT_ENV_HINT_KEYS`] hint.
+    ///
+    /// NOTHING pinned that gate. If it regressed — a flipped flag, a second publisher, a refactor
+    /// of `new_forwarding_child` — a nested orchestrator would publish its own id, the register
+    /// would shadow the inherited root anchor, and a depth-2 grandchild would address its immediate
+    /// parent's forwarding spool instead of the root's. Every forwarded ask from that subtree would
+    /// then land on a spool with no watcher on it and fail-closed DENY, silently and with no
+    /// prompt. This test is the guard for that.
+    #[tokio::test]
+    async fn a_subagent_child_never_publishes_or_clears_the_parent_session_anchor() {
+        let _guard = ANCHOR_REGISTER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        // A nested orchestrator: itself a subagent child, so `permission_extension_for_env` builds
+        // it with `new_forwarding_child` (`install_watcher: false`). It has a perfectly good live
+        // session id of its own — the gate, not the absence of an id, is what must stop it.
+        let child = PermissionSystemExtension::new_forwarding_child(
+            agent_dir.clone(),
+            dir.path().to_path_buf(),
+        );
+        child.set_host_services(Arc::new(AnchorHost("nested-orchestrator-own-id")));
+        let ctx = event_ctx(dir.path().to_path_buf());
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
+        let _ = child
+            .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
+            None,
+            "a CHILD-role SessionStart must NOT publish its own id (pi's \
+             `if (!process.env[SUBAGENT_CHILD_ENV])` guard, `index.ts:596`) — publishing here is \
+             what would make the published-first ladder hand a grandchild the WRONG ancestor"
+        );
+
+        // The consequence that makes the reorder safe, asserted directly rather than inferred: with
+        // nothing published, the inherited ROOT anchor is what a spawn from this process resolves.
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor_from(
+                Some("root-session-anchor".to_string())
+            ),
+            Some("root-session-anchor".to_string()),
+            "a nested orchestrator keeps threading the ROOT's anchor downward — this is the case \
+             the published-first reorder had to leave untouched, and it holds because the register \
+             above is empty"
+        );
+
+        // The mirror gate (`SessionShutdown`): a child never published, so it must never CLEAR
+        // either — otherwise a child sharing a process with a parent-role session would wipe the
+        // anchor out from under it.
+        cyrup_ext_subagents::publish_parent_session_anchor("root-session-anchor");
+        let _ = child
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
+                .as_deref(),
+            Some("root-session-anchor"),
+            "a CHILD-role SessionShutdown must leave a published anchor alone (it never published \
+             one), or it would clear an anchor that is not its to clear"
+        );
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
     }
 
     // ============================================================================================
@@ -1872,12 +1968,31 @@ mod tests {
         HostCtx::event(cyrup_ext::ExtMode::Tui, false, cwd.to_path_buf())
     }
 
-    fn parent_ext(dir: &Path, session: &str) -> PermissionSystemExtension {
+    /// Builds a PARENT-role extension AND takes [`ANCHOR_REGISTER_LOCK`], returning the guard the
+    /// caller must hold for the rest of the test.
+    ///
+    /// The guard is bundled rather than left to each caller because the coupling is INVISIBLE at
+    /// the call site: none of these PERM-005 watcher tests mentions the parent-session anchor, but
+    /// every one of them fires a PARENT-role `SessionStart`, and that hook calls
+    /// `publish_parent_session_anchor` as a SIDE EFFECT — writing the process-global register that
+    /// `parent_role_publishes_and_clears_the_process_parent_session_anchor` and
+    /// `a_subagent_child_never_publishes_or_clears_the_parent_session_anchor` assert on. Four
+    /// unsynchronized writers against two asserting readers in one test binary is a live race: it
+    /// was observed failing the child-gate assertion with `Some("perm005-detach")` — this helper's
+    /// own session id — leaking in from `a_detaching_ui_tears_the_forwarding_watcher_down`.
+    ///
+    /// Returning the guard makes that safety automatic for any FUTURE watcher test too, instead of
+    /// depending on its author noticing an anchor coupling nothing in the test text mentions.
+    async fn parent_ext(
+        dir: &Path,
+        session: &str,
+    ) -> (tokio::sync::MutexGuard<'static, ()>, PermissionSystemExtension) {
+        let guard = ANCHOR_REGISTER_LOCK.lock().await;
         let agent_dir = dir.join("agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let ext = PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.to_path_buf());
         ext.set_host_services(Arc::new(WatcherHost(session.to_string())));
-        ext
+        (guard, ext)
     }
 
     /// PERM-005, the crux: the three per-turn hooks fire on EVERY turn, so a non-idempotent start
@@ -1885,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
         let dir = tempfile::tempdir().unwrap();
-        let ext = parent_ext(dir.path(), "perm005-idem");
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-idem").await;
         let ctx = ui_ctx(dir.path());
 
         let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
@@ -1943,7 +2058,7 @@ mod tests {
     #[tokio::test]
     async fn a_later_hook_arms_the_watcher_a_headless_session_start_could_not() {
         let dir = tempfile::tempdir().unwrap();
-        let ext = parent_ext(dir.path(), "perm005-late-ui");
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-late-ui").await;
 
         let _ = ext
             .on_event(
@@ -1983,7 +2098,7 @@ mod tests {
     #[tokio::test]
     async fn a_detaching_ui_tears_the_forwarding_watcher_down() {
         let dir = tempfile::tempdir().unwrap();
-        let ext = parent_ext(dir.path(), "perm005-detach");
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-detach").await;
 
         let _ = ext
             .on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ui_ctx(dir.path()))
@@ -2015,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn the_running_watcher_shares_the_extensions_live_config() {
         let dir = tempfile::tempdir().unwrap();
-        let ext = parent_ext(dir.path(), "perm005-config");
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-config").await;
         let ctx = ui_ctx(dir.path());
 
         let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;

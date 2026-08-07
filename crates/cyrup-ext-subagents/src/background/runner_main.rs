@@ -260,6 +260,40 @@ pub struct RunnerConfig {
     /// on-disk config still deserialize — `None` keeps the pre-fix "no config cap" behavior.
     #[serde(default)]
     pub dynamic_fanout_max_items: Option<u32>,
+    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:153,1802` @v0.34.0): the
+    /// FULLY-RESOLVED live-control thresholds/channels this run was authorized with.
+    ///
+    /// Resolved ONCE, parent-side, by the orchestrator
+    /// ([`crate::exec::control::resolve_control_config`] over the extension-level
+    /// `subagents.control` block plus the call's own `control` override) and carried here verbatim,
+    /// exactly as upstream does — `runSinglePath` computes
+    /// `resolveControlConfig(deps.config.control, effectiveParams.control)` and passes the RESOLVED
+    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870`), whose runner reads
+    /// it back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG`.
+    ///
+    /// Parent-side resolution is load-bearing rather than stylistic: this process has no settings
+    /// access by design (see [`Self::model_scope`]'s note), so re-resolving here could apply a
+    /// *different* `subagents.control` block than the one on disk when the run was authorized.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and is hop 2's
+    /// `?? DEFAULT_CONTROL_CONFIG` degrade: control tracking on, with stock thresholds.
+    #[serde(default)]
+    pub control: Option<crate::exec::control::ResolvedControlConfig>,
+    /// SUBA-N06 — this run's `includeProgress` flag (pi `params.includeProgress`,
+    /// `extension/schemas.ts:272` @v0.34.0), carried verbatim from the orchestrator and installed
+    /// on every dispatched step's [`crate::exec::RunOptions::include_progress`], so each persisted
+    /// [`crate::exec::SingleResult`] in the terminal result file carries its own progress snapshot.
+    ///
+    /// Upstream has no counterpart on this hop: pi never threads `includeProgress` into
+    /// `executeAsyncSingle` (`subagent-executor.ts:2845-2874` @v0.34.0) because its async return
+    /// is a "started" message with no results attached. cyrup's async run produces a retrievable
+    /// `SingleResult`, so the flag has somewhere real to land; dropping it here instead would be
+    /// the advertised-and-silently-dropped defect SUBA-041 names.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and is the
+    /// pre-existing behaviour: no snapshot, full R-SA-043 compaction.
+    #[serde(default)]
+    pub include_progress: Option<bool>,
 }
 
 // =================================================================================================
@@ -992,6 +1026,13 @@ async fn run_inner(
         // the one-shot config for the same reason as the two fields above — this process performs
         // no discovery and reads no settings.
         model_scope: config.model_scope.clone(),
+        // SUBA-N05 (pi `const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG`,
+        // `subagent-runner.ts:1802` @v0.34.0): the live-control config resolved parent-side and
+        // carried in the one-shot config, so an async run's `control` override genuinely changes
+        // the thresholds each step's child stream is judged against instead of being dropped.
+        control: config.control.clone(),
+        // SUBA-N06: R-SA-043 compaction's opt-out, carried the same way and for the same reason.
+        include_progress: config.include_progress,
     });
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
@@ -1148,6 +1189,12 @@ async fn run_inner(
                 final_output: Some(imported.output.clone()),
                 error: imported.error.clone(),
                 interrupted: false,
+                // An IMPORTED async root's control events belong to the run that was attached, and
+                // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
+                // deliberately carries only the identity/output fields
+                // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
+                // here (matching pi's `runSingleStep`, `subagent-runner.ts:695-709`).
+                control_events: Vec::new(),
             };
             // Register the imported output under its named key (pi's `outputName`/`as`) so a later
             // `{outputs.name}` reference in this chain resolves to it — a validated structured
@@ -1407,6 +1454,11 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         error: result.error.clone(),
         tool_calls: Vec::new(),
         output_truncated: false,
+        // SUBA-N05: the step's raised control events, carried through `StepResult` rather than
+        // dropped — this is the only channel by which an ASYNC run's control events reach the
+        // orchestrator, which reads them off the terminal `ResultFile`.
+        control_events: result.control_events.clone(),
+        progress: None,
     }
 }
 
@@ -1437,6 +1489,8 @@ fn imported_root_to_single_result(
         error: imported.error.clone(),
         tool_calls: Vec::new(),
         output_truncated: false,
+        control_events: Vec::new(),
+        progress: None,
     }
 }
 
@@ -1516,6 +1570,21 @@ pub(crate) struct ExecSingleStepExecutor {
     /// outside the scope FAILS the step (fail-closed, pi's `explicit` severity) rather than being
     /// quietly replaced by an allowed model. `None` = enforcement off.
     pub(crate) model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-N05 — the run's FULLY-RESOLVED live-control config (pi `controlConfig`,
+    /// `subagent-runner.ts:1802` / `chain-execution.ts:388,1064` @v0.34.0), carried from
+    /// [`RunnerConfig::control`] (background) or handed by [`Self::with_control`] (foreground
+    /// `/chain`, `/parallel`, `/run-chain`). Threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::control_config`], so an explicit `control` override really does
+    /// move the attention/long-running thresholds each child stream is judged against.
+    ///
+    /// `None` is pi's `?? DEFAULT_CONTROL_CONFIG` degrade, applied inside `run_sync`.
+    pub(crate) control: Option<crate::exec::control::ResolvedControlConfig>,
+    /// SUBA-N06 — the run's `includeProgress` flag, carried from
+    /// [`RunnerConfig::include_progress`] (background) or handed by [`Self::with_control`]'s
+    /// sibling [`Self::with_include_progress`] (foreground `/chain`, `/parallel`, `/run-chain`).
+    /// Threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`], so each
+    /// step's [`crate::exec::SingleResult`] carries its own progress snapshot.
+    pub(crate) include_progress: Option<bool>,
 }
 
 impl ExecSingleStepExecutor {
@@ -1574,7 +1643,40 @@ impl ExecSingleStepExecutor {
             run_id,
             inherited_session_model,
             model_scope,
+            // Set separately via `with_control` rather than as a seventh positional argument — see
+            // that method's doc.
+            control: None,
+            // Same rationale, via `with_include_progress`.
+            include_progress: None,
         }
+    }
+
+    /// Install this run's `includeProgress` flag (SUBA-N06) — R-SA-043 compaction's opt-out,
+    /// threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`].
+    ///
+    /// A builder step for the same two reasons [`Self::with_control`] is one: [`Self::foreground`]
+    /// stays at six positional arguments, and the value is not a product of the single discovery
+    /// pass those six all come from.
+    #[must_use]
+    pub(crate) fn with_include_progress(mut self, include_progress: Option<bool>) -> Self {
+        self.include_progress = include_progress;
+        self
+    }
+
+    /// Install this run's already-resolved live-control config (SUBA-N05).
+    ///
+    /// A builder step rather than a [`Self::foreground`] parameter for two reasons: it keeps that
+    /// constructor at six arguments (clippy's `too_many_arguments` threshold is seven), and it
+    /// mirrors how the value actually flows — every caller resolves it with
+    /// [`crate::exec::control::resolve_control_config`] at a different point in its own plan phase,
+    /// whereas the six positional arguments are all products of the single discovery pass.
+    #[must_use]
+    pub(crate) fn with_control(
+        mut self,
+        control: Option<crate::exec::control::ResolvedControlConfig>,
+    ) -> Self {
+        self.control = control;
+        self
     }
 }
 
@@ -1648,6 +1750,45 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         ) {
             Ok(resolved) => resolved,
             Err(violation) => return Ok(StepResult::failure(violation.message)),
+        };
+
+        // SUBA-N04: lower THIS step's declared acceptance contract (pi `chain-execution.ts:400`
+        // `acceptance: task.acceptance` for a parallel task / `:1335` `acceptance:
+        // seqStep.acceptance` for a sequential step — both handed straight into the same `runSync`
+        // call the SINGLE path uses) through the SAME
+        // `exec::acceptance::lower_acceptance_input` the `subagent` tool's SINGLE-mode `acceptance`
+        // param goes through (`extension.rs::route_single`). `run_sync` then resolves the effective
+        // contract (R-SA-023), injects the `## Acceptance Contract` block into the task text,
+        // EXECUTES any declared `verify[]` command as a real subprocess (R-SA-032/DI-SA-5), and —
+        // because an explicitly-declared contract sets `AcceptanceContract::explicit` — applies
+        // R-SA-033's post-hoc exit-code correction, so a rejected gate turns this step's `exit_code`
+        // nonzero and therefore its `StepResult` into a FAILURE below.
+        //
+        // This field was previously a hard `None`. A chain/parallel/background step that declared
+        // `acceptance` was parsed, carried all the way here, and then discarded with no warning: the
+        // step ran completely UNVERIFIED and reported success on the exact same path an accepted run
+        // reports it — silent, unlike a refusal, and reachable through the `tasks:[{…}]` surface
+        // SUBA-041 documents as the workaround for the background SINGLE surface.
+        //
+        // A malformed policy FAILS the step (pi's own verbatim `validateAcceptanceInput` message)
+        // rather than degrading to "no contract" — the same fail-closed choice the `modelScope`
+        // violation directly above makes, and for the same reason: silently running a gate-less
+        // child is the defect, not the remedy. The tool boundary
+        // (`extension.rs::execute` -> `validate_execution_acceptance`, pi
+        // `subagent-executor.ts:1534`) normally refuses such a policy before any child spawns; this
+        // is the last line of defence for a step reaching the runner from a config file that was
+        // hand-edited after validation.
+        let acceptance = match step.acceptance.as_ref() {
+            Some(raw) => match crate::exec::acceptance::lower_acceptance_input(raw) {
+                Ok(contract) => contract,
+                Err(message) => {
+                    return Ok(StepResult::failure(format!(
+                        "subagent step '{}' has an invalid acceptance policy: {message}",
+                        step.agent
+                    )));
+                }
+            },
+            None => None,
         };
 
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
@@ -1729,9 +1870,13 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // one-shot runner config, so a background step resolves skills against its own step cwd.
             skills: None,
             runtime_cwd: None,
-            include_progress: None,
+            // SUBA-N06: the run's `includeProgress`, carried from `RunnerConfig::include_progress`
+            // through this executor, so a background step's persisted `SingleResult` carries the
+            // same progress snapshot the foreground path returns.
+            include_progress: self.include_progress,
             agent_scope: step.agent_scope,
-            acceptance: None,
+            // SUBA-N04: the step's own lowered contract (resolved above), NOT a hard `None`.
+            acceptance,
             fork_context,
             live_events,
             // R-SA-P1 / PERM-001: the anchor the hop-1 spawn injected into THIS runner's own
@@ -1765,6 +1910,24 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
             child_index: Some(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            // SUBA-N05: the run's resolved live-control config, threaded from
+            // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
+            // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
+            // per-step `runSync` call (`chain-execution.ts:388,1064,1323` @v0.34.0), and
+            // `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` in the async runner
+            // (`subagent-runner.ts:1802`). `None` still degrades to `DEFAULT_CONTROL_CONFIG` inside
+            // `run_sync`, so an omitted config keeps control tracking ON with stock thresholds
+            // rather than turning it off.
+            control_config: self.control.clone(),
+            // No live notice SINK on this path: the detached runner has no orchestrator transcript
+            // to inject into, and a foreground chain/parallel walk's notices are surfaced by the
+            // parent from `SingleResult::control_events`. Events are still RAISED — they land on
+            // each step's `SingleResult::control_events` and travel back in the result file — which
+            // is what `notifyChannels: ["async"]` describes upstream, where the runner appends them
+            // to the async dir's control-event log for the parent tracker to replay
+            // (`subagent-runner.ts:2270-2280` → `async-job-tracker.ts:138-166` @v0.34.0). That
+            // replay hop is not ported; the events themselves are not lost.
+            on_control_event: None,
         };
 
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
@@ -1781,6 +1944,11 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             }))
         };
         step_result.interrupted = result.interrupted;
+        // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
+        // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
+        // hop the whole async control path is inert: the thresholds are honoured, the events are
+        // raised, and then they die here.
+        step_result.control_events = result.control_events;
         Ok(step_result)
     }
 }
@@ -2018,6 +2186,8 @@ async fn finish_run(
             error: Some(error.clone()),
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         });
     }
 
@@ -2152,6 +2322,8 @@ mod tests {
             run_id: None,
             inherited_session_model: None,
             model_scope: None,
+            control: None,
+            include_progress: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
@@ -2219,6 +2391,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2261,6 +2435,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2375,6 +2551,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -2442,6 +2620,8 @@ mod tests {
                 error: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
             }],
             dir.path().to_path_buf(),
             None,
@@ -2633,6 +2813,8 @@ mod tests {
                 error: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
             }],
         };
         write_atomic_json(&target_paths.result, &target_result)
@@ -2676,6 +2858,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");

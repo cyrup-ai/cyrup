@@ -494,6 +494,8 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             error: Some(step.error.clone().unwrap_or_else(|| diagnostic.to_string())),
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         })
         .collect()
 }
@@ -521,6 +523,8 @@ fn placeholder_result(
         error: Some(diagnostic.to_string()),
         tool_calls: Vec::new(),
         output_truncated: false,
+        control_events: Vec::new(),
+        progress: None,
     }
 }
 

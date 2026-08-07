@@ -52,8 +52,8 @@ pub mod tui;
 // `background::spawn_detached`) and permission reads it back in the child.
 //
 // PERM-001 adds the one flow in the other direction: pi's orchestrator publishes the anchor into
-// its OWN `process.env` at `SessionStart` (`pi-subagents/src/extension/index.ts:555`, deleted at
-// `:584`) so that even a DETACHED descendant inherits it, and this crate cannot do that
+// its OWN `process.env` at `SessionStart` (`pi-subagents/src/extension/index.ts:599` @v0.34.0,
+// deleted at `:619`) so that even a DETACHED descendant inherits it, and this crate cannot do that
 // (`#![forbid(unsafe_code)]` vs. 2024-edition `unsafe std::env::set_var`). The
 // [`background::parent_anchor`] register stands in for that `process.env` slot, and the anchor's
 // sole consumer — `cyrup-permission-system`, in its PARENT role — is what publishes into it. These

@@ -553,6 +553,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -758,6 +760,8 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -888,7 +892,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
 /// crate's own bookkeeping: with a published parent-session anchor (what
 /// `cyrup-permission-system`'s PARENT-role `SessionStart` installs — pi's
 /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`,
-/// `pi-subagents/src/extension/index.ts:555`), the REAL detached `__subagent-runner` process
+/// `pi-subagents/src/extension/index.ts:599` @v0.34.0), the REAL detached `__subagent-runner` process
 /// spawned by the production entry point [`spawn_detached_runner`] has
 /// `CYRUP_SUBAGENT_PARENT_SESSION` in its own environment — read straight out of
 /// `/proc/<pid>/environ`, i.e. the kernel's copy, not ours.
@@ -941,12 +945,48 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
 
     let pid = spawn_result.expect("detached spawn succeeds");
 
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
-    let entries: Vec<String> = environ
-        .split(|b| *b == 0)
-        .filter(|chunk| !chunk.is_empty())
-        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-        .collect();
+    // Wait for the child to have actually `execve`'d before reading the kernel's copy of its
+    // environment — otherwise this probe measures the PARENT's environ, not the child's, and this
+    // test is a load-dependent flake.
+    //
+    // Mechanism (reproduced directly, 84/200 trials under `nproc` busy-loops): glibc's
+    // `posix_spawn` — which `std::process::Command` uses on Linux for a plain spawn — implements
+    // the fork half as `clone(CLONE_VM | CLONE_VFORK)`, so between `spawn()` returning and the
+    // child reaching `execve` the child SHARES the parent's address space and `/proc/<pid>/environ`
+    // reports the parent's LIVE environment. This test removes `CYRUP_SUBAGENT_BINARY` /
+    // `CYRUP_SUBAGENT_FIXTURE_SCRIPT` from its own environment a few lines above, so a pre-exec
+    // read yields the parent env MINUS those vars and MINUS the overlay — which is exactly the
+    // observed failure (`got: [...]` with no `CYRUP_*` entry at all). Under an idle box the child
+    // execs first and the race never shows.
+    //
+    // `/proc/<pid>/exe` is the discriminator: pre-exec it resolves to the PARENT's binary, post-exec
+    // to the spawned one. Polling it (rather than sleeping a fixed amount, or relaxing the
+    // assertion) is what makes the probe measure the thing the test claims to measure. The
+    // production overlay itself is unchanged and correct — `.envs(env_overlay)` is handed to
+    // `execve`, which is precisely why the value only becomes observable after that `execve`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut entries: Vec<String> = Vec::new();
+    loop {
+        let exec_done = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|target| target != std::env::current_exe().unwrap_or_default())
+            .unwrap_or(false);
+        if exec_done {
+            let environ =
+                std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
+            entries = environ
+                .split(|b| *b == 0)
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached runner never reached execve within 5s; /proc/{pid}/exe still resolves to \
+             this test binary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     kill_pid_for_cleanup(pid);
 

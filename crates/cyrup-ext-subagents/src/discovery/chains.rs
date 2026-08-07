@@ -1335,9 +1335,10 @@ fn is_non_negative_integer(value: &Value) -> bool {
 /// exactly mirroring `registration::slash_commands::step_token_to_spec`'s established mapping. Like
 /// that converter, it defers to a later phase (T0.1 plan-time enrichment): the per-step `model`
 /// string is not resolved to a `ModelId` here (`model: None` -> the persona's own model), a
-/// path-form `outputSchema` is not loaded into `structured_output_schema`, an object-form
-/// `acceptance` is not lowered into a runtime contract, and a static `parallel`/`dynamic` group's
-/// `concurrency` falls back to `default_concurrency` when the step omits it.
+/// path-form `outputSchema` is not loaded into `structured_output_schema`, and a static
+/// `parallel`/`dynamic` group's `concurrency` falls back to `default_concurrency` when the step
+/// omits it. The step's `acceptance` IS carried through verbatim (SUBA-N04) — lowering it to a
+/// runtime contract is `run_single`'s job, at dispatch, exactly as upstream does it.
 pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u32) -> RunnerStep {
     if let Some(Value::Array(items)) = &step.parallel {
         let steps: Vec<SingleStepSpec> = items.iter().filter_map(value_to_single_step_spec).collect();
@@ -1453,11 +1454,18 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
             }
             Some(ChainListBinding::Toggle(_)) | None => None,
         },
+        // SUBA-N04: the RAW acceptance value, carried whole. This used to be
+        // `.and_then(Value::as_str)`, which kept only the level-string form and silently discarded
+        // the `false` shorthand AND every `{ level, verify: [{ command }], … }` object — i.e. the
+        // only forms that can declare a `verify[]` command at all. `run_single` lowers whatever is
+        // here through `exec::acceptance::lower_acceptance_input` (pi `chain-execution.ts:1335`
+        // passes `seqStep.acceptance` into `runSync` unmodified for exactly this reason). `null` is
+        // normalized to `None` so an explicit JSON `null` reads as pi's `undefined`.
         acceptance: step
             .acceptance
             .as_ref()
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .filter(|value| !value.is_null())
+            .cloned(),
         context: None,
         agent_scope: None,
     }
@@ -1958,6 +1966,56 @@ mod tests {
                 assert_eq!(group.template.agent, "reviewer");
             }
             other => panic!("expected DynamicGroup, got {other:?}"),
+        }
+    }
+
+    /// SUBA-N04: a saved chain file's per-step `acceptance` reaches the runtime step spec WHOLE, in
+    /// every form — including the `{ level, verify: [{ command }] }` object, which is the only form
+    /// that can declare a `verify[]` command and which this bridge previously discarded outright
+    /// (`.and_then(Value::as_str)` kept the bare level string and nothing else). Lowering it to a
+    /// contract stays `run_single`'s job, exactly as upstream hands `seqStep.acceptance` to `runSync`
+    /// unmodified (pi `chain-execution.ts:1335` @v0.34.0).
+    #[test]
+    fn chain_step_to_runner_step_carries_every_acceptance_form_onto_the_step_spec() {
+        let policy = serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "unit", "command": "cargo test" }]
+        });
+        let step = ChainStepConfig {
+            agent: Some("builder".to_string()),
+            task: Some("fix it".to_string()),
+            acceptance: Some(policy.clone()),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&step, 4) {
+            RunnerStep::SingleStep(spec) => assert_eq!(spec.acceptance, Some(policy)),
+            other => panic!("expected SingleStep, got {other:?}"),
+        }
+
+        // A static parallel task's own policy survives the per-item `Value` -> spec hop too.
+        let group = ChainStepConfig {
+            parallel: Some(serde_json::json!([
+                { "agent": "a", "task": "ta", "acceptance": false },
+                { "agent": "b", "task": "tb", "acceptance": "checked" }
+            ])),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&group, 8) {
+            RunnerStep::ParallelGroup(group) => {
+                assert_eq!(group.steps[0].acceptance, Some(serde_json::json!(false)));
+                assert_eq!(group.steps[1].acceptance, Some(serde_json::json!("checked")));
+            }
+            other => panic!("expected ParallelGroup, got {other:?}"),
+        }
+
+        // No policy at all stays `None` — pi's `undefined`, which defers to the heuristic default.
+        let bare = ChainStepConfig {
+            agent: Some("c".to_string()),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&bare, 4) {
+            RunnerStep::SingleStep(spec) => assert_eq!(spec.acceptance, None),
+            other => panic!("expected SingleStep, got {other:?}"),
         }
     }
 }

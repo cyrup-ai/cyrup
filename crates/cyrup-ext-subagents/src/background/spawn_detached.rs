@@ -46,7 +46,7 @@
 //! and that is still true. The single exception is the R-SA-P1 parent-session ANCHOR
 //! ([`crate::exec::PARENT_SESSION_ENV_VAR`]), which is not runner configuration at all — it is
 //! ambient process identity that pi propagates purely by environment INHERITANCE
-//! (`pi-subagents/src/extension/index.ts:555` publishes it into the orchestrator's own
+//! (`pi-subagents/src/extension/index.ts:599` @v0.34.0 publishes it into the orchestrator's own
 //! `process.env`, so every descendant at every hop simply inherits it). cyrup's orchestrator cannot
 //! write its own `process.env` (`#![forbid(unsafe_code)]` + 2024-edition `unsafe std::env::set_var`),
 //! so this module writes that ONE entry explicitly onto the hop-1 child instead, resolved by
@@ -168,11 +168,13 @@ pub fn spawn_detached_runner(
         cfg_path,
         stdout_log_path,
         stderr_log_path,
-        // PERM-001: the R-SA-P1 anchor this orchestrator should hand downward — INHERITED (this
-        // process is itself a subagent child launching a nested background run) → PUBLISHED (the
-        // root orchestrator's live session id, put in the register by the permission companion's
-        // PARENT-role `SessionStart`) → none. Resolved HERE, in the env-reading wrapper, for the
-        // same reason `spawn::resolve_spawn_command` is: the injectable core below stays pure.
+        // PERM-001: the R-SA-P1 anchor this orchestrator should hand downward — PUBLISHED (this
+        // session's own live id, put in the register by the permission companion's PARENT-role
+        // `SessionStart`, and an ASSIGNMENT upstream so it SHADOWS what was inherited) → INHERITED
+        // (this process is itself a subagent child launching a nested background run, and never
+        // published, so it keeps threading the root's anchor) → none. Resolved HERE, in the
+        // env-reading wrapper, for the same reason `spawn::resolve_spawn_command` is: the injectable
+        // core below stays pure.
         &super::parent_anchor::detached_runner_env_overlay(),
     )
 }

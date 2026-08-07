@@ -194,6 +194,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -331,6 +333,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -390,6 +394,8 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        control_config: None,
+        on_control_event: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -592,6 +598,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config).await.expect("write runner config");
@@ -938,6 +946,8 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
                 resolved_agents: BTreeMap::new(),
                 original_task: String::new(),
                 chain_dir: None,
+                control: None,
+                include_progress: None,
             },
         )
         .await
@@ -972,5 +982,175 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         Some(7),
         "the live config's chain.dynamicFanout.maxItems (7) must be baked into RunnerConfig \
          verbatim — pre-fix this was always None regardless of the live config"
+    );
+}
+
+// =============================================================================================
+// SUBA-N04 regression: a chain step's declared `acceptance` contract is HONOURED — its `verify[]`
+// commands really execute, and a FAILING one makes the step fail instead of silently reporting
+// success.
+//
+// Pre-fix, `ExecSingleStepExecutor::run_single` built `RunOptions { acceptance: None, .. }`
+// unconditionally, so the field was parsed off the chain/tool surface, carried all the way into the
+// runner, and then discarded with no warning. Every chain/parallel/background step that declared an
+// acceptance contract ran completely UNVERIFIED and reported success on the exact same code path an
+// accepted run reports it — silent, unlike a refusal. Upstream passes the step's own acceptance into
+// the very same `runSync` call the single path uses (`pi-subagents/src/runs/foreground/
+// chain-execution.ts:400` for a parallel task, `:1335` for a sequential step, @v0.34.0).
+//
+// Both directions are asserted against the REAL scripted fixture child through the REAL foreground
+// chain walker (`SubagentExecutor::run_chain_foreground` -> `ExecSingleStepExecutor::run_single` ->
+// `exec::run_sync` -> `exec::acceptance::evaluate_acceptance` -> a REAL `verify[]` subprocess), so a
+// gate that always failed would be caught by the passing-command case just as a dropped contract is
+// caught by the failing one.
+// =============================================================================================
+
+/// A persona whose completion guard is OFF, so the only thing that can reject the acceptance gate in
+/// these two tests is the `verify[]` command's own real exit code.
+fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
+    ResolvedAgentPersona {
+        name: name.to_string(),
+        model: Some(ModelId::from("fixture-model")),
+        fallback_models: Vec::new(),
+        thinking: None,
+        system_prompt_mode: SystemPromptMode::Replace,
+        system_prompt_body: String::new(),
+        tools: None,
+        extensions: None,
+        subagent_only_extensions: Vec::new(),
+        output: None,
+        inherit_project_context: false,
+        inherit_skills: true,
+        skills: Vec::new(),
+        completion_guard: Some(false),
+        max_subagent_depth: None,
+        default_context: None,
+    }
+}
+
+/// Run ONE chain step carrying `acceptance` through the real foreground walker against the real
+/// fixture child, and return its [`StepResult`]-shaped outcome fields (`success`, `error`).
+///
+/// `verify_command` is a real shell command run by `exec::acceptance::run_verify_commands` in the
+/// step's own cwd.
+async fn run_chain_step_with_acceptance(
+    dir: &Path,
+    acceptance: serde_json::Value,
+) -> (bool, Option<String>) {
+    let script = serde_json::json!({
+        "steps": [ {"kind": "emit", "line": message_end_line("implemented the fix")} ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir, "script.json", &script);
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let mut resolved_agents = BTreeMap::new();
+    resolved_agents.insert("builder".to_string(), acceptance_persona("builder"));
+
+    let mut step = single_step("builder", "Fix the failing parser.");
+    step.acceptance = Some(acceptance);
+
+    let outcome = SubagentExecutor::new()
+        .run_chain_foreground(
+            dir,
+            vec![RunnerStep::SingleStep(step)],
+            resolved_agents,
+            String::new(),
+            None,
+            CancelToken::new(),
+            None,
+        )
+        .await;
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+
+    let (results, _groups) = outcome.expect("the foreground chain walk completes");
+    assert_eq!(results.len(), 1, "one step, one result");
+    (results[0].success, results[0].error.clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_step_acceptance_contract_with_a_failing_verify_command_fails_the_step() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // `level: "verified"` REQUIRES a real, executed, exit-0 `verify[]` command (DI-SA-5) — this one
+    // exits 1. The child itself exits 0 and claims success in prose, which is precisely the claim
+    // the acceptance gate exists to refuse.
+    let (success, error) = run_chain_step_with_acceptance(
+        dir.path(),
+        serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "unit-tests", "command": "exit 1" }]
+        }),
+    )
+    .await;
+
+    assert!(
+        !success,
+        "a declared `verified` contract whose verify[] command FAILED must not report success — \
+         pre-fix the contract was dropped to None and this step reported success"
+    );
+    let error = error.expect("a rejected acceptance gate must carry the rejection reason");
+    assert!(
+        error.contains("acceptance rejected"),
+        "the failure must name the acceptance gate (R-SA-033's post-hoc correction), not some \
+         unrelated error: {error}"
+    );
+    assert!(
+        error.contains("exit 1"),
+        "the rejection must name the verify[] command that actually failed: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_step_acceptance_contract_with_a_passing_verify_command_still_succeeds() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // The positive control for the test above: the SAME contract shape, with a command that really
+    // exits 0. If the gate were simply always-rejecting (or if `verified` could never be reached),
+    // this would fail — which is what makes the failing case above meaningful.
+    let (success, error) = run_chain_step_with_acceptance(
+        dir.path(),
+        serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "unit-tests", "command": "exit 0" }]
+        }),
+    )
+    .await;
+
+    assert!(
+        success,
+        "a declared `verified` contract whose verify[] command PASSED must still succeed: {error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_step_with_an_invalid_acceptance_policy_fails_the_step_rather_than_running_ungated() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // A policy that reaches the runner already malformed (the tool boundary refuses these up front,
+    // pi `subagent-executor.ts:1534`; a hand-edited `runner-config.json` does not go through it).
+    // Fail-closed: the step FAILS with pi's own `validateAcceptanceInput` message rather than
+    // silently degrading to "no contract", which would be the very defect SUBA-N04 names.
+    let (success, error) =
+        run_chain_step_with_acceptance(dir.path(), serde_json::json!("nonsense")).await;
+
+    assert!(!success, "an invalid acceptance policy must not run ungated and report success");
+    let error = error.expect("an invalid acceptance policy must carry a reason");
+    assert!(
+        error.contains("acceptance has invalid level 'nonsense'."),
+        "pi's verbatim validateAcceptanceInput message: {error}"
     );
 }

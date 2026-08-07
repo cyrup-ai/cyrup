@@ -1196,6 +1196,8 @@ mod tests {
             error: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         }
     }
 

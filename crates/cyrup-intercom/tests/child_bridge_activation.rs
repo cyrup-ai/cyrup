@@ -154,6 +154,8 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        control_config: None,
+        on_control_event: None,
     }
 }
 

@@ -122,7 +122,20 @@ pub struct SingleStepSpec {
     pub reads: Option<Vec<PathBuf>>,
     /// Explicit acceptance-contract override for this step (func-SA §4.2 `acceptance`); `None`
     /// defers to the agent's own default / heuristic inference (R-SA-023).
-    pub acceptance: Option<String>,
+    ///
+    /// This is the RAW wire value pi carries on a step (`ChainStep["acceptance"]`, pi
+    /// `chain-execution.ts:400` `acceptance: task.acceptance` / `:1335` `acceptance:
+    /// seqStep.acceptance`) — a level string (`"checked"`), the `false` shorthand, or a full
+    /// `AcceptanceConfig` object (`{ level, verify: [{ command }], … }`) — never a pre-lowered
+    /// contract. [`crate::background::runner_main::ExecSingleStepExecutor::run_single`] lowers it
+    /// onto a real [`crate::exec::acceptance::AcceptanceContract`] via
+    /// [`crate::exec::acceptance::lower_acceptance_input`] at dispatch, the same single lowering the
+    /// SINGLE-mode `acceptance` tool param uses.
+    ///
+    /// SUBA-N04: this was `Option<String>`, which silently discarded every object/`false` form on
+    /// the way in and was then hard-dropped to `None` on the way out, so a step declaring an
+    /// acceptance contract ran completely UNVERIFIED and reported success on the accepted-run path.
+    pub acceptance: Option<Value>,
     /// Fork-vs-fresh session context for this step. `None` defers to the agent's own
     /// `default_context` (func-SA §4.1).
     pub context: Option<ContextMode>,
@@ -945,6 +958,26 @@ pub struct StepResult {
     /// `Paused`, never `Complete`. `false` for every non-interrupted step.
     #[doc(alias = "paused")]
     pub interrupted: bool,
+    /// SUBA-N05 — the live-control events this step's child raised
+    /// ([`crate::exec::SingleResult::control_events`], pi `result.controlEvents`,
+    /// `runs/foreground/execution.ts:1260` @v0.34.0).
+    ///
+    /// Carried here for the same reason `structured_output` is: something one layer OUT needs it
+    /// and there is no other channel. The detached hop-2 runner collapses every step into a
+    /// `SingleResult` through
+    /// [`crate::background::runner_main::step_result_to_single_result`] before writing the terminal
+    /// `ResultFile`, so without this field an async run's control events were raised, counted, and
+    /// then discarded at this boundary — the orchestrator saw an empty `controlEvents` no matter
+    /// what `control` the run was launched with. Upstream's async runner does not lose them either:
+    /// it appends each one to the run's control-event log for the parent tracker to replay
+    /// (`runs/background/subagent-runner.ts:2270-2280` → `async-job-tracker.ts:138-166`).
+    ///
+    /// This is a plain, serializable data vector — it does NOT make this module depend on
+    /// [`crate::exec::SingleResult`], the fuller per-run record the type doc above rules out.
+    ///
+    /// Empty for every step whose control config was disabled, whose `notifyOn` excluded both
+    /// classes, or that simply never tripped a threshold.
+    pub control_events: Vec<crate::exec::control::ControlEvent>,
 }
 
 impl StepResult {
@@ -957,6 +990,7 @@ impl StepResult {
             final_output,
             error: None,
             interrupted: false,
+            control_events: Vec::new(),
         }
     }
 
@@ -969,6 +1003,7 @@ impl StepResult {
             final_output: None,
             error: Some(error.into()),
             interrupted: false,
+            control_events: Vec::new(),
         }
     }
 }
@@ -1538,6 +1573,18 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
         ))
     };
 
+    // SUBA-N05: a group's aggregate carries the concatenation of its children's control events, in
+    // child order — the aggregate is the only `StepResult` the chain walk records for a group step
+    // (`record_step_outcome` folds per-child detail into `status.parallel_groups` separately), so
+    // dropping them here would silently lose every event a fanned-out child raised. Upstream keeps
+    // per-child events too: its async runner emits one control record per child, keyed by
+    // `event.index` (`subagent-runner.ts:2271`), and each cyrup event carries the same `index`.
+    let aggregate_control_events: Vec<crate::exec::control::ControlEvent> = children
+        .iter()
+        .flatten()
+        .flat_map(|child| child.control_events.iter().cloned())
+        .collect();
+
     GroupStepResult {
         aggregate: StepResult {
             success,
@@ -1545,6 +1592,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             final_output: None,
             error,
             interrupted: false,
+            control_events: aggregate_control_events,
         },
         children,
     }

@@ -1136,7 +1136,18 @@ pub fn step_token_to_spec(
         },
         output_mode,
         reads,
-        acceptance: step.config.acceptance.clone(),
+        // The slash surface's inline `acceptance=<level>` is a bare level string (already narrowed
+        // to `auto|attested|checked` by `validate_inline_acceptance` above); it becomes the raw
+        // JSON string form of pi's `AcceptanceOverride` union, which is what
+        // `SingleStepSpec::acceptance` now carries and what `run_single` lowers at dispatch
+        // (SUBA-N04). An `acceptance=auto` token lowers to `None` inside
+        // `exec::acceptance::lower_acceptance_input` — pi's "omitted means infer" — so it correctly
+        // stays a heuristic contract rather than becoming an explicit one.
+        acceptance: step
+            .config
+            .acceptance
+            .as_deref()
+            .map(|level| serde_json::Value::String(level.to_string())),
         context: None,
         agent_scope: None,
     })

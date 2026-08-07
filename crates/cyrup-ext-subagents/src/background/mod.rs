@@ -52,7 +52,7 @@ pub mod spawn_detached;
 
 /// The process-wide parent-session anchor register (R-SA-P1, PERM-001) — cyrup's `unsafe`-free
 /// stand-in for pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
-/// (`pi-subagents/src/extension/index.ts:555`, cleared at `:584`), and the source of the one env
+/// (`pi-subagents/src/extension/index.ts:599` @v0.34.0, cleared at `:619`), and the source of the one env
 /// entry [`spawn_detached`] overlays onto the hop-1 `__subagent-runner` process so a BACKGROUND
 /// subagent's forwarded permission ask can still address its root's inbox. See [`parent_anchor`]
 /// for the full why.
@@ -2377,6 +2377,8 @@ mod tests {
             error: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         };
         let mut bad = ok.clone();
         bad.agent = "writer".to_string();

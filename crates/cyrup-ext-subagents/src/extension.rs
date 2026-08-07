@@ -183,6 +183,19 @@ pub struct SubagentExecutor {
     /// matches the live one, and again at `SessionStart` ([`Self::reset_spawn_budget`], pi
     /// `resetSessionState`, `extension/index.ts:590`).
     spawn_budget: std::sync::Mutex<SpawnBudget>,
+    /// The control-notice debounce/actionability/dedup state machine (pi
+    /// `extension/control-notices.ts`: its `pendingForegroundControlNotices` timer map + the
+    /// `__piSubagentVisibleControlNotices` global dedup set). Held on the EXECUTOR — not rebuilt
+    /// per run — because both halves must outlive any single run: the dedup set is at-most-once for
+    /// the process (R-SA-115/122, pi's own reload-surviving global store), and a foreground
+    /// notice's 1s debounce timer routinely outlives the run that raised it.
+    notices: Arc<AsyncMutex<crate::tui::notices::ControlNoticeState>>,
+    /// An EXPLICITLY-injected control-notice delivery sink (a test's capturing sink, or a caller
+    /// wiring its own transcript surface). `None` — the production default — derives the effective
+    /// sink per delivery: a live [`crate::tui::notices::HostServicesControlNoticeSink`] when the
+    /// P-1 `host_services` slot is bound (pi's `pi.sendMessage`), else the stderr
+    /// [`crate::tui::notices::LoggingControlNoticeSink`] degradation.
+    control_notice_sink_override: Option<Arc<dyn crate::tui::notices::ControlNoticeSink>>,
 }
 
 /// One session's subagent spawn budget (pi `SubagentState.subagentSpawns`, `shared/types.ts:842`).
@@ -209,6 +222,69 @@ struct ForegroundControlEntry {
     current_agent: Option<String>,
     /// The run's current step's flat child index (pi `control.currentIndex ?? 0`).
     current_index: Option<usize>,
+    /// The run's live control activity state (pi `control.currentActivityState`, read by
+    /// `isForegroundNoticeStillActionable`, `extension/control-notices.ts:58-65`): a debounced
+    /// foreground notice is only delivered while this is still `NeedsAttention`. Updated by
+    /// [`SubagentExecutor::foreground_control_notifier`] on every raised control event (pi
+    /// `applyControlEventToRememberedForegroundRun`, `subagent-executor.ts:1435`).
+    current_activity_state: Option<crate::background::ActivityState>,
+}
+
+/// How long [`ForegroundControlNotifier::flush`] waits for the notice pump to acknowledge that it
+/// has drained every event raised before teardown.
+///
+/// A bound (rather than an unbounded await) is deliberate and load-bearing: the pump is a spawned
+/// task, and a runtime being shut down — or a pump that has already exited because every
+/// [`crate::exec::control::ControlEventSink`] clone was dropped — must degrade to "stop waiting and
+/// finish tearing the run down", never to a hang inside a tool call. The value is generous relative
+/// to the work being flushed (each queued event is two short mutex sections plus arming a timer),
+/// so a timeout here means something is genuinely wrong, not that the pump was merely busy.
+const FOREGROUND_CONTROL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One message on a foreground run's ordered control-notice pump (see
+/// [`SubagentExecutor::foreground_control_notifier`]).
+enum ForegroundControlPumpMsg {
+    /// A raised control event to project + (possibly) surface as a transcript notice. Boxed so the
+    /// enum's size is not dominated by [`crate::exec::control::ControlEvent`]'s many optional
+    /// fields, given the far more common `Flush` variant carries only a oneshot sender.
+    Event(Box<crate::exec::control::ControlEvent>),
+    /// A teardown barrier: the pump acknowledges it only after every event queued ahead of it has
+    /// been fully applied.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// One foreground run's control-notice notifier: the sync [`crate::exec::control::ControlEventSink`]
+/// handed to [`crate::exec::RunOptions::on_control_event`], plus the handle its owner uses to drain
+/// the pump before declaring the run over.
+///
+/// See [`SubagentExecutor::foreground_control_notifier`] for why the pump exists at all.
+struct ForegroundControlNotifier {
+    sink: crate::exec::control::ControlEventSink,
+    tx: tokio::sync::mpsc::UnboundedSender<ForegroundControlPumpMsg>,
+}
+
+impl ForegroundControlNotifier {
+    /// The sink to install on [`crate::exec::RunOptions::on_control_event`].
+    fn sink(&self) -> crate::exec::control::ControlEventSink {
+        self.sink.clone()
+    }
+
+    /// Block until every control event raised so far has been applied to the notice machine's live
+    /// projection — the happens-before that lets the caller run pi's teardown sequence
+    /// (`clearPendingForegroundControlNotices(state, runId)` then
+    /// `state.foregroundControls.delete(runId)`, `subagent-executor.ts:3579-3581` @v0.34.0) without
+    /// a still-unpolled event racing in behind it and resurrecting the finished run.
+    ///
+    /// Never fails and never hangs: a closed channel (pump already exited) and an expired
+    /// [`FOREGROUND_CONTROL_FLUSH_TIMEOUT`] both mean "there is nothing left that can be waited
+    /// for", and both simply return.
+    async fn flush(&self) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(ForegroundControlPumpMsg::Flush(ack_tx)).is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(FOREGROUND_CONTROL_FLUSH_TIMEOUT, ack_rx).await;
+    }
 }
 
 /// The structured result of [`SubagentExecutor::run_or_background_graph`]: either a detached
@@ -277,6 +353,21 @@ pub struct SingleRunOverrides {
     /// pi `params.artifacts` (`subagent-executor.ts:3387-3390`): `enabled = artifacts !== false`, so
     /// only an explicit `Some(false)` turns the artifact quadruple off.
     pub artifacts: Option<bool>,
+    /// pi `params.control` (`ControlOverrides`, `extension/schemas.ts:201-215,279` @v0.34.0),
+    /// already lowered from the wire object by
+    /// [`crate::exec::control::parse_control_overrides`]. `None` = the param was omitted, which
+    /// defers wholly to the extension-level `subagents.control` block and then to
+    /// `DEFAULT_CONTROL_CONFIG`, exactly as pi's `resolveControlConfig(deps.config.control,
+    /// undefined)` does (`subagent-executor.ts:1179`). Resolution happens inside
+    /// `run_foreground_impl`, not at the dispatch site, because the extension-level base is read
+    /// off the live `config_snapshot` there.
+    pub control: Option<crate::registration::ControlConfig>,
+    /// pi `params.includeProgress` (`extension/schemas.ts:272` @v0.34.0): R-SA-043 compaction's
+    /// documented opt-out. Threaded straight onto [`crate::exec::RunOptions::include_progress`],
+    /// where only `Some(true)` populates [`crate::exec::SingleResult::progress`] — pi's own
+    /// truthiness gate (`progress: params.includeProgress ? allProgress : undefined`,
+    /// `subagent-executor.ts:3008`).
+    pub include_progress: Option<bool>,
 }
 
 /// The seven inputs one foreground single run needs, bundled into one borrowed request so
@@ -311,6 +402,59 @@ pub struct ForegroundRunRequest<'a> {
     pub cancel: CancelToken,
 }
 
+/// The inputs one BACKGROUND single run needs, bundled into one borrowed request so
+/// [`SubagentExecutor::spawn_background`] stays within the argument-count budget — the same role
+/// [`ForegroundRunRequest`] plays for the foreground path and [`BackgroundStepsSpec`] for the
+/// general step-graph path. All borrowed fields live for the duration of the one
+/// `spawn_background` call they are passed to.
+pub struct BackgroundSingleRequest<'a> {
+    /// The task's working directory (also the discovery root for the named persona).
+    pub cwd: &'a Path,
+    /// The persona name to resolve and run.
+    pub agent_name: &'a str,
+    /// The task text handed to the child.
+    pub task: &'a str,
+    /// Call-site fork/fresh context; `None` defers to the persona's own `default_context`.
+    pub context: Option<ContextMode>,
+    /// Per-call model override; `None` inherits (pi `async-execution.ts:849-855`).
+    pub model_override: Option<ModelId>,
+    /// The resolved execution-time agent-discovery scope.
+    pub agent_scope: AgentReadScope,
+    /// SUBA-N04: the RAW wire `acceptance` policy (pi `AcceptanceOverride`) this run declares, or
+    /// `None` for "omitted". pi's async SINGLE path honours it exactly as its foreground one does
+    /// (`runs/background/async-execution.ts:1282-1289` resolves `explicit: params.acceptance` with
+    /// `async: true`, and `:1319` persists it on the steering recovery descriptor). It rides to the
+    /// detached hop-2 runner on the step itself and is lowered there by
+    /// [`crate::exec::acceptance::lower_acceptance_input`].
+    pub acceptance: Option<serde_json::Value>,
+    /// SUBA-N05: the RAW per-call `control` override this run declares, or `None` for "omitted".
+    /// [`SubagentExecutor::spawn_background`] folds it against the extension-level
+    /// `subagents.control` block via [`crate::exec::control::resolve_control_config`] — the SAME
+    /// parent-side resolution the foreground path performs — and carries the RESOLVED value to the
+    /// detached runner on [`crate::background::runner_main::RunnerConfig::control`].
+    ///
+    /// Upstream honours `control` on its async SINGLE path exactly this way:
+    /// `executeAsyncSingle(id, { …, controlConfig: resolveControlConfig(deps.config.control,
+    /// effectiveParams.control), … })` (`subagent-executor.ts:2845,2868-2870` @v0.34.0). Before this
+    /// field existed the param was parsed at the tool boundary, was NOT on `route_single`'s
+    /// foreground-only refusal list, and had no `BackgroundSingleRequest` field — i.e. it was
+    /// advertised-and-silently-dropped, the exact defect SUBA-041 exists to prevent.
+    pub control: Option<crate::registration::ControlConfig>,
+    /// SUBA-N06: pi `params.includeProgress` — R-SA-043 compaction's opt-out, carried to the
+    /// detached hop-2 runner on [`crate::background::runner_main::RunnerConfig::include_progress`]
+    /// and installed on every step's [`crate::exec::RunOptions::include_progress`], so the
+    /// persisted `ResultFile`'s `SingleResult`s carry their own progress snapshots.
+    ///
+    /// **This is deliberately MORE than upstream, and the reason is structural.** pi never passes
+    /// `includeProgress` into `executeAsyncSingle` (`subagent-executor.ts:2845-2874` @v0.34.0):
+    /// its async return is a "started" message with no results attached, so there is nothing for
+    /// the flag to gate. cyrup's async run DOES produce a retrievable `SingleResult` (via
+    /// `subagent({action: "status"})` over the terminal result file), so the only two readings
+    /// available here are "honour it" and "silently drop it" — and a silent drop is the exact
+    /// defect SUBA-041 names.
+    pub include_progress: Option<bool>,
+}
+
 /// The already-resolved, plan-shaped inputs [`SubagentExecutor::spawn_background_steps`] takes from
 /// its caller, bundled into one owned spec so that entry point stays within the argument-count
 /// budget (mirroring [`ForegroundRunRequest`]'s role for the foreground path). Every field here is
@@ -336,6 +480,23 @@ pub struct BackgroundStepsSpec {
     /// The dedicated per-run scratch directory `{chain_dir}` resolves to (`RunnerConfig::chain_dir`);
     /// `None` for a single top-level task that has no chain dir (`{chain_dir}` → the run cwd).
     pub chain_dir: Option<PathBuf>,
+    /// SUBA-N05: the FULLY-RESOLVED live-control config for this run
+    /// (`RunnerConfig::control`), already folded from the extension-level `subagents.control` block
+    /// and the call's own `control` override by [`crate::exec::control::resolve_control_config`].
+    ///
+    /// Resolved by the CALLER, parent-side, exactly as upstream does — `runSinglePath` /
+    /// `runChainPath` compute `resolveControlConfig(deps.config.control, params.control)` and hand
+    /// the resolved object to `executeAsyncSingle`/`executeAsyncChain`
+    /// (`subagent-executor.ts:2845,2868` / `:1312-1313` @v0.34.0), and the detached runner reads it
+    /// back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` (`subagent-runner.ts:1802`). `None`
+    /// means "this caller supplied none", which hop 2 degrades to
+    /// [`crate::exec::control::ResolvedControlConfig::default`] — pi's identical `??` fallback.
+    pub control: Option<crate::exec::control::ResolvedControlConfig>,
+    /// SUBA-N06: this run's `includeProgress` flag (`RunnerConfig::include_progress`), carried
+    /// verbatim to hop 2 and installed on every step's
+    /// [`crate::exec::RunOptions::include_progress`]. `None`/`Some(false)` is pi's default —
+    /// R-SA-043 compaction with no per-step progress snapshot.
+    pub include_progress: Option<bool>,
 }
 
 impl SubagentExecutor {
@@ -354,6 +515,8 @@ impl SubagentExecutor {
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
+            notices: Arc::new(AsyncMutex::new(crate::tui::notices::ControlNoticeState::new())),
+            control_notice_sink_override: None,
         }
     }
 
@@ -608,6 +771,219 @@ impl SubagentExecutor {
             return Arc::new(crate::background::watch::HostServicesCompletionSink::new(services));
         }
         Arc::new(crate::background::watch::LoggingCompletionSink)
+    }
+
+    /// The effective control-notice delivery sink, resolved per delivery with the same precedence
+    /// as [`Self::effective_completion_sink`]: an explicit [`Self::with_control_notice_sink`]
+    /// override → the live [`crate::tui::notices::HostServicesControlNoticeSink`] (pi's
+    /// `pi.sendMessage`) when the P-1 host-services slot is bound → the stderr
+    /// [`crate::tui::notices::LoggingControlNoticeSink`].
+    fn effective_control_notice_sink(&self) -> Arc<dyn crate::tui::notices::ControlNoticeSink> {
+        if let Some(sink) = &self.control_notice_sink_override {
+            return Arc::clone(sink);
+        }
+        if let Some(services) = self.host_services() {
+            return Arc::new(crate::tui::notices::HostServicesControlNoticeSink::new(services));
+        }
+        Arc::new(crate::tui::notices::LoggingControlNoticeSink)
+    }
+
+    /// pi `createForegroundControlNotifier` (`subagent-executor.ts:1222-1229`) +
+    /// `emitControlNotification` (`:505-535`) + the `SUBAGENT_CONTROL_EVENT` listener it feeds
+    /// (`extension/index.ts:549-556` → `handleSubagentControlNotice`), collapsed into the one
+    /// callback [`crate::exec::RunOptions::on_control_event`] takes, plus the ORDERED hand-off that
+    /// callback needs in a multi-threaded runtime (see "Ordering", below). All line numbers are
+    /// `@v0.34.0`.
+    ///
+    /// Per raised event, in the source's own order:
+    ///
+    /// 1. Refresh the live `foregroundControls` entry's `currentActivityState` — pi assigns it from
+    ///    the child's progress fold (`subagent-executor.ts:2972`), and it is what the debounced
+    ///    notice's actionability re-check (`isForegroundNoticeStillActionable`,
+    ///    `control-notices.ts:59-65`) reads a second later.
+    /// 2. Resolve `childIntercomTarget` exactly as `emitControlNotification` does
+    ///    (`:512-513`): `intercomBridge.active ? resolveSubagentIntercomTarget(event.runId,
+    ///    event.agent, event.index) : undefined`. It is not decoration — it renders the
+    ///    "Direct intercom target: …" line of the notice body AND is the leading component of the
+    ///    dedup key (`controlNotificationKey`, `shared/subagent-control.ts:141-144`).
+    /// 3. `shouldNotifyControlEvent` (already applied one layer down —
+    ///    [`crate::exec::control::ControlMonitor::emit_control_event`] gates on it before this sink
+    ///    is ever called) and then the `notifyChannels.includes("event")` CHANNEL gate (`:521`). A
+    ///    config whose channels exclude `event` still raises the event onto
+    ///    [`crate::exec::SingleResult::control_events`], it just delivers no transcript notice.
+    /// 4. `handleSubagentControlNotice`'s own first line: `active_long_running` is NEVER surfaced
+    ///    as a transcript notice (`control-notices.ts:74`) — it is informational telemetry only.
+    /// 5. Hand the notice to [`crate::tui::notices::ControlNoticeState`], which owns the debounce,
+    ///    the at-fire-time actionability re-check and the at-most-once dedup.
+    ///
+    /// # Ordering (SUBA-N05) — why this returns a pump, not just a closure
+    ///
+    /// Upstream's whole pipeline is synchronous on one event-loop thread: `onControlEvent` →
+    /// `emitControlNotification` → `pi.events.emit` → the listener → `handleSubagentControlNotice`
+    /// all run to completion, in raise order, before the child's stdout reader resumes. cyrup's
+    /// notice state lives behind a `tokio::sync::Mutex`, so the hand-off must be async while this
+    /// sink is sync.
+    ///
+    /// The previous revision did that with a bare `tokio::spawn` PER EVENT, which silently gave up
+    /// two properties upstream has by construction:
+    ///
+    /// - **Order.** N spawned tasks are scheduled, not sequenced. Two events raised microseconds
+    ///   apart could apply their `observe_run` projections in either order, leaving the
+    ///   actionability oracle holding the OLDER of the two views.
+    /// - **A happens-before against run teardown.** `run_foreground_impl` calls `forget_run` once
+    ///   the run settles. Nothing ordered a late event's spawned task against it, so a task that
+    ///   had not been polled yet would `observe_run` AFTER `forget_run` — resurrecting a finished
+    ///   run in `live_runs` permanently (nothing ever removes it again) and making its pending
+    ///   notice pass the "is this run still tracked" check it is supposed to fail.
+    ///
+    /// Both are fixed by funnelling every event through ONE unbounded mpsc into ONE pump task:
+    /// `UnboundedSender::send` is non-blocking and callable from this sync closure, and the channel
+    /// is FIFO, so the pump applies events in exactly raise order. Teardown then sends a
+    /// [`ForegroundControlNotifier::flush`] marker through the SAME channel and awaits its ack,
+    /// which — again by FIFO — cannot arrive until every previously-raised event has been fully
+    /// applied. The ack wait is bounded ([`FOREGROUND_CONTROL_FLUSH_TIMEOUT`]) so a pump that has
+    /// already exited, or a runtime being torn down, degrades to "proceed" rather than to a hang.
+    ///
+    /// # The `intercom` channel leg
+    ///
+    /// `emitControlNotification`'s second leg (`:524-530`) emits `SUBAGENT_CONTROL_INTERCOM_EVENT`
+    /// onto pi's in-process event bus. At the ported baseline that bus event has NO delivering
+    /// subscriber anywhere in `pi-subagents` — the only consumers are `runs/background/wait.ts`,
+    /// which lists it purely as a WAKE channel (`wait.ts:136-141`), and
+    /// `async-job-tracker.ts:160-166`, which re-emits it for the async source. Nothing in upstream
+    /// actually sends that message to the broker; an out-of-tree extension subscribing to the bus
+    /// would. cyrup has no such bus, and its `wait` is documented poll-only
+    /// (`background/wait.rs:32`), so there is no cyrup-side subscriber for this leg to feed either.
+    /// The rendered body is ported and tested
+    /// ([`crate::exec::control::format_control_intercom_message`]); the gate that decides whether
+    /// it would be sent is honoured below, so re-adding a delivery target is a call-site change.
+    fn foreground_control_notifier(
+        &self,
+        run_id: RunId,
+        agent: String,
+        config: crate::exec::control::ResolvedControlConfig,
+    ) -> ForegroundControlNotifier {
+        let foreground_controls = Arc::clone(&self.foreground_controls);
+        let notices = Arc::clone(&self.notices);
+        let notice_sink = self.effective_control_notice_sink();
+        // pi's `intercomBridge.active && intercomBridge.orchestratorTarget` predicate; this crate's
+        // equivalent live-bridge signal is the same one `RunOptions::orchestrator_intercom_target`
+        // is built from, so a headless/no-intercom session resolves no child target at all.
+        let bridge_active = self.orchestrator_intercom_target().is_some();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ForegroundControlPumpMsg>();
+
+        let pump_run_id = run_id.clone();
+        let pump_agent = agent.clone();
+        drop(tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let event = match msg {
+                    ForegroundControlPumpMsg::Flush(ack) => {
+                        // FIFO: every event queued before this marker has already been applied.
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    ForegroundControlPumpMsg::Event(event) => *event,
+                };
+                // (2) pi `emitControlNotification`'s `childIntercomTarget` (`:512-513`).
+                let child_intercom_target = bridge_active.then(|| {
+                    crate::spawn::intercom_target::resolve_subagent_intercom_target_opt(
+                        &event.run_id,
+                        &event.agent,
+                        event.index.map(|i| i as usize),
+                    )
+                });
+                let notice = crate::tui::ControlNotice {
+                    key: crate::tui::ControlNoticeKey {
+                        run_id: pump_run_id.clone(),
+                        kind: crate::tui::ControlNoticeKind::NeedsAttention,
+                        notification_key: crate::exec::control::control_notification_key(
+                            &event,
+                            child_intercom_target.as_deref(),
+                        ),
+                    },
+                    source: crate::tui::RunSource::Foreground,
+                    agent: Some(pump_agent.clone()),
+                    step_index: event.index,
+                    reason: crate::exec::control::control_event_reason_wire(
+                        event.reason.unwrap_or(crate::exec::control::ControlEventReason::Idle),
+                    )
+                    .to_string(),
+                    // pi's `noticeText` (`subagent-executor.ts:519`) — the full rendered body,
+                    // built ONCE at raise time and carried on the payload, not re-derived at
+                    // delivery.
+                    message: crate::exec::control::format_control_notice_message(
+                        &event,
+                        child_intercom_target.as_deref(),
+                    ),
+                };
+                let live = crate::tui::notices::LiveRunView {
+                    current_agent: Some(pump_agent.clone()),
+                    current_step_index: event.index,
+                    needs_attention: event.to == crate::background::ActivityState::NeedsAttention,
+                };
+                notices.lock().await.observe_run(pump_run_id.clone(), live);
+                crate::tui::notices::ControlNoticeState::handle(
+                    &notices,
+                    notice,
+                    Arc::clone(&notice_sink),
+                )
+                .await;
+            }
+        }));
+
+        let sink_tx = tx.clone();
+        let sink = crate::exec::control::ControlEventSink::new(move |event| {
+            // (1) refresh the live control entry's activity state. Done SYNCHRONOUSLY, on the drive
+            // loop's own thread, so the nested-control inbox listener and the notice pump both see
+            // transitions in raise order (this is the map `resolve_nested_control_request` reads).
+            {
+                let mut controls = foreground_controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(entry) = controls.get_mut(run_id.as_str()) {
+                    entry.current_activity_state = Some(event.to);
+                }
+            }
+            // (3) the `notifyChannels.includes("event")` CHANNEL gate (`:521`). `shouldNotifyControlEvent`
+            // already ran one layer down. Note the ordering matters for parity: pi computes
+            // `childIntercomTarget`/`noticeText` BEFORE this gate, but both are pure, so evaluating
+            // the gate first is observationally identical and avoids the render on the dropped path.
+            if !config
+                .notify_channels
+                .contains(&crate::registration::ControlNotificationChannel::Event)
+            {
+                return;
+            }
+            // (4) pi `handleSubagentControlNotice`'s `active_long_running` early return
+            // (`control-notices.ts:74`).
+            if event.event_type == crate::registration::ControlEventType::ActiveLongRunning {
+                return;
+            }
+            // (5) ordered hand-off. A closed channel (pump already gone) drops the notice, which is
+            // the same outcome pi's own fire-and-forget `setTimeout` has once its state is torn down.
+            let _ = sink_tx.send(ForegroundControlPumpMsg::Event(Box::new(event.clone())));
+        });
+
+        ForegroundControlNotifier { sink, tx }
+    }
+
+    /// Construct an executor whose control notices are delivered to `sink` instead of the default
+    /// host-services/logging pair — the seam a test uses to capture what the notice pipeline
+    /// actually delivered. Mirrors [`Self::with_completion_sink`]'s precedence exactly.
+    #[must_use]
+    pub fn with_control_notice_sink(
+        sink: Arc<dyn crate::tui::notices::ControlNoticeSink>,
+    ) -> Self {
+        Self { control_notice_sink_override: Some(sink), ..Self::new() }
+    }
+
+    /// Override the control-notice debounce window (production: 1000ms, pi's
+    /// `foregroundDelayMs ?? 1000`). Test-facing, so a notice-delivery assertion need not sleep out
+    /// the full production window; `SubagentExecutor` otherwise always uses the production value.
+    pub async fn set_control_notice_debounce(&self, debounce: std::time::Duration) {
+        let mut guard = self.notices.lock().await;
+        *guard = crate::tui::notices::ControlNoticeState::with_debounce(debounce);
     }
 
     /// Install (or reinstall) the background-completion watcher (C6) over this cwd's `ResultsDir`
@@ -1133,6 +1509,22 @@ impl SubagentExecutor {
         // context (R-SA-037/119/120) below; it doubles as the artifact-quadruple run id further down.
         let run_id = RunId::new();
 
+        // pi `runSinglePath` (`subagent-executor.ts:1179` `controlConfig`, resolved as
+        // `resolveControlConfig(deps.config.control, params.control)`): the extension-level
+        // `subagents.control` block is the base, this call's own `control` object overrides it field
+        // by field. Resolved ONCE here because BOTH `RunOptions::control_config` (the thresholds the
+        // child's stream is judged against) and the notifier's `notifyChannels` gate read it — pi
+        // likewise resolves it once into `ExecutionContextData.controlConfig` and hands the same
+        // value to `runSingleAttempt` and `createForegroundControlNotifier`.
+        let resolved_control = crate::exec::control::resolve_control_config(
+            cfg.control.as_ref(),
+            overrides.control.as_ref(),
+        );
+        // pi `createForegroundControlNotifier(data, deps)` (`:1222-1229`), plus the ordered pump its
+        // Rust equivalent needs; see the method doc.
+        let control_notifier =
+            self.foreground_control_notifier(run_id.clone(), agent.name.clone(), resolved_control.clone());
+
         // T6 artifact quadruple config + root (pi `subagent-executor.ts:3387-3391`). Resolved HERE,
         // ahead of `run_options`, because pi derives the single-run output base directory from the
         // artifacts dir (`resolveSingleRunOutputBaseDir`, `:2203-2207`). SUBA-041: an explicit
@@ -1237,7 +1629,10 @@ impl SubagentExecutor {
             // orchestrator/runtime fallback cwd).
             skills: overrides.skills,
             runtime_cwd: None,
-            include_progress: None,
+            // pi `progress: params.includeProgress ? allProgress : undefined`
+            // (`subagent-executor.ts:3008` @v0.34.0). `run_sync` assembles the snapshot; this is
+            // the only place the caller's flag reaches it on the foreground path.
+            include_progress: overrides.include_progress,
             agent_scope: None,
             // SUBA-041: the per-call `acceptance` policy (pi `acceptance: params.acceptance`,
             // `subagent-executor.ts:2962`); `None` (an omitted param, or the explicit `"auto"`)
@@ -1270,6 +1665,14 @@ impl SubagentExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target(),
             run_id: Some(run_id.clone()),
             child_index: Some(0),
+            // pi `runSinglePath`'s `controlConfig: resolveControlConfig(deps.config.control,
+            // input.params.control)` (`subagent-executor.ts:1179` @v0.34.0): the extension-level
+            // `subagents.control` block is the base, the call's own `control` object overrides it
+            // field by field. Resolved once above so the notifier's channel gate reads the SAME
+            // value, exactly as pi shares one `ExecutionContextData.controlConfig`.
+            control_config: Some(resolved_control.clone()),
+            // pi `onControlEvent: createForegroundControlNotifier(data, deps)` (`:1222-1229`).
+            on_control_event: Some(control_notifier.sink()),
         };
 
         // pi `state.foregroundControls.set(runId, {interrupt, currentAgent, currentIndex})`
@@ -1290,9 +1693,24 @@ impl SubagentExecutor {
                     interrupt: run_options.interrupt.clone(),
                     current_agent: Some(agent.name.clone()),
                     current_index: Some(0),
+                    current_activity_state: None,
                 },
             );
         }
+
+        // The notice machine's own live-state projection (R-SA-116 check 1: an unknown run is not
+        // actionable). Registered alongside the `foregroundControls` entry above and dropped
+        // alongside it below, so the two views of "is this run still live" cannot disagree — pi
+        // reads BOTH off the single `state.foregroundControls` map, which is what
+        // `isForegroundNoticeStillActionable` consults (`control-notices.ts:58-65`).
+        self.notices.lock().await.observe_run(
+            run_id.clone(),
+            crate::tui::notices::LiveRunView {
+                current_agent: Some(agent.name.clone()),
+                current_step_index: Some(0),
+                needs_attention: false,
+            },
+        );
 
         // T6 artifact quadruple (pi `runs/foreground/execution.ts:960-1074`): record this run's input
         // BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
@@ -1323,6 +1741,14 @@ impl SubagentExecutor {
         )
         .await;
 
+        // SUBA-N05: drain the ordered control-notice pump FIRST. Every event raised by the run that
+        // just settled is now guaranteed to have been applied to the notice machine's live
+        // projection, so the teardown below cannot be raced by a late event re-registering a
+        // finished run (see `foreground_control_notifier`'s "Ordering" section). Bounded — this can
+        // stall the tool call by at most `FOREGROUND_CONTROL_FLUSH_TIMEOUT`, and only if the pump
+        // has genuinely wedged.
+        control_notifier.flush().await;
+
         // The run has settled (success, failure, or interrupted-terminal) — pi's foregroundControls
         // entry only exists while a run is live, so a nested-control request arriving after this
         // point must see a lookup miss ("is not active in this fanout child"), never a stale entry.
@@ -1333,6 +1759,14 @@ impl SubagentExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             controls.remove(run_id.as_str());
         }
+        // ...and the notice machine's projection of the same fact (pi's single
+        // `state.foregroundControls` map serves both roles), together with the pending-timer abort
+        // pi pairs it with (`clearPendingForegroundControlNotices(deps.state, runId)` immediately
+        // ahead of `foregroundControls.delete(runId)`, `subagent-executor.ts:3579-3581`). A
+        // foreground notice still sitting in its debounce window when the run settles is therefore
+        // cancelled outright, and would in any case fail check 1 of the actionability re-check —
+        // pi's `if (!control) return false` (`control-notices.ts:60`).
+        self.notices.lock().await.forget_run(&run_id);
 
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
 
@@ -1379,13 +1813,19 @@ impl SubagentExecutor {
     /// config cannot be written, or the detached spawn itself fails.
     pub async fn spawn_background(
         &self,
-        cwd: &Path,
-        agent_name: &str,
-        task: &str,
-        context: Option<ContextMode>,
-        model_override: Option<ModelId>,
-        agent_scope: AgentReadScope,
+        request: BackgroundSingleRequest<'_>,
     ) -> Result<RunId, SubagentError> {
+        let BackgroundSingleRequest {
+            cwd,
+            agent_name,
+            task,
+            context,
+            model_override,
+            agent_scope,
+            acceptance,
+            control,
+            include_progress,
+        } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
         // (correct, but too-late-for-THIS-call-site) independent re-check, since this function
@@ -1429,7 +1869,11 @@ impl SubagentExecutor {
             output_path: None,
             output_mode: None,
             reads: None,
-            acceptance: None,
+            // SUBA-N04: an async SINGLE run's declared acceptance policy rides to the detached
+            // runner on its own step, exactly like the `model` override directly above — pi
+            // `async-execution.ts:1282-1289,1319`. Before this it was hardcoded `None` and the tool
+            // surface refused the param outright, because the runner dropped it anyway.
+            acceptance,
             context: Some(effective_context),
             agent_scope: None,
         };
@@ -1445,6 +1889,18 @@ impl SubagentExecutor {
                 // chain scratch dir (`{chain_dir}` → the run cwd).
                 original_task: task.to_string(),
                 chain_dir: None,
+                // SUBA-N05: the same parent-side `resolveControlConfig(deps.config.control,
+                // params.control)` fold the foreground path performs (`cfg` was already snapshotted
+                // above for the depth guard), carried to hop 2 on `RunnerConfig::control`. pi:
+                // `executeAsyncSingle(id, { …, controlConfig, … })`,
+                // `subagent-executor.ts:2845,2868` @v0.34.0.
+                control: Some(crate::exec::control::resolve_control_config(
+                    cfg.control.as_ref(),
+                    control.as_ref(),
+                )),
+                // SUBA-N06: the caller's `includeProgress`, carried verbatim to hop 2 (there is no
+                // config-level base to fold it against — pi has none either).
+                include_progress,
             },
         )
         .await
@@ -1481,6 +1937,8 @@ impl SubagentExecutor {
             resolved_agents,
             original_task,
             chain_dir,
+            control,
+            include_progress,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -1596,6 +2054,15 @@ impl SubagentExecutor {
             // `expand.maxItems` is absent falls back to the SAME run-wide cap the foreground path
             // applies (`run_chain_foreground`), rather than always failing materialization.
             dynamic_fanout_max_items,
+            // SUBA-N05 (pi `config.controlConfig`, `subagent-runner.ts:1802` @v0.34.0): the
+            // live-control thresholds/channels this run was AUTHORIZED with, resolved parent-side
+            // by the caller and baked in here. This is the only channel by which a per-call
+            // `control` override reaches the detached hop-2 runner — it has no settings access and
+            // no orchestrator to ask.
+            control,
+            // SUBA-N06: R-SA-043 compaction's opt-out, carried to hop 2 for the same reason — the
+            // detached runner cannot ask anyone what the caller requested.
+            include_progress,
         };
 
         let cfg_path = run_paths.run_dir.join("runner-config.json");
@@ -1722,6 +2189,52 @@ impl SubagentExecutor {
         // param at all) means no chain-wide deadline, matching pi exactly.
         timeout_ms: Option<u64>,
     ) -> Result<(Vec<StepResult>, Vec<GroupStepResult>), SubagentError> {
+        self.run_chain_foreground_with_control(
+            cwd,
+            graph,
+            resolved_agents,
+            original_task,
+            chain_dir,
+            cancel,
+            timeout_ms,
+            None,
+            // SUBA-N06: no `includeProgress` on the slash/integration surface either.
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::run_chain_foreground`] plus the per-call `control` override (SUBA-N05).
+    ///
+    /// Split out rather than added as an eighth parameter to the public entry point: that signature
+    /// is consumed by integration tests and by the slash surface, neither of which has a `control`
+    /// param to supply, and pi's own slash/chain callers likewise pass only the extension-level
+    /// config. The override is folded against `subagents.control` here, so a caller passing `None`
+    /// still gets the CONFIGURED thresholds rather than the hardcoded defaults — which is itself a
+    /// fix: before SUBA-N05 every foreground chain/parallel step ran with `control_config: None`
+    /// and the extension-level block reached nothing on this path at all.
+    ///
+    /// pi: `runChainPath` resolves `controlConfig: resolveControlConfig(input.deps.config.control,
+    /// input.params.control)` (`subagent-executor.ts:1133`) and threads it into
+    /// `chain-execution.ts`'s per-step `runSync` calls (`:388,1064,1323`), all @v0.34.0.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_chain_foreground_with_control(
+        &self,
+        cwd: &Path,
+        graph: Vec<RunnerStep>,
+        resolved_agents: BTreeMap<String, ResolvedAgentPersona>,
+        original_task: String,
+        chain_dir: Option<PathBuf>,
+        cancel: CancelToken,
+        timeout_ms: Option<u64>,
+        control_override: Option<crate::registration::ControlConfig>,
+        // SUBA-N06: pi's `includeProgress`, threaded onto every step this walk dispatches. pi does
+        // the same on its chain path — `executeChain({ ..., includeProgress: params.includeProgress })`
+        // (`subagent-executor.ts:2012` @v0.34.0) → `progress: input.includeProgress ?
+        // input.allProgress : undefined` (`chain-execution.ts:167`). `None` for every
+        // slash-command caller (no such param on that surface, matching pi).
+        include_progress: Option<bool>,
+    ) -> Result<(Vec<StepResult>, Vec<GroupStepResult>), SubagentError> {
         let cfg = self.config_snapshot().await;
         let depth = resolve_effective_depth(cfg.max_subagent_depth);
         if crate::spawn::depth::is_blocked(&depth) {
@@ -1752,7 +2265,21 @@ impl SubagentExecutor {
             // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
             // step's own `model:` is policed exactly as a single run's `model` is.
             Self::resolve_model_scope(cwd)?,
-        ));
+        )
+        // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
+        // `chain-execution.ts:388,1064,1323` @v0.34.0): the extension-level `subagents.control`
+        // block folded with this call's own override, so a foreground chain/parallel step's child
+        // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
+        // defaults this path used to fall back to.
+        .with_control(Some(crate::exec::control::resolve_control_config(
+            cfg.control.as_ref(),
+            control_override.as_ref(),
+        )))
+        // SUBA-N06 (pi `chain-execution.ts:167`, gated on the same `includeProgress` the SINGLE
+        // path uses): each foreground chain/parallel step's own `SingleResult` carries its
+        // progress snapshot, which is where cyrup's [CYRUP-DELTA] on placement puts pi's
+        // `details.progress` array.
+        .with_include_progress(include_progress));
         let global_limit = GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
         // R-SA-035/036 (pi `chain-execution.ts:606`): the chain-wide deadline is computed ONCE here,
         // before the walk starts, from the nominal `timeout_ms` budget the caller resolved
@@ -1828,6 +2355,18 @@ impl SubagentExecutor {
         // separate unit); `route_chain_mode` is the one caller that resolves a real value from the
         // tool's `timeoutMs`/`maxRuntimeMs` params.
         timeout_ms: Option<u64>,
+        // SUBA-N05: the RAW per-call `control` override (pi `params.control`), folded here against
+        // the extension-level `subagents.control` block by
+        // [`crate::exec::control::resolve_control_config`] and threaded into BOTH outcomes — the
+        // detached runner's `RunnerConfig::control` and the foreground walk's per-step
+        // `RunOptions::control_config`. `None` for every slash-command caller (no `control` param
+        // on that surface, matching pi, whose slash path likewise passes only the config).
+        control_override: Option<crate::registration::ControlConfig>,
+        // SUBA-N06: pi's `includeProgress`, threaded into BOTH outcomes — the detached runner's
+        // `RunnerConfig::include_progress` and the foreground walk's per-step
+        // `RunOptions::include_progress`. `None` for every slash-command caller (no such param on
+        // that surface, matching pi).
+        include_progress: Option<bool>,
     ) -> Result<GraphRunOutcome, SubagentError> {
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before persona resolution (real
         // discovery I/O) or fork-context resolution (real session I/O).
@@ -1905,6 +2444,14 @@ impl SubagentExecutor {
                         resolved_agents,
                         original_task,
                         chain_dir: Some(chain_dir),
+                        // SUBA-N05 (pi `executeAsyncChain(..., { controlConfig, ... })`,
+                        // `subagent-executor.ts:1312-1313` @v0.34.0).
+                        control: Some(crate::exec::control::resolve_control_config(
+                            cfg.control.as_ref(),
+                            control_override.as_ref(),
+                        )),
+                        // SUBA-N06.
+                        include_progress,
                     },
                 )
                 .await?;
@@ -1919,7 +2466,7 @@ impl SubagentExecutor {
                 .map(|s| matches!(s, RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_)))
                 .collect();
             let (results, groups) = self
-                .run_chain_foreground(
+                .run_chain_foreground_with_control(
                     cwd,
                     graph,
                     resolved_agents,
@@ -1927,6 +2474,8 @@ impl SubagentExecutor {
                     Some(chain_dir),
                     cancel,
                     timeout_ms,
+                    control_override,
+                    include_progress,
                 )
                 .await?;
             Ok(GraphRunOutcome::Foreground {
@@ -2655,6 +3204,18 @@ impl SubagentExecutor {
                     // The revival's follow-up is its `{task}`; a single revived run has no chain dir.
                     original_task: follow_up.to_string(),
                     chain_dir: None,
+                    // SUBA-N05: a revival carries no per-call `control` object of its own — pi's
+                    // revive path likewise resolves `resolveControlConfig(deps.config.control,
+                    // input.params.control)` where `params` is the ACTION's params
+                    // (`subagent-executor.ts:1179` @v0.34.0), and cyrup's `resume` action exposes no
+                    // `control` field. The extension-level `subagents.control` block still applies.
+                    control: Some(crate::exec::control::resolve_control_config(
+                        self.config_snapshot().await.control.as_ref(),
+                        None,
+                    )),
+                    // SUBA-N06: a revival exposes no `includeProgress` param either, for the same
+                    // reason — the `resume` action's params carry no such field.
+                    include_progress: None,
                 },
             )
             .await?;
@@ -3884,11 +4445,21 @@ fn parse_tool_reads(raw: Option<&serde_json::Value>) -> Option<Vec<PathBuf>> {
     }
 }
 
-fn parse_tool_acceptance(raw: Option<&serde_json::Value>) -> Option<String> {
+/// Carry a `tasks[]`/`chain[]` item's raw `acceptance` value onto its [`SingleStepSpec`] (pi keeps
+/// `task.acceptance`/`step.acceptance` raw on the step and hands it to `runSync` unmodified,
+/// `chain-execution.ts:400,1335` @v0.34.0).
+///
+/// SUBA-N04: this used to keep ONLY the level-string form, so `{ level: "verified", verify: [{
+/// command: "cargo test" }] }` and the `false` shorthand were both discarded at the tool boundary —
+/// and the string form that did survive was then dropped again in the runner. Every form pi's
+/// `AcceptanceOverride` union admits now reaches
+/// [`crate::exec::acceptance::lower_acceptance_input`] at dispatch. Only JSON `null` and the empty
+/// string (neither of which is a policy) normalize to `None`, i.e. pi's `undefined`.
+fn parse_tool_acceptance(raw: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     match raw {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        // Object-policy / boolean-`false` acceptance forms are not lowered here (Tier 3, C12).
-        _ => None,
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(value.clone()),
     }
 }
 
@@ -3998,83 +4569,16 @@ fn normalize_skill_input(raw: Option<&serde_json::Value>) -> Option<Vec<String>>
     }
 }
 
-/// SUBA-041 — lower the SINGLE-mode `acceptance` param (pi `AcceptanceOverride`, `schemas.ts:69-76`)
-/// onto this crate's [`crate::exec::acceptance::AcceptanceContract`], after running pi's own
-/// `validateAcceptanceInput` (`runs/shared/acceptance.ts:138-249`, applied at
-/// `subagent-executor.ts:1418`) so a malformed policy is refused BEFORE any child spawns with pi's
-/// verbatim messages.
-///
-/// Level mapping (pi `AcceptanceLevel` -> [`crate::exec::acceptance::AcceptanceStatus`]): `auto`
-/// yields `None`, i.e. pi's own "omitted means auto-inferred" — `run_sync` then falls through to
-/// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] (R-SA-023), which is this
-/// crate's `inferLevel`. Every other level (and the `false` shorthand, pi's `level: "none"`) becomes
-/// an EXPLICIT contract, which is what arms R-SA-033's post-hoc exit-code correction.
-///
-/// **[CYRUP-DELTA]** pi's richer `AcceptanceConfig` fields (`criteria`/`evidence`/`review`/
-/// `stopRules`/`reason`) are validated here but carry no [`crate::exec::acceptance::AcceptanceContract`]
-/// home — that shape lives in the parallel, not-yet-wired `exec::acceptance::model` port. Only
-/// `level` and `verify[].command` are lowered; the rest are accepted-and-ignored rather than
-/// rejected, matching pi's own tolerance for a config that declares more than a given run consumes.
-fn parse_single_acceptance(
-    raw: &serde_json::Value,
-) -> Result<Option<crate::exec::acceptance::AcceptanceContract>, String> {
-    use crate::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
-
-    let errors = crate::exec::acceptance::model::validate_acceptance_input(raw, "acceptance");
-    if !errors.is_empty() {
-        return Err(errors.join(" "));
-    }
-
-    fn level_to_status(level: &str) -> Option<AcceptanceStatus> {
-        match level {
-            "none" => Some(AcceptanceStatus::NotRequired),
-            "attested" => Some(AcceptanceStatus::Attested),
-            "checked" => Some(AcceptanceStatus::Checked),
-            "verified" => Some(AcceptanceStatus::Verified),
-            "reviewed" => Some(AcceptanceStatus::Reviewed),
-            // "auto" (and anything `validate_acceptance_input` already let through) infers.
-            _ => None,
-        }
-    }
-
-    match raw {
-        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`).
-        serde_json::Value::Bool(false) => Ok(Some(AcceptanceContract::explicit(
-            AcceptanceStatus::NotRequired,
-            Vec::new(),
-        ))),
-        serde_json::Value::String(level) => Ok(level_to_status(level)
-            .map(|status| AcceptanceContract::explicit(status, Vec::new()))),
-        serde_json::Value::Object(config) => {
-            let verify: Vec<String> = config
-                .get("verify")
-                .and_then(serde_json::Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let level = config.get("level").and_then(serde_json::Value::as_str);
-            match level.and_then(level_to_status) {
-                Some(status) => Ok(Some(AcceptanceContract::explicit(status, verify))),
-                // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
-                // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
-                // still inferred — but declared `verify[]` commands must not be dropped, so an
-                // object carrying any is lowered as an explicit `verified` contract.
-                None if !verify.is_empty() => Ok(Some(AcceptanceContract::explicit(
-                    AcceptanceStatus::Verified,
-                    verify,
-                ))),
-                None => Ok(None),
-            }
-        }
-        // `null`/absent is pi's `undefined`.
-        _ => Ok(None),
-    }
-}
+// SUBA-041 / SUBA-N04 — the SINGLE-mode `acceptance` param's lowering (pi `AcceptanceOverride`,
+// `schemas.ts:69-76`, applied at `subagent-executor.ts:1418`).
+//
+// The single implementation lives in `crate::exec::acceptance::lower_acceptance_input` so the
+// chain/parallel/background STEP path (`background/runner_main.rs::ExecSingleStepExecutor::
+// run_single`, pi `chain-execution.ts:400,1335`) shares it verbatim instead of growing a second,
+// drifting parser — SUBA-N04's root cause was exactly a step path that lowered nothing at all. See
+// that function for the level mapping and the [CYRUP-DELTA] on pi's richer `AcceptanceConfig`
+// fields.
+use crate::exec::acceptance::lower_acceptance_input as parse_single_acceptance;
 
 /// Translate the tool's `chain[]` array into a `Vec<RunnerStep>`: a sequential step for a
 /// `{agent, task, …}` element, a [`RunnerStep::ParallelGroup`] for a `{parallel: [...]}` element
@@ -4377,14 +4881,22 @@ fn sj_chain_item() -> serde_json::Value {
     })
 }
 
-/// `ControlOverrides` (`schemas.ts:180-193`): per-run subagent-control attention thresholds.
+/// `ControlOverrides` (`extension/schemas.ts:201-215` @v0.34.0): per-run subagent-control attention
+/// thresholds and notification routing.
 ///
-/// SUBA-041 unhooked this fragment from [`subagent_tool_parameters`]: cyrup ports the control CONFIG
-/// shape ([`crate::registration::ControlConfig`]) but not pi's `resolveControlConfig` /
-/// control-notice pipeline, so a per-call `control` override has nothing to override and the
-/// dispatcher refuses it. The fragment is kept — not deleted — as the schema-shape record for
-/// whichever tier lands that subsystem, at which point it is re-inserted and the refusal is dropped.
-#[allow(dead_code)]
+/// SUBA-041 unhooked this fragment from [`subagent_tool_parameters`] because cyrup had the control
+/// CONFIG shape ([`crate::registration::ControlConfig`]) but neither `resolveControlConfig` nor the
+/// notice pipeline behind it. SUBA-N05 landed both — [`crate::exec::control`] is a full port of
+/// `runs/shared/subagent-control.ts`, [`crate::exec::control::ControlMonitor`] raises real events off
+/// the child's NDJSON stream, and [`SubagentExecutor::foreground_control_notifier`] feeds them to
+/// [`crate::tui::notices::ControlNoticeState`] — so the fragment is live again and the dispatcher
+/// honours the param on both the foreground and the async path.
+///
+/// Per-property descriptions are pruned, matching how [`subagent_tool_parameters`] treats every
+/// other nested object shape (`tasks[]`, `chain[]`): pi's own top-level `control` entry
+/// (`schemas.ts:279`) carries no description of its own either, so the union of what the model sees
+/// is `{type, minimum, enum}` structure exactly as upstream ships it after
+/// `keepTopLevelParameterDescriptions` pruning.
 fn sj_control_overrides() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -4403,9 +4915,8 @@ fn sj_control_overrides() -> serde_json::Value {
 
 /// The complete LLM-facing JSON Schema for the `subagent` tool (C8) — a faithful port of pi's
 /// exported `SubagentParams` (`schemas.ts:195-265`, after `keepTopLevelParameterDescriptions`
-/// pruning). Every top-level parameter pi advertises is present with its top-level description
-/// EXCEPT the two SUBA-041 withholds (`includeProgress`, `control`) whose subsystems this port does
-/// not have — see the inline notes at their former insertion points. The nested `tasks[]`/`chain[]`
+/// pruning). Every top-level parameter pi advertises is present with its top-level description; as
+/// of SUBA-N06 there are no withholds left. The nested `tasks[]`/`chain[]`
 /// element shapes carry their full structural detail (types, enums, `minimum`s, `items`, `anyOf`
 /// unions) with per-node descriptions pruned to keep the provider payload compact, exactly as pi
 /// ships it.
@@ -4413,31 +4924,79 @@ fn sj_control_overrides() -> serde_json::Value {
 /// # The SUBA-041 invariant, stated accurately
 ///
 /// This schema must never advertise a parameter [`SubagentTool::route_single`] refuses
-/// UNCONDITIONALLY. `includeProgress` and `control` are refused on every path, so they are absent
-/// here; the other seven SINGLE-mode overrides (`output`, `outputMode`, `skill`, `acceptance`,
-/// `share`, `sessionDir`, `artifacts`) reach [`RunOptions`] on the FOREGROUND path and are
-/// advertised for that reason.
+/// UNCONDITIONALLY — and it no longer refuses any. All nine SINGLE-mode overrides (`output`,
+/// `outputMode`, `skill`, `acceptance`, `share`, `sessionDir`, `artifacts`, `control`,
+/// `includeProgress`) reach [`RunOptions`] on the FOREGROUND path and are advertised for that
+/// reason.
 ///
-/// Those seven are still refused — loudly and by name — when the same call resolves to a BACKGROUND
-/// run (`async: true`, or `asyncByDefault`/`forceTopLevelAsync` making a top-level call background).
+/// SUBA-N06 restored `includeProgress`, the last withhold. It was absent for exactly one reason —
+/// [`crate::exec::SingleResult`] carried no progress object for it to include or omit — and that
+/// reason is gone: [`crate::exec::AgentProgress::snapshot`] projects the winning attempt's fold
+/// into pi's `AgentProgress` wire shape and [`crate::exec::run_sync`] publishes it on
+/// [`crate::exec::SingleResult::progress`] under pi's own truthiness gate
+/// (`progress: params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3008`
+/// @v0.34.0). It is honoured on the ASYNC path too — the flag rides to the detached hop-2 runner on
+/// [`crate::background::runner_main::RunnerConfig::include_progress`] and lands on every step's
+/// `RunOptions`, so the persisted `ResultFile`'s `SingleResult`s carry their snapshots. That is
+/// STRICTLY MORE than upstream, which never passes `includeProgress` into `executeAsyncSingle`
+/// (`subagent-executor.ts:2845-2874` @v0.34.0) because its async return is a "started" message
+/// with no results to attach progress to; cyrup's async run does produce a retrievable
+/// `SingleResult`, so honouring the flag there is the only reading that is not a silent drop.
+///
+/// SUBA-N05 restored `control`. It was withheld for exactly one reason — this port had
+/// [`crate::registration::ControlConfig`]'s shape but no `resolveControlConfig` and no notice
+/// pipeline — and that reason is gone: [`crate::exec::control`] ports
+/// `runs/shared/subagent-control.ts` in full, [`crate::exec::control::ControlMonitor`] raises real
+/// `ControlEvent`s off the child's NDJSON stream, and
+/// [`SubagentExecutor::foreground_control_notifier`] delivers them through
+/// [`crate::tui::notices::ControlNoticeState`]. It is honoured on the ASYNC path too — the resolved
+/// config rides to the detached hop-2 runner on [`crate::background::runner_main::RunnerConfig`],
+/// matching upstream's `executeAsyncSingle(id, { …, controlConfig, … })`
+/// (`subagent-executor.ts:2845,2868-2870` @v0.34.0).
+///
+/// SIX of those nine (`output`, `outputMode`, `skill`, `share`, `sessionDir`, `artifacts`) are
+/// still refused — loudly and by name — when the same call resolves to a BACKGROUND run
+/// (`async: true`, or `asyncByDefault`/`forceTopLevelAsync` making a top-level call background).
 /// That is a MODE-CONDITIONAL refusal of an honoured parameter, which is a shape upstream itself
 /// ships: `timeoutMs`/`maxRuntimeMs` are advertised and then refused for async runs at
 /// `pi-subagents/src/runs/foreground/subagent-executor.ts:3022` @v0.34.0, and this crate mirrors
-/// that refusal directly above the seven-param one.
+/// that refusal directly above the six-param one.
+///
+/// `control` is one of the three exceptions, and its async support is REAL rather than a refusal: the
+/// resolved config rides to hop 2 on `RunnerConfig::control`, hop 2 installs it on every step's
+/// `RunOptions::control_config`, and the events each step raises travel back on
+/// [`crate::spawn::chain_graph::StepResult::control_events`] → the terminal `ResultFile`'s
+/// `SingleResult::control_events`. (What an async run does NOT get is a live transcript notice —
+/// that is the `notifyChannels: ["async"]` replay hop, `subagent-runner.ts:2270-2280` →
+/// `async-job-tracker.ts:138-166` @v0.34.0, which is unported; the events themselves are not lost.)
+///
+/// `includeProgress` is the second, and its async support is likewise real: the flag rides to hop 2
+/// on `RunnerConfig::include_progress`, hop 2 installs it on every step's
+/// `RunOptions::include_progress`, and each step's snapshot travels back on the terminal
+/// `ResultFile`'s `SingleResult::progress`.
+///
+/// `acceptance` is the third, and it is NO LONGER refused (SUBA-N04). It was on that list for one
+/// reason only — the detached hop-2 runner dropped `SingleStepSpec::acceptance` on the floor — and
+/// that reason is gone: [`SubagentExecutor::spawn_background`] now writes the raw policy onto the
+/// step in `runner-config.json`, and
+/// [`crate::background::runner_main::ExecSingleStepExecutor::run_single`] lowers it through
+/// [`crate::exec::acceptance::lower_acceptance_input`] and evaluates it exactly as the foreground
+/// path does. Upstream honours it on the async path too (`runs/background/async-execution.ts:1282-1289`
+/// resolves `explicit: params.acceptance` with `async: true`, and `:1319` persists it on the
+/// steering recovery descriptor), so refusing it was parity debt rather than a design choice.
 ///
 /// # Known parity debt this comment must not paper over
 ///
-/// Upstream DOES honour all seven on the async path — `executeAsyncSingle`
+/// Upstream honours the remaining six on the async path — `executeAsyncSingle`
 /// (`subagent-executor.ts:2845-2874` @v0.34.0) threads `artifactConfig`, `shareEnabled`,
 /// `sessionRoot`, `skills`, `output`, `outputMode` and `outputBaseDir` into the background run.
 /// cyrup's background hop hands a `RunnerConfig` to a detached second-hop runner that has no fields
-/// for share/sessionDir/artifacts, no `skill` on [`crate::spawn::chain_graph::SingleStepSpec`], and
-/// drops `SingleStepSpec::acceptance` on the floor in BOTH walkers
-/// (`background/runner_main.rs` and `spawn/chain_graph.rs`), so closing it is a real port, not a
+/// for share/sessionDir/artifacts and no `skill` on
+/// [`crate::spawn::chain_graph::SingleStepSpec`], so closing THOSE is still a real port, not a
 /// tweak. Until then the refusal is the honest behaviour — an advertised-and-silently-dropped param
 /// is the defect SUBA-041 names; an advertised-and-loudly-refused-in-one-mode param is upstream's
 /// own `timeoutMs` precedent. The refusal is pinned by
-/// `tests::a_background_single_run_refuses_the_seven_foreground_only_overrides_by_name`, so this
+/// `tests::a_background_single_run_refuses_the_six_foreground_only_overrides_by_name`, so this
 /// contract cannot drift silently in either direction.
 fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
@@ -4485,19 +5044,25 @@ fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
     props.insert("cwd".to_string(), serde_json::json!({ "type": "string" }));
     props.insert("artifacts".to_string(), serde_json::json!({ "type": "boolean", "description": "Write debug artifacts (default: true)" }));
-    // SUBA-041: `includeProgress` is deliberately NOT advertised. pi uses it to gate the
-    // `details.progress` array of `AgentProgress` snapshots (`subagent-executor.ts:3008`); cyrup's
-    // `details` is the deliberately compacted `SingleResult` (R-SA-043), which has no progress array
-    // to include or omit. Advertising a knob the dispatcher must refuse is the SUBA-041 defect
-    // itself, so the schema stays silent until that shape exists.
+    // SUBA-N06: `includeProgress` is advertised again, in pi's own position (between `artifacts`
+    // and `share`, `schemas.ts:271-273` @v0.34.0) and with pi's description verbatim. It was
+    // withheld for exactly one reason — `SingleResult` had no progress object to include or omit —
+    // and that reason is gone: `exec::AgentProgress::snapshot` projects the winning attempt's fold
+    // into pi's `AgentProgress` shape and `run_sync` publishes it on `SingleResult::progress`
+    // under pi's own truthiness gate. Honoured on the foreground path via
+    // `SingleRunOverrides::include_progress` and on the async one via
+    // `RunnerConfig::include_progress`.
+    props.insert("includeProgress".to_string(), serde_json::json!({ "type": "boolean", "description": "Include full progress in result (default: false)" }));
     props.insert("share".to_string(), serde_json::json!({ "type": "boolean", "description": "Upload session to GitHub Gist for sharing (default: false)" }));
     props.insert("sessionDir".to_string(), serde_json::json!({ "type": "string", "description": "Directory to store session logs (default: temp; enables sessions even if share=false)" }));
     props.insert("clarify".to_string(), serde_json::json!({ "type": "boolean", "description": "Show TUI to preview/edit before execution. Explicit clarify: true keeps the run foreground for the clarify UI; omitted clarify can still run in the background when async: true is set." }));
-    // SUBA-041: `control` is deliberately NOT advertised. pi feeds it to `resolveControlConfig`
-    // (`shared/subagent-control.ts`) which drives the live attention/notice pipeline; this crate
-    // ports only that config's SHAPE ([`crate::registration::ControlConfig`]) — no resolver, no
-    // notice emission, no notify channels — so there is nothing for a per-call override to override.
-    // See [`sj_control_overrides`], kept for the schema-fragment record.
+    // SUBA-N05: `control` is advertised again, in pi's own position (between `clarify` and the solo
+    // agent overrides, `schemas.ts:278-279` @v0.34.0). It reaches `resolveControlConfig`
+    // ([`crate::exec::control::resolve_control_config`]) on the foreground path via
+    // `SingleRunOverrides::control` and on the async path via `RunnerConfig::control`, and drives
+    // the live attention/notice pipeline in both. pi gives the top-level entry no description of
+    // its own, so neither does this.
+    props.insert("control".to_string(), sj_control_overrides());
     // pi's own description (`schemas.ts:286`) is kept VERBATIM, including its stale
     // "Relative paths resolve against cwd" clause: pi's `resolveSingleOutputPath`
     // (`single-output.ts:21-34`) only falls back to a cwd when no `relativeBaseDir` is supplied, and
@@ -4781,10 +5346,17 @@ impl SubagentTool {
     ///
     /// SUBA-041 — the per-call override surface pi's `runSinglePath` honors
     /// (`subagent-executor.ts:2788-2791` output/outputMode/skill, `:2962` acceptance, `:2874` share,
-    /// `:3387-3401` artifacts/sessionDir) now reaches [`RunOptions`] through
-    /// [`SingleRunOverrides`] instead of being rejected wholesale. The two params with no subsystem
-    /// behind them (`includeProgress`, `control`) were removed from the tool schema and are still
+    /// `:3387-3401` artifacts/sessionDir, `:1179` control) now reaches [`RunOptions`] through
+    /// [`SingleRunOverrides`] instead of being rejected wholesale. `includeProgress` — the one
+    /// remaining param with no subsystem behind it — is absent from the tool schema and still
     /// refused here, so the schema never promises what this dispatcher declines.
+    ///
+    /// SUBA-N05 moved `control` out of that refusal and into [`SingleRunOverrides::control`], on
+    /// BOTH paths: the foreground run resolves it into `RunOptions::control_config` alongside the
+    /// notice notifier, and the background run carries it to hop 2 on
+    /// [`BackgroundSingleRequest::control`]. It had been the crate's one remaining
+    /// advertised-and-silently-dropped param on the async side — parsed, not on the foreground-only
+    /// refusal list, and with nowhere to go.
     async fn route_single(
         &self,
         p: &SubagentToolParams,
@@ -4802,30 +5374,31 @@ impl SubagentTool {
         let context = p.context_override();
         let model = p.model.clone().map(ModelId::from);
 
-        // SUBA-041: the two SINGLE-mode params the tool schema NO LONGER advertises, because this
-        // port has no subsystem for either — `control` needs pi's `resolveControlConfig` +
-        // control-notice pipeline (`shared/subagent-control.ts`), of which this crate ports only the
-        // config shape, and `includeProgress` gates pi's `details.progress` array, which cyrup's
-        // deliberately compacted [`SingleResult`] (R-SA-043) has no home for. They are still parsed
-        // (the tool schema is `additionalProperties: true`, so a caller can still send them) and are
-        // still rejected LOUDLY here, so no override is ever silently dropped — but nothing promises
-        // them any more, which is the defect SUBA-041 actually names. `chainDir` is CHAIN-mode-only
-        // in pi (it resolves `{chain_dir}` for chain steps) so it is not gated here for SINGLE mode.
-        let unsupported_single_overrides: Vec<&'static str> =
-            [("includeProgress", p.include_progress.is_some()), ("control", p.control.is_some())]
-                .into_iter()
-                .filter_map(|(name, present)| present.then_some(name))
-                .collect();
-        if !unsupported_single_overrides.is_empty() {
-            return Err(ToolError::new(format!(
-                "subagent SINGLE mode does not support the following param(s): {}. Omit them (they \
-                 are not advertised in this tool's schema and have no effect on a SINGLE \
-                 {{agent, task}} call).",
-                unsupported_single_overrides.join(", ")
-            )));
-        }
+        // SUBA-041, as amended by SUBA-N05 and then SUBA-N06: this dispatcher no longer refuses ANY
+        // advertised SINGLE-mode parameter outright.
+        //
+        // `control` came off the list in SUBA-N05. It was there for exactly one reason — this port
+        // had `registration::ControlConfig`'s SHAPE but neither `resolveControlConfig` nor the
+        // control-notice pipeline behind it — and that reason is gone: `exec::control` now ports
+        // `runs/shared/subagent-control.ts` in full, `run_sync` raises real `ControlEvent`s off the
+        // child's NDJSON stream, and `SubagentExecutor::foreground_control_notifier` feeds them to
+        // the (previously producer-less) `tui::notices::ControlNoticeState`.
+        //
+        // `includeProgress` came off in SUBA-N06, and for the same shape of reason. It was refused
+        // because `SingleResult` carried no progress object to include or omit — R-SA-043
+        // compaction with no opt-out. It now has one: `exec::AgentProgress::snapshot` projects the
+        // winning attempt's fold into pi's `AgentProgress` wire shape and `run_sync` publishes it
+        // on `SingleResult::progress` when — and only when — this flag is `Some(true)`, matching
+        // pi's `progress: params.includeProgress ? allProgress : undefined`
+        // (`subagent-executor.ts:3008` @v0.34.0). It is advertised in the tool schema again and
+        // honoured on BOTH the foreground path (`SingleRunOverrides::include_progress` →
+        // `RunOptions::include_progress`) and the async one (`BackgroundSingleRequest::
+        // include_progress` → `RunnerConfig::include_progress` → every hop-2 step's `RunOptions`).
+        //
+        // `chainDir` is CHAIN-mode-only in pi (it resolves `{chain_dir}` for chain steps) so it is
+        // not gated here for SINGLE mode.
 
-        // SUBA-041: the seven SINGLE-mode overrides pi's `runSinglePath` honors, resolved here and
+        // SUBA-041: the SINGLE-mode overrides pi's `runSinglePath` honors, resolved here and
         // carried into `run_foreground_impl` as one bundle. `acceptance` is validated up front
         // through pi's own `validateAcceptanceInput` (`subagent-executor.ts:1418`) so a malformed
         // policy is refused BEFORE agent resolution and before any child spawns.
@@ -4840,6 +5413,15 @@ impl SubagentTool {
             share: p.share,
             session_dir: p.session_dir.clone(),
             artifacts: p.artifacts,
+            // SUBA-N05 / pi `effectiveParams.control` (`subagent-executor.ts:1179`). Lowered
+            // tolerantly (a wrong-typed threshold or an unknown `notifyOn` string degrades to
+            // "that field was not supplied", exactly as `parsePositiveInt`/`parseControlList` do)
+            // rather than hard-failing the call — see `parse_control_overrides`.
+            control: p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+            // SUBA-N06 / pi `params.includeProgress`. Passed through untouched: `run_sync` applies
+            // pi's own `? :` truthiness gate, so an explicit `false` behaves exactly like an
+            // omitted flag.
+            include_progress: p.include_progress,
         };
 
         // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:85-90`, applied at
@@ -4867,16 +5449,22 @@ impl SubagentTool {
                      async: false or omit the timeout for background runs.",
                 ));
             }
-            // SUBA-041: the seven wired overrides ride on `RunOptions`, which only the FOREGROUND
+            // SUBA-041: the remaining SIX overrides ride on `RunOptions`, which only the FOREGROUND
             // path builds — `spawn_background` hands a `RunnerConfig` to a detached second-hop
             // runner (pi's `executeAsyncSingle`, a separate options plumbing this crate has not
             // ported). Same rule as the `timeoutMs` refusal directly above: name them and refuse,
             // rather than accept a param the background hop would drop on the floor.
+            //
+            // SUBA-N04 removed `acceptance` from this list. It was refused for exactly one reason —
+            // `SingleStepSpec::acceptance` was dropped on the floor by the runner — and that reason
+            // is gone: the step now carries the raw policy to hop 2, which lowers and evaluates it
+            // through the same `exec::acceptance` path the foreground run uses. Upstream honours it
+            // on the async path too (`async-execution.ts:1282-1289`, `explicit: params.acceptance`
+            // with `async: true`), so refusing it was parity debt, not a design choice.
             let foreground_only: Vec<&'static str> = [
                 ("output", p.output.is_some()),
                 ("outputMode", p.output_mode.is_some()),
                 ("skill", p.skill.is_some()),
-                ("acceptance", p.acceptance.is_some()),
                 ("share", p.share.is_some()),
                 ("sessionDir", p.session_dir.is_some()),
                 ("artifacts", p.artifacts.is_some()),
@@ -4893,14 +5481,27 @@ impl SubagentTool {
             }
             let run_id = self
                 .executor
-                .spawn_background(
+                .spawn_background(BackgroundSingleRequest {
                     cwd,
-                    agent,
-                    &task,
+                    agent_name: agent,
+                    task: &task,
                     context,
-                    model.clone(),
-                    resolve_execution_agent_scope(p.agent_scope.as_deref()),
-                )
+                    model_override: model.clone(),
+                    agent_scope: resolve_execution_agent_scope(p.agent_scope.as_deref()),
+                    // SUBA-N04: the raw policy, already validated by `validate_execution_acceptance`
+                    // at the tool boundary; hop 2 lowers it per step.
+                    acceptance: p.acceptance.clone(),
+                    // SUBA-N05: the raw per-call `control` override. `spawn_background` folds it
+                    // against `subagents.control` and carries the RESOLVED value to hop 2 — pi
+                    // `executeAsyncSingle(id, { ..., controlConfig, ... })`,
+                    // `subagent-executor.ts:2845,2868-2870` @v0.34.0. Before this it was parsed,
+                    // absent from the foreground-only refusal list, and dropped on the floor.
+                    control: overrides.control.clone(),
+                    // SUBA-N06: the raw per-call `includeProgress`, carried to hop 2 on
+                    // `RunnerConfig::include_progress` so an async SINGLE run's persisted
+                    // `SingleResult` carries its progress snapshot instead of dropping the flag.
+                    include_progress: overrides.include_progress,
+                })
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
             // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
@@ -4969,6 +5570,12 @@ impl SubagentTool {
                 final_output: result.final_output.clone(),
                 error: result.error.clone(),
                 interrupted: result.interrupted,
+                // The out-of-band RESULT payload is a delivery of the run's OUTPUT
+                // (`IntercomPayload::from_group_children` reads only success/output/error); control
+                // events travel their own channel — the transcript notice on the foreground path,
+                // and the terminal `ResultFile` on the async one — and are deliberately not
+                // duplicated into the result relay.
+                control_events: Vec::new(),
             };
             let payload = crate::tui::intercom::IntercomPayload::from_group_children(
                 run_id.clone(),
@@ -5188,12 +5795,30 @@ impl SubagentTool {
                 self.executor.control_interrupt(cwd, target).await
             }
             "resume" => {
+                // pi `resumeAsyncRun` (`subagent-executor.ts:1145-1152`): a resume may carry an
+                // attach-chain, whose steps' `acceptance` is validated with pi's own prefix before
+                // anything is enqueued (SUBA-N04 — those policies are now really honoured).
+                let acceptance_errors = validate_execution_acceptance(p);
+                if !acceptance_errors.is_empty() {
+                    return Err(ToolError::new(format!(
+                        "Cannot resume: {}",
+                        acceptance_errors.join(" ")
+                    )));
+                }
                 let target = p.id.as_deref().or(p.run_id.as_deref());
                 self.executor
                     .control_resume(cwd, target, p.message.as_deref(), p.task.as_deref(), index)
                     .await
             }
             "append-step" => {
+                // pi `appendStepToRun` (`subagent-executor.ts:791-798`), same rule, pi's own prefix.
+                let acceptance_errors = validate_execution_acceptance(p);
+                if !acceptance_errors.is_empty() {
+                    return Err(ToolError::new(format!(
+                        "Cannot append step: {}",
+                        acceptance_errors.join(" ")
+                    )));
+                }
                 let target = p.id.as_deref().or(p.run_id.as_deref());
                 self.executor
                     .control_append_step(cwd, target, p.chain.as_deref().unwrap_or(&[]))
@@ -5275,6 +5900,16 @@ impl SubagentTool {
                 // Timeout wiring for a bare top-level PARALLEL call is a separate unit; this call
                 // site carries no timeout param yet, matching its pre-existing behavior exactly.
                 None,
+                // SUBA-N05: `control` is a top-level param on pi's `SubagentParams`, so it applies
+                // to a PARALLEL invocation exactly as it does to a SINGLE one — `runParallelPath`
+                // shares `ExecutionContextData.controlConfig` with every other mode
+                // (`subagent-executor.ts:1133,1179` @v0.34.0).
+                p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+                // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
+                // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
+                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
+                // threads it into `executeChain` (`:2012`), both @v0.34.0.
+                p.include_progress,
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
@@ -5415,6 +6050,14 @@ impl SubagentTool {
                 p.task.clone(),
                 cancel,
                 timeout_ms,
+                // SUBA-N05 (pi `runChainPath` -> `resolveControlConfig(deps.config.control,
+                // params.control)`, `subagent-executor.ts:1133` @v0.34.0).
+                p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+                // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
+                // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
+                // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
+                // threads it into `executeChain` (`:2012`), both @v0.34.0.
+                p.include_progress,
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
@@ -5581,6 +6224,15 @@ impl Tool for SubagentTool {
             )));
         }
 
+        // pi `validateExecutionInput`'s acceptance gate (`subagent-executor.ts:1534-1541`), in pi's
+        // own position: immediately after the mode-exclusivity check and before agent resolution or
+        // any spawn. Covers the top-level SINGLE `acceptance` AND every `tasks[]`/`chain[]` item's
+        // own — SUBA-N04, since those items' policies now really do reach their children.
+        let acceptance_errors = validate_execution_acceptance(&parsed);
+        if !acceptance_errors.is_empty() {
+            return Err(ToolError::new(acceptance_errors.join(" ")));
+        }
+
         // pi `reserveSubagentSpawns` (`subagent-executor.ts:266-282`, called at `:3434-3441` right
         // after the mode is settled and before any `ExecutionContextData` is built): charge this
         // dispatch's worst-case spawn count against the SESSION-wide budget
@@ -5595,6 +6247,27 @@ impl Tool for SubagentTool {
         // re-enters), which is the worse divergence; the over-charge only affects a call that was
         // going to error anyway.
         let cfg = self.executor.config_snapshot().await;
+        // SUBA-002 follow-up — the DEPTH guard must precede the charge. pi checks the recursion
+        // ceiling at `subagent-executor.ts:3297-3312`, well ahead of `reserveSubagentSpawns`
+        // (`:3434-3441`), so a dispatch the ceiling will refuse never spends a spawn from the
+        // per-SESSION budget. cyrup's own R-SA-055 guard lives one level down — inside
+        // `run_foreground`/`spawn_background`/`run_or_background_graph`, i.e. strictly AFTER this
+        // charge — so without this rung a depth-blocked call was billed and then rejected, and a
+        // subagent pinned at max depth could drain its parent session's budget by repeatedly asking
+        // for children it can never have. The downstream guards stay exactly as they are (they are
+        // the SAFETY-CRITICAL ones, ahead of discovery/IO); this is a pure env+config read that
+        // makes the ordering match pi's. It changes no charge COUNT: this remains the tool path's
+        // one and only reserve.
+        let depth = resolve_effective_depth(cfg.max_subagent_depth);
+        if crate::spawn::depth::is_blocked(&depth) {
+            return Err(ToolError::new(
+                SubagentError::DepthExceeded {
+                    current: depth.current_depth,
+                    max: depth.max_depth,
+                }
+                .to_string(),
+            ));
+        }
         if let Err(limit_notice) = self.executor.reserve_subagent_spawns(
             count_requested_subagent_spawns(&parsed, &cfg),
             cfg.max_subagent_spawns_per_session,
@@ -5615,6 +6288,64 @@ impl Tool for SubagentTool {
         // per-child folds would multiplex through the same `SubagentUpdatePayload.progress[]`).
         self.route_single(&parsed, &effective_cwd, on_update, cancel).await
     }
+}
+
+/// pi `validateExecutionAcceptance` (`runs/shared/acceptance.ts:288-310` @v0.34.0, called from
+/// `validateExecutionInput` at `subagent-executor.ts:1534` immediately after the mode-exclusivity
+/// gate and BEFORE agent resolution): run `validateAcceptanceInput` over EVERY `acceptance` the
+/// dispatch declares — the top-level SINGLE param, each `tasks[i]`, each `chain[i]`, and each
+/// `chain[i].parallel[j]` (array form) or `chain[i].parallel` (dynamic-template object form) — using
+/// pi's own per-site path labels, and return the collected messages.
+///
+/// SUBA-N04: cyrup validated only the top-level SINGLE `acceptance` (inside `route_single`), so a
+/// malformed policy on a `tasks[]`/`chain[]` item was never refused. Now that those items' policies
+/// actually reach the child (they used to be silently dropped, which is what made the missing
+/// validation invisible), the refusal has to be up front for the same reason upstream puts it there:
+/// a fan-out must be rejected whole, never half-run and then failed on step 3.
+fn validate_execution_acceptance(params: &SubagentToolParams) -> Vec<String> {
+    use crate::exec::acceptance::model::validate_acceptance_input;
+
+    /// `undefined` for `validate_acceptance_input`'s purposes — a missing key reads as `Null`.
+    fn field<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        value.get(key).unwrap_or(&serde_json::Value::Null)
+    }
+
+    let mut errors = validate_acceptance_input(
+        params.acceptance.as_ref().unwrap_or(&serde_json::Value::Null),
+        "acceptance",
+    );
+    for (index, task) in params.tasks.iter().flatten().enumerate() {
+        errors.extend(validate_acceptance_input(
+            field(task, "acceptance"),
+            &format!("tasks[{index}].acceptance"),
+        ));
+    }
+    for (step_index, step) in params.chain.iter().flatten().enumerate() {
+        errors.extend(validate_acceptance_input(
+            field(step, "acceptance"),
+            &format!("chain[{step_index}].acceptance"),
+        ));
+        match step.get("parallel") {
+            Some(serde_json::Value::Array(tasks)) => {
+                for (task_index, task) in tasks.iter().enumerate() {
+                    errors.extend(validate_acceptance_input(
+                        field(task, "acceptance"),
+                        &format!("chain[{step_index}].parallel[{task_index}].acceptance"),
+                    ));
+                }
+            }
+            // pi's `else if (step.parallel)`: the dynamic-fanout TEMPLATE object. A JSON `null`/
+            // `false` `parallel` is falsy upstream and is skipped here for the same reason.
+            Some(template) if !template.is_null() && template.as_bool() != Some(false) => {
+                errors.extend(validate_acceptance_input(
+                    field(template, "acceptance"),
+                    &format!("chain[{step_index}].parallel.acceptance"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    errors
 }
 
 /// pi `countRequestedSubagentSpawns` (`runs/foreground/subagent-executor.ts:284-292`): how many
@@ -6311,20 +7042,44 @@ impl SubagentsExtension {
                 // ahead of the mode branch below rather than inside either arm (charging once, never
                 // twice, and never a count that differs from what actually gets spawned).
                 let run_cfg = self.executor.config_snapshot().await;
+                // SUBA-002 follow-up — the DEPTH guard must precede the charge (pi checks the
+                // ceiling at `subagent-executor.ts:3297-3312`, ahead of `reserveSubagentSpawns` at
+                // `:3434-3441`). `/run`'s own R-SA-055 guard lives inside `run_foreground`/
+                // `spawn_background`, i.e. strictly after this charge, so a depth-blocked `/run`
+                // was billed and then refused. `/run-chain` already checks here for its own
+                // (discovery-ordering) reason; this is the same rung for the `/run` surface.
+                let depth = resolve_effective_depth(run_cfg.max_subagent_depth);
+                if crate::spawn::depth::is_blocked(&depth) {
+                    return Err(SubagentError::DepthExceeded {
+                        current: depth.current_depth,
+                        max: depth.max_depth,
+                    });
+                }
                 self.executor
                     .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
                     .map_err(SubagentError::SpawnLimitExceeded)?;
                 if parsed.flags.background {
                     let run_id = self
                         .executor
-                        .spawn_background(
+                        .spawn_background(BackgroundSingleRequest {
                             cwd,
-                            &parsed.agent,
-                            &parsed.task,
+                            agent_name: &parsed.agent,
+                            task: &parsed.task,
                             context,
-                            model,
-                            AgentReadScope::Both,
-                        )
+                            model_override: model,
+                            agent_scope: AgentReadScope::Both,
+                            // pi's own `/run` handler forwards `output`/`outputMode`/`skill`/`model`
+                            // and NOTHING else (`slash/slash-commands.ts:1193-1196` @v0.34.0) — the
+                            // inline `acceptance=` token it parses is only ever consumed by the
+                            // `/chain`//`/parallel` step builders. Faithful parity: `None` here.
+                            acceptance: None,
+                            // SUBA-N06: nor an `includeProgress=` token.
+                            include_progress: None,
+                            // Same parity rule: the `/run` surface parses no `control=` token, so
+                            // there is no per-call override to forward. `spawn_background` still
+                            // folds in the extension-level `subagents.control` block.
+                            control: None,
+                        })
                         .await?;
                     Ok(format!("Background subagent run started: {run_id}"))
                 } else {
@@ -6587,6 +7342,21 @@ impl SubagentsExtension {
         // `run_or_background_graph` via `route_chain_mode`/`route_parallel_mode`, never through this
         // slash-only wrapper.
         let budget_cfg = self.executor.config_snapshot().await;
+        // SUBA-002 follow-up — the DEPTH guard must precede the charge. pi refuses on depth at
+        // `subagent-executor.ts:3297-3312`, well ahead of `reserveSubagentSpawns` (`:3434-3441`),
+        // so a dispatch the ceiling will reject never spends a spawn. `run_or_background_graph`'s
+        // own R-SA-055 guard (the SAFETY-CRITICAL one, ahead of persona/fork IO) runs strictly
+        // AFTER this reserve, so `/chain` and `/parallel` were billed and then refused — the
+        // budget drained while nothing could ever be spawned. `/run-chain` was already immune: it
+        // checks depth itself before `resolve_chain`. Re-checking here (a pure env+config read)
+        // leaves the downstream guard untouched and changes no charge count.
+        let depth = resolve_effective_depth(budget_cfg.max_subagent_depth);
+        if crate::spawn::depth::is_blocked(&depth) {
+            return Err(SubagentError::DepthExceeded {
+                current: depth.current_depth,
+                max: depth.max_depth,
+            });
+        }
         self.executor
             .reserve_subagent_spawns(
                 count_graph_requested_spawns(&graph, &budget_cfg),
@@ -6617,6 +7387,12 @@ impl SubagentsExtension {
                 CancelToken::new(),
                 // The slash-command surface (`/chain`/`/parallel`/`/run-chain`) exposes no timeout
                 // param at all (pi's `timeoutMs`/`maxRuntimeMs` are tool-only) — always `None`.
+                None,
+                // ...and no `control` token either (same rule, same reason): the extension-level
+                // `subagents.control` block is still folded in one layer down.
+                None,
+                // ...and no `includeProgress` (SUBA-N06, same rule): the slash surface renders
+                // text, never a `details` payload a progress snapshot could ride on.
                 None,
             )
             .await?
@@ -8597,6 +9373,8 @@ mod tests {
                 None,
                 CancelToken::new(),
                 None,
+                None,
+                None,
             )
             .await
         {
@@ -8737,6 +9515,90 @@ mod tests {
             .contains("acceptance.bogus is not supported."));
     }
 
+    /// SUBA-N04: a `tasks[]`/`chain[]` item's `acceptance` reaches its [`SingleStepSpec`] WHOLE.
+    ///
+    /// Pre-fix `parse_tool_acceptance` returned `Option<String>` and kept only the bare-level form,
+    /// so `{ level: "verified", verify: [{ command }] }` and the `false` shorthand — the only forms
+    /// that can declare a `verify[]` command at all — were discarded at the tool boundary, before
+    /// the runner got its own chance to drop the survivor. Both losses were silent.
+    #[test]
+    fn a_tasks_item_carries_every_acceptance_form_onto_its_step_spec() {
+        let item: ToolTaskItem = serde_json::from_value(serde_json::json!({
+            "agent": "builder",
+            "task": "fix it",
+            "acceptance": { "level": "verified", "verify": [{ "command": "cargo test" }] }
+        }))
+        .expect("a well-formed tasks[] item");
+        assert_eq!(
+            tool_task_to_spec(&item).acceptance,
+            Some(serde_json::json!({
+                "level": "verified",
+                "verify": [{ "command": "cargo test" }]
+            })),
+            "the object policy must survive whole — it is the only form carrying verify[]"
+        );
+
+        // The `false` shorthand (pi's `level: "none"`) and the bare level string both survive too.
+        assert_eq!(
+            parse_tool_acceptance(Some(&serde_json::json!(false))),
+            Some(serde_json::json!(false))
+        );
+        assert_eq!(
+            parse_tool_acceptance(Some(&serde_json::json!("checked"))),
+            Some(serde_json::json!("checked"))
+        );
+        // Only "no policy at all" normalizes to `None` (pi's `undefined`).
+        assert_eq!(parse_tool_acceptance(None), None);
+        assert_eq!(parse_tool_acceptance(Some(&serde_json::Value::Null)), None);
+        assert_eq!(parse_tool_acceptance(Some(&serde_json::json!(""))), None);
+    }
+
+    /// SUBA-N04: pi `validateExecutionAcceptance` (`runs/shared/acceptance.ts:288-310` @v0.34.0)
+    /// validates EVERY declared acceptance in one dispatch, with pi's own per-site path labels —
+    /// not just the top-level SINGLE param, which was all this crate checked while the item-level
+    /// policies were being dropped anyway.
+    #[test]
+    fn validate_execution_acceptance_labels_every_declared_policy_site() {
+        let params: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                { "agent": "a", "acceptance": "checked" },
+                { "agent": "b", "acceptance": "bogus" }
+            ]
+        }))
+        .expect("params parse");
+        assert_eq!(
+            validate_execution_acceptance(&params),
+            vec!["tasks[1].acceptance has invalid level 'bogus'.".to_string()],
+            "the failing item is named by its own index; the valid one contributes nothing"
+        );
+
+        let chain: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "chain": [
+                { "agent": "a", "acceptance": { "nope": 1 } },
+                { "parallel": [{ "agent": "b" }, { "agent": "c", "acceptance": "bad" }] },
+                { "expand": { "from": { "output": "x" } },
+                  "parallel": { "agent": "d", "acceptance": "worse" },
+                  "collect": { "as": "y" } }
+            ]
+        }))
+        .expect("params parse");
+        assert_eq!(
+            validate_execution_acceptance(&chain),
+            vec![
+                "chain[0].acceptance.nope is not supported.".to_string(),
+                "chain[1].parallel[1].acceptance has invalid level 'bad'.".to_string(),
+                "chain[2].parallel.acceptance has invalid level 'worse'.".to_string(),
+            ],
+            "static parallel tasks are labelled by index; a dynamic template is labelled bare"
+        );
+
+        // A dispatch declaring no acceptance anywhere is silent.
+        let bare: SubagentToolParams =
+            serde_json::from_value(serde_json::json!({ "agent": "a", "task": "t" }))
+                .expect("params parse");
+        assert!(validate_execution_acceptance(&bare).is_empty());
+    }
+
     /// C8: the LLM-facing `subagent` tool schema exposes pi's FULL parameter union
     /// (`schemas.ts:195-265`), not just the pre-C8 5-property single-task shape. Asserts every
     /// top-level pi property name is present, the 11-value management/control `action` enum is
@@ -8746,10 +9608,24 @@ mod tests {
     /// Rust analog of pi's own `test/unit/schemas.test.ts`.
     ///
     /// SUBA-041 re-scoped the property list: `includeProgress` and `control` were dropped from the
-    /// expected set and are now asserted ABSENT, because this port has no subsystem behind either
-    /// and [`SubagentTool::route_single`] refuses them. See
-    /// [`single_mode_wires_the_seven_supported_overrides_and_refuses_only_the_two_unadvertised`]
-    /// for the other half of that invariant.
+    /// expected set and asserted ABSENT, because this port had no subsystem behind either and
+    /// [`SubagentTool::route_single`] refused them.
+    ///
+    /// SUBA-N05 moved `control` back into the expected set — the subsystem now exists
+    /// ([`crate::exec::control`] + [`crate::tui::notices::ControlNoticeState`]) and the dispatcher
+    /// honours the param on both the foreground and the async path — and additionally pins its
+    /// nested shape (the two enums and the `minimum: 1` bounds), so a future edit cannot advertise
+    /// a `control` object whose fields `parse_control_overrides` would silently discard. See
+    /// [`single_mode_accepts_every_wired_override_and_never_silently_drops_an_unwired_one`] for the
+    /// other half of that invariant.
+    ///
+    /// SUBA-N06 moved `includeProgress` back too, and with it the withhold list is EMPTY: the
+    /// subsystem now exists ([`crate::exec::AgentProgress::snapshot`] →
+    /// [`crate::exec::SingleResult::progress`], under pi's own truthiness gate) and the dispatcher
+    /// honours the param on the foreground path (`SingleRunOverrides::include_progress`) and the
+    /// async one ([`crate::background::runner_main::RunnerConfig::include_progress`]). The
+    /// assertion that used to demand its ABSENCE is inverted below rather than deleted — it is the
+    /// same invariant, now discharged in the other direction.
     #[test]
     fn subagent_tool_schema_exposes_the_full_pi_parameter_union() {
         let schema = subagent_tool_parameters();
@@ -8758,13 +9634,14 @@ mod tests {
             .and_then(|p| p.as_object())
             .expect("schema has a properties object");
 
-        // Every top-level pi `SubagentParamsSchema` property (schemas.ts:195-263), in source order,
-        // minus SUBA-041's two withholds.
+        // Every top-level pi `SubagentParamsSchema` property (schemas.ts:195-263), in source
+        // order. As of SUBA-N06 there are no withholds: the list is pi's, entire.
         let expected_properties = [
             "agent", "task", "action", "id", "runId", "dir", "index", "message", "chainName",
             "config", "tasks", "concurrency", "worktree", "chain", "context", "chainDir", "async",
-            "timeoutMs", "maxRuntimeMs", "agentScope", "cwd", "artifacts", "share", "sessionDir",
-            "clarify", "output", "outputMode", "skill", "model", "acceptance",
+            "timeoutMs", "maxRuntimeMs", "agentScope", "cwd", "artifacts", "includeProgress",
+            "share", "sessionDir", "clarify", "control", "output", "outputMode", "skill", "model",
+            "acceptance",
         ];
         for name in expected_properties {
             assert!(
@@ -8774,15 +9651,56 @@ mod tests {
             );
         }
 
-        // SUBA-041's core invariant: a param the dispatcher refuses must not be advertised. These
-        // two have no subsystem in this port (`control` → no `resolveControlConfig`/notice pipeline;
-        // `includeProgress` → no `details.progress` array on the compacted `SingleResult`).
-        for withheld in ["includeProgress", "control"] {
+        // SUBA-041's core invariant: a param the dispatcher refuses UNCONDITIONALLY must not be
+        // advertised. SUBA-N06 emptied the withhold list, so the invariant is now discharged from
+        // the other side — this loop asserts that NOTHING is withheld, and it is the assertion
+        // that must gain an entry (with a citation) if a future param is ever refused outright.
+        const UNCONDITIONALLY_REFUSED: &[&str] = &[];
+        for name in UNCONDITIONALLY_REFUSED {
             assert!(
-                !props.contains_key(withheld),
-                "'{withheld}' is rejected at dispatch, so the schema must NOT advertise it"
+                !props.contains_key(*name),
+                "'{name}' is rejected at dispatch, so the schema must NOT advertise it"
             );
         }
+        assert!(
+            UNCONDITIONALLY_REFUSED.is_empty(),
+            "the withhold list is expected to be empty as of SUBA-N06; adding an entry means a \
+             param is advertised-and-refused, which needs an upstream citation here"
+        );
+
+        // SUBA-N05: `control`'s nested shape, pinned against `ControlOverrides`
+        // (`extension/schemas.ts:201-215` @v0.34.0). Every advertised field must be one
+        // `crate::exec::control::parse_control_overrides` actually reads, and both string unions
+        // must match `ControlEventType`/`ControlNotificationChannel`'s wire spellings exactly —
+        // advertising an enum member the lowering drops is the same defect class as advertising a
+        // param the dispatcher refuses.
+        let control_props = props["control"]["properties"]
+            .as_object()
+            .expect("control carries a properties object");
+        assert_eq!(props["control"]["type"], serde_json::json!("object"));
+        for (field, minimum) in [
+            ("needsAttentionAfterMs", Some(1)),
+            ("activeNoticeAfterMs", Some(1)),
+            ("activeNoticeAfterTurns", Some(1)),
+            ("activeNoticeAfterTokens", Some(1)),
+            ("failedToolAttemptsBeforeAttention", Some(1)),
+        ] {
+            assert_eq!(
+                control_props[field]["type"],
+                serde_json::json!("integer"),
+                "control.{field} is an integer threshold upstream"
+            );
+            assert_eq!(control_props[field]["minimum"], serde_json::json!(minimum));
+        }
+        assert_eq!(control_props["enabled"]["type"], serde_json::json!("boolean"));
+        assert_eq!(
+            control_props["notifyOn"]["items"]["enum"],
+            serde_json::json!(["active_long_running", "needs_attention"])
+        );
+        assert_eq!(
+            control_props["notifyChannels"]["items"]["enum"],
+            serde_json::json!(["event", "async", "intercom"])
+        );
 
         // The management/control action enum (schemas.ts:199-202 + SUBAGENT_ACTIONS,
         // shared/types.ts:1121), exact values AND order. 15 of pi's 20: SUBA-005 added
@@ -8964,6 +9882,7 @@ mod tests {
                     interrupt: token.clone(),
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
+                    current_activity_state: None,
                 },
             );
         }
@@ -9029,6 +9948,7 @@ mod tests {
                     interrupt: CancelToken::new(),
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
+                    current_activity_state: None,
                 },
             );
         }
@@ -9535,6 +10455,99 @@ mod tests {
         );
     }
 
+    /// SUBA-002 follow-up: a dispatch the DEPTH ceiling refuses must not spend a spawn.
+    ///
+    /// pi checks the recursion ceiling at `subagent-executor.ts:3297-3312` and only then reaches
+    /// `reserveSubagentSpawns` (`:3434-3441`), so a blocked call is billed nothing. cyrup's
+    /// R-SA-055 guard lives one level down — inside `run_foreground`/`spawn_background`/
+    /// `run_or_background_graph` — i.e. strictly AFTER each of the three charge sites SUBA-002
+    /// added, so pre-fix every depth-blocked invocation of `/run`, `/chain`, `/parallel` and the
+    /// `subagent` TOOL consumed budget it could never use: a subagent pinned at max depth could
+    /// drain its whole session's allowance by repeatedly asking for children.
+    ///
+    /// Asserts BOTH halves, on all four surfaces: the call is refused with `DepthExceeded` (not
+    /// `SpawnLimitExceeded`), and the budget is still intact afterwards — proven by a `1`-spawn cap
+    /// that a subsequent `reserve_subagent_spawns(1, 1)` can still satisfy. Against the pre-fix
+    /// ordering that reserve fails, because the blocked call already took the session's only spawn.
+    #[tokio::test]
+    async fn a_depth_blocked_dispatch_is_refused_before_it_can_spend_a_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `max_subagent_depth: 0` with no `CYRUP_SUBAGENT_DEPTH` in the env ⇒ current (0) >= max (0)
+        // ⇒ blocked, the same state the executor-level R-SA-055 tests in this module use.
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                max_subagent_depth: 0,
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        // (1) the `subagent` TOOL.
+        ext.executor().reset_spawn_budget();
+        let tool_err = ext
+            .subagent_tool()
+            .execute(
+                ToolCallId::from("t"),
+                serde_json::json!({ "agent": "ghost", "task": "a" }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("a blocked depth ceiling refuses the dispatch");
+        assert!(
+            tool_err.to_string().contains("depth limit exceeded"),
+            "the tool must be refused on DEPTH, not billed and then refused: {tool_err}"
+        );
+        assert!(
+            ext.executor().reserve_subagent_spawns(1, 1).is_ok(),
+            "a depth-blocked TOOL dispatch must not have consumed the session's only spawn"
+        );
+
+        // (2) `/run`, foreground and `--bg` (pi bills the SINGLE shape 1 either way).
+        for args in ["ghost do the thing", "ghost do the thing --bg"] {
+            ext.executor().reset_spawn_budget();
+            let err = ext
+                .dispatch_slash(SlashCommandName::Run, args, dir.path())
+                .await
+                .expect_err("a blocked depth ceiling refuses the dispatch");
+            assert!(
+                matches!(err, SubagentError::DepthExceeded { .. }),
+                "`/run {args}` must be refused on DEPTH, got: {err:?}"
+            );
+            assert!(
+                ext.executor().reserve_subagent_spawns(1, 1).is_ok(),
+                "a depth-blocked `/run {args}` must not have consumed the session's only spawn"
+            );
+        }
+
+        // (3) the chain-shaped slash wrapper `/chain` // `/parallel` // `/run-chain` share.
+        for background in [false, true] {
+            ext.executor().reset_spawn_budget();
+            let err = ext
+                .run_or_background_chain(
+                    dir.path(),
+                    vec![RunnerStep::SingleStep(bare_single_step("ghost", "a"))],
+                    RunMode::Chain,
+                    None,
+                    background,
+                    None,
+                )
+                .await
+                .expect_err("a blocked depth ceiling refuses the dispatch");
+            assert!(
+                matches!(err, SubagentError::DepthExceeded { .. }),
+                "background={background}: the chain slash wrapper must be refused on DEPTH, \
+                 got: {err:?}"
+            );
+            assert!(
+                ext.executor().reserve_subagent_spawns(1, 1).is_ok(),
+                "background={background}: a depth-blocked chain slash dispatch must not have \
+                 consumed the session's only spawn"
+            );
+        }
+    }
+
     /// SUBA-002's no-double-charge invariant: the `subagent` TOOL's chain/parallel shapes reserve
     /// exactly ONCE (in [`SubagentTool::execute`]) and then reach
     /// [`SubagentExecutor::run_or_background_graph`] through
@@ -9740,23 +10753,284 @@ mod tests {
         assert!(!listed.content.is_empty());
     }
 
+    // ---------------------------------------------------------------------------------------
+    // SUBA-N05: the foreground control-notice pump's ordering + teardown contract.
+    // ---------------------------------------------------------------------------------------
+
+    /// Build the `ControlEvent` a `needs_attention` raise produces, with an explicit reason so
+    /// distinct reasons yield distinct `controlNotificationKey`s (pi
+    /// `shared/subagent-control.ts:141-144` @v0.34.0).
+    fn pump_test_event(
+        run_id: &RunId,
+        index: u32,
+        reason: crate::exec::control::ControlEventReason,
+    ) -> crate::exec::control::ControlEvent {
+        crate::exec::control::build_control_event(
+            crate::background::ActivityState::NeedsAttention,
+            crate::exec::control::ControlEventInput {
+                event_type: Some(crate::registration::ControlEventType::NeedsAttention),
+                ts: 1_700_000_000_000,
+                run_id: run_id.as_str().to_string(),
+                agent: "scout".to_string(),
+                index: Some(index),
+                reason: Some(reason),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// SUBA-N05 — the ORDERING + TEARDOWN contract [`ForegroundControlNotifier`] exists to provide.
+    ///
+    /// Upstream gets both for free: `onControlEvent` → `emitControlNotification` → the
+    /// `SUBAGENT_CONTROL_EVENT` listener → `handleSubagentControlNotice` is one synchronous
+    /// call chain on one event-loop thread, so by the time the child's stdout reader resumes, the
+    /// event has been fully applied. cyrup's notice state is behind a `tokio::sync::Mutex` and the
+    /// sink is sync, so the hand-off has to cross an async boundary — and the previous revision
+    /// crossed it with a bare `tokio::spawn` PER EVENT, which is neither ordered nor ordered
+    /// against run teardown.
+    ///
+    /// This test pins the replacement's guarantee directly, with no sleeping and no scheduler luck:
+    ///
+    /// 1. The notice lock is held while three events are raised, so the hand-off provably CANNOT
+    ///    have been applied yet — the raise path is non-blocking, exactly as the drive loop needs.
+    /// 2. `flush()` returns only once all three have been applied. Asserted IMMEDIATELY on return,
+    ///    with no `sleep` anywhere: all three debounce timers are armed and the live projection
+    ///    already reflects the LAST event (`step_index: 2`), which is the FIFO property.
+    /// 3. `forget_run` then leaves the run untracked AND aborts every armed timer — pi's own
+    ///    teardown pair (`clearPendingForegroundControlNotices(deps.state, runId)` immediately
+    ///    followed by `foregroundControls.delete(runId)`, `subagent-executor.ts:3579-3581`) — and a
+    ///    generous settle window afterwards cannot resurrect it.
+    ///
+    /// Step 2's assertion is what a spawn-per-event hand-off cannot satisfy: it has no barrier to
+    /// wait on at all, so the checks would run against zero-to-three applied events depending on
+    /// the scheduler. Step 3 is the production bug that shape caused — an event still unpolled at
+    /// teardown re-inserted its run into `live_runs`, where nothing ever removes it again, and its
+    /// pending notice then passed the "is this run still tracked" check it is supposed to fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn control_events_are_applied_in_order_and_never_after_the_run_is_torn_down() {
+        let delivered: Arc<std::sync::Mutex<Vec<crate::tui::ControlNotice>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&delivered);
+        let executor = SubagentExecutor::with_control_notice_sink(Arc::new(
+            move |notice: crate::tui::ControlNotice, _trigger: bool| {
+                captured.lock().unwrap_or_else(|e| e.into_inner()).push(notice);
+            },
+        ));
+        // Long enough that no timer can fire during this test: every assertion below is about the
+        // PUMP, not about delivery.
+        executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+
+        let run_id = RunId::new();
+        let notifier = executor.foreground_control_notifier(
+            run_id.clone(),
+            "scout".to_string(),
+            crate::exec::control::ResolvedControlConfig::default(),
+        );
+        executor.notices.lock().await.observe_run(
+            run_id.clone(),
+            crate::tui::notices::LiveRunView {
+                current_agent: Some("scout".to_string()),
+                current_step_index: Some(0),
+                needs_attention: false,
+            },
+        );
+
+        // Three distinct reasons => three distinct `controlNotificationKey`s => three independent
+        // debounce timers, so "all three were applied" is observable rather than coalesced away.
+        let events = [
+            pump_test_event(&run_id, 0, crate::exec::control::ControlEventReason::Idle),
+            pump_test_event(
+                &run_id,
+                1,
+                crate::exec::control::ControlEventReason::ToolFailures,
+            ),
+            pump_test_event(
+                &run_id,
+                2,
+                crate::exec::control::ControlEventReason::SupervisorRequest,
+            ),
+        ];
+
+        // (1) Raise all three while the notice lock is held: the hand-off must not block the drive
+        // loop, and must not have been applied by the time the last `emit` returns.
+        {
+            let guard = executor.notices.lock().await;
+            for event in &events {
+                notifier.sink().emit(event);
+            }
+            assert_eq!(
+                guard.live_view(&run_id).and_then(|v| v.current_step_index),
+                Some(0),
+                "raising an event must not have applied it yet — the lock is still held here"
+            );
+        }
+
+        // (2) The barrier. No sleep: everything below is asserted on flush's own guarantee.
+        notifier.flush().await;
+        {
+            let guard = executor.notices.lock().await;
+            assert_eq!(
+                guard.live_view(&run_id).and_then(|v| v.current_step_index),
+                Some(2),
+                "the live projection must reflect the LAST raised event — FIFO, not whichever \
+                 hand-off happened to be scheduled last"
+            );
+            for event in &events {
+                let key = crate::tui::ControlNoticeKey {
+                    run_id: run_id.clone(),
+                    kind: crate::tui::ControlNoticeKind::NeedsAttention,
+                    notification_key: crate::exec::control::control_notification_key(event, None),
+                };
+                assert!(
+                    guard.has_pending(&key),
+                    "every raised event must have armed its own debounce timer by the time \
+                     flush() returns; missing {}",
+                    key.notification_key
+                );
+            }
+        }
+
+        // (3) pi's teardown pair, then a settle window a straggler could have used.
+        executor.notices.lock().await.forget_run(&run_id);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let guard = executor.notices.lock().await;
+            assert!(
+                guard.live_view(&run_id).is_none(),
+                "a finished run must stay untracked — nothing may re-register it after teardown"
+            );
+            for event in &events {
+                let key = crate::tui::ControlNoticeKey {
+                    run_id: run_id.clone(),
+                    kind: crate::tui::ControlNoticeKind::NeedsAttention,
+                    notification_key: crate::exec::control::control_notification_key(event, None),
+                };
+                assert!(
+                    !guard.has_pending(&key),
+                    "forget_run must abort this run's armed timers (pi \
+                     clearPendingForegroundControlNotices)"
+                );
+            }
+        }
+        assert!(
+            delivered.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "with a 600s debounce nothing may have been delivered"
+        );
+    }
+
+    /// SUBA-N05 — the `notifyChannels` gate, which had ZERO runtime consumers before this change.
+    ///
+    /// pi routes a raised event onto the transcript channel only when
+    /// `controlConfig.notifyChannels.includes("event")` (`subagent-executor.ts:521` @v0.34.0). A
+    /// config of `notifyChannels: ["intercom"]` must therefore raise the event (it still lands on
+    /// `SingleResult::control_events`) and deliver NO transcript notice. Before this change the
+    /// notifier had no channel check at all, so such a config still produced a notice.
+    ///
+    /// Also pins the two gates that were already correct, so a refactor cannot quietly drop them:
+    /// `active_long_running` is never surfaced as a transcript notice
+    /// (`control-notices.ts:74`), and an `["event"]` config does surface `needs_attention`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notify_channels_gates_the_transcript_notice_without_suppressing_the_event() {
+        use crate::registration::ControlNotificationChannel;
+
+        for (channels, expect_pending) in [
+            (vec![ControlNotificationChannel::Event], true),
+            (vec![ControlNotificationChannel::Intercom], false),
+            (vec![ControlNotificationChannel::Async], false),
+            (Vec::new(), false),
+        ] {
+            let executor = SubagentExecutor::new();
+            executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+            let run_id = RunId::new();
+            let notifier = executor.foreground_control_notifier(
+                run_id.clone(),
+                "scout".to_string(),
+                crate::exec::control::ResolvedControlConfig {
+                    notify_channels: channels.clone(),
+                    ..crate::exec::control::ResolvedControlConfig::default()
+                },
+            );
+            let event = pump_test_event(&run_id, 0, crate::exec::control::ControlEventReason::Idle);
+            notifier.sink().emit(&event);
+            notifier.flush().await;
+
+            let key = crate::tui::ControlNoticeKey {
+                run_id: run_id.clone(),
+                kind: crate::tui::ControlNoticeKind::NeedsAttention,
+                notification_key: crate::exec::control::control_notification_key(&event, None),
+            };
+            assert_eq!(
+                executor.notices.lock().await.has_pending(&key),
+                expect_pending,
+                "notifyChannels {channels:?} must {} a transcript notice",
+                if expect_pending { "arm" } else { "suppress" }
+            );
+        }
+
+        // `active_long_running` is telemetry only — never a transcript notice, on any channel set.
+        let executor = SubagentExecutor::new();
+        executor.set_control_notice_debounce(std::time::Duration::from_secs(600)).await;
+        let run_id = RunId::new();
+        let notifier = executor.foreground_control_notifier(
+            run_id.clone(),
+            "scout".to_string(),
+            crate::exec::control::ResolvedControlConfig::default(),
+        );
+        let long_running = crate::exec::control::build_control_event(
+            crate::background::ActivityState::ActiveLongRunning,
+            crate::exec::control::ControlEventInput {
+                event_type: Some(crate::registration::ControlEventType::ActiveLongRunning),
+                ts: 1_700_000_000_000,
+                run_id: run_id.as_str().to_string(),
+                agent: "scout".to_string(),
+                index: Some(0),
+                reason: Some(crate::exec::control::ControlEventReason::ActiveLongRunning),
+                ..Default::default()
+            },
+        );
+        notifier.sink().emit(&long_running);
+        notifier.flush().await;
+        let key = crate::tui::ControlNoticeKey {
+            run_id: run_id.clone(),
+            kind: crate::tui::ControlNoticeKind::NeedsAttention,
+            notification_key: crate::exec::control::control_notification_key(&long_running, None),
+        };
+        assert!(
+            !executor.notices.lock().await.has_pending(&key),
+            "handleSubagentControlNotice drops active_long_running before any debounce is armed"
+        );
+    }
+
     /// SUBA-041 (re-scoped from `single_mode_rejects_unwired_override_params_before_any_agent_resolution`,
     /// which pinned the pre-fix behavior of rejecting all NINE schema-advertised SINGLE-mode
-    /// overrides): the seven params pi's `runSinglePath` honors must now be ACCEPTED — a call
-    /// carrying them proceeds past dispatch into agent resolution, so the only error left is the
-    /// unresolvable agent — while the two the schema no longer advertises must still be refused
-    /// LOUDLY by name, never silently dropped.
+    /// overrides): the params pi's `runSinglePath` honors must be ACCEPTED — a call carrying them
+    /// proceeds past dispatch into agent resolution, so the only error left is the unresolvable
+    /// agent — while any param the schema does NOT advertise must still be refused LOUDLY by name,
+    /// never silently dropped.
     ///
     /// The `"ghost"` agent makes the two outcomes trivially distinguishable: `agent not found:
     /// ghost` proves the param got through dispatch; the named refusal proves it did not. Against
-    /// pre-SUBA-041 code every one of the seven produced the refusal instead, so this fails there.
+    /// pre-SUBA-041 code every one of the wired params produced the refusal instead, so this fails
+    /// there.
+    ///
+    /// SUBA-N05 re-scoped it again rather than leaving it pinning stale behaviour: `control` was in
+    /// the "refused" half and is now genuinely HONOURED (foreground via
+    /// `SingleRunOverrides::control` → `resolve_control_config` → `RunOptions::control_config`,
+    /// async via `RunnerConfig::control`), so it moved into the accepted half. The test name
+    /// deliberately no longer encodes a COUNT — it encoded "seven"/"two" and went stale twice.
+    ///
+    /// SUBA-N06 emptied the refused half entirely: `includeProgress` is now HONOURED too
+    /// (foreground via `SingleRunOverrides::include_progress` → `RunOptions::include_progress` →
+    /// `run_sync`'s `SingleResult::progress` assembly, async via `RunnerConfig::include_progress`).
+    /// Rather than delete the refusal leg, it is inverted — the loop below now asserts that NO
+    /// advertised param is refused, over a table that is exactly the schema's own property list for
+    /// the SINGLE-mode overrides, and a `REFUSED_UNCONDITIONALLY` table that must stay empty.
     #[tokio::test]
-    async fn single_mode_wires_the_seven_supported_overrides_and_refuses_only_the_two_unadvertised()
-    {
+    async fn single_mode_accepts_every_wired_override_and_never_silently_drops_an_unwired_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
-        // The seven SUBA-041 wired the schema's promise back onto: each must reach agent resolution.
+        // Every SINGLE-mode override this dispatcher wires: each must reach agent resolution.
         let accepted = [
             serde_json::json!({ "share": true }),
             serde_json::json!({ "sessionDir": "~/x" }),
@@ -9765,6 +11039,11 @@ mod tests {
             serde_json::json!({ "output": "report.md", "outputMode": "file-only" }),
             serde_json::json!({ "skill": "rust,testing" }),
             serde_json::json!({ "acceptance": "checked" }),
+            // SUBA-N05.
+            serde_json::json!({ "control": { "enabled": true, "needsAttentionAfterMs": 1500 } }),
+            // SUBA-N06 — both truthiness arms, since `run_sync` gates on `Some(true)` exactly.
+            serde_json::json!({ "includeProgress": true }),
+            serde_json::json!({ "includeProgress": false }),
         ];
         for (i, extra) in accepted.iter().enumerate() {
             let mut params = serde_json::json!({ "agent": "ghost", "task": "do it" });
@@ -9794,26 +11073,45 @@ mod tests {
             );
         }
 
-        // The two the schema no longer advertises are still named and refused, before any
-        // agent resolution — an override is never silently dropped.
-        let err = tool
-            .execute(
-                ToolCallId::from("refused"),
-                serde_json::json!({
-                    "agent": "ghost", "task": "do it",
-                    "includeProgress": true, "control": { "enabled": true }
-                }),
-                CancelToken::new(),
-                Box::new(|_u: cyrup_core::ToolUpdate| {}),
-            )
-            .await
-            .expect_err("a param with no subsystem behind it must be refused");
-        let message = err.to_string();
-        assert!(message.contains("includeProgress"), "got: {message}");
-        assert!(message.contains("control"), "got: {message}");
+        // The other half of the invariant: any param this dispatcher refuses UNCONDITIONALLY must
+        // be named LOUDLY (never silently dropped) AND must be absent from the schema. SUBA-N06
+        // emptied this table; it exists so that re-introducing a refusal is a deliberate, cited act
+        // rather than a silent one. The loop still runs, and still proves both halves, for every
+        // entry that is ever added.
+        const REFUSED_UNCONDITIONALLY: &[(&str, serde_json::Value)] = &[];
+        for (name, value) in REFUSED_UNCONDITIONALLY {
+            let mut params = serde_json::json!({ "agent": "ghost", "task": "do it" });
+            params
+                .as_object_mut()
+                .expect("object literal")
+                .insert((*name).to_string(), value.clone());
+            let message = tool
+                .execute(
+                    ToolCallId::from("refused"),
+                    params,
+                    CancelToken::new(),
+                    Box::new(|_u: cyrup_core::ToolUpdate| {}),
+                )
+                .await
+                .expect_err("a param with no subsystem behind it must be refused")
+                .to_string();
+            assert!(message.contains(name), "got: {message}");
+            assert!(
+                !message.contains("agent not found"),
+                "the refusal must fire BEFORE agent resolution ever runs: {message}"
+            );
+            assert!(
+                !subagent_tool_parameters()["properties"]
+                    .as_object()
+                    .expect("properties object")
+                    .contains_key(*name),
+                "'{name}' is refused unconditionally, so the schema must not advertise it"
+            );
+        }
         assert!(
-            !message.contains("agent not found"),
-            "the refusal must fire BEFORE agent resolution ever runs: {message}"
+            REFUSED_UNCONDITIONALLY.is_empty(),
+            "as of SUBA-N06 no advertised SINGLE-mode param is refused outright; an entry here \
+             needs an upstream citation justifying the refusal"
         );
 
         // A malformed `acceptance` policy is refused up front with pi's own
@@ -9841,7 +11139,7 @@ mod tests {
     /// SUBA-041, the OTHER half of the contract — previously asserted nowhere at all.
     ///
     /// The seven overrides above are advertised because the FOREGROUND path honours them. The same
-    /// call resolved to a BACKGROUND run refuses them by name, because cyrup's second-hop
+    /// call resolved to a BACKGROUND run refuses SIX of them by name, because cyrup's second-hop
     /// `RunnerConfig` has nowhere to put them (upstream's `executeAsyncSingle`,
     /// `subagent-executor.ts:2845-2874` @v0.34.0, does — that plumbing is unported parity debt,
     /// recorded on [`subagent_tool_parameters`]). The refusal is deliberate and mirrors upstream's
@@ -9849,11 +11147,18 @@ mod tests {
     /// leaving it untested, so a future change could silently turn it into an accepted-and-dropped
     /// param — precisely the defect SUBA-041 exists to prevent.
     ///
-    /// Every one of the seven is asserted individually, and the message must name the offender, so
+    /// Every one of the six is asserted individually, and the message must name the offender, so
     /// this test also fails the day one of them starts being honoured without being removed from
     /// the refusal list.
+    ///
+    /// SUBA-N04 rewrote this test rather than leaving it pinning stale behaviour: `acceptance` was
+    /// the seventh entry, and it is now genuinely HONOURED on the background path (the step carries
+    /// the raw policy to hop 2, which lowers and evaluates it). Its refusal assertion is replaced
+    /// below by a positive assertion that a background run declaring `acceptance` is NOT refused,
+    /// plus `spawn_background_single_carries_the_acceptance_policy_into_the_runner_config`, which
+    /// proves the policy really reaches the detached runner's `runner-config.json`.
     #[tokio::test]
-    async fn a_background_single_run_refuses_the_seven_foreground_only_overrides_by_name() {
+    async fn a_background_single_run_refuses_the_six_foreground_only_overrides_by_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
@@ -9861,7 +11166,6 @@ mod tests {
             ("output", serde_json::json!({ "output": "report.md" })),
             ("outputMode", serde_json::json!({ "outputMode": "inline" })),
             ("skill", serde_json::json!({ "skill": "rust" })),
-            ("acceptance", serde_json::json!({ "acceptance": "checked" })),
             ("share", serde_json::json!({ "share": true })),
             ("sessionDir", serde_json::json!({ "sessionDir": "~/x" })),
             ("artifacts", serde_json::json!({ "artifacts": false })),
@@ -9916,7 +11220,27 @@ mod tests {
             .to_string();
         assert!(
             !clean.contains("only supported for foreground SINGLE runs"),
-            "a background call carrying none of the seven must not trip the gate: {clean}"
+            "a background call carrying none of the six must not trip the gate: {clean}"
+        );
+
+        // SUBA-N04: `acceptance` is the ex-seventh entry, now honoured. A background SINGLE call
+        // declaring it must NOT be refused — it must fall through to agent resolution like any
+        // other background run.
+        let with_acceptance = tool
+            .execute(
+                ToolCallId::from("bg-acceptance"),
+                serde_json::json!({
+                    "agent": "ghost", "task": "do it", "async": true, "acceptance": "checked"
+                }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("the agent is unresolvable, so the call still errors")
+            .to_string();
+        assert!(
+            !with_acceptance.contains("only supported for foreground SINGLE runs"),
+            "a background run declaring `acceptance` is honoured, not refused: {with_acceptance}"
         );
     }
 
@@ -10189,14 +11513,17 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .spawn_background(
-                dir.path(),
-                "ghost",
-                "do something",
-                Some(ContextMode::Fresh),
-                None,
-                AgentReadScope::Both,
-            )
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "ghost",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+            })
             .await
             .expect_err("a blocked depth ceiling must reject before discovery or any spawn setup");
         assert!(
@@ -10229,14 +11556,17 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
-            .spawn_background(
-                dir.path(),
-                "worker",
-                "do something",
-                Some(ContextMode::Fresh),
-                Some(ModelId::from("anthropic/claude-override-test")),
-                AgentReadScope::Both,
-            )
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: Some(ModelId::from("anthropic/claude-override-test")),
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+            })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
@@ -10256,6 +11586,148 @@ mod tests {
             Some("anthropic/claude-override-test"),
             "the per-call model override must reach the background single run's step, not be \
              silently dropped in favor of the persona's own model"
+        );
+    }
+
+    /// SUBA-N04, the async SINGLE half: a background run's declared `acceptance` policy reaches the
+    /// detached hop-2 runner's step WHOLE, in the object form that carries `verify[]`.
+    ///
+    /// Upstream honours acceptance on the async path exactly as on the foreground one
+    /// (`runs/background/async-execution.ts:1282-1289` resolves `explicit: params.acceptance` with
+    /// `async: true`; `:1319` persists it on the steering recovery descriptor). cyrup used to hard-
+    /// code `acceptance: None` into the `SingleStepSpec` it wrote into `runner-config.json` — and
+    /// then refuse the param at the tool boundary to keep the drop from being silent. Both are gone;
+    /// this asserts the replacement at the same filesystem boundary the sibling model-override test
+    /// uses, since that file is the entire hop-1 -> hop-2 contract.
+    #[tokio::test]
+    async fn spawn_background_single_carries_the_acceptance_policy_into_the_runner_config() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "unit", "command": "cargo test" }]
+        });
+        let run_id = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: Some(policy.clone()),
+                control: None,
+                include_progress: None,
+            })
+            .await
+            .expect("spawn_background should succeed for a resolvable builtin agent");
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+            .expect("spawn_background must have written runner-config.json before spawning hop 1");
+        let cfg: crate::background::runner_main::RunnerConfig =
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+        let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+            panic!("a single-agent background run must produce exactly one SingleStep");
+        };
+        assert_eq!(
+            step.acceptance.as_ref(),
+            Some(&policy),
+            "the declared acceptance policy must survive the hop-1 -> hop-2 handoff whole, \
+             verify[] commands included"
+        );
+    }
+
+    /// SUBA-N05, the async SINGLE half: a background run's declared `control` override is RESOLVED
+    /// parent-side and reaches the detached hop-2 runner's one-shot config.
+    ///
+    /// This is the defect the advertised-vs-honoured audit turned up: `control` was parsed at the
+    /// tool boundary, was NOT on `route_single`'s foreground-only refusal list, and had nowhere to
+    /// go on `BackgroundSingleRequest` — so `subagent({ async: true, control: {...} })` accepted the
+    /// param and dropped it silently, which is precisely the failure mode SUBA-041 exists to
+    /// prevent. Upstream honours it: `executeAsyncSingle(id, { ..., controlConfig:
+    /// resolveControlConfig(deps.config.control, effectiveParams.control), ... })`
+    /// (`subagent-executor.ts:2845,2868-2870` @v0.34.0), read back by the runner as
+    /// `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` (`subagent-runner.ts:1802`).
+    ///
+    /// Asserted at the `runner-config.json` filesystem boundary — the entire hop-1 -> hop-2
+    /// contract — exactly like its `acceptance` and `model` siblings above. Both halves of the
+    /// resolution are checked: the explicitly-overridden field takes the call's value, and an
+    /// UNSET field takes the extension-level `subagents.control` block rather than being reset to
+    /// the hardcoded default (pi's `resolveControlConfig` is field-by-field, never wholesale).
+    #[tokio::test]
+    async fn spawn_background_single_resolves_and_carries_control_into_the_runner_config() {
+        let executor = SubagentExecutor::new();
+        {
+            let mut cfg = executor.config.lock().await;
+            cfg.control = Some(crate::registration::ControlConfig {
+                // Overridden by the per-call value below.
+                needs_attention_after_ms: Some(11_000),
+                // NOT overridden — must survive into the resolved config.
+                active_notice_after_ms: Some(22_000),
+                ..crate::registration::ControlConfig::default()
+            });
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: Some(crate::registration::ControlConfig {
+                    needs_attention_after_ms: Some(1_234),
+                    notify_channels: Some(vec![
+                        crate::registration::ControlNotificationChannel::Async,
+                    ]),
+                    ..crate::registration::ControlConfig::default()
+                }),
+                include_progress: None,
+            })
+            .await
+            .expect("spawn_background should succeed for a resolvable builtin agent");
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+            .expect("spawn_background must have written runner-config.json before spawning hop 1");
+        // The on-disk shape is the contract, so assert against the RAW JSON keys too — hop 2 reads
+        // this file, not a Rust value handed across a function boundary.
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("runner-config.json must be valid JSON");
+        assert_eq!(
+            json["control"]["needsAttentionAfterMs"],
+            serde_json::json!(1_234),
+            "the per-call override must win, and must serialize under pi's camelCase key: {raw}"
+        );
+        assert_eq!(
+            json["control"]["activeNoticeAfterMs"],
+            serde_json::json!(22_000),
+            "a field the call did not override must inherit the extension-level config, not the \
+             hardcoded default (resolveControlConfig is field-by-field): {raw}"
+        );
+
+        let cfg: crate::background::runner_main::RunnerConfig =
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+        let control = cfg.control.expect("the resolved control config must be present");
+        assert_eq!(control.needs_attention_after_ms, 1_234);
+        assert_eq!(control.active_notice_after_ms, 22_000);
+        assert_eq!(
+            control.notify_channels,
+            vec![crate::registration::ControlNotificationChannel::Async],
+            "the notify-channel list must survive the handoff, so hop 2 knows which channels this \
+             run was authorized to use"
+        );
+        assert_eq!(
+            control.failed_tool_attempts_before_attention,
+            crate::exec::control::DEFAULT_FAILED_TOOL_ATTEMPTS_BEFORE_ATTENTION,
+            "and an entirely unmentioned field falls through to DEFAULT_CONTROL_CONFIG"
         );
     }
 
@@ -10512,6 +11984,8 @@ mod tests {
                     resolved_agents: BTreeMap::new(),
                     original_task: String::new(),
                     chain_dir: None,
+                    control: None,
+                    include_progress: None,
                 },
             )
             .await
@@ -11525,6 +12999,57 @@ mod tests {
         );
     }
 
+    /// SUBA-N04: pi validates a control action's acceptance too, with its own prefix, BEFORE the
+    /// action touches disk — `appendStepToRun` (`subagent-executor.ts:791-798`) and `resumeAsyncRun`
+    /// (`:1145-1152`) @v0.34.0. cyrup validated neither, which was invisible while the appended
+    /// step's policy was being dropped by the runner anyway; now that it is honoured, a malformed
+    /// one must be refused rather than enqueued.
+    #[tokio::test]
+    async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+
+        let appended = tool
+            .execute(
+                ToolCallId::from("append-bad-acceptance"),
+                serde_json::json!({
+                    "action": "append-step",
+                    "id": "run00000000",
+                    "chain": [{ "agent": "worker", "task": "t", "acceptance": "nonsense" }]
+                }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("a malformed appended-step acceptance must be refused")
+            .to_string();
+        assert_eq!(
+            appended,
+            "Cannot append step: chain[0].acceptance has invalid level 'nonsense'.",
+            "pi's own prefix and per-site path label, and it must fire before the run lookup"
+        );
+
+        let resumed = tool
+            .execute(
+                ToolCallId::from("resume-bad-acceptance"),
+                serde_json::json!({
+                    "action": "resume",
+                    "id": "run00000000",
+                    "message": "continue",
+                    "chain": [{ "agent": "worker", "task": "t", "acceptance": { "bogus": 1 } }]
+                }),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("a malformed attach-chain acceptance must be refused")
+            .to_string();
+        assert_eq!(
+            resumed,
+            "Cannot resume: chain[0].acceptance.bogus is not supported."
+        );
+    }
+
     // =====================================================================================
     // Tier-2 (a): fork default-mode + per-index branch (`apply_fork_contexts`).
     // =====================================================================================
@@ -12298,6 +13823,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         let json = serde_json::to_value(&config).expect("config serializes");
         assert_eq!(

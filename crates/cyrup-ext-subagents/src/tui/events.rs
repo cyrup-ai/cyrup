@@ -49,7 +49,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
-use crate::background::{RunId, RunMode, RunState, RunStatus};
+use crate::background::{ActivityState, RunId, RunMode, RunState, RunStatus};
 use crate::exec::ndjson::{parse_line, SubagentEvent};
 use crate::exec::SingleResult;
 use crate::fork_context::ContextMode;
@@ -62,73 +62,223 @@ use crate::tui::{RunSource, SubagentProgressSnapshot};
 /// a long-running child's fold can never grow without bound.
 pub const RECENT_OUTPUT_CAP: usize = 20;
 
+/// Bounded cap on a live progress fold's `recent_tools` ring — pi's `MAX_STREAMED_RECENT_TOOLS`
+/// (`pi-subagents/src/shared/utils.ts:435`, applied by `boundStreamedRecentTools` at `:444-447`).
+///
+/// **[CYRUP-DELTA]** pi lets the LIVE `progress.recentTools` array grow without bound and slices it
+/// to the last 32 entries only when a snapshot is taken (`snapshotProgress`, `execution.ts:175`).
+/// This fold evicts at push time instead, which yields the identical 32-entry tail on every
+/// snapshot while making a long, tool-heavy child's in-memory fold O(1) rather than O(tool calls).
+/// The distinction is invisible on the wire: no consumer reads past the tail pi already slices to,
+/// and a SETTLED snapshot empties the ring entirely
+/// ([`LiveProgressSnapshot::compact_completed`]).
+pub const RECENT_TOOLS_CAP: usize = 32;
+
 // =================================================================================================
 // LiveProgressStatus / LiveProgressSnapshot (the per-run progress the inline surface renders)
 // =================================================================================================
 
-/// The lifecycle phase a [`LiveProgressSnapshot`] represents (pi `AgentProgress.status`,
-/// `runs/foreground/execution.ts`). Deliberately the three phases a *foreground single run* can be
-/// in from the inline surface's point of view — a still-streaming child is `Running`, a settled
-/// child is `Complete` or `Failed`. (The richer `Paused`/`Queued` background lifecycle lives on
-/// [`RunState`], which [`AsyncJobSnapshot`] carries for the C21 widget.)
+/// The lifecycle phase a [`LiveProgressSnapshot`] represents — a 1:1 port of pi's
+/// `AgentProgress["status"]` union (`pi-subagents/src/shared/types.ts:565`,
+/// `"pending" | "running" | "completed" | "failed" | "detached"`), including its exact wire
+/// spellings. (The richer `Paused`/`Queued` BACKGROUND lifecycle lives on [`RunState`], which
+/// [`AsyncJobSnapshot`] carries for the C21 widget; this enum is the FOREGROUND child's own.)
+///
+/// `Complete` serializes as `"completed"` (pi's spelling) rather than the Rust variant's own
+/// lower-cased name — the variant keeps its original identifier so existing in-crate matches are
+/// untouched, while the wire shape is pi's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveProgressStatus {
+    /// Queued for execution; no child process has started streaming yet (pi `"pending"`, the
+    /// initial state a not-yet-started parallel task carries).
+    Pending,
     /// The child is still streaming NDJSON — the animated activity glyph applies.
     #[default]
     Running,
     /// The child exited cleanly (exit code 0).
+    #[serde(rename = "completed")]
     Complete,
     /// The child exited non-zero, timed out, or errored.
     Failed,
+    /// The child handed off to intercom coordination and is no longer this run's to settle
+    /// (pi `progress.status = "detached"`, `runs/foreground/execution.ts:449`).
+    Detached,
 }
 
 impl LiveProgressStatus {
     /// Map to the [`RunState`] the pure render primitives key their activity-glyph gate off
     /// (`render::is_actively_running` animates only [`RunState::Running`]). `Complete`/`Failed`
-    /// map to their [`RunState`] namesakes so a settled run renders the static idle glyph.
+    /// map to their [`RunState`] namesakes so a settled run renders the static idle glyph;
+    /// `Pending` is [`RunState::Queued`] and `Detached` is [`RunState::Paused`] (a detached child
+    /// is awaiting an out-of-band reply, which is exactly the paused/idle glyph's meaning).
     #[must_use]
     pub fn to_run_state(self) -> RunState {
         match self {
+            LiveProgressStatus::Pending => RunState::Queued,
             LiveProgressStatus::Running => RunState::Running,
             LiveProgressStatus::Complete => RunState::Complete,
             LiveProgressStatus::Failed => RunState::Failed,
+            LiveProgressStatus::Detached => RunState::Paused,
         }
+    }
+
+    /// Whether this phase is pi's `"running"` — the ONE status
+    /// [`LiveProgressSnapshot::compact_completed`] refuses to compact (pi
+    /// `compactCompletedProgress`'s `if (progress.status === "running") return progress;`,
+    /// `pi-subagents/src/shared/utils.ts:330`).
+    #[must_use]
+    pub fn is_running(self) -> bool {
+        matches!(self, LiveProgressStatus::Running)
     }
 }
 
-/// One run's live progress fold, reduced to the renderer-facing fields the inline surface shows
-/// (pi's `snapshotProgress` output, `runs/foreground/execution.ts:134-141`): the agent, its
-/// lifecycle phase, the tool it is currently running, cumulative tool/turn counts, cumulative
-/// tokens (`input + output`, pi `progress.tokens`), and a bounded tail of recent output.
+/// One entry of [`LiveProgressSnapshot::recent_tools`] — a 1:1 port of pi's
+/// `AgentProgress["recentTools"][number]` (`pi-subagents/src/shared/types.ts:574`,
+/// `{ tool: string; args: string; endMs: number }`), pushed once per `tool_execution_end`
+/// (`runs/foreground/execution.ts:803-810`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentToolCall {
+    /// The tool that just finished (pi `progress.currentTool` at `tool_execution_end` time).
+    pub tool: String,
+    /// The short argument preview captured when the call STARTED (pi `progress.currentToolArgs`,
+    /// itself `extractToolArgsPreview(toolArgs)`, `execution.ts:794`); empty when the start carried
+    /// no previewable argument.
+    pub args: String,
+    /// Wall-clock epoch-millis at which the call finished (pi `endMs: now`, `execution.ts:808`).
+    pub end_ms: u64,
+}
+
+/// One run's progress snapshot — a port of pi's `AgentProgress` (`shared/types.ts:562-587`) as
+/// produced by `snapshotProgress` (`runs/foreground/execution.ts:171-178`) for a LIVE update and
+/// by `compactCompletedProgress` (`shared/utils.ts:329-345`) for a SETTLED one.
 ///
-/// Serializable so it round-trips through [`SubagentUpdatePayload`] over the
-/// [`cyrup_core::ToolUpdate`] `details` channel to `cyrup-tui`.
+/// Two consumers, one shape (exactly as upstream):
+///
+/// - the C19/C20 live stream, where it rides [`SubagentUpdatePayload`] over the
+///   [`cyrup_core::ToolUpdate`] `details` channel to `cyrup-tui`; and
+/// - a settled run's [`crate::exec::SingleResult::progress`], populated only when the caller asked
+///   for it via `includeProgress` (pi `progress: params.includeProgress ? allProgress : undefined`,
+///   `runs/foreground/subagent-executor.ts:3071,3406`), and always passed through
+///   [`Self::compact_completed`] first.
+///
+/// Every field beyond the original renderer-facing six is `#[serde(default)]` and skipped when
+/// empty/`None`, so a payload that carries none of them serializes byte-for-byte as it did before
+/// they existed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveProgressSnapshot {
+    /// This child's flat index within its run (pi `AgentProgress.index`, `types.ts:563`) — `0` for
+    /// a SINGLE run, the task position for a PARALLEL fan-out.
+    #[serde(default)]
+    pub index: u32,
     /// The fully-qualified persona name this run executes, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// The run's lifecycle phase from the inline surface's point of view.
     pub status: LiveProgressStatus,
+    /// pi `AgentProgress.activityState` (`types.ts:566`): the live-control attention classification
+    /// this child most recently transitioned to, when one was raised at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_state: Option<ActivityState>,
+    /// The task text this child was launched with (pi `AgentProgress.task`, `types.ts:567`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task: String,
+    /// The resolved skill names injected into this child's prompt (pi `AgentProgress.skills`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
     /// The tool the child is currently invoking, if the most recent event started one and no
     /// `tool_execution_end` has cleared it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool: Option<String>,
+    /// The bounded tail of finished tool calls (pi `AgentProgress.recentTools`). Always EMPTY on a
+    /// settled snapshot — see [`Self::compact_completed`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_tools: Vec<RecentToolCall>,
     /// Number of `tool_execution_start` events observed so far.
     pub tool_count: u32,
     /// Number of assistant `message_end` turns observed so far (pi `progress.turnCount`).
     pub turn_count: u32,
     /// Cumulative `input + output` tokens observed so far (pi `progress.tokens`).
     pub tokens: u64,
+    /// The resolved launch model for this child (pi `AgentProgress.model`, `types.ts:580`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The resolved thinking level for this child (pi `AgentProgress.thinking`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// Split input-token total (pi `AgentProgress.inputTokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Split output-token total (pi `AgentProgress.outputTokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Wall-clock milliseconds this child has been running (pi `AgentProgress.durationMs`, stamped
+    /// at settle as `Date.now() - startTime`, `execution.ts:1177`).
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// The run's terminal error text, when it failed (pi `progress.error = result.error`,
+    /// `execution.ts:1179`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The tool that was in flight when the run failed (pi `progress.failedTool =
+    /// progress.currentTool`, `execution.ts:1181`, set ONLY when there was both an error and a
+    /// tool in flight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tool: Option<String>,
     /// A bounded tail of the child's most recent textual output lines (assistant + tool-result
-    /// text), oldest-first (pi `progress.recentOutput`).
+    /// text), oldest-first (pi `progress.recentOutput`). Always EMPTY on a settled snapshot — see
+    /// [`Self::compact_completed`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_output: Vec<String>,
 }
 
 impl LiveProgressSnapshot {
+    /// pi `compactCompletedProgress` (`pi-subagents/src/shared/utils.ts:329-345`) — the ONLY shape
+    /// a SETTLED run's progress is ever published in, and the reason a chatty child cannot inflate
+    /// a returned result without bound.
+    ///
+    /// A still-`running` snapshot is returned untouched (pi's first line). Any other status is
+    /// rebuilt from the eleven fields pi's literal names — `index`, `agent`, `status`,
+    /// `activityState`, `task`, `skills`, `toolCount`, `tokens`, `durationMs`, `error`,
+    /// `failedTool` — with `recentTools`/`recentOutput` reset to empty and EVERY other field
+    /// dropped, because pi constructs a fresh object listing exactly those keys. So the per-run
+    /// growth terms (the tool-history ring and the output tail) are gone, and what remains is a
+    /// fixed-size record whose only unbounded member is the task text the CALLER supplied.
+    ///
+    /// Dropping `currentTool`/`turnCount`/`model`/`thinking`/`inputTokens`/`outputTokens` here is
+    /// not an oversight — it is pi's own object literal, reproduced key-for-key. `failedTool`
+    /// survives, which is how a failed run still names the tool that was in flight after
+    /// `currentTool` itself is dropped.
+    #[must_use]
+    pub fn compact_completed(self) -> Self {
+        if self.status.is_running() {
+            return self;
+        }
+        Self {
+            index: self.index,
+            agent: self.agent,
+            status: self.status,
+            activity_state: self.activity_state,
+            task: self.task,
+            skills: self.skills,
+            tool_count: self.tool_count,
+            tokens: self.tokens,
+            duration_ms: self.duration_ms,
+            error: self.error,
+            failed_tool: self.failed_tool,
+            recent_tools: Vec::new(),
+            recent_output: Vec::new(),
+            // Every remaining key is absent from pi's literal.
+            current_tool: None,
+            turn_count: 0,
+            model: None,
+            thinking: None,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
     /// A single compact, dim stats line for the inline surface: the current tool (when running),
     /// the tool/turn counts, and the token total — the fields pi's `formatProgressStats`
     /// (`tui/render.ts`) folds onto the running/settled result row. Kept as a plain styled
@@ -165,19 +315,65 @@ impl LiveProgressSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct LiveProgressFold {
     agent: Option<String>,
+    /// This child's flat index within its run (pi `progress.index`, seeded from `options.index`,
+    /// `runs/foreground/execution.ts:358`).
+    index: u32,
+    /// The launch task text (pi `progress.task`, `execution.ts:361`).
+    task: String,
+    /// The resolved skill names (pi `progress.skills`, `execution.ts:362`).
+    skills: Option<Vec<String>>,
+    /// The resolved launch model/effort (pi `progress.model`/`progress.thinking`,
+    /// `execution.ts:367-368`).
+    model: Option<String>,
+    thinking: Option<String>,
     current_tool: Option<String>,
+    /// The argument preview captured at the current tool's START (pi `progress.currentToolArgs`,
+    /// `execution.ts:794`), copied onto the `recent_tools` entry when it ends.
+    current_tool_args: String,
+    /// The bounded finished-tool ring (pi `progress.recentTools`), capped at [`RECENT_TOOLS_CAP`].
+    recent_tools: VecDeque<RecentToolCall>,
     tool_count: u32,
     turn_count: u32,
     input_tokens: u64,
     output_tokens: u64,
     recent_output: VecDeque<String>,
+    /// When this fold started, for `durationMs` (pi's `startTime` local, `execution.ts:1177`).
+    /// `None` in a `Default`-constructed fold, which reports a zero duration.
+    started_at: Option<std::time::Instant>,
 }
 
 impl LiveProgressFold {
-    /// Start a fold for `agent` (the persona name shown in the header), with empty counters.
+    /// Start a fold for `agent` (the persona name shown in the header), with empty counters and the
+    /// duration clock started (pi's `startTime`, captured before the child spawns).
     #[must_use]
     pub fn new(agent: Option<String>) -> Self {
-        Self { agent, ..Self::default() }
+        Self {
+            agent,
+            started_at: Some(std::time::Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    /// Seed the launch-time descriptive fields pi writes into `progress` at construction
+    /// (`runs/foreground/execution.ts:357-373`) and never mutates thereafter: this child's flat
+    /// `index`, its `task` text, its resolved `skills`, and its resolved `model`/`thinking`.
+    /// Chained onto [`Self::new`] by callers that know them; callers that do not (the raw
+    /// NDJSON-only folds in tests) simply leave them at their empty defaults.
+    #[must_use]
+    pub fn with_launch_context(
+        mut self,
+        index: u32,
+        task: impl Into<String>,
+        skills: Option<Vec<String>>,
+        model: Option<String>,
+        thinking: Option<String>,
+    ) -> Self {
+        self.index = index;
+        self.task = task.into();
+        self.skills = skills;
+        self.model = model;
+        self.thinking = thinking;
+        self
     }
 
     /// Fold one raw NDJSON stdout line into this state. Returns `true` iff the line parsed to a
@@ -191,13 +387,30 @@ impl LiveProgressFold {
             return false;
         };
         match &event {
-            SubagentEvent::ToolExecutionStart { tool_name, .. } => {
+            SubagentEvent::ToolExecutionStart { tool_name, args, .. } => {
                 self.tool_count = self.tool_count.saturating_add(1);
                 self.current_tool = Some(tool_name.clone());
+                // pi `progress.currentToolArgs = extractToolArgsPreview(toolArgs)`
+                // (`runs/foreground/execution.ts:794`).
+                self.current_tool_args =
+                    crate::exec::tool_call_summary::extract_tool_args_preview(args);
                 true
             }
             SubagentEvent::ToolExecutionEnd { result, .. } => {
-                self.current_tool = None;
+                // pi pushes the finished call onto `recentTools` ONLY when a `currentTool` was in
+                // flight (`execution.ts:804-810`), then clears both it and its args (`:811-812`).
+                if let Some(tool) = self.current_tool.take() {
+                    if self.recent_tools.len() >= RECENT_TOOLS_CAP {
+                        self.recent_tools.pop_front();
+                    }
+                    self.recent_tools.push_back(RecentToolCall {
+                        tool,
+                        args: std::mem::take(&mut self.current_tool_args),
+                        end_ms: u64::try_from(crate::background::now_epoch_millis_pub())
+                            .unwrap_or(0),
+                    });
+                }
+                self.current_tool_args.clear();
                 self.push_output(&extract_event_text(result));
                 true
             }
@@ -219,18 +432,44 @@ impl LiveProgressFold {
         }
     }
 
-    /// Take a [`LiveProgressSnapshot`] of the current fold at the given lifecycle `status`.
+    /// Take a [`LiveProgressSnapshot`] of the current fold at the given lifecycle `status` (pi
+    /// `snapshotProgress`, `runs/foreground/execution.ts:171-178`). The returned snapshot is the
+    /// FULL, still-running shape; a caller publishing a SETTLED run's progress must additionally
+    /// run it through [`LiveProgressSnapshot::compact_completed`], exactly as pi's
+    /// `compactForegroundDetails` does (`shared/utils.ts:414-421`).
     #[must_use]
     pub fn snapshot(&self, status: LiveProgressStatus) -> LiveProgressSnapshot {
         LiveProgressSnapshot {
+            index: self.index,
             agent: self.agent.clone(),
             status,
+            activity_state: None,
+            task: self.task.clone(),
+            skills: self.skills.clone(),
             current_tool: self.current_tool.clone(),
+            recent_tools: self.recent_tools.iter().cloned().collect(),
             tool_count: self.tool_count,
             turn_count: self.turn_count,
             tokens: self.input_tokens.saturating_add(self.output_tokens),
+            model: self.model.clone(),
+            thinking: self.thinking.clone(),
+            input_tokens: Some(self.input_tokens),
+            output_tokens: Some(self.output_tokens),
+            duration_ms: self.duration_ms(),
+            error: None,
+            failed_tool: None,
             recent_output: self.recent_output.iter().cloned().collect(),
         }
+    }
+
+    /// Milliseconds elapsed since [`Self::new`] started this fold's clock (pi `Date.now() -
+    /// startTime`, `runs/foreground/execution.ts:1177`); `0` for a `Default`-constructed fold that
+    /// never started one.
+    #[must_use]
+    pub fn duration_ms(&self) -> u64 {
+        self.started_at
+            .map(|start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
     }
 
     /// Append the non-empty lines of `text` to the bounded `recent_output` ring, evicting oldest
@@ -253,7 +492,13 @@ impl LiveProgressFold {
 /// Extract human-readable text from a message-`content`/tool-`result` JSON value (pi
 /// `extractTextFromContent`): a bare string is itself; an array of parts joins each part's `text`;
 /// an object falls back to its own `text` member. Any other shape yields `""`.
-fn extract_event_text(value: &serde_json::Value) -> String {
+///
+/// `pub(crate)` because [`crate::exec::AgentProgress::append_recent_output`] folds the SAME
+/// extraction into its own `recent_output` ring — pi runs one `extractTextFromContent` over both
+/// the assistant `message_end` content and the `tool_execution_end` result before appending
+/// (`runs/foreground/execution.ts:850,869`), so a second private copy here would be two
+/// implementations of one upstream function drifting apart.
+pub(crate) fn extract_event_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(parts) => parts
@@ -577,6 +822,7 @@ mod tests {
             turn_count: 2,
             tokens: 128,
             recent_output: vec!["some output".to_string()],
+            ..LiveProgressSnapshot::default()
         };
         let payload = SubagentUpdatePayload::single_live(ContextMode::Fork, progress);
         let text = payload.content_text();
@@ -602,6 +848,7 @@ mod tests {
             turn_count: 1,
             tokens: 10,
             recent_output: Vec::new(),
+            ..LiveProgressSnapshot::default()
         };
         let payload = SubagentUpdatePayload::single_live(ContextMode::Fork, progress);
         let lines = render_inline_result(&payload, 0);

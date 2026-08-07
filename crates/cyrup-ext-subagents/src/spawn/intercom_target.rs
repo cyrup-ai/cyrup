@@ -76,11 +76,36 @@ pub fn sanitize_intercom_target_part(value: &str) -> String {
 /// `subagent-<sanitize(agent)>-<sanitize(run_id)>-<index+1>`.
 #[must_use]
 pub fn resolve_subagent_intercom_target(run_id: &str, agent: &str, index: usize) -> String {
+    resolve_subagent_intercom_target_opt(run_id, agent, Some(index))
+}
+
+/// The index-OPTIONAL form of [`resolve_subagent_intercom_target`], matching upstream's signature
+/// exactly: `resolveSubagentIntercomTarget(runId, agent, index?: number)` renders
+/// `stepSuffix = index !== undefined ? `-${index + 1}` : ""` (`intercom-bridge.ts:94-97`
+/// @v0.34.0), so an index-less caller gets the bare `subagent-<agent>-<run>` label with NO trailing
+/// step number.
+///
+/// Every SPAWN site in this crate knows its child's flat index and therefore uses the `usize` form
+/// above. The one caller that genuinely may not is
+/// `SubagentExecutor::foreground_control_notifier`, which mirrors `emitControlNotification`'s
+/// `resolveSubagentIntercomTarget(event.runId, event.agent, event.index)`
+/// (`subagent-executor.ts:512-513` @v0.34.0) — `ControlEvent::index` is optional there, and
+/// synthesising a `-1` suffix for an index-less event would both mis-address the child and change
+/// the notice's dedup key.
+#[must_use]
+pub fn resolve_subagent_intercom_target_opt(
+    run_id: &str,
+    agent: &str,
+    index: Option<usize>,
+) -> String {
+    let step_suffix = match index {
+        Some(index) => format!("-{}", index + 1),
+        None => String::new(),
+    };
     format!(
-        "subagent-{}-{}-{}",
+        "subagent-{}-{}{step_suffix}",
         sanitize_intercom_target_part(agent),
         sanitize_intercom_target_part(run_id),
-        index + 1
     )
 }
 

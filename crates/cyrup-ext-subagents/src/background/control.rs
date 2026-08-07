@@ -2277,6 +2277,8 @@ mod tests {
             error: error.map(str::to_string),
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         }
     }
 

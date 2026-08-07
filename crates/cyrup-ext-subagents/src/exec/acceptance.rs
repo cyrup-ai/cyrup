@@ -338,6 +338,101 @@ pub struct ReviewerResult {
     pub detail: Option<String>,
 }
 
+// ============================================================================================
+// Lowering a raw wire `acceptance` value onto an `AcceptanceContract` (SUBA-041 / SUBA-N04)
+// ============================================================================================
+
+/// Lower a raw wire `acceptance` value (pi `AcceptanceOverride`, `schemas.ts:69-76`) onto this
+/// crate's [`AcceptanceContract`], after running pi's own `validateAcceptanceInput`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:164-286` @v0.34.0, applied at
+/// `subagent-executor.ts:1418`) so a malformed policy is refused BEFORE any child spawns, with pi's
+/// verbatim messages.
+///
+/// Level mapping (pi `AcceptanceLevel` -> [`AcceptanceStatus`]): `auto` yields `None`, i.e. pi's own
+/// "omitted means auto-inferred" — [`crate::exec::run_sync`] then falls through to
+/// [`AcceptanceContract::heuristic_default`] (R-SA-023), which is this crate's `inferLevel`. Every
+/// other level (and the `false` shorthand, pi's `level: "none"`) becomes an EXPLICIT contract, which
+/// is what arms R-SA-033's post-hoc exit-code correction.
+///
+/// # Why this lives here and not on one call site
+///
+/// It is the SINGLE lowering every execution surface shares: the SINGLE-mode `acceptance` tool param
+/// (`extension.rs::route_single`, pi `subagent-executor.ts:1418`), and every chain/parallel/
+/// background STEP's own `acceptance` (`background/runner_main.rs::ExecSingleStepExecutor::
+/// run_single`, pi `chain-execution.ts:400,1335` — which pass `task.acceptance`/`seqStep.acceptance`
+/// into the very same `runSync` call the single path uses). SUBA-N04: the step path used to hard-drop
+/// the field to `None`, so a declared contract ran UNVERIFIED; a second parser would have re-opened
+/// exactly that drift, so both paths call this one function.
+///
+/// **[CYRUP-DELTA]** pi's richer `AcceptanceConfig` fields (`criteria`/`evidence`/`review`/
+/// `stopRules`/`reason`) are validated here but carry no [`AcceptanceContract`] home — that shape
+/// lives in the parallel, not-yet-wired [`model`] port. Only `level` and `verify[].command` are
+/// lowered; the rest are accepted-and-ignored rather than rejected, matching pi's own tolerance for
+/// a config that declares more than a given run consumes.
+///
+/// # Errors
+///
+/// Returns every `validateAcceptanceInput` message, space-joined, exactly as pi renders them
+/// (`subagent-executor.ts:1535-1541`).
+pub fn lower_acceptance_input(
+    raw: &serde_json::Value,
+) -> Result<Option<AcceptanceContract>, String> {
+    let errors = model::validate_acceptance_input(raw, "acceptance");
+    if !errors.is_empty() {
+        return Err(errors.join(" "));
+    }
+
+    fn level_to_status(level: &str) -> Option<AcceptanceStatus> {
+        match level {
+            "none" => Some(AcceptanceStatus::NotRequired),
+            "attested" => Some(AcceptanceStatus::Attested),
+            "checked" => Some(AcceptanceStatus::Checked),
+            "verified" => Some(AcceptanceStatus::Verified),
+            "reviewed" => Some(AcceptanceStatus::Reviewed),
+            // "auto" (and anything `validate_acceptance_input` already let through) infers.
+            _ => None,
+        }
+    }
+
+    match raw {
+        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`).
+        serde_json::Value::Bool(false) => Ok(Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            Vec::new(),
+        ))),
+        serde_json::Value::String(level) => Ok(level_to_status(level)
+            .map(|status| AcceptanceContract::explicit(status, Vec::new()))),
+        serde_json::Value::Object(config) => {
+            let verify: Vec<String> = config
+                .get("verify")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let level = config.get("level").and_then(serde_json::Value::as_str);
+            match level.and_then(level_to_status) {
+                Some(status) => Ok(Some(AcceptanceContract::explicit(status, verify))),
+                // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
+                // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
+                // still inferred — but declared `verify[]` commands must not be dropped, so an
+                // object carrying any is lowered as an explicit `verified` contract.
+                None if !verify.is_empty() => Ok(Some(AcceptanceContract::explicit(
+                    AcceptanceStatus::Verified,
+                    verify,
+                ))),
+                None => Ok(None),
+            }
+        }
+        // `null`/absent is pi's `undefined`.
+        _ => Ok(None),
+    }
+}
+
 /// The exact heading this module injects and later scans for — kept as a named constant so
 /// [`inject_acceptance_contract`] and any future re-detection logic never drift out of sync with
 /// each other over a hand-typed literal.
