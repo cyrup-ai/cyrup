@@ -1347,6 +1347,7 @@ name = "cyrup-session-svc"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "cyrup-agent",
  "cyrup-config",
  "cyrup-core",
@@ -1356,6 +1357,7 @@ dependencies = [
  "cyrup-session",
  "cyrup-tools",
  "futures",
+ "image",
  "serde",
  "serde_json",
  "tempfile",
