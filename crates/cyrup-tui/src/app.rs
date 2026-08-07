@@ -4254,6 +4254,16 @@ impl App<CrosstermBackend<Stdout>> {
             ui_tx.clone(),
             ui_effect_tx.clone(),
         );
+        // The `/` menu's dynamic half (pi `interactive-mode.ts:1240-1300`). `slash_command_catalog()`
+        // already merges registered extension commands, prompt templates and skills — it was just
+        // never consumed outside RPC mode, so the interactive `/` list showed builtins only while an
+        // RPC client saw everything from the SAME session. Re-installed on session swap below, for
+        // the same reason the sinks are: a replacement session brings different extensions.
+        self.state
+            .editor
+            .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                crate::commands::dynamic_commands_from_catalog(&session.slash_command_catalog()),
+            ));
         // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
         // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
         // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
@@ -4600,6 +4610,16 @@ impl App<CrosstermBackend<Stdout>> {
                             &session.services().host_services,
                             ui_tx.clone(),
                             ui_effect_tx.clone(),
+                        );
+                        // ...and the same for the `/` menu: a replacement session can load a
+                        // DIFFERENT extension set (`/reload` exists precisely to change it), so a
+                        // registry built from the previous session's catalog would be stale.
+                        self.state.editor.set_registry(
+                            crate::commands::CommandRegistry::with_dynamic(
+                                crate::commands::dynamic_commands_from_catalog(
+                                    &session.slash_command_catalog(),
+                                ),
+                            ),
                         );
                         // `rebind_session` reset the transcript to Pi's default pad; re-read the
                         // swapped-in session's `outputPad` so a configured value survives the swap.

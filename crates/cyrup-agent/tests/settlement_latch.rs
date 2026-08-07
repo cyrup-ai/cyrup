@@ -113,13 +113,44 @@ async fn wait_for_idle_then_prompt_is_never_refused() {
 /// the guard into a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_starts_admit_exactly_one_run() {
-    let agent = Arc::new(Agent::builder(model_ref(), stream_fn(8)).build());
+    // The first run is held OPEN until every competitor has attempted. Without this gate the test
+    // asserts a scheduling accident rather than the latch: `FauxProvider` answers instantly, so
+    // under CPU contention task #1 can finish its whole run before task #16 is even scheduled, and
+    // the later start is then admitted LEGITIMATELY — sequentially, not concurrently. That is what
+    // `accepted: 2` meant when this failed 3 runs in 6 under load while passing 5 in 5 idle.
+    //
+    // The invariant being tested is "at most one run AT A TIME", and only a run that is still in
+    // flight can test it.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let inner = stream_fn(8);
+    let gated: Arc<dyn StreamFn> = Arc::new(GatedStreamFn { inner, gate: Arc::clone(&gate) });
+    let agent = Arc::new(Agent::builder(model_ref(), gated).build());
 
+    // All 16 start together, and none can settle while the gate is closed.
+    let started = Arc::new(tokio::sync::Barrier::new(16));
+    // Counts tasks whose `prompt()` has RETURNED. The winner never returns while the gate is shut,
+    // so this reaching 15 proves all 16 have called `prompt()` — 15 rejected plus one parked.
+    let returned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let a = Arc::clone(&agent);
-        tasks.push(tokio::spawn(async move { a.prompt("go").await.map(|_| ()) }));
+        let b = Arc::clone(&started);
+        let r = Arc::clone(&returned);
+        tasks.push(tokio::spawn(async move {
+            b.wait().await;
+            let outcome = a.prompt("go").await.map(|_| ());
+            r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }));
     }
+
+    // Open the gate ONLY once every competitor has been rejected. Releasing it earlier (as a first
+    // attempt at this fix did) reintroduces the exact race: the winner settles, and a later start
+    // is admitted legitimately.
+    while returned.load(std::sync::atomic::Ordering::SeqCst) < 15 {
+        tokio::task::yield_now().await;
+    }
+    gate.add_permits(1);
 
     let mut accepted = 0usize;
     for task in tasks {
@@ -132,6 +163,37 @@ async fn concurrent_starts_admit_exactly_one_run() {
     assert_eq!(accepted, 1, "exactly one concurrent start may claim the run latch");
 
     agent.wait_for_idle().await;
+    gate.add_permits(1);
     agent.prompt("go").await.expect("the latch is released once the run settles");
     agent.wait_for_idle().await;
+}
+
+/// A [`StreamFn`] whose stream yields nothing until a permit is released, so a run can be held
+/// deliberately in flight. `FauxProvider` is otherwise instantaneous, which leaves no window in
+/// which concurrent starts are actually concurrent.
+struct GatedStreamFn {
+    inner: Arc<dyn StreamFn>,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl StreamFn for GatedStreamFn {
+    fn stream(
+        &self,
+        model: &cyrup_core::ModelRef,
+        ctx: &cyrup_agent::Context,
+        opts: &cyrup_agent::StreamOptions,
+    ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
+        let inner = self.inner.stream(model, ctx, opts);
+        let gate = Arc::clone(&self.gate);
+        Box::pin(
+            futures::StreamExt::flatten(futures::stream::once(async move {
+                // A permit is never returned to the semaphore: each `add_permits(1)` releases
+                // exactly one run.
+                if let Ok(p) = gate.acquire().await {
+                    p.forget();
+                }
+                inner
+            })),
+        )
+    }
 }

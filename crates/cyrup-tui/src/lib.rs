@@ -82,7 +82,8 @@ pub use autocomplete::{
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
 pub use commands::{
-    CommandRegistry, CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+    dynamic_commands_from_catalog, CommandRegistry, CommandSource, Dispatch, SlashCommand,
+    BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;
