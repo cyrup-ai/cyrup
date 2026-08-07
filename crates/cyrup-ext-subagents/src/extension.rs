@@ -2565,6 +2565,19 @@ impl SubagentExecutor {
         // `RunOptions::include_progress`. `None` for every slash-command caller (no such param on
         // that surface, matching pi).
         include_progress: Option<bool>,
+        // pi `params.chainDir` — the caller's explicit chain artifact directory, honoured verbatim
+        // when given and otherwise defaulted below: `chainDir: params.chainDir ??
+        // getProjectChainRunsDir(effectiveCwd)` (`subagent-executor.ts:2022` @v0.34.0). That line
+        // lives in `runChainPath`, so this is CHAIN-mode-only upstream and every other caller here
+        // passes `None` — `route_parallel_mode`, the slash surface (which exposes no `chainDir`
+        // param at all), and the tests.
+        //
+        // Before this parameter existed the tool ADVERTISED `chainDir` with pi's description
+        // copied verbatim (`schemas.ts:263`), deserialized it into `SubagentToolParams::chain_dir`,
+        // counted it in `provided_keys()` — and then dropped it on the floor, because this boundary
+        // had nowhere to put it. Same defect shape as SUBA-041/SUBA-N03: a narrow seam silently
+        // eating an advertised param.
+        chain_dir_override: Option<PathBuf>,
     ) -> Result<GraphRunOutcome, SubagentError> {
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before persona resolution (real
         // discovery I/O) or fork-context resolution (real session I/O).
@@ -2607,7 +2620,13 @@ impl SubagentExecutor {
         // an orchestrator correlating a follow-up status/resume action against the id it just saw in
         // the receipt would otherwise find nothing. See [`GraphRunOutcome::Foreground::run_id`].
         let foreground_run_id = RunId::new();
-        let chain_dir = crate::artifacts::chain_runs_dir(cwd).join(foreground_run_id.as_str());
+        // pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
+        // (`subagent-executor.ts:2022` @v0.34.0): an explicit caller value WINS and is used exactly
+        // as given — pi does not rewrite it either, and `chain-execution.ts:283` is what resolves a
+        // step's relative `output` against it. The `unwrap_or_else` fallback keeps cyrup's existing
+        // per-run subdirectory ([CYRUP-DELTA] vs pi's flat project chain-runs dir), which the block
+        // below relies on for `{chain_dir}` uniqueness and which `cleanup_old_chain_dirs` housekeeps.
+        let chain_dir = resolve_chain_dir(chain_dir_override, cwd, &foreground_run_id);
         crate::background::ensure_accessible_dir(&chain_dir)
             .await
             .map_err(SubagentError::Spawn)?;
@@ -5213,6 +5232,21 @@ fn sj_control_overrides() -> serde_json::Value {
 /// `tests::a_background_single_run_honours_the_nine_single_mode_overrides`, which asserts the
 /// replacement behaviour at the `runner-config.json` filesystem boundary (the entire hop-1 -> hop-2
 /// contract), so this schema-vs-behaviour contract still cannot drift silently in either direction.
+/// Resolve a chain run's artifact directory, pi's
+/// `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
+/// (`subagent-executor.ts:2022` @v0.34.0).
+///
+/// An explicit caller value WINS and is used verbatim — pi does not rewrite it either (a step's
+/// relative `output` is what gets joined against it, at `chain-execution.ts:283`), so a relative
+/// `chainDir` stays relative here exactly as it does upstream.
+///
+/// [CYRUP-DELTA] the fallback is a PER-RUN subdirectory rather than pi's flat project chain-runs
+/// dir, so `{chain_dir}` is unique per run and `artifacts::cleanup_old_chain_dirs` can housekeep by
+/// age. Only the default differs; the override path is pi-identical.
+fn resolve_chain_dir(override_dir: Option<PathBuf>, cwd: &Path, run_id: &RunId) -> PathBuf {
+    override_dir.unwrap_or_else(|| crate::artifacts::chain_runs_dir(cwd).join(run_id.as_str()))
+}
+
 fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
     // `json!` object overflows the macro's default `recursion_limit` at expansion time. Each insert
@@ -6139,6 +6173,10 @@ impl SubagentTool {
                 // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
                 // threads it into `executeChain` (`:2012`), both @v0.34.0.
                 p.include_progress,
+                // ...but `chainDir` is NOT such a field: pi resolves it only in `runChainPath`
+                // (`subagent-executor.ts:2022`), never in `runParallelPath`, so a bare PARALLEL run
+                // keeps the default scratch dir even when the caller sent one.
+                None,
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
@@ -6286,6 +6324,10 @@ impl SubagentTool {
                 // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:2679`) and
                 // threads it into `executeChain` (`:2012`), both @v0.34.0.
                 p.include_progress,
+                // pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
+                // (`subagent-executor.ts:2022` @v0.34.0). THE one caller that forwards it: `:2022`
+                // sits in `runChainPath`, and this is cyrup's CHAIN arm.
+                p.chain_dir.clone().map(PathBuf::from),
             )
             .await
             .map_err(|e| ToolError::new(e.to_string()))?
@@ -6404,12 +6446,22 @@ impl Tool for SubagentTool {
         let parsed: SubagentToolParams = serde_json::from_value(params)
             .map_err(|e| ToolError::new(format!("invalid subagent tool call: {e}")))?;
 
-        // Observe the full parsed pi-union once so the SINGLE-mode override fields (`output`/
-        // `outputMode`/`skill`/`acceptance`) and execution knobs (`artifacts`/`includeProgress`/
-        // `share`/`sessionDir`/`clarify`/`control`/`timeoutMs`/`maxRuntimeMs`/`chainDir`) that no
-        // dispatch arm consumes yet (their wire-ups are Tiers 3/5) stay live under the workspace's
-        // `-D warnings` (`dead_code`) without any non-`#[cfg(test)]` `#[allow]` — the same
-        // liveness pattern the per-item `ToolTaskItem::provided_keys` calls above use.
+        // Observe the full parsed pi-union once, keeping every field live under the workspace's
+        // `-D warnings` (`dead_code`) without a non-`#[cfg(test)]` `#[allow]` — the same liveness
+        // pattern the per-item `ToolTaskItem::provided_keys` calls above use.
+        //
+        // The list this comment used to carry ("fields no dispatch arm consumes yet: output/
+        // outputMode/skill/acceptance/artifacts/includeProgress/share/sessionDir/clarify/control/
+        // timeoutMs/maxRuntimeMs/chainDir, wire-ups are Tiers 3/5") is GONE because it went stale
+        // — every one of those is wired now — and a stale inventory here is actively harmful: it
+        // reads as license for the next unwired param to sit unnoticed.
+        //
+        // Note the cost this call carries. Suppressing `dead_code` also suppresses the only
+        // AUTOMATIC signal that an advertised param reaches no dispatch arm, which is how
+        // `chainDir` stayed silently dropped. The replacement detector is deliberate, not free:
+        // `every_advertised_schema_property_is_read_outside_provided_keys` excises this very
+        // function and re-checks the whole advertised set. If you add a field here to quiet a
+        // warning, that test is what will stop you.
         let _ = parsed.provided_keys();
 
         // pi `resolveRequestedCwd(ctx.cwd, params.cwd)` (`subagent-executor.ts:2801`): resolved ONCE
@@ -7637,6 +7689,9 @@ impl SubagentsExtension {
                 None,
                 // ...and no `includeProgress` (SUBA-N06, same rule): the slash surface renders
                 // text, never a `details` payload a progress snapshot could ride on.
+                None,
+                // ...and no `chainDir` (same rule again): pi reads it off the TOOL params in
+                // `runChainPath`, and this surface has no such param to read.
                 None,
             )
             .await?
@@ -9621,6 +9676,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         {
@@ -10069,6 +10125,115 @@ mod tests {
         assert!(
             !desc.contains("disabled builtins"),
             "the description must NOT contain 'disabled builtins' (pi tool-description.test.ts pins its absence)"
+        );
+    }
+
+    /// pi `chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`
+    /// (`subagent-executor.ts:2022` @v0.34.0), which lives in `runChainPath`.
+    ///
+    /// Regression: `chainDir` was advertised with pi's description copied verbatim
+    /// (`schemas.ts:263`), deserialized into `SubagentToolParams::chain_dir`, counted by
+    /// `provided_keys()` — and then dropped, because `run_or_background_graph` had no parameter to
+    /// carry it and built its own path unconditionally. A caller setting `chainDir` got silence.
+    #[test]
+    fn an_explicit_chain_dir_wins_over_the_default_scratch_dir() {
+        let cwd = std::path::Path::new("/tmp/cyrup-chain-dir-parity");
+        let run = RunId::new();
+
+        let explicit = PathBuf::from("/somewhere/the/caller/picked");
+        assert_eq!(
+            resolve_chain_dir(Some(explicit.clone()), cwd, &run),
+            explicit,
+            "an explicit chainDir must be used EXACTLY as given — pi does not rewrite it either"
+        );
+
+        // A RELATIVE value also stays verbatim: upstream joins a step's relative `output` against
+        // this dir (`chain-execution.ts:283`); it never normalizes the dir itself.
+        let relative = PathBuf::from("artifacts/chain");
+        assert_eq!(resolve_chain_dir(Some(relative.clone()), cwd, &run), relative);
+
+        // ...and only the FALLBACK is cyrup's per-run subdir ([CYRUP-DELTA]).
+        let fallback = resolve_chain_dir(None, cwd, &run);
+        assert_eq!(
+            fallback,
+            crate::artifacts::chain_runs_dir(cwd).join(run.as_str())
+        );
+        assert_ne!(fallback, explicit);
+    }
+
+    /// THE GUARD. Every property this tool advertises must actually be read somewhere outside
+    /// `provided_keys()`.
+    ///
+    /// This defect class has now cost four separate fixes (SUBA-041, SUBA-N03, `control`/
+    /// `includeProgress`, `chainDir`): a param is advertised in the schema, deserialized, and then
+    /// silently eaten by a dispatch seam too narrow to carry it. Nothing failed, because
+    /// `provided_keys()` touches every field precisely so the compiler's `dead_code` lint — the one
+    /// automatic signal that would have flagged it — stays quiet. That is a real trade (the crate
+    /// runs under `-D warnings` with no non-test `#[allow]`), but it costs the only free detector,
+    /// so the detection has to be bought back explicitly. This is that purchase.
+    ///
+    /// It derives the advertised set from `subagent_tool_parameters()` itself rather than a
+    /// hand-copied list, because a hand-copied list is exactly what encoded a fabricated
+    /// "pi-pinned" substring in the sibling test above.
+    #[test]
+    fn every_advertised_schema_property_is_read_outside_provided_keys() {
+        const SRC: &str = include_str!("extension.rs");
+
+        // Excise `provided_keys()`'s body — its whole purpose is to touch every field, so leaving
+        // it in would make this assertion vacuously true.
+        let start = SRC.find("fn provided_keys").expect("provided_keys() must exist");
+        let end = start
+            + SRC[start..]
+                .find("\n    }")
+                .expect("provided_keys() must terminate");
+        let scanned = format!("{}{}", &SRC[..start], &SRC[end..]);
+
+        // A read is `.field` NOT followed by another identifier char, so `.id` does not match
+        // `.identity` and `.index` does not match `.indexed`.
+        fn reads_field(hay: &str, field: &str) -> bool {
+            let needle = format!(".{field}");
+            let mut from = 0;
+            while let Some(i) = hay[from..].find(&needle) {
+                let at = from + i;
+                let after = hay[at + needle.len()..].chars().next();
+                if !matches!(after, Some(c) if c.is_alphanumeric() || c == '_') {
+                    return true;
+                }
+                from = at + needle.len();
+            }
+            false
+        }
+
+        let schema = subagent_tool_parameters();
+        let props = schema["properties"]
+            .as_object()
+            .expect("the tool schema must expose an object of properties");
+
+        let mut unwired: Vec<&str> = Vec::new();
+        for name in props.keys() {
+            let mut field = String::new();
+            for ch in name.chars() {
+                if ch.is_ascii_uppercase() {
+                    field.push('_');
+                    field.push(ch.to_ascii_lowercase());
+                } else {
+                    field.push(ch);
+                }
+            }
+            if field == "async" {
+                field = "r#async".to_string();
+            }
+            if !reads_field(&scanned, &field) {
+                unwired.push(name.as_str());
+            }
+        }
+
+        assert!(
+            unwired.is_empty(),
+            "ADVERTISED but never read outside provided_keys(), so a caller that sets one is \
+             silently ignored: {unwired:?}\n\
+             Wire it into dispatch, or stop advertising it. Do NOT satisfy this test by adding a \
+             mention to provided_keys() — that is the exact move that hid `chainDir`."
         );
     }
 
