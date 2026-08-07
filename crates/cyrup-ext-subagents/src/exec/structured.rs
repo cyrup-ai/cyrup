@@ -267,11 +267,14 @@ pub const STRUCTURED_OUTPUT_MISSING_ERROR: &str =
 /// The child-facing instruction injected when a schema is declared: the run MUST finish by calling
 /// the `structured_output` tool. Kept here as the one canonical wording the spawn/task-text
 /// assembly (or a future child-side prompt runtime) injects, mirroring pi's boundary instruction.
-#[must_use]
-pub fn structured_output_instruction() -> &'static str {
+pub const STRUCTURED_OUTPUT_INSTRUCTION: &str =
     "This step has a declared output schema. You MUST finish by calling the `structured_output` \
      tool exactly once with a value conforming to the schema; prose alone is not accepted as the \
-     structured result for this step."
+     structured result for this step.";
+
+#[must_use]
+pub fn structured_output_instruction() -> &'static str {
+    STRUCTURED_OUTPUT_INSTRUCTION
 }
 
 /// The parent-side runtime for one structured-output capture (pi `StructuredOutputRuntime`).

@@ -38,6 +38,7 @@ pub mod fork_context;
 /// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
 /// event log. See [`jsonl`] for the full contract.
 pub mod jsonl;
+pub mod prompt_runtime;
 pub mod registration;
 pub mod spawn;
 pub mod tui;

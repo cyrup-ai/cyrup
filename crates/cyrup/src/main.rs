@@ -433,6 +433,15 @@ async fn run() -> anyhow::Result<i32> {
         if let Some(ext) = subagent_ext {
             factory_builder = factory_builder.with_native_extension(ext);
         }
+        // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+        // as its OWN extension): a plain subagent child attaches NO subagents extension —
+        // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+        // `structured_output` tool cannot come from that gate. This one is independent: it
+        // builds only when the parent passed both structured-output env vars, i.e. only for a
+        // step that actually declared an `outputSchema`. Every other process attaches nothing.
+        if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+            factory_builder = factory_builder.with_native_extension(runtime);
+        }
         if let Some(ic) = intercom_ext {
             factory_builder = factory_builder.with_native_extension(ic);
         }
@@ -537,6 +546,15 @@ async fn run() -> anyhow::Result<i32> {
             if let Some(ext) = subagent_ext {
                 factory_builder = factory_builder.with_native_extension(ext);
             }
+            // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+            // as its OWN extension): a plain subagent child attaches NO subagents extension —
+            // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+            // `structured_output` tool cannot come from that gate. This one is independent: it
+            // builds only when the parent passed both structured-output env vars, i.e. only for a
+            // step that actually declared an `outputSchema`. Every other process attaches nothing.
+            if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+                factory_builder = factory_builder.with_native_extension(runtime);
+            }
             if let Some(ic) = intercom_ext {
                 factory_builder = factory_builder.with_native_extension(ic);
             }
@@ -620,6 +638,15 @@ async fn run() -> anyhow::Result<i32> {
             };
             if let Some(ext) = subagent_ext {
                 factory_builder = factory_builder.with_native_extension(ext);
+            }
+            // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+            // as its OWN extension): a plain subagent child attaches NO subagents extension —
+            // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+            // `structured_output` tool cannot come from that gate. This one is independent: it
+            // builds only when the parent passed both structured-output env vars, i.e. only for a
+            // step that actually declared an `outputSchema`. Every other process attaches nothing.
+            if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+                factory_builder = factory_builder.with_native_extension(runtime);
             }
             if let Some(ic) = intercom_ext {
                 factory_builder = factory_builder.with_native_extension(ic);

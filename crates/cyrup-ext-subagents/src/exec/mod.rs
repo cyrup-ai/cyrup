@@ -1191,6 +1191,10 @@ pub fn build_attempt_spawn_plan(
     opts: &RunOptions,
     depth: DepthEnvelope,
     temp_dir: &std::path::Path,
+    // SUBA-S01 (pi `pi-args.ts:246-250`): the run's capture runtime, whose two paths become the
+    // child's structured-output env overlay. `None` = the step declared no `outputSchema`, and the
+    // child then registers no `structured_output` tool at all.
+    structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
 ) -> Result<AttemptSpawnPlan, SubagentError> {
     let command = crate::spawn::resolve_spawn_command();
 
@@ -1447,6 +1451,22 @@ pub fn build_attempt_spawn_plan(
         );
     }
 
+    // SUBA-S01 (pi `pi-args.ts:246-250`): hand the child BOTH paths. pi's child-side runtime gates
+    // on both being present (`subagent-prompt-runtime.ts:281`), and so does cyrup's
+    // [`crate::prompt_runtime::prompt_runtime_extension_for_env`] — so these are set together or
+    // not at all. Without them the child has no `structured_output` tool, which is precisely the
+    // state every declared-schema run was in before this wiring existed.
+    if let Some(runtime) = structured_runtime {
+        env_overlay.insert(
+            crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV.to_string(),
+            runtime.schema_path.display().to_string(),
+        );
+        env_overlay.insert(
+            crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV.to_string(),
+            runtime.output_path.display().to_string(),
+        );
+    }
+
     let cwd = opts.cwd.clone();
 
     Ok(AttemptSpawnPlan {
@@ -1526,6 +1546,12 @@ struct SpawnedChildAttemptRunner<'a> {
     /// is built once and reused rather than re-resolved per attempt. Empty when no skills apply.
     skill_injection: String,
     attempt_index: u32,
+    /// SUBA-S01: the run's structured-output capture runtime (pi `StructuredOutputRuntime`), or
+    /// `None` when the step declared no `outputSchema`. Created ONCE by [`run_sync`] and shared
+    /// across every fallback attempt so a retry cannot capture into a different file than the one
+    /// read back; its two paths become the child's
+    /// [`crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV`]/`..._CAPTURE_ENV` overlay.
+    structured_runtime: Option<crate::exec::structured::StructuredOutputRuntime>,
 }
 
 /// The richer per-attempt payload [`SpawnedChildAttemptRunner::run_attempt`] returns alongside its
@@ -1620,6 +1646,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             self.opts,
             child_depth,
             &self.scratch_dir,
+            self.structured_runtime.as_ref(),
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -2518,6 +2545,20 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         };
     }
 
+    // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
+    // `outputSchema`, create the capture runtime ONCE per run — not per attempt — and write the
+    // schema to a private file the child reads. Every fallback attempt shares it, exactly as pi
+    // shares one runtime across a step's execution, so a retry cannot silently capture into a
+    // different file than the one read back below.
+    //
+    // A creation failure degrades to `None` rather than failing the run: the child then never
+    // receives the env vars, never registers `structured_output`, and the read-back reports pi's
+    // own "missing" hard failure — which is the correct outcome for "the schema never reached the
+    // child", and strictly better than aborting a run that might still produce useful prose.
+    let structured_runtime = opts.structured_output_schema.as_ref().and_then(|schema| {
+        crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
+    });
+
     // Step 4: drive the fallback ladder.
     let mut runner = SpawnedChildAttemptRunner {
         agent,
@@ -2527,6 +2568,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         scratch_dir,
         skill_injection,
         attempt_index: 0,
+        structured_runtime: structured_runtime.clone(),
     };
     let outcome = run_fallback_ladder(&candidates, &mut runner).await;
 
@@ -2640,8 +2682,28 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     })
     .is_clean()
     {
-        match resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
-        {
+        // SUBA-S01: with a capture runtime, read the FILE the child's `structured_output` tool
+        // wrote (pi `readStructuredOutput`, `structured-output.ts:55-68`) rather than scanning the
+        // transcript. The event scan is a cyrup-original heuristic that accepts the newest fenced
+        // ```json block — i.e. prose — which is exactly what the "EVEN WHEN prose was produced"
+        // rule below says must NOT satisfy a declared schema. It stays as the fallback for the one
+        // degraded case where the runtime could not be created at all (see `run_sync`), because
+        // there is genuinely no capture file to consult then.
+        let structured_outcome = match structured_runtime.as_ref() {
+            Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
+                Ok(value) => StructuredOutcome::Valid(value),
+                Err(message)
+                    if message == crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR =>
+                {
+                    StructuredOutcome::Missing
+                }
+                Err(message) => StructuredOutcome::Invalid(message),
+            },
+            None => {
+                resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
+            }
+        };
+        match structured_outcome {
             StructuredOutcome::NotRequested => None,
             StructuredOutcome::Valid(value) => Some(value),
             StructuredOutcome::Missing => {
@@ -2866,6 +2928,14 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     } else {
         None
     };
+
+    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:70-77`): remove the
+    // runtime's private temp dir once the value has been read back. Best-effort and deliberately
+    // unconditional — the schema file is written 0600 because it can carry whatever the caller's
+    // schema describes, and leaving one behind per run would accumulate under the scratch dir.
+    if let Some(runtime) = structured_runtime.as_ref() {
+        crate::exec::structured::cleanup_structured_output_runtime(runtime);
+    }
 
     SingleResult {
         agent: agent.name.clone(),
@@ -3279,7 +3349,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
     }
@@ -3307,7 +3377,7 @@ mod tests {
         };
 
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path(), None)
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -3322,6 +3392,99 @@ mod tests {
         );
         // `replace` must never also append — the two flags are mutually exclusive per mode.
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
+    }
+
+    /// SUBA-S01 (pi `pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
+    /// structured-output env vars, pointing at the runtime's real schema and capture paths.
+    ///
+    /// Before this wiring, `create_structured_output_runtime`, `read_structured_output`,
+    /// `cleanup_structured_output_runtime`, `structured_output_instruction`, both env constants and
+    /// `StructuredOutputRuntime` were ALL ported and had zero callers outside their own file — so a
+    /// child never learned a schema had been declared, never registered `structured_output`, and
+    /// the run fell back to a fenced-```json-block scan that pi does not have.
+    #[test]
+    fn a_declared_output_schema_reaches_the_child_as_both_env_vars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "verdict": { "type": "string" } },
+            "required": ["verdict"],
+        });
+        let runtime =
+            crate::exec::structured::create_structured_output_runtime(&schema, dir.path())
+                .expect("runtime is created");
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            Some(&runtime),
+        )
+        .expect("plan builds");
+
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV)
+                .map(String::as_str),
+            Some(runtime.schema_path.display().to_string().as_str()),
+            "the child must be told where to READ the schema"
+        );
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV)
+                .map(String::as_str),
+            Some(runtime.output_path.display().to_string().as_str()),
+            "...and where to WRITE the captured value"
+        );
+
+        // The schema file must actually exist and round-trip: the child reads it to build the
+        // `structured_output` tool's parameters, so an unwritten file silently disables the tool.
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime.schema_path).expect("schema written"))
+                .expect("schema parses");
+        assert_eq!(written, schema);
+    }
+
+    /// The other half of the gate: no declared schema means NO structured-output env at all, so an
+    /// ordinary child registers no `structured_output` tool (pi gates on both vars being present,
+    /// `subagent-prompt-runtime.ts:281`).
+    #[test]
+    fn no_output_schema_means_no_structured_output_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV)
+                && !plan
+                    .spec
+                    .env_overlay
+                    .contains_key(crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV),
+            "a step with no outputSchema must carry no structured-output env"
+        );
     }
 
     #[test]
@@ -3340,7 +3503,7 @@ mod tests {
 
         let task_text = build_task_text("do the thing", &opts, &contract, "");
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path(), None)
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -3375,7 +3538,7 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
@@ -3395,7 +3558,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
@@ -3415,7 +3578,7 @@ mod tests {
         opts.run_id = Some(crate::background::RunId::from_token("run-XYZ"));
         opts.child_index = Some(2);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert_eq!(
@@ -3441,7 +3604,7 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]); // orchestrator_intercom_target / run_id both None
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET));
@@ -3458,7 +3621,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(!plan.spec.build_argv().contains(&"--tools".to_string()));
     }
@@ -3476,7 +3639,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--session").expect("--session present");
@@ -3497,7 +3660,7 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
@@ -3515,7 +3678,7 @@ mod tests {
         let session_dir = dir.path().join("sessions").join("run-0");
         opts.session_dir = Some(session_dir.clone());
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv
@@ -3539,7 +3702,7 @@ mod tests {
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.share = Some(true);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(!argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
@@ -3556,7 +3719,7 @@ mod tests {
         let mut opts = base_opts(dir.path(), &["m1"]);
         opts.share = Some(false);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-session".to_string()));
     }
@@ -3570,7 +3733,7 @@ mod tests {
             current_depth: 2,
             max_depth: 4,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::depth::DEPTH_ENV_VAR),
@@ -3604,7 +3767,7 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         assert_eq!(
@@ -3636,7 +3799,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
@@ -3670,7 +3833,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         assert_eq!(
@@ -3715,7 +3878,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
@@ -3804,6 +3967,7 @@ mod tests {
             &opts,
             depth,
             dir.path(),
+            None,
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
@@ -3857,7 +4021,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--model").expect("--model present");
@@ -3879,7 +4043,7 @@ mod tests {
         let mut inheriting = sample_agent_config("m1", &[]);
         inheriting.inherit_skills = true;
         let plan =
-            build_attempt_spawn_plan(&inheriting, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+            build_attempt_spawn_plan(&inheriting, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
                 .expect("plan builds");
         assert!(
             !plan.spec.build_argv().contains(&"--no-skills".to_string()),
@@ -3899,6 +4063,7 @@ mod tests {
             &opts,
             depth,
             dir.path(),
+            None,
         )
         .expect("plan builds");
         assert!(
@@ -3921,7 +4086,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get("CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT"),
@@ -3948,7 +4113,7 @@ mod tests {
         agent.name = String::new();
         let opts = base_opts(dir.path(), &["m1"]);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         // An empty persona name writes NO var (child resolves `None` — pi's top-level `""`).
         assert_eq!(plan.spec.env_overlay.get(AGENT_NAME_ENV_VAR), None);
@@ -3970,7 +4135,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -4007,7 +4172,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
@@ -4051,7 +4216,7 @@ mod tests {
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
                 .expect("plan builds");
 
         assert_eq!(
@@ -4082,7 +4247,7 @@ mod tests {
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
                 .expect("plan builds");
 
         assert_eq!(

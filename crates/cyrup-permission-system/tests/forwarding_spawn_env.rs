@@ -215,6 +215,10 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         &opts,
         DepthEnvelope { current_depth: 1, max_depth: 5 },
         cwd,
+        // SUBA-S01: no `outputSchema` declared here — this test asserts the PERMISSION
+        // forwarding env, and a structured-output runtime would add two unrelated vars to the
+        // overlay it inspects.
+        None,
     )
     .expect("the production spawn planner must build a plan");
     plan.spec.env_overlay
