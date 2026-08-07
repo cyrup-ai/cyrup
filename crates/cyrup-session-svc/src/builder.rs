@@ -640,6 +640,19 @@ impl SessionBuilder {
                     command_prefix: shell_command_prefix_setting.clone(),
                     shell_path: shell_path_setting.clone(),
                     session_env: Some(bash_session_env.clone()),
+                    // pi `getShellEnv()` (`utils/shell.ts:122-134`) unconditionally prepends
+                    // `getBinDir()` to PATH for EVERY bash child (`tools/bash.ts:100,165`); there is
+                    // no pi path where the bash tool spawns without it.
+                    //
+                    // cyrup set this only on the user-facing `/bash` seam
+                    // (`session.rs:4225`, the same `<agent_dir>/bin`), leaving the agent-loop `bash`
+                    // tool — the one the MODEL calls — with `bin_dir: None`, which makes
+                    // `ops::shell::shell_env` return an empty overlay and inherit the parent PATH
+                    // unchanged. So a binary cyrup manages into `<agent_dir>/bin` produced
+                    // `command not found` for the model while the identical command succeeded
+                    // through `/bash`: two bash paths in one process disagreeing about PATH, which
+                    // reads as nondeterminism from the outside.
+                    bin_dir: Some(cfg.agent_dir.join("bin")),
                     ..BashOpts::default()
                 },
                 ..ToolsOptions::default()

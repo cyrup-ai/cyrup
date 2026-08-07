@@ -829,13 +829,27 @@ fn map_tool_choice(tc: &ToolChoice) -> &'static str {
     }
 }
 
-/// Map a raw Gemini `finishReason` string to a cyrup [`StopReason`] (Pi `mapStopReason`,
+/// Map a raw Gemini `finishReason` to `(stop_reason, error_message)` (Pi `mapStopReason`,
 /// google-shared.ts:309-336 — only `STOP`/`MAX_TOKENS` are non-error).
-fn map_stop_reason(reason: &str) -> StopReason {
+///
+/// The message half is the point. Gemini's characteristic failures are all finish reasons rather
+/// than HTTP errors — `SAFETY`, `RECITATION`, `PROHIBITED_CONTENT`, `BLOCKLIST`,
+/// `MALFORMED_FUNCTION_CALL` — and this used to discard the raw string, so every one of them
+/// surfaced as the identical, information-free "An unknown error occurred". A content-policy
+/// refusal and a tool-schema bug demand completely different responses from the user, and the
+/// message carried nothing to tell them apart.
+///
+/// pi keeps the raw value on `output.rawStopReason` (`google-generative-ai.ts:214-216`) and builds
+/// the terminal error as ``output.rawStopReason ? `Provider stopped with: ${output.rawStopReason}`
+/// : "An unknown error occurred"`` (`:269-273`), so the reason names itself.
+fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
     match reason {
-        "STOP" => StopReason::Stop,
-        "MAX_TOKENS" => StopReason::Length,
-        _ => StopReason::Error,
+        "STOP" => (StopReason::Stop, None),
+        "MAX_TOKENS" => (StopReason::Length, None),
+        other => (
+            StopReason::Error,
+            Some(format!("Provider stopped with: {other}")),
+        ),
     }
 }
 
@@ -1020,9 +1034,16 @@ async fn process_chunk(
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str)
     {
-        dec.stop_reason = Some(map_stop_reason(reason));
+        let (stop, err) = map_stop_reason(reason);
+        dec.stop_reason = Some(stop);
+        if let Some(err) = err {
+            dec.error_message = Some(err);
+        }
         if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_))) {
+            // A tool call present alongside a non-STOP reason is still a tool-use turn; clear the
+            // diagnostic with it so a successful turn never carries a stale error message.
             dec.stop_reason = Some(StopReason::ToolUse);
+            dec.error_message = None;
         }
     }
 
@@ -1311,6 +1332,33 @@ fn now_millis() -> i64 {
 )]
 mod tests {
     use super::*;
+
+    /// pi `google-generative-ai.ts:214-216` + `:269-273`: the raw finishReason names itself in the
+    /// terminal error. Gemini's real failure modes are all finish reasons, and before this they all
+    /// collapsed to the identical "An unknown error occurred".
+    #[test]
+    fn a_non_stop_finish_reason_names_itself_in_the_error() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "MALFORMED_FUNCTION_CALL",
+        ] {
+            let (stop, err) = map_stop_reason(reason);
+            assert_eq!(stop, StopReason::Error, "{reason}");
+            assert_eq!(
+                err.as_deref(),
+                Some(format!("Provider stopped with: {reason}").as_str()),
+                "{reason} must be distinguishable from every other block reason"
+            );
+        }
+
+        // The two non-error arms stay clean and carry no diagnostic.
+        assert_eq!(map_stop_reason("STOP"), (StopReason::Stop, None));
+        assert_eq!(map_stop_reason("MAX_TOKENS"), (StopReason::Length, None));
+    }
+
     use crate::api::channel;
     use crate::model::ModelCost;
     use crate::stream::sse::decode_sse_bytes;
