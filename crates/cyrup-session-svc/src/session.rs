@@ -1437,13 +1437,30 @@ impl AgentSession {
             )
             .await;
         // Estimate the rebuilt context size for the result payload (Pi `estimateMessagesTokens`).
-        let estimated_tokens_after: u64 = guard
-            .build_context()
+        let compacted_ctx = guard.build_context();
+        let estimated_tokens_after: u64 = compacted_ctx
             .messages
             .iter()
             .map(cyrup_provider::estimate_message_tokens)
             .sum();
         drop(guard);
+        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
+        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
+        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
+        //
+        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
+        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
+        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
+        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
+        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
+        // reducing context or switching to a larger-context model", blaming the model for a
+        // compaction that had never taken effect.
+        //
+        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
+        // the two compaction paths were the ones that built the context only to COUNT it.
+        let compacted_messages: Vec<AgentMessage> =
+            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
@@ -4057,13 +4074,30 @@ impl AgentSession {
         // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload. Hoisted
         // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released
         // on ONE path, before the retry queue is flushed.
-        let estimated_tokens_after: u64 = guard
-            .build_context()
+        let compacted_ctx = guard.build_context();
+        let estimated_tokens_after: u64 = compacted_ctx
             .messages
             .iter()
             .map(cyrup_provider::estimate_message_tokens)
             .sum();
         drop(guard);
+        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
+        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
+        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
+        //
+        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
+        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
+        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
+        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
+        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
+        // reducing context or switching to a larger-context model", blaming the model for a
+        // compaction that had never taken effect.
+        //
+        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
+        // the two compaction paths were the ones that built the context only to COUNT it.
+        let compacted_messages: Vec<AgentMessage> =
+            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);

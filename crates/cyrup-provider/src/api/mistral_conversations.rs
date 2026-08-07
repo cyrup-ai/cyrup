@@ -868,7 +868,11 @@ async fn process_chunk(
         .and_then(Value::as_str)
         .filter(|r| !r.is_empty())
     {
-        dec.stop_reason = Some(map_chat_stop_reason(Some(reason)));
+        let (stop, err) = map_chat_stop_reason(Some(reason));
+        dec.stop_reason = Some(stop);
+        if let Some(err) = err {
+            dec.error_message = Some(err);
+        }
     }
 
     let delta = match choice.get("delta") {
@@ -1221,19 +1225,30 @@ fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
 /// `if (choice.finishReason)` (`:355`) and cyrup matches that — a null/empty `finishReason` leaves
 /// the turn unsettled rather than mapping it to `Stop`.
 ///
-/// **Known divergence (separate defect, not PROV-010):** Pi's `default` arm returns
-/// `{ stopReason: "error", errorMessage: "Provider stopped with: {reason}" }` and its `"error"` arm
-/// returns `{ stopReason: "error", errorMessage: "Provider stopped with: error" }` (`:673-675`).
-/// cyrup maps an UNKNOWN reason to `Stop` and carries no `errorMessage`, so an unrecognized Mistral
-/// finish reason is silently transcribed as a clean turn. Fixing that needs its own change (the
-/// return type has to carry the message) and its own test.
-fn map_chat_stop_reason(reason: Option<&str>) -> StopReason {
+/// Returns `(stop_reason, error_message)`, mirroring pi's `{ stopReason, errorMessage? }` tuple —
+/// the same shape [`crate::api::anthropic_messages`]'s `map_stop_reason` already uses.
+///
+/// The unknown arm is the point. This previously returned a bare [`StopReason`] whose catch-all was
+/// `Some(_) => StopReason::Stop`, so ANY finish reason outside the five known values — `content_filter`,
+/// or anything Mistral adds later — was transcribed as a clean, successful turn: the agent loop saw
+/// `Stop`, emitted `turn_end` with no tool calls, and ended the run with no error banner and no
+/// retry, carrying only whatever partial text arrived before the cutoff. pi's `default` arm returns
+/// `{ stopReason: "error", errorMessage: `Provider stopped with: ${reason}` }` (`:674-675`), and its
+/// `"error"` arm likewise carries `"Provider stopped with: error"` (`:672-673`) rather than letting
+/// the call site fall back to the generic `"An unknown error occurred"`.
+fn map_chat_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
     match reason {
-        None | Some("stop") => StopReason::Stop,
-        Some("length") | Some("model_length") => StopReason::Length,
-        Some("tool_calls") => StopReason::ToolUse,
-        Some("error") => StopReason::Error,
-        Some(_) => StopReason::Stop,
+        None | Some("stop") => (StopReason::Stop, None),
+        Some("length") | Some("model_length") => (StopReason::Length, None),
+        Some("tool_calls") => (StopReason::ToolUse, None),
+        Some("error") => (
+            StopReason::Error,
+            Some("Provider stopped with: error".to_string()),
+        ),
+        Some(other) => (
+            StopReason::Error,
+            Some(format!("Provider stopped with: {other}")),
+        ),
     }
 }
 
@@ -1263,6 +1278,43 @@ fn now_millis() -> i64 {
 )]
 mod tests {
     use super::*;
+
+    /// pi `mapChatStopReason` (`mistral-conversations.ts:662-677`). The unknown arm is the whole
+    /// point: before this, `Some(_) => StopReason::Stop` meant a provider-terminated turn was
+    /// transcribed as a clean success — no error banner, no retry, just the partial text that
+    /// arrived before the cutoff.
+    #[test]
+    fn an_unrecognized_finish_reason_is_an_error_not_a_clean_stop() {
+        // The reason that motivated this: a real Mistral value outside the known five.
+        let (stop, err) = map_chat_stop_reason(Some("content_filter"));
+        assert_eq!(stop, StopReason::Error, "must NOT be transcribed as Stop");
+        assert_eq!(err.as_deref(), Some("Provider stopped with: content_filter"));
+
+        // Anything Mistral adds later behaves the same way, by construction.
+        let (stop, err) = map_chat_stop_reason(Some("some_future_reason"));
+        assert_eq!(stop, StopReason::Error);
+        assert_eq!(err.as_deref(), Some("Provider stopped with: some_future_reason"));
+
+        // pi's explicit `"error"` arm carries its own message rather than letting the call site
+        // fall back to the generic "An unknown error occurred".
+        let (stop, err) = map_chat_stop_reason(Some("error"));
+        assert_eq!(stop, StopReason::Error);
+        assert_eq!(err.as_deref(), Some("Provider stopped with: error"));
+
+        // The known-good arms stay clean and carry no message.
+        for (reason, expected) in [
+            (None, StopReason::Stop),
+            (Some("stop"), StopReason::Stop),
+            (Some("length"), StopReason::Length),
+            (Some("model_length"), StopReason::Length),
+            (Some("tool_calls"), StopReason::ToolUse),
+        ] {
+            let (stop, err) = map_chat_stop_reason(reason);
+            assert_eq!(stop, expected, "{reason:?}");
+            assert_eq!(err, None, "{reason:?} must carry no errorMessage");
+        }
+    }
+
     use crate::api::channel;
     use crate::model::ModelCost;
     use crate::stream::sse::decode_sse_bytes;
