@@ -255,16 +255,39 @@ impl IntercomTool {
                     .unwrap_or_else(|e| e.into_inner())
                     .list_pending(now);
                 if pending.is_empty() {
-                    return Ok(text_result("No pending intercom asks."));
+                    return Ok(text_result("No unresolved inbound asks."));
                 }
+                // pi `index.ts:1747-1751`:
+                // `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago · ${preview}`
+                //
+                // The MESSAGE ID is the load-bearing column. `reply_tracker.rs:126` refuses a
+                // sender-targeted reply with `Multiple pending asks from "{x}" — use the message id`
+                // (upstream's own wording), and the tool documents `replyTo` as the escape. This row
+                // used to print the sender's SESSION short-id instead, which is not a valid
+                // `replyTo`, so once two asks shared a sender the model was told to use an id that
+                // nothing in its output ever showed — an unbreakable loop of failing replies.
+                //
+                // `preview` collapses whitespace and truncates to 80 chars; the body was previously
+                // emitted whole, so one long inbound ask could flood the tool result.
                 let rows: Vec<String> = pending
                     .iter()
                     .map(|c| {
                         let who = c.from.name.clone().unwrap_or_else(|| c.from.id.clone());
-                        format!("• {} ({}): {}", who, short_session_id(&c.from.id), c.message.content.text)
+                        let preview: String = c
+                            .message
+                            .content
+                            .text
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(80)
+                            .collect();
+                        let elapsed = now.saturating_sub(c.received_at) / 1000;
+                        format!("- {} · {} · {}s ago · {}", who, c.message.id, elapsed, preview)
                     })
                     .collect();
-                Ok(text_result(rows.join("\n")))
+                Ok(text_result(format!("**Pending asks:**\n{}", rows.join("\n"))))
             }
             "status" => {
                 let connected = client.is_connected();
@@ -399,6 +422,58 @@ mod tests {
     use crate::transport::spawn::wait_for_broker;
 
     use super::*;
+
+    /// pi `index.ts:1747-1751`. The MESSAGE ID is the load-bearing column, not decoration:
+    /// `reply_tracker.rs:126` refuses a sender-targeted reply with upstream's own wording
+    /// `Multiple pending asks from "{x}" — use the message id`, and the tool documents `replyTo` as
+    /// the escape hatch. This row previously printed the sender's SESSION short-id, which is not a
+    /// valid `replyTo` — so once two asks shared a sender the model was told to use an id that
+    /// nothing in its own output had ever shown it, and every reply attempt failed.
+    #[test]
+    fn pending_rows_carry_the_message_id_so_reply_to_is_reachable() {
+        let mut tracker = crate::reply_tracker::ReplyTracker::new(600_000);
+        let now = now_ms();
+        // Two asks from the SAME sender: the exact case that forces `replyTo`.
+        tracker.record_incoming_message(session("s1", "/tmp/a"), ask_message("m-first"), now);
+        tracker.record_incoming_message(session("s1", "/tmp/a"), ask_message("m-second"), now);
+
+        let pending = tracker.list_pending(now);
+        assert_eq!(pending.len(), 2, "both asks are pending");
+
+        let rows: Vec<String> = pending
+            .iter()
+            .map(|c| {
+                let who = c.from.name.clone().unwrap_or_else(|| c.from.id.clone());
+                format!("- {} · {} · 0s ago · {}", who, c.message.id, c.message.content.text)
+            })
+            .collect();
+        let rendered = format!("**Pending asks:**\n{}", rows.join("\n"));
+
+        assert!(rendered.starts_with("**Pending asks:**"), "pi's header");
+        for id in ["m-first", "m-second"] {
+            assert!(
+                rendered.contains(id),
+                "every row must name its message id so `replyTo: {id}` is reachable:\n{rendered}"
+            );
+        }
+    }
+
+    /// pi collapses whitespace and slices the preview to 80 chars (`index.ts:1748`); the body used
+    /// to be emitted whole, so one long inbound ask could flood the tool result.
+    #[test]
+    fn a_long_pending_body_is_whitespace_collapsed_and_truncated_to_80_chars() {
+        let raw = format!("word\n\tspaced   out {}", "x".repeat(200));
+        let preview: String = raw
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(80)
+            .collect();
+        assert_eq!(preview.chars().count(), 80, "sliced to 80 chars");
+        assert!(preview.starts_with("word spaced out "), "whitespace collapsed: {preview:?}");
+        assert!(!preview.contains('\n') && !preview.contains('\t'));
+    }
 
     fn registration(name: &str) -> SessionRegistration {
         SessionRegistration {

@@ -175,17 +175,32 @@ async fn builtin_prompt_snippets_and_guidelines_reach_the_system_prompt() {
     let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
     let p = session.system_prompt().to_string();
 
-    // (a) "Available tools" carries Pi's verbatim snippets, not the old paraphrases.
+    // (a) "Available tools" carries Pi's verbatim snippets, not the old paraphrases — for the
+    // DEFAULT-ACTIVE tools only. pi's own builder hardcodes the same four as its fallback:
+    // `const tools = selectedTools || ["read", "bash", "edit", "write"]` (`system-prompt.ts:80`),
+    // and lists a tool only if it is in that set.
     for want in [
         "- read: Read file contents",
         "- write: Create or overwrite files",
         "- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         "- bash: Execute bash commands (ls, grep, find, etc.)",
+    ] {
+        assert!(p.contains(want), "missing snippet {want:?} in system prompt:\n{p}");
+    }
+    // ...and NOT for the three built-ins pi does not activate by default. This assertion is the
+    // parity property: it previously required all seven, which is what encoded the divergence —
+    // cyrup advertised `grep`/`find`/`ls` in every request's tool array AND system prompt, so the
+    // model routed searches to them instead of `bash`, producing different transcripts than pi for
+    // identical inputs. They remain enable-able via `set_active_tools_by_name`.
+    for absent in [
         "- grep: Search file contents for patterns (respects .gitignore)",
         "- find: Find files by glob pattern (respects .gitignore)",
         "- ls: List directory contents",
     ] {
-        assert!(p.contains(want), "missing snippet {want:?} in system prompt:\n{p}");
+        assert!(
+            !p.contains(absent),
+            "{absent:?} must NOT be in the default system prompt (pi system-prompt.ts:80):\n{p}"
+        );
     }
     for gone in [
         "Read a file from the workspace",
