@@ -53,8 +53,8 @@ pub use session_resolve::{
 };
 pub use signals::spawn_abort_on_signal;
 pub use startup::{
-    are_experimental_features_enabled, file_settings_store, is_official_distribution,
-    should_run_first_time_setup,
+    apply_settings_session_dir, are_experimental_features_enabled, file_settings_store,
+    is_official_distribution, should_run_first_time_setup,
 };
 pub use startup_ui::{
     MissingCwdChoice, ResumeChoice, TrustChoice, has_trust_requiring_project_resources,

@@ -1364,6 +1364,14 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
                 .unwrap_or_default()
                 .to_string(),
             concurrency: chain_concurrency(step, default_concurrency),
+            // `failFast` is a legal dynamic-step key at the ported baseline
+            // (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
+            // `DYNAMIC_STEP_KEYS`) and upstream forwards it verbatim when it lowers the dynamic
+            // step to a `ParallelStep` (`chain-execution.ts:897-901`: `failFast: step.failFast`),
+            // where `runParallelChainTasks` applies pi's `?? false` default
+            // (`chain-execution.ts:231`). Reading it here — exactly as the static-`parallel` arm
+            // above does — is what keeps the validator's acceptance of the key honest.
+            fail_fast: step.fail_fast.unwrap_or(false),
             // C16: carry pi's `expand.{item,key,maxItems,onEmpty}` and `collect.outputSchema`
             // through to the runtime `DynamicGroupSpec` so the walker can substitute each item's
             // task, cap/dedup the fan-out, and validate the collect record shape.
@@ -1968,6 +1976,43 @@ mod tests {
                 assert_eq!(group.template.agent, "reviewer");
             }
             other => panic!("expected DynamicGroup, got {other:?}"),
+        }
+    }
+
+    /// A dynamic-fanout step's `failFast` must survive lowering. `DYNAMIC_STEP_KEYS` accepts the
+    /// key (mirroring `dynamic-fanout.ts:44` @v0.34.0) and `ChainStepConfig::fail_fast` parses it,
+    /// but this bridge previously read it ONLY on the static-`parallel` arm and dropped it on the
+    /// dynamic arm — so an author's `failFast: true` was validated as legal and then silently
+    /// ignored. Upstream forwards it verbatim when it lowers the dynamic step to a `ParallelStep`
+    /// (`chain-execution.ts:897-901` @v0.34.0: `failFast: step.failFast`), and applies pi's `??
+    /// false` default only at dispatch (`chain-execution.ts:231`).
+    #[test]
+    fn chain_step_to_runner_step_carries_fail_fast_onto_a_dynamic_group() {
+        let dynamic = |fail_fast: Option<bool>| ChainStepConfig {
+            expand: Some(serde_json::json!({ "from": { "output": "targets", "path": "/items" } })),
+            parallel: Some(serde_json::json!({ "agent": "reviewer", "task": "review" })),
+            collect: Some(serde_json::json!({ "as": "reviews" })),
+            fail_fast,
+            ..ChainStepConfig::default()
+        };
+
+        match chain_step_to_runner_step(&dynamic(Some(true)), 8) {
+            RunnerStep::DynamicGroup(group) => assert!(
+                group.fail_fast,
+                "`failFast: true` on a dynamic step must reach DynamicGroupSpec::fail_fast"
+            ),
+            other => panic!("expected DynamicGroup, got {other:?}"),
+        }
+
+        // Absent and explicit-`false` both lower to pi's `?? false`.
+        for omitted in [None, Some(false)] {
+            match chain_step_to_runner_step(&dynamic(omitted), 8) {
+                RunnerStep::DynamicGroup(group) => assert!(
+                    !group.fail_fast,
+                    "a dynamic step without `failFast: true` must default to false ({omitted:?})"
+                ),
+                other => panic!("expected DynamicGroup, got {other:?}"),
+            }
         }
     }
 

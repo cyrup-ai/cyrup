@@ -56,7 +56,7 @@ use serde_json::Value;
 use crate::discovery::types::{AgentReadScope, OutputMode};
 use crate::error::SubagentError;
 use crate::fork_context::ContextMode;
-use crate::spawn::parallel::{FanOutResult, GlobalConcurrencyLimit, run_bounded};
+use crate::spawn::parallel::{FanOutResult, GlobalConcurrencyLimit, SkipReason, run_bounded};
 
 // -------------------------------------------------------------------------------------------
 // RunnerStep: the three-shape discriminated union (func-SA §4.2)
@@ -236,6 +236,22 @@ pub struct DynamicGroupSpec {
     /// Local worker-pool concurrency ceiling for the expanded group, identical in meaning to
     /// [`ParallelGroupSpec::concurrency`].
     pub concurrency: u32,
+    /// Cooperative fail-fast for the expanded group, identical in meaning to
+    /// [`ParallelGroupSpec::fail_fast`] — a dynamic fan-out is NOT exempt from R-SA-066.
+    ///
+    /// Upstream lowers a dynamic step to a plain parallel step and forwards the flag verbatim
+    /// (`chain-execution.ts:897-901`: `const dynamicParallelStep: ParallelStep = { parallel:
+    /// materialized.parallel, concurrency: step.concurrency, failFast: step.failFast }`), and the
+    /// shared `runParallelChainTasks` then honours it identically for both shapes
+    /// (`chain-execution.ts:231`, `:391`). `failFast` is a legal dynamic-step key at the ported
+    /// baseline (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`), so accepting it in the validator
+    /// (`discovery/chains.rs` `DYNAMIC_STEP_KEYS`) without honouring it here would silently drop
+    /// an author's declared intent.
+    ///
+    /// `#[serde(default)]`: a dynamic step that omits `failFast` is pi's `?? false`
+    /// (`chain-execution.ts:231`), and older serialized graphs predate the field entirely.
+    #[serde(default)]
+    pub fail_fast: bool,
     /// The template variable name each `{item}`/`{item.path}` reference binds to (pi
     /// `expand.item`); `None` means the pi default `"item"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1046,6 +1062,17 @@ impl StepResult {
     }
 }
 
+/// The exit code pi stamps on a fan-out item that a `failFast` trip prevented from ever being
+/// dispatched (`chain-execution.ts:242`: `exitCode: -1`). Deliberately outside the `0`/`1` range
+/// [`collapse_fan_out`] maps real child outcomes to, so a consumer of the dynamic collect array
+/// can tell "never ran" apart from "ran and failed".
+const FAIL_FAST_SKIPPED_EXIT_CODE: i64 = -1;
+
+/// The verbatim `error` text pi attaches to that same synthetic skipped result
+/// (`chain-execution.ts:245`: `error: "Skipped due to fail-fast"`). Kept byte-identical because it
+/// surfaces to chain authors through `{outputs.<collect.as>}`.
+const FAIL_FAST_SKIPPED_ERROR: &str = "Skipped due to fail-fast";
+
 /// One [`RunnerStep::ParallelGroup`]/[`RunnerStep::DynamicGroup`]'s fully collapsed outcome,
 /// combining the aggregate [`StepResult`] the chain's own [`OutputRegistry`] cares about with the
 /// full, position-ordered per-child detail [`crate::spawn::parallel::run_bounded`] returned
@@ -1060,6 +1087,16 @@ pub struct GroupStepResult {
     /// (R-SA-051) — `None` for a task [`crate::spawn::parallel::run_bounded`] never dispatched
     /// (fail-fast skip or cancellation).
     pub children: Vec<Option<StepResult>>,
+    /// Positionally aligned with [`Self::children`]: `true` for a `None` child that was never
+    /// dispatched specifically because a prior sibling failed under `fail_fast` (R-SA-066), as
+    /// opposed to one skipped by cancellation.
+    ///
+    /// Carried because pi distinguishes the two: its fail-fast skips materialize as a synthetic
+    /// `SingleResult` with `exitCode: -1` / `error: "Skipped due to fail-fast"`
+    /// (`chain-execution.ts:238-246`) that flows on into the dynamic collect array
+    /// (`collectDynamicResults`, `chain-execution.ts:976`), while a cancellation skip has no
+    /// upstream analog at all.
+    pub fail_fast_skipped: Vec<bool>,
 }
 
 /// Everything [`walk_chain`] needs to dispatch one [`SingleStepSpec`] inline, threaded straight
@@ -1360,6 +1397,7 @@ pub async fn walk_chain(
                             Some(collected_value.clone()),
                         ),
                         children: Vec::new(),
+                        fail_fast_skipped: Vec::new(),
                     });
                     StepResult::success(
                         Some("Dynamic fanout produced 0 results.".to_string()),
@@ -1390,8 +1428,16 @@ pub async fn walk_chain(
                     }
                     let agents: Vec<String> = expanded.iter().map(|s| s.agent.clone()).collect();
 
+                    // A dynamic fan-out honours `failFast` exactly as a static one does: pi lowers
+                    // the dynamic step to a plain `ParallelStep` carrying `failFast: step.failFast`
+                    // (`chain-execution.ts:897-901`) and dispatches it through the very same
+                    // `runParallelChainTasks` (`:231` `?? false`, `:391` trip-on-nonzero-exit) that
+                    // a static parallel step uses. Passing a hardcoded `false` here would leave the
+                    // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
+                    // spawn — and pay for — every remaining item after the first failure.
                     let group_result =
-                        dispatch_group(expanded, spec.concurrency, false, single, ctx).await;
+                        dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx)
+                            .await;
 
                     // Fold the per-child results into the ordered collect-record array (pi
                     // `collectDynamicResults`). The narrow [`StepResult`] seam supplies
@@ -1399,25 +1445,51 @@ pub async fn walk_chain(
                     // failure (`1`); `timedOut`/`outputPath`/`artifactPaths` are not visible at
                     // this walker layer (the fuller `exec::SingleResult` this crate does not carry
                     // here) and are therefore omitted, not fabricated.
+                    //
+                    // A child that fail-fast SKIPPED is not a hole in the array: pi returns a
+                    // synthetic `SingleResult` for it (`chain-execution.ts:238-246` — `task:
+                    // "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`, empty
+                    // messages) and that record flows on into `collectDynamicResults` (`:976`), so
+                    // the registered `{outputs.<collect.as>}` array carries an explicit `-1`
+                    // marker per un-run item rather than a `null` exit code. A CANCELLED skip has
+                    // no upstream analog and is deliberately left as `None` (exit code `null`).
                     let child_inputs: Vec<
                         Option<crate::spawn::dynamic_fanout::CollectChildResult>,
                     > = group_result
                         .children
                         .iter()
-                        .map(|child| {
-                            child.as_ref().map(|sr| {
-                                crate::spawn::dynamic_fanout::CollectChildResult {
+                        .enumerate()
+                        .map(|(index, child)| match child.as_ref() {
+                            Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
+                                agent: Some(spec.template.agent.clone()),
+                                exit_code: Some(i64::from(!sr.success)),
+                                error: sr.error.clone(),
+                                timed_out: false,
+                                structured_output: sr.structured_output.clone(),
+                                artifact_paths: None,
+                                saved_output_path: None,
+                                output: None,
+                                final_output: sr.final_output.clone(),
+                            }),
+                            None if group_result
+                                .fail_fast_skipped
+                                .get(index)
+                                .copied()
+                                .unwrap_or(false) =>
+                            {
+                                Some(crate::spawn::dynamic_fanout::CollectChildResult {
                                     agent: Some(spec.template.agent.clone()),
-                                    exit_code: Some(i64::from(!sr.success)),
-                                    error: sr.error.clone(),
+                                    exit_code: Some(FAIL_FAST_SKIPPED_EXIT_CODE),
+                                    error: Some(FAIL_FAST_SKIPPED_ERROR.to_string()),
                                     timed_out: false,
-                                    structured_output: sr.structured_output.clone(),
+                                    structured_output: None,
                                     artifact_paths: None,
                                     saved_output_path: None,
                                     output: None,
-                                    final_output: sr.final_output.clone(),
-                                }
-                            })
+                                    final_output: None,
+                                })
+                            }
+                            None => None,
                         })
                         .collect();
                     let collected = crate::spawn::dynamic_fanout::collect_dynamic_results(
@@ -1579,6 +1651,13 @@ async fn dispatch_group(
 /// guarantee, restated at the aggregate level), and the full per-child list (including `None` for
 /// skipped slots) is retained verbatim in `children`.
 fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupStepResult {
+    // Captured BEFORE `slots` is consumed below; positionally aligned with it by construction
+    // (`run_bounded::finalize` pushes to both vectors in lockstep).
+    let fail_fast_skipped: Vec<bool> = fan_out
+        .skip_reasons
+        .iter()
+        .map(|reason| matches!(reason, Some(SkipReason::FailFastSkipped)))
+        .collect();
     let children: Vec<Option<StepResult>> = fan_out
         .slots
         .into_iter()
@@ -1637,6 +1716,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             control_events: aggregate_control_events,
         },
         children,
+        fail_fast_skipped,
     }
 }
 
@@ -1718,6 +1798,7 @@ mod tests {
             max_items: Some(8),
             on_empty: OnEmpty::Skip,
             collect_schema: None,
+            fail_fast: false,
         }
     }
 
@@ -2506,6 +2587,7 @@ mod tests {
             max_items,
             on_empty,
             collect_schema: None,
+            fail_fast: false,
         }
     }
 
@@ -2889,6 +2971,131 @@ mod tests {
         assert_eq!(records[1]["key"], serde_json::json!("1"));
     }
 
+    // ---- DynamicGroup: fail-fast reaches dispatch (R-SA-066) ----
+
+    /// A [`SingleStepExecutor`] that returns a hard `Err` for the first task whose resolved text
+    /// contains `fail_on`, and `Ok` for every other — the shape `run_bounded` trips `fail_fast` on
+    /// (`spawn/parallel.rs`: `let failed = outcome.is_err()`). Call order is recorded so a test can
+    /// assert which items were never dispatched at all.
+    #[derive(Default)]
+    struct ErrOnceExecutor {
+        calls: StdMutex<Vec<String>>,
+        fail_on: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SingleStepExecutor for ErrOnceExecutor {
+        async fn run_single(
+            &self,
+            _step: &SingleStepSpec,
+            resolved_task: &str,
+            _ctx: &ChainRunContext,
+        ) -> Result<StepResult, SubagentError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(resolved_task.to_string());
+            if resolved_task.contains(&self.fail_on) {
+                return Err(SubagentError::StructuredOutputInvalid(
+                    "forced child failure".to_string(),
+                ));
+            }
+            Ok(StepResult::success(Some("ok".to_string()), None))
+        }
+    }
+
+    /// Regression: a dynamic fan-out's `failFast` reached the validator but never dispatch.
+    /// `walk_chain`'s `DynamicGroup` arm passed a hardcoded `false` as `dispatch_group`'s
+    /// `fail_fast` argument (and `DynamicGroupSpec` had no field to pass), so every remaining item
+    /// was spawned — and paid for — after the first failure.
+    ///
+    /// Upstream lowers the dynamic step to a `ParallelStep` carrying `failFast: step.failFast`
+    /// (`chain-execution.ts:897-901` @v0.34.0) and runs it through the same
+    /// `runParallelChainTasks` a static parallel step uses, which trips on the first non-zero exit
+    /// (`chain-execution.ts:391`) and returns a synthetic result for every not-yet-started sibling
+    /// (`:238-246`: `exitCode: -1`, `error: "Skipped due to fail-fast"`). Those synthetic entries
+    /// flow into `collectDynamicResults` (`:976`), so they are visible in `{outputs.<collect.as>}`.
+    ///
+    /// `concurrency: 1` makes the dispatch order deterministic: item 0 fails, and items 1-3 must
+    /// never start. R-SA-066 is cooperative, so this asserts only that NEW work stops.
+    #[tokio::test]
+    async fn dynamic_group_fail_fast_stops_dispatch_and_marks_skipped_items_in_the_collect_array() {
+        let items = serde_json::json!([
+            { "path": "a" }, { "path": "b" }, { "path": "c" }, { "path": "d" }
+        ]);
+
+        // (fail_fast, expected dispatch count) — the `false` arm is the control that proves the
+        // assertion below is about the flag, not about the forced failure.
+        for (fail_fast, expected_dispatches) in [(true, 1usize), (false, 4usize)] {
+            let dynamic = DynamicGroupSpec {
+                concurrency: 1,
+                fail_fast,
+                ..dynamic_group_full(
+                    "outputs.targets",
+                    single_step("reviewer", "Review {t.path}"),
+                    "reviews",
+                    Some("t"),
+                    Some("/path"),
+                    Some(8),
+                    OnEmpty::Skip,
+                )
+            };
+            let graph: ChainGraph = vec![RunnerStep::DynamicGroup(dynamic)];
+            let executor = Arc::new(ErrOnceExecutor {
+                calls: StdMutex::new(Vec::new()),
+                fail_on: "Review a".to_string(),
+            });
+            let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
+            let ctx = run_ctx(CancelToken::new());
+            let mut registry = OutputRegistry::new();
+            registry.register("targets", items.clone());
+
+            let (results, groups) = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
+                .await
+                .expect("walk returns a failed step result, not a hard error");
+
+            let dispatched = executor.calls.lock().expect("lock").len();
+            assert_eq!(
+                dispatched, expected_dispatches,
+                "fail_fast={fail_fast}: expected {expected_dispatches} child dispatch(es), got \
+                 {dispatched}"
+            );
+
+            // The collect array is always 4 records wide (one per source item), regardless.
+            let group = groups.first().expect("one group result");
+            assert_eq!(group.children.len(), 4);
+            let collected = results
+                .first()
+                .and_then(|step| step.structured_output.clone())
+                .expect("dynamic step's aggregate carries the collect-record array");
+            let records = collected.as_array().expect("collect array");
+            assert_eq!(records.len(), 4);
+
+            if fail_fast {
+                // Items 1-3 never ran: pi's `-1` / "Skipped due to fail-fast" sentinel, NOT a
+                // `null` exit code and NOT a real result.
+                assert_eq!(
+                    group.fail_fast_skipped,
+                    vec![false, true, true, true],
+                    "only the un-dispatched siblings are fail-fast skips"
+                );
+                for record in records.iter().skip(1) {
+                    assert_eq!(record["exitCode"], serde_json::json!(-1));
+                    assert_eq!(
+                        record["error"],
+                        serde_json::json!("Skipped due to fail-fast")
+                    );
+                }
+            } else {
+                assert_eq!(group.fail_fast_skipped, vec![false; 4]);
+                // Without fail-fast every sibling really ran, so none carries the -1 sentinel.
+                for record in records.iter().skip(1) {
+                    assert_eq!(record["exitCode"], serde_json::json!(0));
+                }
+            }
+        }
+    }
+
     // ---- Serialization round-trip: tagged JSON per arch-SA §4.2 ----
 
     #[test]
@@ -2911,6 +3118,7 @@ mod tests {
                 max_items: Some(5),
                 on_empty: OnEmpty::Fail,
                 collect_schema: Some(serde_json::json!({ "type": "array" })),
+                fail_fast: true,
             }),
         ];
         let json = serde_json::to_string(&steps).expect("serializes");

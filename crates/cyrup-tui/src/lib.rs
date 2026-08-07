@@ -53,6 +53,7 @@ mod keymap;
 mod markdown;
 mod model_selector;
 mod overlay;
+mod panic_hook;
 mod select_list;
 mod selector;
 mod session_search;
@@ -81,6 +82,7 @@ pub use autocomplete::{
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
+pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
 pub use commands::{
     dynamic_commands_from_catalog, CommandRegistry, CommandSource, Dispatch, SlashCommand,
     BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,

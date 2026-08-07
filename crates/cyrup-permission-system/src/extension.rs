@@ -207,8 +207,9 @@ pub struct PermissionSystemExtension {
     permanent_approvals: Mutex<PermanentApprovalStore>,
     dedup: Mutex<DedupCache>,
     /// The extension `config.json` snapshot. `yolo_mode` is read on the live `ask` path (below);
-    /// `debug`/`forwarded_prompt_timeout_seconds` are consumed by later phases (logging / forwarding
-    /// P-4) — the public fields carry them without any callerless primitive. `Mutex`-wrapped because
+    /// `debug` gates the audit/debug JSONL trail ([`Self::logger`], pi `logging.ts:89,97`) AND the
+    /// forwarding "child is waiting" notice (`forwarding.rs`); `forwarded_prompt_timeout_seconds` is
+    /// consumed by forwarding (P-4). `Mutex`-wrapped because
     /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
     /// `resources_discover` reload (pi `refreshExtensionConfig`, `index.ts:1600-1608`).
     ///
@@ -261,6 +262,15 @@ pub struct PermissionSystemExtension {
     /// a repeated refresh that keeps failing the same way notifies once and a refresh that STOPS
     /// failing re-arms the report (`refreshExtensionConfig`, `index.ts:1610-1618`).
     last_config_warning: Mutex<Option<String>>,
+    /// pi `extensionLogger` (`index.ts:148-150`): the `debug`-gated audit/debug JSONL trail
+    /// ([`crate::logging`], pi `logging.ts`). Shares the SAME `config` `Arc` above, so the operator
+    /// flipping `"debug": true` in `config.json` arms it on the next
+    /// `session_start` / `resources_discover` reload with no restart.
+    logger: crate::logging::PermissionSystemLogger,
+    /// pi `reportedLoggingWarnings` (`index.ts:151`): a logging failure (an unwritable log dir) is
+    /// surfaced ONCE per distinct message, so a broken trail cannot spam the human on every gated
+    /// tool call (`reportLoggingWarning`, `index.ts:162-169`).
+    reported_logging_warnings: Mutex<HashSet<String>>,
 }
 
 impl PermissionSystemExtension {
@@ -341,6 +351,16 @@ impl PermissionSystemExtension {
         agent_dir.join(CONFIG_DIR).join(CONFIG_FILE)
     }
 
+    /// The default audit/debug log directory for `agent_dir` (pi `LOGS_DIR =
+    /// join(EXTENSION_ROOT, "logs")`, `extension-config.ts:38`). cyrup's analog of pi's
+    /// `EXTENSION_ROOT` is `<agent_dir>/cyrup-permission-system/` — the directory
+    /// [`Self::config_path_for`] puts `config.json` in — so the trail lands beside the config that
+    /// enables it. Overridable per write via `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`
+    /// ([`crate::logging::resolve_logs_dir`]).
+    fn logs_dir_for(agent_dir: &Path) -> PathBuf {
+        agent_dir.join(CONFIG_DIR).join(crate::logging::LOGS_DIR_NAME)
+    }
+
     /// Derive the [`ManagerPaths`] + permanent-store path + extension config from `agent_dir` + `cwd`
     /// (shared by every constructor).
     fn derive_parts(agent_dir: &Path, cwd: PathBuf) -> (ManagerPaths, PathBuf, ExtensionConfig) {
@@ -363,8 +383,22 @@ impl PermissionSystemExtension {
         // pi order (`refreshSessionRuntimeState`, `index.ts:2077-2085`): config first, manager
         // second.
         let loaded = ExtensionConfig::load_with_result(&Self::config_path_for(&self.agent_dir));
+        let (created, debug, yolo_mode) =
+            (loaded.created, loaded.config.debug, loaded.config.yolo_mode);
         *guard(&self.config) = loaded.config;
-        self.report_config_warning(loaded.warning);
+        self.report_config_warning(loaded.warning.clone());
+        // pi `refreshExtensionConfig`'s tail (`index.ts:1619-1624`) — emitted AFTER the new config
+        // is installed, so a reload that turns `debug` ON records its own arrival as the trail's
+        // first line.
+        self.write_debug_entry(
+            "config.loaded",
+            &json!({
+                "created": created,
+                "warning": loaded.warning,
+                "debug": debug,
+                "yoloMode": yolo_mode,
+            }),
+        );
         *guard(&self.manager) =
             manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
         guard(&self.active_skill_entries).clear();
@@ -434,13 +468,21 @@ impl PermissionSystemExtension {
         // observes the backend the host attaches LATER (`set_host_services` runs after
         // construction).
         let warnings = Arc::new(WarningSink::new(Arc::clone(&host_services)));
+        // Built here so the logger and `self.config` are the SAME `Arc` — pi's `extensionLogger`
+        // reads the module-scope `extensionConfig` binding `refreshExtensionConfig` reassigns
+        // (`index.ts:146-150`), so a reload must be observable through both.
+        let shared_config: crate::forwarding::SharedExtensionConfig = Arc::new(Mutex::new(config));
+        let logger = crate::logging::PermissionSystemLogger::new(
+            Arc::clone(&shared_config),
+            Self::logs_dir_for(&agent_dir),
+        );
         Self {
             id: ExtensionId::from(EXTENSION_ID),
             manager: Mutex::new(manager_with_warnings(paths, &warnings)),
             session_approvals: Mutex::new(SessionApprovalStore::new()),
             permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
-            config: Arc::new(Mutex::new(config)),
+            config: shared_config,
             ask_channel,
             host_services,
             agent_dir,
@@ -451,7 +493,85 @@ impl PermissionSystemExtension {
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
             warnings,
             last_config_warning: Mutex::new(None),
+            logger,
+            reported_logging_warnings: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// pi `writeDebugEntry` (`index.ts:171-176`): the diagnostic stream, with the logger's own
+    /// failure funnelled into the dedup-once warning reporter.
+    fn write_debug_entry(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.debug(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `writeReviewEntry` (`index.ts:178-183`): the SECURITY-relevant decision stream — the
+    /// "why was this blocked / who approved this" trail. Same warning funnel.
+    fn write_review_entry(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.review(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `reportLoggingWarning` (`index.ts:162-169`): surface a NEW logging failure once through
+    /// the same `ui.notify` channel every other warning uses, and remember it so a persistently
+    /// broken trail cannot notify on every gated tool call.
+    fn report_logging_warning(&self, message: &str) {
+        // Scoped so the memo lock is released before the sink is touched — `notify` takes its own
+        // lock and reaches the host.
+        let is_new = guard(&self.reported_logging_warnings).insert(message.to_string());
+        if is_new {
+            self.warnings.notify(message);
+        }
+    }
+
+    /// pi `reviewPermissionDecision` (`index.ts:1767-1793`): the ONE shaped `review` record every
+    /// decision-point entry is built from — the prompt and denial reason accompanied by their
+    /// `createSensitiveLogMetadata` digests, plus the resolution / persistence / scope fields.
+    ///
+    /// `details` is the same [`DedupDetails`] the dedup fingerprint is built from, which already
+    /// mirrors pi's `PermissionPromptDetails` field for field (`dedup.rs:36-50`).
+    fn review_permission_decision(&self, event: &str, details: &DedupDetails, tail: Value) {
+        let mut record = json!({
+            "requestId": details.request_id,
+            "source": details.source,
+            "agentName": details.agent_name,
+            "prompt": details.message,
+            "promptMetadata": crate::logging::sensitive_log_metadata(Some(&details.message)),
+            "toolCallId": details.tool_call_id,
+            "toolName": details.tool_name,
+            "skillName": details.skill_name,
+            "path": details.path,
+            "command": details.command,
+            "commandMetadata": crate::logging::sensitive_log_metadata(details.command.as_deref()),
+            "target": details.target,
+            "toolInput": details.tool_input,
+        });
+        // pi spreads `...details` then the per-call-site resolution/persistence keys; the tail
+        // overwrites, matching JS object-literal ordering.
+        if let (Value::Object(base), Value::Object(extra)) = (&mut record, &tail) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        self.write_review_entry(event, &record);
+    }
+
+    /// pi `getPermissionDecisionScope` (`index.ts:876-888`): the first non-empty of
+    /// `target`, `command`, `path`, `toolName`, `skillName`.
+    fn permission_decision_scope(details: &DedupDetails) -> Value {
+        [
+            details.target.as_deref(),
+            details.command.as_deref(),
+            details.path.as_deref(),
+            details.tool_name.as_deref(),
+            details.skill_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map_or(Value::Null, |s| Value::String(s.to_string()))
     }
 
     /// Override the resolved persona name (deterministic tests / an embedder that resolves the name
@@ -497,8 +617,12 @@ impl PermissionSystemExtension {
         // (3) SKILL-READ bypass (pi `index.ts:2230-2303`): a `read` whose path lands on a tracked skill
         // is governed by the SKILL policy (allow → proceed; ask → prompt; deny → block), bypassing the
         // read-tool policy. `None` = no skill matched → fall through to the external-dir + main checks.
+        // The per-call identity every gated layer audits against (pi threads `event.toolCallId` /
+        // `toolName` / `input` / `ctx.cwd` / `agentName` into each `writeReviewEntry` by hand).
+        let call = GateCall { call_id, tool_name: normalized, input, cwd: &cwd, agent_name };
+
         if normalized == "read"
-            && let Some(outcome) = self.resolve_skill_read(input, agent_name, &cwd, ctx).await
+            && let Some(outcome) = self.resolve_skill_read(&call, ctx).await
         {
             return outcome;
         }
@@ -510,8 +634,7 @@ impl PermissionSystemExtension {
         if !cwd.is_empty()
             && let Some(path) = gate::get_path_bearing_tool_path(normalized, input)
             && gate::is_path_outside_working_directory(&path, &cwd)
-            && let Some(outcome) =
-                self.resolve_external_directory(normalized, &path, &cwd, agent_name, ctx).await
+            && let Some(outcome) = self.resolve_external_directory(&call, &path, ctx).await
         {
             return outcome;
         }
@@ -526,6 +649,20 @@ impl PermissionSystemExtension {
 
         match check.state {
             PermissionState::Deny => {
+                // pi `index.ts:2422-2439`: the policy-denied audit entry, then `flush()` before the
+                // block is returned (`[CYRUP-DELTA]` — the write is already durable here).
+                let details = dedup_details(call_id, input, &check, agent_name);
+                self.review_permission_decision(
+                    "permission_request.blocked",
+                    &details,
+                    json!({
+                        "source": "tool_call",
+                        "resolution": "policy_denied",
+                        "decisionPersistence": "none",
+                        "decisionScope": Self::permission_decision_scope(&details),
+                    }),
+                );
+                self.logger.flush();
                 HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)) }
             }
             PermissionState::Allow => HookOutcome::Noop,
@@ -547,13 +684,8 @@ impl PermissionSystemExtension {
     /// `ask` → live prompt (fail-closed / user-deny → block), `allow`/approved → proceed. Returns
     /// `Some(HookOutcome)` when a skill matched (a terminal decision, allow via `Noop`), `None` when no
     /// skill matched (the caller falls through to the external-dir + main checks).
-    async fn resolve_skill_read(
-        &self,
-        input: &Value,
-        agent_name: Option<&str>,
-        cwd: &str,
-        ctx: &HostCtx,
-    ) -> Option<HookOutcome> {
+    async fn resolve_skill_read(&self, call: &GateCall<'_>, ctx: &HostCtx) -> Option<HookOutcome> {
+        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
         let read_path =
             to_record(input).get("path").and_then(Value::as_str).unwrap_or("").to_string();
         let normalized_read_path = common::normalize_path_for_comparison(&read_path, cwd);
@@ -588,6 +720,20 @@ impl PermissionSystemExtension {
         if !explicitly_requested {
             match read_skill.state {
                 PermissionState::Deny => {
+                    // pi `index.ts:2243-2255`.
+                    self.write_review_entry(
+                        "permission_request.blocked",
+                        &json!({
+                            "source": "skill_read",
+                            "toolCallId": call_id,
+                            "toolName": tool_name,
+                            "skillName": read_skill.name,
+                            "agentName": agent_name,
+                            "path": read_path,
+                            "toolInput": input,
+                            "resolution": "policy_denied",
+                        }),
+                    );
                     return Some(HookOutcome::Block {
                         reason: Some(skill::format_skill_path_deny_reason(&read_skill, agent_name)),
                     });
@@ -595,8 +741,38 @@ impl PermissionSystemExtension {
                 PermissionState::Ask => {
                     let message =
                         skill::format_skill_path_ask_prompt(&read_skill, &read_path, agent_name);
-                    match self.prompt_decision(&message, ctx).await {
+                    // pi `index.ts:2282-2291`'s `promptPermission` details record.
+                    let details = DedupDetails {
+                        request_id: call_id.to_string(),
+                        source: "skill_read".to_string(),
+                        agent_name: agent_name.map(str::to_string),
+                        message: message.clone(),
+                        tool_call_id: Some(call_id.to_string()),
+                        tool_name: Some(tool_name.to_string()),
+                        skill_name: Some(read_skill.name.clone()),
+                        path: Some(read_path.clone()),
+                        command: None,
+                        target: None,
+                        tool_input: input.clone(),
+                    };
+                    match self.prompt_decision(&details, ctx).await {
                         AskOutcome::NoLiveChannel => {
+                            // pi `index.ts:2262-2276`.
+                            self.write_review_entry(
+                                "permission_request.blocked",
+                                &json!({
+                                    "source": "skill_read",
+                                    "toolCallId": call_id,
+                                    "toolName": tool_name,
+                                    "skillName": read_skill.name,
+                                    "agentName": agent_name,
+                                    "path": read_path,
+                                    "prompt": message,
+                                    "promptMetadata": crate::logging::sensitive_log_metadata(Some(&message)),
+                                    "toolInput": input,
+                                    "resolution": "confirmation_unavailable",
+                                }),
+                            );
                             return Some(HookOutcome::Block {
                                 reason: Some(skill::skill_ask_unavailable_reason()),
                             });
@@ -624,12 +800,11 @@ impl PermissionSystemExtension {
     /// then fall through); `allow` → fall through. `None` = allowed (proceed to the main check).
     async fn resolve_external_directory(
         &self,
-        tool_name: &str,
+        call: &GateCall<'_>,
         path: &str,
-        cwd: &str,
-        agent_name: Option<&str>,
         ctx: &HostCtx,
     ) -> Option<HookOutcome> {
+        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
         let ext_input = json!({ "path": path, "cwd": cwd });
         let raw = guard(&self.manager).check_permission("external_directory", &ext_input, agent_name);
         // pi `:2319-2321`: the session/permanent overlay is applied ONLY on an `ask` result.
@@ -642,18 +817,65 @@ impl PermissionSystemExtension {
         };
 
         match ext_check.state {
-            PermissionState::Deny => Some(HookOutcome::Block {
-                reason: Some(gate::format_external_directory_deny_reason(
-                    tool_name, path, cwd, agent_name,
-                )),
-            }),
+            PermissionState::Deny => {
+                // pi `index.ts:2323-2333`.
+                self.write_review_entry(
+                    "permission_request.blocked",
+                    &json!({
+                        "source": "tool_call",
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "agentName": agent_name,
+                        "path": path,
+                        "toolInput": input,
+                        "resolution": "policy_denied",
+                    }),
+                );
+                Some(HookOutcome::Block {
+                    reason: Some(gate::format_external_directory_deny_reason(
+                        tool_name, path, cwd, agent_name,
+                    )),
+                })
+            }
             PermissionState::Ask => {
                 let message =
                     gate::format_external_directory_ask_prompt(tool_name, path, cwd, agent_name);
-                match self.prompt_decision(&message, ctx).await {
-                    AskOutcome::NoLiveChannel => Some(HookOutcome::Block {
-                        reason: Some(gate::format_external_directory_unavailable_reason(path)),
-                    }),
+                // pi `index.ts:2368-2377`'s `promptPermission` details record — note `source` is
+                // `"tool_call"` here, not `"skill_read"`, and no `skillName`/`command`/`target`.
+                let details = DedupDetails {
+                    request_id: call_id.to_string(),
+                    source: "tool_call".to_string(),
+                    agent_name: agent_name.map(str::to_string),
+                    message: message.clone(),
+                    tool_call_id: Some(call_id.to_string()),
+                    tool_name: Some(tool_name.to_string()),
+                    skill_name: None,
+                    path: Some(path.to_string()),
+                    command: None,
+                    target: None,
+                    tool_input: input.clone(),
+                };
+                match self.prompt_decision(&details, ctx).await {
+                    AskOutcome::NoLiveChannel => {
+                        // pi `index.ts:2351-2362`.
+                        self.write_review_entry(
+                            "permission_request.blocked",
+                            &json!({
+                                "source": "tool_call",
+                                "toolCallId": call_id,
+                                "toolName": tool_name,
+                                "agentName": agent_name,
+                                "path": path,
+                                "prompt": message,
+                                "promptMetadata": crate::logging::sensitive_log_metadata(Some(&message)),
+                                "toolInput": input,
+                                "resolution": "confirmation_unavailable",
+                            }),
+                        );
+                        Some(HookOutcome::Block {
+                            reason: Some(gate::format_external_directory_unavailable_reason(path)),
+                        })
+                    }
                     AskOutcome::Decided(d) if !d.approved => Some(HookOutcome::Block {
                         reason: Some(gate::format_external_directory_user_denied_reason(
                             tool_name,
@@ -669,6 +891,25 @@ impl PermissionSystemExtension {
                             if !subject.is_empty() {
                                 guard(&self.session_approvals)
                                     .approve_always(&ext_check.tool_name, &subject);
+                                // pi `index.ts:2397-2409`: the persist is audited only when a
+                                // subject was actually recorded, and names the SPECIAL tool
+                                // `external_directory` rather than the calling tool.
+                                self.write_review_entry(
+                                    "permission_request.approval_persisted",
+                                    &json!({
+                                        "source": "tool_call",
+                                        "toolCallId": call_id,
+                                        "toolName": "external_directory",
+                                        "agentName": agent_name,
+                                        "path": path,
+                                        "toolInput": input,
+                                        "resolution": decision_state_str(d.state),
+                                        "decisionPersistence": "session",
+                                        "approvalPersistence": "session",
+                                        "approvalScope": subject,
+                                    }),
+                                );
+                                self.logger.flush();
                             }
                         }
                         None
@@ -688,18 +929,41 @@ impl PermissionSystemExtension {
     /// the BLOCKING dialog — the SAME machinery [`Self::resolve_ask`] uses. `AskOutcome::NoLiveChannel`
     /// = fail-CLOSED (no reachable human), returned IMMEDIATELY by the pre-check when none of the three
     /// conditions hold — zero lock/dialog work touched, exactly like pi's early return.
-    async fn prompt_decision(&self, message: &str, ctx: &HostCtx) -> AskOutcome {
+    ///
+    /// Also emits pi `promptPermission`'s four audit entries (`index.ts:1820,1843,1855-1857`):
+    /// `permission_request.auto_approved` (yolo), `.waiting` (before the dialog opens) and
+    /// `.approved`/`.denied` (after the human answers). `details` is pi's `PermissionPromptDetails`
+    /// — `details.message` IS the prompt text, so this takes the record rather than a bare string.
+    async fn prompt_decision(&self, details: &DedupDetails, ctx: &HostCtx) -> AskOutcome {
+        let message = details.message.as_str();
         let yolo_mode = guard(&self.config).yolo_mode;
         if !(ctx.has_ui || is_subagent_child() || yolo_mode) {
+            // The caller's `confirmation_unavailable` entry covers this branch (pi audits it at
+            // each of its three `canRequestPermissionConfirmation` sites, not inside
+            // `promptPermission`).
             return AskOutcome::NoLiveChannel;
         }
         if yolo_mode {
+            // pi `index.ts:1820-1826`.
+            self.review_permission_decision(
+                "permission_request.auto_approved",
+                details,
+                json!({
+                    "resolution": "auto_response",
+                    "decisionPersistence": "none",
+                    "decisionScope": "yolo_mode",
+                }),
+            );
+            self.logger.flush();
             return AskOutcome::Decided(PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Approved,
                 denial_reason: None,
             });
         }
+        // pi `index.ts:1843` — recorded BEFORE the dialog opens, so a session killed mid-prompt
+        // still leaves evidence of what was asked.
+        self.review_permission_decision("permission_request.waiting", details, json!({}));
         let human_lock = self.host_services.get().and_then(|s| s.human_interaction_lock());
         let _human_guard = match human_lock {
             Some(lock) => Some(lock.acquire().await),
@@ -709,8 +973,32 @@ impl PermissionSystemExtension {
             (true, Some(services)) => Arc::new(LocalAskChannel::new(services.clone())),
             _ => self.ask_channel.clone(),
         };
-        let _human_wait = ctx.begin_human_wait();
-        channel.confirm("Permission Required", message, PromptOpts::default()).await
+        let outcome = {
+            let _human_wait = ctx.begin_human_wait();
+            channel.confirm("Permission Required", message, PromptOpts::default()).await
+        };
+
+        // pi `index.ts:1855-1868`: the resolved decision, with the "Allow Always" session-persist
+        // intent recorded alongside it.
+        if let AskOutcome::Decided(ref d) = outcome {
+            let always = d.state == PermissionDecisionState::Always;
+            let scope = Self::permission_decision_scope(details);
+            self.review_permission_decision(
+                if d.approved { "permission_request.approved" } else { "permission_request.denied" },
+                details,
+                json!({
+                    "resolution": decision_state_str(d.state),
+                    "denialReason": d.denial_reason,
+                    "denialReasonMetadata":
+                        crate::logging::sensitive_log_metadata(d.denial_reason.as_deref()),
+                    "decisionPersistence": if always { "session" } else { "none" },
+                    "approvalPersistence": if d.approved && always { "session" } else { "none" },
+                    "decisionScope": scope,
+                    "approvalScope": if d.approved && always { scope.clone() } else { Value::Null },
+                }),
+            );
+        }
+        outcome
     }
 
     /// The main-check `ask` branch (pi `:2444-2496` + `promptPermission :1794-1902` + `confirmPermission
@@ -734,6 +1022,22 @@ impl PermissionSystemExtension {
         if let Some(k) = &key {
             let cached = guard(&self.dedup).get(k);
             if let Some(decision) = cached {
+                // pi `index.ts:1804-1812`: a reused decision is STILL audited — otherwise a
+                // re-emitted tool call looks like it was never gated at all.
+                self.review_permission_decision(
+                    "permission_request.duplicate_reused",
+                    &details,
+                    json!({
+                        "resolution": decision_state_str(decision.state),
+                        "denialReason": decision.denial_reason,
+                        "denialReasonMetadata":
+                            crate::logging::sensitive_log_metadata(decision.denial_reason.as_deref()),
+                        "decisionPersistence": "none",
+                        "approvalPersistence": "none",
+                        "decisionScope": Self::permission_decision_scope(&details),
+                    }),
+                );
+                self.logger.flush();
                 return self.apply_decision(decision, check, input);
             }
         }
@@ -741,12 +1045,19 @@ impl PermissionSystemExtension {
         // pi `formatAskPrompt` (`index.ts:570-590`) — the human-facing prompt (NOT the headless reason).
         // The shared prompting core applies yolo auto-approve (pi `shouldAutoApprovePermissionState`),
         // the C3 human lock, the live-vs-fallback channel, and the P-3 dispatch-budget guard.
-        let message = gate::format_ask_prompt(check, agent_name, input);
-        let decision = match self.prompt_decision(&message, ctx).await {
+        // `details.message` already IS `format_ask_prompt(check, agent_name, input)` (built by
+        // `dedup_details` above), which is what `prompt_decision` prompts with.
+        let decision = match self.prompt_decision(&details, ctx).await {
             AskOutcome::Decided(d) => d,
             // Fail-CLOSED: no reachable human (headless / no live UI) → Block, never proceed
             // (pi `confirmPermission` headless `{approved:false}` :1509-1513 / `:2452-2467`).
             AskOutcome::NoLiveChannel => {
+                // pi `index.ts:2452-2464`.
+                self.review_permission_decision(
+                    "permission_request.blocked",
+                    &details,
+                    json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
+                );
                 return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)) };
             }
         };
@@ -754,6 +1065,25 @@ impl PermissionSystemExtension {
         if let Some(k) = &key {
             guard(&self.dedup).remember(k, decision.clone());
         }
+        // pi `index.ts:2481-2494`: audit the SESSION persist an approved-Always produces (only when
+        // a real subject was recorded), then `flush()`.
+        if decision.approved && decision.state == PermissionDecisionState::Always {
+            let subject = gate::get_pattern_approval_subject(check, input);
+            if !subject.is_empty() {
+                self.review_permission_decision(
+                    "permission_request.approval_persisted",
+                    &details,
+                    json!({
+                        "source": "tool_call",
+                        "resolution": decision_state_str(decision.state),
+                        "decisionPersistence": "session",
+                        "approvalPersistence": "session",
+                        "approvalScope": subject,
+                    }),
+                );
+            }
+        }
+        self.logger.flush();
         self.apply_decision(decision, check, input)
     }
 
@@ -945,13 +1275,22 @@ impl PermissionSystemExtension {
     /// `watcher` slot.
     ///
     /// Every spawned watcher moves its own clone of the shared `config` handle into the task future,
-    /// synchronously at `tokio::spawn` time, so `Arc::strong_count - 1` (the extension's own handle)
-    /// is the number of watcher futures still alive. This is the assertion that would catch a
+    /// synchronously at `tokio::spawn` time, so `Arc::strong_count` MINUS the non-watcher holders is
+    /// the number of watcher futures still alive. This is the assertion that would catch a
     /// non-idempotent start: the slot only ever holds ONE `JoinHandle`, so overwriting it would hide
     /// a leaked task, whereas the leaked task's `Arc` clone cannot hide.
+    ///
+    /// The non-watcher holders are exactly two and are structural, not incidental: the extension's
+    /// own `self.config` field, and `self.logger`, which must share the SAME handle so a config
+    /// reload re-arms the audit trail (pi's `extensionLogger` reads the module-scope
+    /// `extensionConfig` binding, `index.ts:146-150`). Adding a THIRD holder without updating this
+    /// constant makes the count read one watcher too many — which is precisely how this seam is
+    /// meant to fail: loudly, at the assertion, rather than silently under-counting a leak.
     #[cfg(test)]
     fn live_watcher_task_count(&self) -> usize {
-        Arc::strong_count(&self.config).saturating_sub(1)
+        /// `self.config` + `self.logger` — see the note above.
+        const NON_WATCHER_CONFIG_HOLDERS: usize = 2;
+        Arc::strong_count(&self.config).saturating_sub(NON_WATCHER_CONFIG_HOLDERS)
     }
 
     /// PERM-001 — publish this PARENT session's own id as the process-wide parent-session anchor
@@ -1014,6 +1353,39 @@ fn dedup_details(
         command: check.command.clone(),
         target: check.target.clone(),
         tool_input: input.clone(),
+    }
+}
+
+/// The per-`tool_call` identity the layered gate threads into every branch — the borrowed subset of
+/// pi's `event` + `ctx` its `writeReviewEntry` records are built from (`toolCallId`, `toolName`,
+/// `input`, `ctx.cwd`, `agentName`). Bundled rather than passed loose so the layer resolvers keep a
+/// two-argument shape as the audit fields grew.
+#[derive(Clone, Copy)]
+struct GateCall<'a> {
+    /// pi `event.toolCallId` — also the `requestId` of any prompt this call raises.
+    call_id: &'a str,
+    /// The trimmed tool name (pi `toolName`).
+    tool_name: &'a str,
+    /// The `cwd`-injected input (pi's `input` after `index.ts:2305-2309`).
+    input: &'a Value,
+    /// pi `ctx.cwd`.
+    cwd: &'a str,
+    /// The resolved persona (pi `agentName`), `None` at top level.
+    agent_name: Option<&'a str>,
+}
+
+/// The on-the-wire `state` string pi writes into a `resolution` field — the SAME strings the
+/// `serde(rename_all = "snake_case")` derive on [`PermissionDecisionState`] produces
+/// (`ask.rs:27-42`, pi `permission-dialog.ts:1`), spelled out here so the audit trail cannot drift
+/// from the derive silently.
+fn decision_state_str(state: PermissionDecisionState) -> &'static str {
+    match state {
+        PermissionDecisionState::Approved => "approved",
+        PermissionDecisionState::Denied => "denied",
+        PermissionDecisionState::DeniedWithReason => "denied_with_reason",
+        PermissionDecisionState::Once => "once",
+        PermissionDecisionState::Always => "always",
+        PermissionDecisionState::Reject => "reject",
     }
 }
 

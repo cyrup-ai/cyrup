@@ -1700,3 +1700,205 @@ async fn edit_malformed_edits_yields_pi_literal() {
         "Edit tool input is invalid. edits must contain at least one replacement."
     );
 }
+
+// ---------------------------------------------------------- numeric-parameter coercion (jsnum)
+//
+// Every numeric tool parameter is a TypeBox `Type.Number` upstream — no `integer`, no `minimum`
+// (read.ts:22-23, grep.ts:31-34, ls.ts:16, find.ts:25) — and Pi never validates tool arguments at
+// runtime: `wrapToolDefinition` (tool-definition-wrapper.ts:16-18) hands the model's parsed JSON
+// straight to `execute`, which coerces at the point of use. So `10.0` and `-1` are inputs Pi
+// accepts and answers. cyrup modeled them as `usize`, so `serde_json::from_value` rejected the
+// whole call ("invalid type: floating point `10.0`" / "invalid value: integer `-1`") before the
+// tool ran — a hard error where Pi returns a result. These tests pin the coerced behavior per
+// tool, using Pi's own clamp expression as the oracle.
+
+// read — `startLine = offset ? Math.max(0, offset - 1) : 0` (read.ts:271) and
+// `endLine = Math.min(startLine + limit, allLines.length)` (read.ts:282).
+#[tokio::test]
+async fn read_accepts_float_and_negative_numeric_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let ten = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    std::fs::write(cwd.join("f.txt"), &ten).unwrap();
+    let read = ReadTool::new(fs(), cwd.clone(), ReadOpts::default());
+
+    // Integral floats must behave exactly like the integer spelling.
+    let float_args = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 2.0, "limit": 3.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float offset/limit must not fail the call");
+    let int_args = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 2, "limit": 3 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_text(&float_args), first_text(&int_args));
+    assert!(first_text(&float_args).starts_with("line2\nline3\nline4"));
+
+    // Negative offset: `Math.max(0, -5 - 1)` is 0, i.e. identical to reading from line 1.
+    let neg = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": -5 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative offset clamps to the start of the file, it does not fail the call");
+    assert_eq!(first_text(&neg), ten);
+
+    // Negative limit: Pi's unclamped `startLine + limit` selects nothing; cyrup clamps the window
+    // end to `start` and still reports the remainder, so the model gets an actionable result.
+    let neg_limit = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "\n\n[10 more lines in file. Use offset=1 to continue.]");
+
+    // The out-of-bounds message interpolates the RAW argument (read.ts:275); an integral float
+    // renders without a fraction in both JS and Rust.
+    let err = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 99.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Offset 99 is beyond end of file (10 lines total)");
+}
+
+// grep — `contextValue = context && context > 0 ? context : 0` and
+// `effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT)` (grep.ts:188-189).
+#[tokio::test]
+async fn grep_accepts_float_and_negative_numeric_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\nNEEDLE\nfive\nNEEDLE\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
+
+    // context: 1.0 must equal context: 1 — one line either side of the match.
+    let ctx_float = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": 1.0, "limit": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float context must not fail the call");
+    assert!(first_text(&ctx_float).contains("a.txt-1- one"), "got: {}", first_text(&ctx_float));
+
+    // Negative context collapses to 0 — the match line alone, no surrounding rows.
+    let ctx_neg = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": -1, "limit": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative context clamps to 0, it does not fail the call");
+    assert_eq!(first_text(&ctx_neg).lines().next().unwrap(), "a.txt:2: NEEDLE");
+    assert!(!first_text(&ctx_neg).contains("a.txt-1-"), "got: {}", first_text(&ctx_neg));
+
+    // Negative limit is absorbed by `Math.max(1, …)`: exactly one match, not an error.
+    let lim_neg = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit clamps to 1, it does not fail the call");
+    assert_eq!(first_text(&lim_neg).lines().filter(|l| l.contains("NEEDLE")).count(), 1);
+
+    // limit: 2.0 must equal limit: 2.
+    let lim_float = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "limit": 2.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float limit must not fail the call");
+    assert_eq!(first_text(&lim_float).lines().filter(|l| l.contains("NEEDLE")).count(), 2);
+}
+
+// ls — `effectiveLimit = limit ?? DEFAULT_LIMIT` (ls.ts:125), unclamped: a non-positive limit
+// satisfies `results.length >= effectiveLimit` immediately (ls.ts:156) so nothing is collected and
+// Pi returns "(empty directory)".
+#[tokio::test]
+async fn ls_accepts_float_and_negative_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(cwd.join(n), "").unwrap();
+    }
+    let ls = LsTool::new(fs(), cwd.clone(), LsOpts::default());
+
+    let float_limit = ls
+        .execute(cid(), serde_json::json!({ "limit": 2.0 }), CancelToken::new(), noop_sink())
+        .await
+        .expect("float limit must not fail the call");
+    let text = first_text(&float_limit);
+    assert!(text.starts_with("a.txt\nb.txt\n\n[2 entries limit reached."), "got: {text}");
+
+    let neg_limit = ls
+        .execute(cid(), serde_json::json!({ "limit": -1 }), CancelToken::new(), noop_sink())
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "(empty directory)");
+}
+
+// find — `effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151) handed to `fd --max-results`
+// (find.ts:241); a non-positive count produces no rows, which is Pi's "No files found" branch.
+#[tokio::test]
+async fn find_accepts_float_and_negative_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(cwd.join(n), "").unwrap();
+    }
+    let find = FindTool::new(fs(), cwd.clone(), FindOpts::default());
+
+    let float_limit = find
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt", "limit": 2.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float limit must not fail the call");
+    let text = first_text(&float_limit);
+    assert!(text.starts_with("a.txt\nb.txt\n\n[2 results limit reached."), "got: {text}");
+
+    let neg_limit = find
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "No files found matching pattern");
+}

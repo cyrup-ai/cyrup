@@ -13,8 +13,13 @@ use std::sync::Arc;
 #[serde(rename_all = "camelCase")]
 struct ReadInput {
     path: String,
-    offset: Option<usize>,
-    limit: Option<usize>,
+    // Pi's TypeBox `Type.Number` (read.ts:22-23) carries no `integer` and no `minimum`, and Pi
+    // never validates tool arguments at runtime, so `offset: 10.0` and `limit: -1` are inputs Pi
+    // accepts and coerces. Modeling these as `usize` (the old cyrup type) rejected the entire
+    // call at deserialization. See [`crate::jsnum`]; `bash`'s `timeout` (bash.rs:24) is the same
+    // fix applied earlier.
+    offset: Option<f64>,
+    limit: Option<f64>,
 }
 
 pub struct ReadTool {
@@ -120,17 +125,34 @@ impl Tool for ReadTool {
         let lines: Vec<&str> = text.split('\n').collect();
         let total = lines.len();
 
-        let start = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
+        // Pi: `const startLine = offset ? Math.max(0, offset - 1) : 0` (read.ts:271). `offset` is a
+        // JS float: a falsy `0` and a negative both land on `0` via the `Math.max`, and `NaN`
+        // likewise (`f64::max` returns the non-NaN operand, matching `Math.max(0, NaN - 1)`… which
+        // is NaN in JS, but `offset` being NaN is unreachable from JSON). A fractional offset is
+        // truncated toward zero, which is what `allLines.slice(startLine, …)` (read.ts:283) does
+        // with it downstream.
+        let start = crate::jsnum::to_count(input.offset.map_or(0.0, |o| (o - 1.0).max(0.0)));
         if start >= total {
+            // Pi interpolates the RAW argument here (read.ts:275), not the clamped index. Rust's
+            // `f64` Display matches JS number-to-string for the integral values this sees (`3.0`
+            // renders as `3` in both).
             return Err(error::invalid(format!(
                 "Offset {} is beyond end of file ({} lines total)",
-                input.offset.unwrap_or(0),
+                input.offset.unwrap_or(0.0),
                 total
             )));
         }
 
+        // Pi: `const endLine = Math.min(startLine + limit, allLines.length)` (read.ts:282). The add
+        // is unclamped in JS, so a negative `limit` makes `endLine < startLine`; `slice` then
+        // applies its count-from-the-end rule and the continuation notice below quotes a negative
+        // `offset=`. [CYRUP-DELTA]: cyrup clamps the window end into `[start, total]`, so a
+        // negative `limit` yields an empty window and a notice that points back at `start + 1`.
+        // Byte-identical to Pi for every non-negative `limit`; a fractional one truncates toward
+        // zero exactly as `slice` would.
         let end = match input.limit {
-            Some(l) => (start + l).min(total),
+            #[allow(clippy::cast_precision_loss)]
+            Some(l) => crate::jsnum::to_count(start as f64 + l).clamp(start, total),
             None => total,
         };
         let window: Vec<&str> =

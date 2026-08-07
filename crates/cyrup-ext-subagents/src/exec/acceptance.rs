@@ -208,10 +208,21 @@ pub fn build_timed_out_acceptance_ledger(contract: &AcceptanceContract) -> Accep
 // ============================================================================================
 
 /// One declared verification command (func-SA `acceptance.verify[]`): a literal shell command
-/// string, executed via a real subprocess (R-SA-032, [`run_verify_commands`]) — never parsed or
+/// string plus the per-command execution knobs upstream's `AcceptanceVerifyCommand` carries,
+/// executed via a real subprocess (R-SA-032, [`run_verify_commands`]) — never parsed or
 /// interpreted beyond being handed to a shell, and never treated as satisfied by anything the
 /// child itself claims about it.
-pub type VerifyCommand = String;
+///
+/// This is deliberately an alias for [`model::AcceptanceVerifyCommand`] — the faithful port of
+/// upstream `AcceptanceVerifyCommand` (`pi-subagents/src/runs/shared/types.ts` @v0.34.0, whose
+/// accepted key set upstream pins as `ACCEPTANCE_VERIFY_KEYS = {id, command, timeoutMs, cwd, env,
+/// allowFailure}`, `acceptance.ts:44`) — rather than a second, parallel struct, so the two runners
+/// in this file ([`run_one_verify_command`] and [`model::run_verify_command`]) cannot drift apart
+/// over what a declared command even *is*. Before SUBA-C12b this alias was a bare `String`, so
+/// [`lower_acceptance_input`] validated all six keys (`model::validate_verify_input`) and then
+/// discarded five of them: `cwd`/`env`/`timeoutMs` never reached the subprocess and `allowFailure`
+/// never reached the gate.
+pub type VerifyCommand = model::AcceptanceVerifyCommand;
 
 /// The effective acceptance contract for one task (func-SA R-SA-023), resolved BEFORE launch from
 /// either an explicit caller-supplied `acceptance` param or heuristic inference from agent
@@ -403,14 +414,14 @@ pub fn lower_acceptance_input(
         serde_json::Value::String(level) => Ok(level_to_status(level)
             .map(|status| AcceptanceContract::explicit(status, Vec::new()))),
         serde_json::Value::Object(config) => {
-            let verify: Vec<String> = config
+            let verify: Vec<VerifyCommand> = config
                 .get("verify")
                 .and_then(serde_json::Value::as_array)
                 .map(|items| {
                     items
                         .iter()
-                        .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
-                        .map(str::to_string)
+                        .enumerate()
+                        .filter_map(|(index, item)| lower_verify_command(item, index))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -431,6 +442,49 @@ pub fn lower_acceptance_input(
         // `null`/absent is pi's `undefined`.
         _ => Ok(None),
     }
+}
+
+/// Lower one authored `acceptance.verify[i]` object onto a [`VerifyCommand`], carrying **every**
+/// key upstream's `ACCEPTANCE_VERIFY_KEYS` admits (`acceptance.ts:44` @v0.34.0) —
+/// `id`/`command`/`timeoutMs`/`cwd`/`env`/`allowFailure`. Before SUBA-C12b only `command`
+/// survived, so a user who authored `{ id: "lint", command: "npm run lint", allowFailure: true }`
+/// passed validation and then had `allowFailure` silently dropped, rejecting the run.
+///
+/// `command` is the only required-at-lowering key: an entry without it is skipped rather than
+/// lowered to an empty shell command. That is unreachable in practice —
+/// [`model::validate_acceptance_input`] runs first and already rejects a missing/blank `command`
+/// (`acceptance.ts:210`) — but keeping the filter makes this function total on arbitrary JSON.
+///
+/// `id` falls back to `verify[{index}]` for the same defensive reason (upstream requires it,
+/// `acceptance.ts:209`); it is used only for diagnostics, never for dispatch.
+fn lower_verify_command(item: &serde_json::Value, index: usize) -> Option<VerifyCommand> {
+    let command = item.get("command").and_then(serde_json::Value::as_str)?;
+    Some(VerifyCommand {
+        id: item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| format!("verify[{index}]"), str::to_string),
+        command: command.to_string(),
+        timeout_ms: item.get("timeoutMs").and_then(serde_json::Value::as_u64),
+        cwd: item
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        env: item
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            }),
+        allow_failure: item.get("allowFailure").and_then(serde_json::Value::as_bool),
+    })
 }
 
 /// The exact heading this module injects and later scans for — kept as a named constant so
@@ -482,8 +536,10 @@ pub fn inject_acceptance_contract(task: &str, contract: &AcceptanceContract) -> 
             "Note: the orchestrator will independently execute the following verification \
              command(s) after you finish and will NOT rely on your own report of their outcome:\n",
         );
+        // `- ${command.id}: ${command.command}` — upstream `formatAcceptancePrompt`
+        // (`acceptance.ts:319` @v0.34.0).
         for cmd in &contract.verify {
-            block.push_str(&format!("- `{cmd}`\n"));
+            block.push_str(&format!("- {}: `{}`\n", cmd.id, cmd.command));
         }
     }
 
@@ -518,24 +574,43 @@ impl AcceptanceStatus {
 // R-SA-032 / DI-SA-5: verify[] REAL subprocess execution
 // ============================================================================================
 
-/// The default bound on how long a single `verify[]` command may run before it is treated as a
-/// failure (this crate introduces no configuration surface for this in v1; a generous fixed bound
-/// keeps a hung verification command from blocking the acceptance gate — and therefore the whole
-/// run — indefinitely, mirroring `spawn::worktree::DEFAULT_HOOK_TIMEOUT`'s identical rationale for
-/// its own bounded external-command call).
-pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_millis(300_000);
+/// The bound applied to a `verify[]` command that declares no `timeoutMs` of its own — upstream's
+/// `command.timeoutMs ?? 120_000` fallback (`acceptance.ts:759` @v0.34.0). A declared `timeoutMs`
+/// wins (see [`VerifyCommand::timeout_ms`] and [`run_one_verify_command`]); this bound only keeps
+/// a hung *undeclared* verification command from blocking the acceptance gate — and therefore the
+/// whole run — indefinitely, mirroring `spawn::worktree::DEFAULT_HOOK_TIMEOUT`'s identical
+/// rationale for its own bounded external-command call.
+///
+/// Before SUBA-C12b this was a fixed 300 s applied to EVERY command with no way to override it,
+/// so an authored `timeoutMs: 5000` became five minutes.
+pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_millis(120_000);
 
 /// The observed outcome of ACTUALLY EXECUTING one `verify[]` command as a real OS subprocess
 /// (R-SA-032, DI-SA-5) — never a child's self-report.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifyCommandResult {
+    /// The declared [`VerifyCommand::id`] this result belongs to — upstream carries it onto
+    /// `AcceptanceVerifyResult.id` (`acceptance.ts:735`) so a rejection message can name the
+    /// command that failed rather than quote its whole shell text.
+    pub id: String,
     /// The literal command string that was executed.
     pub command: String,
     /// The real observed exit code, or `None` if the process was terminated by a signal (Unix)
     /// rather than exiting normally.
     pub exit_code: Option<i32>,
     /// Whether this command counts as passed: `exit_code == Some(0)`.
+    ///
+    /// This is the raw exit observation, NOT the gate verdict — a command declaring
+    /// `allowFailure: true` that exits nonzero is `passed: false` yet does not reject the run.
+    /// [`status`](Self::status) is what [`evaluate_acceptance`] gates on.
     pub passed: bool,
+    /// Upstream's `AcceptanceVerifyResult.status` (`acceptance.ts:766`):
+    /// `timedOut ? "timed-out" : passed ? "passed" : command.allowFailure ? "allowed-failure"
+    /// : "failed"`. Only [`model::VerifyRunStatus::Failed`] and
+    /// [`model::VerifyRunStatus::TimedOut`] reject the run (`evaluateAcceptance`,
+    /// `acceptance.ts:842`) — note `allowFailure` does NOT rescue a TIMEOUT, exactly as upstream's
+    /// ternary orders those tests.
+    pub status: model::VerifyRunStatus,
     /// Combined stdout+stderr tail (bounded, see [`run_one_verify_command`]'s doc comment) —
     /// kept for the rejection detail text so a caller/UI can show WHY a `verify[]` command
     /// failed, not merely that it did.
@@ -544,6 +619,20 @@ pub struct VerifyCommandResult {
     /// timed out — distinct from a genuine nonzero exit, since both cases still make `passed`
     /// `false` but a UI/log message should describe them differently.
     pub spawn_error: Option<String>,
+}
+
+impl VerifyCommandResult {
+    /// Whether this result REJECTS the run — upstream's
+    /// `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
+    /// (`acceptance.ts:842` @v0.34.0). A passed command and an `allowed-failure` command both
+    /// return `false`.
+    #[must_use]
+    pub fn rejects(&self) -> bool {
+        matches!(
+            self.status,
+            model::VerifyRunStatus::Failed | model::VerifyRunStatus::TimedOut
+        )
+    }
 }
 
 /// The largest number of trailing bytes of a `verify[]` command's combined output retained in
@@ -559,7 +648,13 @@ const VERIFY_OUTPUT_TAIL_BYTES: usize = 4096;
 /// per command, always in the same order as `commands` — this function does NOT short-circuit on
 /// the first failure (a caller wants to see every command's real outcome for a rejected run's
 /// detail text, not just the first one that failed), but callers deciding overall pass/fail MUST
-/// require every result's `passed` to be `true` (see [`evaluate_acceptance`]).
+/// require that no result [`rejects`](VerifyCommandResult::rejects) (see [`evaluate_acceptance`]) —
+/// NOT that every result's `passed` is `true`, since a declared `allowFailure: true` command that
+/// exits nonzero is `passed: false` and still must not reject the run (`acceptance.ts:766,842`).
+///
+/// `default_cwd` is the run-level working directory: it is used verbatim for a command declaring
+/// no `cwd`, and as the base a relative declared `cwd` resolves against — upstream's
+/// `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`).
 ///
 /// Each command is executed via the platform shell (`/bin/sh -c <command>` on Unix,
 /// `cmd /C <command>` on Windows) — a `verify[]` entry is, by func-SA's own data model, a literal
@@ -575,17 +670,31 @@ const VERIFY_OUTPUT_TAIL_BYTES: usize = 4096;
 /// never a propagated error that would abort evaluation of the REMAINING commands.
 pub async fn run_verify_commands(
     commands: &[VerifyCommand],
-    cwd: &Path,
+    default_cwd: &Path,
 ) -> Vec<VerifyCommandResult> {
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
-        results.push(run_one_verify_command(command, cwd, DEFAULT_VERIFY_TIMEOUT).await);
+        results.push(run_one_verify_command(command, default_cwd).await);
     }
     results
 }
 
-/// The single-command core [`run_verify_commands`] loops over, factored out so tests can inject a
-/// shorter timeout without waiting out [`DEFAULT_VERIFY_TIMEOUT`].
+/// The single-command core [`run_verify_commands`] loops over, factored out so tests can execute a
+/// single declared command without going through a whole contract.
+///
+/// Every per-command field the caller declared is honored here, and this is the ONLY place they
+/// are consumed:
+///
+/// - `cwd` — resolved against `default_cwd` when relative, used as-is when absolute
+///   (`path.resolve(defaultCwd, command.cwd)`, `acceptance.ts:716`).
+/// - `env` — layered OVER the inherited environment, never replacing it
+///   (`env: { ...process.env, ...(command.env ?? {}) }`, `acceptance.ts:724`).
+/// - `timeout_ms` — the absolute deadline, falling back to [`DEFAULT_VERIFY_TIMEOUT`]
+///   (`command.timeoutMs ?? 120_000`, `acceptance.ts:759`).
+/// - `allow_failure` — maps a nonzero exit (or a spawn/wait error) to
+///   [`model::VerifyRunStatus::AllowedFailure`] instead of `Failed`, which
+///   [`evaluate_acceptance`] does not reject on. A TIMEOUT is never rescued this way: upstream's
+///   ternary tests `timedOut` FIRST (`acceptance.ts:766`).
 ///
 /// On expiry the command is KILLED, never abandoned: `crate::spawn::signal::terminate_on_timeout`
 /// sends `SIGTERM` and then a hard `SIGKILL` a second later, targeting the command's own process
@@ -603,15 +712,35 @@ pub async fn run_verify_commands(
 /// descendant holding the inherited stdout/stderr write ends (`./server &`, `npm run dev &`) —
 /// `read_to_end` sees EOF only when the LAST holder closes. See [`drained_by`].
 async fn run_one_verify_command(
-    command: &str,
-    cwd: &Path,
-    timeout: Duration,
+    command: &VerifyCommand,
+    default_cwd: &Path,
 ) -> VerifyCommandResult {
-    let mut cmd = shell_command(command);
-    cmd.current_dir(cwd);
+    // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`) —
+    // `path.resolve` returns an absolute segment verbatim and joins a relative one onto the base,
+    // which is exactly what `Path::join` does, so the branch is on absoluteness, not on presence.
+    let cwd = match command.cwd.as_deref() {
+        Some(declared) => default_cwd.join(declared),
+        None => default_cwd.to_path_buf(),
+    };
+    // `command.timeoutMs ?? 120_000` (`acceptance.ts:759`).
+    let timeout = command
+        .timeout_ms
+        .map_or(DEFAULT_VERIFY_TIMEOUT, Duration::from_millis);
+    let allow_failure = command.allow_failure == Some(true);
+
+    let mut cmd = shell_command(&command.command);
+    cmd.current_dir(&cwd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // `env: { ...process.env, ...(command.env ?? {}) }` (`acceptance.ts:724`) — the declared pairs
+    // are layered OVER the inherited environment (`Command` inherits by default and `env` sets a
+    // single key), never a `env_clear()` replacement of it.
+    if let Some(declared) = &command.env {
+        for (key, value) in declared {
+            cmd.env(key, value);
+        }
+    }
     #[cfg(unix)]
     {
         // Own process group, exactly mirroring `spawn::SpawnedChild::spawn`'s rationale: a
@@ -620,13 +749,25 @@ async fn run_one_verify_command(
         cmd.process_group(0);
     }
 
+    // `status: timedOut ? "timed-out" : passed ? "passed" : command.allowFailure
+    // ? "allowed-failure" : "failed"` (`acceptance.ts:766`), for the non-timeout, non-passing arms.
+    let failed_status = if allow_failure {
+        model::VerifyRunStatus::AllowedFailure
+    } else {
+        model::VerifyRunStatus::Failed
+    };
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return VerifyCommandResult {
-                command: command.to_string(),
+                id: command.id.clone(),
+                command: command.command.clone(),
                 exit_code: None,
                 passed: false,
+                // Upstream's `child.on("error", …)` arm honors `allowFailure` too
+                // (`acceptance.ts:775`).
+                status: failed_status,
                 output_tail: String::new(),
                 spawn_error: Some(format!("failed to spawn verify command: {err}")),
             };
@@ -669,9 +810,13 @@ async fn run_one_verify_command(
             task.abort();
         }
         return VerifyCommandResult {
-            command: command.to_string(),
+            id: command.id.clone(),
+            command: command.command.clone(),
             exit_code: None,
             passed: false,
+            // `timedOut` is tested FIRST in upstream's status ternary (`acceptance.ts:766`), so
+            // `allowFailure` deliberately does NOT rescue a timeout.
+            status: model::VerifyRunStatus::TimedOut,
             output_tail: String::new(),
             spawn_error: Some(format!(
                 "verify command exceeded its {}ms timeout and was terminated",
@@ -688,9 +833,11 @@ async fn run_one_verify_command(
         drained_by(deadline + TIMEOUT_SIGTERM_GRACE, stdout_task, stderr_task).await
     else {
         return VerifyCommandResult {
-            command: command.to_string(),
+            id: command.id.clone(),
+            command: command.command.clone(),
             exit_code: None,
             passed: false,
+            status: model::VerifyRunStatus::TimedOut,
             output_tail: String::new(),
             spawn_error: Some(format!(
                 "verify command exceeded its {}ms timeout: it exited, but a process it \
@@ -707,17 +854,25 @@ async fn run_one_verify_command(
             let exit_code = status.code();
             let passed = exit_code == Some(0);
             VerifyCommandResult {
-                command: command.to_string(),
+                id: command.id.clone(),
+                command: command.command.clone(),
                 exit_code,
                 passed,
+                status: if passed {
+                    model::VerifyRunStatus::Passed
+                } else {
+                    failed_status
+                },
                 output_tail: tail_utf8_lossy(&combined, VERIFY_OUTPUT_TAIL_BYTES),
                 spawn_error: None,
             }
         }
         Err(err) => VerifyCommandResult {
-            command: command.to_string(),
+            id: command.id.clone(),
+            command: command.command.clone(),
             exit_code: None,
             passed: false,
+            status: failed_status,
             output_tail: String::new(),
             spawn_error: Some(format!("failed to wait on verify command: {err}")),
         },
@@ -875,10 +1030,13 @@ impl CleanCompletionGate {
 ///    the evidence this module consults — an orchestrator-observed fact, not a child assertion —
 ///    and raising the achieved level to [`AcceptanceStatus::Checked`] when it holds.
 /// 4. If `contract.required_level >= Verified`, [`run_verify_commands`] is ACTUALLY invoked
-///    against every declared command; achieving [`AcceptanceStatus::Verified`] requires **every**
-///    result's `passed` to be `true` — a single failing (or unspawnable/timed-out) command caps
-///    the achieved level below `Verified` regardless of how many others passed, and regardless of
-///    anything the child's own report claims.
+///    against every declared command; achieving [`AcceptanceStatus::Verified`] requires that **no**
+///    result [`rejects`](VerifyCommandResult::rejects) — a single failing (or unspawnable/timed-out)
+///    command caps the achieved level below `Verified` regardless of how many others passed, and
+///    regardless of anything the child's own report claims. A command that declared
+///    `allowFailure: true` and merely exited nonzero is [`model::VerifyRunStatus::AllowedFailure`]
+///    and does NOT cap the level — upstream `evaluateAcceptance` rejects only on
+///    `status === "failed" || status === "timed-out"` (`acceptance.ts:842` @v0.34.0).
 /// 5. If `contract.required_level >= Reviewed`, `contract.reviewer_result` MUST be
 ///    `Some(ReviewerResult { approved: true, .. })` to reach [`AcceptanceStatus::Reviewed`]; a
 ///    `None` reviewer result or an `approved: false` one caps the achieved level below `Reviewed`.
@@ -928,15 +1086,17 @@ pub async fn evaluate_acceptance(
             detail.push("verified: no verify[] commands were declared".to_string());
         } else {
             verify_results = run_verify_commands(&contract.verify, verify_cwd).await;
-            let all_passed = verify_results.iter().all(|r| r.passed);
-            if all_passed {
+            // `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
+            // (`acceptance.ts:842` @v0.34.0) — NOT `!every(passed)`, which would also reject a
+            // command the author explicitly marked `allowFailure: true`.
+            let failed: Vec<&str> = verify_results
+                .iter()
+                .filter(|r| r.rejects())
+                .map(|r| r.command.as_str())
+                .collect();
+            if failed.is_empty() {
                 achieved = achieved.max(AcceptanceStatus::Verified);
             } else {
-                let failed: Vec<&str> = verify_results
-                    .iter()
-                    .filter(|r| !r.passed)
-                    .map(|r| r.command.as_str())
-                    .collect();
                 detail.push(format!(
                     "verified: {} of {} verify[] command(s) failed: {}",
                     failed.len(),
@@ -1140,6 +1300,23 @@ mod tests {
 
     use super::*;
 
+    /// A `verify[]` entry declaring nothing but its shell command — the run-level `cwd`, the
+    /// inherited environment and [`DEFAULT_VERIFY_TIMEOUT`] all apply.
+    fn vc(command: &str) -> VerifyCommand {
+        VerifyCommand::shell(command)
+    }
+
+    /// A `verify[]` entry declaring its own `timeoutMs`, for the timeout/kill-ladder tests that
+    /// must not wait out [`DEFAULT_VERIFY_TIMEOUT`].
+    fn vc_timeout(command: &str, timeout: Duration) -> VerifyCommand {
+        VerifyCommand {
+            timeout_ms: Some(
+                u64::try_from(timeout.as_millis()).expect("a test timeout fits in u64 ms"),
+            ),
+            ..VerifyCommand::shell(command)
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // AcceptanceStatus: lattice ordering and satisfies()
     // ---------------------------------------------------------------------------------------
@@ -1210,7 +1387,7 @@ mod tests {
     fn explicit_contract_is_marked_explicit_and_carries_verify_commands() {
         let contract = AcceptanceContract::explicit(
             AcceptanceStatus::Verified,
-            vec!["true".to_string()],
+            vec![vc("true")],
         );
         assert!(contract.explicit);
         assert_eq!(contract.required_level, AcceptanceStatus::Verified);
@@ -1246,7 +1423,7 @@ mod tests {
 
     #[test]
     fn required_contract_appends_a_machine_parseable_acceptance_contract_block() {
-        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["cargo test".to_string()]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("cargo test")]);
         let out = inject_acceptance_contract("Fix the bug", &contract);
         assert!(out.starts_with("Fix the bug"));
         assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
@@ -1270,7 +1447,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_command_that_exits_zero_is_recorded_as_passed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command("exit 0", dir.path(), Duration::from_secs(5)).await;
+        let result = run_one_verify_command(&vc("exit 0"), dir.path()).await;
         assert!(result.passed);
         assert_eq!(result.exit_code, Some(0));
         assert!(result.spawn_error.is_none());
@@ -1279,7 +1456,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_command_that_exits_nonzero_is_recorded_as_failed_with_real_exit_code() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command("exit 7", dir.path(), Duration::from_secs(5)).await;
+        let result = run_one_verify_command(&vc("exit 7"), dir.path()).await;
         assert!(!result.passed);
         assert_eq!(result.exit_code, Some(7));
     }
@@ -1288,9 +1465,8 @@ mod tests {
     async fn output_tail_captures_real_combined_stdout_and_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = run_one_verify_command(
-            "echo out-marker; echo err-marker 1>&2; exit 1",
+            &vc("echo out-marker; echo err-marker 1>&2; exit 1"),
             dir.path(),
-            Duration::from_secs(5),
         )
         .await;
         assert!(!result.passed);
@@ -1303,19 +1479,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("marker.txt"), "hi").expect("seed file");
         let result =
-            run_one_verify_command("test -f marker.txt", dir.path(), Duration::from_secs(5)).await;
+            run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
         assert!(result.passed, "the file must be visible relative to cwd");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hanging_command_times_out_and_is_recorded_as_failed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command(
-            "sleep 5",
-            dir.path(),
-            Duration::from_millis(100),
-        )
-        .await;
+        let result = run_one_verify_command(&vc_timeout("sleep 5", Duration::from_millis(100)), dir.path())
+            .await;
         assert!(!result.passed);
         assert!(result.spawn_error.as_deref().unwrap_or_default().contains("timeout"));
     }
@@ -1378,9 +1550,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("pid");
         let result = run_one_verify_command(
-            "echo $$ > pid; exec sleep 300",
+            &vc_timeout("echo $$ > pid; exec sleep 300", Duration::from_millis(200)),
             dir.path(),
-            Duration::from_millis(200),
         )
         .await;
 
@@ -1404,9 +1575,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let descendant_pid_file = dir.path().join("descendant");
         let result = run_one_verify_command(
-            "sleep 300 & echo $! > descendant; wait",
+            &vc_timeout("sleep 300 & echo $! > descendant; wait", Duration::from_millis(200)),
             dir.path(),
-            Duration::from_millis(200),
         )
         .await;
 
@@ -1443,9 +1613,11 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(20),
             run_one_verify_command(
-                "sleep 300 & echo $! > descendant; exit 0",
+                &vc_timeout(
+                    "sleep 300 & echo $! > descendant; exit 0",
+                    Duration::from_millis(200),
+                ),
                 dir.path(),
-                Duration::from_millis(200),
             ),
         )
         .await
@@ -1492,9 +1664,11 @@ mod tests {
         let pid_file = dir.path().join("pid");
         let started = tokio::time::Instant::now();
         let result = run_one_verify_command(
-            "trap '' TERM; echo $$ > pid; while true; do sleep 1; done",
+            &vc_timeout(
+                "trap '' TERM; echo $$ > pid; while true; do sleep 1; done",
+                Duration::from_millis(200),
+            ),
             dir.path(),
-            Duration::from_millis(200),
         )
         .await;
         let elapsed = started.elapsed();
@@ -1517,13 +1691,203 @@ mod tests {
     async fn run_verify_commands_executes_every_command_in_order_and_never_short_circuits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let commands = vec![
-            "exit 1".to_string(), // fails
-            "exit 0".to_string(), // still runs, passes
+            vc("exit 1"), // fails
+            vc("exit 0"), // still runs, passes
         ];
         let results = run_verify_commands(&commands, dir.path()).await;
         assert_eq!(results.len(), 2, "both commands must run even though the first failed");
         assert!(!results[0].passed);
         assert!(results[1].passed);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-C12b regression: the per-command `verify[]` fields upstream's ACCEPTANCE_VERIFY_KEYS
+    // admits (`acceptance.ts:44` @v0.34.0 — id/command/timeoutMs/cwd/env/allowFailure) must
+    // actually REACH execution and the gate. `validate_verify_input` has always accepted and
+    // type-checked all six, but the contract carried only the command string, so five of them
+    // were validated and then silently discarded: a `cwd` ran in the wrong directory, an `env`
+    // pair was absent, a `timeoutMs` was replaced by a fixed 300 s, and an `allowFailure: true`
+    // command still rejected the run (rewriting its exit code to 1 via
+    // `apply_post_hoc_correction`) where upstream reports `allowed-failure` and succeeds.
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lower_acceptance_input_carries_every_declared_verify_field() {
+        let contract = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [{
+                "id": "lint",
+                "command": "npm run lint",
+                "timeoutMs": 5000,
+                "cwd": "packages/api",
+                "env": { "CI": "1" },
+                "allowFailure": true,
+            }],
+        }))
+        .expect("a well-formed acceptance policy must lower")
+        .expect("an explicit contract");
+
+        assert_eq!(contract.verify.len(), 1);
+        let declared = &contract.verify[0];
+        assert_eq!(declared.id, "lint");
+        assert_eq!(declared.command, "npm run lint");
+        assert_eq!(declared.timeout_ms, Some(5000), "timeoutMs must survive lowering");
+        assert_eq!(
+            declared.cwd.as_deref(),
+            Some("packages/api"),
+            "cwd must survive lowering"
+        );
+        assert_eq!(
+            declared.env.as_ref().and_then(|env| env.get("CI")).map(String::as_str),
+            Some("1"),
+            "env must survive lowering"
+        );
+        assert_eq!(
+            declared.allow_failure,
+            Some(true),
+            "allowFailure must survive lowering"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_cwd_resolves_against_the_run_level_cwd() {
+        // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("subdir");
+        std::fs::write(dir.path().join("sub/marker.txt"), "hi").expect("seed file");
+
+        let declared = VerifyCommand {
+            cwd: Some("sub".to_string()),
+            ..VerifyCommand::shell("test -f marker.txt")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        assert!(
+            result.passed,
+            "a declared relative cwd must resolve against the run-level cwd, got {result:?}"
+        );
+
+        // The same command WITHOUT the declared cwd must fail, proving the pass above came from
+        // the declared `cwd` and not from the file being visible at the run-level cwd anyway.
+        let undeclared = run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
+        assert!(!undeclared.passed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_env_is_layered_over_the_inherited_environment() {
+        // `env: { ...process.env, ...(command.env ?? {}) }` (`acceptance.ts:724`) — the declared
+        // pairs are added to the inherited environment, never a replacement of it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            env: Some([("CYRUP_VERIFY_MARKER".to_string(), "1".to_string())].into()),
+            ..VerifyCommand::shell(r#"test "$CYRUP_VERIFY_MARKER" = 1 && test -n "$PATH""#)
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        assert!(
+            result.passed,
+            "the declared env pair must be present AND the inherited PATH must survive, got \
+             {result:?}"
+        );
+
+        let undeclared =
+            run_one_verify_command(&vc(r#"test "$CYRUP_VERIFY_MARKER" = 1"#), dir.path()).await;
+        assert!(!undeclared.passed, "the marker must come from the declared env, not the harness");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_timeout_ms_bounds_the_command_instead_of_the_default() {
+        // `setTimeout(abortVerification, command.timeoutMs ?? 120_000)` (`acceptance.ts:759`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            timeout_ms: Some(150),
+            ..VerifyCommand::shell("sleep 30")
+        };
+        let started = std::time::Instant::now();
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.status, model::VerifyRunStatus::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a declared 150ms timeoutMs must bound the command, not DEFAULT_VERIFY_TIMEOUT — took \
+             {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_failure_maps_a_nonzero_exit_to_allowed_failure_and_does_not_reject() {
+        // `status: … passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed"`
+        // (`acceptance.ts:766`) and `evaluateAcceptance`'s reject test, which never names
+        // `allowed-failure` (`acceptance.ts:842`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            allow_failure: Some(true),
+            ..VerifyCommand::shell("exit 1")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+
+        assert_eq!(result.exit_code, Some(1), "the real exit code is still observed");
+        assert!(!result.passed, "`passed` stays the raw exit observation");
+        assert_eq!(result.status, model::VerifyRunStatus::AllowedFailure);
+        assert!(!result.rejects(), "an allowed-failure command must not reject the run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_failure_never_rescues_a_timed_out_command() {
+        // Upstream tests `timedOut` FIRST in the status ternary (`acceptance.ts:766`), so a
+        // command that hangs is `"timed-out"` — which `evaluateAcceptance` DOES reject — even when
+        // it declared `allowFailure: true`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            allow_failure: Some(true),
+            timeout_ms: Some(150),
+            ..VerifyCommand::shell("sleep 30")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+
+        assert_eq!(result.status, model::VerifyRunStatus::TimedOut);
+        assert!(result.rejects(), "a timeout rejects regardless of allowFailure");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allow_failure_command_that_exits_nonzero_still_reaches_verified() {
+        // The end-to-end shape from the bug report: an authored
+        // `{ level: "verified", verify: [{ id: "lint", command: "…", allowFailure: true }] }`
+        // whose command exits nonzero must still be ACCEPTED, so `apply_post_hoc_correction`
+        // never rewrites the run's exit code to ACCEPTANCE_REJECTED_EXIT_CODE.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [
+                { "id": "tests", "command": "exit 0" },
+                { "id": "lint", "command": "exit 1", "allowFailure": true },
+            ],
+        }))
+        .expect("a well-formed acceptance policy must lower")
+        .expect("an explicit contract");
+
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            Some("Done.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
+            no_guard_trigger(),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(
+            ledger.status,
+            AcceptanceStatus::Verified,
+            "a verify[] command declaring allowFailure: true must not reject the run, got: \
+             {ledger:?}"
+        );
+        assert_eq!(ledger.verify_results.len(), 2);
+        assert_eq!(ledger.verify_results[1].status, model::VerifyRunStatus::AllowedFailure);
+        assert_eq!(
+            apply_post_hoc_correction(&ledger, contract.explicit, clean_gate(), None).exit_code,
+            0,
+            "an accepted run must not have its exit code rewritten to \
+             ACCEPTANCE_REJECTED_EXIT_CODE"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1552,7 +1916,7 @@ mod tests {
     async fn a_real_executed_passing_verify_command_reaches_verified() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 0".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
 
         let ledger = evaluate_acceptance(
             &contract,
@@ -1607,7 +1971,7 @@ mod tests {
     async fn a_real_executed_failing_verify_command_is_rejected_regardless_of_prose_claim() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 1".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 1")]);
 
         let ledger = evaluate_acceptance(
             &contract,
@@ -1630,7 +1994,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(
             AcceptanceStatus::Verified,
-            vec!["exit 0".to_string(), "exit 1".to_string(), "exit 0".to_string()],
+            vec![vc("exit 0"), vc("exit 1"), vc("exit 0")],
         );
         let ledger =
             evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
@@ -1643,7 +2007,7 @@ mod tests {
     async fn not_clean_gate_short_circuits_to_not_required_regardless_of_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 0".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
         let dirty_gate = CleanCompletionGate {
             exit_code: 1,
             detached: false,
@@ -2013,6 +2377,60 @@ pub mod model {
         pub env: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub allow_failure: Option<bool>,
+    }
+
+    impl AcceptanceVerifyCommand {
+        /// A bare shell command with no per-command overrides — every optional field left unset so
+        /// [`super::run_one_verify_command`] applies the run-level `cwd`, the inherited
+        /// environment and [`super::DEFAULT_VERIFY_TIMEOUT`], exactly as an authored entry that
+        /// declares only `{ id, command }` does.
+        ///
+        /// `id` defaults to the command text itself. Upstream *requires* an explicit `id`
+        /// (`acceptance.ts:209` — `verify[i].id is required.`) and
+        /// [`validate_acceptance_input`] enforces that before [`super::lower_acceptance_input`]
+        /// runs, so this fallback is only ever reached by callers constructing a contract in Rust
+        /// rather than from an authored `acceptance` param.
+        #[must_use]
+        pub fn shell(command: impl Into<String>) -> Self {
+            let command = command.into();
+            Self {
+                id: command.clone(),
+                command,
+                timeout_ms: Option::None,
+                cwd: Option::None,
+                env: Option::None,
+                allow_failure: Option::None,
+            }
+        }
+    }
+
+    impl From<String> for AcceptanceVerifyCommand {
+        fn from(command: String) -> Self {
+            Self::shell(command)
+        }
+    }
+
+    impl From<&str> for AcceptanceVerifyCommand {
+        fn from(command: &str) -> Self {
+            Self::shell(command)
+        }
+    }
+
+    /// A declared command compares equal to the bare command string it runs, so callers that only
+    /// care about *which shell commands a contract will execute* (the property that mattered when
+    /// [`super::VerifyCommand`] was still a `String`) keep expressing that directly. The
+    /// per-command overrides are deliberately NOT part of this comparison — use the derived
+    /// `PartialEq` on two `AcceptanceVerifyCommand`s for full structural equality.
+    impl PartialEq<String> for AcceptanceVerifyCommand {
+        fn eq(&self, other: &String) -> bool {
+            self.command == *other
+        }
+    }
+
+    impl PartialEq<&str> for AcceptanceVerifyCommand {
+        fn eq(&self, other: &&str) -> bool {
+            self.command == *other
+        }
     }
 
     /// `AcceptanceReviewGate` (types.ts:277-281).

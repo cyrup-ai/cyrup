@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_config::{ConfigDirs, FileSettingsStore, SettingsStore};
+use cyrup_config::{ConfigDirs, FileSettingsStore, SettingsManager, SettingsStore};
 
 /// The official Pi distribution identity (startup-ui.ts:26-28).
 const OFFICIAL_APP_NAME: &str = "pi";
@@ -71,6 +71,31 @@ pub fn settings_path(dirs: &ConfigDirs) -> PathBuf {
     dirs.settings_path()
 }
 
+/// Apply the **third** tier of Pi's `sessionDir` chain to an already-resolved layout (main.ts:625-630):
+///
+/// ```text
+/// const sessionDir =
+///     (parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
+///     (envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+///     startupSettingsManager.getSessionDir();
+/// ```
+///
+/// Tiers 1 (`--session-dir`) and 2 (`$CYRUP_SESSION_DIR`) are already folded into `dirs` by
+/// `ConfigDirs::resolve`; this reads the merged `settings.json` key off the caller's startup
+/// settings manager (Pi `getSessionDir()`, settings-manager.ts:670-673, which tilde-normalizes —
+/// `EffectiveSettings::session_dir` does the same). The lookup lives in the BIN, not in
+/// `cyrup-config`, because the settings file sits under the `agent_dir` that `ConfigDirs::resolve`
+/// is what computes — Pi has the identical ordering and constructs its `startupSettingsManager`
+/// only after the dirs (main.ts:610).
+///
+/// A settings-derived dir is treated as EXPLICIT (used literally, not cwd-encoded): Pi passes it
+/// into `createSessionManager(parsed, cwd, sessionDir, …)` (main.ts:630) through the same argument
+/// slot as `--session-dir`.
+#[must_use]
+pub fn apply_settings_session_dir(dirs: ConfigDirs, settings: &SettingsManager) -> ConfigDirs {
+    dirs.with_settings_session_dir(settings.effective().session_dir().map(PathBuf::from))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -110,5 +135,69 @@ mod tests {
         assert!(store.read(SettingsScope::Global).unwrap().is_none());
         std::fs::write(settings_path(&dirs), "{\"theme\":\"dark\"}").unwrap();
         assert!(store.read(SettingsScope::Global).unwrap().is_some());
+    }
+
+    fn dirs_under(root: &Path) -> ConfigDirs {
+        ConfigDirs {
+            agent_dir: root.join("agent"),
+            session_dir: root.join("agent/sessions"),
+            session_dir_explicit: false,
+            package_dir: root.join("agent/packages"),
+            cwd: root.join("work"),
+            home: root.to_path_buf(),
+        }
+    }
+
+    /// The full startup path Pi runs at main.ts:610-630: build the settings manager over the
+    /// resolved dirs, then let `getSessionDir()` (settings-manager.ts:670-673) supply the third
+    /// `sessionDir` tier. A `"sessionDir"` written into the global `settings.json` must relocate the
+    /// session dir AND mark it explicit, or `session_list_layout`/`Cli::to_session_config` cwd-encode
+    /// a dir the user asked to be used literally.
+    #[test]
+    fn settings_json_session_dir_is_wired_into_config_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = dirs_under(root.path());
+        std::fs::create_dir_all(&dirs.agent_dir).unwrap();
+        let configured = root.path().join("elsewhere/sessions");
+        std::fs::write(
+            settings_path(&dirs),
+            format!(
+                "{{\"sessionDir\": {}}}",
+                serde_json::Value::String(configured.to_string_lossy().into_owned())
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::load(
+            file_settings_store(&dirs),
+            cyrup_config::Settings::new(),
+            false,
+        );
+        let dirs = apply_settings_session_dir(dirs, &settings);
+
+        assert_eq!(dirs.session_dir, configured);
+        assert!(dirs.session_dir_explicit);
+    }
+
+    /// No `sessionDir` key ⇒ the `<agent_dir>/sessions` default stands and the layout stays
+    /// cwd-encoded (Pi's `getSessionDir()` returns `undefined`, so `createSessionManager` falls
+    /// through to `getDefaultSessionDir(cwd)`).
+    #[test]
+    fn absent_settings_session_dir_leaves_the_default_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = dirs_under(root.path());
+        std::fs::create_dir_all(&dirs.agent_dir).unwrap();
+        std::fs::write(settings_path(&dirs), "{\"theme\":\"dark\"}").unwrap();
+
+        let settings = SettingsManager::load(
+            file_settings_store(&dirs),
+            cyrup_config::Settings::new(),
+            false,
+        );
+        let default_dir = dirs.session_dir.clone();
+        let dirs = apply_settings_session_dir(dirs, &settings);
+
+        assert_eq!(dirs.session_dir, default_dir);
+        assert!(!dirs.session_dir_explicit);
     }
 }

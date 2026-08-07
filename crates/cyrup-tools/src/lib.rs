@@ -19,6 +19,7 @@ pub mod config;
 pub mod details;
 pub(crate) mod error;
 pub mod isolation;
+pub(crate) mod jsnum;
 pub mod lock;
 pub mod ops;
 pub mod output;

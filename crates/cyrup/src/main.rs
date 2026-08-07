@@ -175,12 +175,32 @@ async fn run() -> anyhow::Result<i32> {
     let migration = migrations::run_migrations(&dirs);
     timings.mark("runMigrations");
 
-    // Surface settings load/parse errors as warnings (Pi `collectSettingsDiagnostics` over the
-    // `startupSettingsManager`, main.ts:552-553).
+    // Pi's `startupSettingsManager` (main.ts:610-611), created after the migrations and used for
+    // exactly two things: surfacing settings load/parse errors as warnings
+    // (`collectSettingsDiagnostics(startupSettingsManager, "startup session lookup")`), and the
+    // `sessionDir` lookup immediately below. One manager, both jobs — as upstream.
+    //
+    // `project_trusted: false` is cyrup's standing pre-trust posture (R-07-002; the same value this
+    // site already used, and the one every other startup-phase manager here uses). Pi's startup
+    // manager defaults to `projectTrusted: true` (settings-manager.ts:320), so an UNTRUSTED
+    // project's `.cyrup/settings.json` cannot relocate the session dir under cyrup; the global
+    // `<agent_dir>/settings.json` tier — the documented one — behaves exactly as upstream.
+    let mut startup_settings =
+        SettingsManager::load(file_settings_store(&dirs), Settings::new(), false);
     report_diagnostics(&collect_settings_diagnostics(
-        file_settings_store(&dirs),
+        &mut startup_settings,
         "startup session lookup",
     ));
+
+    // `sessionDir` tier 3 (Pi main.ts:625-630): CLI `--session-dir` > `$CYRUP_SESSION_DIR` >
+    // `startupSettingsManager.getSessionDir()` (settings-manager.ts:670-673). `ConfigDirs::resolve`
+    // folded in the first two tiers; the settings tier has to be applied out here because the
+    // settings file lives under the `agent_dir` that `resolve` itself computes — the same reason Pi
+    // builds its startup manager only after the dirs exist. A settings-derived dir counts as
+    // EXPLICIT: Pi hands it to `createSessionManager(parsed, cwd, sessionDir, …)` (main.ts:630)
+    // through the same argument slot as `--session-dir`, so it is used literally rather than
+    // cwd-encoded, and `session_list_layout`/`Cli::to_session_config` below key off that flag.
+    let dirs = cyrup::apply_settings_session_dir(dirs, &startup_settings);
 
     // First-time-setup gate (Pi main.ts:557 / startup-ui.ts:115). Faithfully `false` for the cyrup
     // rebrand (not the official distribution), so the wizard is never invoked; the call-site exists
@@ -1612,13 +1632,14 @@ const EXTENSION_LOAD_FAILURE_MARKER: &str = "Failed to load extension";
 const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"cyrup -ne\".";
 
 /// Drain settings load/parse errors into warning diagnostics (Pi `collectSettingsDiagnostics`,
-/// main.ts:77-85): `(<context>, <scope> settings) <message>`. Builds a throwaway `SettingsManager`
-/// over the file store (project untrusted, so only global is read — matching the startup manager).
+/// main.ts:77-85): `(<context>, <scope> settings) <message>`. Takes the caller's manager rather than
+/// building a throwaway one, because Pi passes the *same* `startupSettingsManager` it then queries
+/// for `sessionDir` (main.ts:610-611, 629) — draining a second, independent manager's errors would
+/// leave the live one still holding them.
 fn collect_settings_diagnostics(
-    store: std::sync::Arc<dyn cyrup_config::SettingsStore>,
+    mgr: &mut cyrup_config::SettingsManager,
     context: &str,
 ) -> Vec<Diagnostic> {
-    let mut mgr = cyrup_config::SettingsManager::load(store, cyrup_config::Settings::new(), false);
     mgr.drain_load_errors()
         .into_iter()
         .map(|e| {

@@ -148,6 +148,9 @@ impl ConfigDirs {
             .or_else(|| env.agent_dir.clone())
             .unwrap_or_else(|| home.join(".cyrup").join("agent"));
 
+        // Tiers 1 and 2 of Pi's three-tier `sessionDir` chain (main.ts:625-630). The third —
+        // `startupSettingsManager.getSessionDir()` — is applied afterwards by the bin via
+        // [`ConfigDirs::with_settings_session_dir`]; see that method for why it cannot live here.
         let session_dir_override = cli.session_dir.clone().or_else(|| env.session_dir.clone());
         let session_dir_explicit = session_dir_override.is_some();
         let session_dir =
@@ -175,6 +178,53 @@ impl ConfigDirs {
             cwd,
             home,
         })
+    }
+
+    /// Apply the third and lowest-precedence `sessionDir` tier — the merged `settings.json` key —
+    /// on top of an already-resolved layout. Pi resolves the whole chain in one expression
+    /// (main.ts:625-630):
+    ///
+    /// ```text
+    /// const sessionDir =
+    ///     (parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
+    ///     (envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+    ///     startupSettingsManager.getSessionDir();
+    /// ```
+    ///
+    /// where `getSessionDir()` returns the merged global+project `settings.sessionDir`
+    /// (settings-manager.ts:670-673). Tiers 1 and 2 are folded in by [`ConfigDirs::resolve`]; this
+    /// method is the tier-3 fallback and it deliberately takes the value as an argument instead of
+    /// reading a file: the settings live under the `agent_dir`/`cwd` that `resolve` is what
+    /// computes, so the caller must resolve the layout first. Pi has the identical ordering — its
+    /// `startupSettingsManager` is constructed *after* the dirs, at main.ts:610 — so the settings
+    /// I/O stays in the bin and `cyrup-config` never touches the filesystem to resolve directories.
+    ///
+    /// Precedence and edge cases, matching Pi's `??` chain:
+    /// - a `--session-dir`/`$CYRUP_SESSION_DIR` override wins outright (the flag is already
+    ///   `session_dir_explicit`, so this is a no-op);
+    /// - an absent or blank value leaves the `<agent_dir>/sessions` default in place. Pi threads a
+    ///   `""` through `??` unchanged, but every consumer re-tests it as
+    ///   `sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd)`
+    ///   (session-manager.ts:1538), so a blank setting resolves to the default either way.
+    ///
+    /// When the tier fires, `session_dir_explicit` becomes **true**: Pi passes a settings-derived
+    /// `sessionDir` into `createSessionManager(parsed, cwd, sessionDir, …)` (main.ts:630) through
+    /// the very same argument slot as `--session-dir`, so it is used LITERALLY rather than
+    /// cwd-encoded (see the field docs on [`ConfigDirs::session_dir_explicit`]).
+    #[must_use]
+    pub fn with_settings_session_dir(mut self, settings_session_dir: Option<PathBuf>) -> Self {
+        if self.session_dir_explicit {
+            return self;
+        }
+        let Some(dir) = settings_session_dir else {
+            return self;
+        };
+        if dir.to_string_lossy().trim().is_empty() {
+            return self;
+        }
+        self.session_dir = dir;
+        self.session_dir_explicit = true;
+        self
     }
 
     pub fn settings_path(&self) -> PathBuf {
@@ -237,6 +287,56 @@ mod tests {
         assert_eq!(dirs.agent_dir, dirs.home.join(".cyrup").join("agent"));
         assert_ne!(dirs.home, dirs.agent_dir);
         assert!(dirs.agent_dir.starts_with(&dirs.home));
+    }
+
+    /// Tier 3 of Pi's `sessionDir` chain (main.ts:625-630): with neither `--session-dir` nor
+    /// `$CYRUP_SESSION_DIR`, the merged `settings.json` key wins over the `<agent_dir>/sessions`
+    /// default — and counts as EXPLICIT, because Pi hands it to `createSessionManager` in the same
+    /// argument slot as the flag (main.ts:630), which selects the literal (not cwd-encoded) layout.
+    #[test]
+    fn settings_session_dir_overrides_the_default_and_is_explicit() {
+        let env = EnvVars::default();
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            ..Default::default()
+        };
+        let dirs = ConfigDirs::resolve(&cli, &env).unwrap();
+        assert_eq!(dirs.session_dir, dirs.agent_dir.join("sessions"));
+        assert!(!dirs.session_dir_explicit);
+
+        let dirs = dirs.with_settings_session_dir(Some(PathBuf::from("/work/sessions")));
+        assert_eq!(dirs.session_dir, PathBuf::from("/work/sessions"));
+        assert!(dirs.session_dir_explicit);
+    }
+
+    /// `??` short-circuits: an explicit `--session-dir`/`$CYRUP_SESSION_DIR` is never reached by the
+    /// settings tier (Pi main.ts:625-627). Blank and absent settings leave the default standing —
+    /// Pi threads `""` through unchanged but every consumer re-tests it with
+    /// `sessionDir ? … : getDefaultSessionDir(cwd)` (session-manager.ts:1538).
+    #[test]
+    fn settings_session_dir_yields_to_cli_env_and_ignores_blanks() {
+        let env = EnvVars::default();
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            session_dir: Some(PathBuf::from("/flag/sessions")),
+            ..Default::default()
+        };
+        let dirs = ConfigDirs::resolve(&cli, &env)
+            .unwrap()
+            .with_settings_session_dir(Some(PathBuf::from("/settings/sessions")));
+        assert_eq!(dirs.session_dir, PathBuf::from("/flag/sessions"));
+
+        let cli = CliConfigOverrides {
+            cwd: Some(PathBuf::from("/")),
+            ..Default::default()
+        };
+        let base = ConfigDirs::resolve(&cli, &env).unwrap();
+        let default_dir = base.agent_dir.join("sessions");
+        for absent in [None, Some(PathBuf::from("")), Some(PathBuf::from("  "))] {
+            let dirs = base.clone().with_settings_session_dir(absent);
+            assert_eq!(dirs.session_dir, default_dir);
+            assert!(!dirs.session_dir_explicit);
+        }
     }
 }
 

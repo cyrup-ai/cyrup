@@ -38,6 +38,19 @@
 //! built here is reachable from the wired gate, the shaping seam, the forwarding transport, or its
 //! integration tests.
 //!
+//! The AUDIT / DEBUG TRAIL is wired too ([`logging`], pi `logging.ts` + the `writeReviewEntry` call
+//! sites throughout `index.ts`): setting `"debug": true` in the `config.json` this crate itself
+//! materializes arms a JSONL trail at `<agent_dir>/cyrup-permission-system/logs/
+//! cyrup-permission-system-debug.jsonl` (redirectable with `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`),
+//! one `{timestamp, extension, stream, event, ...details}` line per record. The `review` stream
+//! carries every decision the gate reaches — `permission_request.blocked` (policy-denied and
+//! confirmation-unavailable, at each of the main / skill-read / external-directory layers),
+//! `.waiting`, `.approved`/`.denied`, `.auto_approved` (yolo), `.duplicate_reused` and
+//! `.approval_persisted` — with prompts and denial reasons accompanied by their
+//! `createSensitiveLogMetadata` digests; the `debug` stream carries lifecycle events
+//! (`config.loaded`). This is the answer to "why was this tool blocked / who approved this", and it
+//! is the reason `debug` is more than a shape-parity field.
+//!
 //! No-panic policy (arch-00 §8): the workspace lints deny unwrap/expect/panic/indexing; this
 //! crate-level `#![deny(...)]` restates it. Tests `#[allow(...)]` at the module level.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -52,6 +65,7 @@ pub mod extension;
 pub mod forwarding;
 pub mod gate;
 pub mod jsonc;
+pub mod logging;
 pub mod manager;
 pub mod ordered;
 pub mod sanitize;

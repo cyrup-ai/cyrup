@@ -34,13 +34,11 @@ use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
-    EndSynchronizedUpdate,
+    enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
 };
 use ratatui::crossterm::{execute, queue, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
@@ -4071,7 +4069,14 @@ fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppStat
 impl App<CrosstermBackend<Stdout>> {
     /// Build the production app: raw mode on, bracketed paste + Kitty keyboard flags enabled
     /// (best-effort, with graceful fallback, R-ARCH-TUI-008), inline viewport on stdout.
+    ///
+    /// The panic hook goes in FIRST, before a single terminal mode is touched, so the window it
+    /// covers is a superset of the window that can leave the terminal broken — a panic between
+    /// `enable_raw_mode` and the return of this function is exactly as fatal to the user's shell as
+    /// one during the event loop. Ports pi's `uncaughtCrash` install
+    /// (`interactive-mode.ts:3684-3686`, handler at `:3622-3638`).
     pub fn into_stdout(theme: UiTheme) -> Result<Self, TuiError> {
+        crate::panic_hook::install_panic_hook();
         enable_raw_mode()?;
         let mut out = io::stdout();
         out.execute(ratatui::crossterm::event::EnableBracketedPaste)?;
@@ -4093,12 +4098,19 @@ impl App<CrosstermBackend<Stdout>> {
     }
 
     /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
-    /// cursor. Total and idempotent so a `Drop` guard / error path always leaves a usable terminal.
+    /// cursor. Total and idempotent so an error path always leaves a usable terminal.
+    ///
+    /// The escape sequence itself lives in [`crate::panic_hook::restore_terminal_best_effort`] and
+    /// this method is a thin delegation to it, deliberately: the panic hook runs the *same*
+    /// teardown, and two hand-maintained copies would silently drift the first time
+    /// [`Self::into_stdout`] learned to enable a fourth mode — a drift only ever discovered by a
+    /// user whose terminal was already broken. Note the release profile sets `panic = "abort"`, so
+    /// no `Drop` guard can stand in for the hook (`Cargo.toml:215`).
     pub fn restore(&mut self) -> Result<(), TuiError> {
-        let mut out = io::stdout();
-        let _ = execute!(out, PopKeyboardEnhancementFlags);
-        let _ = out.execute(ratatui::crossterm::event::DisableBracketedPaste);
-        let _ = disable_raw_mode();
+        crate::panic_hook::restore_terminal_best_effort();
+        // Not a second `Show`-for-its-own-sake: ratatui's `Terminal` tracks `hidden_cursor` itself
+        // and its `Drop` re-emits `Show` when that flag is still set, so the flag is synced through
+        // the API rather than left stale by the raw-stdout write above.
         let _ = self.terminal.show_cursor();
         Ok(())
     }

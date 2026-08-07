@@ -13,7 +13,10 @@ use std::sync::Arc;
 #[serde(rename_all = "camelCase")]
 struct LsInput {
     path: Option<String>,
-    limit: Option<usize>,
+    // Pi's TypeBox `Type.Number` (ls.ts:16) carries no `integer` and no `minimum`, and Pi never
+    // validates tool arguments at runtime, so `limit: 500.0` and `limit: -1` are inputs Pi accepts.
+    // Modeling this as `usize` rejected the whole call at deserialization. See [`crate::jsnum`].
+    limit: Option<f64>,
 }
 
 pub struct LsTool {
@@ -97,7 +100,12 @@ impl Tool for LsTool {
             feruca::Collator::new(feruca::Tailoring::default(), false, true);
         entries.sort_by(|a, b| collator.collate(&a.name.to_lowercase(), &b.name.to_lowercase()));
 
-        let limit = input.limit.unwrap_or(self.opts.limit);
+        // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (ls.ts:125) — no clamp at all. A
+        // negative or zero limit satisfies `results.length >= effectiveLimit` on the very first
+        // iteration (ls.ts:156), so the loop collects nothing and Pi returns "(empty directory)"
+        // before any notice is built; folding negatives to 0 reproduces that exactly. `??` is
+        // null/undefined-only, so a JSON `null` takes the default.
+        let limit = input.limit.map_or(self.opts.limit, crate::jsnum::to_count);
         let mut lines: Vec<String> = Vec::new();
         let mut limit_reached = false;
         for entry in &entries {

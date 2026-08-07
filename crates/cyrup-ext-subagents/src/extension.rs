@@ -10793,6 +10793,7 @@ mod tests {
                 max_items,
                 on_empty: crate::spawn::chain_graph::OnEmpty::Skip,
                 collect_schema: None,
+                fail_fast: false,
             })
         };
 

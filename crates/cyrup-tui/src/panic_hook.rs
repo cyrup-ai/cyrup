@@ -26,6 +26,7 @@
 //! by auditing this workspace's own code.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
@@ -65,11 +66,26 @@ pub fn restore_terminal_best_effort() {
 /// any `RUST_BACKTRACE` output still reach the user. Restoring first is what makes that message
 /// legible: printed under raw mode it would render as a staircase with no carriage returns.
 pub fn install_panic_hook() {
+    INSTALLS.fetch_add(1, Ordering::Relaxed);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_best_effort();
         previous(info);
     }));
+}
+
+/// Number of [`install_panic_hook`] calls so far.
+///
+/// The installed hook is process-global state that no in-process test can read back —
+/// `std::panic::take_hook` hands back an opaque `Box<dyn Fn>` and `PanicHookInfo` cannot be
+/// constructed to invoke it — so this counter is the only handle a test has on "did the wiring
+/// actually happen". One relaxed increment on a once-per-process call.
+static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read [`INSTALLS`]. Test-only; see that static for why it exists.
+#[cfg(test)]
+pub(crate) fn install_count() -> usize {
+    INSTALLS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -78,12 +94,24 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// Both tests below mutate the one process-global panic hook, and libtest runs tests on
+    /// parallel threads. Without this the install-count assertion would race the other test's
+    /// `install_panic_hook` call and fail on an unrelated increment.
+    static HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take [`HOOK_LOCK`], ignoring poisoning: a sibling test that panicked already reported its own
+    /// failure, and refusing the lock here would turn that into a second, misleading one.
+    fn lock_hook() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// The chaining property: the panic message must still be produced. A hook that restored the
     /// terminal and swallowed the diagnostic would trade one silent failure for another.
     #[test]
     fn the_previous_hook_still_runs_after_restoration() {
+        let _guard = lock_hook();
         let seen = Arc::new(AtomicUsize::new(0));
         let flag = Arc::clone(&seen);
 
@@ -110,5 +138,42 @@ mod tests {
     fn restoration_is_safe_without_a_tty_and_is_idempotent() {
         restore_terminal_best_effort();
         restore_terminal_best_effort();
+    }
+
+    /// The wiring: a module that is never called restores nothing. [`crate::App::into_stdout`] must
+    /// install the hook, and must do it BEFORE `enable_raw_mode`.
+    ///
+    /// The ordering half is what makes this assertion sharp rather than incidental. With no
+    /// controlling terminal `enable_raw_mode` fails and `into_stdout` returns `Err` at that line, so
+    /// an install placed after it would never run — the count would not move and this test would
+    /// fail. The two assertions therefore pin both "installed" and "installed first".
+    ///
+    /// Skipped where a controlling terminal exists (a developer running `cargo test` from a shell):
+    /// there `into_stdout` would succeed, really putting that terminal into raw mode and really
+    /// allocating an inline viewport underneath the test harness's output.
+    #[test]
+    fn into_stdout_installs_the_hook_before_it_enables_raw_mode() {
+        if has_controlling_terminal() {
+            return;
+        }
+        let _guard = lock_hook();
+        let before = install_count();
+        let app = crate::App::into_stdout(crate::UiTheme::default());
+        assert!(
+            app.is_err(),
+            "precondition: with no controlling terminal enable_raw_mode must fail, which is what \
+             makes the count below an ordering assertion"
+        );
+        assert_eq!(
+            install_count(),
+            before + 1,
+            "App::into_stdout must call install_panic_hook() before enable_raw_mode()"
+        );
+    }
+
+    /// Mirror of the terminal crossterm would grab: stdin when it is a TTY, else `/dev/tty`.
+    fn has_controlling_terminal() -> bool {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() || std::fs::File::open("/dev/tty").is_ok()
     }
 }
