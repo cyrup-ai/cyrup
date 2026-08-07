@@ -305,6 +305,27 @@ pub enum NdjsonEvent {
 /// Per arch-SA §5.1's ownership invariant, a `SpawnedChild` is owned by exactly one task at a
 /// time — never shared bare across threads (mirrors arch-08 §5.1's "single-thread-per-Store"
 /// invariant for WASM instances, applied here to child-process ownership instead).
+/// One step of a child's stdout read loop, as returned by [`SpawnedChild::next_event_or_exit`].
+///
+/// [`SpawnedChild::next_event`] can only ever report "a line" or "EOF", which silently assumes EOF
+/// always arrives once the child is done. It does not: stdout's write end is inherited by every
+/// descendant, so a child that exits while a surviving grandchild still holds that pipe produces
+/// **no EOF at all**. A read loop with only those two outcomes waits forever on something that can
+/// never happen. [`Self::Exited`] is the missing third outcome.
+#[derive(Debug)]
+pub enum ChildStep {
+    /// A stdout line arrived — or reading/teeing it failed, exactly as
+    /// [`SpawnedChild::next_event`] reports it.
+    Line(Result<NdjsonLine, SubagentError>),
+    /// stdout reached EOF: the ordinary end of a well-behaved child.
+    Eof,
+    /// The process exited while its stdout is STILL OPEN (a surviving grandchild inherited the
+    /// write end). Buffered lines written before the exit may still be readable, so the caller
+    /// should keep draining under a bounded window rather than stopping here — but it must no
+    /// longer wait on an EOF that will never come.
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
 pub struct SpawnedChild {
     child: tokio::process::Child,
     stdout_lines: Lines<BufReader<ChildStdout>>,
@@ -465,6 +486,59 @@ impl SpawnedChild {
 
         let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
         Some(Ok(NdjsonLine { raw: line, parsed }))
+    }
+
+    /// [`SpawnedChild::next_event`], plus the third outcome that method cannot express: the process
+    /// exiting while its stdout stays open. See [`ChildStep`] for why that is not hypothetical.
+    ///
+    /// The race lives INSIDE this method on purpose. A caller cannot put `next_event()` and
+    /// `wait()` in two arms of its own `tokio::select!` — both need `&mut SpawnedChild`, so the
+    /// borrow checker rejects it. That is why the executor's read loop had no exit arm at all: not
+    /// an oversight about the failure mode, a structural block on expressing it. Racing the two
+    /// disjoint fields behind a single `&mut` borrow is what unblocks it.
+    ///
+    /// `biased` with stdout FIRST is load-bearing: when a line and the exit are ready in the same
+    /// poll, the line wins, so a child's final output is never dropped in favour of its own exit
+    /// signal. Both halves are cancellation-safe (`Lines::next_line` retains partial data in its
+    /// buffer; `Child::wait` records the status), which the surrounding loop already depends on —
+    /// it has raced `next_event()` against cancel/deadline arms since it was written.
+    ///
+    /// After an [`ChildStep::Exited`] the child is marked reaped and this method degrades to a pure
+    /// stdout read, so a caller that keeps draining never double-`wait()`s.
+    pub async fn next_event_or_exit(&mut self) -> ChildStep {
+        let Self {
+            child,
+            stdout_lines,
+            jsonl_writer,
+            exited,
+            ..
+        } = self;
+
+        let read = if *exited {
+            stdout_lines.next_line().await
+        } else {
+            tokio::select! {
+                biased;
+                line = stdout_lines.next_line() => line,
+                status = child.wait() => {
+                    *exited = true;
+                    return ChildStep::Exited(status);
+                }
+            }
+        };
+
+        let line = match read {
+            Ok(Some(line)) => line,
+            Ok(None) => return ChildStep::Eof,
+            Err(err) => return ChildStep::Line(Err(SubagentError::Spawn(err))),
+        };
+
+        if let Err(err) = jsonl_writer.write_line(&line).await {
+            return ChildStep::Line(Err(SubagentError::Spawn(err)));
+        }
+
+        let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
+        ChildStep::Line(Ok(NdjsonLine { raw: line, parsed }))
     }
 
     /// Move the child's stderr reader out of this [`SpawnedChild`] so the executor can drain it
@@ -817,6 +891,60 @@ mod tests {
             binary: sh_path,
             base_args: vec!["-c".to_string(), script.to_string()],
         }
+    }
+
+    /// SUBA-S06: a child that exits while a surviving grandchild still holds its stdout open never
+    /// produces EOF, so a read loop whose only outcomes are "line" and "EOF" waits forever on
+    /// something that cannot happen. The executor's `drive_attempt` was exactly that loop: with no
+    /// `timeoutMs` and no terminal assistant stop from the child, not one of its arms could fire,
+    /// and the tool call hung permanently while the activity tick spun once a second.
+    ///
+    /// BOTH halves are asserted on purpose. A fix for a hang is only meaningful if the old shape
+    /// demonstrably hung, and a test that just checks the new call works would pass just as
+    /// happily against a child that closes stdout normally — i.e. against the case that was never
+    /// broken.
+    #[tokio::test]
+    async fn a_child_that_exits_holding_stdout_open_reports_exited_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        // `sleep 30 &` inherits stdout's write end; the direct child then exits immediately. The
+        // pipe stays open long after the process this crate waits on is gone.
+        let spec = ChildSpawnSpec {
+            command: sh_command("sleep 30 & exit 0"),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: StdHashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: Vec::new(),
+        };
+
+        // The pre-fix shape: EOF cannot arrive, so this waits out the whole budget.
+        let mut hung = SpawnedChild::spawn(spec.clone(), &dir.path().join("hang.jsonl"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), hung.next_event())
+                .await
+                .is_err(),
+            "next_event() must HANG here — if it ever starts returning, the failure mode SUBA-S06 \
+             fixes has changed shape, and next_event_or_exit()'s justification needs re-checking \
+             rather than the assertion being deleted"
+        );
+        let _ = hung.terminate(&CancelToken::new()).await;
+
+        // The fix: process exit is itself a wake condition, so the loop is never stranded.
+        let mut child = SpawnedChild::spawn(spec, &dir.path().join("exit.jsonl"))
+            .await
+            .unwrap();
+        let step = tokio::time::timeout(Duration::from_secs(5), child.next_event_or_exit())
+            .await
+            .expect("next_event_or_exit() must observe the exit rather than hang");
+        match step {
+            ChildStep::Exited(status) => {
+                assert!(status.unwrap().success(), "the child exited 0");
+            }
+            other => panic!("expected ChildStep::Exited, got {other:?}"),
+        }
+        let _ = child.terminate(&CancelToken::new()).await;
     }
 
     /// A real spawned child's argv is EXACTLY `base_args` then `args` then the task argument —

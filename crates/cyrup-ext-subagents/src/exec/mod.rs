@@ -1923,6 +1923,17 @@ fn structured_output_absent(schema: Option<&serde_json::Value>, events: &[Subage
 /// SIGTERM->SIGKILL escalation, which this crate routes every forced termination through.
 const FINAL_STOP_GRACE_MS: u64 = 1000;
 
+/// SUBA-S06: how long to keep draining stdout after the child process itself has been reaped while
+/// its stdout is still held open by a surviving grandchild.
+///
+/// This is NOT [`FINAL_STOP_GRACE_MS`]'s job and must not be folded into it. That window is armed
+/// by a *protocol* event (a terminal assistant stop) and expiring it means force-draining a live
+/// process through the signal ladder. This one is armed by an *OS* event (the direct child is
+/// already gone, so there is nothing left to signal) and expiring it simply ends the read loop, so
+/// the ordinary post-loop path can report the exit status it already has. They coincide at 1000ms
+/// today only because both are "give buffered output a beat to arrive".
+const POST_EXIT_DRAIN_MS: u64 = 1000;
+
 /// R-SA-037: does `event` show a child BLOCKING on a `contact_supervisor` supervisor-clarify ask,
 /// and if so, what is the human-facing prompt? A blocking ask is `contact_supervisor`'s
 /// `need_decision`/`interview` reason (the intercom `ask_and_wait` shapes,
@@ -1985,6 +1996,9 @@ async fn drive_attempt(
     // exiting, the child is force-drained. `clean_terminal_stop` accumulates across every terminal
     // stop (pi's `||=`) for `forcedDrainAfterFinalSuccess`.
     let mut final_drain_at: Option<tokio::time::Instant> = None;
+    // SUBA-S06: armed when the child is reaped with stdout still open; expiring it ends the read
+    // loop so the post-loop `wait_final_drain()` can report the already-known exit status.
+    let mut exit_drain_at: Option<tokio::time::Instant> = None;
     let mut clean_terminal_stop = false;
     // R-SA-037: set once the child's NDJSON shows a blocking `contact_supervisor` ask; the ask is
     // surfaced via `spawn_clarify` exactly once (the guard below), and this flag then rides out to
@@ -2003,6 +2017,15 @@ async fn drive_attempt(
         // and reduces to `pending()` (never fires) until the window is armed.
         let final_drain_arm = async {
             match final_drain_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        // SUBA-S06: same fixed-instant reconstruction as `final_drain_arm` above, and `pending()`
+        // (never fires) until the child is actually reaped.
+        let exit_drain_arm = async {
+            match exit_drain_at {
                 Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending::<()>().await,
             }
@@ -2053,9 +2076,9 @@ async fn drive_attempt(
                     detached: detached_seen,
                 };
             }
-            next = child.next_event() => {
-                match next {
-                    Some(Ok(line)) => {
+            step = child.next_event_or_exit() => {
+                match step {
+                    crate::spawn::ChildStep::Line(Ok(line)) => {
                         // NOTE: the raw NDJSON envelope deliberately does NOT enter
                         // `progress.recent_output` — pi appends only EXTRACTED text, from an
                         // assistant `message_end`'s content and a finished tool call's result, and
@@ -2129,12 +2152,42 @@ async fn drive_attempt(
                             progress.record_event(event);
                         }
                     }
-                    Some(Err(_)) | None => {
+                    crate::spawn::ChildStep::Line(Err(_)) | crate::spawn::ChildStep::Eof => {
                         // Stdout EOF (child exited/closed stdout) or a genuine read fault — either
                         // way, stop reading and wait for the real exit status below.
                         break;
                     }
+                    crate::spawn::ChildStep::Exited(_) => {
+                        // SUBA-S06: the process is gone but stdout is STILL OPEN, because a
+                        // surviving grandchild inherited the write end. The EOF this loop used to
+                        // wait on can never arrive, and none of the other arms is guaranteed to
+                        // fire either — `deadline_arm` only exists when the caller passed a
+                        // timeout, `final_drain_arm` only after a terminal assistant stop the
+                        // child never emitted, and the activity tick merely re-scores heuristics.
+                        // So the tool call hung forever, spinning once a second.
+                        //
+                        // Do NOT break here: lines written before the exit may still be buffered
+                        // in the pipe, and dropping them would trade a hang for silent output
+                        // loss. Arm a bounded post-exit window instead and keep draining; the
+                        // status itself is deliberately discarded because the post-loop
+                        // `wait_final_drain()` re-reads it (the child is marked reaped, so that
+                        // call returns immediately) and routes it through the ONE existing clean
+                        // path — which is what keeps this a normal exit rather than a
+                        // `forced_termination`.
+                        if exit_drain_at.is_none() {
+                            exit_drain_at = Some(
+                                tokio::time::Instant::now()
+                                    + Duration::from_millis(POST_EXIT_DRAIN_MS),
+                            );
+                        }
+                    }
                 }
+            }
+            () = exit_drain_arm => {
+                // SUBA-S06: the reaped child's buffered stdout has had its beat; whatever still
+                // holds the pipe open is not this run's problem. Break (never return) so the exit
+                // status flows through the normal post-loop path as an ordinary clean exit.
+                break;
             }
             () = final_drain_arm => {
                 // The child emitted its terminal stop but did not exit within the grace window —
