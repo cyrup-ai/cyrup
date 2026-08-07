@@ -23,6 +23,14 @@ test-fixtures = []
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
+# `prompt_runtime.rs`'s child-side `context` hook (pi `subagent-prompt-runtime.ts:317-321`) filters
+# the LIVE message list, and that seam is typed: `cyrup_ext::EventPatch::Context` carries a
+# `Vec<cyrup_agent::AgentMessage>`, so the filter cannot be written against an opaque JSON value the
+# way `exec/ndjson.rs` deliberately treats a CHILD's NDJSON stream. This names the type that seam
+# already requires — `cyrup-ext` (a direct dependency above) depends on `cyrup-agent` itself, so no
+# new layering is introduced. NB `cyrup_session::AgentMessage` is a DIFFERENT type (a session-entry
+# message); the extension seam wants the agent-loop one.
+cyrup-agent = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }

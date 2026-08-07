@@ -1047,11 +1047,15 @@ const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "
 
 /// Child env flag: whether the subagent inherits the parent's project-context files
 /// (`AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_PROJECT_CONTEXT` (`pi-args.ts:199`).
-const INHERIT_PROJECT_CONTEXT_ENV: &str = "CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT";
+///
+/// Aliased to the READER's declaration ([`crate::prompt_runtime`], which acts on it child-side in
+/// `before_agent_start`) rather than re-spelled here: the two spellings drifting apart would
+/// silently restore the write-only-flag bug this alias exists to prevent.
+const INHERIT_PROJECT_CONTEXT_ENV: &str = crate::prompt_runtime::INHERIT_PROJECT_CONTEXT_ENV;
 
 /// Child env flag: whether the subagent inherits skills discovery — pi
-/// `PI_SUBAGENT_INHERIT_SKILLS` (`pi-args.ts:200`).
-const INHERIT_SKILLS_ENV: &str = "CYRUP_SUBAGENT_INHERIT_SKILLS";
+/// `PI_SUBAGENT_INHERIT_SKILLS` (`pi-args.ts:200`). Same aliasing rule as above.
+const INHERIT_SKILLS_ENV: &str = crate::prompt_runtime::INHERIT_SKILLS_ENV;
 
 /// The MCP adapter's direct-tool-allowlist env (pi keeps this un-namespaced, `pi-args.ts:216-220`):
 /// the comma-joined `mcp:` selectors, or [`MCP_DIRECT_TOOLS_NONE_SENTINEL`] when the agent declares

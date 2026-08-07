@@ -28,6 +28,7 @@ pub mod subagent_config;
 pub mod subagent_runner_cmd;
 pub mod subcommands;
 pub mod timings;
+pub mod update_check;
 
 pub use cli::{
     Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, normalize_short_aliases,

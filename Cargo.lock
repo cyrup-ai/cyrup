@@ -1174,6 +1174,7 @@ name = "cyrup-ext-subagents"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "cyrup-agent",
  "cyrup-config",
  "cyrup-core",
  "cyrup-ext",

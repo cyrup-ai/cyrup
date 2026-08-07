@@ -99,7 +99,7 @@ impl BashExecution {
     /// normalize CRLF/CR to LF, then merge the first new line onto the last existing line (an
     /// incomplete-line continuation) and push the rest as new lines.
     pub fn append_output(&mut self, chunk: &str) {
-        let clean = strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
+        let clean = crate::ansi::strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
         let new_lines: Vec<&str> = clean.split('\n').collect();
         if let (Some(last), Some(first)) = (self.output_lines.last_mut(), new_lines.first()) {
             last.push_str(first);
@@ -212,51 +212,6 @@ impl BashExecution {
 }
 
 
-/// Strip ANSI/VT escape sequences (CSI/OSC and the common single-char escapes) from `s`
-/// (`utils/ansi.ts` `stripAnsi`). A small hand-rolled scanner — no new dependency, no `unsafe`.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek().copied() {
-            // CSI: ESC [ ... final-byte in @-~
-            Some('[') => {
-                chars.next();
-                for n in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            // OSC: ESC ] ... terminated by BEL or ESC \
-            Some(']') => {
-                chars.next();
-                while let Some(n) = chars.next() {
-                    if n == '\u{07}' {
-                        break;
-                    }
-                    if n == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            // Other escapes (e.g. ESC ( B): drop ESC + the next byte.
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -264,12 +219,6 @@ mod tests {
 
     fn plain(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn strip_ansi_removes_color_codes() {
-        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m text"), "red text");
-        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
     }
 
     #[test]

@@ -34,6 +34,7 @@
 //! clipboard-image paste + base64 message-image decode — plus the outer-layer ext-UI command protocol.
 #![forbid(unsafe_code)]
 
+mod ansi;
 mod app;
 mod auth_select;
 mod autocomplete;
@@ -48,6 +49,7 @@ mod editor;
 mod error;
 mod export;
 mod extension_editor;
+mod footer_data;
 mod fuzzy;
 mod image;
 mod keyboard_protocol;
@@ -105,6 +107,10 @@ pub use chrome::{
     truncate_to_visual_lines, BorderedLoader, VisualTruncate,
 };
 pub use editor::{EditorOutcome, InputEditor, VisualLine};
+pub use footer_data::{
+    find_git_paths, resolve_branch as resolve_git_branch, FooterGitBranch, GitPaths,
+    POLL_INTERVAL as GIT_BRANCH_POLL_INTERVAL,
+};
 pub use export::session_jsonl_to_html;
 pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};

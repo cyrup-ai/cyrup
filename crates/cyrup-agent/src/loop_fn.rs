@@ -127,7 +127,10 @@ fn build_run_ctx(
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
-            headers: None,
+        headers: None,
+        // The low-level loop has no live agent to mutate, so state mirrors the supplied config
+        // (pi `createLoopConfig` reads `this.transport`; here the caller supplies it directly).
+        transport: config.gen_config.transport,
     }));
     let subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>> =
         Arc::new(Mutex::new(vec![Arc::new(SinkSubscriber(sink))]));

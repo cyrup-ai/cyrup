@@ -20,7 +20,12 @@ pub struct GenerationConfig {
     pub cache_retention: Option<CacheRetention>,
     /// Per-request header overlay (Pi `SimpleStreamOptions.headers`).
     pub headers: Option<cyrup_provider::HeaderMap>,
-    /// Preferred transport (Pi `AgentOptions.transport`, agent.ts:113/430). Pi defaults to `auto`.
+    /// Preferred transport (Pi `AgentOptions.transport`, agent.ts:118/228). Pi defaults to `auto`.
+    ///
+    /// This is only the BUILD-TIME seed: pi keeps `transport` as a mutable public field on the
+    /// `Agent` (`agent.ts:204`) that `/settings` writes live (`interactive-mode.ts:4213-4216`), so
+    /// the authoritative value lives in [`StateInner::transport`] and this seeds it in
+    /// `AgentBuilder::build`.
     pub transport: Option<Transport>,
     /// Cap (ms) on server-requested retry delays (Pi `AgentOptions.maxRetryDelayMs`, agent.ts:114).
     pub max_retry_delay_ms: Option<u64>,
@@ -78,6 +83,16 @@ pub struct StateInner {
     /// `GenerationConfig` froze them at session build, so a cross-provider `/model` switch kept
     /// sending the PREVIOUS provider's attribution headers.
     pub headers: Option<cyrup_provider::HeaderMap>,
+    /// Preferred transport (pi `SimpleStreamOptions.transport`), LIVE rather than fixed at build.
+    ///
+    /// pi models this as a mutable PUBLIC field on the agent — `public transport: Transport`
+    /// (`agent.ts:204`), seeded from `AgentOptions.transport ?? "auto"` (`agent.ts:228`) and read
+    /// back when the loop config is assembled at run start (`createLoopConfig`, `agent.ts:442`).
+    /// The `/settings` "Transport" row writes it directly: `this.settingsManager.setTransport(t);
+    /// this.session.agent.transport = t` (`interactive-mode.ts:4213-4216`). Holding it only in
+    /// `GenerationConfig` froze it at session build, so cycling the row persisted JSON and changed
+    /// nothing until the next process start.
+    pub transport: Option<Transport>,
 }
 
 impl StateInner {

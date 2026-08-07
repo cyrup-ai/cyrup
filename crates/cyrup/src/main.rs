@@ -517,8 +517,30 @@ async fn run() -> anyhow::Result<i32> {
         // positional is downsampled to 2000px or inlined at full resolution.
         let auto_resize_images = session.services().settings.effective().image_auto_resize();
         let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
-        let interactive =
-            run_interactive(runtime.clone(), session.clone(), inputs, cli.verbose, cancel).await;
+        // The startup package-update check (Pi `interactive-mode.ts:850-856`): DETACHED, gated on
+        // `NetworkPolicy::allow_update_check()` (`--offline` / `CYRUP_OFFLINE` /
+        // `CYRUP_SKIP_VERSION_CHECK`), and delivered to the run loop over a channel so nothing here
+        // is awaited before the first frame. `None` when the gate declines — see
+        // `cyrup::update_check` for why only the PACKAGE half of Pi's pair is ported.
+        let update_policy = cyrup_config::policy::NetworkPolicy::resolve(
+            session.services().settings.effective(),
+            &env,
+            &overrides,
+        );
+        let package_updates = cyrup::update_check::spawn_package_update_check(
+            dirs.package_dir.clone(),
+            Some(dirs.cwd.clone()),
+            update_policy,
+        );
+        let interactive = run_interactive(
+            runtime.clone(),
+            session.clone(),
+            inputs,
+            cli.verbose,
+            cancel,
+            package_updates,
+        )
+        .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
         // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
         // extensions can flush/deregister. Runs even when the TUI loop errored out.
@@ -1526,6 +1548,9 @@ async fn run_interactive(
     // (`cli.rs:818` has always advertised exactly that; TUI-006 makes it true).
     verbose: bool,
     cancel: CancelToken,
+    // The detached startup package-update check's answer channel (Pi `interactive-mode.ts:850-856`);
+    // `None` when the network policy declined. Handed straight to the run loop.
+    package_updates: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -1559,6 +1584,9 @@ async fn run_interactive(
     }
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
+    // Pi shows the package-update notification whenever the detached check settles, which is why the
+    // channel — not the answer — is what reaches the loop (`interactive-mode.ts:850-856`).
+    app.set_package_update_channel(package_updates);
 
     // Configurable keybindings (feature #2; Pi `KeybindingsManager.create`, keybindings.ts:348-352):
     // load the user's `~/.cyrup/keybindings.json` and merge it into every live keymap (global/editor/
@@ -1713,6 +1741,14 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
 
     // Location line (`cwd (branch) • name`, footer.ts:116-130).
     status.set_cwd(home_relative(runtime.cwd()));
+    // …and the `(branch)` half of it, which Pi reads from its `FooterDataProvider`
+    // (`footer.ts:117` → `footer-data-provider.ts` `getGitBranch()`). This is the sole production
+    // caller: before it existed `StatusLine::set_branch` had only test callers, so the segment could
+    // never appear in a real session. Constructed from the RUNTIME's cwd, the same value Pi passes
+    // (`new FooterDataProvider(sessionManager.getCwd())`), not the process cwd — a `--resume` of a
+    // session recorded elsewhere must show THAT tree's branch.
+    let cwd = runtime.cwd().to_path_buf();
+    app.set_footer_git_cwd(&cwd);
 
     // Thinking level → footer suffix + editor rule color (spec/tui/03 §3.3, footer.ts:186-188).
     let level = thinking_level_str(session.thinking_level().await);

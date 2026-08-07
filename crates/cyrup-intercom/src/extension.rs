@@ -210,7 +210,39 @@ impl IntercomExtension {
         let Some(target_id) = self.state.resolve_target(client, &target).await? else {
             return Ok(format!("No intercom session matches \"{target}\"."));
         };
-        compose_send(client, &target_id, &message).await?;
+        let sent = compose_send(client, &target_id, &message).await?;
+        // `pi.appendEntry("intercom_sent", { to, message: { text }, messageId, timestamp })` on the
+        // compose-overlay result path (`index.ts:1878-1884`). Without this the `/intercom <target>
+        // <message>` leg was the ONLY send in the crate that left no trace in the transcript — the
+        // `intercom` tool's `send`/`ask`/`reply` arms all append (`tools/intercom.rs`), so a session
+        // driven from the slash command had an audit log that silently omitted its own outbound
+        // messages (and the `intercom_sent` renderer had nothing to render for them). The §4.3
+        // rendering carve-out degrades pi's interactive OVERLAY to text; it does not excuse dropping
+        // the persistence half.
+        //
+        // `to` is pi's `selectedSession.name || selectedSession.id` — the resolved peer's label, not
+        // the caller-supplied token (JS `||`, so a blank name falls through to the id).
+        if let Some(services) = self.state.host_services() {
+            let to = others
+                .iter()
+                .find(|s| s.id == target_id)
+                .map(|s| {
+                    s.name
+                        .clone()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| s.id.clone())
+                })
+                .unwrap_or_else(|| target_id.clone());
+            let _ = services.append_entry(
+                "intercom_sent",
+                &serde_json::json!({
+                    "to": to,
+                    "message": { "text": message },
+                    "messageId": sent.id,
+                    "timestamp": now_ms(),
+                }),
+            );
+        }
         Ok(format!("Message sent to {target}."))
     }
 }

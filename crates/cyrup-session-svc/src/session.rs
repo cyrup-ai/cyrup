@@ -3030,6 +3030,28 @@ impl AgentSession {
         Ok(effective)
     }
 
+    /// Apply a `transport` settings value to the RUNNING agent — the second half of pi's
+    /// `/settings` "Transport" handler:
+    ///
+    /// ```ts
+    /// onTransportChange: (transport) => {
+    ///     this.settingsManager.setTransport(transport);
+    ///     this.session.agent.transport = transport;   // interactive-mode.ts:4215
+    /// },
+    /// ```
+    ///
+    /// cyrup did only the persist half, so cycling the row wrote JSON that nothing re-read until the
+    /// next process start. `s` is the persisted `TransportSetting` string (`"auto" | "sse" |
+    /// "websocket" | "websocket-cached"`); an unrecognized value falls back to `auto`, matching
+    /// `getTransport()`'s `?? "auto"` (settings-manager.ts:751). Returns the transport actually
+    /// applied. Takes effect from the NEXT run, exactly as pi's `createLoopConfig` read does
+    /// (agent.ts:442).
+    pub async fn set_transport(&self, s: &str) -> cyrup_provider::Transport {
+        let t = crate::builder::parse_transport(s);
+        self.agent.set_transport(Some(t)).await;
+        t
+    }
+
     /// Cycle to the next thinking level (Pi `cycleThinkingLevel`, agent-session.ts:1551). Returns
     /// `None` when the model does not support thinking.
     pub async fn cycle_thinking_level(&self) -> Result<Option<ModelThinkingLevel>, SessionServiceError> {

@@ -75,6 +75,11 @@ use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
 /// height, then clamped against the real content at render time.
 const PAGE_SCROLL_LINES: usize = 10;
 
+/// How often a running `bash` call's `Elapsed …` figure is repainted — Pi's
+/// `setInterval(() => context.invalidate(), 1000)` (bash.ts:471-473), armed only while a bash result
+/// is still partial. See [`TranscriptView::has_running_elapsed_tool`].
+pub const ELAPSED_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The decision produced by feeding one input event to the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppAction {
@@ -333,6 +338,10 @@ pub struct AppState {
     /// Pi's `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
     /// (`interactive-mode.ts:4792-4795`), restored in its `finally`.
     branch_summary_in_flight: bool,
+    /// The footer's git-branch source (Pi's `FooterDataProvider`, `footer-data-provider.ts`), which
+    /// is what fills [`StatusLine::branch`]. Boots as "no repo" and is pointed at the session cwd by
+    /// [`App::set_footer_git_cwd`]; the run loop re-polls it so a `git checkout` elsewhere repaints.
+    pub git_branch: crate::footer_data::FooterGitBranch,
 }
 
 /// Row values of the "Summarize branch?" prompt. Pi compares the returned LABELS
@@ -395,6 +404,10 @@ impl AppState {
             extension_footer: None,
             extension_widget: None,
             branch_summary_in_flight: false,
+            // Pi constructs its `FooterDataProvider` from the session cwd; the binary points this at
+            // the runtime's cwd via [`App::set_footer_git_cwd`] before the first frame. Booting as
+            // "no repo" keeps a backend-only `AppState` free of any filesystem probe.
+            git_branch: crate::footer_data::FooterGitBranch::none(),
         }
     }
 
@@ -577,6 +590,12 @@ pub struct App<B: Backend> {
     /// non-summarizing navigation (no model call, so no abort to deliver and nothing to keep the
     /// loop free for) and the only thing a caller without a loop can do.
     tree_nav_tx: Option<tokio::sync::mpsc::UnboundedSender<TreeNavMsg>>,
+    /// Where the detached startup package-update check posts its answer — Pi's
+    /// `this.checkForPackageUpdates().then((u) => u.length > 0 && this.showPackageUpdateNotification(u))`
+    /// (`interactive-mode.ts:850-856`). Installed by [`App::set_package_update_channel`] before
+    /// [`App::run`]; `None` (no channel wired, or the network policy declined) means the run loop
+    /// grows no arm for it at all. The producer is `cyrup::update_check::spawn_package_update_check`.
+    package_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
 }
 
 /// A spawned `/tree` navigation's outcome, posted back to [`App::run`]'s `select!` so the summarize
@@ -615,7 +634,14 @@ impl<B: Backend> App<B> {
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
         // `Terminal` is top-anchored at the backend's initial cursor; the rebuild fixes the anchor).
-        Ok(App { terminal, state, viewport_height: 0, live_floor: 0, tree_nav_tx: None })
+        Ok(App {
+            terminal,
+            state,
+            viewport_height: 0,
+            live_floor: 0,
+            tree_nav_tx: None,
+            package_update_rx: None,
+        })
     }
 
     /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
@@ -712,6 +738,45 @@ impl<B: Backend> App<B> {
     /// The status line.
     pub fn status_mut(&mut self) -> &mut StatusLine {
         &mut self.state.status
+    }
+
+    /// Point the footer's git-branch source at `cwd` and publish the branch it finds — Pi's
+    /// `new FooterDataProvider(cwd)` followed by the footer's `getGitBranch()`
+    /// (`footer-data-provider.ts`, consumed at `footer.ts:116-120`).
+    ///
+    /// This is the ONLY producer of [`StatusLine::branch`] in the binary: without it the `(branch)`
+    /// segment of the location line can never appear, because nothing else resolves a git HEAD.
+    /// Called once from the bin's footer seeding, before the first frame.
+    pub fn set_footer_git_cwd(&mut self, cwd: &std::path::Path) {
+        self.state.git_branch = crate::footer_data::FooterGitBranch::discover(cwd);
+        let branch = self.state.git_branch.branch().map(str::to_string);
+        self.state.status.set_branch(branch);
+    }
+
+    /// Install the channel the detached startup package-update check answers on — Pi fires that
+    /// check from `run()` and shows the notification whenever it settles
+    /// (`interactive-mode.ts:850-861`, `:3920-3936`).
+    ///
+    /// Must be called before [`App::run`]; the binary passes the receiver
+    /// `cyrup::update_check::spawn_package_update_check` returns, which is `None` when the
+    /// [`NetworkPolicy`](cyrup_config::policy::NetworkPolicy) declined — and then no arm exists.
+    pub fn set_package_update_channel(
+        &mut self,
+        rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
+    ) {
+        self.package_update_rx = rx;
+    }
+
+    /// Re-check the git refs and republish the branch when it moved — Pi's watch-driven
+    /// `refreshGitBranchAsync` → `notifyBranchChange` (`footer-data-provider.ts`), driven here by
+    /// [`App::run`]'s poll tick. Returns `true` when the footer needs a repaint.
+    pub fn poll_footer_git_branch(&mut self) -> bool {
+        if !self.state.git_branch.poll() {
+            return false;
+        }
+        let branch = self.state.git_branch.branch().map(str::to_string);
+        self.state.status.set_branch(branch);
+        true
     }
     /// The terminal (test access to the rendered buffer via `terminal.backend()`).
     pub fn terminal(&self) -> &Terminal<B> {
@@ -2885,6 +2950,14 @@ impl<B: Backend> App<B> {
                             ),
                         ));
                 }
+                // `transport` is live in Pi too, and it is the ONLY row whose live half touches the
+                // agent rather than the UI: `onTransportChange` persists the setting AND assigns
+                // `this.session.agent.transport = transport` (`interactive-mode.ts:4213-4216`), so
+                // the very next request streams with the chosen transport. cyrup persisted only,
+                // which left `AgentBuilder::transport`'s build-time seed in force until restart.
+                if id == "transport" {
+                    session.set_transport(&value).await;
+                }
                 match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
@@ -3201,6 +3274,20 @@ impl<B: Backend> App<B> {
                     args.clone(),
                     rendered,
                 );
+                // Pi's `edit` renderCall fires `computeEditsDiff` the moment the streamed arguments
+                // are complete (edit.ts:377-386) so the diff is on screen while the call is still
+                // pending. `ToolExecutionStart` IS that moment here: cyrup emits it with the full
+                // arguments and BEFORE `prepare`, i.e. before the `before_tool_call` permission gate
+                // (`cyrup-agent/src/agent.rs:1181/1334`), so the preview is up for the whole time an
+                // approval prompt is waiting — and nothing has been written yet.
+                if tool_name == "edit" {
+                    let cwd = self.state.title_cwd.clone();
+                    if let Some(preview) = edit_preview(args, &cwd) {
+                        self.state
+                            .transcript
+                            .set_edit_preview(Some(tool_call_id.as_str()), preview);
+                    }
+                }
             }
             AgentSessionEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
                 // Pi: `this.pendingTools.get(event.toolCallId)` (interactive-mode.ts:3104).
@@ -3750,6 +3837,59 @@ fn flatten_children(items: &[serde_json::Value], depth: usize, sep: &str) -> Opt
     Some(out.join(sep))
 }
 
+/// The largest `edit` target that gets a synchronous pre-execution preview.
+///
+/// Pi's `computeEditsDiff` is `async` and its result lands via `context.invalidate()`, so an
+/// enormous file only costs it a late repaint. cyrup's fold ([`App::ingest_event_rendered`]) is
+/// synchronous — it mutates `&mut self` from a `select!` arm — so the read+diff happens on the UI
+/// thread and an unbounded one would stall the frame. Source files an `edit` targets are orders of
+/// magnitude under this; above it the preview is simply skipped and the post-write `details.diff`
+/// renders as before, which is the pre-preview behaviour, not a regression.
+const MAX_EDIT_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Pi `getRenderablePreviewInput` (edit.ts:170-192) + the `computeEditsDiff` call its `renderCall`
+/// makes (`:377-386`), as one synchronous step.
+///
+/// The arguments are the RAW ones off the wire, before the agent preflight runs the tool's
+/// `prepare_arguments` shim, so both shapes Pi accepts are handled here too: `edits[]` of
+/// `{oldText, newText}` string pairs, and the legacy top-level `{oldText, newText}` single edit.
+/// The path may arrive as `path` or `file_path`. Anything else yields `None` — no preview, no
+/// change in behaviour.
+fn edit_preview(
+    args: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> Option<Result<String, String>> {
+    let obj = args.as_object()?;
+    let path = obj
+        .get("path")
+        .or_else(|| obj.get("file_path"))
+        .and_then(serde_json::Value::as_str)?;
+
+    let str_field = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(serde_json::Value::as_str).map(str::to_string)
+    };
+    let edits: Vec<(String, String)> = match obj.get("edits").and_then(serde_json::Value::as_array) {
+        // `args.edits.every(edit => typeof edit?.oldText === "string" && ...)` — one malformed
+        // entry rejects the whole preview (edit.ts:180-186).
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|e| Some((str_field(e, "oldText")?, str_field(e, "newText")?)))
+            .collect::<Option<Vec<_>>>()?,
+        // `if (typeof args.oldText === "string" && typeof args.newText === "string")` (`:188-190`).
+        _ => vec![(str_field(args, "oldText")?, str_field(args, "newText")?)],
+    };
+
+    let absolute = cyrup_tools::path::resolve_to_cwd(path, cwd);
+    if std::fs::metadata(&absolute).is_ok_and(|m| m.len() > MAX_EDIT_PREVIEW_BYTES) {
+        return None;
+    }
+    Some(
+        cyrup_tools::tools::edit_diff::compute_edits_diff(path, &edits, cwd)
+            .map(|p| p.diff)
+            .map_err(|e| e.to_string()),
+    )
+}
+
 /// The `usage` a `toolResult` message carries, if any (Pi `entry.message.role === "toolResult" &&
 /// entry.message.usage`, `footer.ts:99-101`). Read through the same serde projection
 /// [`custom_message_from_event`] uses, for the same reason: the `AgentMessage` type lives in
@@ -4000,7 +4140,11 @@ fn settings_rows(eff: &cyrup_session_svc::EffectiveSettings, current_theme: &str
             "transport",
             "Transport",
             eff.transport(),
-            choices(&["auto", "websocket", "sse"]),
+            // Pi's four `TransportSetting` values in Pi's own cycle order (`settings-selector.ts:
+            // 505-510`: `["sse", "websocket", "websocket-cached", "auto"]`). `websocket-cached` was
+            // missing here, so a value the settings parser and `parse_transport` both accept was
+            // unreachable from `/settings` and cycling past `sse` could never select it.
+            choices(&["sse", "websocket", "websocket-cached", "auto"]),
         ),
         SettingRow::choice(
             "doubleEscapeAction",
@@ -4563,6 +4707,19 @@ impl App<CrosstermBackend<Stdout>> {
         // pays for it — mirrors the spinner's own `if`-gated pattern immediately above.
         let mut dialog_countdown = tokio::time::interval(Duration::from_secs(1));
         dialog_countdown.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The footer's git-branch refresh (Pi watches `.git/HEAD` with `fs.watch` + a 500 ms debounce,
+        // `footer-data-provider.ts`). cyrup polls the same 500 ms instead of holding an inotify
+        // watch, and the branch is `if`-gated on actually being inside a repo — outside one this arm
+        // never runs at all, and inside one a tick costs a `stat` and repaints only on a real change.
+        let mut git_branch_poll = tokio::time::interval(crate::footer_data::POLL_INTERVAL);
+        git_branch_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The running-`bash` elapsed tick — Pi's `setInterval(() => context.invalidate(), 1000)`,
+        // armed by bash's own `renderResult` while its result is still partial and cleared on the
+        // final one (bash.ts:471-479). Without it the `Elapsed …` figure would only advance when
+        // some OTHER event happened to redraw. Same `if`-gated shape as the spinner above: an idle
+        // session, and any turn not running a bash call, never ticks.
+        let mut elapsed_tick = tokio::time::interval(ELAPSED_TICK_INTERVAL);
+        elapsed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A live `!`/`!!` bash subprocess: its output receiver + a cancel token to kill it (`Esc`).
         // Kept as run-loop locals (not on `self`) so the `select!` borrow does not collide with the
         // input-arm `&mut self`.
@@ -4594,6 +4751,11 @@ impl App<CrosstermBackend<Stdout>> {
         // what makes the spawned path (and therefore Escape→abort and the live
         // `IndicatorKind::BranchSummary` spinner) reachable at all.
         let mut tree_nav_rx = self.install_tree_nav_channel();
+        // The startup package-update check's answer channel, moved out of `self` so the `select!`
+        // arm's borrow does not collide with the `&mut self` the other arms take — the same
+        // run-loop-local shape as `bash_rx` / `tree_nav_rx`. `None` when the binary wired no channel
+        // (offline / `--offline` / `CYRUP_SKIP_VERSION_CHECK`), in which case the arm never resolves.
+        let mut package_update_rx = self.package_update_rx.take();
         loop {
             let theme_changed = async {
                 match theme_rx.as_mut() {
@@ -4609,6 +4771,12 @@ impl App<CrosstermBackend<Stdout>> {
             };
             // Resolve to `true` when the runtime swaps the active session (generation bump). When no
             // runtime is threaded in, never resolves (single fixed session).
+            let package_updates = async {
+                match package_update_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
             let session_swapped = async {
                 match gen_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -4625,6 +4793,19 @@ impl App<CrosstermBackend<Stdout>> {
                 {
                     self.tick_extension_dialog_countdown();
                     self.draw_synchronized()?;
+                }
+                _ = elapsed_tick.tick(), if self.state.transcript.has_running_elapsed_tool() => {
+                    // Pi's `context.invalidate()` → `ui.requestRender()`: nothing to mutate, the
+                    // `Elapsed` figure is computed from `started_at` at render time.
+                    self.draw_synchronized()?;
+                }
+                _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
+                    // Pi repaints only when the branch actually CHANGED (`notifyBranchChange` fires
+                    // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
+                    // nothing.
+                    if self.poll_footer_git_branch() {
+                        self.draw_synchronized()?;
+                    }
                 }
                 maybe_in = input.next() => {
                     let Some(ev) = maybe_in else { break };
@@ -4848,6 +5029,17 @@ impl App<CrosstermBackend<Stdout>> {
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
                     self.draw_synchronized()?;
+                }
+                maybe_updates = package_updates => {
+                    // Pi `:851-855` — `if (updates.length > 0) this.showPackageUpdateNotification(updates)`.
+                    // The producer only ever sends a non-empty list and then drops its sender, so the
+                    // receiver is retired here and the arm goes permanently pending: exactly one
+                    // notification per session, as upstream's single `.then()` gives.
+                    package_update_rx = None;
+                    if let Some(packages) = maybe_updates {
+                        self.state.transcript.push_package_updates(&packages);
+                        self.draw_synchronized()?;
+                    }
                 }
                 Some(warning) = tmux_warning_rx.recv() => {
                     // Pi `:866-868` — `showWarning`, whose copy is `Warning: {message}`

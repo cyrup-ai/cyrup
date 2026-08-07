@@ -542,6 +542,58 @@ pub fn apply_edits_to_normalized_content(
     Ok(AppliedEdits { base_content, new_content })
 }
 
+/// The successful shape of [`compute_edits_diff`] — Pi `EditDiffResult` (edit-diff.ts:505-508).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditDiffPreview {
+    pub diff: String,
+    pub first_changed_line: Option<usize>,
+}
+
+/// `computeEditsDiff` (edit-diff.ts:514-547) — compute the diff one or more edits WOULD produce
+/// **without applying them**.
+///
+/// Pi's doc on that function is literally "Used for preview rendering in the TUI before the tool
+/// executes": `edit`'s `renderCall` fires it as soon as the streamed arguments are complete
+/// (`context.argsComplete`, edit.ts:377-386) so the diff is on screen while the call is still
+/// pending — through the permission prompt, and before a single byte is written. It reads the file
+/// but never writes one.
+///
+/// The steps are exactly [`super::edit::EditTool::execute`]'s minus the write: resolve against
+/// `cwd`, check readability, [`strip_bom`] → [`normalize_to_lf`] →
+/// [`apply_edits_to_normalized_content`] → [`generate_diff_string`]. That shared core is why the
+/// preview and the post-write `details.diff` agree byte-for-byte on the ordinary path, which is
+/// what lets a caller suppress the duplicate (Pi `formatEditResult`, edit.ts:220-226).
+///
+/// `edits` are raw `(oldText, newText)` pairs, LF-normalized internally. Errors are returned as the
+/// message string Pi puts in `EditDiffError.error`: the unreadable-file case keeps Pi's
+/// `Could not edit file: {path}. {…}.` wording (edit-diff.ts:527-531), and everything else is the
+/// `applyEditsToNormalizedContent` message verbatim (not-found / duplicate / overlap / no-change),
+/// so a preview failure reads identically to the failure the real tool would report.
+///
+/// **Blocking.** Pi's is `async` because Node has no other kind of file read; this one uses
+/// `std::fs` so a synchronous renderer can call it. Callers on a UI thread should bound the file
+/// size themselves.
+pub fn compute_edits_diff(
+    path: &str,
+    edits: &[(String, String)],
+    cwd: &std::path::Path,
+) -> Result<EditDiffPreview, String> {
+    let absolute = crate::path::resolve_to_cwd(path, cwd);
+    // Pi checks `access(absolutePath, R_OK)` first and reports the failure as
+    // `Could not edit file: {path}. {…}.` (edit-diff.ts:527-531). A failing read is the same
+    // condition, and the wording matches what `EditTool::execute` already emits (edit.rs:194).
+    let bytes = std::fs::read(&absolute)
+        .map_err(|e| format!("Could not edit file: {path}. {e}."))?;
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+    let (_had_bom, body) = strip_bom(&raw);
+    let normalized = normalize_to_lf(body);
+    let applied =
+        apply_edits_to_normalized_content(&normalized, edits, path).map_err(|e| e.0)?;
+    let (diff, first_changed_line) =
+        generate_diff_string(&applied.base_content, &applied.new_content);
+    Ok(EditDiffPreview { diff, first_changed_line })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

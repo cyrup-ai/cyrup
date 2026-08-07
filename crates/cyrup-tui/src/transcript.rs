@@ -143,6 +143,18 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<String>,
+    /// `edit`'s **pre-execution** diff preview — Pi `EditCallRenderComponent.preview`
+    /// (edit.ts:145-153), set by `setEditPreview` (`:263-280`) from the `computeEditsDiff` its
+    /// `renderCall` fires the moment the streamed arguments are complete (`:377-386`).
+    ///
+    /// It is what puts the diff on screen while the call is still PENDING — through the permission
+    /// prompt (cyrup emits `ToolExecutionStart` before `prepare`, i.e. before the `before_tool_call`
+    /// gate, `cyrup-agent/src/agent.rs:1181/1334`) and before anything is written. `Ok` is the diff
+    /// text, `Err` the `EditDiffError.error` message; `None` is "no preview" (a non-`edit` tool, a
+    /// replayed history entry, or a file too large to preview synchronously).
+    ///
+    /// Populated only through [`TranscriptView::set_edit_preview`].
+    pub preview: Option<Result<String, String>>,
     /// The `image` content blocks of the result, decoded once when the run finishes
     /// (`tool-execution.ts:331-350` filters `content` for `type === "image"` on every display
     /// update). Decoding here rather than per frame keeps a screenshot-sized PNG off the redraw path.
@@ -525,6 +537,7 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
+            preview: None,
             images: Vec::new(),
         });
     }
@@ -544,6 +557,44 @@ impl TranscriptView {
             && partial.is_some()
         {
             run.result = partial;
+        }
+    }
+
+    /// Whether any live tool run is currently drawing a ticking `Elapsed …` figure, i.e. whether the
+    /// frame goes stale on its own and must be repainted on a timer.
+    ///
+    /// This is Pi's `setInterval(() => context.invalidate(), 1000)` condition, verbatim: bash's
+    /// `renderResult` arms that interval exactly when `state.startedAt !== undefined &&
+    /// options.isPartial` and clears it on the final result (bash.ts:471-479). The `result.is_some()`
+    /// term is upstream's `if (this.result)` gate on `renderResult` running at all
+    /// (tool-execution.ts:281) — bash's initial empty update satisfies it immediately (bash.ts:384).
+    ///
+    /// Gates [`crate::App::run`]'s elapsed tick, so an idle session — or one running any tool but
+    /// `bash` — never pays for a redraw.
+    pub fn has_running_elapsed_tool(&self) -> bool {
+        self.active_tools
+            .iter()
+            .any(|r| !r.done && r.name == "bash" && r.started_at.is_some() && r.result.is_some())
+    }
+
+    /// Attach `edit`'s pre-execution diff preview to a still-running call — Pi `setEditPreview`
+    /// (edit.ts:263-280), the sink its `renderCall`'s `computeEditsDiff(...).then(...)` writes into
+    /// (`:378-386`).
+    ///
+    /// `preview` is `Ok(diff)` or `Err(message)` (Pi's `EditDiffResult | EditDiffError`). Routed by
+    /// `toolCallId` like every other per-run update ([`Self::push_tool_update`]); `None` falls back
+    /// to the latest still-running tool. A run that has already finished is skipped — Pi drops a
+    /// late preview by comparing `previewArgsKey` against the request key (`:381`), and once the
+    /// result is in it is the result diff that renders (`formatEditResult`, `:220-226`).
+    pub fn set_edit_preview(&mut self, call_id: Option<&str>, preview: Result<String, String>) {
+        let run = match call_id {
+            Some(id) => {
+                self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id))
+            }
+            None => self.active_tools.iter_mut().rev().find(|r| !r.done),
+        };
+        if let Some(run) = run {
+            run.preview = Some(preview);
         }
     }
 
@@ -594,6 +645,7 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
+                preview: None,
                 images,
             });
         }
@@ -728,6 +780,37 @@ impl TranscriptView {
     /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).
     pub fn push_block(&mut self, title: impl Into<String>, markdown: impl Into<String>) {
         self.pending.push(Entry::Block { title: title.into(), markdown: markdown.into() });
+    }
+
+    /// The startup "packages are out of date" notice — Pi `showPackageUpdateNotification`
+    /// (`interactive-mode.ts:3920-3936`), pushed when the detached package-update check settles with
+    /// a non-empty list (`:850-856`).
+    ///
+    /// Upstream's block is a `DynamicBorder`, a bold title, the instruction, `Packages:` and one
+    /// `- name` line per package, then a closing border — structurally [`Entry::Block`], which is the
+    /// same border/title/body sandwich (interactive-mode.ts:5502-5507). `[CYRUP-DELTA]`: upstream
+    /// tints THIS block's border and title `warning` where the generic block is `accent`; cyrup
+    /// reuses the generic block rather than forking the entry type for a colour.
+    ///
+    /// The action names cyrup's own command, `cyrup update --extensions` (`subcommands.rs`), which is
+    /// upstream's `${APP_NAME} update --extensions` after the rebrand. A no-op on an empty list, so
+    /// the caller never has to guard.
+    pub fn push_package_updates(&mut self, packages: &[String]) {
+        if packages.is_empty() {
+            return;
+        }
+        let list = packages
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.push_block(
+            "Package Updates Available",
+            format!(
+                "Package updates are available. Run {} update --extensions\nPackages:\n{list}",
+                crate::resume_hint::APP_NAME
+            ),
+        );
     }
 
     /// Push a skill-invocation message (`skill-invocation-message.ts`): a `[skill]` label + the skill
@@ -1120,25 +1203,68 @@ fn render_write(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Li
     }
 }
 
-/// `edit` — header `edit <path>` + the result self-diff (`edit.ts:200-227/363-431`, rendered via
+/// `edit` — header `edit <path>` + the diff (`edit.ts:200-227/244-262/363-431`, rendered via
 /// [`crate::diff::render_diff`], the port of `diff.ts`).
+///
+/// Two sources feed that diff, in Pi's order:
+///
+/// 1. the **pre-execution preview** ([`ToolRun::preview`], Pi `buildEditCallComponent`
+///    edit.ts:244-262): a `Spacer(1)` then the diff `computeEditsDiff` produced from the arguments
+///    alone, or the failure message in the error colour. This is on screen while the call is still
+///    PENDING — including for the whole time a permission prompt is up — and before anything is
+///    written.
+/// 2. the settled result's `details.diff`, which **replaces** the preview rather than being appended
+///    below it. That is Pi's own ordering, and it is easy to misread: `renderResult` calls
+///    `setEditPreview(callComponent, { diff: result.details.diff, … })` (edit.ts:196-204) BEFORE
+///    handing `callComponent.preview` to `formatEditResult`, so by the time `formatEditResult` tests
+///    `resultDiff !== previewDiff` (`:220-223`) the two are the same object and the result body
+///    renders nothing. The diff is therefore drawn exactly once, by the call component, and it is
+///    the authoritative post-write one.
+///
+/// The same de-duplication applies to failures: an error result whose text merely restates the
+/// preview error is dropped (`:212-218`), while a preview that succeeded stays on screen next to an
+/// error the tool itself hit.
 fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     let mut spans = vec![Span::styled("edit ", theme.tool_title_style())];
     spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
     out.push(Line::from(spans));
-    let Some(result) = &run.result else { return };
-    if run.is_error {
-        push_error_body(result, theme, out);
-        return;
-    }
-    if let Some(diff) = result
-        .get("details")
+
+    let preview_diff = match &run.preview {
+        Some(Ok(d)) if !d.is_empty() => Some(d.as_str()),
+        _ => None,
+    };
+    let preview_error = match &run.preview {
+        Some(Err(e)) if !e.trim().is_empty() => Some(e.as_str()),
+        _ => None,
+    };
+    // The settled diff supersedes the preview (`setEditPreview` from `renderResult`, edit.ts:196-204).
+    let result_diff = run
+        .result
+        .as_ref()
+        .filter(|_| !run.is_error)
+        .and_then(|r| r.get("details"))
         .and_then(|d| d.get("diff"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+
+    if let Some(diff) = result_diff.or(preview_diff) {
         out.push(Line::default());
         out.extend(crate::diff::render_diff(diff, theme));
+    } else if let Some(err) = preview_error {
+        out.push(Line::default());
+        for l in err.split('\n') {
+            out.push(Line::styled(l.to_string(), theme.error_style()));
+        }
+    }
+
+    if run.is_error
+        && let Some(result) = &run.result
+    {
+        // `if (!errorText || errorText === previewError) return undefined` (edit.ts:215-217).
+        if preview_error.is_some_and(|e| result_text(result).trim() == e.trim()) {
+            return;
+        }
+        push_error_body(result, theme, out);
     }
 }
 
@@ -1192,9 +1318,27 @@ fn render_bash(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Lin
             }
         }
         push_bash_warnings(result, theme, out);
-        if let Some(ms) = run.duration_ms {
+        // The duration footer (bash.ts:309-313). Upstream is literally
+        // `const label = options.isPartial ? "Elapsed" : "Took"` with
+        // `formatDuration((endedAt ?? Date.now()) - startedAt)`, so a RUNNING command shows a live
+        // `Elapsed 12.3s` that only becomes `Took 12.4s` when the call settles — the tool's
+        // `renderResult` arms a 1 s `setInterval(() => context.invalidate())` (`:471-473`) precisely
+        // to make it tick. It is gated on `startedAt`, which `renderCall` stamps the moment
+        // execution begins (`:460-463`), NOT on the result being final; `run.result` is already
+        // `Some` from the first frame because bash emits an initial empty update before it spawns
+        // (bash.ts:384-385, ported at `cyrup-tools/src/tools/bash.rs:170`), which is what makes
+        // upstream's `if (this.result)` renderResult gate (tool-execution.ts:281) pass too.
+        //
+        // Before this, cyrup keyed the line on `duration_ms`, which is written only on settle
+        // (`push_tool_end_rendered`), so a long-running command rendered NO duration at all — the
+        // one number that tells a user a 10-minute build is still alive.
+        if let Some(started) = run.started_at {
+            let (label, ms) = match run.duration_ms {
+                Some(ms) => ("Took", ms),
+                None => ("Elapsed", started.elapsed().as_millis() as u64),
+            };
             out.push(Line::styled(
-                format!("Took {}", format_duration(ms)),
+                format!("{label} {}", format_duration(ms)),
                 theme.muted_style(),
             ));
         }
@@ -1423,23 +1567,29 @@ fn push_error_body(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>
     }
 }
 
-/// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-64): join the `text`
+/// Extract the tool result's display text (`getTextOutput`, render-utils.ts:39-63): join the `text`
 /// blocks of `{content:[…]}`, else a `text`/`output`/`stdout`/`message` string field, else a bare
-/// string/array. Carriage returns are stripped.
+/// string/array.
+///
+/// Every branch goes through [`crate::ansi::sanitize_display_text`] — the full
+/// `sanitizeBinaryOutput(stripAnsi(text)).replace(/\r/g, "")` of `render-utils.ts:48`, not just the
+/// `\r` drop. Only `bash` output arrives pre-sanitized (at capture, `cyrup-session-svc/src/bash.rs`
+/// `sanitize_chunk`); `read`/`ls`/`find`/`grep` and every extension tool reach here raw, and the
+/// transform is idempotent so the pre-sanitized path is unaffected.
 ///
 /// `image` blocks are NOT represented here — they are rendered by [`tool_lines`], either as an
 /// inline half-block raster or as Pi's `[Image: …]` stand-in ([`push_image_fallbacks`]) — so this is
 /// the `showImages`-on half of Pi's `getTextOutput`, whose image-indicator half lives there.
 fn result_text(result: &Value) -> String {
     match result {
-        Value::String(s) => s.replace('\r', ""),
+        Value::String(s) => crate::ansi::sanitize_display_text(s),
         Value::Object(o) => {
             if let Some(content) = o.get("content") {
                 return content_blocks_text(content);
             }
             for k in ["text", "output", "stdout", "message"] {
                 if let Some(Value::String(s)) = o.get(k) {
-                    return s.replace('\r', "");
+                    return crate::ansi::sanitize_display_text(s);
                 }
             }
             String::new()
@@ -1461,16 +1611,16 @@ fn content_blocks_text(content: &Value) -> String {
                     if matches!(ty, Some("text") | None)
                         && let Some(Value::String(t)) = obj.get("text")
                     {
-                        parts.push(t.replace('\r', ""));
+                        parts.push(crate::ansi::sanitize_display_text(t));
                         continue;
                     }
                 } else if let Some(s) = it.as_str() {
-                    parts.push(s.replace('\r', ""));
+                    parts.push(crate::ansi::sanitize_display_text(s));
                 }
             }
             parts.join("\n")
         }
-        Value::String(s) => s.replace('\r', ""),
+        Value::String(s) => crate::ansi::sanitize_display_text(s),
         _ => String::new(),
     }
 }
