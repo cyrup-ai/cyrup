@@ -224,15 +224,12 @@ pub fn match_text(text: &str, parsed: &ParsedSearchQuery) -> Option<f64> {
                 if phrase.is_empty() {
                     continue;
                 }
-                match norm.find(&phrase) {
-                    Some(idx) => total += idx as f64 * 0.1,
-                    None => return None,
-                }
+                // A phrase token that does not occur at all disqualifies the row outright — `?`
+                // is that `return None`, not a silently skipped token.
+                total += norm.find(&phrase)? as f64 * 0.1;
             }
-            TokenKind::Fuzzy => match fuzzy_match(&token.value, text) {
-                Some(s) => total += s,
-                None => return None,
-            },
+            // Same rule for a fuzzy token: no match means the row does not match.
+            TokenKind::Fuzzy => total += fuzzy_match(&token.value, text)?,
         }
     }
     Some(total)

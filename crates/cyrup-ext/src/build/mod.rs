@@ -3,6 +3,8 @@
 //! builds it via `cargo` -> `wasm32-wasip2`. If the wasm/component toolchain is unavailable, the
 //! loop + loader are present but the live build/load path is tooling-gated (surfaced, never a crash).
 
+/// Fingerprinting of the ABI sources that live OUTSIDE an authored extension crate (EXT-028).
+pub mod abi;
 pub mod cache;
 pub mod toolchain;
 
@@ -14,9 +16,25 @@ use crate::manifest::HOST_WORLD;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// BLAKE3 of every ABI source file, computed by `build.rs` at HOST compile time (EXT-028).
+/// `unknown` only if the build script could not resolve the workspace `crates/` directory.
+pub const ABI_FINGERPRINT: &str = env!("CYRUP_EXT_ABI_FINGERPRINT");
+
+/// The full world identity folded into every Tier-1 cache key: the declared [`HOST_WORLD`] PLUS
+/// [`ABI_FINGERPRINT`] (EXT-028).
+///
+/// [`cache::hash_source_tree`] walks only the authored extension crate directory, so a guest that
+/// links `cyrup-ext-sdk` from OUTSIDE that tree — every Tier-1 guest does — would otherwise keep
+/// hitting a stale artifact after an SDK or `world.wit` edit, because neither moves the key.
+/// [`HOST_WORLD`] alone is not enough: it moves only when someone remembers to bump it, which is
+/// precisely the omission (`f777e44`) EXT-028 records.
+pub fn world_abi_id() -> String {
+    format!("{HOST_WORLD}+abi:{ABI_FINGERPRINT}")
+}
+
 /// Build an authored extension crate to a `cyrup:ext` COMPONENT (arch-08 §6.4; R-08-031 /
 /// R-ARCH-EXT-004/015/016). Content-addresses the crate first: a cache HIT (same source ⊕ toolchain
-/// ⊕ world) returns the stored component without invoking `cargo`. On a miss it requires the
+/// ⊕ [`world_abi_id`]) returns the stored component without invoking `cargo`. On a miss it requires the
 /// toolchain (surfaced cleanly if absent), runs `cargo build --target wasm32-wasip2` (the
 /// wasm32-wasip2 linker componentizes directly), locates the artifact, validates the component
 /// preamble, stores it under the cache key, and returns the bytes. A build failure surfaces
@@ -38,7 +56,10 @@ pub fn build_component_in(crate_dir: &Path, cache: &ArtifactCache) -> Result<Vec
     let toolchain = detect_toolchain();
     let key = {
         let src = cache::hash_source_tree(crate_dir)?;
-        cache_key(&src, &toolchain.id(), HOST_WORLD)
+        // EXT-028: the world identity, not the bare `HOST_WORLD` string — `hash_source_tree` cannot
+        // see `world.wit` or the `cyrup-ext-sdk` crate the guest links, and a missed `HOST_WORLD`
+        // bump would otherwise poison the cache exactly as it poisons the version gate.
+        cache_key(&src, &toolchain.id(), &world_abi_id())
     };
 
     // Cache hit: skip cargo entirely (R-ARCH-EXT-016).

@@ -10,6 +10,7 @@
 //! stays here (it needs a real terminal and is not unit-tested).
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use cyrup_config::{
 use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{
-    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionBuilder, SessionConfig,
+    AgentSession, AgentSessionRuntime, InputSource, ScopedModel, SessionConfig,
     SessionFactory, SessionInfo, SessionLayout, SessionServiceError, SessionTarget, SessionsRoot,
     UserInput, list_all, list_in_dir,
 };
@@ -175,12 +176,32 @@ async fn run() -> anyhow::Result<i32> {
     let migration = migrations::run_migrations(&dirs);
     timings.mark("runMigrations");
 
-    // Surface settings load/parse errors as warnings (Pi `collectSettingsDiagnostics` over the
-    // `startupSettingsManager`, main.ts:552-553).
+    // Pi's `startupSettingsManager` (main.ts:610-611), created after the migrations and used for
+    // exactly two things: surfacing settings load/parse errors as warnings
+    // (`collectSettingsDiagnostics(startupSettingsManager, "startup session lookup")`), and the
+    // `sessionDir` lookup immediately below. One manager, both jobs — as upstream.
+    //
+    // `project_trusted: false` is cyrup's standing pre-trust posture (R-07-002; the same value this
+    // site already used, and the one every other startup-phase manager here uses). Pi's startup
+    // manager defaults to `projectTrusted: true` (settings-manager.ts:320), so an UNTRUSTED
+    // project's `.cyrup/settings.json` cannot relocate the session dir under cyrup; the global
+    // `<agent_dir>/settings.json` tier — the documented one — behaves exactly as upstream.
+    let mut startup_settings =
+        SettingsManager::load(file_settings_store(&dirs), Settings::new(), false);
     report_diagnostics(&collect_settings_diagnostics(
-        file_settings_store(&dirs),
+        &mut startup_settings,
         "startup session lookup",
     ));
+
+    // `sessionDir` tier 3 (Pi main.ts:625-630): CLI `--session-dir` > `$CYRUP_SESSION_DIR` >
+    // `startupSettingsManager.getSessionDir()` (settings-manager.ts:670-673). `ConfigDirs::resolve`
+    // folded in the first two tiers; the settings tier has to be applied out here because the
+    // settings file lives under the `agent_dir` that `resolve` itself computes — the same reason Pi
+    // builds its startup manager only after the dirs exist. A settings-derived dir counts as
+    // EXPLICIT: Pi hands it to `createSessionManager(parsed, cwd, sessionDir, …)` (main.ts:630)
+    // through the same argument slot as `--session-dir`, so it is used literally rather than
+    // cwd-encoded, and `session_list_layout`/`Cli::to_session_config` below key off that flag.
+    let dirs = cyrup::apply_settings_session_dir(dirs, &startup_settings);
 
     // First-time-setup gate (Pi main.ts:557 / startup-ui.ts:115). Faithfully `false` for the cyrup
     // rebrand (not the official distribution), so the wizard is never invoked; the call-site exists
@@ -271,8 +292,11 @@ async fn run() -> anyhow::Result<i32> {
         report_diagnostics(&[Diagnostic::warning(warning)]);
     }
 
-    // Map CLI → SessionConfig.
-    let mut config = cli.to_session_config(&dirs, mode);
+    // Map CLI → SessionConfig. The diagnostics half is Pi's `resolvePromptInput` warning channel
+    // (resource-loader.ts:60-63): a `--system-prompt`/`--append-system-prompt` token that names an
+    // EXISTING but unreadable file warns and falls back to being used as literal text — never fatal.
+    let (mut config, prompt_diagnostics) = cli.to_session_config_with_diagnostics(&dirs, mode);
+    report_diagnostics(&prompt_diagnostics);
 
     // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
     // `--session`/`--fork` partial-UUID prefix match, a global cross-project search, a
@@ -348,9 +372,17 @@ async fn run() -> anyhow::Result<i32> {
         && is_fresh_target(&config.target)
     {
         // Pi `hasConfiguredAuth`: the model's provider has a stored credential / known env var
-        // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds.
+        // (e.g. `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds —
+        // **or** a `models.json` block of its own that carries a configured `apiKey` (CFG-022). Pi's
+        // `configuredProviders` set is filled by running `checkAuth` over every COMPOSED provider
+        // (model-runtime.ts:372-374), so a user-declared provider counts with an empty `auth.json`;
+        // without the second tier a fresh custom-provider-only install filtered its own provider out
+        // of step 4 and launched on the offline faux provider instead.
         let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));
-        let has_configured_auth = move |m: &cyrup_provider::Model| auth.has_auth(&m.provider, None);
+        let auth_models_json = models_json.clone();
+        let has_configured_auth = move |m: &cyrup_provider::Model| {
+            cyrup_config::provider_is_configured(&auth, &auth_models_json, &m.provider, None)
+        };
         // Saved settings default `(provider, model)` (Pi step 3), read from the same file store.
         let settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
         let eff = settings.effective();
@@ -422,6 +454,15 @@ async fn run() -> anyhow::Result<i32> {
         if let Some(ext) = subagent_ext {
             factory_builder = factory_builder.with_native_extension(ext);
         }
+        // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+        // as its OWN extension): a plain subagent child attaches NO subagents extension —
+        // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+        // `structured_output` tool cannot come from that gate. This one is independent: it
+        // builds only when the parent passed both structured-output env vars, i.e. only for a
+        // step that actually declared an `outputSchema`. Every other process attaches nothing.
+        if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+            factory_builder = factory_builder.with_native_extension(runtime);
+        }
         if let Some(ic) = intercom_ext {
             factory_builder = factory_builder.with_native_extension(ic);
         }
@@ -440,6 +481,12 @@ async fn run() -> anyhow::Result<i32> {
         let runtime = AgentSessionRuntime::create(factory, target)
             .await
             .context("building agent session runtime")?;
+        // Pi main.ts:843-848 — report the runtime's build diagnostics and exit 1 on any error
+        // (today: the extension-flag reconciliation errors, SEAM-S01).
+        if report_runtime_diagnostics(&runtime).await {
+            runtime.dispose().await;
+            return Ok(1);
+        }
         let session = runtime.session().await;
         apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
         // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
@@ -465,13 +512,24 @@ async fn run() -> anyhow::Result<i32> {
             return Ok(0);
         }
         timings.print();
-        let inputs = build_inputs(&cli, &dirs.cwd).await?;
+        // Pi `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
+        // (main.ts:828-832): the `images.autoResize` setting decides whether an `@image.png`
+        // positional is downsampled to 2000px or inlined at full resolution.
+        let auto_resize_images = session.services().settings.effective().image_auto_resize();
+        let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
         let interactive =
-            run_interactive(runtime.clone(), session, inputs, cli.verbose, cancel).await;
+            run_interactive(runtime.clone(), session.clone(), inputs, cli.verbose, cancel).await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
         // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
         // extensions can flush/deregister. Runs even when the TUI loop errored out.
         runtime.dispose().await;
+        // …and then, on a clean quit, the ONE line Pi prints after disposing
+        // (interactive-mode.ts:3594-3597): the exact invocation that returns here. Under an explicit
+        // `--session-dir` this is the only surfaced route back to the session — the picker a bare
+        // relaunch offers only ever lists the session's own directory.
+        if interactive.is_ok() {
+            print_resume_hint(&dirs, &session).await;
+        }
         interactive?;
         return Ok(0);
     }
@@ -520,6 +578,15 @@ async fn run() -> anyhow::Result<i32> {
             if let Some(ext) = subagent_ext {
                 factory_builder = factory_builder.with_native_extension(ext);
             }
+            // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+            // as its OWN extension): a plain subagent child attaches NO subagents extension —
+            // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+            // `structured_output` tool cannot come from that gate. This one is independent: it
+            // builds only when the parent passed both structured-output env vars, i.e. only for a
+            // step that actually declared an `outputSchema`. Every other process attaches nothing.
+            if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+                factory_builder = factory_builder.with_native_extension(runtime);
+            }
             if let Some(ic) = intercom_ext {
                 factory_builder = factory_builder.with_native_extension(ic);
             }
@@ -540,6 +607,12 @@ async fn run() -> anyhow::Result<i32> {
                     return Err(anyhow::Error::new(e).context("building agent session runtime"));
                 }
             };
+            // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
+            if report_runtime_diagnostics(&runtime).await {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return Ok(1);
+            }
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
@@ -552,10 +625,17 @@ async fn run() -> anyhow::Result<i32> {
             Ok(0)
         }
         AppMode::Print | AppMode::Json => {
-            // One-shot modes never swap sessions: build the one `AgentSession` seam (R-11-008).
+            // SEAM-006: print/json run on the RUNTIME host, exactly like interactive and RPC. Pi's
+            // entry point is `runPrintMode(runtimeHost: AgentSessionRuntime, options)`
+            // (print-mode.ts:32) — it has no bare-session host. Building a bare `AgentSession` here
+            // left every loaded extension's `ctx.newSession()`/`ctx.fork()`/`ctx.switchSession()`/
+            // `ctx.reload()` with nothing to act on (`SessionServiceError::NoRuntimeHost`, warned
+            // and swallowed), and since this arm is what a spawned subagent child re-execs into,
+            // EVERY subagent run inherited the missing host.
+            let target = config.target.clone();
             let fresh = is_fresh_target(&config.target);
             let session_cwd = config.cwd.clone();
-            let mut builder = SessionBuilder::new(provider, config)
+            let mut factory_builder = SessionFactory::new(provider, config)
                 .settings_store(settings_store.clone())
                 .provider_resolver(Arc::new(cyrup::provider::BuiltinProviderResolver::new(models_json.clone())));
             // Intercom companion: built FIRST (concrete) so its broker-backed delivery/clarify seam
@@ -589,10 +669,19 @@ async fn run() -> anyhow::Result<i32> {
                 ),
             };
             if let Some(ext) = subagent_ext {
-                builder = builder.with_native_extension(ext);
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
+            // SUBA-S01 (pi `pi-args.ts:13`, which loads `subagent-prompt-runtime.ts` into the child
+            // as its OWN extension): a plain subagent child attaches NO subagents extension —
+            // `subagent_extension_for_env` returns `None` for it by design — so the child-side
+            // `structured_output` tool cannot come from that gate. This one is independent: it
+            // builds only when the parent passed both structured-output env vars, i.e. only for a
+            // step that actually declared an `outputSchema`. Every other process attaches nothing.
+            if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+                factory_builder = factory_builder.with_native_extension(runtime);
             }
             if let Some(ic) = intercom_ext {
-                builder = builder.with_native_extension(ic);
+                factory_builder = factory_builder.with_native_extension(ic);
             }
             // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + role selection.
             // The one-shot print/json mode is exactly what a spawned subagent child re-execs into, so
@@ -602,26 +691,55 @@ async fn run() -> anyhow::Result<i32> {
                 dirs.agent_dir.clone(),
                 session_cwd,
             ) {
-                builder = builder.with_native_extension(ext);
+                factory_builder = factory_builder.with_native_extension(ext);
             }
-            let session = match builder.build().await {
-                // Bind the self-handle (via `into_shared`) so the post-run loop — auto-retry,
-                // post-run auto-compaction, queued continuations — fires for one-shot print/json runs.
-                Ok(s) => s.into_shared(),
+            let factory = Arc::new(factory_builder);
+            // `create_unannounced` also binds the self-handle (via `into_shared`) so the post-run
+            // loop — auto-retry, post-run auto-compaction, queued continuations — fires for one-shot
+            // print/json runs.
+            //
+            // SEAM-033: it does NOT announce `session_start`. Pi's `createAgentSessionRuntime`
+            // doesn't either (agent-session-runtime.ts:414-432); the mode does, from
+            // `rebindSession()` → `bindExtensions()` at print-mode.ts:119 → :73, which is reached
+            // only after `main.ts` has applied `--name` (main.ts:650) and the scoped `--models`
+            // (main.ts:742-750). `apply_post_build` below is cyrup's analog of both, so announcing
+            // inside the constructor would show every `session_start` handler an unnamed, unscoped
+            // session — and this arm is what a spawned subagent child re-execs into, so every
+            // subagent run would inherit it. `run_print_dispatch`/`run_json_dispatch` announce.
+            let runtime = match AgentSessionRuntime::create_unannounced(factory, target).await {
+                Ok(r) => r,
                 // Non-interactive no-models-available guard (Pi main.ts:795-798).
                 Err(SessionServiceError::NoModels(_)) => return no_models_available(),
-                Err(e) => return Err(anyhow::Error::new(e).context("building agent session")),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context("building agent session runtime"));
+                }
             };
+            // Pi main.ts:843-848 (SEAM-S01) — same checkpoint, every mode.
+            if report_runtime_diagnostics(&runtime).await {
+                runtime.dispose().await;
+                cyrup::output_guard::restore_stdout();
+                return Ok(1);
+            }
+            let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
-            let _signals = spawn_abort_on_signal(session.clone(), cancel.clone());
-            let inputs = build_inputs(&cli, &dirs.cwd).await?;
-            ensure_prompt(&inputs)?;
+            // `settingsManager.getImageAutoResize()` for the `@file` image path (Pi main.ts:830),
+            // read before `session` moves into the signal guard.
+            let auto_resize_images = session.services().settings.effective().image_auto_resize();
+            let _signals = spawn_abort_on_signal(session, cancel.clone());
+            // NO prompt-required guard here: Pi has none. `buildInitialMessage` answers
+            // `initialMessage: undefined` for a run with no stdin/`@file`/message
+            // (initial-message.ts:36-42) and `runPrintMode` simply skips its send loops
+            // (print-mode.ts:121-127), falling through to the terminal output block and returning 0.
+            // The `ensure_prompt` bail that used to sit here inverted the exit code of every
+            // prompt-less one-shot invocation — `cyrup -c -p`, `cyrup --session <id> --mode json` —
+            // and suppressed JSON mode's session header entirely. See `run::turn_inputs`.
+            let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
             let mut out = io::stdout();
             let dispatch = if let AppMode::Json = mode {
-                run_json_dispatch(&session, &inputs, &mut out).await
+                run_json_dispatch(&runtime, &inputs, &mut out).await
             } else {
-                run_print_dispatch(&session, &inputs, &mut out).await
+                run_print_dispatch(&runtime, &inputs, &mut out).await
             };
             // Restore stdout at teardown (Pi `finally { restoreStdout() }`, main.ts:848).
             cyrup::output_guard::restore_stdout();
@@ -655,7 +773,14 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
         cli.models.clone()
     };
     if !patterns.is_empty() {
-        let scoped = resolve_scoped_models(&session.model_catalog(), &patterns);
+        let catalog = session.model_catalog();
+        // Pi `resolveModelScope` prints EVERY diagnostic its `WithDiagnostics` sibling collected —
+        // `console.warn(chalk.yellow(`Warning: ${diagnostic.message}`))`, model-resolver.ts:355-361 —
+        // before returning the (possibly empty) scope, and does so on the live path at main.ts:741-743
+        // for both `--models` and the `enabledModels` fallback. Without this a typo'd
+        // `--models "anthropc/*"` scoped nothing with no output at all.
+        report_diagnostics(&scope_diagnostics(&catalog, &patterns));
+        let scoped = resolve_scoped_models(&catalog, &patterns);
         if !scoped.is_empty() {
             // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
             // when `--models` scopes the set and `--model` is omitted, the active model is the saved
@@ -737,6 +862,86 @@ fn resolve_scoped_models(
             thinking_level: sm.thinking_level,
         })
         .collect()
+}
+
+/// The scope diagnostics Pi emits alongside the resolved scope (Pi `ModelScopeDiagnostic` /
+/// `resolveModelScopeWithDiagnostics`, model-resolver.ts:259-350), in Pi's order: for each pattern,
+/// the `invalid-thinking-level` warning first (:330-332), then the `no-match` warning when the
+/// pattern selected nothing (:311-318 for the glob arm, :334-341 for the non-glob arm).
+///
+/// `resolve_scope` returns only the matched set, so emptiness *per pattern* is the no-match test —
+/// hence the one-element slice per iteration rather than a bulk call. That keeps the glob/non-glob
+/// split, the `:level` suffix stripping and the `minimatch` semantics in the single ported
+/// implementation instead of duplicating them here; the only cost is that the de-duplication Pi does
+/// across patterns is irrelevant to emptiness anyway (a pattern whose every match was already seen
+/// still matched, and still resolves non-empty on its own).
+///
+/// [CYRUP-DELTA] Pi's glob arm short-circuits on `findExactModelReferenceMatch(globPattern)` before
+/// running `minimatch` (:308-314), so a literal model id that happens to contain `[` or `?` never
+/// reaches the no-match branch. `resolve_scope` has no such short-circuit, so such an id would warn
+/// here where Pi stays silent — no shipped catalog id contains a glob metacharacter, and closing it
+/// belongs in `cyrup-config`'s resolver, not in the bin.
+fn scope_diagnostics(catalog: &[cyrup_provider::Model], patterns: &[String]) -> Vec<Diagnostic> {
+    let resolver = cyrup_config::ModelResolver::new(catalog);
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    for pattern in patterns {
+        // Pi pushes the `invalid-thinking-level` warning BEFORE the no-match check, and only for the
+        // non-glob arm — the glob arm silently ignores an unrecognised `:suffix` and globs the whole
+        // pattern (model-resolver.ts:288-297).
+        if !is_glob_pattern(pattern)
+            && let Some(message) = invalid_thinking_level_message(&resolver, pattern)
+        {
+            diagnostics.push(Diagnostic::warning(message));
+        }
+        if resolver.resolve_scope(std::slice::from_ref(pattern)).is_empty() {
+            diagnostics.push(Diagnostic::warning(format!(
+                "No models match pattern \"{pattern}\""
+            )));
+        }
+    }
+    diagnostics
+}
+
+/// Pi's glob test — a pattern is a glob iff it contains `*`, `?` or `[` (model-resolver.ts:286,
+/// mirrored at `cyrup-config` model.rs:257).
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+/// Pi's `invalid-thinking-level` message at Pi's exact wording — `Invalid thinking level "X" in
+/// pattern "Y". Using default instead.` (`parseModelPattern`, model-resolver.ts:243).
+///
+/// `cyrup-config`'s [`cyrup_config::ModelResolver::parse_pattern`] detects the identical condition
+/// but abbreviates the text to `invalid thinking level '<suffix>'` and drops the pattern (model.rs:
+/// 205-212), because on the `--model` path that string is only ever appended to a caller-composed
+/// sentence. So this replays `parseModelPattern`'s colon-stripping recursion (model-resolver.ts:
+/// 196-246) to recover WHICH recursion level produced it, and formats Pi's sentence there:
+///
+/// * a valid `:level` suffix recurses on the prefix and *propagates* the inner warning (:218-226);
+/// * an invalid suffix warns at THIS level and *overwrites* any inner warning, but only when the
+///   prefix itself resolves to a model (:237-245) — otherwise the inner (model-less, warning-less)
+///   result is returned verbatim.
+///
+/// Gated on the resolver reporting a warning at all, so a pattern that simply does not match
+/// produces nothing here and falls through to the `no-match` diagnostic.
+fn invalid_thinking_level_message(
+    resolver: &cyrup_config::ModelResolver<'_>,
+    pattern: &str,
+) -> Option<String> {
+    resolver.parse_pattern(pattern, false).warning?;
+    // A warning implies the pattern did NOT match outright (an exact/partial hit returns early with
+    // `warning: None`, model-resolver.ts:200-204), so a colon split did happen.
+    let idx = pattern.rfind(':')?;
+    let (prefix, rest) = pattern.split_at(idx);
+    let suffix = rest.get(1..).unwrap_or("");
+    if cyrup_config::parse_thinking_level(suffix).is_some() {
+        // Valid level — the warning came from deeper in the recursion (:218-226).
+        return invalid_thinking_level_message(resolver, prefix);
+    }
+    // Invalid suffix — Pi warns HERE iff the prefix resolves (:237-245).
+    resolver.parse_pattern(prefix, false).model.map(|_| {
+        format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead.")
+    })
 }
 
 /// Resolve the session target with Pi's full non-interactive depth (Pi `createSessionManager`,
@@ -928,14 +1133,81 @@ fn session_list_layout(dirs: &ConfigDirs) -> SessionLayout {
     }
 }
 
+/// Pi's shared-directory cwd filter for the LOCAL listing:
+/// `const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd)`
+/// (`SessionManager.list`, session-manager.ts:1639-1640), applied as
+/// `.filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd))` (:1641-1643).
+/// A custom `--session-dir` may hold SEVERAL projects' sessions in one flat directory, so the local
+/// listing must keep only this cwd's; the cwd-encoded default already isolates by cwd, so it never
+/// filters — and an explicit dir that happens to BE the cwd-encoded default is likewise not filtered
+/// (Pi compares the resolved paths, not just "was it explicit"). This is the same predicate the
+/// CONTINUE path computes for `continue_recent_filtered` (`SessionServiceBuilder::build`,
+/// builder.rs:576-583; Pi `continueRecent`, session-manager.ts:1558-1559).
+fn session_list_cwd_filter(dirs: &ConfigDirs) -> Option<&Path> {
+    if !dirs.session_dir_explicit {
+        return None;
+    }
+    let default_dir = SessionLayout::new(dirs.agent_dir.join("sessions"), dirs.cwd.clone()).dir();
+    (dirs.session_dir != default_dir).then_some(dirs.cwd.as_path())
+}
+
+/// Write Pi's exit hint — `To resume this session: cyrup [--session-dir DIR] --session ID` — on the
+/// way out of interactive mode (`interactive-mode.ts:3594-3597`, using `formatResumeCommand`,
+/// `:231-244`).
+///
+/// The gates (tty stdout, a persisted session, a session file that exists) live in
+/// [`cyrup_tui::format_resume_command`]; this function's whole job is to resolve the four inputs off
+/// the live session. `default_session_dir` is Pi's `getDefaultSessionDirPath(cwd)` — the SAME
+/// cwd-encoded path [`session_list_cwd_filter`] compares against — so the `--session-dir` argument is
+/// printed exactly when the session is not where a bare relaunch would look for it.
+async fn print_resume_hint(dirs: &ConfigDirs, session: &AgentSession) {
+    use std::io::Write;
+
+    use cyrup_tui::crossterm::tty::IsTty;
+
+    let session_file = session.session_file().await;
+    let default_session_dir =
+        SessionLayout::new(dirs.agent_dir.join("sessions"), dirs.cwd.clone()).dir();
+    let target = cyrup_tui::ResumeTarget {
+        session_id: session.session_id().as_str(),
+        session_file: session_file.as_deref(),
+        session_dir: session.session_dir(),
+        default_session_dir: &default_session_dir,
+    };
+    let Some(command) = cyrup_tui::format_resume_command(&target, std::io::stdout().is_tty()) else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(cyrup_tui::resume_hint_line(&command).as_bytes());
+    let _ = out.flush();
+}
+
+/// The cross-project listing, mirroring Pi's TWO `SessionManager.listAll` overloads
+/// (session-manager.ts:1653-1655). With a custom `sessionDir` it degenerates to
+/// `listSessionsFromDir(customSessionDir)` — that ONE directory, newest-first, no cross-project walk
+/// and (unlike `list`) no cwd filter, so the picker can still reach another project's session parked
+/// in the shared dir (session-manager.ts:1660-1665). Without one it walks every project directory
+/// under the sessions root (:1667+). Handing an explicit `--session-dir` to the root walk instead
+/// would scan its SUBdirectories and return nothing for a flat shared dir.
+fn list_global_sessions(dirs: &ConfigDirs) -> Vec<SessionInfo> {
+    if dirs.session_dir_explicit {
+        // Pi's `listAll(sessionDir)` overload — an unfiltered single-directory scan, i.e.
+        // `cyrup_session::listing::list_all_in_dir`, which is `list_in_dir(dir, None, …)`.
+        list_in_dir(&dirs.session_dir, None, None)
+    } else {
+        list_all(&SessionsRoot(dirs.session_dir.clone()))
+    }
+}
+
 /// Scan the cwd's local session listing and the global cross-project listing into a merged
 /// [`SessionInfo`] vector (locals first, globals de-duplicated by path) for the `--resume` picker (Pi
-/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25).
+/// `selectSession`'s `current`/`all` `SessionsLoader`s, session-picker.ts:23-25 — fed by
+/// `SessionManager.list(cwd, sessionDir, onProgress)` / `SessionManager.listAll(sessionDir,
+/// onProgress)`, main.ts:372-373).
 fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
-    let root = dirs.session_dir.clone();
     let layout = session_list_layout(dirs);
-    let mut sessions = list_in_dir(&layout.dir(), None, None);
-    for global in list_all(&SessionsRoot(root)) {
+    let mut sessions = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None);
+    for global in list_global_sessions(dirs) {
         if !sessions.iter().any(|s| s.path == global.path) {
             sessions.push(global);
         }
@@ -944,15 +1216,14 @@ fn gather_session_infos(dirs: &ConfigDirs) -> Vec<SessionInfo> {
 }
 
 /// Scan the cwd's session listing and the global cross-project listing into [`SessionRef`]s (Pi
-/// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:169,179).
+/// `SessionManager.list(cwd, sessionDir)` + `SessionManager.listAll(sessionDir)`, main.ts:218,227).
 fn gather_session_refs(dirs: &ConfigDirs) -> (Vec<SessionRef>, Vec<SessionRef>) {
-    let root = dirs.session_dir.clone();
     let layout = session_list_layout(dirs);
-    let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), None, None)
+    let locals: Vec<SessionRef> = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None)
         .iter()
         .map(SessionRef::from)
         .collect();
-    let globals: Vec<SessionRef> = list_all(&SessionsRoot(root))
+    let globals: Vec<SessionRef> = list_global_sessions(dirs)
         .iter()
         .map(SessionRef::from)
         .collect();
@@ -1164,16 +1435,6 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
     Ok(0)
 }
 
-/// Require a non-empty prompt for the one-shot modes (a message, an `@file`, or piped stdin).
-fn ensure_prompt(inputs: &Inputs) -> anyhow::Result<()> {
-    if inputs.is_empty() {
-        anyhow::bail!(
-            "no prompt provided: pass a message, an @file reference, or pipe text on stdin"
-        );
-    }
-    Ok(())
-}
-
 /// The terminal-query drain window for the startup benchmark (Pi `setTimeout(resolve, 150)`,
 /// main.ts:826): the brief pause that lets the TUI's stdin handler consume the terminal's query
 /// replies (Kitty keyboard protocol, device attributes, cell size) before the terminal is restored.
@@ -1239,6 +1500,10 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
             ResourceKind::Prompt,
             home,
         ),
+        // The whole extension vector, Pi-faithfully (`:1660-1665` maps every recorded error into the
+        // block). In practice only the NON-fatal entries — the project-trust skips — are reachable
+        // here: a genuine load failure is reported and exits 1 at `report_runtime_diagnostics`, well
+        // before this panel is built, exactly as Pi's `main.ts:843-849` precedes `InteractiveMode`.
         extension_diagnostics: cyrup_tui::extension_diagnostics(
             &services.startup_diagnostics.extensions,
             home,
@@ -1381,6 +1646,9 @@ async fn run_interactive(
             cancel,
         )
         .await;
+    // `App::run` already drained and restored on its way out (app.rs, `drain_and_restore`). This is
+    // the idempotent safety net for the error paths that leave `run` early — restore only, since
+    // draining after raw mode is gone accomplishes nothing.
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
@@ -1492,14 +1760,53 @@ fn report_diagnostics(diagnostics: &[Diagnostic]) {
     }
 }
 
+/// Pi's SECOND `reportDiagnostics` checkpoint — `reportDiagnostics(runtime.diagnostics)` +
+/// `process.exit(1)` on any error (main.ts:843-848). Returns `true` when the caller must exit 1.
+///
+/// SEAM-S01: `AgentSessionRuntime::diagnostics()` had NO production consumer, which is why a
+/// mistyped `--flag` (captured as an extension flag, then owned by no loaded extension) was
+/// swallowed with no message and exit 0. Runs in every mode, exactly like Pi's single call site,
+/// which sits after runtime creation and before the mode dispatch.
+///
+/// EXT-S01: extension LOAD failures ride this channel too. Containment (one built-in's failing
+/// `init()` no longer aborts the whole build) is Pi's `loader.ts:537-540` `errors.push(...); continue`
+/// — but Pi then LIFTS those errors onto `runtime.diagnostics` (`main.ts:735-738`) and exits 1 on
+/// them, including Pi's `EXTENSION_LOAD_FAILURE_HINT` (`main.ts:61`, `:844-846`), reproduced below.
+/// Routing them to the interactive-only `[Extension issues]` panel alone would leave print/json/rpc
+/// silent at exit 0 — and cyrup's natives include the permission gate, so that would be fail-OPEN.
+async fn report_runtime_diagnostics(runtime: &AgentSessionRuntime) -> bool {
+    let diagnostics = runtime.diagnostics().await;
+    let mut fatal = false;
+    for d in &diagnostics {
+        if d.severity == "error" {
+            fatal = true;
+            eprintln!("Error: {}", d.message);
+        } else {
+            eprintln!("Warning: {}", d.message);
+        }
+    }
+    // Pi `main.ts:844-846`: matched on the message text, over ALL diagnostics, not just the errors.
+    if fatal && diagnostics.iter().any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER)) {
+        eprintln!("{EXTENSION_LOAD_FAILURE_HINT}");
+    }
+    fatal
+}
+
+/// Pi `main.ts:844` — the substring that selects the extension-load hint.
+const EXTENSION_LOAD_FAILURE_MARKER: &str = "Failed to load extension";
+
+/// Pi `EXTENSION_LOAD_FAILURE_HINT` (main.ts:61), rebranded to cyrup's own `-ne` short flag.
+const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"cyrup -ne\".";
+
 /// Drain settings load/parse errors into warning diagnostics (Pi `collectSettingsDiagnostics`,
-/// main.ts:77-85): `(<context>, <scope> settings) <message>`. Builds a throwaway `SettingsManager`
-/// over the file store (project untrusted, so only global is read — matching the startup manager).
+/// main.ts:77-85): `(<context>, <scope> settings) <message>`. Takes the caller's manager rather than
+/// building a throwaway one, because Pi passes the *same* `startupSettingsManager` it then queries
+/// for `sessionDir` (main.ts:610-611, 629) — draining a second, independent manager's errors would
+/// leave the live one still holding them.
 fn collect_settings_diagnostics(
-    store: std::sync::Arc<dyn cyrup_config::SettingsStore>,
+    mgr: &mut cyrup_config::SettingsManager,
     context: &str,
 ) -> Vec<Diagnostic> {
-    let mut mgr = cyrup_config::SettingsManager::load(store, cyrup_config::Settings::new(), false);
     mgr.drain_load_errors()
         .into_iter()
         .map(|e| {
@@ -1535,9 +1842,61 @@ fn init_tracing(verbose: bool) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        ScopedModel, SessionTarget, format_token_count, fuzzy_match, is_fresh_target,
-        pick_scoped_active_model, resolve_scoped_models,
+        DiagnosticLevel, ScopedModel, SessionTarget, format_token_count, fuzzy_match,
+        is_fresh_target, pick_scoped_active_model, resolve_scoped_models, scope_diagnostics,
     };
+
+    /// The `--models`/`enabledModels` scope must report Pi's diagnostics, not resolve in silence
+    /// (Pi `resolveModelScopeWithDiagnostics` → `resolveModelScope`, model-resolver.ts:270-361;
+    /// live path main.ts:741-743). Before the fix `resolve_scope` returned only the matched set and
+    /// `apply_post_build` dropped everything else on the floor, so a typo'd pattern was a silent
+    /// no-op.
+    #[test]
+    fn scope_diagnostics_report_no_match_and_invalid_thinking_level_like_pi() {
+        let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
+
+        // A pattern that matches nothing warns, in BOTH arms — the glob arm
+        // (model-resolver.ts:311-318) and the non-glob arm (:334-341).
+        for pattern in ["anthropc/*", "no-such-model-anywhere"] {
+            let diags = scope_diagnostics(&catalog, &[pattern.to_string()]);
+            assert_eq!(diags.len(), 1, "{pattern}: {diags:?}");
+            let only = diags.first().expect("one diagnostic");
+            assert_eq!(only.level, DiagnosticLevel::Warning);
+            assert_eq!(only.message, format!("No models match pattern \"{pattern}\""));
+        }
+
+        // A pattern that DOES match is silent.
+        assert!(
+            scope_diagnostics(&catalog, &["anthropic/*".to_string()]).is_empty(),
+            "a matching pattern emits no diagnostic"
+        );
+
+        // An invalid `:level` suffix on a resolving pattern warns with Pi's exact sentence
+        // (`parseModelPattern`, model-resolver.ts:243) and does NOT also warn no-match — the model
+        // still resolves, at the default thinking level.
+        let diags = scope_diagnostics(&catalog, &["claude-opus-4-8:hihg".to_string()]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(
+            diags.first().expect("one diagnostic").message,
+            "Invalid thinking level \"hihg\" in pattern \"claude-opus-4-8:hihg\". Using default instead."
+        );
+
+        // A VALID `:level` is not a diagnostic at all.
+        assert!(
+            scope_diagnostics(&catalog, &["claude-opus-4-8:high".to_string()]).is_empty(),
+            "a valid thinking level is silent"
+        );
+
+        // Both warnings can ride on one pattern list, in pattern order.
+        let diags = scope_diagnostics(
+            &catalog,
+            &["claude-opus-4-8:hihg".to_string(), "anthropc/*".to_string()],
+        );
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.first().is_some_and(|m| m.starts_with("Invalid thinking level")));
+        assert!(messages.get(1).is_some_and(|m| m.starts_with("No models match pattern")));
+    }
 
     /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s
     /// `minimatch`-faithful `ModelResolver::resolve_scope`, NOT the removed bespoke `*`-only matcher
@@ -1635,6 +1994,115 @@ mod tests {
 
         // An empty scope yields nothing to pick.
         assert!(pick_scoped_active_model(&[], Some("openai"), Some("gpt-4o")).is_none());
+    }
+
+    /// A flat, shared `--session-dir` holding two projects' sessions must list like Pi:
+    ///
+    /// * the LOCAL listing applies `filterCwd` — `sessionDir !== undefined && dir !==
+    ///   getDefaultSessionDirPath(cwd)` → `sessionCwdMatches` (`SessionManager.list`,
+    ///   session-manager.ts:1639-1643) — so only THIS cwd's sessions appear as "current project";
+    /// * the GLOBAL listing takes Pi's `listAll(sessionDir)` overload — `listSessionsFromDir(
+    ///   customSessionDir)` over that one directory, no cross-project walk, no cwd filter
+    ///   (session-manager.ts:1654,1660-1665) — so the other project's session is still reachable
+    ///   (and reported as "found in a different project", main.ts:227-232).
+    ///
+    /// Before this was wired, both listing paths passed `None` for the cwd filter and handed the
+    /// explicit dir to the cross-project root walk, which scans SUBdirectories: locals leaked the
+    /// foreign session and globals came back empty.
+    #[test]
+    fn shared_session_dir_filters_locals_and_lists_globals_flat_like_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let shared = root.join("shared-sessions");
+        let here = root.join("project-here");
+        let other = root.join("project-other");
+        for d in [&shared, &here, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_session(&shared, "11111111-1111-7111-8111-111111111111", &here);
+        write_session(&shared, "22222222-2222-7222-8222-222222222222", &other);
+
+        let dirs = config_dirs(&root, shared.clone(), true, here.clone());
+        let (locals, globals) = super::gather_session_refs(&dirs);
+
+        let local_ids: Vec<&str> = locals.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            local_ids,
+            vec!["11111111-1111-7111-8111-111111111111"],
+            "a shared --session-dir must list only THIS cwd's sessions locally (Pi filterCwd)"
+        );
+
+        let mut global_ids: Vec<&str> = globals.iter().map(|s| s.id.as_str()).collect();
+        global_ids.sort_unstable();
+        assert_eq!(
+            global_ids,
+            vec![
+                "11111111-1111-7111-8111-111111111111",
+                "22222222-2222-7222-8222-222222222222"
+            ],
+            "Pi's listAll(sessionDir) overload scans the custom dir itself, unfiltered"
+        );
+
+        // The merged `--resume` listing keeps both, locals first, de-duplicated by path.
+        let infos = super::gather_session_infos(&dirs);
+        assert_eq!(infos.len(), 2, "merged picker listing de-duplicates by path");
+        assert_eq!(
+            infos.first().map(|i| i.cwd.clone()),
+            Some(here.to_string_lossy().into_owned()),
+            "the cwd-filtered locals come first in the merged listing"
+        );
+    }
+
+    /// The DEFAULT (cwd-encoded) session dir must keep its old behavior: `sessionDir === undefined`
+    /// ⇒ `filterCwd` is false and `listAll()` walks every project directory under the root
+    /// (session-manager.ts:1640,1667+). The encoded layout already isolates by cwd.
+    #[test]
+    fn default_session_dir_walks_projects_and_never_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let agent_dir = root.join("agent");
+        let here = root.join("project-here");
+        let other = root.join("project-other");
+        for d in [&here, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sessions_root = agent_dir.join("sessions");
+        let here_dir = super::SessionLayout::new(sessions_root.clone(), here.clone()).dir();
+        let other_dir = super::SessionLayout::new(sessions_root, other.clone()).dir();
+        std::fs::create_dir_all(&here_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        write_session(&here_dir, "33333333-3333-7333-8333-333333333333", &here);
+        write_session(&other_dir, "44444444-4444-7444-8444-444444444444", &other);
+
+        let dirs = config_dirs(&root, agent_dir.join("sessions"), false, here.clone());
+        let (locals, globals) = super::gather_session_refs(&dirs);
+        assert_eq!(locals.len(), 1, "the encoded dir holds only this cwd's session");
+        assert_eq!(globals.len(), 2, "listAll() walks every project dir under the root");
+    }
+
+    /// One session file: a v3 header line, which is all the listing scanner needs.
+    fn write_session(dir: &std::path::Path, id: &str, cwd: &std::path::Path) {
+        let line = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+            cwd.to_string_lossy()
+        );
+        std::fs::write(dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl")), line).unwrap();
+    }
+
+    fn config_dirs(
+        root: &std::path::Path,
+        session_dir: std::path::PathBuf,
+        session_dir_explicit: bool,
+        cwd: std::path::PathBuf,
+    ) -> cyrup_config::ConfigDirs {
+        cyrup_config::ConfigDirs {
+            agent_dir: root.join("agent"),
+            session_dir,
+            session_dir_explicit,
+            package_dir: root.join("agent").join("packages"),
+            cwd,
+            home: root.to_path_buf(),
+        }
     }
 
     #[test]

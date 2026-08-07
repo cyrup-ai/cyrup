@@ -11,6 +11,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[build-dependencies]
+# EXT-028: `build.rs` `include!`s `src/build/abi.rs` to fingerprint the ABI sources (both
+# `world.wit` copies + the `cyrup-ext-sdk` guest crate) that live OUTSIDE an authored extension
+# crate, so an SDK/WIT edit busts the Tier-1 artifact cache. Same hasher as the runtime key.
+blake3 = "1.8.5"
+
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-agent = { workspace = true }

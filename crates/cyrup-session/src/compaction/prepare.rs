@@ -78,9 +78,15 @@ pub fn prepare_compaction(
             from_hook,
             ..
         })) => {
-            let bs = path
-                .iter()
-                .position(|e| &e.id() == first_kept_entry_id)
+            // Pi: `const firstKeptEntryIndex = prevCompaction.firstKeptEntryId ? findIndex(...) :
+            // -1; boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex :
+            // prevCompactionIndex + 1` (`agent/src/harness/compaction/compaction.ts:661-664`; the
+            // live fork's unguarded `findIndex` returns -1 on an absent id, same outcome —
+            // `coding-agent/src/core/compaction/compaction.ts:731-732`). So an UNRESOLVABLE
+            // `firstKeptEntryId` resumes just after the previous compaction, never at 0.
+            let bs = first_kept_entry_id
+                .as_ref()
+                .and_then(|fk| path.iter().position(|e| &e.id() == fk))
                 .unwrap_or_else(|| prev_idx.map(|i| i + 1).unwrap_or(0));
             // Hook-sourced details may use a custom shape; only absorb our default shape.
             let det = if from_hook.unwrap_or(false) { None } else { details.clone() };

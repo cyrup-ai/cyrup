@@ -83,6 +83,33 @@ pub fn build() -> ExtensionApi {
         }
     });
 
+    // EXT-028: `tool_result` carries the tool's OWN reported usage (Pi `ToolResultEventBase.usage`,
+    // extensions/types.ts:919-921), which `f777e44` re-signed onto the `events.on-tool-result`
+    // EXPORT as a trailing `usage-json: option<string>`. Nothing registered this handler until now,
+    // so the widened export had never crossed a real wasm boundary.
+    //
+    // The handler proves BOTH directions in one round trip: it notifies the usage it RECEIVED (so a
+    // host test can see the inbound arg arrived, and see `none` for the ordinary tool that reports
+    // no usage), and for `usage_probe` it echoes that very payload back with `output` doubled —
+    // Pi `ToolResultEventResult.usage` (types.ts:1085-1090) REPLACES the recorded usage wholesale.
+    // Deriving the patch from the received value is what makes it a read proof rather than a
+    // constant the guest could have invented.
+    api.on_tool_result(|ev, ctx| {
+        let received =
+            ev.usage.as_ref().map(|u| u.to_string()).unwrap_or_else(|| "none".to_string());
+        ctx.ui().notify(&format!("demo: tool_result {} usage={received}", ev.name));
+        match ev.usage.clone() {
+            Some(mut usage) if ev.name == "usage_probe" => {
+                let doubled = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0) * 2;
+                if let Some(obj) = usage.as_object_mut() {
+                    obj.insert("output".into(), json!(doubled));
+                }
+                Outcome::mutate(json!({ "usage": usage }))
+            }
+            _ => Outcome::noop(),
+        }
+    });
+
     // Notify hook: announce activation when a run starts.
     api.on_agent_start(|ctx| {
         ctx.ui().notify("demo extension active");
@@ -311,7 +338,11 @@ pub fn build() -> ExtensionApi {
             ctx.ui().set_status("greet", Some("greeting…"));
             ctx.ui().clear_status("greet");
             // A COMMAND-tier control op (R-08-008): legal here, recorded by the host backend.
-            let _ = ctx.compact();
+            // Carries Pi's `CompactOptions.customInstructions` (types.ts:296-300) so the host-side
+            // op is proved to arrive with its payload, not just to arrive.
+            let _ = ctx.compact_with(&crate::CompactOptions {
+                custom_instructions: Some("demo: keep the greeting".into()),
+            });
             Ok(Some(format!("hello, {}!", args.trim())))
         },
         |prefix: &str| {
@@ -320,6 +351,19 @@ pub fn build() -> ExtensionApi {
                 .filter(|c| c.starts_with(prefix))
                 .map(|c| c.to_string())
                 .collect()
+        },
+    );
+
+    // Report the host's run mode + dialog capability back out as command output (Pi `ctx.mode` /
+    // `ctx.hasUI`, extensions/types.ts:311,313). A guest guards terminal-only UI on these, so the
+    // pair has to reflect the mode the HOST was actually configured with — which is what
+    // `crates/cyrup-ext/tests/guest_host_mode.rs` reads this command's output to prove.
+    api.register_command(
+        "hostmode",
+        CommandDescriptor::new("Report ctx.mode + ctx.hasUI (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let base = ctx.ctx();
+            Ok(Some(format!("mode={} has_ui={}", base.mode().as_str(), base.has_ui())))
         },
     );
 

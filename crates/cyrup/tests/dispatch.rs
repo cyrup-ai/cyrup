@@ -16,12 +16,19 @@ use cyrup::run::{run_json_dispatch, run_print_dispatch};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_sdk::core::{AssistantMessage, StopReason};
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, SessionTarget};
+use cyrup_session_svc::{
+    AgentSessionRuntime, SessionBuilder, SessionConfig, SessionFactory, SessionTarget,
+};
 use tempfile::TempDir;
 
-/// Build an ephemeral in-memory session over a faux provider scripted with `responses`.
-/// The tempdirs are returned so they outlive the session.
-async fn session_with(responses: Vec<AssistantMessage>) -> (AgentSession, TempDir, TempDir) {
+/// Build the RUNTIME host the one-shot modes drive, over a faux provider scripted with `responses`.
+///
+/// SEAM-006: print/json take an `AgentSessionRuntime`, not a bare `AgentSession` — Pi's entry point
+/// is `runPrintMode(runtimeHost: AgentSessionRuntime, options)` (print-mode.ts:32). The tempdirs are
+/// returned so they outlive the runtime.
+async fn runtime_with(
+    responses: Vec<AssistantMessage>,
+) -> (Arc<AgentSessionRuntime>, TempDir, TempDir) {
     let cwd = tempfile::tempdir().unwrap();
     let agent_dir = tempfile::tempdir().unwrap();
 
@@ -31,9 +38,11 @@ async fn session_with(responses: Vec<AssistantMessage>) -> (AgentSession, TempDi
 
     let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
     config.persist = false; // ephemeral, like one-shot PRINT/JSON (R-11-008)
+    let target = config.target.clone();
 
-    let session = SessionBuilder::new(provider, config).build().await.unwrap();
-    (session, cwd, agent_dir)
+    let factory = Arc::new(SessionFactory::new(provider, config));
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+    (runtime, cwd, agent_dir)
 }
 
 fn text(initial: &str, follow_ups: &[&str]) -> Inputs {
@@ -46,14 +55,14 @@ fn text(initial: &str, follow_ups: &[&str]) -> Inputs {
 
 #[tokio::test]
 async fn print_dispatch_writes_final_assistant_text() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+    let (runtime, _cwd, _agent) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("hello world")],
         StopReason::Stop,
     )])
     .await;
 
     let mut out: Vec<u8> = Vec::new();
-    let code = run_print_dispatch(&session, &text("hi", &[]), &mut out)
+    let code = run_print_dispatch(&runtime, &text("hi", &[]), &mut out)
         .await
         .unwrap();
 
@@ -64,14 +73,14 @@ async fn print_dispatch_writes_final_assistant_text() {
 
 #[tokio::test]
 async fn print_dispatch_replays_follow_ups_in_order() {
-    let (session, _cwd, _agent) = session_with(vec![
+    let (runtime, _cwd, _agent) = runtime_with(vec![
         faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
     ])
     .await;
 
     let mut out: Vec<u8> = Vec::new();
-    run_print_dispatch(&session, &text("q1", &["q2"]), &mut out)
+    run_print_dispatch(&runtime, &text("q1", &["q2"]), &mut out)
         .await
         .unwrap();
 
@@ -92,14 +101,14 @@ async fn print_dispatch_replays_follow_ups_in_order() {
 
 #[tokio::test]
 async fn json_dispatch_emits_ordered_event_stream() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+    let (runtime, _cwd, _agent) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("hi there")],
         StopReason::Stop,
     )])
     .await;
 
     let mut out: Vec<u8> = Vec::new();
-    let code = run_json_dispatch(&session, &text("hello", &[]), &mut out)
+    let code = run_json_dispatch(&runtime, &text("hello", &[]), &mut out)
         .await
         .unwrap();
 
@@ -155,14 +164,14 @@ async fn json_dispatch_emits_ordered_event_stream() {
 /// so the divergence is JSON-mode-specific, not a session-wide change.
 #[tokio::test]
 async fn json_dispatch_always_exits_zero_even_on_failed_turn() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+    let (runtime, _cwd, _agent) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("boom")],
         StopReason::Error,
     )])
     .await;
 
     let mut out: Vec<u8> = Vec::new();
-    let code = run_json_dispatch(&session, &text("hi", &[]), &mut out)
+    let code = run_json_dispatch(&runtime, &text("hi", &[]), &mut out)
         .await
         .unwrap();
     assert_eq!(
@@ -171,13 +180,13 @@ async fn json_dispatch_always_exits_zero_even_on_failed_turn() {
     );
 
     // Contrast: the identical failed turn in PRINT/text mode surfaces exit 1 (print-mode.ts:135-137).
-    let (session2, _cwd2, _agent2) = session_with(vec![faux_assistant_message(
+    let (runtime2, _cwd2, _agent2) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("boom")],
         StopReason::Error,
     )])
     .await;
     let mut sink: Vec<u8> = Vec::new();
-    let text_code = run_print_dispatch(&session2, &text("hi", &[]), &mut sink)
+    let text_code = run_print_dispatch(&runtime2, &text("hi", &[]), &mut sink)
         .await
         .unwrap();
     assert_eq!(
@@ -220,15 +229,16 @@ async fn fork_target_copies_history_into_a_new_id() {
     let provider: Arc<dyn Provider> = faux;
     let mut src_cfg = SessionConfig::new(cwd.path(), agent_dir.path());
     src_cfg.persist = true;
-    let source = SessionBuilder::new(provider, src_cfg)
-        .build()
-        .await
-        .unwrap();
+    let src_target = src_cfg.target.clone();
+    let src_factory = Arc::new(SessionFactory::new(provider, src_cfg));
+    let source = AgentSessionRuntime::create(src_factory, src_target).await.unwrap();
     let mut sink: Vec<u8> = Vec::new();
     run_print_dispatch(&source, &text("seed", &[]), &mut sink)
         .await
         .unwrap();
     let source_file = source
+        .session()
+        .await
         .session_file()
         .await
         .expect("source session flushed to disk");
@@ -291,15 +301,15 @@ async fn saw_quit_shutdown(
 
 #[tokio::test]
 async fn print_dispatch_disposes_the_session_on_exit() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+    let (runtime, _cwd, _agent) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("done")],
         StopReason::Stop,
     )])
     .await;
-    let mut sub = session.subscribe();
+    let mut sub = runtime.session().await.subscribe();
 
     let mut out: Vec<u8> = Vec::new();
-    run_print_dispatch(&session, &text("hi", &[]), &mut out)
+    run_print_dispatch(&runtime, &text("hi", &[]), &mut out)
         .await
         .unwrap();
 
@@ -311,15 +321,15 @@ async fn print_dispatch_disposes_the_session_on_exit() {
 
 #[tokio::test]
 async fn json_dispatch_disposes_the_session_on_exit() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
+    let (runtime, _cwd, _agent) = runtime_with(vec![faux_assistant_message(
         vec![faux_text("done")],
         StopReason::Stop,
     )])
     .await;
-    let mut sub = session.subscribe();
+    let mut sub = runtime.session().await.subscribe();
 
     let mut out: Vec<u8> = Vec::new();
-    run_json_dispatch(&session, &text("hi", &[]), &mut out)
+    run_json_dispatch(&runtime, &text("hi", &[]), &mut out)
         .await
         .unwrap();
 
@@ -344,8 +354,7 @@ async fn rpc_dispatch_disposes_the_runtime_at_reader_eof() {
     let factory = Arc::new(SessionFactory::new(provider, config));
     let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
 
-    let session = runtime.session().await;
-    let mut sub = session.subscribe();
+    let mut sub = runtime.session().await.subscribe();
 
     // A single command, then EOF.
     let reader =
@@ -371,6 +380,144 @@ async fn rpc_dispatch_disposes_the_runtime_at_reader_eof() {
 // same path a spawned subagent child re-execs into — never announced its one and only session.
 // ----------------------------------------------------------------------------------------------
 
+/// A native built-in that records the ORDER of the extension-visible lifecycle events. This is the
+/// consumer Pi's `bindExtensions` actually serves (agent-session.ts:2250 emits `session_start` to
+/// the extension runner), and the one SEAM-001/SEAM-002 exist for: the permission gate refreshing
+/// its per-cwd policy, subagents resetting background-run tracking, intercom deregistering.
+///
+/// Asserting from HERE rather than from a session subscriber is what makes the test independent of
+/// when the host happens to subscribe. Pi's own print/json subscriber is installed AFTER
+/// `bindExtensions` (print-mode.ts:98→104), so it never sees `session_start` either — an assertion
+/// on subscriber ordering would be pinning a cyrup-specific accident.
+#[derive(Default)]
+struct LifecycleProbe {
+    seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for LifecycleProbe {
+    fn id(&self) -> cyrup_sdk::core::ExtensionId {
+        cyrup_sdk::core::ExtensionId::from("lifecycle-probe")
+    }
+
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[
+            cyrup_ext::EventKind::SessionStart,
+            cyrup_ext::EventKind::AgentStart,
+            cyrup_ext::EventKind::SessionShutdown,
+        ]);
+        Ok(())
+    }
+
+    async fn on_event(
+        &self,
+        ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        let tag = match ev {
+            cyrup_ext::HostEvent::SessionStart { .. } => Some("session_start"),
+            cyrup_ext::HostEvent::AgentStart => Some("agent_start"),
+            cyrup_ext::HostEvent::SessionShutdown { .. } => Some("session_shutdown"),
+            _ => None,
+        };
+        if let Some(tag) = tag
+            && let Ok(mut g) = self.seen.lock()
+        {
+            g.push(tag);
+        }
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// Build a runtime carrying the lifecycle probe; hands back the probe's shared log.
+async fn runtime_with_probe(
+    responses: Vec<AssistantMessage>,
+) -> (
+    Arc<AgentSessionRuntime>,
+    Arc<std::sync::Mutex<Vec<&'static str>>>,
+    TempDir,
+    TempDir,
+) {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(responses);
+    let provider: Arc<dyn Provider> = faux;
+
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+
+    let probe = Arc::new(LifecycleProbe::default());
+    let seen = Arc::clone(&probe.seen);
+    let factory = Arc::new(
+        SessionFactory::new(provider, config)
+            .with_native_extension(probe as Arc<dyn cyrup_ext::NativeExtension>),
+    );
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+    (runtime, seen, cwd, agent_dir)
+}
+
+/// Assert `session_start` reached the extension exactly once, before the first run, and that
+/// `session_shutdown` closed the sequence (SEAM-001 + SEAM-002 in one ordering).
+fn assert_lifecycle(kinds: &[&str], mode: &str) {
+    let starts = kinds.iter().filter(|k| **k == "session_start").count();
+    assert_eq!(
+        starts, 1,
+        "{mode} dispatch must emit exactly one session_start (Pi agent-session.ts:2250); saw {kinds:?}"
+    );
+    let start_at = kinds.iter().position(|k| *k == "session_start").unwrap();
+    let agent_at = kinds
+        .iter()
+        .position(|k| *k == "agent_start")
+        .unwrap_or_else(|| panic!("{mode} dispatch must actually run a turn; saw {kinds:?}"));
+    assert!(
+        start_at < agent_at,
+        "{mode} dispatch must announce the session BEFORE the first prompt \
+         (Pi binds extensions at print-mode.ts:73, ahead of the send loop at :121); saw {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().copied(),
+        Some("session_shutdown"),
+        "{mode} dispatch must tear the session down last (Pi print-mode.ts:152-157); saw {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_dispatch_announces_session_start_before_the_run() {
+    let (runtime, seen, _cwd, _agent) = runtime_with_probe(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+
+    let mut out: Vec<u8> = Vec::new();
+    run_print_dispatch(&runtime, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    let kinds = seen.lock().unwrap().clone();
+    assert_lifecycle(&kinds, "PRINT");
+}
+
+#[tokio::test]
+async fn json_dispatch_announces_session_start_before_the_run() {
+    let (runtime, seen, _cwd, _agent) = runtime_with_probe(vec![faux_assistant_message(
+        vec![faux_text("done")],
+        StopReason::Stop,
+    )])
+    .await;
+
+    let mut out: Vec<u8> = Vec::new();
+    run_json_dispatch(&runtime, &text("hi", &[]), &mut out)
+        .await
+        .unwrap();
+
+    let kinds = seen.lock().unwrap().clone();
+    assert_lifecycle(&kinds, "JSON");
+}
+
 /// Drain `sub` until the stream ends (or a per-event timeout elapses) and return the ordered event
 /// kind strings.
 async fn drain_kinds(
@@ -387,59 +534,181 @@ async fn drain_kinds(
     kinds
 }
 
-/// Assert `session_start` is present exactly once and precedes the first `agent_start`.
-fn assert_announced_before_run(kinds: &[&str], mode: &str) {
-    let starts = kinds.iter().filter(|k| **k == "session_start").count();
-    assert_eq!(
-        starts, 1,
-        "{mode} dispatch must emit exactly one session_start (Pi agent-session.ts:2250); saw {kinds:?}"
+/// SEAM-006: a loaded extension's `ctx.newSession()` must actually REPLACE the session under
+/// `--mode print` / `--mode json`. Pi's print mode binds `commandContextActions.newSession` to
+/// `runtimeHost.newSession` (print-mode.ts:76), so the op has a host. Before this, print/json ran
+/// on a bare `AgentSession`, `apply_pending_control` found no `runtime_actions`, and the op died as
+/// `SessionServiceError::NoRuntimeHost` behind a `tracing::warn!` the user never sees — for every
+/// `cyrup -p` run AND every spawned subagent child, which re-execs into this same arm.
+/// A native built-in whose `/swap` command queues a runtime-tier `ControlOp::NewSession` through the
+/// same `HostServices::control` seam a wasm guest's `control.*` import reaches.
+#[derive(Default)]
+struct NewSessionExt {
+    services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::HostServices>>>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for NewSessionExt {
+    fn id(&self) -> cyrup_sdk::core::ExtensionId {
+        cyrup_sdk::core::ExtensionId::from("print-new-session")
+    }
+    fn set_host_services(&self, services: Arc<dyn cyrup_ext::HostServices>) {
+        if let Ok(mut g) = self.services.lock() {
+            *g = Some(services);
+        }
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_command(
+            "swap",
+            cyrup_ext::CommandDescriptor {
+                description: "replace the active session".to_string(),
+                completions: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+    async fn execute_command(
+        &self,
+        _name: &str,
+        _args: &str,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> Result<Option<String>, cyrup_ext::ExtError> {
+        let svc = self
+            .services
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| cyrup_ext::ExtError::Component("no host services".into()))?;
+        svc.control(cyrup_ext::ControlOp::NewSession { opts: serde_json::json!({}) })
+            .map_err(cyrup_ext::ExtError::Component)?;
+        Ok(Some(String::new()))
+    }
+}
+
+/// Whether any assistant message in `ms` carries `needle` as text.
+fn transcript_has(ms: &[cyrup_sdk::core::Message], needle: &str) -> bool {
+    ms.iter().any(|m| match m {
+        cyrup_sdk::core::Message::Assistant(a) => a.content.iter().any(|c| {
+            matches!(c, cyrup_sdk::core::Content::Text { text, .. } if text.contains(needle))
+        }),
+        _ => false,
+    })
+}
+
+#[tokio::test]
+async fn print_dispatch_gives_extension_control_ops_a_runtime_host() {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("after the swap")],
+        StopReason::Stop,
+    )]);
+    let provider: Arc<dyn Provider> = faux;
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+    let factory = Arc::new(
+        SessionFactory::new(provider, config).with_native_extension(
+            Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>,
+        ),
     );
-    let start_at = kinds.iter().position(|k| *k == "session_start").unwrap();
-    let agent_at = kinds
-        .iter()
-        .position(|k| *k == "agent_start")
-        .unwrap_or_else(|| panic!("{mode} dispatch must actually run a turn; saw {kinds:?}"));
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+    // Hold the ORIGINAL session so the test can prove the follow-up did NOT land on it. Asserting
+    // only on stdout does not discriminate: the pre-fix, hoisted-session code prints "after the
+    // swap" too — it just prints it out of the WRONG (replaced, disposed) session's transcript.
+    let first = runtime.session().await;
+    let first_id = first.session_id().to_string();
+
+    let mut out: Vec<u8> = Vec::new();
+    // `/swap` is the initial submission; the follow-up then runs on whatever session is active.
+    run_print_dispatch(&runtime, &text("/swap", &["say something"]), &mut out)
+        .await
+        .unwrap();
+
+    let active = runtime.session().await;
+    assert_ne!(
+        active.session_id().to_string(),
+        first_id,
+        "ctx.newSession() from a print-mode extension command must REPLACE the active session \
+         (SEAM-006); it silently failed with NoRuntimeHost"
+    );
+
+    // The discriminating assertion: the follow-up ran on the REBOUND session, so its answer is in
+    // the NEW session's transcript and absent from the replaced one. Pi's `rebindSession` does
+    // `session = runtimeHost.session` (print-mode.ts:72), which is why cyrup's send loop re-reads
+    // the active session per message instead of hoisting it once.
     assert!(
-        start_at < agent_at,
-        "{mode} dispatch must announce the session BEFORE the first prompt \
-         (Pi binds extensions at print-mode.ts:73, ahead of the send loop at :121); saw {kinds:?}"
+        transcript_has(&active.messages().await, "after the swap"),
+        "the follow-up must run on the REBOUND session; the NEW session's transcript is {:?}",
+        active.messages().await
+    );
+    assert!(
+        !transcript_has(&first.messages().await, "after the swap"),
+        "the follow-up must NOT be serviced by the replaced session (SEAM-006); it landed on {first_id}"
+    );
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(
+        printed.contains("after the swap"),
+        "the follow-up must run on the REBOUND session and print its answer (Pi print-mode.ts:72); \
+         got {printed:?}"
     );
 }
 
+/// The JSON-mode twin of the above. `runPrintMode` serves BOTH modes off the same `runtimeHost`
+/// (print-mode.ts:32, the `mode === "json"` branch at :73), so fixing only one leaves the identical
+/// defect in the other — which is exactly how this class of bug survives.
 #[tokio::test]
-async fn print_dispatch_announces_session_start_before_the_run() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
-        vec![faux_text("done")],
+async fn json_dispatch_gives_extension_control_ops_a_runtime_host() {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("after the swap")],
         StopReason::Stop,
-    )])
-    .await;
-    let mut sub = session.subscribe();
+    )]);
+    let provider: Arc<dyn Provider> = faux;
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+    let factory = Arc::new(
+        SessionFactory::new(provider, config).with_native_extension(
+            Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>,
+        ),
+    );
+    let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+    let first = runtime.session().await;
+    let first_id = first.session_id().to_string();
 
     let mut out: Vec<u8> = Vec::new();
-    run_print_dispatch(&session, &text("hi", &[]), &mut out)
+    run_json_dispatch(&runtime, &text("/swap", &["say something"]), &mut out)
         .await
         .unwrap();
 
-    let kinds = drain_kinds(&mut sub).await;
-    assert_announced_before_run(&kinds, "PRINT");
-}
-
-#[tokio::test]
-async fn json_dispatch_announces_session_start_before_the_run() {
-    let (session, _cwd, _agent) = session_with(vec![faux_assistant_message(
-        vec![faux_text("done")],
-        StopReason::Stop,
-    )])
-    .await;
-    let mut sub = session.subscribe();
-
-    let mut out: Vec<u8> = Vec::new();
-    run_json_dispatch(&session, &text("hi", &[]), &mut out)
-        .await
-        .unwrap();
-
-    let kinds = drain_kinds(&mut sub).await;
-    assert_announced_before_run(&kinds, "JSON");
+    let active = runtime.session().await;
+    assert_ne!(
+        active.session_id().to_string(),
+        first_id,
+        "ctx.newSession() from a json-mode extension command must REPLACE the active session \
+         (SEAM-006); it silently failed with NoRuntimeHost"
+    );
+    assert!(
+        transcript_has(&active.messages().await, "after the swap"),
+        "the follow-up must run on the REBOUND session; the NEW session's transcript is {:?}",
+        active.messages().await
+    );
+    assert!(
+        !transcript_has(&first.messages().await, "after the swap"),
+        "the follow-up must NOT be serviced by the replaced session (SEAM-006); it landed on {first_id}"
+    );
 }
 
 /// RPC: `AgentSessionRuntime::create` is the bind point for the persistent host (Pi rpc-mode.ts:318
@@ -459,7 +728,7 @@ async fn rpc_runtime_announces_the_initial_session_at_startup() {
     let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
 
     let session = runtime.session().await;
-    let mut sub = session.subscribe();
+    let mut sub = runtime.session().await.subscribe();
     // A host that binds after taking the runtime's session must NOT produce a second announcement.
     cyrup::run::announce_session_start(&session).await;
 
@@ -467,5 +736,207 @@ async fn rpc_runtime_announces_the_initial_session_at_startup() {
     assert!(
         !kinds.contains(&"session_start"),
         "the runtime already announced its initial session; a host bind must not repeat it, saw {kinds:?}"
+    );
+}
+
+// ================================================================================================
+// SEAM-033 — the initial `session_start` must be announced AFTER the host applies post-build CLI
+// configuration, not at runtime-construction time.
+//
+// Pi ground truth, read from source: `main.ts:650` applies `--name`
+// (`sessionManager.appendSessionInfo(name)`) and `main.ts:742-750` folds the resolved `--models`
+// scope into `sessionOptions`, both strictly BEFORE `main.ts:793 createAgentSessionRuntime(...)`.
+// `createAgentSessionRuntime` itself (agent-session-runtime.ts:414-432) deliberately never calls
+// `bindExtensions`, so it emits nothing. The HOST announces, later still, from
+// `rebindSession()` → `session.bindExtensions(...)` (print-mode.ts:119 → :73 →
+// agent-session.ts:2250).
+//
+// Cyrup's analog of main.ts:650/742-750 is `main.rs`'s `apply_post_build`, which runs AFTER the
+// runtime is built (the session it configures does not exist before). So the runtime constructor
+// used by the print/json arm must NOT announce — `AgentSessionRuntime::create_unannounced` — and
+// the announcement is the first thing `run_print`/`run_json` do. Announcing at construction time
+// hands every `session_start` handler an unnamed, unscoped session; and since print/json is the arm
+// a spawned subagent child re-execs into, every subagent run inherits it.
+// ================================================================================================
+
+/// Records, for each `session_start` it observes, what the session looked like AT THAT MOMENT.
+///
+/// The session handle is installed by the test after the runtime exists — which is exactly the
+/// window under test. If the announcement has already happened by then, the probe records the
+/// `announced-before-the-host-could-configure-anything` marker instead of a name, so a regression
+/// reads as a description rather than an empty vector.
+#[derive(Default)]
+struct ConfigAtStartProbe {
+    session: Arc<std::sync::OnceLock<Arc<cyrup_session_svc::AgentSession>>>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for ConfigAtStartProbe {
+    fn id(&self) -> cyrup_sdk::core::ExtensionId {
+        cyrup_sdk::core::ExtensionId::from("config-at-start-probe")
+    }
+
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[cyrup_ext::EventKind::SessionStart]);
+        Ok(())
+    }
+
+    async fn on_event(
+        &self,
+        ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        if matches!(ev, cyrup_ext::HostEvent::SessionStart { .. }) {
+            let observed = match self.session.get() {
+                None => "announced-before-the-host-could-configure-anything".to_string(),
+                Some(session) => format!(
+                    "name={:?} scoped_models={}",
+                    session.session_name().await,
+                    session.scoped_models().len()
+                ),
+            };
+            if let Ok(mut g) = self.seen.lock() {
+                g.push(observed);
+            }
+        }
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// Build the print/json arm the way `main.rs` does: `create_unannounced`, then post-build
+/// configuration, then dispatch. Returns the probe's shared handles so the test can install the
+/// session and read what the extension saw.
+#[allow(clippy::type_complexity)]
+async fn unannounced_runtime_with_probe(
+    responses: Vec<AssistantMessage>,
+) -> (
+    Arc<AgentSessionRuntime>,
+    Arc<std::sync::OnceLock<Arc<cyrup_session_svc::AgentSession>>>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    TempDir,
+    TempDir,
+) {
+    let cwd = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(responses);
+    let provider: Arc<dyn Provider> = faux;
+
+    let mut config = SessionConfig::new(cwd.path(), agent_dir.path());
+    config.persist = false;
+    let target = config.target.clone();
+
+    let probe = Arc::new(ConfigAtStartProbe::default());
+    let session_slot = Arc::clone(&probe.session);
+    let seen = Arc::clone(&probe.seen);
+    let factory = Arc::new(
+        SessionFactory::new(provider, config)
+            .with_native_extension(probe as Arc<dyn cyrup_ext::NativeExtension>),
+    );
+    let runtime = AgentSessionRuntime::create_unannounced(factory, target).await.unwrap();
+    (runtime, session_slot, seen, cwd, agent_dir)
+}
+
+/// The constructor `main.rs`'s print/json arm uses must be silent — pi's `createAgentSessionRuntime`
+/// returns without ever calling `bindExtensions` (agent-session-runtime.ts:414-432).
+#[tokio::test]
+async fn create_unannounced_leaves_the_announcement_to_the_host() {
+    let (runtime, slot, seen, _cwd, _agent) = unannounced_runtime_with_probe(vec![]).await;
+    let session = runtime.session().await;
+    let _ = slot.set(Arc::clone(&session));
+
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        Vec::<String>::new(),
+        "create_unannounced must not announce; the host does (Pi createAgentSessionRuntime never \
+         calls bindExtensions, agent-session-runtime.ts:414-432)"
+    );
+
+    // …and the announcement is still reachable, once, when the host does bind.
+    session.bind_extensions().await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the host bind must produce exactly one session_start (agent-session.ts:2250)"
+    );
+}
+
+/// PRINT: `--name` and `--models` (cyrup's `apply_post_build`, pi main.ts:650 + :742-750) are
+/// applied between building the runtime and running the mode, so the extension's `session_start`
+/// handler must see a session that already carries them.
+#[tokio::test]
+async fn print_dispatch_announces_only_after_post_build_configuration() {
+    let (runtime, slot, seen, _cwd, _agent) = unannounced_runtime_with_probe(vec![
+        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
+    ])
+    .await;
+
+    // Exactly what `main.rs` does between `create_unannounced` and the dispatch call.
+    let session = runtime.session().await;
+    let _ = slot.set(Arc::clone(&session));
+    session.set_session_name("configured-by-cli").await.unwrap();
+    session.set_scoped_models(
+        session
+            .model_catalog()
+            .into_iter()
+            .take(1)
+            .map(|model| cyrup_session_svc::ScopedModel { model, thinking_level: None })
+            .collect(),
+    );
+    let scoped = session.scoped_models().len();
+
+    let mut buf: Vec<u8> = Vec::new();
+    run_print_dispatch(&runtime, &text("hi", &[]), &mut buf).await.unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![format!("name={:?} scoped_models={scoped}", Some("configured-by-cli".to_string()))],
+        "PRINT must announce the session only after --name/--models are applied \
+         (Pi main.ts:650/:742-750 precede main.ts:793, and the announcement is later still at \
+         print-mode.ts:119)"
+    );
+}
+
+/// JSON: same ordering, and the announcement still lands after the JSONL header — pi writes the
+/// header at print-mode.ts:112-118 and only then `await rebindSession()` at :119.
+#[tokio::test]
+async fn json_dispatch_announces_after_the_header_and_after_post_build_configuration() {
+    let (runtime, slot, seen, _cwd, _agent) = unannounced_runtime_with_probe(vec![
+        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
+    ])
+    .await;
+
+    let session = runtime.session().await;
+    let _ = slot.set(Arc::clone(&session));
+    session.set_session_name("configured-by-cli").await.unwrap();
+    session.set_scoped_models(
+        session
+            .model_catalog()
+            .into_iter()
+            .take(1)
+            .map(|model| cyrup_session_svc::ScopedModel { model, thinking_level: None })
+            .collect(),
+    );
+    let scoped = session.scoped_models().len();
+
+    let mut buf: Vec<u8> = Vec::new();
+    run_json_dispatch(&runtime, &text("hi", &[]), &mut buf).await.unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![format!("name={:?} scoped_models={scoped}", Some("configured-by-cli".to_string()))],
+        "JSON must announce the session only after --name/--models are applied"
+    );
+
+    let text_out = String::from_utf8(buf).unwrap();
+    let first = text_out.lines().next().unwrap_or_default();
+    let header: serde_json::Value = serde_json::from_str(first).unwrap();
+    assert_eq!(
+        header.get("type").and_then(serde_json::Value::as_str),
+        Some("session"),
+        "the JSONL header is still written FIRST, ahead of the bind (Pi print-mode.ts:112-118 → :119); \
+         first line was {first}"
     );
 }

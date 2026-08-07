@@ -539,6 +539,7 @@ impl ImagesModels {
                 AuthOverrides {
                     api_key: options.api_key.as_deref(),
                     env: options.env.as_ref(),
+                    min_oauth_validity_ms: None,
                 },
             )
             .await

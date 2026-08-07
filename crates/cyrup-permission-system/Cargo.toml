@@ -53,6 +53,11 @@ regex = "1"
 # `createHash("sha256").update(fingerprint).digest("hex")`). Same version `cyrup-ext-subagents`
 # already pins directly (0.11.0); no new workspace-wide version surface.
 sha2 = "0.11.0"
+# The audit/debug JSONL trail's `timestamp` field (`logging.rs`, pi `logging.ts:72`
+# `new Date().toISOString()`): UTC wall-clock formatted to millisecond precision. `std::time` has no
+# calendar, and the workspace already resolves `time` (cyrup-session, cyrup-session-svc) with the
+# `formatting` feature, so this adds no new version surface.
+time = { workspace = true }
 
 [dev-dependencies]
 # The FULLY-WIRED integration proof (`tests/gate_integration.rs`, R-PERM-010/012/050): a real

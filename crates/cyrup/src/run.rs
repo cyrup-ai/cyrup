@@ -17,23 +17,26 @@ use crate::input::Inputs;
 /// writing only the *final* transcript message to `out` (Pi print-mode.ts:129-146); a failed/aborted
 /// final turn routes its error to stderr with no assistant stdout. Returns the process exit code
 /// derived from the terminal stop reason (R-11-005, arch-11 §6.6).
+///
+/// A prompt-less run is legal and submits nothing at all — see [`turn_inputs`].
 pub async fn run_print_dispatch<W: Write>(
-    session: &AgentSession,
+    runtime: &AgentSessionRuntime,
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    // Bind + announce BEFORE the first prompt — Pi's `rebindSession()` → `session.bindExtensions()`
-    // runs at print-mode.ts:73, ahead of the send loop at :121 (see [`announce_session_start`]).
-    announce_session_start(session).await;
-    let messages =
-        std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    // The initial session is bound + announced by `run_print` itself, at Pi's point — the
+    // `rebindSession()` → `session.bindExtensions()` at print-mode.ts:119 → :73, ahead of the send
+    // loop at :121. `main.rs` therefore builds this runtime with
+    // `AgentSessionRuntime::create_unannounced` and applies `--name`/`--models` in between
+    // (SEAM-033); see [`announce_session_start`].
+    let messages = turn_inputs(inputs);
     let mut err = std::io::stderr();
-    let ran = run_print(session, messages, out, &mut err, PrintOptions::default()).await;
-    let code = exit_code(session).await;
+    let ran = run_print(runtime, messages, out, &mut err, PrintOptions::default()).await;
+    let code = exit_code(&*runtime.session().await).await;
     // Teardown on EVERY exit path — Pi's `finally { await disposeRuntime() }` (print-mode.ts:152-157),
     // which emits `session_shutdown{reason:"quit"}` before releasing the session (see
     // [`dispose_session`]). The exit code is read FIRST because dispose aborts the run.
-    dispose_session(session).await;
+    runtime.dispose().await;
     ran?;
     Ok(code)
 }
@@ -45,22 +48,16 @@ pub async fn run_print_dispatch<W: Write>(
 /// the JSON-mode exit code — a consumer scripting `cyrup --mode json … ; echo $?` relies on the
 /// always-0 convention. (The terminal stop reason is still observable in the streamed event records.)
 pub async fn run_json_dispatch<W: Write>(
-    session: &AgentSession,
+    runtime: &AgentSessionRuntime,
     inputs: &Inputs,
     out: &mut W,
 ) -> anyhow::Result<i32> {
-    // Same startup bind as PRINT — print-mode.ts:73 serves both modes (`mode === "json" ? …`).
-    announce_session_start(session).await;
-    let ran = async {
-        run_json(session, initial_input(inputs), out).await?;
-        for follow_up in &inputs.follow_ups {
-            run_json(session, cli_input(follow_up), out).await?;
-        }
-        Ok::<(), cyrup_modes::ModesError>(())
-    }
-    .await;
+    // Same startup bind as PRINT, done by `run_json` itself — but AFTER the JSONL header, which is
+    // exactly pi's order (header at print-mode.ts:112-118, `await rebindSession()` at :119).
+    let messages = turn_inputs(inputs);
+    let ran = run_json(runtime, messages, out).await;
     // Same `finally { await disposeRuntime() }` as PRINT (print-mode.ts:152-157 serves both modes).
-    dispose_session(session).await;
+    runtime.dispose().await;
     ran?;
     Ok(0)
 }
@@ -69,11 +66,15 @@ pub async fn run_json_dispatch<W: Write>(
 /// `session.bindExtensions(...)`, print-mode.ts:73 → agent-session.ts:2250, whose event defaults to
 /// `{type:"session_start", reason:"startup"}` at agent-session.ts:389).
 ///
-/// The mirror image of [`dispose_session`]: the ONE startup announcement every non-interactive
-/// one-shot host funnels through. Without it no extension observes the FIRST — and for `cyrup -p`
-/// the ONLY — session of the process, so the permission gate never refreshes its per-cwd policy or
-/// starts the ask-forwarding watcher, subagents never reset background-run tracking, and intercom's
-/// `SessionStart` arm never runs. Interactive/RPC get theirs from `AgentSessionRuntime::create`.
+/// The mirror image of [`dispose_session`]. Every first-party host now takes an
+/// [`AgentSessionRuntime`] (SEAM-006 moved print/json onto the runtime, matching
+/// `runPrintMode(runtimeHost, …)`, print-mode.ts:32) and gets its announcement either from
+/// `AgentSessionRuntime::create` (interactive/RPC) or from the mode entry point itself
+/// (print/json — SEAM-033, so `--name`/`--models` are applied first), so this remains for
+/// EMBEDDERS that drive a bare [`AgentSession`]. Without it no extension
+/// observes the session, so the permission gate never refreshes its per-cwd policy or starts the
+/// ask-forwarding watcher, subagents never reset background-run tracking, and intercom's
+/// `SessionStart` arm never runs.
 ///
 /// Idempotent per session (`AgentSession::bind_extensions`), so a host that also drives a runtime
 /// cannot announce twice.
@@ -84,8 +85,9 @@ pub async fn announce_session_start(session: &AgentSession) {
 /// Emit `session_shutdown{reason:"quit"}` and tear the session down (Pi `AgentSessionRuntime.dispose`
 /// → `session.dispose()`, agent-session-runtime.ts:397-404).
 ///
-/// This is the ONE teardown every non-interactive host funnels through. Without it no extension ever
-/// observes `session_shutdown` on a normal exit, so anything that flushes or deregisters on shutdown
+/// The bare-[`AgentSession`] teardown for embedders; the first-party hosts reach the same code
+/// through `AgentSessionRuntime::dispose()`. Without it no extension ever observes
+/// `session_shutdown` on a normal exit, so anything that flushes or deregisters on shutdown
 /// (intercom broker deregistration, subagent background-run cleanup, permission-store teardown) never
 /// runs, and an in-flight run is never settled before the process returns.
 pub async fn dispose_session(session: &AgentSession) {
@@ -115,14 +117,20 @@ where
 
 /// The process exit code for a settled one-shot run, from the last assistant message's stop reason
 /// (arch-11 §6.6): `error` ⇒ 1, `aborted` ⇒ 130, otherwise (`stop`/`length`/`toolUse`) ⇒ 0.
+///
+/// `pending` — the in-flight sentinel — exits **1**, not 0. A transcript whose last assistant
+/// message never settled is a stream that was cut off, and reporting success for it is precisely
+/// the silent-truncation failure PROV-010 / AGENT-014 / DRIFT-012 closed on the decoder side. The
+/// match is exhaustive on purpose: the `_ => 0` it replaces would have swallowed `Pending` (and
+/// will not swallow whatever variant comes next either).
 pub async fn exit_code(session: &AgentSession) -> i32 {
     use cyrup_sdk::core::{Message, StopReason};
     for message in session.messages().await.iter().rev() {
         if let Message::Assistant(assistant) = message {
             return match assistant.stop_reason {
-                StopReason::Error => 1,
+                StopReason::Error | StopReason::Pending => 1,
                 StopReason::Aborted => 130,
-                _ => 0,
+                StopReason::Stop | StopReason::Length | StopReason::ToolUse => 0,
             };
         }
     }
@@ -132,6 +140,32 @@ pub async fn exit_code(session: &AgentSession) -> i32 {
 /// Wrap one-shot text as a CLI-sourced [`UserInput`].
 fn cli_input(text: &str) -> UserInput {
     UserInput::text(text.to_string(), InputSource::Cli)
+}
+
+/// The ordered turn a one-shot run submits: the initial submission **when there is one**, then each
+/// CLI follow-up (Pi `if (initialMessage) { await session.prompt(…) }` followed by
+/// `for (const message of messages) { … }`, print-mode.ts:121-127).
+///
+/// The `if (initialMessage)` guard is the whole point: `buildInitialMessage` returns
+/// `initialMessage: undefined` when there is no stdin, no `@file` and no message
+/// (initial-message.ts:36-42), and nothing upstream treats that as fatal — pi skips BOTH loops and
+/// falls straight through to the terminal output block (print-mode.ts:129-146), printing the last
+/// assistant message of the resumed transcript and returning the `exitCode = 0` it initialised at
+/// :34. `cyrup -c -p` (continue a session and print its last response) is that idiom. cyrup used to
+/// reject a prompt-less one-shot run outright, via a `main.rs::ensure_prompt` bail that carried no
+/// upstream citation, so the exit code inverted (0 ⇒ 1) and JSON mode never even emitted the session
+/// header pi writes before `rebindSession()` (print-mode.ts:112-118).
+///
+/// Emptiness is [`Inputs::is_empty`], i.e. no text **and** no images: an image-only run still
+/// submits its initial input (pi's `if (initialMessage)` would drop the images with it, since
+/// `initialImages` rides along on that same call — a quirk not worth porting).
+fn turn_inputs(inputs: &Inputs) -> Vec<UserInput> {
+    let mut turn: Vec<UserInput> = Vec::new();
+    if !inputs.is_empty() {
+        turn.push(initial_input(inputs));
+    }
+    turn.extend(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    turn
 }
 
 /// The initial submission: the assembled text plus any image `@file` attachments (Pi

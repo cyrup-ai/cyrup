@@ -628,8 +628,16 @@ async fn parse_and_validate_hook_output(
     Ok(unique)
 }
 
-/// pi `runWorktreeSetupHook`: invoke the hook (no args) with the worktree as cwd, the input JSON on
-/// stdin, bounded by the resolved timeout, and validate its `syntheticPaths` response.
+/// pi `runWorktreeSetupHook` (`pi-subagents/src/runs/shared/worktree.ts:290-296` @v0.34.0): invoke
+/// the hook (no args) with the worktree as cwd, the input JSON on stdin, bounded by the resolved
+/// timeout, and validate its `syntheticPaths` response.
+///
+/// Upstream uses `spawnSync(hook.hookPath, [], { …, timeout: hook.timeoutMs })`, and Node's
+/// `timeout` option KILLS the child on expiry (surfacing as `result.error.code === "ETIMEDOUT"`).
+/// So must this: the `Child` binding is deliberately held OUTSIDE the `tokio::time::timeout`, and
+/// the elapsed arm drives [`crate::spawn::signal::terminate_on_timeout`] (SIGTERM, then a hard
+/// SIGKILL a second later). Racing a future that OWNS the child instead — which this function used
+/// to do — dropped the only handle on expiry and left a hung setup hook running indefinitely.
 async fn run_worktree_setup_hook(
     hook: &ResolvedWorktreeSetupHook,
     input: &WorktreeSetupHookInput<'_>,
@@ -640,17 +648,15 @@ async fn run_worktree_setup_hook(
     })?;
     let worktree_path = input.worktree_path;
 
-    let call = async {
-        let mut child = Command::new(&hook.hook_path)
-            .current_dir(worktree_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}"))
-            })?;
+    let mut child = Command::new(&hook.hook_path)
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}")))?;
 
+    let call = async {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(&payload).await.map_err(SubagentError::Spawn)?;
             stdin.shutdown().await.map_err(SubagentError::Spawn)?;
@@ -692,12 +698,21 @@ async fn run_worktree_setup_hook(
         parse_and_validate_hook_output(worktree_path, &stdout).await
     };
 
-    match tokio::time::timeout(timeout, call).await {
+    // Bind the race outcome in its own statement so `call` (which mutably borrows `child`) is
+    // dropped before the elapsed arm needs `&mut child` again.
+    let outcome = tokio::time::timeout(timeout, call).await;
+    match outcome {
         Ok(result) => result,
-        Err(_elapsed) => Err(SubagentError::WorktreeSetup(format!(
-            "worktree setup hook timed out after {}ms",
-            hook.timeout_ms
-        ))),
+        Err(_elapsed) => {
+            // Node's `spawnSync` timeout kills; so do we. `terminate_on_timeout` returns only once
+            // the OS process is confirmed reaped, so a hook that outlived its budget can never be
+            // left behind holding the worktree we are about to report as failed.
+            let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
+            Err(SubagentError::WorktreeSetup(format!(
+                "worktree setup hook timed out after {}ms",
+                hook.timeout_ms
+            )))
+        }
     }
 }
 
@@ -1529,6 +1544,98 @@ mod tests {
             .expect("create");
         assert!(setup.worktrees[0].synthetic_paths.contains(&".venv".to_string()));
         cleanup_worktrees(&setup).await;
+    }
+
+    /// SUBA-027 regression: a setup hook that blows through its timeout must be KILLED, matching
+    /// upstream `spawnSync(…, { timeout })` (`worktree.ts:290-296`), which kills on expiry.
+    /// Before the fix the `Child` lived inside the future `tokio::time::timeout` was racing, so
+    /// the elapsed arm dropped the only handle and the hook ran on forever. `exec` in the fixture
+    /// is load-bearing: it makes the pid the script publishes the same pid the parent holds, so
+    /// this test proves which process was actually signalled rather than reasoning about whether
+    /// a given `/bin/sh` forks.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_setup_hook_is_killed_not_abandoned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let hook_path = dir.path().join("hang.sh");
+        std::fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = ResolvedWorktreeSetupHook {
+            hook_path,
+            timeout_ms: 200,
+        };
+        let input = WorktreeSetupHookInput {
+            version: 1,
+            repo_root: dir.path(),
+            worktree_path: dir.path(),
+            agent_cwd: dir.path(),
+            branch: "suba-027",
+            index: 0,
+            run_id: "suba-027",
+            base_commit: "0000000",
+            agent: None,
+        };
+
+        let err = run_worktree_setup_hook(&hook, &input)
+            .await
+            .expect_err("a hook that never exits must surface as a timeout");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+
+        let pid = wait_for_published_pid(&pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "setup hook pid {pid} must be gone once the timeout is reported — Node's spawnSync \
+             timeout kills the hook, and so must this"
+        );
+    }
+
+    /// Poll `kill(pid, 0)` until it reports ESRCH, up to `timeout`.
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32, timeout: Duration) -> bool {
+        let target = nix::unistd::Pid::from_raw(pid);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if nix::sys::signal::kill(target, None).is_err() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll for `path` to contain a parseable pid, up to `timeout`.
+    #[cfg(unix)]
+    async fn wait_for_published_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hook never published its pid to {} within {timeout:?}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

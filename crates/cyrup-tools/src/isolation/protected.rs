@@ -1,10 +1,10 @@
 //! Protected-paths [`FsOps`] decorator (R-12-006).
 //!
-//! [`ProtectedFs`] wraps an `Arc<dyn FsOps>` and **blocks mutating operations** (`write_atomic`,
+//! [`ProtectedFs`] wraps an `Arc<dyn FsOps>` and **blocks mutating operations** (`write_in_place`,
 //! and writable `access`) targeting configured protected paths (e.g. `.env`, `.git/`,
 //! `node_modules/`), while **passing reads through** unchanged. A blocked write returns an `Err`
 //! (via [`crate::error::denied`]) which the runtime maps to an `isError:true` tool result
-//! (R-03-038) — never a panic. Because the built-in `edit` tool mutates through `write_atomic`,
+//! (R-03-038) — never a panic. Because the built-in `edit` tool mutates through `write_in_place`,
 //! wrapping the backend covers both `write` and `edit` (arch-12 §6.2). This is the *operations-seam*
 //! sibling of the [`crate::isolation::policy`] gate rule: the gate blocks before `Tool::execute`,
 //! this decorator blocks at the backend so any tool (built-in or custom) sharing the backend is
@@ -99,9 +99,9 @@ impl FsOps for ProtectedFs {
         self.inner.read(path).await
     }
 
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         self.deny_if_protected(path)?;
-        self.inner.write_atomic(path, bytes).await
+        self.inner.write_in_place(path, bytes).await
     }
 
     async fn access(&self, path: &Path, mode: super::Access) -> Result<(), ToolError> {

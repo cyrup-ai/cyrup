@@ -11,7 +11,7 @@ use std::path::Path;
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.1`.
+    /// WIT world compatibility, e.g. `cyrup:ext@0.3` (see [`HOST_WORLD`]).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,15 +35,38 @@ pub struct Capabilities {
     pub ui: bool,
 }
 
-/// The world version this host implements.
+/// The world version this host implements. Kept in lockstep with the `package cyrup:ext@…` line of
+/// BOTH `world.wit` copies — `crates/cyrup-ext/tests/wit_world_sync.rs` enforces that tie.
 ///
-/// Bumped 0.1 → 0.2 by SEAM-005, which added the `events.on-agent-settled` EXPORT. An added export
-/// is breaking for an already-built guest: a 0.1 component simply does not have the function, and
-/// [`crate::host::LiveExtension`] would fail at instantiation with a raw wasmtime link error rather
-/// than a typed [`ExtError::WorldVersion`]. [`ExtensionManifest::check_world`] is minor-aware for
-/// exactly that reason. (The `ctx-state`/`control.abort`/`control.shutdown` additions in the same
-/// batch are IMPORTS, which are additive and would not have needed a bump on their own.)
-pub const HOST_WORLD: &str = "cyrup:ext@0.2";
+/// # The bump rule (EXT-028)
+///
+/// **ANY change to an EXPORT — added, removed, or RE-SIGNED — bumps the MINOR.** An export change is
+/// breaking for an already-built guest: it either does not have the function at all, or has it at
+/// the old signature. Either way [`crate::host::LiveExtension`] fails at instantiation with a raw
+/// wasmtime link error rather than a typed [`ExtError::WorldVersion`], because
+/// `bindings::Extension::instantiate_async` resolves the world's exports eagerly.
+/// [`ExtensionManifest::check_world`] is minor-aware for exactly that reason, and it only helps if
+/// this constant actually moves.
+///
+/// ADDED imports are additive from the guest's point of view and need no bump on their own. A
+/// RE-SIGNED or REMOVED import does: the guest's own import list is baked into its component, so it
+/// asks the host for a function the host no longer has and fails to link identically to a stale
+/// export.
+///
+/// History:
+/// - 0.1 → 0.2 (SEAM-005): ADDED the `events.on-agent-settled` export. (The `ctx-state` /
+///   `control.abort` / `control.shutdown` additions in the same batch were IMPORTS.)
+/// - 0.2 → 0.3 (EXT-028, for `f777e44`): RE-SIGNED the `events.on-tool-result` export, which gained
+///   a trailing `usage-json: option<string>` (Pi `ToolResultEventBase.usage`, types.ts:919-921).
+///   `f777e44` changed `world.wit` without touching this constant, so a pre-`f777e44` guest still
+///   declaring `cyrup:ext@0.2` passed the gate and then died inside wasmtime. This bump is the fix.
+/// - 0.3 → 0.4: RE-SIGNED the `control.compact` IMPORT, which gained `opts-json: string` (Pi
+///   `ctx.compact(options?: CompactOptions)`, types.ts:296-300,344). An import re-signing is
+///   normally the guest's problem alone — but a guest built against 0.3 imports `compact` at the
+///   ZERO-argument signature, which the 0.4 host no longer provides, so it fails to LINK exactly
+///   the way a stale export does. (The `ctx-state.get-mode`/`has-ui` additions in the same batch
+///   were purely additive imports and would not have required a bump on their own.)
+pub const HOST_WORLD: &str = "cyrup:ext@0.4";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.
@@ -61,9 +84,10 @@ impl ExtensionManifest {
     /// Check world-version compatibility (arch-08 §4.1): the MAJOR must match AND the guest's MINOR
     /// must be at least the host's. Both mismatches are surfaced as a typed error, never a trap.
     ///
-    /// The MINOR rule is what makes an added EXPORT safe to ship. The host's world grows by adding
-    /// guest exports (`events.on-agent-settled`, SEAM-005); a guest built against an older MINOR
-    /// does not implement them, so instantiation would fail deep inside wasmtime with an opaque
+    /// The MINOR rule is what makes an EXPORT change safe to ship. The host's world changes by
+    /// adding guest exports (`events.on-agent-settled`, SEAM-005) and by RE-SIGNING them
+    /// (`events.on-tool-result` gaining `usage-json`, EXT-028); a guest built against an older MINOR
+    /// implements neither shape, so instantiation would fail deep inside wasmtime with an opaque
     /// missing-export link error. Comparing MINOR here turns that into
     /// [`ExtError::WorldVersion`] at manifest-check time, before any bytes are instantiated. A guest
     /// with a HIGHER minor is accepted: it may want imports this host lacks, and that failure is

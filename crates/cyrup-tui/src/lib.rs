@@ -43,16 +43,20 @@ mod commands;
 mod component;
 mod config_selector;
 mod diff;
+mod drain;
 mod editor;
 mod error;
 mod export;
 mod extension_editor;
 mod fuzzy;
 mod image;
+mod keyboard_protocol;
 mod keymap;
 mod markdown;
 mod model_selector;
 mod overlay;
+mod panic_hook;
+mod resume_hint;
 mod select_list;
 mod selector;
 mod session_search;
@@ -62,15 +66,19 @@ mod startup;
 mod startup_selector;
 mod status;
 mod status_indicator;
+mod stray_reply;
 mod terminal_query;
+mod terminal_title;
 mod text_input;
 mod theme;
+mod tmux;
 mod transcript;
 mod tree_selector;
 
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
-    should_honor_extension_shutdown, App, AppAction, AppCommand, AppState, RebuildBackend,
+    should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
+    RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{
@@ -79,11 +87,19 @@ pub use autocomplete::{
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
+pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
+pub use resume_hint::{
+    format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
+};
 pub use commands::{
-    CommandRegistry, CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+    dynamic_commands_from_catalog, dynamic_commands_from_catalog_gated, CommandRegistry,
+    CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;
+pub use drain::{
+    drain_count, drain_input, drain_stdin_before_exit, InputDrain, DRAIN_IDLE, DRAIN_MAX,
+};
 pub use chrome::{
     compact_hints, format_key_text, key_hint_line, key_hint_spans, render_compact_hints,
     truncate_to_visual_lines, BorderedLoader, VisualTruncate,
@@ -95,6 +111,12 @@ pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match
 pub use image::{
     detect_capabilities, detect_capabilities_from, image_fallback_text, ImageBlock, ImageProtocol,
     ImageRenderer, TerminalCapabilities,
+};
+pub use keyboard_protocol::{
+    current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
+    is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
+    set_current as set_keyboard_protocol, KeyboardProtocol, NegotiationSequence,
+    KITTY_FLAGS_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT,
 };
 pub use keymap::{
     Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
@@ -126,15 +148,22 @@ pub use startup::{
     StartupRole, StartupSpan,
 };
 pub use terminal_query::{
-    find_color_scheme_report, find_osc11_background_color, parse_color_scheme_report,
-    parse_osc11_background_color, saw_device_attributes, NoTerminalProbe, StdinTerminalProbe,
-    TerminalProbe, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
+    find_cell_size_report, find_color_scheme_report, find_osc11_background_color,
+    parse_cell_size_report, parse_color_scheme_report, parse_osc11_background_color,
+    saw_device_attributes, NoTerminalProbe, StdinTerminalProbe, TerminalProbe, CELL_SIZE_QUERY,
+    CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
 };
+pub use terminal_title::{session_terminal_title, APP_TITLE};
 pub use theme::{
     color_of, detect_terminal_background_from_env, detect_terminal_background_theme,
     detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb, BackgroundTheme, ColorMode,
     DetectionConfidence, TerminalTheme, TerminalThemeDetection, TerminalThemeSource,
     ThemeController, ThinkingTheme, UiTheme,
+};
+pub use tmux::{
+    check_keyboard_setup as check_tmux_keyboard_setup, in_tmux,
+    keyboard_warning as tmux_keyboard_warning, EXTENDED_KEYS_FORMAT_WARNING,
+    EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,
 };
 pub use transcript::{
     content_text, parse_skill_block, thinking_text, Entry, ParsedSkillBlock, ResultImage,

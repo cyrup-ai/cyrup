@@ -27,6 +27,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::json_parse::parse_json_with_repair;
+use crate::utils::provider_retry::ProviderRetry;
 use crate::utils::simple_options::ThinkingBudgets;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
@@ -119,10 +120,14 @@ impl ApiImpl for GoogleGenerativeAiApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -137,7 +142,16 @@ impl ApiImpl for GoogleGenerativeAiApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -704,7 +718,11 @@ fn user_parts(content: &[Content]) -> Vec<Value> {
         .collect()
 }
 
-/// Build the `parts` for an assistant (`model`) turn (Pi google-shared.ts:126-175).
+/// Build the `parts` for an assistant (`model`) turn (Pi google-shared.ts:127-182).
+///
+/// Empty text/thinking blocks are dropped only when they carry no usable thought signature
+/// (Pi 6138f5a0, google-shared.ts:134-151); the cross-provider `else` branch keeps the old
+/// unconditional skip because the signature is unusable there (google-shared.ts:157-162).
 fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
     for block in &am.content {
@@ -713,10 +731,15 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
                 text,
                 text_signature,
             } => {
-                if text.trim().is_empty() {
+                let sig = resolve_thought_signature(same, text_signature.as_deref());
+                // Skip empty text blocks — unless they carry a thought signature. Gemini can
+                // attach the signature to a part whose visible text is empty and requires it
+                // echoed back; dropping it breaks the reasoning chain and the model
+                // intermittently ends mid-task turns with a thought-only STOP (empty
+                // completion, no tool call). (Pi google-shared.ts:134-139.)
+                if text.trim().is_empty() && sig.is_none() {
                     continue;
                 }
-                let sig = resolve_thought_signature(same, text_signature.as_deref());
                 let mut o = Map::new();
                 o.insert("text".to_string(), json!(sanitize_surrogates(text)));
                 if let Some(s) = sig {
@@ -729,11 +752,15 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
                 thinking_signature,
                 ..
             } => {
-                if thinking.trim().is_empty() {
-                    continue;
-                }
+                // Only keep as thinking block if same provider AND same model; otherwise
+                // convert to plain text (no tags to avoid model mimicking them).
                 if same {
                     let sig = resolve_thought_signature(same, thinking_signature.as_deref());
+                    // Same rule as text blocks: an empty thinking block is dropped only when it
+                    // carries no signature (Pi google-shared.ts:148-151).
+                    if thinking.trim().is_empty() && sig.is_none() {
+                        continue;
+                    }
                     let mut o = Map::new();
                     o.insert("thought".to_string(), json!(true));
                     o.insert("text".to_string(), json!(sanitize_surrogates(thinking)));
@@ -742,6 +769,11 @@ fn assistant_parts(am: &AssistantMessage, same: bool) -> Vec<Value> {
                     }
                     parts.push(Value::Object(o));
                 } else {
+                    // Cross-provider/model: the signature is unusable, empty blocks stay
+                    // dropped unconditionally (Pi google-shared.ts:157-162).
+                    if thinking.trim().is_empty() {
+                        continue;
+                    }
                     // Convert to plain text (no tags) for a different provider/model.
                     parts.push(json!({ "text": sanitize_surrogates(thinking) }));
                 }
@@ -797,13 +829,27 @@ fn map_tool_choice(tc: &ToolChoice) -> &'static str {
     }
 }
 
-/// Map a raw Gemini `finishReason` string to a cyrup [`StopReason`] (Pi `mapStopReason`,
+/// Map a raw Gemini `finishReason` to `(stop_reason, error_message)` (Pi `mapStopReason`,
 /// google-shared.ts:309-336 — only `STOP`/`MAX_TOKENS` are non-error).
-fn map_stop_reason(reason: &str) -> StopReason {
+///
+/// The message half is the point. Gemini's characteristic failures are all finish reasons rather
+/// than HTTP errors — `SAFETY`, `RECITATION`, `PROHIBITED_CONTENT`, `BLOCKLIST`,
+/// `MALFORMED_FUNCTION_CALL` — and this used to discard the raw string, so every one of them
+/// surfaced as the identical, information-free "An unknown error occurred". A content-policy
+/// refusal and a tool-schema bug demand completely different responses from the user, and the
+/// message carried nothing to tell them apart.
+///
+/// pi keeps the raw value on `output.rawStopReason` (`google-generative-ai.ts:214-216`) and builds
+/// the terminal error as ``output.rawStopReason ? `Provider stopped with: ${output.rawStopReason}`
+/// : "An unknown error occurred"`` (`:269-273`), so the reason names itself.
+fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
     match reason {
-        "STOP" => StopReason::Stop,
-        "MAX_TOKENS" => StopReason::Length,
-        _ => StopReason::Error,
+        "STOP" => (StopReason::Stop, None),
+        "MAX_TOKENS" => (StopReason::Length, None),
+        other => (
+            StopReason::Error,
+            Some(format!("Provider stopped with: {other}")),
+        ),
     }
 }
 
@@ -820,27 +866,20 @@ enum CurrentKind {
 }
 
 /// Streaming-decode state (mirrors Pi's `output` accumulation, google-generative-ai.ts:57-264).
+#[derive(Default)]
 struct Decoder {
     blocks: Vec<Content>,
     current: Option<CurrentKind>,
     usage: Usage,
     response_id: Option<String>,
-    stop_reason: StopReason,
+    /// The settled stop reason, or `None` while none has been delivered — cyrup's spelling of Pi's
+    /// `output.stopReason = "pending"` seed (google-generative-ai.ts:73), which is where the
+    /// `Default` below now starts. Gemini only sets this from a candidate's `finishReason`, so
+    /// `None` at EOF means the stream was TRUNCATED. It previously seeded `Stop` (on a misreading of
+    /// upstream, which seeds `"pending"`, not `"stop"`), which is what let a truncated Gemini stream
+    /// be transcribed as a cleanly completed turn (PROV-010).
+    stop_reason: Option<StopReason>,
     error_message: Option<String>,
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            current: None,
-            usage: Usage::default(),
-            response_id: None,
-            // Pi seeds `output.stopReason = "stop"` (google-generative-ai.ts:71).
-            stop_reason: StopReason::Stop,
-            error_message: None,
-        }
-    }
 }
 
 impl Decoder {
@@ -859,7 +898,11 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason,
+            // Pi's live `partial` carries the raw `output.stopReason`, i.e. `"pending"` until a
+            // `finishReason` lands (google-generative-ai.ts:73,229). The TERMINAL event never takes
+            // this value — it goes through `StreamEvent::end_of_stream`, which routes
+            // `None`/`Pending` to the `error` terminal.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }
@@ -923,7 +966,10 @@ where
         return;
     }
 
-    if dec.stop_reason == StopReason::Aborted || dec.stop_reason == StopReason::Error {
+    if matches!(
+        dec.stop_reason,
+        Some(StopReason::Aborted) | Some(StopReason::Error)
+    ) {
         emit_error(
             &dec,
             model,
@@ -937,8 +983,15 @@ where
         return;
     }
 
-    let message = dec.snapshot(model, api);
-    sink.send(StreamEvent::terminal(message)).await;
+    // No candidate ever carried a `finishReason` → the stream was TRUNCATED. Pi throws
+    // "Google stream ended without a finish reason" (google-generative-ai.ts:266-268); this used to
+    // fall through to the `Stop` seed and report a clean turn.
+    sink.send(StreamEvent::end_of_stream(
+        dec.snapshot(model, api),
+        dec.stop_reason,
+        "Google stream ended without a finish reason",
+    ))
+    .await;
 }
 
 /// Process one decoded `GenerateContentResponse` chunk. Returns `false` if the consumer dropped.
@@ -981,9 +1034,16 @@ async fn process_chunk(
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str)
     {
-        dec.stop_reason = map_stop_reason(reason);
+        let (stop, err) = map_stop_reason(reason);
+        dec.stop_reason = Some(stop);
+        if let Some(err) = err {
+            dec.error_message = Some(err);
+        }
         if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_))) {
-            dec.stop_reason = StopReason::ToolUse;
+            // A tool call present alongside a non-STOP reason is still a tool-use turn; clear the
+            // diagnostic with it so a successful turn never carries a stale error message.
+            dec.stop_reason = Some(StopReason::ToolUse);
+            dec.error_message = None;
         }
     }
 
@@ -1272,6 +1332,33 @@ fn now_millis() -> i64 {
 )]
 mod tests {
     use super::*;
+
+    /// pi `google-generative-ai.ts:214-216` + `:269-273`: the raw finishReason names itself in the
+    /// terminal error. Gemini's real failure modes are all finish reasons, and before this they all
+    /// collapsed to the identical "An unknown error occurred".
+    #[test]
+    fn a_non_stop_finish_reason_names_itself_in_the_error() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "MALFORMED_FUNCTION_CALL",
+        ] {
+            let (stop, err) = map_stop_reason(reason);
+            assert_eq!(stop, StopReason::Error, "{reason}");
+            assert_eq!(
+                err.as_deref(),
+                Some(format!("Provider stopped with: {reason}").as_str()),
+                "{reason} must be distinguishable from every other block reason"
+            );
+        }
+
+        // The two non-error arms stay clean and carry no diagnostic.
+        assert_eq!(map_stop_reason("STOP"), (StopReason::Stop, None));
+        assert_eq!(map_stop_reason("MAX_TOKENS"), (StopReason::Length, None));
+    }
+
     use crate::api::channel;
     use crate::model::ModelCost;
     use crate::stream::sse::decode_sse_bytes;
@@ -1652,6 +1739,208 @@ mod tests {
             "got: {}",
             tool.id.as_str()
         );
+    }
+
+    /// A valid (multiple-of-4, base64) thought signature for the signed-empty-block tests.
+    const VALID_SIG: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+
+    /// Build a two-message context whose assistant turn is attributed to `(provider, model)`.
+    fn signed_block_ctx(provider: &str, model: &str, content: Vec<Content>) -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User {
+                    content: vec![Content::text("Hi")],
+                    timestamp: 0,
+                },
+                Message::Assistant(AssistantMessage {
+                    content,
+                    provider: provider.into(),
+                    model: model.to_string(),
+                    api: API_ID.into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 1,
+                }),
+            ],
+            tools: Vec::new(),
+        }
+    }
+
+    fn a_tool_call() -> Content {
+        Content::ToolCall(ToolCall {
+            id: ToolCallId::from("call_1"),
+            name: "bash".to_string(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+        })
+    }
+
+    fn model_turn_parts(contents: &[Value]) -> Vec<Value> {
+        contents
+            .iter()
+            .find(|c| c["role"] == "model")
+            .and_then(|c| c["parts"].as_array().cloned())
+            .expect("model turn")
+    }
+
+    /// Pi google-shared.ts:148-151 (commit 6138f5a0): Gemini can attach `thoughtSignature` to a
+    /// part whose visible text is empty and requires it echoed back. A signed EMPTY thinking block
+    /// must survive so the reasoning chain is not broken.
+    #[test]
+    fn keeps_signed_empty_thinking_block() {
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = signed_block_ctx(
+            "google",
+            "gemini-3-pro-preview",
+            vec![
+                Content::Thinking {
+                    thinking: String::new(),
+                    thinking_signature: Some(VALID_SIG.to_string()),
+                    redacted: false,
+                },
+                a_tool_call(),
+            ],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        let signed: Vec<&Value> = parts
+            .iter()
+            .filter(|p| p.get("thoughtSignature").and_then(Value::as_str) == Some(VALID_SIG))
+            .collect();
+        assert_eq!(signed.len(), 1, "parts: {parts:?}");
+        assert_eq!(signed[0]["thought"], true);
+        assert_eq!(signed[0]["text"], "");
+    }
+
+    /// Pi google-shared.ts:134-139: the same rule for a signed EMPTY text block.
+    #[test]
+    fn keeps_signed_empty_text_block() {
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = signed_block_ctx(
+            "google",
+            "gemini-3-pro-preview",
+            vec![
+                Content::Text {
+                    text: String::new(),
+                    text_signature: Some(VALID_SIG.to_string()),
+                },
+                a_tool_call(),
+            ],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        let signed: Vec<&Value> = parts
+            .iter()
+            .filter(|p| p.get("thoughtSignature").and_then(Value::as_str) == Some(VALID_SIG))
+            .collect();
+        assert_eq!(signed.len(), 1, "parts: {parts:?}");
+        assert!(signed[0].get("thought").is_none());
+        assert_eq!(signed[0]["text"], "");
+    }
+
+    /// The skip is gated on the signature being ABSENT — UNSIGNED empty blocks are still dropped
+    /// (Pi google-shared.ts:139/151).
+    #[test]
+    fn still_drops_unsigned_empty_blocks() {
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = signed_block_ctx(
+            "google",
+            "gemini-3-pro-preview",
+            vec![
+                Content::Thinking {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                    redacted: false,
+                },
+                Content::Text {
+                    text: "   ".to_string(),
+                    text_signature: None,
+                },
+                a_tool_call(),
+            ],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        assert_eq!(parts.len(), 1, "parts: {parts:?}");
+        assert!(parts[0].get("functionCall").is_some());
+    }
+
+    /// An empty text block whose signature is INVALID base64 resolves to no signature, so the
+    /// unsigned rule applies and it is still dropped.
+    #[test]
+    fn still_drops_empty_block_with_invalid_signature() {
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = signed_block_ctx(
+            "google",
+            "gemini-3-pro-preview",
+            vec![
+                Content::Text {
+                    text: String::new(),
+                    text_signature: Some("not base64!".to_string()),
+                },
+                a_tool_call(),
+            ],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        assert_eq!(parts.len(), 1, "parts: {parts:?}");
+        assert!(parts[0].get("functionCall").is_some());
+    }
+
+    /// The cross-provider/model `else` branch keeps the OLD unconditional skip — the signature is
+    /// unusable there, so signed empty blocks are still dropped and the signature never leaks
+    /// (Pi google-shared.ts:157-162, deliberately retained by 6138f5a0).
+    #[test]
+    fn cross_provider_drops_signed_empty_blocks_unconditionally() {
+        let m = model_with("gemini-3-pro-preview", true);
+        // Assistant turn is attributed to a DIFFERENT model → `same` is false.
+        let ctx = signed_block_ctx(
+            "google",
+            "other-model",
+            vec![
+                Content::Thinking {
+                    thinking: String::new(),
+                    thinking_signature: Some(VALID_SIG.to_string()),
+                    redacted: false,
+                },
+                Content::Text {
+                    text: String::new(),
+                    text_signature: Some(VALID_SIG.to_string()),
+                },
+                a_tool_call(),
+            ],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        assert_eq!(parts.len(), 1, "parts: {parts:?}");
+        assert!(parts[0].get("functionCall").is_some());
+        assert!(!Value::Array(parts).to_string().contains(VALID_SIG));
+    }
+
+    /// The cross-provider branch still converts a NON-empty thinking block to plain text.
+    #[test]
+    fn cross_provider_keeps_non_empty_thinking_as_text() {
+        let m = model_with("gemini-3-pro-preview", true);
+        let ctx = signed_block_ctx(
+            "google",
+            "other-model",
+            vec![Content::Thinking {
+                thinking: "reasoned".to_string(),
+                thinking_signature: Some(VALID_SIG.to_string()),
+                redacted: false,
+            }],
+        );
+        let contents = convert_messages(&m, &ctx);
+        let parts = model_turn_parts(&contents);
+        assert_eq!(parts.len(), 1, "parts: {parts:?}");
+        assert_eq!(parts[0]["text"], "reasoned");
+        assert!(parts[0].get("thought").is_none());
+        assert!(parts[0].get("thoughtSignature").is_none());
     }
 
     #[test]

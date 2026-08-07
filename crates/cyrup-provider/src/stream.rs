@@ -303,6 +303,12 @@ impl StreamOptions {
     }
 }
 
+/// Fallback diagnostic stamped by [`StreamEvent::terminal`] when a caller routes a still-`pending`
+/// message to a terminal without going through [`StreamEvent::end_of_stream`] (which supplies the
+/// exact per-api text Pi throws). Reaching this string means a code path built a terminal from an
+/// unfinished message — a bug in that path, surfaced rather than swallowed.
+pub const PENDING_AT_TERMINAL: &str = "stream ended without a stop reason";
+
 /// Terminal-`done` reason. Pi narrows the `done` event's `reason` to
 /// `Extract<StopReason, "stop" | "length" | "toolUse">` (Pi types.ts:464), so cyrup mirrors that
 /// with a dedicated enum rather than the full [`StopReason`] (arch-01 §3.3). `rename_all="camelCase"`
@@ -359,6 +365,12 @@ impl TryFrom<StopReason> for DoneReason {
             StopReason::ToolUse => Ok(DoneReason::ToolUse),
             StopReason::Error => Err(ErrorReason::Error),
             StopReason::Aborted => Err(ErrorReason::Aborted),
+            // `pending` is Pi's in-flight sentinel and is NOT in its `done` extract (types.ts:464).
+            // Pi turns a surviving `"pending"` into a `throw`, and the catch pushes
+            // `{type:"error", reason:"error"}` (anthropic-messages.ts:751-768) — so `error`, never
+            // `aborted`. This arm is what makes `Pending` unable to reach a `done` event by
+            // construction, not merely by convention.
+            StopReason::Pending => Err(ErrorReason::Error),
         }
     }
 }
@@ -462,9 +474,25 @@ pub enum StreamEvent {
 impl StreamEvent {
     /// Build the correct terminal event for a final `message`, narrowing `message.stop_reason` into a
     /// [`DoneReason`] (`done` terminal) or an [`ErrorReason`] (`error` terminal). The mapping is total
-    /// and never panics: `error`/`aborted` route to the `error` terminal, every other reason to the
-    /// `done` terminal — matching Pi's `done`/`error` split (types.ts:464-465).
-    pub fn terminal(message: AssistantMessage) -> Self {
+    /// and never panics: `error`/`aborted` route to the `error` terminal, every other settled reason
+    /// to the `done` terminal — matching Pi's `done`/`error` split (types.ts:464-465).
+    ///
+    /// A still-[`StopReason::Pending`] message is **normalized in place** to
+    /// [`StopReason::Error`] before routing, exactly as Pi's catch does
+    /// (`output.stopReason = signal.aborted ? "aborted" : "error"`, anthropic-messages.ts:765-768;
+    /// the abort case never reaches here because every decoder emits its own aborted terminal).
+    /// This is the second half of the structural guarantee that `pending` never escapes a
+    /// non-terminal `partial`: no caller can hand a `Pending` message to a terminal and have it
+    /// survive into `message_end`, the settled transcript, or a session file. `error_message` is
+    /// filled only if the caller left it empty, so a decoder that already recorded the per-api
+    /// diagnostic (see [`Self::end_of_stream`]) keeps its exact Pi-matching text.
+    pub fn terminal(mut message: AssistantMessage) -> Self {
+        if message.stop_reason == StopReason::Pending {
+            message.stop_reason = StopReason::Error;
+            if message.error_message.as_deref().unwrap_or("").is_empty() {
+                message.error_message = Some(PENDING_AT_TERMINAL.to_string());
+            }
+        }
         match DoneReason::try_from(message.stop_reason) {
             Ok(reason) => StreamEvent::Done { reason, message },
             Err(reason) => StreamEvent::Error {
@@ -472,6 +500,52 @@ impl StreamEvent {
                 error: message,
             },
         }
+    }
+
+    /// Build the terminal event for a stream that reached **end of input**, given the settled stop
+    /// reason the provider actually delivered.
+    ///
+    /// This is the single seam that encodes Pi's truncated-stream rule, and every wire-API decoder
+    /// funnels its end-of-stream path through it so the rule cannot be forgotten in one converter
+    /// and honoured in another (which is exactly how PROV-010 arose: `openai-completions` guarded,
+    /// `anthropic-messages` and `google-generative-ai` defaulted a stop-reason-less stream to a
+    /// clean `stop`, transcribing a truncated turn as a completed one with no diagnostic).
+    ///
+    /// `delivered` is `None` when the stream ended without the provider ever sending a terminal
+    /// stop reason — cyrup's spelling of Pi's still-`"pending"` output, which every Pi stream
+    /// function turns into a `throw` and therefore an `{type:"error", reason:"error"}` terminal:
+    ///
+    /// | Pi source | throw text |
+    /// |---|---|
+    /// | `anthropic-messages.ts:751-753` | `Anthropic stream ended without a stop reason` |
+    /// | `google-generative-ai.ts:266-268` | `Google stream ended without a finish reason` |
+    /// | `mistral-conversations.ts:88-90` | `Mistral stream ended without a finish reason` |
+    /// | `openai-responses.ts:170-172` | `OpenAI Responses stream ended without a stop reason` |
+    /// | `openai-completions.ts:580-582` | `Stream ended without finish_reason` |
+    ///
+    /// `truncated` carries that per-api text; it lands in `error_message`, matching Pi's catch block
+    /// (`output.errorMessage = error.message`). A `Some(_)` settled reason is used verbatim, so an
+    /// already-settled `error`/`aborted` keeps the `error_message` the decoder recorded.
+    ///
+    /// `Some(StopReason::Pending)` is treated identically to `None` — Pi's guard is a value test on
+    /// the sentinel (`output.stopReason === "pending"`), not a "was anything assigned" test, so a
+    /// decoder that tracks its reason as a plain [`StopReason`] rather than an `Option` gets the
+    /// same answer.
+    pub fn end_of_stream(
+        mut message: AssistantMessage,
+        delivered: Option<StopReason>,
+        truncated: &str,
+    ) -> Self {
+        match delivered {
+            Some(reason) if reason != StopReason::Pending => {
+                message.stop_reason = reason;
+            }
+            _ => {
+                message.stop_reason = StopReason::Error;
+                message.error_message = Some(truncated.to_string());
+            }
+        }
+        StreamEvent::terminal(message)
     }
 
     /// The final message iff this is a terminal event (func-01 R-01-023).

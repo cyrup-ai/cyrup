@@ -51,6 +51,7 @@ struct Captured {
     system_prompt: Option<String>,
     env: Option<cyrup_provider::ProviderEnv>,
     timeout_ms: Option<u64>,
+    headers: Option<cyrup_provider::HeaderMap>,
 }
 
 /// A `StreamFn` that records the forwarded `Context`/`StreamOptions`, then delegates to a faux
@@ -80,6 +81,7 @@ impl StreamFn for RecordingStreamFn {
             system_prompt: ctx.system_prompt.clone(),
             env: opts.env.clone(),
             timeout_ms: opts.timeout_ms,
+            headers: opts.headers.clone(),
         });
         self.inner.stream(model, ctx, opts)
     }
@@ -671,5 +673,54 @@ async fn gap22_prompt_with_images_builds_multimodal_user_message() {
     assert!(
         content.iter().any(|c| matches!(c, Content::Image { .. })),
         "image attached after the text"
+    );
+}
+
+/// `Agent::set_headers` must change what the NEXT request actually carries.
+///
+/// pi recomputes provider-attribution and opencode session-affinity headers inside `streamFn`, on
+/// the model the request is going to (`sdk.ts:318-327`). cyrup held them in `GenerationConfig`,
+/// fixed at build, so a cross-provider `/model` switch kept sending the previous provider's
+/// attribution — an OpenRouter `HTTP-Referer`/`X-Title` on an Anthropic request.
+///
+/// This asserts at the only level that discriminates: what reaches `StreamOptions`. Two earlier
+/// attempts at a session-level test did NOT — with no model switch the pinned build-time map
+/// trivially equals the active model's attribution, and the faux catalog offers no
+/// attribution-distinguishable pair to switch between. Both passed against the defect.
+#[tokio::test]
+async fn set_headers_repoints_the_next_requests_header_overlay() {
+    let (sf, captured) = recording_stream_fn(vec![
+        faux_assistant_message(vec![faux_text("one")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("two")], StopReason::Stop),
+    ]);
+
+    let mut built = cyrup_provider::HeaderMap::new();
+    built.insert("x-attribution".to_string(), Some("first-provider".to_string()));
+    let agent = Agent::builder(model_ref(), sf).headers(built.clone()).build();
+
+    agent.prompt("go").await.expect("first turn");
+    agent.wait_for_idle().await;
+
+    // The builder value reaches the first request.
+    assert_eq!(
+        captured.lock().unwrap()[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        Some(&Some("first-provider".to_string())),
+        "the build-time overlay reaches the first request"
+    );
+
+    // Now repoint it, as a `/model` switch does.
+    let mut switched = cyrup_provider::HeaderMap::new();
+    switched.insert("x-attribution".to_string(), Some("second-provider".to_string()));
+    agent.set_headers(Some(switched)).await;
+
+    agent.prompt("go again").await.expect("second turn");
+    agent.wait_for_idle().await;
+
+    let seen = captured.lock().unwrap();
+    assert_eq!(seen.len(), 2, "two requests were made");
+    assert_eq!(
+        seen[1].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        Some(&Some("second-provider".to_string())),
+        "the SECOND request must carry the repointed overlay, not the pinned build-time one"
     );
 }

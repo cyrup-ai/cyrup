@@ -41,6 +41,10 @@ pub mod acceptance;
 /// Implementation-expecting classification and mutating-tool-call scan (R-SA-034).
 pub mod completion_guard;
 
+/// Live-control config resolution + the control-event/notice pipeline (pi
+/// `runs/shared/subagent-control.ts` + the control half of `runs/shared/long-running-guard.ts`).
+pub mod control;
+
 /// Direct-MCP tool-allowlist resolution (T4) — `mcp:<server>[/<tool>]` selectors are expanded into
 /// concrete adapter-visible builtin tool names for the child's `--tools` allowlist (pi
 /// `resolveMcpDirectToolNames`, `runs/shared/mcp-direct-tool-allowlist.ts`), rather than passed
@@ -101,8 +105,54 @@ use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::{ChildSpawnSpec, SpawnCommand, SpawnedChild};
 
 /// R-SA-028 (MUST) — bounded recent-output buffer cap: `recent_output` in a live progress
-/// snapshot MUST be capped at 50 lines (oldest evicted first) while the run is active.
+/// snapshot MUST be capped at 50 lines (oldest evicted first) while the run is active. Identical to
+/// pi's own `if (progress.recentOutput.length > 50) splice(...)` window
+/// (`runs/foreground/execution.ts:115-120`).
 pub const RECENT_OUTPUT_CAP: usize = 50;
+
+/// How many trailing lines of ONE chunk of child text enter [`AgentProgress::recent_output`] —
+/// pi's `.split("\n").slice(-10)` at both append sites (`runs/foreground/execution.ts:850,869`
+/// @HEAD; `:794,813` @v0.34.0). A single enormous assistant turn therefore contributes at most ten
+/// lines to the ring, before [`RECENT_OUTPUT_CAP`] even applies.
+pub const RECENT_OUTPUT_TAIL_LINES: usize = 10;
+
+/// Hard per-line character cap applied as each line enters [`AgentProgress::recent_output`] — pi's
+/// `MAX_STREAMED_OUTPUT_LINE_CHARS` (`pi-subagents/src/shared/utils.ts:442`, applied by
+/// `boundStreamedRecentOutput` at `:450-456`), whose own doc comment is *"Cap per-line length of
+/// recent output so one long line can't inflate a snapshot."*
+///
+/// **Version note**: this constant does NOT exist at the ported v0.34.0 baseline — it arrived
+/// upstream with `boundStreamedRecentTools`/`MAX_STREAMED_RECENT_TOOLS`, which
+/// [`crate::tui::events::RECENT_TOOLS_CAP`] already adopts for the same reason. Adopting the
+/// sibling bound keeps the two halves of one upstream guard from being half-ported.
+///
+/// **[CYRUP-DELTA] ×2.**
+/// 1. pi applies the bound only when SNAPSHOTTING for the streamed wire (`snapshotProgress`,
+///    `execution.ts:171-178`), leaving the live array's lines unbounded in length. This fold
+///    truncates at append time instead — the identical bounded lines on every snapshot, with an
+///    in-memory ring that is O(1) in line width too. That closes the one growth term a
+///    settled-but-`running` snapshot (pi's interrupt-paused shape, which `compactCompletedProgress`
+///    deliberately refuses to compact) would otherwise still carry: 50 lines × unbounded width.
+/// 2. pi's `line.slice(0, N)` counts UTF-16 code units; this counts `char`s, because a byte slice
+///    at an arbitrary offset can split a UTF-8 sequence (and the crate denies `indexing_slicing`).
+///    The suffix `… [truncated]` is pi's, verbatim.
+pub const RECENT_OUTPUT_LINE_CHARS: usize = 2000;
+
+/// pi `boundStreamedRecentOutput`'s per-line arm (`shared/utils.ts:450-456`), applied at append
+/// time per [`RECENT_OUTPUT_LINE_CHARS`]'s delta note: a line longer than the cap becomes its first
+/// `RECENT_OUTPUT_LINE_CHARS` `char`s followed by pi's verbatim `… [truncated]` suffix; anything
+/// within the cap is returned unchanged.
+#[must_use]
+fn bound_output_line(line: &str) -> String {
+    // `chars().count()` rather than `len()`: the cap is a CHARACTER cap (pi's UTF-16-code-unit
+    // `slice`), and a byte length would truncate multi-byte text far too eagerly.
+    if line.chars().count() <= RECENT_OUTPUT_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(RECENT_OUTPUT_LINE_CHARS).collect();
+    out.push_str("… [truncated]");
+    out
+}
 
 /// The exact message a timed-out run leads its delivered output with, and the text of the timeout
 /// error — a 1:1 port of pi's `formatTimeoutMessage` (`execution.ts:87-89`). `ms` is the NOMINAL
@@ -409,7 +459,17 @@ pub struct RunOptions {
     /// under its own `interrupted` flag on [`SingleResult`] rather than conflating it with
     /// `timed_out`.
     pub interrupt: CancelToken,
+    /// pi `options.share` (`execution.ts:1027`, the tool's SINGLE-mode `share` param). Its ONE
+    /// effect at this port's baseline is pi's `sessionEnabled` term (`execution.ts:1039`): a
+    /// `Some(true)` keeps the child's session store ON even without an explicit
+    /// [`Self::session_dir`], so `--no-session` is not emitted (see
+    /// [`build_attempt_spawn_plan`]). pi v0.34.0 has no gist upload of its own — the tool schema's
+    /// legacy "Upload session to GitHub Gist" wording describes a capability neither side ships.
     pub share: Option<bool>,
+    /// pi `options.sessionDir` (`pi-args.ts:107-111`): the directory the child persists its session
+    /// under, passed through as `--session-dir <dir>` and created up front. Ignored when
+    /// [`ForkContext::session_file_path`] resolved a concrete session FILE (pi's `sessionFile` wins
+    /// that branch outright).
     pub session_dir: Option<PathBuf>,
     /// Per-call skill-name override (pi `options.skills`, `execution.ts:935`): when `Some`, these
     /// names are resolved and injected into the child prompt INSTEAD of the agent's own
@@ -421,11 +481,19 @@ pub struct RunOptions {
     /// second arg to `resolveSkillsWithFallback`, `execution.ts:937`). `None` resolves skills
     /// against `cwd` alone (no fallback).
     pub runtime_cwd: Option<PathBuf>,
-    /// R-SA-043: when `Some(false)`, even a still-running progress snapshot omits per-turn
-    /// detail; `None`/`Some(true)` is the default fuller shape. `run_sync`'s own return value
-    /// (always a terminal, compacted [`SingleResult`]) is unaffected either way — see
-    /// [`SingleResult`]'s own doc comment for exactly what compaction means for a *completed*
-    /// result vs. a live callback snapshot.
+    /// pi `params.includeProgress` (`extension/schemas.ts:272` @v0.34.0, *"Include full progress in
+    /// result (default: false)"*) — R-SA-043 compaction's ONE documented opt-out.
+    ///
+    /// `Some(true)` — and ONLY `Some(true)`, matching pi's truthiness gate `progress:
+    /// params.includeProgress ? allProgress : undefined` (`subagent-executor.ts:3008` for SINGLE,
+    /// `:2679` for PARALLEL) — makes [`run_sync`] assemble this run's own
+    /// [`crate::tui::events::LiveProgressSnapshot`] onto [`SingleResult::progress`]. `None` and
+    /// `Some(false)` leave that field `None`, which `skip_serializing_if` then omits from the wire
+    /// entirely: the returned/persisted result is byte-for-byte what it was before the field
+    /// existed.
+    ///
+    /// It never affects any OTHER field of [`SingleResult`] — the messages/transcript compaction
+    /// R-SA-043 mandates is unconditional on both sides.
     pub include_progress: Option<bool>,
     pub agent_scope: Option<AgentReadScope>,
     /// The effective `subagents.modelScope` policy for this run (SUBA-003), threaded down from the
@@ -490,6 +558,20 @@ pub struct RunOptions {
     /// [`crate::spawn::nested_events::CHILD_INDEX_ENV`]. `None` defaults to `0` (a single top-level
     /// run has one child at index 0).
     pub child_index: Option<usize>,
+    /// pi `options.controlConfig` (`execution.ts:245`, threaded from `runSinglePath`'s
+    /// `resolveControlConfig(deps.config.control, params.control)`, `subagent-executor.ts:1179`
+    /// @v0.34.0; the detached async runner reads the same value back out of its one-shot config,
+    /// `subagent-runner.ts:1802`):
+    /// the fully-resolved live-control thresholds/channels this run's attention pipeline runs
+    /// against. `None` is pi's `?? DEFAULT_CONTROL_CONFIG` — control tracking ON with the stock
+    /// 60s/240s/3 thresholds, NOT "off". Set
+    /// [`crate::exec::control::ResolvedControlConfig::enabled`] to `false` to turn it off.
+    pub control_config: Option<crate::exec::control::ResolvedControlConfig>,
+    /// pi `options.onControlEvent` (`execution.ts:255`): the per-raise callback the ORCHESTRATOR
+    /// installs (`createForegroundControlNotifier`, `subagent-executor.ts:1222-1229` @v0.34.0) to fan a
+    /// raised event out to the notice channels. `None` (every non-tool caller, and tests) still
+    /// records events on [`SingleResult::control_events`]; it just delivers none of them live.
+    pub on_control_event: Option<crate::exec::control::ControlEventSink>,
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`run_sync`]'s per-attempt driver
@@ -530,11 +612,9 @@ pub use crate::exec::fallback::ModelAttempt as RunModelAttempt;
 pub use crate::exec::tool_call_summary::ToolCallSummary;
 
 /// The full, terminal outcome of one `run_sync` call (arch-SA §3.4). This is always the
-/// **compacted** (R-SA-043) shape: no raw per-turn messages, no live `progress` object — only the
-/// summarized fields below. A still-running progress snapshot used for live update callbacks
-/// (`RunOptions.include_progress`-gated, §4.3) is a materially different, richer shape this crate
-/// does not construct in this module (that belongs to `tui/` once it exists); `SingleResult` is
-/// exclusively the terminal return value.
+/// **compacted** (R-SA-043) shape: no raw per-turn messages — only the summarized fields below.
+/// The one opt-out is [`Self::progress`], which [`RunOptions::include_progress`] gates exactly as
+/// pi's `includeProgress` gates `Details.progress`; see that field's own doc.
 ///
 /// `PartialEq`/`Serialize`/`Deserialize` are derived (beyond the original `Debug, Clone`) because
 /// `background::ResultFile` (func-SA §4.5, R-SA-077/166) embeds `Vec<SingleResult>` directly and
@@ -571,6 +651,22 @@ pub struct SingleResult {
     pub interrupted: bool,
     pub timed_out: bool,
     pub error: Option<String>,
+    /// pi `result.savedOutputPath` (`shared/types.ts:492`, assigned at
+    /// `runs/foreground/execution.ts:963` from `resolveSingleOutput(...).savedPath`): the concrete
+    /// file the R-SA-031 output-path handoff actually persisted this run's delivered output to,
+    /// `None` when no `output_path` was requested, the run did not complete cleanly, or nothing
+    /// was written.
+    ///
+    /// This is the SAME value the saved-output reference message folded into `final_output` is
+    /// built from — carried as its own field because consumers need the bare path, not the prose:
+    /// pi's `collectDynamicResults` emits it as a dynamic collect record's `outputPath`
+    /// (`runs/shared/dynamic-fanout.ts:283`) so a later chain step can locate the file each
+    /// fanned-out sibling wrote.
+    ///
+    /// `#[serde(default)]` + omit-when-absent so a `status.json`/result file written before this
+    /// field existed still round-trips (the same discipline `control_events` below follows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_output_path: Option<String>,
     /// Summarized `{text, expandedText}` tool-call previews observed across the winning attempt's
     /// transcript — R-SA-043's "only summarized `tool_calls`" compaction requirement (pi's
     /// `ToolCallSummary[]`, `utils.ts:368-373`). Each carries a short and an expanded argument
@@ -578,6 +674,49 @@ pub struct SingleResult {
     pub tool_calls: Vec<ToolCallSummary>,
     /// Whether [`output::truncate_output`] actually cut the delivered `final_output` (R-SA-042).
     pub output_truncated: bool,
+    /// pi `result.controlEvents` (`execution.ts:1112`/`:1260`): every live-control event the
+    /// WINNING attempt raised, in raise order, plus the post-settlement completion-guard raise
+    /// (`:1234`). Empty for a run whose control config is disabled, whose `notifyOn` excluded both
+    /// classes, or that simply never tripped a threshold — which is why it is `#[serde(default)]`
+    /// and omitted from the wire when empty: a persisted `status.json`/result file written before
+    /// this field existed still round-trips.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_events: Vec<crate::exec::control::ControlEvent>,
+    /// pi `SingleResult.progress` (`pi-subagents/src/shared/types.ts:844`) — this run's own
+    /// `AgentProgress` snapshot, and the home for what `includeProgress` gates.
+    ///
+    /// **`None` unless [`RunOptions::include_progress`] is `Some(true)`.** That is the whole
+    /// contract: R-SA-043's compaction stays the default, `includeProgress` is its documented
+    /// opt-out (pi `progress: params.includeProgress ? allProgress : undefined`,
+    /// `runs/foreground/subagent-executor.ts:3071` for PARALLEL and `:3406` for SINGLE), and with
+    /// the flag off or omitted this field skips serialization entirely so a returned/persisted
+    /// `SingleResult` is byte-for-byte what it was before the field existed.
+    ///
+    /// When populated it has always been through
+    /// [`crate::tui::events::LiveProgressSnapshot::compact_completed`] (pi
+    /// `compactCompletedProgress` via `compactForegroundDetails`, `shared/utils.ts:414-421`), which
+    /// for every SETTLED status empties the two per-run growth terms — the tool-history ring and
+    /// the recent-output tail.
+    ///
+    /// **The one exception is upstream's, not this port's**: pi's `compactCompletedProgress` opens
+    /// with `if (progress.status === "running") return progress;`, and an interrupt-PAUSED run is
+    /// precisely the case pi leaves at `"running"` (`execution.ts:828`, returning at `:861` before
+    /// the `completed`/`failed` assignment at `:907`). Such a snapshot keeps its rings — which is
+    /// the point, since the caller is expected to resume the run. Both rings are bounded at PUSH
+    /// time in this port ([`crate::tui::events::RECENT_TOOLS_CAP`] entries,
+    /// [`RECENT_OUTPUT_CAP`] lines of at most [`RECENT_OUTPUT_LINE_CHARS`] chars each), so even
+    /// that shape is O(1) in the child's chattiness. pi bounds neither on this path.
+    ///
+    /// **[CYRUP-DELTA] on placement.** pi carries the array one level UP, on
+    /// `Details.progress: AgentProgress[]` (`types.ts:908`), assembled as `allProgress` from each
+    /// child's own `result.progress` (`subagent-executor.ts:3060-3062,3380`), and blanks
+    /// `SingleResult.progress` in the returned `results` (`compactForegroundResult`,
+    /// `utils.ts:404-412`). cyrup's SINGLE-mode tool `details` IS the serialized `SingleResult`
+    /// (`extension.rs::route_single`) rather than a `Details` wrapper, so the snapshot lands on the
+    /// field pi already declares for it and surfaces at the same JSON path (`details.progress`) a
+    /// pi caller reads for a SINGLE run — one snapshot rather than a one-element array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::tui::events::LiveProgressSnapshot>,
 }
 
 // ================================================================================================
@@ -601,10 +740,20 @@ pub struct AgentProgress {
     /// The most recently started tool's name, if any tool call has started and none more recent
     /// has superseded it (R-SA-027's "set `current_tool`").
     pub current_tool: Option<String>,
-    /// Bounded ring buffer of recent raw NDJSON lines, oldest evicted first once
-    /// [`RECENT_OUTPUT_CAP`] is exceeded (R-SA-028). Kept as raw text (not parsed events) since
-    /// R-SA-028's own text speaks of "recent output" as a rendering/log concern, not a
-    /// re-parseable event queue.
+    /// Bounded ring buffer of the child's recent OUTPUT TEXT, oldest evicted first once
+    /// [`RECENT_OUTPUT_CAP`] is exceeded (R-SA-028) — pi `progress.recentOutput`
+    /// (`shared/types.ts:575`), seeded with the fallback ladder's attempt notes
+    /// (`recentOutput: [...shared.attemptNotes]`, `runs/foreground/execution.ts:366`) and appended
+    /// to by `appendRecentOutput` on each assistant `message_end` and each `tool_execution_end`.
+    ///
+    /// This holds EXTRACTED, human-readable text (`extractTextFromContent` over the message
+    /// `content` / tool `result`), never the raw NDJSON envelope. That distinction is load-bearing
+    /// rather than cosmetic: R-SA-028 describes "recent output" as a rendering/log concern, the
+    /// only consumer that publishes it —
+    /// [`SingleResult::progress`] via [`AgentProgress::snapshot`] — surfaces it to a caller as
+    /// pi's `AgentProgress.recentOutput`, and a raw `{"type":"message_end","message":{...}}` line
+    /// is both unrenderable and (before [`RECENT_OUTPUT_LINE_CHARS`]) an unbounded blob of the
+    /// whole turn.
     pub recent_output: VecDeque<String>,
     /// Every `MessageEnd` event observed this attempt, in chronological (parse) order — the exact
     /// input [`output::extract_final_output`] (R-SA-029) needs, and what
@@ -621,6 +770,20 @@ pub struct AgentProgress {
     /// that R-SA-030 wiring, alongside `message_end_events`/`tool_end_events` for its own
     /// R-SA-029/034 wiring.
     pub all_events: Vec<SubagentEvent>,
+    /// The short argument preview captured when [`Self::current_tool`] STARTED (pi
+    /// `progress.currentToolArgs = extractToolArgsPreview(toolArgs)`,
+    /// `runs/foreground/execution.ts:794`), copied onto the [`Self::recent_tools`] entry that call
+    /// produces when it ends and cleared alongside `current_tool` (`:811-812`).
+    pub current_tool_args: String,
+    /// Bounded ring of finished tool calls (pi `progress.recentTools`, `shared/types.ts:574`),
+    /// oldest evicted first past [`crate::tui::events::RECENT_TOOLS_CAP`] — the same
+    /// bound-at-push discipline (and the same rationale) as
+    /// [`crate::tui::events::LiveProgressFold`]'s own ring.
+    pub recent_tools: VecDeque<crate::tui::events::RecentToolCall>,
+    /// When this attempt's clock started, for `durationMs` (pi's `startTime` local, captured before
+    /// the child spawns and read back at `execution.ts:1177`). `None` in a `Default`-constructed
+    /// fold, which reports a zero duration.
+    pub started_at: Option<std::time::Instant>,
 }
 
 impl AgentProgress {
@@ -628,19 +791,59 @@ impl AgentProgress {
     /// event's usage is accumulated additively (never last-wins — mirrors
     /// [`fallback::add_usage`]'s own contract, restated here at the per-attempt granularity); every
     /// `ToolExecutionStart` increments `tool_count` and sets `current_tool`.
+    ///
+    /// Also feeds [`Self::recent_output`], on exactly pi's two append sites: an ASSISTANT
+    /// `message_end`'s extracted content text (`appendRecentOutput(progress,
+    /// assistantText.split("\n").slice(-10))`, `runs/foreground/execution.ts:651` @v0.34.0) and a
+    /// finished tool call's extracted result text (`:670`). **[CYRUP-DELTA]** pi reads the result
+    /// text off a separate `tool_result_end` event; cyrup's wire has no such event and carries the
+    /// same payload on `ToolExecutionEnd.result` — the delta [`crate::exec::ndjson::SubagentEvent`]
+    /// already documents, and the same one [`crate::tui::events::LiveProgressFold`] makes.
     pub fn record_event(&mut self, event: SubagentEvent) {
         if let Some(usage) = event.assistant_usage() {
             crate::exec::fallback::add_usage(&mut self.usage, &usage);
         }
         match &event {
-            SubagentEvent::ToolExecutionStart { tool_name, .. } => {
+            SubagentEvent::ToolExecutionStart {
+                tool_name, args, ..
+            } => {
                 self.tool_count += 1;
                 self.current_tool = Some(tool_name.clone());
+                // pi `execution.ts:794`.
+                self.current_tool_args =
+                    crate::exec::tool_call_summary::extract_tool_args_preview(args);
             }
-            SubagentEvent::MessageEnd { .. } => {
+            SubagentEvent::MessageEnd { message } => {
+                // pi `execution.ts:650-651` @v0.34.0 — ASSISTANT turns only; a user/tool-role
+                // `message_end` contributes nothing to the rendered output tail.
+                if message.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
+                    let text = message
+                        .get("content")
+                        .map(crate::tui::events::extract_event_text)
+                        .unwrap_or_default();
+                    self.append_recent_output(&text);
+                }
                 self.message_end_events.push(event.clone());
             }
-            SubagentEvent::ToolExecutionEnd { .. } => {
+            SubagentEvent::ToolExecutionEnd { result, .. } => {
+                // pi `execution.ts:664,670` @v0.34.0.
+                let result_text = crate::tui::events::extract_event_text(result);
+                self.append_recent_output(&result_text);
+                // pi pushes onto `recentTools` ONLY when a `currentTool` was in flight
+                // (`execution.ts:804-810`), then clears it and its args (`:811-812`).
+                if let Some(tool) = self.current_tool.take() {
+                    if self.recent_tools.len() >= crate::tui::events::RECENT_TOOLS_CAP {
+                        self.recent_tools.pop_front();
+                    }
+                    self.recent_tools
+                        .push_back(crate::tui::events::RecentToolCall {
+                            tool,
+                            args: std::mem::take(&mut self.current_tool_args),
+                            end_ms: u64::try_from(crate::background::now_epoch_millis_pub())
+                                .unwrap_or(0),
+                        });
+                }
+                self.current_tool_args.clear();
                 self.tool_end_events.push(event.clone());
             }
             _ => {}
@@ -648,13 +851,58 @@ impl AgentProgress {
         self.all_events.push(event);
     }
 
-    /// Push one raw NDJSON line into the bounded `recent_output` ring buffer (R-SA-028): capped
-    /// at [`RECENT_OUTPUT_CAP`] lines, oldest evicted first.
-    pub fn record_raw_line(&mut self, line: &str) {
-        if self.recent_output.len() >= RECENT_OUTPUT_CAP {
-            self.recent_output.pop_front();
+    /// Number of ASSISTANT `message_end` events observed this attempt — pi's `progress.turnCount`,
+    /// which it keeps in lockstep with `result.usage.turns` and increments only for an assistant
+    /// message (`runs/foreground/execution.ts:825-827`).
+    #[must_use]
+    pub fn turn_count(&self) -> u32 {
+        let turns = self
+            .message_end_events
+            .iter()
+            .filter(|event| match event {
+                SubagentEvent::MessageEnd { message } => {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                }
+                _ => false,
+            })
+            .count();
+        u32::try_from(turns).unwrap_or(u32::MAX)
+    }
+
+    /// Milliseconds elapsed since this attempt's clock started (pi `Date.now() - startTime`,
+    /// `runs/foreground/execution.ts:1177`); `0` for a fold whose clock was never started.
+    #[must_use]
+    pub fn duration_ms(&self) -> u64 {
+        self.started_at
+            .map(|start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Append one chunk of child output text to the bounded `recent_output` ring (R-SA-028) — a
+    /// 1:1 port of pi's `appendRecentOutput` (`runs/foreground/execution.ts:112-120`) fused with
+    /// the `.split("\n").slice(-10)` every call site applies to its argument (`:850,869`).
+    ///
+    /// Exactly pi's three rules, in pi's order: keep only the last
+    /// [`RECENT_OUTPUT_TAIL_LINES`] lines of THIS chunk, drop the blank ones
+    /// (`lines.filter((line) => line.trim())`), then evict from the front until the ring is back
+    /// within [`RECENT_OUTPUT_CAP`]. Plus the one [CYRUP-DELTA] documented on
+    /// [`RECENT_OUTPUT_LINE_CHARS`]: each surviving line is truncated to that many `char`s here
+    /// rather than at snapshot time.
+    ///
+    /// pi keeps the ORIGINAL (untrimmed) line text and only *tests* `line.trim()` for emptiness,
+    /// so leading indentation survives — reproduced here rather than pushing the trimmed form.
+    pub fn append_recent_output(&mut self, text: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        let tail_start = lines.len().saturating_sub(RECENT_OUTPUT_TAIL_LINES);
+        for line in lines.into_iter().skip(tail_start) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if self.recent_output.len() >= RECENT_OUTPUT_CAP {
+                self.recent_output.pop_front();
+            }
+            self.recent_output.push_back(bound_output_line(line));
         }
-        self.recent_output.push_back(line.to_string());
     }
 
     /// Summarized `{text, expandedText}` tool-call previews observed this attempt (R-SA-043's
@@ -677,6 +925,97 @@ impl AgentProgress {
             })
             .collect()
     }
+
+    /// Project this fold into pi's `AgentProgress` wire shape
+    /// ([`crate::tui::events::LiveProgressSnapshot`]) — the bridge `includeProgress` gates.
+    ///
+    /// pi needs no such projection because it has ONE object: `runSingleAttempt` builds a single
+    /// mutable `progress` literal carrying both the launch context and the live counters
+    /// (`runs/foreground/execution.ts:258-270` @v0.34.0), mutates its `status`/`durationMs`/
+    /// `error`/`failedTool` at settle (`:907-913`), and hands that same object out as
+    /// `result.progress` (`:271`). cyrup splits the two halves — the counters accumulate here, per
+    /// ATTEMPT, while the launch context and the post-ladder settled facts are `run_sync` locals —
+    /// so [`ProgressSnapshotInput`] carries the second half in and this method fuses them.
+    ///
+    /// The result is the FULL (still-uncompacted) shape, exactly like pi's object at `:271`. A
+    /// caller publishing a settled run's progress must then run it through
+    /// [`crate::tui::events::LiveProgressSnapshot::compact_completed`], which is what pi's
+    /// `compactForegroundDetails` does one level up (`shared/utils.ts:414-421`).
+    #[must_use]
+    pub fn snapshot(
+        &self,
+        input: ProgressSnapshotInput<'_>,
+    ) -> crate::tui::events::LiveProgressSnapshot {
+        crate::tui::events::LiveProgressSnapshot {
+            index: input.index,
+            agent: Some(input.agent.to_string()),
+            status: input.status,
+            activity_state: input.activity_state,
+            task: input.task.to_string(),
+            skills: input.skills,
+            // pi `progress.currentTool` survives into the returned object; `record_event` `take`s
+            // it on `tool_execution_end`, so it is `Some` only for a call still in flight.
+            current_tool: self.current_tool.clone(),
+            recent_tools: self.recent_tools.iter().cloned().collect(),
+            tool_count: self.tool_count,
+            turn_count: self.turn_count(),
+            // pi `progress.tokens = result.usage.input + result.usage.output`
+            // (`execution.ts:646` @v0.34.0) — NOT the cache-read/write terms.
+            tokens: self.usage.input.saturating_add(self.usage.output),
+            model: input.model,
+            thinking: input.thinking,
+            input_tokens: Some(self.usage.input),
+            output_tokens: Some(self.usage.output),
+            duration_ms: self.duration_ms(),
+            error: input.error.clone(),
+            // pi `if (result.error) { …; if (progress.currentTool) progress.failedTool =
+            // progress.currentTool; }` (`execution.ts:909-913` @v0.34.0) — BOTH conditions, so a
+            // clean run names no failed tool and a failure with nothing in flight names none
+            // either.
+            failed_tool: input
+                .error
+                .as_ref()
+                .and_then(|_| self.current_tool.clone()),
+            recent_output: self.recent_output.iter().cloned().collect(),
+        }
+    }
+}
+
+/// The half of pi's `progress` object that lives OUTSIDE [`AgentProgress`] in this port: the
+/// launch-time descriptive fields pi writes into the literal at construction
+/// (`runs/foreground/execution.ts:258-270` @v0.34.0) and the settled facts it assigns after the
+/// child closes (`:907-913`). Every field is a `run_sync` local by the time
+/// [`AgentProgress::snapshot`] is called.
+///
+/// A struct rather than nine positional arguments so the call site names each value (and so clippy's
+/// `too_many_arguments` stays quiet).
+pub struct ProgressSnapshotInput<'a> {
+    /// pi `progress.index` ← `options.index ?? 0` (`execution.ts:259`); cyrup
+    /// [`RunOptions::child_index`].
+    pub index: u32,
+    /// pi `progress.agent` ← `agent.name` (`:260`).
+    pub agent: &'a str,
+    /// pi `progress.task` ← the (post-fork-wrap) task text (`:262`).
+    pub task: &'a str,
+    /// pi `progress.skills` ← `shared.resolvedSkillNames` (`:263`) — the names that actually
+    /// RESOLVED, `None` when none did (pi `resolvedSkills.length > 0 ? … : undefined`,
+    /// `:1481` @HEAD).
+    pub skills: Option<Vec<String>>,
+    /// pi `progress.model` ← `modelArg` (`:267`), i.e. the winning model id WITH the thinking
+    /// suffix [`apply_thinking_suffix`] appends.
+    pub model: Option<String>,
+    /// pi `progress.thinking` ← `resolvedThinking` (`:268`).
+    pub thinking: Option<String>,
+    /// pi's settled `progress.status` (`:907` / `:344` for a detach / `:828` for an interrupt).
+    pub status: crate::tui::events::LiveProgressStatus,
+    /// pi `progress.activityState`, owned by the live-control state machine and cleared on
+    /// interrupt (`:832,854`); cyrup reads it back off the winning attempt's
+    /// [`crate::exec::control::ControlMonitor`].
+    pub activity_state: Option<crate::background::ActivityState>,
+    /// pi `progress.error` ← the FINAL `result.error`, after every post-settlement gate
+    /// (structured-output, completion guard, acceptance) has had its say (`:910`, plus the
+    /// acceptance-failure assignment at `:1233-1234`).
+    pub error: Option<String>,
 }
 
 // ================================================================================================
@@ -820,9 +1159,11 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
 /// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
 /// `--append-system-prompt=<persona body>` per `agent.system_prompt_mode` when the body is
-/// non-empty (ONE argv element, `=`-joined — see below); an optional `--session <path>` (when
-/// `opts.fork_context` resolved a session file path); then the task prompt last (via
-/// [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
+/// non-empty (ONE argv element, `=`-joined — see below); pi's full session branch
+/// (`pi-args.ts:100-112`) — either `--session <path>` when `opts.fork_context` resolved a session
+/// file path, or else `--no-session` unless [`RunOptions::session_dir`]/[`RunOptions::share`]
+/// enable sessions plus `--session-dir <dir>` for an explicit directory; then the task prompt last
+/// (via [`ChildSpawnSpec::resolve_task_arg`], R-SA-047's `@<tempfile>` overflow rule).
 ///
 /// Env overlay carries the child-ROLE pair
 /// ([`crate::spawn::nested_events::child_role_env`] — pi `pi-args.ts:329-330`), the incremented
@@ -866,6 +1207,10 @@ pub fn build_attempt_spawn_plan(
     opts: &RunOptions,
     depth: DepthEnvelope,
     temp_dir: &std::path::Path,
+    // SUBA-S01 (pi `pi-args.ts:246-250`): the run's capture runtime, whose two paths become the
+    // child's structured-output env overlay. `None` = the step declared no `outputSchema`, and the
+    // child then registers no `structured_output` tool at all.
+    structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
 ) -> Result<AttemptSpawnPlan, SubagentError> {
     let command = crate::spawn::resolve_spawn_command();
 
@@ -983,9 +1328,38 @@ pub fn build_attempt_spawn_plan(
         args.push(format!("{flag}={persona_body}"));
     }
 
+    // Session threading (pi `buildPiArgs`, `pi-args.ts:100-112`) — the FULL branch, both halves:
+    //
+    // * a resolved fork-context session FILE wins outright: its parent directory is created
+    //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
+    //   pins the child to it;
+    // * otherwise the child is spawned `--no-session` UNLESS this run enables sessions at all, and
+    //   an explicit `--session-dir <dir>` (directory likewise created up front) points the child's
+    //   session store at the caller's directory.
+    //
+    // `session_enabled` is pi's `execution.ts:1039` `Boolean(sessionFile || sessionDir) || share`:
+    // an explicit `sessionDir` OR `share: true` keeps sessions on; neither means the child must not
+    // persist a session at all. Pre-SUBA-041 only the `--session` half existed, so
+    // [`RunOptions::share`]/[`RunOptions::session_dir`] were inert fields no argv ever read and every
+    // session-less child silently persisted a session the orchestrator never asked for.
     if let Some(session_path) = &opts.fork_context.session_file_path {
+        if let Some(parent) = session_path.parent() {
+            // Best-effort, exactly like pi's own un-guarded `mkdirSync`: a failure here surfaces as
+            // the child's own session error rather than aborting the spawn plan.
+            let _ = std::fs::create_dir_all(parent);
+        }
         args.push("--session".to_string());
         args.push(session_path.display().to_string());
+    } else {
+        let session_enabled = opts.session_dir.is_some() || opts.share == Some(true);
+        if !session_enabled {
+            args.push("--no-session".to_string());
+        }
+        if let Some(session_dir) = &opts.session_dir {
+            let _ = std::fs::create_dir_all(session_dir);
+            args.push("--session-dir".to_string());
+            args.push(session_dir.display().to_string());
+        }
     }
 
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
@@ -1093,6 +1467,22 @@ pub fn build_attempt_spawn_plan(
         );
     }
 
+    // SUBA-S01 (pi `pi-args.ts:246-250`): hand the child BOTH paths. pi's child-side runtime gates
+    // on both being present (`subagent-prompt-runtime.ts:281`), and so does cyrup's
+    // [`crate::prompt_runtime::prompt_runtime_extension_for_env`] — so these are set together or
+    // not at all. Without them the child has no `structured_output` tool, which is precisely the
+    // state every declared-schema run was in before this wiring existed.
+    if let Some(runtime) = structured_runtime {
+        env_overlay.insert(
+            crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV.to_string(),
+            runtime.schema_path.display().to_string(),
+        );
+        env_overlay.insert(
+            crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV.to_string(),
+            runtime.output_path.display().to_string(),
+        );
+    }
+
     let cwd = opts.cwd.clone();
 
     Ok(AttemptSpawnPlan {
@@ -1172,6 +1562,12 @@ struct SpawnedChildAttemptRunner<'a> {
     /// is built once and reused rather than re-resolved per attempt. Empty when no skills apply.
     skill_injection: String,
     attempt_index: u32,
+    /// SUBA-S01: the run's structured-output capture runtime (pi `StructuredOutputRuntime`), or
+    /// `None` when the step declared no `outputSchema`. Created ONCE by [`run_sync`] and shared
+    /// across every fallback attempt so a retry cannot capture into a different file than the one
+    /// read back; its two paths become the child's
+    /// [`crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV`]/`..._CAPTURE_ENV` overlay.
+    structured_runtime: Option<crate::exec::structured::StructuredOutputRuntime>,
 }
 
 /// The richer per-attempt payload [`SpawnedChildAttemptRunner::run_attempt`] returns alongside its
@@ -1189,6 +1585,12 @@ struct AttemptRecord {
     /// attempt reports `AttemptSignal { success: true, exit_code: Some(0), .. }`, so the ladder
     /// stops on it exactly like an ordinary success.
     interrupted: bool,
+    /// This attempt's live-control state machine, carried out of the ladder so `run_sync` can (a)
+    /// raise the post-settlement completion-guard notice against the WINNING attempt's own dedup
+    /// set — pi's `emitControlEvent` at `execution.ts:1234` is a local of the same
+    /// `runSingleAttempt` scope — and (b) fold its raised events onto
+    /// [`SingleResult::control_events`] (pi `result.controlEvents = allControlEvents`, `:1260`).
+    control: crate::exec::control::ControlMonitor,
 }
 
 #[async_trait::async_trait]
@@ -1200,10 +1602,39 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         model: &ModelId,
         attempt_note: Option<&str>,
     ) -> (AttemptSignal, Self::Attempt) {
-        let mut progress = AgentProgress::default();
+        let mut progress = AgentProgress {
+            // pi's `startTime` local, captured at the very top of `runSingleAttempt` — before the
+            // spawn plan is even built — and read back as `progress.durationMs = Date.now() -
+            // startTime` at every settle site (`runs/foreground/execution.ts:1177`).
+            started_at: Some(std::time::Instant::now()),
+            ..AgentProgress::default()
+        };
+        // pi seeds the ring with the ladder's attempt notes at construction time
+        // (`recentOutput: [...shared.attemptNotes]`, `runs/foreground/execution.ts:366`); this
+        // crate's ladder hands them down one at a time, so each is appended as it arrives.
         if let Some(note) = attempt_note {
-            progress.record_raw_line(note);
+            progress.append_recent_output(note);
         }
+
+        // pi `runSingleAttempt`'s control locals (`execution.ts:336,344-354`): the attempt's own
+        // start instant, its resolved control config (`options.controlConfig ?? DEFAULT_CONTROL_CONFIG`)
+        // and its per-attempt dedup/record state. Built here — before the spawn plan — so every
+        // early-return path below still hands a (trivially empty) monitor back to `run_sync`
+        // rather than the ladder losing the field entirely.
+        let mut control = crate::exec::control::ControlMonitor::new(
+            self.opts.control_config.clone().unwrap_or_default(),
+            self.opts
+                .run_id
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| self.agent.name.clone()),
+            self.agent.name.clone(),
+            self.opts
+                .child_index
+                .and_then(|index| u32::try_from(index).ok()),
+            self.opts.on_control_event.clone(),
+            crate::background::now_epoch_millis_pub(),
+        );
 
         let task_text =
             build_task_text(self.task, self.opts, self.contract, &self.skill_injection);
@@ -1231,6 +1662,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             self.opts,
             child_depth,
             &self.scratch_dir,
+            self.structured_runtime.as_ref(),
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -1247,6 +1679,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         progress,
                         final_output: None,
                         interrupted: false,
+                        control,
                     },
                 );
             }
@@ -1273,6 +1706,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                         progress,
                         final_output: None,
                         interrupted: false,
+                        control,
                     },
                 );
             }
@@ -1289,7 +1723,8 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             .opts
             .deadline_at
             .map(|instant| tokio::time::sleep_until(tokio::time::Instant::from_std(instant)));
-        let outcome = drive_attempt(child, &mut progress, self.opts, deadline_sleep).await;
+        let outcome =
+            drive_attempt(child, &mut progress, self.opts, deadline_sleep, &mut control).await;
 
         // --- Interrupt: paused-success (pi `execution.ts:722-761`, T3 group A bug fix). A soft
         // interrupt is NOT a failure: it terminates the ladder with exit 0, a CLEARED error, and
@@ -1310,6 +1745,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     progress,
                     final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
                     interrupted: true,
+                    control,
                 },
             );
         }
@@ -1339,6 +1775,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     progress,
                     final_output,
                     interrupted: false,
+                    control,
                 },
             );
         }
@@ -1457,6 +1894,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 progress,
                 final_output,
                 interrupted: false,
+                control,
             },
         )
     }
@@ -1528,6 +1966,17 @@ fn structured_output_absent(schema: Option<&serde_json::Value>, events: &[Subage
 /// SIGTERM->SIGKILL escalation, which this crate routes every forced termination through.
 const FINAL_STOP_GRACE_MS: u64 = 1000;
 
+/// SUBA-S06: how long to keep draining stdout after the child process itself has been reaped while
+/// its stdout is still held open by a surviving grandchild.
+///
+/// This is NOT [`FINAL_STOP_GRACE_MS`]'s job and must not be folded into it. That window is armed
+/// by a *protocol* event (a terminal assistant stop) and expiring it means force-draining a live
+/// process through the signal ladder. This one is armed by an *OS* event (the direct child is
+/// already gone, so there is nothing left to signal) and expiring it simply ends the read loop, so
+/// the ordinary post-loop path can report the exit status it already has. They coincide at 1000ms
+/// today only because both are "give buffered output a beat to arrive".
+const POST_EXIT_DRAIN_MS: u64 = 1000;
+
 /// R-SA-037: does `event` show a child BLOCKING on a `contact_supervisor` supervisor-clarify ask,
 /// and if so, what is the human-facing prompt? A blocking ask is `contact_supervisor`'s
 /// `need_decision`/`interview` reason (the intercom `ask_and_wait` shapes,
@@ -1569,15 +2018,30 @@ async fn drive_attempt(
     progress: &mut AgentProgress,
     opts: &RunOptions,
     deadline_sleep: Option<tokio::time::Sleep>,
+    control: &mut crate::exec::control::ControlMonitor,
 ) -> DriveOutcome {
     tokio::pin!(deadline_sleep);
     let cancel = opts.cancel.clone();
     let interrupt = opts.interrupt.clone();
 
+    // pi's 1s activity timer (`execution.ts:896-905`): while control tracking is enabled, the
+    // idle/long-running heuristics are re-evaluated on a fixed tick as well as on every observed
+    // child event — otherwise a child that goes SILENT (the exact condition `needs_attention`
+    // exists to diagnose) would never trip it, because nothing would arrive to trigger the check.
+    // `interval_at` (not `interval`) because tokio's first `interval` tick completes immediately,
+    // which would fire a spurious check at t=0.
+    let mut activity_tick = control.enabled().then(|| {
+        let period = Duration::from_millis(crate::exec::control::ACTIVITY_TICK_MS);
+        tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+    });
+
     // Armed on the FIRST terminal assistant stop; once the grace window elapses without the child
     // exiting, the child is force-drained. `clean_terminal_stop` accumulates across every terminal
     // stop (pi's `||=`) for `forcedDrainAfterFinalSuccess`.
     let mut final_drain_at: Option<tokio::time::Instant> = None;
+    // SUBA-S06: armed when the child is reaped with stdout still open; expiring it ends the read
+    // loop so the post-loop `wait_final_drain()` can report the already-known exit status.
+    let mut exit_drain_at: Option<tokio::time::Instant> = None;
     let mut clean_terminal_stop = false;
     // R-SA-037: set once the child's NDJSON shows a blocking `contact_supervisor` ask; the ask is
     // surfaced via `spawn_clarify` exactly once (the guard below), and this flag then rides out to
@@ -1601,6 +2065,15 @@ async fn drive_attempt(
             }
         };
 
+        // SUBA-S06: same fixed-instant reconstruction as `final_drain_arm` above, and `pending()`
+        // (never fires) until the child is actually reaped.
+        let exit_drain_arm = async {
+            match exit_drain_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
@@ -1615,6 +2088,11 @@ async fn drive_attempt(
                 };
             }
             () = interrupt.cancelled() => {
+                // pi `execution.ts:1090`: a soft interrupt CLEARS the activity state, so a
+                // needs-attention notice that was raised (and is still sitting in the parent's
+                // debounce window) fails its actionability re-check rather than landing in the
+                // transcript for a run the caller has already deliberately paused.
+                control.clear_activity_state();
                 let outcome = child.terminate(&cancel).await;
                 return DriveOutcome {
                     timed_out: false,
@@ -1641,10 +2119,16 @@ async fn drive_attempt(
                     detached: detached_seen,
                 };
             }
-            next = child.next_event() => {
-                match next {
-                    Some(Ok(line)) => {
-                        progress.record_raw_line(&line.raw);
+            step = child.next_event_or_exit() => {
+                match step {
+                    crate::spawn::ChildStep::Line(Ok(line)) => {
+                        // NOTE: the raw NDJSON envelope deliberately does NOT enter
+                        // `progress.recent_output` — pi appends only EXTRACTED text, from an
+                        // assistant `message_end`'s content and a finished tool call's result, and
+                        // `AgentProgress::record_event` does exactly that a few lines below. A raw
+                        // line here would put an unrenderable (and, before
+                        // `RECENT_OUTPUT_LINE_CHARS`, unbounded) JSON blob on the very field
+                        // `SingleResult::progress` publishes as pi's `recentOutput`.
                         // Live-telemetry tee (pi's child-event pump, `subagent-runner.ts:1430`):
                         // hand the raw NDJSON line to the background runner's sink, if one is
                         // installed, BEFORE this module parses/folds it — so the runner folds it
@@ -1700,15 +2184,53 @@ async fn drive_attempt(
                                     );
                                 }
                             }
+                            // pi `processLine` (`execution.ts:775-890`): every parsed child event
+                            // is fresh activity for the control heuristics, and the tool-start /
+                            // tool-result / assistant-turn folds feed the thresholds. Driven
+                            // BEFORE `record_event` because that consumes the event by value.
+                            control.observe_event(
+                                &event,
+                                crate::background::now_epoch_millis_pub(),
+                            );
                             progress.record_event(event);
                         }
                     }
-                    Some(Err(_)) | None => {
+                    crate::spawn::ChildStep::Line(Err(_)) | crate::spawn::ChildStep::Eof => {
                         // Stdout EOF (child exited/closed stdout) or a genuine read fault — either
                         // way, stop reading and wait for the real exit status below.
                         break;
                     }
+                    crate::spawn::ChildStep::Exited(_) => {
+                        // SUBA-S06: the process is gone but stdout is STILL OPEN, because a
+                        // surviving grandchild inherited the write end. The EOF this loop used to
+                        // wait on can never arrive, and none of the other arms is guaranteed to
+                        // fire either — `deadline_arm` only exists when the caller passed a
+                        // timeout, `final_drain_arm` only after a terminal assistant stop the
+                        // child never emitted, and the activity tick merely re-scores heuristics.
+                        // So the tool call hung forever, spinning once a second.
+                        //
+                        // Do NOT break here: lines written before the exit may still be buffered
+                        // in the pipe, and dropping them would trade a hang for silent output
+                        // loss. Arm a bounded post-exit window instead and keep draining; the
+                        // status itself is deliberately discarded because the post-loop
+                        // `wait_final_drain()` re-reads it (the child is marked reaped, so that
+                        // call returns immediately) and routes it through the ONE existing clean
+                        // path — which is what keeps this a normal exit rather than a
+                        // `forced_termination`.
+                        if exit_drain_at.is_none() {
+                            exit_drain_at = Some(
+                                tokio::time::Instant::now()
+                                    + Duration::from_millis(POST_EXIT_DRAIN_MS),
+                            );
+                        }
+                    }
                 }
+            }
+            () = exit_drain_arm => {
+                // SUBA-S06: the reaped child's buffered stdout has had its beat; whatever still
+                // holds the pipe open is not this run's problem. Break (never return) so the exit
+                // status flows through the normal post-loop path as an ordinary clean exit.
+                break;
             }
             () = final_drain_arm => {
                 // The child emitted its terminal stop but did not exit within the grace window —
@@ -1724,6 +2246,18 @@ async fn drive_attempt(
                     exit_status: outcome.map(|o| Some(o.status)),
                     detached: detached_seen,
                 };
+            }
+            () = async {
+                match activity_tick.as_mut() {
+                    Some(tick) => { tick.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // pi's `setInterval(..., 1000)` body (`execution.ts:898-904`), minus the
+                // `fireUpdate()` half: this crate's live-progress payload is assembled by
+                // `tui::events` off the same NDJSON stream, so the tick's job here is purely to
+                // re-evaluate the idle/long-running heuristics on a silent child.
+                control.update_activity_state(crate::background::now_epoch_millis_pub());
             }
         }
     }
@@ -1770,6 +2304,26 @@ async fn drive_attempt(
 // run_sync: the model-fallback attempt loop, wired end to end (arch-SA §6.3.2)
 // ================================================================================================
 
+/// [`run_sync`]'s step 2 (R-SA-023): the effective acceptance contract for this run.
+///
+/// A named function rather than an inline expression because it is the SINGLE seam at which an
+/// explicit, caller-supplied contract meets the heuristically-inferred one, and the rule joining
+/// them is upstream's, not this crate's: pi `resolveEffectiveAcceptance` takes
+/// `max(explicitLevel, inferred.level)` by rank (`runs/shared/acceptance.ts:277-281` @v0.34.0),
+/// so an explicit level may only RAISE the inferred floor. This seam used to read
+/// `opts.acceptance.clone().unwrap_or_else(|| AcceptanceContract::heuristic_default(...))` —
+/// explicit and inferred were mutually exclusive, so `acceptance: "attested"` on a write-capable
+/// task ran a weaker gate than the same policy does under pi, silently. The combination rule
+/// itself lives on [`AcceptanceContract::resolve_effective`]; this function only supplies
+/// `run_sync`'s three inputs to it.
+fn resolve_run_acceptance(
+    opts: &RunOptions,
+    agent: &AgentConfig,
+    task: &str,
+) -> AcceptanceContract {
+    AcceptanceContract::resolve_effective(opts.acceptance.clone(), &agent.name, task)
+}
+
 /// Run one subagent task to completion, synchronously, against `agent`/`opts` (func-SA §5.2;
 /// arch-SA §6.3.2).
 ///
@@ -1788,8 +2342,8 @@ async fn drive_attempt(
 ///    spawns nothing.
 /// 1. R-SA-025: file-only output mode requires an output path — fail fast, before any subprocess
 ///    is spawned, if violated.
-/// 2. Resolve the effective acceptance contract (explicit `opts.acceptance`, or
-///    [`AcceptanceContract::heuristic_default`], R-SA-023).
+/// 2. Resolve the effective acceptance contract — `max(explicit opts.acceptance,
+///    [`AcceptanceContract::heuristic_default`])` via [`resolve_run_acceptance`], R-SA-023.
 /// 3. R-SA-038: build the model-fallback candidate ladder.
 /// 4. Drive [`fallback::run_fallback_ladder`] against a [`SpawnedChildAttemptRunner`] — every
 ///    candidate model gets a FRESH real child OS process (R-SA-039); R-SA-036 (timeout)/R-SA-037
@@ -1858,8 +2412,11 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(err.to_string()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         };
     }
 
@@ -1881,16 +2438,16 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(err.to_string()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         };
     }
 
     // Step 2 (R-SA-023): resolve the effective acceptance contract.
-    let contract = opts
-        .acceptance
-        .clone()
-        .unwrap_or_else(|| AcceptanceContract::heuristic_default(&agent.name, task));
+    let contract = resolve_run_acceptance(opts, agent, task);
 
     // Step 3 (R-SA-038).
     // SUBA-003: pi passes `{ scope: options.modelScope }` here (`execution.ts:1065-1070`), which
@@ -1924,8 +2481,11 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                 "no candidate model available for this subagent run (empty fallback ladder)"
                     .to_string(),
             ),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         };
     }
 
@@ -1939,6 +2499,11 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // configured skills. Resolution is stable across model-fallback attempts (it never depends on the
     // model), so it is done here, not per attempt.
     let skill_names = opts.skills.clone().unwrap_or_else(|| agent.skills.clone());
+    // pi `shared.resolvedSkillNames` (`runs/foreground/execution.ts:1481` @HEAD): the names that
+    // actually RESOLVED to a `SKILL.md`, or `undefined` when none did — the value
+    // `progress.skills` is seeded from (`:263`). Hoisted out of the `else` arm below because it
+    // outlives the injection string it is computed alongside.
+    let mut resolved_skill_names: Option<Vec<String>> = None;
     let skill_injection = if skill_names.is_empty() {
         String::new()
     } else {
@@ -1976,10 +2541,15 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                     "Skills not found: {}",
                     crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL
                 )),
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
             };
         }
+        resolved_skill_names = (!resolution.resolved.is_empty())
+            .then(|| resolution.resolved.iter().map(|s| s.name.clone()).collect());
         crate::discovery::skills::build_skill_injection(&resolution.resolved)
     };
 
@@ -2005,10 +2575,27 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             interrupted: false,
             timed_out: false,
             error: Some(format!("failed to prepare subagent scratch directory: {err}")),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         };
     }
+
+    // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
+    // `outputSchema`, create the capture runtime ONCE per run — not per attempt — and write the
+    // schema to a private file the child reads. Every fallback attempt shares it, exactly as pi
+    // shares one runtime across a step's execution, so a retry cannot silently capture into a
+    // different file than the one read back below.
+    //
+    // A creation failure degrades to `None` rather than failing the run: the child then never
+    // receives the env vars, never registers `structured_output`, and the read-back reports pi's
+    // own "missing" hard failure — which is the correct outcome for "the schema never reached the
+    // child", and strictly better than aborting a run that might still produce useful prose.
+    let structured_runtime = opts.structured_output_schema.as_ref().and_then(|schema| {
+        crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
+    });
 
     // Step 4: drive the fallback ladder.
     let mut runner = SpawnedChildAttemptRunner {
@@ -2019,6 +2606,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         scratch_dir,
         skill_injection,
         attempt_index: 0,
+        structured_runtime: structured_runtime.clone(),
     };
     let outcome = run_fallback_ladder(&candidates, &mut runner).await;
 
@@ -2107,7 +2695,16 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // `subagent-runner.ts:876`) — captured here, before step 9's truncation reassigns `final_output`.
     let full_output_for_reference = final_output.clone();
 
-    let progress = last_attempt.map(|record| record.progress).unwrap_or_default();
+    // The WINNING attempt's progress fold AND its live-control monitor (pi keeps both as locals of
+    // the same `runSingleAttempt` scope; this crate has to carry them out of the ladder because
+    // its post-settlement guard/acceptance steps live one level up, in `run_sync`).
+    let (progress, mut control) = match last_attempt {
+        Some(record) => (record.progress, record.control),
+        None => (
+            AgentProgress::default(),
+            crate::exec::control::ControlMonitor::disabled(),
+        ),
+    };
 
     // Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation.
     // Only evaluated on an otherwise-clean run (mirrors the completion-guard/acceptance gate's own
@@ -2123,8 +2720,28 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     })
     .is_clean()
     {
-        match resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
-        {
+        // SUBA-S01: with a capture runtime, read the FILE the child's `structured_output` tool
+        // wrote (pi `readStructuredOutput`, `structured-output.ts:55-68`) rather than scanning the
+        // transcript. The event scan is a cyrup-original heuristic that accepts the newest fenced
+        // ```json block — i.e. prose — which is exactly what the "EVEN WHEN prose was produced"
+        // rule below says must NOT satisfy a declared schema. It stays as the fallback for the one
+        // degraded case where the runtime could not be created at all (see `run_sync`), because
+        // there is genuinely no capture file to consult then.
+        let structured_outcome = match structured_runtime.as_ref() {
+            Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
+                Ok(value) => StructuredOutcome::Valid(value),
+                Err(message)
+                    if message == crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR =>
+                {
+                    StructuredOutcome::Missing
+                }
+                Err(message) => StructuredOutcome::Invalid(message),
+            },
+            None => {
+                resolve_structured_output(opts.structured_output_schema.as_ref(), &progress.all_events)
+            }
+        };
+        match structured_outcome {
             StructuredOutcome::NotRequested => None,
             StructuredOutcome::Valid(value) => Some(value),
             StructuredOutcome::Missing => {
@@ -2184,6 +2801,18 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             ),
             _ => crate::exec::completion_guard::COMPLETION_GUARD_ERROR_MESSAGE.to_string(),
         });
+        // pi `execution.ts:1234-1247`: the guard also raises a `needs_attention` control event with
+        // `reason: "completion_guard"` — the one raise that happens AFTER the child is gone, and
+        // the one the notice renderer formats as the "Subagent failed: <agent>" body rather than
+        // the steer/resume nudge. Shares the winning attempt's dedup set (`control` is that
+        // attempt's own monitor), exactly as the source's shared `emittedControlEventKeys` does.
+        control.emit_completion_guard_notice(
+            crate::background::now_epoch_millis_pub(),
+            format!(
+                "{} completed without making edits for an implementation task",
+                agent.name
+            ),
+        );
     }
 
     // Re-derive the gate AFTER the completion-guard correction above, since R-SA-033's own
@@ -2279,11 +2908,72 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         _ => final_output,
     };
 
-    // Step 10 (R-SA-043): compaction. `SingleResult` itself is the compacted shape; the
-    // `include_progress` flag governs only a LIVE snapshot this function never constructs (no
-    // live-callback path exists in this phase), so it has no further effect here beyond being
-    // threaded through `RunOptions` for a future phase's live-progress plumbing to read.
-    let _ = opts.include_progress;
+    // Step 10 (R-SA-043): compaction, and its ONE documented opt-out.
+    //
+    // `SingleResult` is unconditionally the compacted shape — no raw per-turn messages, only
+    // summarized `tool_calls`. `include_progress` restores exactly one thing on top of that: this
+    // run's own `AgentProgress` projection, which pi gates identically (`progress:
+    // params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3008` for SINGLE and
+    // `:2679` for PARALLEL @v0.34.0). With the flag off or omitted the field stays `None` and
+    // `skip_serializing_if` drops it, so a returned/persisted result is byte-for-byte what it was
+    // before the field existed.
+    //
+    // Assembled HERE, from the winning attempt's fold plus this function's settled locals, because
+    // that is where pi assembles it too: `execution.ts` mutates the one `progress` object at
+    // `:907-913` @v0.34.0 and hands it out as `result.progress`. Deliberately NOT reusing the
+    // orchestrator-layer `tui::events::LiveProgressFold` — that fold only exists on the streaming
+    // foreground path (it is installed only when an `on_update` sink is present), so the detached
+    // hop-2 runner and every non-streaming caller would get nothing.
+    let progress_snapshot = if opts.include_progress == Some(true) {
+        // pi's settled `progress.status`. Order matters: a detach short-circuits at
+        // `execution.ts:344` and an interrupt returns early at `:861` with the status pi set at
+        // `:828` — neither ever reaches the `exitCode === 0 ? "completed" : "failed"` assignment at
+        // `:907`. Leaving an interrupt-paused run as `Running` is therefore upstream's own shape,
+        // and it is load-bearing: `compact_completed` refuses to compact a `running` snapshot
+        // (pi `compactCompletedProgress`'s first line), which is exactly what lets the caller who
+        // will `resume` this run still see its live detail.
+        let status = if detached {
+            crate::tui::events::LiveProgressStatus::Detached
+        } else if interrupted {
+            crate::tui::events::LiveProgressStatus::Running
+        } else if exit_code == 0 {
+            crate::tui::events::LiveProgressStatus::Complete
+        } else {
+            crate::tui::events::LiveProgressStatus::Failed
+        };
+        let snapshot = progress.snapshot(ProgressSnapshotInput {
+            index: u32::try_from(opts.child_index.unwrap_or(0)).unwrap_or(u32::MAX),
+            agent: &agent.name,
+            task,
+            skills: resolved_skill_names,
+            // pi `progress.model = modelArg` (`execution.ts:267` @v0.34.0) — the id the child was
+            // actually launched with, thinking suffix included, not the bare ladder entry.
+            model: apply_thinking_suffix(
+                winning_model.as_ref().map(ModelId::as_str),
+                agent.thinking.as_deref(),
+            ),
+            thinking: agent.thinking.clone(),
+            status,
+            // pi `progress.activityState`, owned by the control state machine; the winning
+            // attempt's monitor is the one `run_sync` carried out of the ladder, and it already
+            // cleared the state on a soft interrupt exactly as pi does at `:832,854`.
+            activity_state: control.activity_state(),
+            error: error.clone(),
+        });
+        // pi `compactForegroundDetails` → `compactCompletedProgress` (`shared/utils.ts:414-421`):
+        // a SETTLED snapshot keeps eleven fields and empties the two growth terms.
+        Some(snapshot.compact_completed())
+    } else {
+        None
+    };
+
+    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:70-77`): remove the
+    // runtime's private temp dir once the value has been read back. Best-effort and deliberately
+    // unconditional — the schema file is written 0600 because it can carry whatever the caller's
+    // schema describes, and leaving one behind per run would accumulate under the scratch dir.
+    if let Some(runtime) = structured_runtime.as_ref() {
+        crate::exec::structured::cleanup_structured_output_runtime(runtime);
+    }
 
     SingleResult {
         agent: agent.name.clone(),
@@ -2300,8 +2990,19 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         interrupted,
         timed_out,
         error,
+        // pi `result.savedOutputPath = resolvedOutput.savedPath` (`execution.ts:963`) — the SAME
+        // path the saved-output reference message above was built from, published as its own field
+        // so callers that need the bare location (dynamic-fanout collect records) do not have to
+        // re-parse it out of `final_output`.
+        saved_output_path: saved_output_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         tool_calls: progress.summarized_tool_calls(),
         output_truncated,
+        progress: progress_snapshot,
+        // pi `result.controlEvents = allControlEvents.length ? allControlEvents : undefined`
+        // (`execution.ts:1260`) — an empty Vec is this crate's `undefined` (it serializes away).
+        control_events: control.into_events(),
     }
 }
 
@@ -2456,6 +3157,8 @@ mod tests {
             orchestrator_intercom_target: None,
             run_id: None,
             child_index: None,
+            control_config: None,
+            on_control_event: None,
         }
     }
 
@@ -2504,7 +3207,7 @@ mod tests {
     fn recent_output_buffer_is_capped_at_50_lines_oldest_evicted_first() {
         let mut progress = AgentProgress::default();
         for i in 0..(RECENT_OUTPUT_CAP + 10) {
-            progress.record_raw_line(&format!("line-{i}"));
+            progress.append_recent_output(&format!("line-{i}"));
         }
         assert_eq!(progress.recent_output.len(), RECENT_OUTPUT_CAP);
         assert_eq!(progress.recent_output.front().map(String::as_str), Some("line-10"));
@@ -2512,6 +3215,103 @@ mod tests {
         assert_eq!(
             progress.recent_output.back().map(String::as_str),
             Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn append_recent_output_keeps_pis_last_ten_nonblank_lines_of_one_chunk() {
+        // pi `appendRecentOutput(progress, text.split("\n").slice(-10))`
+        // (`runs/foreground/execution.ts:651,670` @v0.34.0): one chunk contributes at most its
+        // last ten lines, blank lines are dropped by `lines.filter((line) => line.trim())`, and
+        // the ORIGINAL (untrimmed) text of each surviving line is what is stored.
+        let mut progress = AgentProgress::default();
+        let mut chunk = String::new();
+        for i in 0..25 {
+            chunk.push_str(&format!("l{i}\n"));
+        }
+        progress.append_recent_output(&chunk);
+        assert_eq!(progress.recent_output.len(), RECENT_OUTPUT_TAIL_LINES);
+        assert_eq!(progress.recent_output.front().map(String::as_str), Some("l15"));
+        assert_eq!(progress.recent_output.back().map(String::as_str), Some("l24"));
+
+        let mut blanks = AgentProgress::default();
+        blanks.append_recent_output("a\n\n   \n  b  \n");
+        assert_eq!(
+            blanks.recent_output.iter().cloned().collect::<Vec<_>>(),
+            vec!["a".to_string(), "  b  ".to_string()],
+            "blank lines are dropped; surviving lines keep their own leading/trailing space"
+        );
+    }
+
+    #[test]
+    fn append_recent_output_truncates_one_enormous_line_to_pis_char_cap() {
+        // pi `boundStreamedRecentOutput` (`shared/utils.ts:450-456`), applied at append time per
+        // this crate's documented delta. Without it, one 10 MB tool result line would ride out on
+        // `SingleResult::progress.recent_output` for an interrupt-paused run, whose `running`
+        // status `compact_completed` deliberately refuses to empty.
+        let mut progress = AgentProgress::default();
+        let huge = "x".repeat(RECENT_OUTPUT_LINE_CHARS * 3);
+        progress.append_recent_output(&huge);
+        let stored = progress
+            .recent_output
+            .front()
+            .cloned()
+            .expect("one line must be stored");
+        assert_eq!(stored.chars().count(), RECENT_OUTPUT_LINE_CHARS + "… [truncated]".chars().count());
+        assert!(stored.ends_with("… [truncated]"), "pi's suffix, verbatim");
+
+        // A multi-byte line must be cut on a char boundary, not a byte one.
+        let mut wide = AgentProgress::default();
+        wide.append_recent_output(&"é".repeat(RECENT_OUTPUT_LINE_CHARS + 5));
+        let stored = wide.recent_output.front().cloned().unwrap_or_default();
+        assert_eq!(
+            stored.chars().filter(|c| *c == 'é').count(),
+            RECENT_OUTPUT_LINE_CHARS
+        );
+
+        // Exactly at the cap is NOT truncated (pi's `line.length > MAX` is strict).
+        let mut exact = AgentProgress::default();
+        exact.append_recent_output(&"y".repeat(RECENT_OUTPUT_LINE_CHARS));
+        assert_eq!(
+            exact.recent_output.front().map(String::len),
+            Some(RECENT_OUTPUT_LINE_CHARS)
+        );
+    }
+
+    #[test]
+    fn record_event_appends_extracted_text_never_the_raw_ndjson_envelope() {
+        // The regression this pins: `drive_attempt` used to push every RAW stdout line into
+        // `recent_output`, so the field `SingleResult::progress` publishes as pi's `recentOutput`
+        // held `{"type":"message_end",...}` JSON rather than the child's prose. pi appends
+        // `extractTextFromContent(...)` at exactly two sites and nothing else.
+        let mut progress = AgentProgress::default();
+        progress.record_event(SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "hello from the child" }]
+            }),
+        });
+        progress.record_event(SubagentEvent::ToolExecutionEnd {
+            tool_call_id: "c1".into(),
+            tool_name: "bash".to_string(),
+            result: serde_json::json!("tool said ok"),
+            is_error: false,
+        });
+        // A non-assistant `message_end` contributes nothing (pi guards on `role === "assistant"`).
+        progress.record_event(SubagentEvent::MessageEnd {
+            message: serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "user echo" }]
+            }),
+        });
+        assert_eq!(
+            progress.recent_output.iter().cloned().collect::<Vec<_>>(),
+            vec!["hello from the child".to_string(), "tool said ok".to_string()]
+        );
+        assert!(
+            !progress.recent_output.iter().any(|line| line.contains("\"type\"")),
+            "no raw NDJSON envelope may reach recent_output: {:?}",
+            progress.recent_output
         );
     }
 
@@ -2594,7 +3394,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &text, &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(plan.spec.build_argv().contains(&"--no-skills".to_string()));
     }
@@ -2622,7 +3422,7 @@ mod tests {
         };
 
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "do the thing", &opts, depth, dir.path(), None)
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -2637,6 +3437,99 @@ mod tests {
         );
         // `replace` must never also append — the two flags are mutually exclusive per mode.
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
+    }
+
+    /// SUBA-S01 (pi `pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH
+    /// structured-output env vars, pointing at the runtime's real schema and capture paths.
+    ///
+    /// Before this wiring, `create_structured_output_runtime`, `read_structured_output`,
+    /// `cleanup_structured_output_runtime`, `structured_output_instruction`, both env constants and
+    /// `StructuredOutputRuntime` were ALL ported and had zero callers outside their own file — so a
+    /// child never learned a schema had been declared, never registered `structured_output`, and
+    /// the run fell back to a fenced-```json-block scan that pi does not have.
+    #[test]
+    fn a_declared_output_schema_reaches_the_child_as_both_env_vars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "verdict": { "type": "string" } },
+            "required": ["verdict"],
+        });
+        let runtime =
+            crate::exec::structured::create_structured_output_runtime(&schema, dir.path())
+                .expect("runtime is created");
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            Some(&runtime),
+        )
+        .expect("plan builds");
+
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV)
+                .map(String::as_str),
+            Some(runtime.schema_path.display().to_string().as_str()),
+            "the child must be told where to READ the schema"
+        );
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV)
+                .map(String::as_str),
+            Some(runtime.output_path.display().to_string().as_str()),
+            "...and where to WRITE the captured value"
+        );
+
+        // The schema file must actually exist and round-trip: the child reads it to build the
+        // `structured_output` tool's parameters, so an unwritten file silently disables the tool.
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime.schema_path).expect("schema written"))
+                .expect("schema parses");
+        assert_eq!(written, schema);
+    }
+
+    /// The other half of the gate: no declared schema means NO structured-output env at all, so an
+    /// ordinary child registers no `structured_output` tool (pi gates on both vars being present,
+    /// `subagent-prompt-runtime.ts:281`).
+    #[test]
+    fn no_output_schema_means_no_structured_output_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV)
+                && !plan
+                    .spec
+                    .env_overlay
+                    .contains_key(crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV),
+            "a step with no outputSchema must carry no structured-output env"
+        );
     }
 
     #[test]
@@ -2655,7 +3548,7 @@ mod tests {
 
         let task_text = build_task_text("do the thing", &opts, &contract, "");
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), &task_text, &opts, depth, dir.path(), None)
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -2690,7 +3583,7 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
@@ -2710,7 +3603,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
@@ -2730,7 +3623,7 @@ mod tests {
         opts.run_id = Some(crate::background::RunId::from_token("run-XYZ"));
         opts.child_index = Some(2);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert_eq!(
@@ -2756,7 +3649,7 @@ mod tests {
         let agent = sample_agent_config("m1", &[]);
         let opts = base_opts(dir.path(), &["m1"]); // orchestrator_intercom_target / run_id both None
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let env = &plan.spec.env_overlay;
         assert!(!env.contains_key(crate::spawn::intercom_target::ENV_ORCHESTRATOR_TARGET));
@@ -2773,7 +3666,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert!(!plan.spec.build_argv().contains(&"--tools".to_string()));
     }
@@ -2791,11 +3684,89 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--session").expect("--session present");
         assert!(argv[idx + 1].contains("parent-branch.jsonl"));
+        // pi's `sessionFile` branch (`pi-args.ts:101-103`) emits ONLY `--session`: never the
+        // `--no-session`/`--session-dir` pair from the else arm.
+        assert!(!argv.contains(&"--no-session".to_string()));
+        assert!(!argv.contains(&"--session-dir".to_string()));
+    }
+
+    /// SUBA-041 prerequisite (pi `buildPiArgs`, `pi-args.ts:104-112`): with NO fork-context session
+    /// file, no `session_dir` and no `share`, pi's `sessionEnabled` is false and the child is spawned
+    /// `--no-session`. Pre-fix this arm emitted nothing at all, so every session-less subagent child
+    /// silently persisted a session into the orchestrator's own store.
+    #[test]
+    fn build_attempt_spawn_plan_emits_no_session_when_nothing_enables_a_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
+        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+    }
+
+    /// SUBA-041 prerequisite: an explicit `session_dir` both ENABLES sessions (no `--no-session`)
+    /// and reaches the child as `--session-dir <dir>`, with the directory created up front — pi's
+    /// `fs.mkdirSync(sessionDir, { recursive: true })` (`pi-args.ts:108-110`).
+    #[test]
+    fn build_attempt_spawn_plan_emits_session_dir_and_creates_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        let session_dir = dir.path().join("sessions").join("run-0");
+        opts.session_dir = Some(session_dir.clone());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv
+            .iter()
+            .position(|a| a == "--session-dir")
+            .expect("--session-dir present");
+        assert_eq!(argv[idx + 1], session_dir.display().to_string());
+        assert!(
+            !argv.contains(&"--no-session".to_string()),
+            "an explicit session dir enables sessions: {argv:?}"
+        );
+        assert!(session_dir.is_dir(), "the session dir must be created up front");
+    }
+
+    /// SUBA-041 prerequisite: `share: true` alone is pi's other `sessionEnabled` term
+    /// (`execution.ts:1039`) — it suppresses `--no-session` without naming a directory.
+    #[test]
+    fn build_attempt_spawn_plan_share_alone_enables_sessions_without_a_session_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.share = Some(true);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(!argv.contains(&"--no-session".to_string()), "argv: {argv:?}");
+        assert!(!argv.contains(&"--session-dir".to_string()), "argv: {argv:?}");
+    }
+
+    /// SUBA-041 prerequisite: `share: false` is NOT an enabling value — pi's term is
+    /// `options.share === true` (`execution.ts:1027`), so an explicit `false` still yields
+    /// `--no-session`.
+    #[test]
+    fn build_attempt_spawn_plan_share_false_still_disables_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.share = Some(false);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        assert!(plan.spec.build_argv().contains(&"--no-session".to_string()));
     }
 
     #[test]
@@ -2807,7 +3778,7 @@ mod tests {
             current_depth: 2,
             max_depth: 4,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::depth::DEPTH_ENV_VAR),
@@ -2841,7 +3812,7 @@ mod tests {
             max_depth: 5,
         };
 
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         assert_eq!(
@@ -2873,7 +3844,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         let is_one = |name: &str| plan.spec.env_overlay.get(name).map(String::as_str) == Some("1");
@@ -2907,7 +3878,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
 
         assert_eq!(
@@ -2952,7 +3923,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
@@ -3041,6 +4012,7 @@ mod tests {
             &opts,
             depth,
             dir.path(),
+            None,
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
@@ -3094,7 +4066,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &candidates[0], "task", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let idx = argv.iter().position(|a| a == "--model").expect("--model present");
@@ -3116,7 +4088,7 @@ mod tests {
         let mut inheriting = sample_agent_config("m1", &[]);
         inheriting.inherit_skills = true;
         let plan =
-            build_attempt_spawn_plan(&inheriting, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+            build_attempt_spawn_plan(&inheriting, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
                 .expect("plan builds");
         assert!(
             !plan.spec.build_argv().contains(&"--no-skills".to_string()),
@@ -3136,6 +4108,7 @@ mod tests {
             &opts,
             depth,
             dir.path(),
+            None,
         )
         .expect("plan builds");
         assert!(
@@ -3158,7 +4131,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         assert_eq!(
             plan.spec.env_overlay.get("CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT"),
@@ -3185,7 +4158,7 @@ mod tests {
         agent.name = String::new();
         let opts = base_opts(dir.path(), &["m1"]);
         let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         // An empty persona name writes NO var (child resolves `None` — pi's top-level `""`).
         assert_eq!(plan.spec.env_overlay.get(AGENT_NAME_ENV_VAR), None);
@@ -3207,7 +4180,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
 
@@ -3244,7 +4217,7 @@ mod tests {
             current_depth: 0,
             max_depth: 5,
         };
-        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path())
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "t", &opts, depth, dir.path(), None)
             .expect("plan builds");
         let argv = plan.spec.build_argv();
         let tools_idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
@@ -3288,7 +4261,7 @@ mod tests {
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
                 .expect("plan builds");
 
         assert_eq!(
@@ -3319,7 +4292,7 @@ mod tests {
         let child_depth =
             crate::spawn::depth::next_envelope(&agent.depth, agent.max_subagent_depth);
         let plan =
-            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path())
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, child_depth, dir.path(), None)
                 .expect("plan builds");
 
         assert_eq!(
@@ -3408,6 +4381,48 @@ mod tests {
         assert_eq!(cfg.skills, vec!["accessibility".to_string()]);
         // The depth is the caller-stamped live envelope, not a plan-time value.
         assert_eq!(cfg.depth, live_depth);
+    }
+
+    // ---- run_sync step 2: the effective contract is max(explicit, inferred) (R-SA-023) ----
+
+    /// The seam itself, not just the rule it delegates to: `run_sync` must combine
+    /// `opts.acceptance` with the inferred contract rather than let it replace it. Pre-fix this
+    /// step read `opts.acceptance.clone().unwrap_or_else(|| heuristic_default(..))`, so the
+    /// explicit `attested` below would have reached the gate verbatim — weaker than the `checked`
+    /// pi resolves for the same policy on the same task
+    /// (`runs/shared/acceptance.ts:277-281` @v0.34.0).
+    #[test]
+    fn run_sync_resolves_an_explicit_acceptance_level_as_a_floor_over_the_inferred_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+
+        // A wire-lowered `acceptance: "attested"` (a floor, never a disable).
+        opts.acceptance = Some(AcceptanceContract::explicit_floor(
+            AcceptanceStatus::Attested,
+            vec![],
+        ));
+        let contract = resolve_run_acceptance(&opts, &agent, "Implement the fix");
+        assert_eq!(
+            contract.required_level,
+            AcceptanceStatus::Checked,
+            "the inferred `checked` floor must win over the explicit `attested`"
+        );
+        assert!(contract.explicit, "R-SA-033's correction stays armed");
+
+        // No explicit policy at all: pi's `auto` — the inferred contract, unchanged.
+        opts.acceptance = None;
+        assert_eq!(
+            resolve_run_acceptance(&opts, &agent, "Implement the fix").required_level,
+            AcceptanceStatus::Checked
+        );
+
+        // An in-Rust `NotRequired` contract still disables the gate outright.
+        opts.acceptance = Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        ));
+        assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
     // ---- run_sync: depth guard runs first, before anything else (R-SA-055, SAFETY-CRITICAL) ----

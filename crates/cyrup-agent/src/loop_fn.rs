@@ -127,6 +127,7 @@ fn build_run_ctx(
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
+            headers: None,
     }));
     let subscribers: Arc<Mutex<Vec<Arc<dyn EventSubscriber>>>> =
         Arc::new(Mutex::new(vec![Arc::new(SinkSubscriber(sink))]));

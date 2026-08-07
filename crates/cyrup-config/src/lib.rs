@@ -47,10 +47,11 @@ pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use model::{
     CliModelResult, InitialModelResult, ModelCostOverride, ModelCycler, ModelDefinition, ModelFile,
-    ModelOverride, ModelResolver, ParsedModel, ProviderConfig, RestoredModelResult, ScopedModel,
-    build_fallback_model, default_model_per_provider, find_initial_model, load_custom_models,
-    load_models_file, load_models_file_reporting, parse_thinking_level, resolve_cli_model,
-    restore_model_from_session,
+    ModelOverride, ModelResolver, ModelsJsonOauth, ParsedModel, ProviderConfig,
+    RestoredModelResult, ScopedModel, build_fallback_model, default_model_per_provider,
+    find_initial_model, load_custom_models, load_models_file, load_models_file_reporting,
+    models_json_provider_is_configured, parse_thinking_level, provider_is_configured,
+    resolve_cli_model, restore_model_from_session,
 };
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};

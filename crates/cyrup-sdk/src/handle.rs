@@ -77,6 +77,31 @@ impl Session {
         self.inner
     }
 
+    /// Tear the session down: settle any in-flight run, announce `session_shutdown{reason:"quit"}`
+    /// to every loaded extension, and cancel the long-lived session token so the extension
+    /// subscriber unwinds.
+    ///
+    /// SEAM-026/SEAM-002 — the mirror image of the `session_start` [`crate::CyrupBuilder::build_session`]
+    /// emits, and pi's `AgentSessionRuntime.dispose()` (agent-session-runtime.ts:398-404, which
+    /// emits `session_shutdown{reason:"quit"}` and then disposes the session). Before this the SDK
+    /// had NO teardown call at all: an embedder dropping a `Session` left every extension without a
+    /// shutdown hook, so audit logs never flushed, intercom identities were never deregistered and
+    /// spooled permission asks were never released.
+    ///
+    /// This is `async` and consuming rather than a `Drop` impl on purpose: `session_shutdown` is
+    /// dispatched to extensions (possibly across a wasm boundary) and awaited, which `Drop` cannot
+    /// do. Dropping a `Session` without calling this is therefore still silent — call it.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn demo(session: cyrup_sdk::Session) {
+    /// session.close().await;
+    /// # }
+    /// ```
+    pub async fn close(self) {
+        self.inner.dispose("quit").await;
+    }
+
     // ----------------------------------------------------------------- run helpers ----
 
     /// Submit a prompt, drive the run to completion, and return the final assistant text.
@@ -197,7 +222,9 @@ impl Session {
         Ok(self.inner.follow_up(input).await?)
     }
 
-    /// Interrupt the active run (idempotent; R-11-018).
+    /// Interrupt the active run and its auto-retry backoff (idempotent; R-11-018). Returns as soon
+    /// as the cancellation is signalled — use [`Session::abort_and_settle`] to await the run
+    /// actually stopping.
     ///
     /// # Examples
     /// ```no_run
@@ -207,6 +234,20 @@ impl Session {
     /// ```
     pub fn abort(&self) {
         self.inner.abort();
+    }
+
+    /// Interrupt the active run **and await its settlement** — pi's `await session.abort()`
+    /// (`abortRetry(); agent.abort(); await waitForIdle()`, agent-session.ts:1542-1546). Use this
+    /// wherever "aborted" must mean "stopped", e.g. before inspecting the transcript or compacting.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn demo(session: &cyrup_sdk::Session) {
+    /// session.abort_and_settle().await;
+    /// # }
+    /// ```
+    pub async fn abort_and_settle(&self) {
+        self.inner.abort_and_settle().await;
     }
 
     /// Await full settlement of the in-flight run (`agent_end`).

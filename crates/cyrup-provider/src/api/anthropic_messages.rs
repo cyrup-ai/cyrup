@@ -23,6 +23,7 @@ use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
+use crate::utils::provider_retry::ProviderRetry;
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
@@ -178,10 +179,14 @@ impl ApiImpl for AnthropicMessagesApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112; applied per request as in bedrock-converse-stream.ts:187).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -196,7 +201,16 @@ impl ApiImpl for AnthropicMessagesApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -1301,7 +1315,12 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            // In-flight: Pi's `output.stopReason` is still its `"pending"` seed until a
+            // `message_delta` carries one (anthropic-messages.ts:509,714-717), and `output` IS the
+            // `partial` attached to every non-terminal event. The TERMINAL never takes this value —
+            // it goes through `StreamEvent::end_of_stream`, which rewrites `Pending` to the `error`
+            // terminal Pi's throw produces.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }
@@ -1441,8 +1460,16 @@ pub(crate) async fn decode_stream<S>(
     }
 
     finish_blocks(&dec, model, api, sink).await;
-    let message = build_final_message(&dec, model, api);
-    sink.send(StreamEvent::terminal(message)).await;
+    // A stream that ran to EOF without a `message_delta.stop_reason` is TRUNCATED, not complete.
+    // `dec.stop_reason == None` is cyrup's spelling of Pi's still-`"pending"` output, and
+    // `end_of_stream` turns it into the same `error` terminal Pi's throw produces
+    // (anthropic-messages.ts:751-753) instead of the clean `stop` this used to default to.
+    sink.send(StreamEvent::end_of_stream(
+        dec.snapshot(model, api),
+        dec.stop_reason,
+        "Anthropic stream ended without a stop reason",
+    ))
+    .await;
 }
 
 /// Whether `event` is one of the six Anthropic message events (Pi `ANTHROPIC_MESSAGE_EVENTS`).
@@ -1763,14 +1790,6 @@ async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink,
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;
-}
-
-/// Build the terminal message from the final decoder state.
-fn build_final_message(dec: &Decoder, model: &Model, api: &ApiId) -> AssistantMessage {
-    let mut msg = dec.snapshot(model, api);
-    msg.stop_reason = dec.stop_reason.unwrap_or(StopReason::Stop);
-    msg.error_message = dec.error_message.clone();
-    msg
 }
 
 /// Apply `message_start` usage (Pi anthropic-messages.ts:551-558): seeds input/output/cache counts.

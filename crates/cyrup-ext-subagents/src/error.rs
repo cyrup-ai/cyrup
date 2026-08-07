@@ -77,6 +77,26 @@ pub enum SubagentError {
     #[error("{0}")]
     ModelOutOfScope(String),
 
+    /// The per-SESSION subagent spawn budget (`subagents.maxSubagentSpawnsPerSession`) would be
+    /// exceeded by this dispatch, so the WHOLE call was refused before any child was planned
+    /// (SUBA-002; pi `reserveSubagentSpawns`, `runs/foreground/subagent-executor.ts:266-282`).
+    ///
+    /// Raised by the SLASH surfaces (`/run`, `/chain`, `/parallel`, `/run-chain`), which reach
+    /// execution through [`crate::extension::SubagentsExtension::dispatch_slash`] rather than the
+    /// `subagent` tool's own `execute`. Upstream needs no dedicated error for this because every
+    /// slash handler funnels back into the SAME `executor.execute` the tool uses
+    /// (`slash/slash-commands.ts` `runSlashSubagent` -> `requestSlashRun` -> the bridge wired at
+    /// `extension/index.ts:396-401` -> `executeSubagentCollapsed` -> `executor.execute`), so its one
+    /// reserve covers both surfaces; in this crate the slash surface is a separate entry point and
+    /// charges the budget itself.
+    ///
+    /// Carries pi's verbatim over-limit notice (`Subagent spawn limit reached for this session
+    /// (N/M used, K requested). Complete the work directly or start a new session.`) as the whole
+    /// message — byte-identical to the text the tool path returns as its `ToolError` — so the
+    /// refusal reads the same on either surface.
+    #[error("{0}")]
+    SpawnLimitExceeded(String),
+
     /// Acceptance-gate evaluation rejected an otherwise-clean run (R-SA-011/033).
     #[error("acceptance rejected: {0}")]
     AcceptanceRejected(String),

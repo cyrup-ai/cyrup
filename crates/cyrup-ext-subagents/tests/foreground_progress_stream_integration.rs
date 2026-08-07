@@ -23,7 +23,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use cyrup_core::{CancelToken, ToolUpdate, ToolUpdateSink};
 use cyrup_ext_subagents::background::RunMode;
 use cyrup_ext_subagents::discovery::types::AgentReadScope;
-use cyrup_ext_subagents::extension::{ForegroundRunRequest, SubagentExecutor};
+use cyrup_ext_subagents::extension::{
+    ForegroundRunRequest, SingleRunOverrides, SubagentExecutor,
+};
 use cyrup_ext_subagents::tui::events::{LiveProgressStatus, SubagentUpdatePayload};
 
 /// Serializes every test in this file that mutates process-global env (`CYRUP_SUBAGENT_BINARY`,
@@ -121,6 +123,8 @@ async fn foreground_run_streams_live_progress_through_on_update() {
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
+                // SUBA-041: this test exercises live progress, not the per-call override surface.
+                overrides: SingleRunOverrides::default(),
                 cwd: dir.path(),
                 agent_name: "streamtest",
                 task: "Research the topic",
@@ -269,6 +273,8 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
+                // SUBA-041: this test exercises live progress, not the per-call override surface.
+                overrides: SingleRunOverrides::default(),
                 cwd: dir.path(),
                 agent_name: "canceltest",
                 task: "Research the topic",

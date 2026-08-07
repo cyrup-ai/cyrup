@@ -76,9 +76,13 @@ struct RuntimeInner {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-/// Collect the build-time diagnostics for `session` (Pi `result.diagnostics`,
-/// agent-session-services.ts:176). Today the only tier-available source is the model-restore
-/// fallback; extension provider-registration diagnostics (`#23`) join here once that lands.
+/// Collect the build-time diagnostics for `session` (Pi `runtime.diagnostics`, main.ts:730-740).
+/// Three tier-available sources today: the model-restore fallback, the CLI extension-flag
+/// reconciliation errors (SEAM-S01), and the contained extension LOAD failures (EXT-S01).
+/// Extension provider-registration diagnostics (`#23`) join here once that lands.
+///
+/// Order matches Pi's array construction: `services.diagnostics` (model + flags) first, then the
+/// mapped `resourceLoader.getExtensions().errors` (main.ts:735-738).
 fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
     let mut out = Vec::new();
     if let Some(msg) = session.model_fallback_message() {
@@ -86,6 +90,33 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
             severity: "warning".to_string(),
             message: msg.to_string(),
             source: Some("model".to_string()),
+        });
+    }
+    // SEAM-S01: `Unknown option(s): --foo` / `Extension flag "--foo" requires a value`. Pi pushes
+    // these onto the SAME `services.diagnostics` array (agent-session-services.ts:182) that becomes
+    // `runtime.diagnostics`, and the bin reports them + exits 1 (main.ts:843-848).
+    for message in &session.services().startup_diagnostics.flags {
+        out.push(RuntimeDiagnostic {
+            severity: "error".to_string(),
+            message: message.clone(),
+            source: Some("extension-flag".to_string()),
+        });
+    }
+    // EXT-S01: a CONTAINED extension load failure is still an ERROR. Pi maps every entry of
+    // `resourceLoader.getExtensions().errors` onto `runtime.diagnostics` as
+    // `{type:"error", message:'Failed to load extension "<path>": <err>'}` (main.ts:735-738) and the
+    // bin exits 1 on it (main.ts:843-849) — in every mode, not just interactive. Without this the
+    // `[Extension issues]` panel is the ONLY consumer, and that panel is built solely by
+    // `run_interactive`, so `cyrup -p …` would drop a failed security built-in silently at exit 0.
+    for ext in &session.services().startup_diagnostics.extensions {
+        if !ext.fatal {
+            // The project-trust skip: Pi never records it as a load error (see `LoadError::fatal`).
+            continue;
+        }
+        out.push(RuntimeDiagnostic {
+            severity: "error".to_string(),
+            message: format!("Failed to load extension \"{}\": {}", ext.path.display(), ext.error),
+            source: Some("extension".to_string()),
         });
     }
     out
@@ -201,13 +232,45 @@ impl AgentSessionRuntime {
     /// `{type:"session_start", reason:"startup"}` (agent-session.ts:389). Replacements are announced
     /// instead by [`Self::install_inner`] with their own reason.
     ///
+    /// This is the convenience shape for a host with NOTHING to configure between build and
+    /// announcement. A host that applies post-build CLI configuration first (`--name`, `--models`,
+    /// `--thinking`) must use [`Self::create_unannounced`] and let its dispatch entry point
+    /// announce, or the announcement races ahead of the configuration — see that constructor's
+    /// SEAM-033 note.
+    pub async fn create(
+        factory: Arc<SessionFactory>,
+        target: SessionTarget,
+    ) -> Result<Arc<Self>, SessionServiceError> {
+        let this = Self::create_unannounced(factory, target).await?;
+        this.session().await.bind_extensions().await;
+        Ok(this)
+    }
+
+    /// Build the runtime WITHOUT announcing the initial session — pi's `createAgentSessionRuntime`
+    /// verbatim (agent-session-runtime.ts:414-432: it constructs and returns, and never touches
+    /// `bindExtensions`).
+    ///
+    /// SEAM-033 ordering: pi's HOST announces, and it does so only after `main.ts` has finished
+    /// configuring the session — `sessionManager.appendSessionInfo(name)` at main.ts:650 and the
+    /// `scopedModels` fold into `sessionOptions` at main.ts:742-750 both run strictly BEFORE
+    /// `createAgentSessionRuntime` at main.ts:793, and the announcement itself lands later still, in
+    /// `runPrintMode`'s `rebindSession()` → `session.bindExtensions(...)` (print-mode.ts:119 → :73 →
+    /// agent-session.ts:2250). A host that must apply post-build configuration (`--name`,
+    /// `--models`, `--thinking`) therefore builds with THIS constructor, configures, and lets the
+    /// dispatch entry point announce; a host with nothing to configure first uses [`Self::create`].
+    ///
+    /// Announcing too early is observable: a `session_start` handler — the permission gate's policy
+    /// refresh, intercom's registration, a subagent's background-run reset — reads session state
+    /// that would still be unconfigured, and since print/json is the arm a spawned subagent child
+    /// re-execs into, every subagent run inherits whatever it sees.
+    ///
     /// SEAM-003: the runtime is returned as an `Arc` because it must hand every session it owns a
     /// `Weak`-backed [`RuntimeActions`] sink, and that `Weak` can only be taken from the `Arc`. The
-    /// sink is installed BEFORE `bind_extensions()` so a `session_start` handler that immediately
-    /// calls `ctx.newSession()`/`ctx.reload()` reaches a live host rather than a dead queue — Pi
-    /// installs `commandContextActions` as an argument OF `bindExtensions` (rpc-mode.ts:342-346), so
-    /// they are bound before the `session_start` emit at its tail (agent-session.ts:2250).
-    pub async fn create(
+    /// sink is installed here, BEFORE any announcement, so a `session_start` handler that
+    /// immediately calls `ctx.newSession()`/`ctx.reload()` reaches a live host rather than a dead
+    /// queue — Pi installs `commandContextActions` as an argument OF `bindExtensions`
+    /// (rpc-mode.ts:342-346), so they are bound before the emit at its tail (agent-session.ts:2250).
+    pub async fn create_unannounced(
         factory: Arc<SessionFactory>,
         target: SessionTarget,
     ) -> Result<Arc<Self>, SessionServiceError> {
@@ -227,7 +290,6 @@ impl AgentSessionRuntime {
         let actions: Arc<dyn RuntimeActions> = Arc::new(RuntimeHostActions(Arc::downgrade(&this)));
         let _ = this.actions.set(actions.clone());
         session.install_runtime_actions(actions);
-        session.bind_extensions().await;
         Ok(this)
     }
 
@@ -407,44 +469,65 @@ impl AgentSessionRuntime {
         let previous = current.session_file().await.map(|p| p.display().to_string());
         let session_file = current.session_file().await;
         let cwd = current.services().cwd.clone();
-        drop(current);
 
-        // Mirror Pi (agent-session-runtime.ts:287-324): for a persisted session, open a throwaway
+        // SEAM-009 — resolve (and VALIDATE) the anchor against the LIVE session manager BEFORE the
+        // persisted/in-memory split, exactly as Pi does: `getEntry(entryId)` +
+        // `throw new Error("Invalid entry ID for forking")` at agent-session-runtime.ts:275-283 sit
+        // ABOVE the `isPersisted()` branch at :290. Resolving inside the persisted arm (as this used
+        // to) meant an unsaved session accepted any entry id, valid or not, and branched at none of
+        // them.
+        let (target_leaf, selected_text) = current.fork_anchor_live(&entry, position).await?;
+
+        // Mirror Pi (agent-session-runtime.ts:287-350): for a persisted session, open a throwaway
         // manager from the current file, branch it in place at the resolved leaf, and hand THAT
         // manager object to the factory (its on-disk write may still be deferred). For an in-memory
-        // session, or a "fork before the first message", fall back to a fresh session.
-        let (next, selected_text) = match session_file {
-            Some(file) => {
+        // session, branch the LIVE manager and hand it over (Pi reuses `this.session.sessionManager`
+        // verbatim, :333-341). Only a "fork before the first message" — no anchor at all — is a
+        // brand-new empty session, on either path (Pi `newSession(...)`, :291/:335).
+        let next = match (&target_leaf, session_file) {
+            (Some(leaf), Some(file)) => {
                 let mut mgr = SessionManager::open(&file)?;
-                let (target_leaf, selected_text) =
-                    crate::session::fork_anchor(&mgr, &entry, position)?;
-                match target_leaf {
-                    Some(leaf) => {
-                        // Reuse the current session file's OWN directory literally (Pi
-                        // `createBranchedSession`'s `this.sessionDir` reuse, session-manager.ts:1343)
-                        // — it is already fully resolved, so re-encoding it would nest the branch one
-                        // level too deep (gap-analysis 05, Finding 1). Falls back to the cwd itself
-                        // only if the file somehow has no parent.
-                        let root =
-                            file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
-                        let layout = cyrup_session::SessionLayout::literal(root, cwd);
-                        mgr.create_branched_session(&leaf, &layout)?;
-                        (self.factory.build_from_manager(mgr).await?.into_shared(), selected_text)
-                    }
-                    // Fork before the first message: a brand-new session.
-                    None => {
-                        (self.factory.build(SessionTarget::New, None).await?.into_shared(), selected_text)
-                    }
-                }
+                // Reuse the current session file's OWN directory literally (Pi
+                // `createBranchedSession`'s `this.sessionDir` reuse, session-manager.ts:1343)
+                // — it is already fully resolved, so re-encoding it would nest the branch one
+                // level too deep (gap-analysis 05, Finding 1). Falls back to the cwd itself
+                // only if the file somehow has no parent.
+                let root = file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
+                let layout = cyrup_session::SessionLayout::literal(root, cwd);
+                mgr.create_branched_session(leaf, &layout)?;
+                self.factory.build_from_manager(mgr).await?.into_shared()
             }
-            None => (self.factory.build(SessionTarget::New, None).await?.into_shared(), None),
+            // SEAM-009: the non-persisted branch. The transcript lives ONLY in memory, so the live
+            // manager is the sole copy — branch it and carry it into the forked session rather than
+            // building an empty `SessionTarget::New` and losing the whole conversation.
+            //
+            // The three steps are ordered, and the order is load-bearing in a way Pi's is not. Pi
+            // branches `this.session.sessionManager` in place and only THEN awaits
+            // `teardownCurrent` (agent-session-runtime.ts:333-341); because the outgoing session
+            // keeps pointing at that same object, everything the dying run appends while it settles
+            // lands in the branched manager — i.e. in the fork. cyrup's `build_from_manager` takes
+            // the manager BY VALUE, so moving it out early would leave the outgoing session writing
+            // into a throwaway placeholder that is then dropped: an in-flight turn's final content
+            // (Pi's "aborted turn including tool results", :167-169) would be lost outright, and a
+            // non-persisted session has no file to recover it from. So: branch in place, settle the
+            // outgoing run against the branched manager, and only then move it.
+            (Some(leaf), None) => {
+                current.branch_live_manager(leaf).await?;
+                current.abort_and_settle().await;
+                let mgr = current.take_manager().await?;
+                self.factory.build_from_manager(mgr).await?.into_shared()
+            }
+            // Fork before the first message: a brand-new session (both persistence modes).
+            (None, _) => self.factory.build(SessionTarget::New, None).await?.into_shared(),
         };
+        drop(current);
         self.install(next, "fork", previous).await;
         Ok(RuntimeForkResult { cancelled: false, selected_text })
     }
 
     /// Import a session JSONL file and switch the runtime to it (Pi `importFromJsonl`,
-    /// agent-session-runtime.ts:353-388). The file is copied into the factory's sessions dir, the
+    /// agent-session-runtime.ts:353-388). The file is copied into the ACTIVE session's own session
+    /// directory (Pi `sessionManager.getSessionDir()`, :367 — the per-cwd dir, not the root), the
     /// `session_before_switch` veto is offered, the imported session's cwd is asserted to exist, and
     /// the runtime is replaced via the standard teardown→install protocol. Errors with
     /// [`SessionServiceError::ImportFileNotFound`] when the source path does not exist.
@@ -457,7 +540,26 @@ impl AgentSessionRuntime {
         if !resolved.exists() {
             return Err(SessionServiceError::ImportFileNotFound(resolved.display().to_string()));
         }
-        let session_dir = self.factory.session_dir();
+        // Pi copies into `this.session.sessionManager.getSessionDir()`
+        // (agent-session-runtime.ts:367) — the LIVE manager's OWN directory, which in the default
+        // layout is the per-cwd `<root>/--<enc-cwd>--` (`getDefaultSessionDirPath`,
+        // session-manager.ts:484,999-1000) and only equals the sessions root when `--session-dir`
+        // pinned it there. Copying into the root instead would make the imported session invisible
+        // to every listing path: `listing::list` scans `layout.dir()` (listing.rs:43-45) and
+        // `list_all` only descends into the per-project subdirectories (listing.rs:76-83).
+        //
+        // cyrup's `SessionManager` does not retain its `SessionLayout`, so the live session's
+        // directory is read off its own file — identical by construction on both sides: a created
+        // session's file is `layout.dir()/<ts>_<uuid>.jsonl`, and an opened one derives its dir from
+        // exactly that parent (Pi `SessionManager.open`, session-manager.ts:1548).
+        let current = self.session().await;
+        let current_file = current.session_file().await;
+        let session_dir = match current_file.as_deref().and_then(Path::parent) {
+            Some(dir) => dir.to_path_buf(),
+            // A non-persisted session has no file to read a directory off (Pi's in-memory manager
+            // still carries one); fall back to the factory's configured sessions dir.
+            None => self.factory.session_dir(),
+        };
         std::fs::create_dir_all(&session_dir)
             .map_err(|e| SessionServiceError::Io(e.to_string()))?;
         let file_name = resolved
@@ -465,12 +567,11 @@ impl AgentSessionRuntime {
             .ok_or_else(|| SessionServiceError::ImportFileNotFound(resolved.display().to_string()))?;
         let destination = session_dir.join(file_name);
 
-        let current = self.session().await;
         let target_id = destination.display().to_string();
         if self.vetoed(&current, HostEvent::SessionBeforeSwitch { target_id }).await {
             return Ok(SwitchResult { cancelled: true });
         }
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current_file.map(|p| p.display().to_string());
         drop(current);
 
         // Copy the source into the sessions dir (skip when it is already the destination).

@@ -259,3 +259,62 @@ async fn compact_aborted_in_flight_errors_with_pi_s_bare_compaction_cancelled() 
         "compaction_end must carry aborted:true with no errorMessage"
     );
 }
+
+/// The point of compaction: it must shrink what the NEXT request sends to the provider.
+///
+/// pi does this explicitly — `agent-session.ts:1874-1876` (manual `compact`) and `:2155-2157`
+/// (`_runAutoCompaction`) both assign `this.agent.state.messages = sessionContext.messages`
+/// straight after `appendCompaction`, because `appendCompaction` alone only writes a JSONL entry.
+///
+/// cyrup built that same context solely to COUNT it for the result payload and then dropped it, so
+/// `/compact` reported success, the TUI re-rendered a compacted transcript from the session, and the
+/// very next turn still shipped the entire pre-compaction history. The session view and the agent
+/// view silently disagreed — which is why this asserts on `agent_messages()` (the agent's own
+/// in-memory transcript, the thing actually sent) and NOT on `raw_context_messages()`, which reads
+/// the manager and was correct all along.
+#[tokio::test]
+async fn compaction_rebuilds_the_agents_in_memory_transcript() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("CONTEXT SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("TURN PREFIX SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build");
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+
+    let before = session.agent_messages().await.len();
+    let result = session.compact(None).await.expect("compaction succeeds");
+    assert!(!result.summary.is_empty(), "a summary was produced");
+
+    let after = session.agent_messages().await;
+    assert!(
+        after.len() < before,
+        "compaction must SHRINK the agent's transcript, not just write a JSONL entry \
+         (before={before}, after={})",
+        after.len()
+    );
+
+    // ...and it must equal the session's own rebuilt context: the two views agreeing is the whole
+    // property. A shrink to some other length would mean the agent was re-seeded from the wrong
+    // thing.
+    let rebuilt = session.raw_context_messages().await.len();
+    assert_eq!(
+        after.len(),
+        rebuilt,
+        "the agent transcript must BE the compacted session context"
+    );
+}

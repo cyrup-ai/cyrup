@@ -79,8 +79,7 @@ impl Tool for BashTool {
         &self.params
     }
 
-    // Verbatim from Pi (bash.ts:284-285). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50. Pi
-    // defines no promptGuidelines for bash, so the trait default (`&[]`) is used.
+    // Verbatim from Pi (bash.ts:327). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
     fn description(&self) -> &str {
         "Execute a bash command in the current working directory. Returns stdout and stderr. \
          Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, \
@@ -88,6 +87,18 @@ impl Tool for BashTool {
     }
     fn prompt_snippet(&self) -> Option<&str> {
         Some("Execute bash commands (ls, grep, find, etc.)")
+    }
+
+    /// Pi: `promptGuidelines: exposeSessionEnvironment ? ["Inspect PI_* environment variables for
+    /// current model and session details."] : undefined` (bash.ts:329-331) — the guideline exists
+    /// precisely because the variables do, so it is gated by the same flag. Renamed to the
+    /// `CYRUP_*` family the injection below actually sets.
+    fn prompt_guidelines(&self) -> &[&str] {
+        if self.opts.expose_session_environment {
+            &["Inspect CYRUP_* environment variables for current model and session details."]
+        } else {
+            &[]
+        }
     }
 
     async fn execute(
@@ -100,14 +111,48 @@ impl Tool for BashTool {
         let input: BashInput =
             serde_json::from_value(params).map_err(|e| error::invalid(format!("bash: {e}")))?;
 
-        // Pi prepends the command prefix, then builds `{command, cwd, env: getShellEnv()}` and runs
-        // it through the optional spawnHook before exec (bash.ts:294-295,141-144).
+        // Pi prepends the command prefix (bash.ts:340), then `resolveSpawnContext` (bash.ts:158-184)
+        // builds the child environment in three ordered steps before handing the context to the
+        // optional spawnHook LAST (bash.ts:182-183):
+        //   1. materialize `{...getShellEnv()}`         (bash.ts:164)
+        //   2. UNCONDITIONALLY delete the five session keys (bash.ts:165-170) — before the flag is
+        //      even consulted, so a stale inherited value can never survive
+        //   3. repopulate them from the live session when `exposeSessionEnvironment && ctx`
+        //      (bash.ts:171-181)
+        // Steps 2 and 3 are expressed here as `env_remove` + `env` because cyrup inherits the parent
+        // environment instead of materializing it; the backend applies the removals first.
         let command = match &self.opts.command_prefix {
             Some(prefix) => format!("{prefix}\n{}", input.command),
             None => input.command.clone(),
         };
-        let env = shell_env(self.opts.bin_dir.as_deref());
-        let ctx = BashSpawnContext { command, cwd: self.cwd.clone(), env };
+        let mut env = shell_env(self.opts.bin_dir.as_deref());
+        let env_remove = crate::config::session_env_scrub_keys();
+        if self.opts.expose_session_environment
+            && let Some(handle) = &self.opts.session_env
+        {
+            // Read at SPAWN time, never at construction: "The values are resolved when each command
+            // starts. Switching models or changing the reasoning level therefore affects the next
+            // bash command without restarting Pi" (docs/environment-variables.md:27).
+            let info = handle.get();
+            if let Some(id) = info.session_id {
+                env.push(("CYRUP_SESSION_ID".to_string(), id));
+            }
+            // Pi guards this one (`if (sessionFile)`, bash.ts:174): an ephemeral session leaves it
+            // unset rather than empty.
+            if let Some(file) = info.session_file {
+                env.push(("CYRUP_SESSION_FILE".to_string(), file.to_string_lossy().into_owned()));
+            }
+            // Pi sets the provider/model PAIR together, only when a model is selected (bash.ts:
+            // 175-178).
+            if let (Some(provider), Some(model)) = (info.provider, info.model) {
+                env.push(("CYRUP_PROVIDER".to_string(), provider));
+                env.push(("CYRUP_MODEL".to_string(), model));
+            }
+            if let Some(level) = info.reasoning_level {
+                env.push(("CYRUP_REASONING_LEVEL".to_string(), level));
+            }
+        }
+        let ctx = BashSpawnContext { command, cwd: self.cwd.clone(), env, env_remove };
         let ctx = match &self.opts.spawn_hook {
             Some(hook) => hook(ctx),
             None => ctx,
@@ -157,7 +202,13 @@ impl Tool for BashTool {
             None => self.shell.clone(),
         };
 
-        let spec = ExecSpec { command: ctx.command, cwd: ctx.cwd, env: ctx.env, shell };
+        let spec = ExecSpec {
+            command: ctx.command,
+            cwd: ctx.cwd,
+            env: ctx.env,
+            env_remove: ctx.env_remove,
+            shell,
+        };
 
         // Pi debounces mid-stream output updates with a 100ms throttle that has BOTH a leading edge
         // AND a scheduled TRAILING-edge `setTimeout` flush (`scheduleOutputUpdate`, bash.ts:158,

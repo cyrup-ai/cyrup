@@ -241,6 +241,15 @@ fn http_proxy_overlay(proxy: Option<&str>) -> Option<cyrup_provider::ProviderEnv
 /// Pi's default active built-in tool names (sdk.ts:244).
 const DEFAULT_BUILTIN_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
 
+/// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:45-67`).
+///
+/// Needed to tell "a built-in pi does not activate by default" (`grep`/`find`/`ls`) apart from "a
+/// non-built-in tool" (an extension- or embedder-supplied one), which must stay active: pi's
+/// `defaultActiveToolNames` gates only its own built-ins and never suppresses a tool the host
+/// registered.
+const ALL_BUILTIN_TOOLS: [&str; 7] =
+    ["read", "write", "edit", "bash", "grep", "find", "ls"];
+
 /// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
 /// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
 fn select_active_tools(
@@ -255,7 +264,26 @@ fn select_active_tools(
             (Some(allow), _) => allow.iter().any(|a| a == name),
             (None, Some(NoTools::All)) => false,
             (None, Some(NoTools::Builtin)) => !DEFAULT_BUILTIN_TOOLS.contains(&name),
-            (None, None) => true,
+            // pi `sdk.ts:244-250`: with no `tools`/`noTools` the active set is
+            // `defaultActiveToolNames` — read/bash/edit/write — NOT every visible tool. Confirmed
+            // at the same tag in `agent-session.ts:2592-2594`, and `_refreshToolRegistry`
+            // (`:2524-2546`) only ever WIDENS it.
+            //
+            // This arm returned `true`, so every cyrup session advertised three tools pi does not
+            // (`grep`, `find`, `ls`). That changed the tool array in every provider request AND the
+            // system prompt (their `prompt_snippet`/`prompt_guidelines` are injected via
+            // `tool_contribution`), so the model routed searches to `grep`/`find` instead of `bash`
+            // — different transcripts, different token counts, different tool-call sequences than
+            // pi for identical inputs — and it silently widened the surface a permission policy has
+            // to cover.
+            //
+            // `registry.visible(...)` is deliberately NOT narrowed: grep/find/ls remain
+            // ENABLE-able at runtime via `set_active_tools_by_name`, exactly as pi's
+            // `_refreshToolRegistry` can widen its own active set. This changes the DEFAULT, not
+            // what is reachable.
+            (None, None) => {
+                DEFAULT_BUILTIN_TOOLS.contains(&name) || !ALL_BUILTIN_TOOLS.contains(&name)
+            }
         }
     };
     visible
@@ -616,13 +644,60 @@ impl SessionBuilder {
             fs = Arc::new(ProtectedFs::with_defaults(fs));
         }
         let backend = Backend { fs, proc: base.proc.clone() };
+        // The live session metadata every `bash` child gets as `CYRUP_*` (Pi's `resolveSpawnContext`
+        // reads the same five values off the per-call `ExtensionContext`, bash.ts:171-181). Pi's
+        // values are "resolved when each command starts" (docs/environment-variables.md:27), so this
+        // is a shared HANDLE the session mutates on `set_model` / `set_thinking_level`, never a
+        // snapshot baked into the tool.
+        // `read`'s non-vision-model warning (pi `tools/read.ts`): the handle is seeded from the
+        // RESOLVED model's declared input modalities and re-pushed on every `/model` switch, exactly
+        // as `bash_session_env` carries provider/model. Without this the tool's
+        // `ReadOpts::model_vision` stayed `None` and `supports_images_now()` fell back to `true`,
+        // so the warning was unreachable and an image handed to a text-only model produced a
+        // provider error instead of the tool's own diagnostic.
+        let read_model_vision =
+            cyrup_tools::config::ModelVisionHandle::new(resolved_model.supports_image_input());
+        let bash_session_env = cyrup_tools::config::SessionEnvHandle::new(
+            cyrup_tools::config::SessionEnvInfo {
+                session_id: Some(session_id.to_string()),
+                // `None` for an ephemeral/in-memory session — Pi leaves `PI_SESSION_FILE` unset
+                // rather than empty in that case (bash.ts:173-174).
+                session_file: manager.session_file().map(std::path::Path::to_path_buf),
+                provider: Some(model_ref.provider.to_string()),
+                model: Some(model_ref.model.to_string()),
+                reasoning_level: Some(thinking_level_to_str(thinking)),
+            },
+        );
         let registry = ToolRegistry::with_builtins(
             cwd.clone(),
             backend,
             ToolsOptions {
+                read: cyrup_tools::config::ReadOpts {
+                    model_vision: Some(read_model_vision.clone()),
+                    // `images.autoResize` (Pi `_buildRuntime`: `const autoResizeImages =
+                    // this.settingsManager.getImageAutoResize()` → `read: { autoResizeImages }`,
+                    // agent-session.ts:2553,2564). Without this the setting had no consumer at all
+                    // and `read` downsampled every image to 2000px regardless.
+                    auto_resize_images: settings.effective().image_auto_resize(),
+                    ..cyrup_tools::config::ReadOpts::default()
+                },
                 bash: BashOpts {
                     command_prefix: shell_command_prefix_setting.clone(),
                     shell_path: shell_path_setting.clone(),
+                    session_env: Some(bash_session_env.clone()),
+                    // pi `getShellEnv()` (`utils/shell.ts:122-134`) unconditionally prepends
+                    // `getBinDir()` to PATH for EVERY bash child (`tools/bash.ts:100,165`); there is
+                    // no pi path where the bash tool spawns without it.
+                    //
+                    // cyrup set this only on the user-facing `/bash` seam
+                    // (`session.rs:4225`, the same `<agent_dir>/bin`), leaving the agent-loop `bash`
+                    // tool — the one the MODEL calls — with `bin_dir: None`, which makes
+                    // `ops::shell::shell_env` return an empty overlay and inherit the parent PATH
+                    // unchanged. So a binary cyrup manages into `<agent_dir>/bin` produced
+                    // `command not found` for the model while the identical command succeeded
+                    // through `/bash`: two bash paths in one process disagreeing about PATH, which
+                    // reads as nondeterminism from the outside.
+                    bin_dir: Some(cfg.agent_dir.join("bin")),
                     ..BashOpts::default()
                 },
                 ..ToolsOptions::default()
@@ -683,8 +758,32 @@ impl SessionBuilder {
         // calls `NativeExtension::set_host_services` before `init`; the manager / ui sink / inject sink
         // attach later (steps 6/10 + the mode entry point) and the captured `Arc` observes them.
         let native_services: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
+        // EXT-S01: CONTAIN a native extension's load/`init` failure. This loop used to propagate the
+        // first error with a bare `?`, so one built-in (permission-system, intercom, subagents)
+        // failing `init` took the ENTIRE session down — no session at all, and the remaining natives
+        // were never even attempted. Pi records a per-extension load failure and keeps building
+        // (`LoadExtensionsResult.errors`, surfaced as `Failed to load extension "<path>": <err>`,
+        // main.ts:735-738). Collected here and folded into `startup_diagnostics.extensions` below
+        // (the same channel the wasm/disk path at step 4c already uses), so a contained failure
+        // reaches BOTH the `[Extension issues]` startup panel AND — because it is marked `fatal` —
+        // `AgentSessionRuntime::diagnostics()`, where the bin reports it on stderr and exits 1 in
+        // every mode (Pi main.ts:843-849). Containment is per-extension, NOT forgiveness: Pi keeps
+        // building past the failure and then refuses to run. The natives are cyrup's security
+        // built-ins (permission-system, intercom), so anything short of a non-zero exit would turn
+        // a failed permission gate into a fail-OPEN session.
+        let mut native_load_errors: Vec<crate::services::ExtensionLoadDiagnostic> = Vec::new();
         for ext in self.native_extensions {
-            host.load_native_with_services(ext, native_services.clone()).await?;
+            let id = ext.id();
+            if let Err(e) = host.load_native_with_services(ext, native_services.clone()).await {
+                tracing::error!(extension = %id, error = %e, "native extension failed to load");
+                native_load_errors.push(crate::services::ExtensionLoadDiagnostic {
+                    // A native built-in has no on-disk path; its id is the display key the panel
+                    // shows (Pi's per-extension diagnostics are keyed by the loader's path).
+                    path: PathBuf::from(id.as_str()),
+                    error: e.to_string(),
+                    fatal: true,
+                });
+            }
         }
         let ext_host = Arc::new(host);
 
@@ -754,9 +853,12 @@ impl SessionBuilder {
         // floor here. Pi shows them at startup even under `quietStartup`
         // (`showDiagnosticsWhenQuiet: true`, interactive-mode.ts:1769), so they now travel on
         // `AgentSessionServices::startup_diagnostics` for the front-end to render.
-        #[cfg_attr(not(feature = "wasm-host"), allow(unused_mut))]
-        let mut startup_diagnostics =
-            crate::services::StartupDiagnostics { resources: report.diagnostics.clone(), ..Default::default() };
+        let mut startup_diagnostics = crate::services::StartupDiagnostics {
+            resources: report.diagnostics.clone(),
+            // EXT-S01: the native built-ins that failed to load at step 4b, contained above.
+            extensions: native_load_errors,
+            ..Default::default()
+        };
         // A malformed `packages` entry never takes the settings document (or the session) down; it
         // is reported alongside the discovery diagnostics.
         for message in package_errors {
@@ -818,13 +920,16 @@ impl SessionBuilder {
             let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
             // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
             // diagnostics, main.ts:679-682) are retained on `startup_diagnostics` so the TUI can
-            // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here.
+            // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here. Each
+            // carries its `fatal` flag through unchanged, so a genuine load fault also reaches the
+            // bin's exit-1 checkpoint while the project-trust skip does not (`LoadError::fatal`).
             let load_result =
                 ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
             startup_diagnostics.extensions.extend(load_result.errors.iter().map(|e| {
                 crate::services::ExtensionLoadDiagnostic {
                     path: e.path.clone(),
                     error: e.error.clone(),
+                    fatal: e.fatal,
                 }
             }));
         }
@@ -852,7 +957,13 @@ impl SessionBuilder {
                     (name.clone(), ov)
                 })
                 .collect();
-            ext_host.apply_extension_flag_values(&overrides)?;
+            // SEAM-S01: the reconciliation diagnostics — `Unknown option(s): --foo` and
+            // `Extension flag "--foo" requires a value` (Pi agent-session-services.ts:98-125) — are
+            // retained here. They used to be `continue`d away inside the ext-host, so a mistyped
+            // `--flag` produced no message and no non-zero exit. Pi merges them into
+            // `services.diagnostics` (:182), which becomes `runtime.diagnostics` and is reported +
+            // `process.exit(1)`-ed at main.ts:843-848.
+            startup_diagnostics.flags.extend(ext_host.apply_extension_flag_values(&overrides)?);
         }
 
         // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
@@ -1058,9 +1169,16 @@ impl SessionBuilder {
         .messages(seed)
         .hooks(policy_hooks)
         .session_id(session_id.clone())
-        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + custom thinking budgets.
+        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + transport + custom thinking budgets.
         .steering_mode(parse_queue_mode(&eff.steering_mode()))
-        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()));
+        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()))
+        // `transport` (Pi sdk.ts:357 `transport: settingsManager.getTransport()`). The setting was
+        // parsed, migrated from the legacy `websockets` boolean and offered in the `/settings` grid,
+        // but never reached the agent — so `AgentBuilder::transport` had no non-test caller and the
+        // value died in the config layer. It now rides `StreamOptions.transport` into every
+        // `StreamFn::stream` call (agent.rs `gen_config.transport`), which is the seam an
+        // embedder-supplied `StreamFn` (e.g. `ProxyStreamFn`) and every wire API read from.
+        .transport(parse_transport(&eff.transport()));
         if let Some(h) = attribution_headers {
             agent_builder = agent_builder.headers(h);
         }
@@ -1084,10 +1202,35 @@ impl SessionBuilder {
         {
             agent_builder = agent_builder.provider_env(overlay);
         }
-        if let Ok(timeout_ms) = eff.http_idle_timeout_ms()
-            && timeout_ms > 0
-        {
+        // PROV-006. Pi's `configureHttpDispatcher(getHttpIdleTimeoutMs())` installs a PROCESS-GLOBAL
+        // dispatcher (main.ts:802, interactive-mode.ts:1778) that bounds every outbound HTTP request
+        // — provider streams, catalog refreshes, everything — so the equivalent global is installed
+        // here, not just threaded onto this agent's requests.
+        //
+        // `0` is passed through rather than skipped: `httpIdleTimeoutMs: 0` / `"disabled"` means the
+        // user turned the timeout OFF, and dropping the call would silently leave the previous value
+        // (or the 5-minute default) in place. The old `timeout_ms > 0` guard did exactly that.
+        if let Ok(timeout_ms) = eff.http_idle_timeout_ms() {
+            cyrup_provider::configure_http_idle_timeout(timeout_ms);
             agent_builder = agent_builder.timeout_ms(timeout_ms);
+        }
+
+        // `settings.retry.provider.*` — Pi's `getProviderRetrySettings()`, applied in `sdk.ts`'s
+        // `streamFn` as `options?.X ?? providerRetrySettings.X` (sdk.ts:303-317). `timeoutMs` wins
+        // over `httpIdleTimeoutMs` when set, which is why it is applied after the block above.
+        // Negative values (JSON has no unsigned type) are treated as unset rather than clamped to 0,
+        // since `0` is a meaningful "disabled" for the timeout and "no retries" for the budget.
+        {
+            let retry = eff.provider_retry_settings();
+            if let Some(timeout_ms) = retry.timeout_ms.filter(|ms| *ms >= 0) {
+                agent_builder = agent_builder.timeout_ms(timeout_ms as u64);
+            }
+            if let Some(max_retries) = retry.max_retries.filter(|n| *n >= 0) {
+                agent_builder = agent_builder.max_retries(max_retries as u32);
+            }
+            if retry.max_retry_delay_ms >= 0 {
+                agent_builder = agent_builder.max_retry_delay_ms(retry.max_retry_delay_ms as u64);
+            }
         }
 
         // gap-08 #2/#3: install the provider transport extension seams. `on_payload` routes the
@@ -1149,6 +1292,24 @@ impl SessionBuilder {
             manager.append_thinking_level_change(&thinking_level_to_str(thinking))?;
         }
 
+        // The directory THIS session's files live in — Pi's `SessionManager.sessionDir`, exposed as
+        // `getSessionDir()` (session-manager.ts:999-1001) and fixed once at construction. Pi resolves
+        // it as `sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd)` when a session is
+        // created (`create`, :1519-1520) and as `sessionDir ?? resolve(path, "..")` — the OPEN FILE's
+        // own parent — when one is resumed (`open`, :1547-1548). The interactive `/resume` picker
+        // lists exactly this directory (`SessionManager.list(getCwd(), getSessionDir())`,
+        // interactive-mode.ts:4867), so it is carried on the services instead of being re-derived
+        // from the cwd-encoded default, which is wrong under `--session-dir` and after a resume from
+        // elsewhere. An in-memory session has no file, so the resolved layout dir stands in.
+        let session_dir = match &cfg.session_dir {
+            Some(dir) => dir.clone(),
+            None => manager
+                .session_file()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| layout.dir()),
+        };
+
         let manager = Arc::new(AsyncMutex::new(manager));
         // Attach the live tree manager to the (already control-wired) host-services backend so a
         // loaded guest's `append_entry`/`set_session_name`/`set_label` capability mutates THIS
@@ -1199,11 +1360,14 @@ impl SessionBuilder {
             shell_command_prefix: shell_command_prefix_setting,
             dynamic_tools,
             handle,
+            bash_session_env,
+            read_model_vision,
         };
 
         let services = AgentSessionServices {
             cwd,
             agent_dir: cfg.agent_dir.clone(),
+            session_dir,
             home: cfg.home.clone(),
             settings,
             project_trusted: trusted,
@@ -1240,6 +1404,20 @@ impl SessionBuilder {
 /// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:698-710). Any non-`all` value ⇒ one-at-a-time.
 pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
     if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
+}
+
+/// Parse the settings `transport` string into the provider [`Transport`] Pi hands the agent
+/// (`sdk.ts:357` `transport: settingsManager.getTransport()`; the `TransportSetting` union is
+/// `"auto" | "sse" | "websocket" | "websocket-cached"`, types.ts:98). The strings are byte-1:1 with
+/// Pi because `Transport` is `#[serde(rename_all = "kebab-case")]`. An unrecognized value falls back
+/// to `auto`, matching `getTransport()`'s `?? "auto"` and the settings dialog's fixed choice set.
+pub(crate) fn parse_transport(s: &str) -> cyrup_provider::Transport {
+    match s {
+        "sse" => cyrup_provider::Transport::Sse,
+        "websocket" => cyrup_provider::Transport::Websocket,
+        "websocket-cached" => cyrup_provider::Transport::WebsocketCached,
+        _ => cyrup_provider::Transport::Auto,
+    }
 }
 
 /// Serialize a [`ModelThinkingLevel`] to its persisted snake/camel key (`off`/`minimal`/…/`xhigh`/`max`).
@@ -1570,22 +1748,49 @@ fn configured_packages_from_settings(
                 errors.push("settings `packages` entry has an empty `source`".to_string());
                 continue;
             }
-            // Pi's `dedupePackages` (package-manager.ts:1681): project scope wins for the same
-            // package identity, so a later (global) entry for an already-seen source is dropped.
-            if out.iter().any(|p| p.source == source) {
-                continue;
-            }
             let (extensions, skills, prompts, themes) = entry.filters();
-            out.push(ConfiguredPackage {
+            let built = ConfiguredPackage {
                 source,
                 scope,
                 filter: PackageFilter {
+                    // `autoload: false` flips the per-type lists from include filters to a delta
+                    // (Pi `collectPackageResources`, package-manager.ts:2084-2085).
+                    autoload: entry.autoload(),
                     extensions: extensions.map(<[String]>::to_vec),
                     skills: skills.map(<[String]>::to_vec),
                     prompts: prompts.map(<[String]>::to_vec),
                     themes: themes.map(<[String]>::to_vec),
                 },
-            });
+            };
+            // Pi's `dedupePackages` (package-manager.ts:1681-1703), all three branches:
+            //
+            // - first sighting of an identity — keep it;
+            // - the kept entry is PROJECT and this one is USER — normally drop this one, EXCEPT
+            //   when the project entry is `autoload: false`, which its doc comment (:1676-1679)
+            //   defines as "a delta over the global entry, so both are kept (delta first)". The
+            //   base entry has to survive or the delta has nothing to layer over and the project
+            //   patterns silently become the whole package;
+            // - otherwise, a PROJECT entry replaces whatever is in the slot (`result[index] =
+            //   entry`, :1698) — project wins, later project entry wins an intra-scope repeat.
+            //
+            // [CYRUP-DELTA] the identity is the trimmed source STRING, where Pi normalizes through
+            // `getPackageIdentity` (:1660-1674) so `npm:x@1` and `npm:x@2`, or an SSH and an HTTPS
+            // URL for one repo, collide. Tracked separately as CFG-026.
+            match out.iter().position(|p| p.source == built.source) {
+                None => out.push(built),
+                Some(index) => {
+                    let existing_is_project_delta = out
+                        .get(index)
+                        .is_some_and(|p| p.scope == InstallScope::Project && p.filter.is_delta());
+                    if existing_is_project_delta && built.scope == InstallScope::Global {
+                        out.push(built);
+                    } else if built.scope == InstallScope::Project
+                        && let Some(slot) = out.get_mut(index)
+                    {
+                        *slot = built;
+                    }
+                }
+            }
         }
     }
     (out, errors)
@@ -1610,6 +1815,62 @@ fn today() -> time::Date {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::http_proxy_overlay;
+
+    /// CFG-010 (dedupe half) — Pi's `dedupePackages` keeps BOTH entries, delta first, when a
+    /// PROJECT entry carrying `autoload: false` collides with a USER one for the same package
+    /// identity: "A project entry with autoload=false is a delta over the global entry, so both
+    /// are kept (delta first)" (package-manager.ts:1676-1679, code at :1691-1696). Dropping the
+    /// global entry turns the delta form inside out — the project entry's patterns become the
+    /// ONLY thing that loads instead of a layer over the full package.
+    #[test]
+    fn a_project_autoload_false_entry_is_a_delta_over_the_global_entry_not_a_replacement() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Project,
+            r#"{"packages":[{"source":"npm:pi-tools","autoload":false,"extensions":["-extensions/foo.ts"]}]}"#,
+        );
+        store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, errors) = super::configured_packages_from_settings(&mgr);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            pkgs.len(),
+            2,
+            "the global entry must survive so the project delta has something to layer over, got \
+             {pkgs:?}"
+        );
+        assert_eq!(pkgs[0].scope, InstallScope::Project, "delta first");
+        assert!(pkgs[0].filter.is_delta());
+        assert_eq!(pkgs[1].scope, InstallScope::Global);
+        assert!(pkgs[1].filter.is_empty(), "the base entry keeps no filter");
+    }
+
+    /// The other side of the same branch: without `autoload: false` a project entry still REPLACES
+    /// the global one outright (`else if (entry.scope === "project")` / the plain drop of a later
+    /// user entry, package-manager.ts:1694-1698).
+    #[test]
+    fn a_plain_project_entry_still_shadows_the_global_one() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Project,
+            r#"{"packages":[{"source":"npm:pi-tools","skills":["skills/a"]}]}"#,
+        );
+        store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, _) = super::configured_packages_from_settings(&mgr);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].scope, InstallScope::Project);
+    }
 
     /// PROV-002: the persisted session key for the `max` rung. Both directions go through serde,
     /// so this pins that the enum change actually reaches session replay + the `model:max`

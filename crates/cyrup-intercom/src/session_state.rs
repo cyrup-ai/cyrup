@@ -133,6 +133,28 @@ impl SharedIntercomState {
         std::mem::take(&mut *self.pending_idle.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Drop the FIRST queued idle message whose id is `message_id` — pi `dismissIncomingAsk`'s
+    /// `const queuedIndex = pendingIdleMessages.findIndex(…); if (queuedIndex >= 0)
+    /// pendingIdleMessages.splice(queuedIndex, 1);` (`index.ts:455-459`). Returns whether one was
+    /// removed.
+    ///
+    /// This is the half of pi's dismissal that the [`crate::reply_tracker::ReplyTracker`] cannot do:
+    /// `dismissPendingAsk` prunes the tracker's pending asks and turn contexts, but an inbound
+    /// message that arrived while this session was BUSY also sits in the pending-idle queue, and
+    /// [`crate::inbound::flush_idle_messages`] replays that queue unconditionally. Answering such a
+    /// message mid-run without this would re-inject it after the flush. Reach it through
+    /// [`crate::inbound::dismiss_incoming_ask`], which does both halves.
+    pub fn remove_pending_inbound(&self, message_id: &str) -> bool {
+        let mut queue = self.pending_idle.lock().unwrap_or_else(|e| e.into_inner());
+        match queue.iter().position(|entry| entry.message.id == message_id) {
+            Some(index) => {
+                queue.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many messages are waiting for this session to go idle (pi's
     /// `pendingIdleMessages.length === 0` early return, `index.ts:686-688`).
     #[must_use]

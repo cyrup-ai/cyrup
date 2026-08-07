@@ -10,6 +10,7 @@
 //! performing any side effect — the app shell runs the resulting action (opening an overlay, calling
 //! the runtime, etc.). This mirrors Pi, where completion never executes and dispatch is a pure
 //! `trim()`-then-if-chain on the exact text (`interactive-mode.ts:2554`).
+use std::borrow::Cow;
 
 /// Where a command came from (`slash-commands.ts`; `interactive-mode.ts:443-467`). Only [`Builtin`]
 /// commands ship in this crate; the dynamic sources are merged by the app from session resources.
@@ -27,11 +28,16 @@ pub enum CommandSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
     /// Command name without the leading `/` (e.g. `"model"`).
-    pub name: &'static str,
+    ///
+    /// [`Cow`] rather than `&'static str` because a registered extension command's name is only
+    /// known at runtime (`InitApi::register_command(name: impl Into<String>)`), as are a prompt
+    /// template's and a skill's. The builtin table stays a `const` array of `Cow::Borrowed`, so
+    /// nothing is allocated for the common case.
+    pub name: Cow<'static, str>,
     /// Human description (Pi's `description`), source-tag-prefixed for non-builtins.
-    pub description: &'static str,
+    pub description: Cow<'static, str>,
     /// Argument hint shown before the description (e.g. `"<model>"`); `None` for arg-less commands.
-    pub argument_hint: Option<&'static str>,
+    pub argument_hint: Option<Cow<'static, str>>,
     /// Provenance.
     pub source: CommandSource,
     /// Whether the command provides argument completion (only `/model` in Pi, `:498-528`).
@@ -75,9 +81,12 @@ const fn cmd(
     argument_hint: Option<&'static str>,
 ) -> SlashCommand {
     SlashCommand {
-        name,
-        description,
-        argument_hint,
+        name: Cow::Borrowed(name),
+        description: Cow::Borrowed(description),
+        argument_hint: match argument_hint {
+            Some(hint) => Some(Cow::Borrowed(hint)),
+            None => None,
+        },
         source: CommandSource::Builtin,
         has_arg_completion: false,
     }
@@ -89,9 +98,9 @@ const fn arg_cmd(
     hint: &'static str,
 ) -> SlashCommand {
     SlashCommand {
-        name,
-        description,
-        argument_hint: Some(hint),
+        name: Cow::Borrowed(name),
+        description: Cow::Borrowed(description),
+        argument_hint: Some(Cow::Borrowed(hint)),
         source: CommandSource::Builtin,
         has_arg_completion: true,
     }
@@ -130,13 +139,47 @@ impl Default for CommandRegistry {
 impl CommandRegistry {
     /// A registry seeded with just the 22 builtins (no dynamic commands yet).
     pub fn new() -> Self {
-        let mut dispatch_names: Vec<&'static str> =
-            BUILTIN_SLASH_COMMANDS.iter().map(|c| c.name).collect();
+        let mut dispatch_names: Vec<&'static str> = BUILTIN_SLASH_COMMANDS
+            .iter()
+            .filter_map(|c| match &c.name {
+                Cow::Borrowed(name) => Some(*name),
+                Cow::Owned(_) => None,
+            })
+            .collect();
         dispatch_names.extend_from_slice(HIDDEN_COMMANDS);
         CommandRegistry { commands: BUILTIN_SLASH_COMMANDS.to_vec(), dispatch_names }
     }
 
-    /// All autocomplete-visible commands in display order (builtins; dynamic appended by the app).
+    /// The registry this crate's doc has always described: the builtin table PLUS the dynamic
+    /// prompt/extension/skill commands the app merges in (spec/tui/04 §2.2).
+    ///
+    /// Until this existed, `CommandSource::{Prompt, Extension, Skill}` were declared and NEVER
+    /// constructed, [`InputEditor::set_registry`] had zero callers, and
+    /// `AgentSession::slash_command_catalog()` — which already merges all three sources — was
+    /// consumed only by RPC mode. An RPC client saw every registered command; the interactive TUI
+    /// showed builtins only, from the same session with the same registrations.
+    ///
+    /// `dispatch_names` is deliberately NOT extended. It drives the local builtin dispatch table,
+    /// and a dynamic command is not dispatched locally — it routes to the extension/prompt/skill
+    /// that registered it. Merging them here would make `/foo` resolve to a builtin `Dispatch`
+    /// that no arm handles. They are autocomplete-visible, which is exactly the gap.
+    #[must_use]
+    pub fn with_dynamic(dynamic: impl IntoIterator<Item = SlashCommand>) -> Self {
+        let mut registry = Self::new();
+        // Builtins win a name collision: pi resolves duplicate registrations by suffixing the
+        // LATER one (`runner.ts:556-595` `invocation_name`), never by shadowing an existing name.
+        let existing: std::collections::HashSet<String> =
+            registry.commands.iter().map(|c| c.name.to_string()).collect();
+        for cmd in dynamic {
+            if !existing.contains(cmd.name.as_ref()) {
+                registry.commands.push(cmd);
+            }
+        }
+        registry
+    }
+
+    /// All autocomplete-visible commands in display order (builtins first, then any dynamic
+    /// commands merged via [`Self::with_dynamic`]).
     pub fn commands(&self) -> &[SlashCommand] {
         &self.commands
     }
@@ -197,4 +240,112 @@ impl CommandRegistry {
         }
         None
     }
+}
+
+/// pi `getAutocompleteSourceTag` (`interactive-mode.ts:536-559`): the short provenance tag shown
+/// before a non-builtin command's description.
+///
+/// `scope` picks the prefix (`user`→`u`, `project`→`p`, anything else→`t`), and the `source` only
+/// widens it for package origins: `npm:…` and git URLs get appended, while `auto`/`local`/`cli`
+/// — and every unrecognized source, via pi's final `return scopePrefix` — stay bare.
+#[must_use]
+pub fn autocomplete_source_tag(scope: &str, source: &str) -> String {
+    let scope_prefix = match scope {
+        "user" => "u",
+        "project" => "p",
+        _ => "t",
+    };
+    let source = source.trim();
+    if source.starts_with("npm:") {
+        return format!("{scope_prefix}:{source}");
+    }
+    // pi also special-cases a parseable git URL (`:552-556`). cyrup's catalog synthesizes
+    // `source: "extension"|"prompt"|"skill"` for every row it emits, so no row reaches that arm
+    // today; it falls through to pi's own `return scopePrefix` default either way.
+    scope_prefix.to_string()
+}
+
+/// pi `prefixAutocompleteDescription` (`interactive-mode.ts:561-567`): `[tag] description`, or a
+/// bare `[tag]` when the command carries no description.
+#[must_use]
+fn prefix_autocomplete_description(description: &str, tag: &str) -> String {
+    if description.is_empty() {
+        format!("[{tag}]")
+    } else {
+        format!("[{tag}] {description}")
+    }
+}
+
+/// Turn `AgentSession::slash_command_catalog()`'s JSON rows into autocomplete-visible commands.
+///
+/// That catalog already merges the three dynamic sources — registered extension commands, prompt
+/// templates and skills — and was consumed ONLY by RPC mode (`cyrup-modes/src/rpc.rs`). This is the
+/// interactive half of the same seam: without it the TUI's `/` menu listed builtins alone, so the
+/// 13 slash commands the subagents extension registers (and every prompt template and skill) were
+/// invisible in the default mode while an RPC client saw all of them from the same session.
+///
+/// Equivalent to [`dynamic_commands_from_catalog_gated`] with skill commands enabled; prefer that
+/// entry point from the app so the `enableSkillCommands` setting is honored.
+#[must_use]
+pub fn dynamic_commands_from_catalog(catalog: &[serde_json::Value]) -> Vec<SlashCommand> {
+    dynamic_commands_from_catalog_gated(catalog, true)
+}
+
+/// [`dynamic_commands_from_catalog`], with the `enableSkillCommands` setting applied.
+///
+/// Pi builds the interactive autocomplete list in `createBaseAutocompleteProvider`
+/// (`interactive-mode.ts:610-622`) and wraps the `skill:<name>` half in
+/// `if (this.settingsManager.getEnableSkillCommands())` — so a `false` setting removes every skill
+/// from the `/` menu while leaving extension commands and prompt templates alone. The gate is
+/// **interactive-only**: Pi's `get_commands` RPC (`rpc-mode.ts:676-690`) emits skills
+/// unconditionally, which is why `AgentSession::slash_command_catalog()` — the port of that RPC
+/// handler — stays ungated and the filtering happens here, at the one consumer Pi gates.
+///
+/// Note the gate is autocomplete visibility only, in cyrup as in Pi: dynamic commands are never
+/// added to `dispatch_names`, and `/skill:<name>` expansion happens server-side in
+/// `AgentSession::expand_slash_command`, so a hidden skill typed out in full still runs — exactly
+/// as Pi's `skillCommands` map (populated at `:616`, read nowhere) leaves it.
+#[must_use]
+pub fn dynamic_commands_from_catalog_gated(
+    catalog: &[serde_json::Value],
+    enable_skill_commands: bool,
+) -> Vec<SlashCommand> {
+    catalog
+        .iter()
+        .filter_map(|row| {
+            let name = row.get("name")?.as_str()?;
+            if name.is_empty() {
+                return None;
+            }
+            let source = row.get("source").and_then(serde_json::Value::as_str).unwrap_or("");
+            let kind = match source {
+                "extension" => CommandSource::Extension,
+                "prompt" => CommandSource::Prompt,
+                "skill" if enable_skill_commands => CommandSource::Skill,
+                "skill" => return None,
+                _ => return None,
+            };
+            let description = row
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let info = row.get("sourceInfo");
+            let scope = info
+                .and_then(|i| i.get("scope"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("temporary");
+            let info_source = info
+                .and_then(|i| i.get("source"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(source);
+            let tag = autocomplete_source_tag(scope, info_source);
+            Some(SlashCommand {
+                name: Cow::Owned(name.to_string()),
+                description: Cow::Owned(prefix_autocomplete_description(description, &tag)),
+                argument_hint: None,
+                source: kind,
+                has_arg_completion: false,
+            })
+        })
+        .collect()
 }

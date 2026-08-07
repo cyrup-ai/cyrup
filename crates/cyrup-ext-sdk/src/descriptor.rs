@@ -338,6 +338,22 @@ pub struct NavigateOptions {
     pub label: Option<String>,
 }
 
+/// Options for `compact` (Pi `CompactOptions`, types.ts:296-300): extra guidance handed to the
+/// compaction summarizer.
+///
+/// Pi's bag also carries `onComplete(result)` / `onError(error)` callbacks. Those are function
+/// VALUES and cannot cross the component boundary, so they have no field here: a guest that needs
+/// the completion signal subscribes to the `session_compact` event
+/// ([`crate::events::SessionCompact`], Pi's own `SessionCompactEvent`), which carries the produced
+/// compaction entry. Pi's `compact()` is fire-and-forget on both sides — it "triggers compaction
+/// without awaiting completion" — so the call itself returns as soon as the host has queued it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+}
+
 /// Options for `newSession` (Pi types.ts:346): an optional parent session + the `with_session`
 /// re-binding request (the `setup`/`withSession` closures map to the host re-binding flow).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

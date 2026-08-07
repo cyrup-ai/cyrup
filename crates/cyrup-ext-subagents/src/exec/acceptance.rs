@@ -72,6 +72,7 @@ use std::time::Duration;
 
 use crate::exec::completion_guard::CompletionMutationGuardResult;
 use crate::exec::output::looks_like_acceptance_report;
+use crate::spawn::signal::TIMEOUT_SIGTERM_GRACE;
 
 // ============================================================================================
 // The ordered provenance lattice (func-SA §4.3, arch-SA §3.4)
@@ -207,10 +208,21 @@ pub fn build_timed_out_acceptance_ledger(contract: &AcceptanceContract) -> Accep
 // ============================================================================================
 
 /// One declared verification command (func-SA `acceptance.verify[]`): a literal shell command
-/// string, executed via a real subprocess (R-SA-032, [`run_verify_commands`]) — never parsed or
+/// string plus the per-command execution knobs upstream's `AcceptanceVerifyCommand` carries,
+/// executed via a real subprocess (R-SA-032, [`run_verify_commands`]) — never parsed or
 /// interpreted beyond being handed to a shell, and never treated as satisfied by anything the
 /// child itself claims about it.
-pub type VerifyCommand = String;
+///
+/// This is deliberately an alias for [`model::AcceptanceVerifyCommand`] — the faithful port of
+/// upstream `AcceptanceVerifyCommand` (`pi-subagents/src/runs/shared/types.ts` @v0.34.0, whose
+/// accepted key set upstream pins as `ACCEPTANCE_VERIFY_KEYS = {id, command, timeoutMs, cwd, env,
+/// allowFailure}`, `acceptance.ts:44`) — rather than a second, parallel struct, so the two runners
+/// in this file ([`run_one_verify_command`] and [`model::run_verify_command`]) cannot drift apart
+/// over what a declared command even *is*. Before SUBA-C12b this alias was a bare `String`, so
+/// [`lower_acceptance_input`] validated all six keys (`model::validate_verify_input`) and then
+/// discarded five of them: `cwd`/`env`/`timeoutMs` never reached the subprocess and `allowFailure`
+/// never reached the gate.
+pub type VerifyCommand = model::AcceptanceVerifyCommand;
 
 /// The effective acceptance contract for one task (func-SA R-SA-023), resolved BEFORE launch from
 /// either an explicit caller-supplied `acceptance` param or heuristic inference from agent
@@ -241,6 +253,54 @@ pub struct AcceptanceContract {
     /// module has no reviewer-dispatch mechanism of its own; it only consumes one a caller
     /// already obtained).
     pub reviewer_result: Option<ReviewerResult>,
+    /// Whether this contract may turn the gate OFF outright, or is merely a FLOOR that the
+    /// heuristically-inferred level can still raise (pi `explicitAcceptanceCanDisable`,
+    /// `runs/shared/acceptance.ts:134-136` @v0.34.0: `explicit.level === "none" && typeof
+    /// explicit.reason === "string" && explicit.reason.trim().length > 0`).
+    ///
+    /// Upstream, only a `level: "none"` that ALSO carries a non-blank `reason` — or the `false`
+    /// shorthand, which `normalizeAcceptanceInput` (`:127-132`) rewrites to exactly that shape
+    /// with the reason `"disabled by deprecated false shorthand"` — actually disables the gate.
+    /// A bare `"none"` string carries no reason at all, so upstream falls through to
+    /// `LEVEL_RANK["none"] >= LEVEL_RANK[inferred.level] ? "none" : inferred.level` (`:277-281`)
+    /// and, since `none` ranks lowest, always ends up back at the inferred level. Before this
+    /// flag existed, [`lower_acceptance_input`] mapped a bare `"none"` onto an explicit
+    /// `NotRequired` contract whose [`is_no_op`](Self::is_no_op) short-circuited the whole gate,
+    /// so a one-word policy silently disarmed acceptance that pi still enforces.
+    ///
+    /// Only ever consulted by [`AcceptanceContract::resolve_effective`]; a contract this crate
+    /// builds directly in Rust (rather than lowering from a wire policy) keeps the historical
+    /// "an explicit `NotRequired` means the caller wants no gate" reading — see
+    /// [`AcceptanceContract::explicit`].
+    pub disables_gate: bool,
+    /// The resolved acceptance criteria this run is gated on (pi `ResolvedAcceptanceConfig.criteria`,
+    /// `types.ts:302-312` @v0.34.0), already through [`model::normalize_criteria`] so every entry
+    /// carries an `id`, a non-blank `must` and a [`model::GateSeverity`].
+    ///
+    /// [`inject_acceptance_contract`] renders them as pi's `- <id>: <must>` list so the child KNOWS
+    /// what it must report, and [`evaluate_acceptance`]'s `Checked` rung enforces them via
+    /// [`model::check_criteria_satisfied`] — pi `evaluateAcceptance`, `acceptance.ts:819-829`. Empty
+    /// means "nothing declared", which is enforcement-neutral: pi's own `formatAcceptancePrompt`
+    /// falls back to `- Return the requested result.` and `checkCriteriaSatisfied` over an empty
+    /// list yields no checks.
+    pub criteria: Vec<model::ResolvedAcceptanceGate>,
+    /// The evidence kinds the child's own `acceptance-report` block MUST carry (pi
+    /// `ResolvedAcceptanceConfig.evidence`). Rendered into the prompt as pi's
+    /// `Required evidence: <kinds>` line and enforced by [`model::run_structural_checks`] —
+    /// including the REAL `git status --short` subprocess pi runs for
+    /// [`model::AcceptanceEvidenceKind::NoStagedFiles`] (`checkNoStagedFiles`,
+    /// `acceptance.ts:646-655`).
+    pub evidence: Vec<model::AcceptanceEvidenceKind>,
+    /// The declared review gate (pi `ResolvedAcceptanceConfig.review`). Rendered into the prompt as
+    /// pi's `Review gate: required|optional[ by <agent>]` / `Review focus:` lines, and consulted at
+    /// [`evaluate_acceptance`]'s `Reviewed` rung: a gate declaring `required: false` is pi's
+    /// `optionalReview` (`acceptance.ts:833-841`), which does NOT reject a run that reached
+    /// `Reviewed` with no [`ReviewerResult`] in hand.
+    pub review: Option<model::ReviewSetting>,
+    /// The declared stop rules (pi `ResolvedAcceptanceConfig.stopRules`). Prompt-only, exactly as
+    /// upstream: `formatAcceptancePrompt` emits them (`acceptance.ts:328-330`) and no upstream
+    /// runtime check ever reads them back.
+    pub stop_rules: Vec<String>,
 }
 
 impl AcceptanceContract {
@@ -251,13 +311,68 @@ impl AcceptanceContract {
     /// requestable level) defensively rather than accepting a nonsensical contract, since this
     /// crate's no-panic policy forbids failing loudly here and a silently-dropped contract would
     /// be worse than a clamped one.
+    ///
+    /// A contract built here with [`AcceptanceStatus::NotRequired`] DISABLES the gate outright
+    /// (`disables_gate`), i.e. it is upstream's `{ level: "none", reason: <non-blank> }` rather
+    /// than its reasonless bare `"none"`: an in-process caller that hands `run_sync` a
+    /// `NotRequired` contract in Rust has stated its intent directly and there is no reason field
+    /// for it to have omitted. Wire policies that must NOT be able to disable the gate are lowered
+    /// through [`AcceptanceContract::explicit_floor`] instead.
     #[must_use]
     pub fn explicit(required_level: AcceptanceStatus, verify: Vec<VerifyCommand>) -> Self {
+        let required_level = clamp_requestable_level(required_level);
         Self {
-            required_level: clamp_requestable_level(required_level),
+            required_level,
             verify,
             explicit: true,
             reviewer_result: None,
+            disables_gate: required_level == AcceptanceStatus::NotRequired,
+            criteria: Vec::new(),
+            evidence: Vec::new(),
+            review: None,
+            stop_rules: Vec::new(),
+        }
+    }
+
+    /// Attach the resolved `criteria`/`evidence`/`review`/`stopRules` half of an authored
+    /// `acceptance` policy (builder-style), the four fields [`lower_acceptance_input`] used to
+    /// validate and then DISCARD.
+    ///
+    /// Splitting this off [`AcceptanceContract::explicit`] keeps that constructor's existing
+    /// signature (and its ~40 in-tree call sites) intact: a contract built in Rust with no declared
+    /// policy is exactly the pre-existing shape, and only a wire-lowered policy carries the extra
+    /// four. Criteria are expected to have already been through
+    /// [`model::normalize_criteria`] — this setter does no normalization of its own so the single
+    /// normalization rule stays in the [`model`] port that owns it.
+    #[must_use]
+    pub fn with_policy(
+        mut self,
+        criteria: Vec<model::ResolvedAcceptanceGate>,
+        evidence: Vec<model::AcceptanceEvidenceKind>,
+        review: Option<model::ReviewSetting>,
+        stop_rules: Vec<String>,
+    ) -> Self {
+        self.criteria = criteria;
+        self.evidence = evidence;
+        self.review = review;
+        self.stop_rules = stop_rules;
+        self
+    }
+
+    /// Build an explicit, caller-supplied contract that acts only as a **floor**: the
+    /// heuristically-inferred level may still raise it, and it can never disable the gate
+    /// (pi `explicitAcceptanceCanDisable` returning `false`, `acceptance.ts:134-136` @v0.34.0).
+    ///
+    /// This is the shape every wire-lowered policy takes EXCEPT the two upstream treats as a
+    /// genuine "off" switch (`acceptance: false`, and `{ level: "none", reason: "…" }` with a
+    /// non-blank reason). For any level above `none` the distinction is invisible — a non-
+    /// `NotRequired` contract has nothing to disable — so this constructor differs from
+    /// [`AcceptanceContract::explicit`] only for `NotRequired`.
+    #[must_use]
+    pub fn explicit_floor(required_level: AcceptanceStatus, verify: Vec<VerifyCommand>) -> Self {
+        Self {
+            disables_gate: false,
+            ..Self::explicit(required_level, verify)
         }
     }
 
@@ -271,6 +386,9 @@ impl AcceptanceContract {
         if self.required_level < AcceptanceStatus::Reviewed {
             self.required_level = AcceptanceStatus::Reviewed;
         }
+        // A contract carrying a reviewer result requires `Reviewed` by construction, so it is no
+        // longer the `level: "none"` shape `disables_gate` describes.
+        self.disables_gate = false;
         self
     }
 
@@ -278,32 +396,136 @@ impl AcceptanceContract {
     /// name/task text" half of R-SA-023's resolution rule), used only when the caller supplied no
     /// explicit `acceptance` param at all.
     ///
-    /// The heuristic itself: an implementation-expecting task (per
-    /// [`crate::exec::completion_guard::expects_implementation_mutation`] — this module
-    /// deliberately reuses that already-built, already-tested classifier rather than inventing a
-    /// second, competing "does this task look like it needs verification" heuristic; the two
-    /// questions ("does this need a mutation" and "does this need acceptance evidence") are
-    /// answered by materially the same signal) defaults to requiring [`AcceptanceStatus::Checked`]
-    /// with no `verify[]` commands (nothing was explicitly declared to run); a task that does not
-    /// read as implementation-expecting defaults to [`AcceptanceStatus::NotRequired`] — there is
-    /// nothing to gate on a pure research/review task by default.
+    /// This IS pi's `inferLevel` (`runs/shared/acceptance.ts:69-125` @v0.34.0), reached through the
+    /// [`model`] port's faithful line-for-line copy of it, so the four-way decision tree, the
+    /// criteria strings and the per-branch evidence sets are upstream's rather than a second,
+    /// drifting approximation:
+    ///
+    /// | branch | level | evidence |
+    /// |---|---|---|
+    /// | risky / dynamic / async write (`:88-96`) | `reviewed` | the full `reviewed` set + a required `reviewer` gate |
+    /// | write-capable worker or task (`:98-105`) | `checked` | the full `checked` set |
+    /// | read-only agent or read-only task wording (`:107-116`) | `attested` | `review-findings`, `residual-risks` |
+    /// | everything else (`:118-124`) | `attested` | `manual-notes`, `residual-risks` |
+    ///
+    /// **`inferLevel` has no `"none"` branch**, which is the property that matters here: upstream
+    /// appends a `## Acceptance Contract` block to essentially every child task
+    /// (`formatAcceptancePrompt` returns `""` only for `level === "none"`, `acceptance.ts:305`, and
+    /// `execution.ts:1037-1038` appends it unconditionally) and always produces a real ledger.
+    /// Before this change this function ran the enum-lattice
+    /// [`crate::exec::completion_guard::expects_implementation_mutation`] classifier instead and
+    /// returned [`AcceptanceStatus::NotRequired`] for anything that did not read as
+    /// implementation-expecting — so a reviewer/scout/researcher/summariser child was sent a
+    /// materially different prompt from pi's (no criteria, no required evidence, no
+    /// `acceptance-report` instruction at all: [`inject_acceptance_contract`] returns the task
+    /// verbatim for an [`is_no_op`](Self::is_no_op) contract) and its result carried
+    /// `acceptance: not-required` where pi reports `attested` or `rejected`.
+    ///
+    /// A heuristically-inferred contract is NOT explicit ([`Self::explicit`] stays `false`), so its
+    /// rejection is recorded on the ledger and never flips an otherwise-clean exit code — pi gates
+    /// that correction on `result.acceptance.explicit` too (`execution.ts:1229`), which is what
+    /// makes always-inferring safe rather than a mass run-failure.
+    ///
+    /// **[CYRUP-DELTA]** the `async`/`dynamic`/`dynamicGroup`/`mode` inputs to `inferLevel` are
+    /// left at their defaults: this signature classifies on agent name + task text alone, which is
+    /// all its callers have. A dynamic step's own group gate is resolved separately, through
+    /// [`lower_acceptance_input`] on the declared policy (`spawn/chain_graph.rs`), so the
+    /// `dynamic fanout context` escalation is reachable there rather than lost outright.
     #[must_use]
     pub fn heuristic_default(agent_local_name: &str, task: &str) -> Self {
-        let expects_mutation = crate::exec::completion_guard::expects_implementation_mutation(
-            agent_local_name,
-            task,
-        );
-        let required_level = if expects_mutation {
-            AcceptanceStatus::Checked
-        } else {
-            AcceptanceStatus::NotRequired
-        };
+        let inferred = model::resolve_effective_acceptance(&model::AcceptanceResolveInput {
+            explicit: None,
+            agent_name: agent_local_name.to_string(),
+            task: Some(task.to_string()),
+            mode: None,
+            is_async: false,
+            dynamic: false,
+            dynamic_group: false,
+        });
         Self {
-            required_level,
+            // `resolve_effective_acceptance` with no explicit input returns `inferred.level`
+            // verbatim, and `infer_level` only ever yields `attested`/`checked`/`reviewed` — the
+            // `Auto`/`None` arms below are unreachable and map to the nearest real level rather
+            // than reintroducing a silent no-op contract.
+            required_level: match inferred.level {
+                model::AcceptanceLevel::Reviewed => AcceptanceStatus::Reviewed,
+                model::AcceptanceLevel::Verified => AcceptanceStatus::Verified,
+                model::AcceptanceLevel::Checked => AcceptanceStatus::Checked,
+                model::AcceptanceLevel::Attested
+                | model::AcceptanceLevel::Auto
+                | model::AcceptanceLevel::None => AcceptanceStatus::Attested,
+            },
+            // Nothing was explicitly declared to run: `inferLevel` never produces `verify[]`
+            // commands (only an authored policy can), and `stopRules` is likewise explicit-only.
             verify: Vec::new(),
             explicit: false,
             reviewer_result: None,
+            disables_gate: false,
+            criteria: inferred.criteria,
+            evidence: inferred.evidence,
+            review: inferred.review,
+            stop_rules: Vec::new(),
         }
+    }
+
+    /// Combine an explicit, caller-supplied contract (if any) with the heuristically-inferred one
+    /// — R-SA-023's resolution rule, and a direct port of pi `resolveEffectiveAcceptance`'s level
+    /// arithmetic (`runs/shared/acceptance.ts:265-302` @v0.34.0):
+    ///
+    /// ```text
+    /// level = explicitAcceptanceCanDisable(explicit) ? "none"
+    ///       : explicitLevel === "auto"               ? inferred.level
+    ///       : LEVEL_RANK[explicitLevel] >= LEVEL_RANK[inferred.level] ? explicitLevel
+    ///                                                                 : inferred.level
+    /// ```
+    ///
+    /// The load-bearing property is the MAX in that last branch: an explicit level may only ever
+    /// RAISE the inferred floor, never lower it. Before this function existed, `run_sync` did
+    /// `opts.acceptance.clone().unwrap_or_else(|| heuristic_default(...))` — explicit and inferred
+    /// were mutually exclusive, so `acceptance: "attested"` on a write-capable task was honoured
+    /// verbatim where pi escalates it to the inferred `checked`, and a bare `acceptance: "none"`
+    /// (which cannot disable upstream, see [`disables_gate`](Self::disables_gate)) turned the gate
+    /// off entirely.
+    ///
+    /// `explicit == None` is pi's `explicitLevel === "auto"` — [`lower_acceptance_input`] maps
+    /// both an absent `acceptance` param and a literal `"auto"` onto `None` — and yields the
+    /// inferred contract unchanged.
+    ///
+    /// **[CYRUP-DELTA]** upstream also feeds `async`/`dynamic`/`dynamicGroup` into `inferLevel`
+    /// and downgrades `review.required` when a `reviewed` level was inferred rather than asked for
+    /// (`acceptance.ts:286-289`); neither has an input here, because
+    /// [`AcceptanceContract::heuristic_default`] classifies on agent name + task text alone. That
+    /// still leaves the `reviewed` rung reachable — `inferLevel`'s risky branch also fires on task
+    /// WORDING (`release`/`migration`/`security`/…, `acceptance.ts:86`), which this signature does
+    /// see — so what is missing is only the three boolean escalations and the review downgrade,
+    /// both tracked separately from this function's own concern, which is strictly the combination
+    /// rule.
+    ///
+    /// This function combines LEVELS only. The inferred contract's `criteria`/`evidence`/`review`
+    /// are dropped whenever an explicit contract is present, where upstream merges them
+    /// (`acceptance.ts:282-292`); an explicit policy that declares none of the three therefore
+    /// gates on nothing rather than on `requiredEvidenceForLevel(level)`.
+    #[must_use]
+    pub fn resolve_effective(
+        explicit: Option<Self>,
+        agent_local_name: &str,
+        task: &str,
+    ) -> Self {
+        let inferred = Self::heuristic_default(agent_local_name, task);
+        let Some(mut contract) = explicit else {
+            return inferred;
+        };
+        if contract.disables_gate {
+            return contract;
+        }
+        // MAX(explicit, inferred) by lattice rank. `AcceptanceStatus`'s derived `Ord` IS that rank
+        // (the enum's own doc comment: declaration order is normative), and neither side can be
+        // `Rejected` — `heuristic_default` never produces it and `explicit`/`explicit_floor` clamp
+        // it away — so the sink variant cannot leak in through this comparison.
+        if inferred.required_level > contract.required_level {
+            contract.required_level = inferred.required_level;
+        }
+        contract
     }
 
     /// Whether this contract requires no gate evaluation at all — `required_level ==
@@ -312,6 +534,50 @@ impl AcceptanceContract {
     #[must_use]
     pub fn is_no_op(&self) -> bool {
         self.required_level == AcceptanceStatus::NotRequired && self.reviewer_result.is_none()
+    }
+
+    /// Project this contract onto the [`model`] port's [`model::ResolvedAcceptanceConfig`], the
+    /// shape pi's own `formatAcceptancePrompt` consumes (`acceptance.ts:304`) — so the child-facing
+    /// prompt is rendered by the faithful port rather than by a second, drifting copy of it.
+    ///
+    /// The level mapping is total both ways for every level a policy can actually declare
+    /// ([`lower_acceptance_input`] only ever produces `NotRequired`/`Attested`/`Checked`/`Verified`/
+    /// `Reviewed`). The two [`AcceptanceStatus`] variants with no [`model::AcceptanceLevel`]
+    /// counterpart are outcomes rather than requirements and are unreachable as a `required_level`:
+    /// [`AcceptanceStatus::Claimed`] is the self-report floor [`evaluate_acceptance`] computes, and
+    /// [`AcceptanceStatus::Rejected`] is clamped away by [`AcceptanceContract::explicit`]. Both are
+    /// mapped to their nearest declarable neighbour rather than silently dropping the whole prompt.
+    ///
+    /// `inferred_reason` is empty because [`AcceptanceContract`] carries no reasons field of its
+    /// own — [`AcceptanceContract::heuristic_default`] does now produce upstream's reason strings
+    /// (via [`model::resolve_effective_acceptance`]) but drops them at this seam. The field is
+    /// prompt-irrelevant (`formatAcceptancePrompt` never reads it); it surfaces upstream only on
+    /// the LEDGER's `inferredReason`, which this crate's narrower [`AcceptanceLedger`] does not
+    /// have either.
+    #[must_use]
+    pub fn to_resolved_config(&self) -> model::ResolvedAcceptanceConfig {
+        let level = match self.required_level {
+            AcceptanceStatus::NotRequired => model::AcceptanceLevel::None,
+            AcceptanceStatus::Claimed | AcceptanceStatus::Attested => {
+                model::AcceptanceLevel::Attested
+            }
+            AcceptanceStatus::Checked => model::AcceptanceLevel::Checked,
+            AcceptanceStatus::Verified => model::AcceptanceLevel::Verified,
+            AcceptanceStatus::Reviewed | AcceptanceStatus::Rejected => {
+                model::AcceptanceLevel::Reviewed
+            }
+        };
+        model::ResolvedAcceptanceConfig {
+            level,
+            explicit: self.explicit,
+            inferred_reason: Vec::new(),
+            criteria: self.criteria.clone(),
+            evidence: self.evidence.clone(),
+            verify: self.verify.clone(),
+            review: self.review.clone(),
+            stop_rules: self.stop_rules.clone(),
+            reason: None,
+        }
     }
 }
 
@@ -337,9 +603,339 @@ pub struct ReviewerResult {
     pub detail: Option<String>,
 }
 
+// ============================================================================================
+// Lowering a raw wire `acceptance` value onto an `AcceptanceContract` (SUBA-041 / SUBA-N04)
+// ============================================================================================
+
+/// Lower a raw wire `acceptance` value (pi `AcceptanceOverride`, `schemas.ts:69-76`) onto this
+/// crate's [`AcceptanceContract`], after running pi's own `validateAcceptanceInput`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:164-286` @v0.34.0, applied at
+/// `subagent-executor.ts:1418`) so a malformed policy is refused BEFORE any child spawns, with pi's
+/// verbatim messages.
+///
+/// Level mapping (pi `AcceptanceLevel` -> [`AcceptanceStatus`]): `auto` yields `None`, i.e. pi's own
+/// "omitted means auto-inferred" — [`crate::exec::run_sync`] then resolves it through
+/// [`AcceptanceContract::resolve_effective`] against
+/// [`AcceptanceContract::heuristic_default`] (R-SA-023), which is this crate's `inferLevel`. Every
+/// other level (and the `false` shorthand, pi's `level: "none"`) becomes an EXPLICIT contract, which
+/// is what arms R-SA-033's post-hoc exit-code correction.
+///
+/// An explicit level is a **floor**, not a replacement ([`AcceptanceContract::explicit_floor`]):
+/// upstream takes `max(explicit, inferred)` by rank (`acceptance.ts:277-281`), so the only inputs
+/// that can lower or remove the inferred requirement are the two `explicitAcceptanceCanDisable`
+/// accepts (`:134-136`) — `false`, and `{ level: "none", reason: <non-blank> }`. A bare `"none"`
+/// string is NOT one of them.
+///
+/// # Why this lives here and not on one call site
+///
+/// It is the SINGLE lowering every execution surface shares: the SINGLE-mode `acceptance` tool param
+/// (`extension.rs::route_single`, pi `subagent-executor.ts:1418`), and every chain/parallel/
+/// background STEP's own `acceptance` (`background/runner_main.rs::ExecSingleStepExecutor::
+/// run_single`, pi `chain-execution.ts:400,1335` — which pass `task.acceptance`/`seqStep.acceptance`
+/// into the very same `runSync` call the single path uses). SUBA-N04: the step path used to hard-drop
+/// the field to `None`, so a declared contract ran UNVERIFIED; a second parser would have re-opened
+/// exactly that drift, so both paths call this one function.
+///
+/// `criteria`/`evidence`/`review`/`stopRules` are lowered onto the contract too (SUBA-C13), through
+/// the [`model`] port's own `normalizeCriteria` (`acceptance.ts:251-263`), so
+/// [`inject_acceptance_contract`] can TELL the child about them and [`evaluate_acceptance`]'s
+/// `Checked` rung can ENFORCE them. Before SUBA-C13 all four were validated here and then dropped on
+/// the floor: `{ level: "checked", criteria: [{ id: "c1", must: "add a regression test" }],
+/// evidence: ["tests-added", "no-staged-files"] }` armed a gate that could never fire, because the
+/// child was never told to report `c1` and nothing ever looked for `testsAddedOrUpdated` or ran
+/// `git status`.
+///
+/// **[CYRUP-DELTA]** `reason` is still consumed only as the `explicitAcceptanceCanDisable` predicate
+/// below, never carried onto the contract — it has no injection or enforcement role upstream either.
+/// And the evidence set here is the DECLARED one only: pi additionally unions in
+/// `requiredEvidenceForLevel(level)` when the resolved level differs from the inferred one
+/// (`acceptance.ts:282-286`), which needs the [`model`] port's full `inferLevel` tree rather than
+/// this crate's enum-lattice [`AcceptanceContract::heuristic_default`], so a bare
+/// `{ level: "checked" }` with no `evidence` key still declares no evidence here where pi would
+/// require five kinds.
+///
+/// # Errors
+///
+/// Returns every `validateAcceptanceInput` message, space-joined, exactly as pi renders them
+/// (`subagent-executor.ts:1535-1541`).
+pub fn lower_acceptance_input(
+    raw: &serde_json::Value,
+) -> Result<Option<AcceptanceContract>, String> {
+    let errors = model::validate_acceptance_input(raw, "acceptance");
+    if !errors.is_empty() {
+        return Err(errors.join(" "));
+    }
+
+    fn level_to_status(level: &str) -> Option<AcceptanceStatus> {
+        match level {
+            "none" => Some(AcceptanceStatus::NotRequired),
+            "attested" => Some(AcceptanceStatus::Attested),
+            "checked" => Some(AcceptanceStatus::Checked),
+            "verified" => Some(AcceptanceStatus::Verified),
+            "reviewed" => Some(AcceptanceStatus::Reviewed),
+            // "auto" (and anything `validate_acceptance_input` already let through) infers.
+            _ => None,
+        }
+    }
+
+    match raw {
+        // pi `acceptance: false` is the `level: "none"` shorthand (`acceptance.ts:127-132`) — and
+        // the ONE string-ish form that genuinely disables the gate, because
+        // `normalizeAcceptanceInput` supplies the reason `"disabled by deprecated false shorthand"`
+        // itself, satisfying `explicitAcceptanceCanDisable` (`:134-136`).
+        serde_json::Value::Bool(false) => Ok(Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            Vec::new(),
+        ))),
+        // A bare level string carries no `reason`, so `explicitAcceptanceCanDisable` is false for
+        // it (`acceptance.ts:127-136`): `"none"` here is a FLOOR of `none`, which
+        // [`AcceptanceContract::resolve_effective`]'s max then discards in favour of the inferred
+        // level — it does not switch the gate off.
+        serde_json::Value::String(level) => Ok(level_to_status(level)
+            .map(|status| AcceptanceContract::explicit_floor(status, Vec::new()))),
+        serde_json::Value::Object(config) => {
+            let verify: Vec<VerifyCommand> = config
+                .get("verify")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, item)| lower_verify_command(item, index))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let level = config.get("level").and_then(serde_json::Value::as_str);
+            // `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`): only an object whose
+            // `reason` is a non-blank string may turn the gate off. In practice
+            // `validate_acceptance_input` already rejects `{ level: "none" }` with no reason
+            // ("acceptance.reason is required when level is none."), so this is belt-and-braces —
+            // and for every level above `none` the two constructors are identical anyway.
+            let can_disable = config
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| !reason.trim().is_empty());
+            let policy = lower_acceptance_policy(config);
+            match level.and_then(level_to_status) {
+                Some(status) if can_disable => {
+                    Ok(Some(policy.apply(AcceptanceContract::explicit(status, verify))))
+                }
+                Some(status) => Ok(Some(
+                    policy.apply(AcceptanceContract::explicit_floor(status, verify)),
+                )),
+                // `{ verify: [...] }` with no `level` is pi's `level: "auto"` default
+                // (`acceptance.ts:127-132` normalizes an absent level to `auto`), so the level is
+                // still inferred — but declared `verify[]` commands must not be dropped, so an
+                // object carrying any is lowered as an explicit `verified` contract.
+                None if !verify.is_empty() => Ok(Some(policy.apply(AcceptanceContract::explicit(
+                    AcceptanceStatus::Verified,
+                    verify,
+                )))),
+                // `{ criteria: [...] }` / `{ evidence: [...] }` with no `level` and no `verify[]` is
+                // ALSO pi's `auto`: the level is inferred, but `resolveEffectiveAcceptance` still
+                // resolves the declared criteria/evidence/review/stopRules and
+                // `formatAcceptancePrompt`/`evaluateAcceptance` still consume them
+                // (`acceptance.ts:265-302`). Lowering it as a `none` FLOOR reproduces that — the
+                // floor is discarded by [`AcceptanceContract::resolve_effective`]'s max in favour of
+                // the inferred level, and the policy rides along. Returning `None` here (as this arm
+                // did before SUBA-C13) threw the whole policy away.
+                None if policy.is_declared() => Ok(Some(
+                    policy.apply(AcceptanceContract::explicit_floor(
+                        AcceptanceStatus::NotRequired,
+                        Vec::new(),
+                    )),
+                )),
+                None => Ok(None),
+            }
+        }
+        // `null`/absent is pi's `undefined`.
+        _ => Ok(None),
+    }
+}
+
+/// Lower one authored `acceptance.verify[i]` object onto a [`VerifyCommand`], carrying **every**
+/// key upstream's `ACCEPTANCE_VERIFY_KEYS` admits (`acceptance.ts:44` @v0.34.0) —
+/// `id`/`command`/`timeoutMs`/`cwd`/`env`/`allowFailure`. Before SUBA-C12b only `command`
+/// survived, so a user who authored `{ id: "lint", command: "npm run lint", allowFailure: true }`
+/// passed validation and then had `allowFailure` silently dropped, rejecting the run.
+///
+/// `command` is the only required-at-lowering key: an entry without it is skipped rather than
+/// lowered to an empty shell command. That is unreachable in practice —
+/// [`model::validate_acceptance_input`] runs first and already rejects a missing/blank `command`
+/// (`acceptance.ts:210`) — but keeping the filter makes this function total on arbitrary JSON.
+///
+/// `id` falls back to `verify[{index}]` for the same defensive reason (upstream requires it,
+/// `acceptance.ts:209`); it is used only for diagnostics, never for dispatch.
+fn lower_verify_command(item: &serde_json::Value, index: usize) -> Option<VerifyCommand> {
+    let command = item.get("command").and_then(serde_json::Value::as_str)?;
+    Some(VerifyCommand {
+        id: item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| format!("verify[{index}]"), str::to_string),
+        command: command.to_string(),
+        timeout_ms: item.get("timeoutMs").and_then(serde_json::Value::as_u64),
+        cwd: item
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        env: item
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            }),
+        allow_failure: item.get("allowFailure").and_then(serde_json::Value::as_bool),
+    })
+}
+
+/// The `criteria`/`evidence`/`review`/`stopRules` half of an authored `acceptance` object, resolved
+/// exactly as pi's `resolveEffectiveAcceptance` resolves them (`acceptance.ts:282-296` @v0.34.0):
+/// evidence de-duplicated in declaration order, criteria normalized AGAINST that evidence so a
+/// criterion declaring none inherits the config-level list.
+struct LoweredAcceptancePolicy {
+    criteria: Vec<model::ResolvedAcceptanceGate>,
+    evidence: Vec<model::AcceptanceEvidenceKind>,
+    review: Option<model::ReviewSetting>,
+    stop_rules: Vec<String>,
+}
+
+impl LoweredAcceptancePolicy {
+    /// Whether the authored object declared ANY of the four — the test the no-`level`, no-`verify[]`
+    /// arm of [`lower_acceptance_input`] uses to decide between "a real policy at the inferred
+    /// level" and pi's own `undefined`.
+    fn is_declared(&self) -> bool {
+        !self.criteria.is_empty()
+            || !self.evidence.is_empty()
+            || self.review.is_some()
+            || !self.stop_rules.is_empty()
+    }
+
+    fn apply(self, contract: AcceptanceContract) -> AcceptanceContract {
+        contract.with_policy(self.criteria, self.evidence, self.review, self.stop_rules)
+    }
+}
+
+/// Lower the four policy keys of an authored `acceptance` object.
+///
+/// Every arm is deliberately total on arbitrary JSON — [`model::validate_acceptance_input`] has
+/// already run by the time [`lower_acceptance_input`] calls this and rejected every malformed
+/// shape with pi's own message, so a value that does not parse here is unreachable in practice and
+/// is skipped rather than defaulted to something a policy author did not write.
+fn lower_acceptance_policy(
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> LoweredAcceptancePolicy {
+    // `evidence: AcceptanceEvidenceKind[]` (types.ts:285), de-duplicated by
+    // `[...new Set(...)]` (acceptance.ts:283-285).
+    let evidence = model::unique_evidence(
+        &config
+            .get("evidence")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(model::AcceptanceEvidenceKind::from_wire)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+
+    // `criteria: Array<string | AcceptanceGate>` (types.ts:284).
+    let criteria_input: Vec<model::CriterionInput> = config
+        .get("criteria")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(lower_criterion).collect())
+        .unwrap_or_default();
+    // `normalizeCriteria(criteria, evidence)` (acceptance.ts:296) — the evidence list is the
+    // SECOND argument, i.e. a gate that declares no `evidence` of its own inherits the config's.
+    let criteria = model::normalize_criteria(&criteria_input, &evidence);
+
+    // `review: AcceptanceReviewGate | false` (types.ts:288).
+    let review = match config.get("review") {
+        Some(serde_json::Value::Bool(flag)) => Some(model::ReviewSetting::Disabled(*flag)),
+        Some(serde_json::Value::Object(gate)) => {
+            Some(model::ReviewSetting::Gate(model::AcceptanceReviewGate {
+                agent: gate
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                focus: gate
+                    .get("focus")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                required: gate.get("required").and_then(serde_json::Value::as_bool),
+            }))
+        }
+        _ => None,
+    };
+
+    // `stopRules: string[]` (types.ts:289).
+    let stop_rules = config
+        .get("stopRules")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    LoweredAcceptancePolicy {
+        criteria,
+        evidence,
+        review,
+        stop_rules,
+    }
+}
+
+/// Lower one authored `acceptance.criteria[i]` — a bare `must` string, or a full `AcceptanceGate`
+/// object (types.ts:261-266). Anything else yields `None` (unreachable past validation).
+fn lower_criterion(item: &serde_json::Value) -> Option<model::CriterionInput> {
+    match item {
+        serde_json::Value::String(must) => Some(model::CriterionInput::Text(must.clone())),
+        serde_json::Value::Object(gate) => {
+            Some(model::CriterionInput::Gate(model::AcceptanceGate {
+                id: gate
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                must: gate
+                    .get("must")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                evidence: gate.get("evidence").and_then(serde_json::Value::as_array).map(
+                    |items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .filter_map(model::AcceptanceEvidenceKind::from_wire)
+                            .collect()
+                    },
+                ),
+                severity: match gate.get("severity").and_then(serde_json::Value::as_str) {
+                    Some("recommended") => Some(model::GateSeverity::Recommended),
+                    Some("required") => Some(model::GateSeverity::Required),
+                    _ => None,
+                },
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// The exact heading this module injects and later scans for — kept as a named constant so
-/// [`inject_acceptance_contract`] and any future re-detection logic never drift out of sync with
-/// each other over a hand-typed literal.
+/// [`model::format_acceptance_prompt`] (which emits it) and any future re-detection logic never
+/// drift out of sync with each other over a hand-typed literal.
 const ACCEPTANCE_CONTRACT_HEADING: &str = "## Acceptance Contract";
 
 /// R-SA-023 (MUST) — append a machine-parseable `## Acceptance Contract` block to `task`,
@@ -354,45 +950,42 @@ const ACCEPTANCE_CONTRACT_HEADING: &str = "## Acceptance Contract";
 /// and returns `task` unchanged — there is nothing to instruct the child to report if the
 /// orchestrator itself will never gate on it.
 ///
-/// The injected block instructs the child to end its answer with a fenced ` ```acceptance-report
-/// ` JSON block carrying, at minimum, `criteriaSatisfied: bool` plus whichever of the
-/// `exec/output.rs::ACCEPTANCE_REPORT_COMPANION_KEYS` fields are relevant — this wording is
-/// deliberately compatible with [`crate::exec::output::looks_like_acceptance_report`]'s own
-/// detection rules so a compliant child's block is reliably picked up by both R-SA-029's
-/// final-output extraction AND this module's own [`extract_acceptance_report`].
+/// The injected block IS pi's `formatAcceptancePrompt` output (`acceptance.ts:304-348` @v0.34.0),
+/// produced by [`model::format_acceptance_prompt`] over a [`model::ResolvedAcceptanceConfig`]
+/// projected from `contract` by [`AcceptanceContract::to_resolved_config`]: the acceptance level,
+/// the `- <id>: <must>` criteria list, the `Required evidence: <kinds>` line, the parent's
+/// `verify[]` commands, the review gate, the stop rules, and the exact `acceptance-report` JSON
+/// template. That template names `criteriaSatisfied` plus every one of
+/// `exec/output.rs::ACCEPTANCE_REPORT_COMPANION_KEYS`, so a compliant child's block is reliably
+/// picked up by both R-SA-029's final-output extraction AND this module's own
+/// [`extract_acceptance_report`].
+///
+/// Before SUBA-C13 this function wrote its own fixed block that mentioned only the required level,
+/// the report keys and the `verify[]` list — a child was never told the criteria it was about to be
+/// gated on, which meant it had no reason to report them and
+/// [`model::check_criteria_satisfied`] would have failed every one of them.
+///
+/// **[CYRUP-DELTA]** upstream joins with a single `\n` (`${task}\n${acceptancePrompt}`,
+/// `execution.ts:1038`) and relies on the prompt's own leading empty line for the blank separator;
+/// this keeps the pre-existing `\n\n` join and drops that leading line instead, which produces the
+/// identical bytes for a non-empty task and, for an EMPTY task, a block with no leading blank line
+/// rather than upstream's `"\n## Acceptance Contract…"`.
 #[must_use]
 pub fn inject_acceptance_contract(task: &str, contract: &AcceptanceContract) -> String {
     if contract.is_no_op() {
         return task.to_string();
     }
 
-    let mut block = String::new();
-    block.push_str(ACCEPTANCE_CONTRACT_HEADING);
-    block.push('\n');
-    block.push_str(&format!(
-        "Required acceptance level for this task: **{}**.\n",
-        contract.required_level.as_wire_str()
-    ));
-    block.push_str(
-        "Before finishing, you MUST end your final answer with a fenced code block, tagged \
-         `acceptance-report`, containing a single JSON object with at minimum the key \
-         `criteriaSatisfied` (boolean) describing whether you believe the task's acceptance \
-         criteria were met. Include any of the following keys that are relevant to this task: \
-         `changedFiles`, `testsAddedOrUpdated`, `commandsRun`, `validationOutput`, \
-         `residualRisks`, `noStagedFiles`, `diffSummary`, `reviewFindings`, `manualNotes`.\n",
-    );
-    if !contract.verify.is_empty() {
-        block.push_str(
-            "Note: the orchestrator will independently execute the following verification \
-             command(s) after you finish and will NOT rely on your own report of their outcome:\n",
-        );
-        for cmd in &contract.verify {
-            block.push_str(&format!("- `{cmd}`\n"));
-        }
+    let block = model::format_acceptance_prompt(&contract.to_resolved_config());
+    // `format_acceptance_prompt`'s first line is deliberately empty (upstream's `lines[0] = ""`);
+    // strip it, since the join below supplies the separator.
+    let block = block.strip_prefix('\n').unwrap_or(&block);
+    if block.is_empty() {
+        return task.to_string();
     }
 
     if task.is_empty() {
-        block
+        block.to_string()
     } else {
         format!("{task}\n\n{block}")
     }
@@ -422,24 +1015,43 @@ impl AcceptanceStatus {
 // R-SA-032 / DI-SA-5: verify[] REAL subprocess execution
 // ============================================================================================
 
-/// The default bound on how long a single `verify[]` command may run before it is treated as a
-/// failure (this crate introduces no configuration surface for this in v1; a generous fixed bound
-/// keeps a hung verification command from blocking the acceptance gate — and therefore the whole
-/// run — indefinitely, mirroring `spawn::worktree::DEFAULT_HOOK_TIMEOUT`'s identical rationale for
-/// its own bounded external-command call).
-pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_millis(300_000);
+/// The bound applied to a `verify[]` command that declares no `timeoutMs` of its own — upstream's
+/// `command.timeoutMs ?? 120_000` fallback (`acceptance.ts:759` @v0.34.0). A declared `timeoutMs`
+/// wins (see [`VerifyCommand::timeout_ms`] and [`run_one_verify_command`]); this bound only keeps
+/// a hung *undeclared* verification command from blocking the acceptance gate — and therefore the
+/// whole run — indefinitely, mirroring `spawn::worktree::DEFAULT_HOOK_TIMEOUT`'s identical
+/// rationale for its own bounded external-command call.
+///
+/// Before SUBA-C12b this was a fixed 300 s applied to EVERY command with no way to override it,
+/// so an authored `timeoutMs: 5000` became five minutes.
+pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_millis(120_000);
 
 /// The observed outcome of ACTUALLY EXECUTING one `verify[]` command as a real OS subprocess
 /// (R-SA-032, DI-SA-5) — never a child's self-report.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifyCommandResult {
+    /// The declared [`VerifyCommand::id`] this result belongs to — upstream carries it onto
+    /// `AcceptanceVerifyResult.id` (`acceptance.ts:735`) so a rejection message can name the
+    /// command that failed rather than quote its whole shell text.
+    pub id: String,
     /// The literal command string that was executed.
     pub command: String,
     /// The real observed exit code, or `None` if the process was terminated by a signal (Unix)
     /// rather than exiting normally.
     pub exit_code: Option<i32>,
     /// Whether this command counts as passed: `exit_code == Some(0)`.
+    ///
+    /// This is the raw exit observation, NOT the gate verdict — a command declaring
+    /// `allowFailure: true` that exits nonzero is `passed: false` yet does not reject the run.
+    /// [`status`](Self::status) is what [`evaluate_acceptance`] gates on.
     pub passed: bool,
+    /// Upstream's `AcceptanceVerifyResult.status` (`acceptance.ts:766`):
+    /// `timedOut ? "timed-out" : passed ? "passed" : command.allowFailure ? "allowed-failure"
+    /// : "failed"`. Only [`model::VerifyRunStatus::Failed`] and
+    /// [`model::VerifyRunStatus::TimedOut`] reject the run (`evaluateAcceptance`,
+    /// `acceptance.ts:842`) — note `allowFailure` does NOT rescue a TIMEOUT, exactly as upstream's
+    /// ternary orders those tests.
+    pub status: model::VerifyRunStatus,
     /// Combined stdout+stderr tail (bounded, see [`run_one_verify_command`]'s doc comment) —
     /// kept for the rejection detail text so a caller/UI can show WHY a `verify[]` command
     /// failed, not merely that it did.
@@ -448,6 +1060,20 @@ pub struct VerifyCommandResult {
     /// timed out — distinct from a genuine nonzero exit, since both cases still make `passed`
     /// `false` but a UI/log message should describe them differently.
     pub spawn_error: Option<String>,
+}
+
+impl VerifyCommandResult {
+    /// Whether this result REJECTS the run — upstream's
+    /// `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
+    /// (`acceptance.ts:842` @v0.34.0). A passed command and an `allowed-failure` command both
+    /// return `false`.
+    #[must_use]
+    pub fn rejects(&self) -> bool {
+        matches!(
+            self.status,
+            model::VerifyRunStatus::Failed | model::VerifyRunStatus::TimedOut
+        )
+    }
 }
 
 /// The largest number of trailing bytes of a `verify[]` command's combined output retained in
@@ -463,7 +1089,13 @@ const VERIFY_OUTPUT_TAIL_BYTES: usize = 4096;
 /// per command, always in the same order as `commands` — this function does NOT short-circuit on
 /// the first failure (a caller wants to see every command's real outcome for a rejected run's
 /// detail text, not just the first one that failed), but callers deciding overall pass/fail MUST
-/// require every result's `passed` to be `true` (see [`evaluate_acceptance`]).
+/// require that no result [`rejects`](VerifyCommandResult::rejects) (see [`evaluate_acceptance`]) —
+/// NOT that every result's `passed` is `true`, since a declared `allowFailure: true` command that
+/// exits nonzero is `passed: false` and still must not reject the run (`acceptance.ts:766,842`).
+///
+/// `default_cwd` is the run-level working directory: it is used verbatim for a command declaring
+/// no `cwd`, and as the base a relative declared `cwd` resolves against — upstream's
+/// `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`).
 ///
 /// Each command is executed via the platform shell (`/bin/sh -c <command>` on Unix,
 /// `cmd /C <command>` on Windows) — a `verify[]` entry is, by func-SA's own data model, a literal
@@ -479,27 +1111,77 @@ const VERIFY_OUTPUT_TAIL_BYTES: usize = 4096;
 /// never a propagated error that would abort evaluation of the REMAINING commands.
 pub async fn run_verify_commands(
     commands: &[VerifyCommand],
-    cwd: &Path,
+    default_cwd: &Path,
 ) -> Vec<VerifyCommandResult> {
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
-        results.push(run_one_verify_command(command, cwd, DEFAULT_VERIFY_TIMEOUT).await);
+        results.push(run_one_verify_command(command, default_cwd).await);
     }
     results
 }
 
-/// The single-command core [`run_verify_commands`] loops over, factored out so tests can inject a
-/// shorter timeout without waiting out [`DEFAULT_VERIFY_TIMEOUT`].
+/// The single-command core [`run_verify_commands`] loops over, factored out so tests can execute a
+/// single declared command without going through a whole contract.
+///
+/// Every per-command field the caller declared is honored here, and this is the ONLY place they
+/// are consumed:
+///
+/// - `cwd` — resolved against `default_cwd` when relative, used as-is when absolute
+///   (`path.resolve(defaultCwd, command.cwd)`, `acceptance.ts:716`).
+/// - `env` — layered OVER the inherited environment, never replacing it
+///   (`env: { ...process.env, ...(command.env ?? {}) }`, `acceptance.ts:724`).
+/// - `timeout_ms` — the absolute deadline, falling back to [`DEFAULT_VERIFY_TIMEOUT`]
+///   (`command.timeoutMs ?? 120_000`, `acceptance.ts:759`).
+/// - `allow_failure` — maps a nonzero exit (or a spawn/wait error) to
+///   [`model::VerifyRunStatus::AllowedFailure`] instead of `Failed`, which
+///   [`evaluate_acceptance`] does not reject on. A TIMEOUT is never rescued this way: upstream's
+///   ternary tests `timedOut` FIRST (`acceptance.ts:766`).
+///
+/// On expiry the command is KILLED, never abandoned: `crate::spawn::signal::terminate_on_timeout`
+/// sends `SIGTERM` and then a hard `SIGKILL` a second later, targeting the command's own process
+/// group. This ports upstream `runVerifyCommand`'s `abortVerification`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0), which does exactly that —
+/// `child.kill("SIGTERM")` plus a 1000 ms `setTimeout` hard `child.kill("SIGKILL")` — and this
+/// function returns only once the OS process is confirmed reaped.
+///
+/// The `timeout` is an ABSOLUTE deadline over the whole call — process exit AND output collection —
+/// never just over `child.wait()`. Upstream's timer is armed once at spawn and its `finish(...)`
+/// resolves the promise unconditionally (`acceptance.ts:731-758`), so upstream returns within
+/// `timeoutMs + 1000ms` even though its own completion signal is Node's `"close"` event, which
+/// likewise waits for every stdio stream to reach EOF. Reproducing only the `wait()` half of that
+/// would hang here forever on a verify command that exits promptly while leaving a backgrounded
+/// descendant holding the inherited stdout/stderr write ends (`./server &`, `npm run dev &`) —
+/// `read_to_end` sees EOF only when the LAST holder closes. See [`drained_by`].
 async fn run_one_verify_command(
-    command: &str,
-    cwd: &Path,
-    timeout: Duration,
+    command: &VerifyCommand,
+    default_cwd: &Path,
 ) -> VerifyCommandResult {
-    let mut cmd = shell_command(command);
-    cmd.current_dir(cwd);
+    // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`) —
+    // `path.resolve` returns an absolute segment verbatim and joins a relative one onto the base,
+    // which is exactly what `Path::join` does, so the branch is on absoluteness, not on presence.
+    let cwd = match command.cwd.as_deref() {
+        Some(declared) => default_cwd.join(declared),
+        None => default_cwd.to_path_buf(),
+    };
+    // `command.timeoutMs ?? 120_000` (`acceptance.ts:759`).
+    let timeout = command
+        .timeout_ms
+        .map_or(DEFAULT_VERIFY_TIMEOUT, Duration::from_millis);
+    let allow_failure = command.allow_failure == Some(true);
+
+    let mut cmd = shell_command(&command.command);
+    cmd.current_dir(&cwd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // `env: { ...process.env, ...(command.env ?? {}) }` (`acceptance.ts:724`) — the declared pairs
+    // are layered OVER the inherited environment (`Command` inherits by default and `env` sets a
+    // single key), never a `env_clear()` replacement of it.
+    if let Some(declared) = &command.env {
+        for (key, value) in declared {
+            cmd.env(key, value);
+        }
+    }
     #[cfg(unix)]
     {
         // Own process group, exactly mirroring `spawn::SpawnedChild::spawn`'s rationale: a
@@ -508,50 +1190,210 @@ async fn run_one_verify_command(
         cmd.process_group(0);
     }
 
-    let child = match cmd.spawn() {
+    // `status: timedOut ? "timed-out" : passed ? "passed" : command.allowFailure
+    // ? "allowed-failure" : "failed"` (`acceptance.ts:766`), for the non-timeout, non-passing arms.
+    let failed_status = if allow_failure {
+        model::VerifyRunStatus::AllowedFailure
+    } else {
+        model::VerifyRunStatus::Failed
+    };
+
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return VerifyCommandResult {
-                command: command.to_string(),
+                id: command.id.clone(),
+                command: command.command.clone(),
                 exit_code: None,
                 passed: false,
+                // Upstream's `child.on("error", …)` arm honors `allowFailure` too
+                // (`acceptance.ts:775`).
+                status: failed_status,
                 output_tail: String::new(),
                 spawn_error: Some(format!("failed to spawn verify command: {err}")),
             };
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let exit_code = output.status.code();
+    // Drain both pipes on their own tasks rather than via `Child::wait_with_output`. That
+    // convenience method takes `self` BY VALUE, so racing it against `tokio::time::timeout`
+    // consumed the only handle to the process: the elapsed arm dropped the future, `kill_on_drop`
+    // was never set, and a hung `cargo test`/`npm run e2e` survived its own timeout for the
+    // machine's uptime — inside a process group `process_group(0)` above has deliberately detached
+    // from the terminal, so the user's Ctrl-C could not reach it either. Keeping the `Child`
+    // binding is what makes the timeout arm able to actually kill (upstream `abortVerification`,
+    // acceptance.ts:742-758 @v0.34.0).
+    let stdout_task = child.stdout.take().map(spawn_pipe_drain);
+    let stderr_task = child.stderr.take().map(spawn_pipe_drain);
+
+    // ONE absolute deadline for the whole call, exactly like upstream's single `setTimeout` armed
+    // at spawn (`acceptance.ts:759`) — not a fresh timer per phase.
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let waited = tokio::select! {
+        biased;
+        result = child.wait() => Some(result),
+        () = tokio::time::sleep_until(deadline) => None,
+    };
+
+    let Some(waited) = waited else {
+        // Timed out: SIGTERM, then a hard SIGKILL 1s later, targeting the child's process GROUP
+        // (it leads one — see `process_group(0)` above), so the descendants the command spawned
+        // die with it. `terminate_on_timeout` returns only once the process is CONFIRMED reaped.
+        let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
+        // The drains would normally end on their own now that the writers are dead, but a pipe
+        // could still be held by something that escaped the group; abort rather than risk hanging
+        // acceptance evaluation. The tail was already empty on this path before the fix.
+        if let Some(task) = stdout_task {
+            task.abort();
+        }
+        if let Some(task) = stderr_task {
+            task.abort();
+        }
+        return VerifyCommandResult {
+            id: command.id.clone(),
+            command: command.command.clone(),
+            exit_code: None,
+            passed: false,
+            // `timedOut` is tested FIRST in upstream's status ternary (`acceptance.ts:766`), so
+            // `allowFailure` deliberately does NOT rescue a timeout.
+            status: model::VerifyRunStatus::TimedOut,
+            output_tail: String::new(),
+            spawn_error: Some(format!(
+                "verify command exceeded its {}ms timeout and was terminated",
+                timeout.as_millis()
+            )),
+        };
+    };
+
+    // The process is reaped, but its pipes may still be held open by something it backgrounded.
+    // Bound the collection by the SAME deadline plus upstream's own hard-kill grace, and report the
+    // overrun as a timeout — which is precisely what upstream does, since its `"close"` event never
+    // fires either and only `abortVerification`'s `finish(...)` resolves the promise.
+    let Some((out_bytes, err_bytes)) =
+        drained_by(deadline + TIMEOUT_SIGTERM_GRACE, stdout_task, stderr_task).await
+    else {
+        return VerifyCommandResult {
+            id: command.id.clone(),
+            command: command.command.clone(),
+            exit_code: None,
+            passed: false,
+            status: model::VerifyRunStatus::TimedOut,
+            output_tail: String::new(),
+            spawn_error: Some(format!(
+                "verify command exceeded its {}ms timeout: it exited, but a process it \
+                 backgrounded still holds its stdout/stderr",
+                timeout.as_millis()
+            )),
+        };
+    };
+    let mut combined = out_bytes;
+    combined.extend_from_slice(&err_bytes);
+
+    match waited {
+        Ok(status) => {
+            let exit_code = status.code();
             let passed = exit_code == Some(0);
-            let mut combined = output.stdout;
-            combined.extend_from_slice(&output.stderr);
             VerifyCommandResult {
-                command: command.to_string(),
+                id: command.id.clone(),
+                command: command.command.clone(),
                 exit_code,
                 passed,
+                status: if passed {
+                    model::VerifyRunStatus::Passed
+                } else {
+                    failed_status
+                },
                 output_tail: tail_utf8_lossy(&combined, VERIFY_OUTPUT_TAIL_BYTES),
                 spawn_error: None,
             }
         }
-        Ok(Err(err)) => VerifyCommandResult {
-            command: command.to_string(),
+        Err(err) => VerifyCommandResult {
+            id: command.id.clone(),
+            command: command.command.clone(),
             exit_code: None,
             passed: false,
+            status: failed_status,
             output_tail: String::new(),
             spawn_error: Some(format!("failed to wait on verify command: {err}")),
         },
-        Err(_elapsed) => VerifyCommandResult {
-            command: command.to_string(),
-            exit_code: None,
-            passed: false,
-            output_tail: String::new(),
-            spawn_error: Some(format!(
-                "verify command exceeded its {}ms timeout and was abandoned",
-                timeout.as_millis()
-            )),
-        },
+    }
+}
+
+/// Read one of a child's piped streams to EOF on its own task, so neither stream can fill its
+/// kernel pipe buffer and deadlock the `child.wait()` the timeout races against.
+fn spawn_pipe_drain<R>(mut pipe: R) -> tokio::task::JoinHandle<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf).await;
+        buf
+    })
+}
+
+/// Collect a [`spawn_pipe_drain`] task's bytes, treating an absent pipe or a join failure as
+/// "no output" — output capture is diagnostic detail here, never a reason to fail a command whose
+/// real exit code was already observed.
+async fn drained(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Collect BOTH [`spawn_pipe_drain`] tasks, but never past `deadline` — returning `None` (and
+/// aborting both tasks, releasing this process's read ends) when the deadline passes first.
+///
+/// This is the single bound that keeps a verify command's own `timeoutMs` honest, and it is shared
+/// by both copies of the runner ([`run_one_verify_command`] and [`model::run_verify_command`]) so
+/// the two cannot drift apart again.
+///
+/// # Why an unbounded collect is a hang, not a slow path
+///
+/// `spawn_pipe_drain` reads to EOF, and a pipe reaches EOF only when the LAST write end closes —
+/// including the copies every descendant inherited. `child.wait()` returns as soon as the DIRECT
+/// child exits, so a routine `verify[]` entry like `./server &`, `npm run dev &` or any script that
+/// daemonises leaves the write end held for the descendant's whole lifetime. Awaiting the drain
+/// tasks after `wait()` with no bound therefore blocks `run_verify_commands` (which loops these
+/// sequentially, with no outer timeout) forever, silently — worse than the abandoned-child bug
+/// SUBA-027 fixed.
+///
+/// # Why the deadline is absolute rather than a fresh post-`wait()` grace
+///
+/// Upstream arms ONE `setTimeout(abortVerification, timeoutMs)` at spawn
+/// (`pi-subagents/src/runs/shared/acceptance.ts:759` @v0.34.0) and settles on Node's `"close"`
+/// event, which — exactly like `read_to_end` — waits for every stdio stream to close. When a
+/// descendant holds them open, upstream's `"close"` never fires and `abortVerification`'s
+/// `hardKill` `finish({status: "timed-out", …})` (`:742-758`) is what resolves the promise, 1000 ms
+/// after the deadline. So upstream reports such a command as TIMED OUT at `timeoutMs + 1000ms`
+/// regardless of the exit code it already observed, and this port does the same rather than
+/// inventing a separate, shorter grace with a different verdict.
+async fn drained_by(
+    deadline: tokio::time::Instant,
+    stdout_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let aborts: Vec<tokio::task::AbortHandle> = [stdout_task.as_ref(), stderr_task.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    let collect = async move {
+        let out = drained(stdout_task).await;
+        let err = drained(stderr_task).await;
+        (out, err)
+    };
+    match tokio::time::timeout_at(deadline, collect).await {
+        Ok(pair) => Some(pair),
+        Err(_elapsed) => {
+            for handle in aborts {
+                handle.abort();
+            }
+            None
+        }
     }
 }
 
@@ -629,10 +1471,13 @@ impl CleanCompletionGate {
 ///    the evidence this module consults — an orchestrator-observed fact, not a child assertion —
 ///    and raising the achieved level to [`AcceptanceStatus::Checked`] when it holds.
 /// 4. If `contract.required_level >= Verified`, [`run_verify_commands`] is ACTUALLY invoked
-///    against every declared command; achieving [`AcceptanceStatus::Verified`] requires **every**
-///    result's `passed` to be `true` — a single failing (or unspawnable/timed-out) command caps
-///    the achieved level below `Verified` regardless of how many others passed, and regardless of
-///    anything the child's own report claims.
+///    against every declared command; achieving [`AcceptanceStatus::Verified`] requires that **no**
+///    result [`rejects`](VerifyCommandResult::rejects) — a single failing (or unspawnable/timed-out)
+///    command caps the achieved level below `Verified` regardless of how many others passed, and
+///    regardless of anything the child's own report claims. A command that declared
+///    `allowFailure: true` and merely exited nonzero is [`model::VerifyRunStatus::AllowedFailure`]
+///    and does NOT cap the level — upstream `evaluateAcceptance` rejects only on
+///    `status === "failed" || status === "timed-out"` (`acceptance.ts:842` @v0.34.0).
 /// 5. If `contract.required_level >= Reviewed`, `contract.reviewer_result` MUST be
 ///    `Some(ReviewerResult { approved: true, .. })` to reach [`AcceptanceStatus::Reviewed`]; a
 ///    `None` reviewer result or an `approved: false` one caps the achieved level below `Reviewed`.
@@ -664,13 +1509,27 @@ pub async fn evaluate_acceptance(
     // Step 3: Checked — orchestrator-observed structural evidence.
     let mut detail: Vec<String> = Vec::new();
     if contract.required_level >= AcceptanceStatus::Checked {
+        let mut checked = true;
         if completion_guard.triggered {
             detail.push(
                 "checked: completion-mutation guard triggered (implementation was expected but \
                  no mutating tool call was observed)"
                     .to_string(),
             );
-        } else {
+            checked = false;
+        }
+        // pi's own `rank >= checked` rung (`evaluateAcceptance`, `acceptance.ts:819-829`): every
+        // declared criterion must appear in the child's report as `satisfied`, every declared
+        // evidence kind must be present in it, and `no-staged-files` additionally shells out to a
+        // REAL `git status --short`. ANY failed runtime check rejects. Runs alongside — not instead
+        // of — the completion-mutation guard above, which is this crate's own extra orchestrator-
+        // observed signal (R-SA-034) and has no upstream counterpart on this rung.
+        let failures = declared_structural_failures(contract, final_output, verify_cwd).await;
+        if !failures.is_empty() {
+            detail.extend(failures);
+            checked = false;
+        }
+        if checked {
             achieved = achieved.max(AcceptanceStatus::Checked);
         }
     }
@@ -682,15 +1541,17 @@ pub async fn evaluate_acceptance(
             detail.push("verified: no verify[] commands were declared".to_string());
         } else {
             verify_results = run_verify_commands(&contract.verify, verify_cwd).await;
-            let all_passed = verify_results.iter().all(|r| r.passed);
-            if all_passed {
+            // `verifyRuns.some((run) => run.status === "failed" || run.status === "timed-out")`
+            // (`acceptance.ts:842` @v0.34.0) — NOT `!every(passed)`, which would also reject a
+            // command the author explicitly marked `allowFailure: true`.
+            let failed: Vec<&str> = verify_results
+                .iter()
+                .filter(|r| r.rejects())
+                .map(|r| r.command.as_str())
+                .collect();
+            if failed.is_empty() {
                 achieved = achieved.max(AcceptanceStatus::Verified);
             } else {
-                let failed: Vec<&str> = verify_results
-                    .iter()
-                    .filter(|r| !r.passed)
-                    .map(|r| r.command.as_str())
-                    .collect();
                 detail.push(format!(
                     "verified: {} of {} verify[] command(s) failed: {}",
                     failed.len(),
@@ -718,6 +1579,18 @@ pub async fn evaluate_acceptance(
                         .map(|d| format!(": {d}"))
                         .unwrap_or_default()
                 ));
+            }
+            // pi `evaluateAcceptance`'s `optionalReview` branch (`acceptance.ts:833-841`): a
+            // declared `review: { required: false }` gate makes a missing reviewer result a
+            // NON-BLOCKING finding rather than a rejection, so the run keeps whatever level it
+            // otherwise reached. Any other shape (a required gate, `review: false`, or no `review`
+            // key at all) still caps the level below `Reviewed`.
+            None if matches!(
+                &contract.review,
+                Some(model::ReviewSetting::Gate(gate)) if gate.required == Some(false)
+            ) =>
+            {
+                achieved = achieved.max(AcceptanceStatus::Reviewed);
             }
             None => {
                 detail.push(
@@ -754,6 +1627,43 @@ pub async fn evaluate_acceptance(
             verify_results,
         }
     }
+}
+
+/// Step 3's declared-policy half: pi's `checkCriteriaSatisfied` + `runStructuralChecks`
+/// (`acceptance.ts:622-669` @v0.34.0, applied on `evaluateAcceptance`'s `rank >= checked` rung at
+/// `:819-829`), run against the child's own `acceptance-report` block.
+///
+/// Returns one message per FAILED [`model::AcceptanceRuntimeCheck`], verbatim, so the ledger detail
+/// (and therefore [`apply_post_hoc_correction`]'s error text) carries pi's own wording —
+/// e.g. `tests-added evidence missing from child report.` or
+/// `Required criterion 'c1' was not reported.`. An empty vector means every declared check passed,
+/// which is also the trivial answer when the contract declares no criteria and no evidence.
+///
+/// The child's report is parsed by [`model::parse_acceptance_report`] — the same faithful port
+/// `exec/mod.rs` already uses to STRIP the block from the delivered output — rather than by this
+/// module's own [`extract_acceptance_report`], which is a presence/companion-key probe for the
+/// `Claimed` vs `Attested` floor and cannot answer "is criterion `c1` reported satisfied". A child
+/// that emitted no parseable report at all is treated as an empty report, so every declared check
+/// fails with pi's "missing"/"not reported" message rather than being skipped.
+async fn declared_structural_failures(
+    contract: &AcceptanceContract,
+    final_output: Option<&str>,
+    cwd: &Path,
+) -> Vec<String> {
+    if contract.criteria.is_empty() && contract.evidence.is_empty() {
+        return Vec::new();
+    }
+    let report = final_output
+        .map(model::parse_acceptance_report)
+        .and_then(|parsed| parsed.report)
+        .unwrap_or_default();
+    let mut checks = model::check_criteria_satisfied(&contract.criteria, &report);
+    checks.extend(model::run_structural_checks(&contract.evidence, &report, cwd).await);
+    checks
+        .into_iter()
+        .filter(|check| check.status == model::RuntimeCheckStatus::Failed)
+        .map(|check| check.message)
+        .collect()
 }
 
 /// Step 2's self-report floor: `NotRequired` if no `final_output` or no acceptance-report-shaped
@@ -894,6 +1804,23 @@ mod tests {
 
     use super::*;
 
+    /// A `verify[]` entry declaring nothing but its shell command — the run-level `cwd`, the
+    /// inherited environment and [`DEFAULT_VERIFY_TIMEOUT`] all apply.
+    fn vc(command: &str) -> VerifyCommand {
+        VerifyCommand::shell(command)
+    }
+
+    /// A `verify[]` entry declaring its own `timeoutMs`, for the timeout/kill-ladder tests that
+    /// must not wait out [`DEFAULT_VERIFY_TIMEOUT`].
+    fn vc_timeout(command: &str, timeout: Duration) -> VerifyCommand {
+        VerifyCommand {
+            timeout_ms: Some(
+                u64::try_from(timeout.as_millis()).expect("a test timeout fits in u64 ms"),
+            ),
+            ..VerifyCommand::shell(command)
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // AcceptanceStatus: lattice ordering and satisfies()
     // ---------------------------------------------------------------------------------------
@@ -952,19 +1879,70 @@ mod tests {
         assert!(contract.verify.is_empty());
     }
 
+    /// pi `inferLevel`'s read-only branch (`acceptance.ts:107-116` @v0.34.0): read-only TASK
+    /// WORDING infers `attested` with the findings criterion and the review-findings evidence
+    /// pair — never `none`, which `inferLevel` has no branch for at all. (This test previously
+    /// asserted `NotRequired`/`is_no_op`, the divergence.)
     #[test]
-    fn heuristic_default_is_not_required_for_review_only_tasks() {
+    fn heuristic_default_attests_review_only_tasks_rather_than_disarming() {
         let contract =
             AcceptanceContract::heuristic_default("worker", "Review only: return findings");
-        assert_eq!(contract.required_level, AcceptanceStatus::NotRequired);
-        assert!(contract.is_no_op());
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert!(!contract.is_no_op(), "there is always something to attest");
+        assert_eq!(contract.criteria.len(), 1);
+        assert_eq!(
+            contract.criteria[0].must,
+            "Return concrete findings with file paths and severity when applicable"
+        );
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ReviewFindings,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
+    }
+
+    /// The read-only AGENT branch of the same tree — `reviewer|scout|context-builder|researcher|
+    /// analyst` (`acceptance.ts:80`) — reached by agent name alone, with no read-only wording in
+    /// the task.
+    #[test]
+    fn heuristic_default_attests_a_research_agent_on_neutral_task_wording() {
+        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ReviewFindings,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
+    }
+
+    /// `inferLevel`'s final fallthrough (`acceptance.ts:118-124`): an agent and a task that match
+    /// no branch at all still attest, with the lightweight manual-notes evidence pair.
+    #[test]
+    fn heuristic_default_falls_through_to_lightweight_attestation() {
+        let contract = AcceptanceContract::heuristic_default("helper", "Say hello");
+        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
+        assert_eq!(
+            contract.criteria[0].must,
+            "Return a concise result and residual risks when applicable"
+        );
+        assert_eq!(
+            contract.evidence,
+            vec![
+                model::AcceptanceEvidenceKind::ManualNotes,
+                model::AcceptanceEvidenceKind::ResidualRisks,
+            ]
+        );
     }
 
     #[test]
     fn explicit_contract_is_marked_explicit_and_carries_verify_commands() {
         let contract = AcceptanceContract::explicit(
             AcceptanceStatus::Verified,
-            vec!["true".to_string()],
+            vec![vc("true")],
         );
         assert!(contract.explicit);
         assert_eq!(contract.required_level, AcceptanceStatus::Verified);
@@ -975,6 +1953,132 @@ mod tests {
     fn explicit_contract_clamps_a_nonsensical_rejected_requested_level() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Rejected, vec![]);
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // resolve_effective: pi `resolveEffectiveAcceptance`'s combination rule
+    // (`runs/shared/acceptance.ts:265-302` @v0.34.0)
+    // ---------------------------------------------------------------------------------------
+
+    /// The MAX at `acceptance.ts:277-281` — an explicit level may only ever RAISE the inferred
+    /// floor. Pre-fix, `run_sync` used `opts.acceptance.unwrap_or_else(heuristic_default)`, so an
+    /// explicit `attested` REPLACED the inferred `checked` on a write-capable task and the run was
+    /// gated more weakly than the identical policy is under pi.
+    #[test]
+    fn an_explicit_level_below_the_inferred_one_is_raised_to_the_inferred_floor() {
+        let inferred = AcceptanceContract::heuristic_default("worker", "Implement the fix");
+        assert_eq!(inferred.required_level, AcceptanceStatus::Checked, "premise");
+
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit_floor(
+                AcceptanceStatus::Attested,
+                vec![],
+            )),
+            "worker",
+            "Implement the fix",
+        );
+
+        assert_eq!(
+            effective.required_level,
+            AcceptanceStatus::Checked,
+            "max(attested, checked) is checked — the explicit level is a floor, not a replacement"
+        );
+        assert!(
+            effective.explicit,
+            "it is still an explicitly-declared contract, so R-SA-033's correction stays armed"
+        );
+    }
+
+    /// The other side of the same expression: an explicit level ABOVE the inferred one wins, and
+    /// its declared `verify[]` commands survive the combination.
+    #[test]
+    fn an_explicit_level_above_the_inferred_one_wins_and_keeps_its_verify_commands() {
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit_floor(
+                AcceptanceStatus::Verified,
+                vec![vc("true")],
+            )),
+            "researcher",
+            "Investigate the bug",
+        );
+        assert_eq!(effective.required_level, AcceptanceStatus::Verified);
+        assert_eq!(effective.verify, vec!["true".to_string()]);
+    }
+
+    /// `explicit == None` is pi's `explicitLevel === "auto"` branch: the inferred contract, whole.
+    #[test]
+    fn no_explicit_contract_yields_the_inferred_one() {
+        let effective =
+            AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        assert_eq!(effective.required_level, AcceptanceStatus::Checked);
+        assert!(!effective.explicit, "an inferred contract never arms R-SA-033");
+    }
+
+    /// `explicitAcceptanceCanDisable` (`acceptance.ts:134-136`) requires a non-blank `reason`, and
+    /// a bare `"none"` string carries none (`normalizeAcceptanceInput`, `:127-132`). So upstream
+    /// falls through to `LEVEL_RANK["none"] >= LEVEL_RANK[inferred]`, which is false for every
+    /// real level — the gate stays armed at the inferred level. Pre-fix, cyrup lowered `"none"`
+    /// onto an explicit `NotRequired` contract whose `is_no_op()` disabled the gate entirely.
+    #[test]
+    fn a_bare_none_string_cannot_disable_the_gate() {
+        let lowered = lower_acceptance_input(&serde_json::json!("none"))
+            .expect("'none' is a valid level")
+            .expect("a bare level string yields a contract");
+        assert!(
+            !lowered.disables_gate,
+            "a reasonless 'none' fails explicitAcceptanceCanDisable"
+        );
+
+        let effective =
+            AcceptanceContract::resolve_effective(Some(lowered), "worker", "Implement the fix");
+        assert_eq!(
+            effective.required_level,
+            AcceptanceStatus::Checked,
+            "the inferred floor survives a reasonless 'none'"
+        );
+        assert!(!effective.is_no_op(), "the gate must still be evaluated");
+    }
+
+    /// Both forms upstream DOES accept as an "off" switch: the `false` shorthand (whose reason
+    /// `normalizeAcceptanceInput` supplies itself) and an object `{ level: "none", reason }` with
+    /// a non-blank reason.
+    #[test]
+    fn the_two_disabling_forms_still_turn_the_gate_off() {
+        for policy in [
+            serde_json::json!(false),
+            serde_json::json!({ "level": "none", "reason": "prototype spike, no gate wanted" }),
+        ] {
+            let lowered = lower_acceptance_input(&policy)
+                .expect("a valid policy")
+                .expect("a contract");
+            assert!(lowered.disables_gate, "must be able to disable: {policy}");
+
+            let effective =
+                AcceptanceContract::resolve_effective(Some(lowered), "worker", "Implement the fix");
+            assert_eq!(
+                effective.required_level,
+                AcceptanceStatus::NotRequired,
+                "an explicit disable is never raised by the inferred floor: {policy}"
+            );
+            assert!(effective.is_no_op(), "policy {policy}");
+        }
+    }
+
+    /// An in-process caller that builds `AcceptanceContract::explicit(NotRequired, …)` directly in
+    /// Rust (as several of this crate's own callers and tests do) has stated its intent with no
+    /// `reason` field to omit, so that form keeps disabling the gate.
+    #[test]
+    fn a_rust_constructed_not_required_contract_still_disables_the_gate() {
+        let effective = AcceptanceContract::resolve_effective(
+            Some(AcceptanceContract::explicit(
+                AcceptanceStatus::NotRequired,
+                vec![],
+            )),
+            "worker",
+            "Implement the fix",
+        );
+        assert_eq!(effective.required_level, AcceptanceStatus::NotRequired);
+        assert!(effective.is_no_op());
     }
 
     #[test]
@@ -991,16 +2095,36 @@ mod tests {
     // inject_acceptance_contract (R-SA-023)
     // ---------------------------------------------------------------------------------------
 
+    /// A contract that genuinely disables the gate (pi's `{ level: "none", reason: … }` /
+    /// `false` shorthand, the only shapes `explicitAcceptanceCanDisable` accepts,
+    /// `acceptance.ts:134-136`) still appends nothing. The INFERRED contract no longer reaches
+    /// this state — `inferLevel` has no `none` branch — so the fixture is now an explicit one.
     #[test]
-    fn no_op_contract_leaves_task_text_unchanged() {
-        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+    fn a_gate_disabling_contract_leaves_task_text_unchanged() {
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
+        assert!(contract.is_no_op());
         let out = inject_acceptance_contract("Investigate the bug", &contract);
         assert_eq!(out, "Investigate the bug");
     }
 
+    /// The converse, and the actual regression this pairs with: a research/read-only child DOES
+    /// get pi's `## Acceptance Contract` block, naming the criterion it will be judged on and the
+    /// evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
+    /// `acceptance.ts:304-348`, appended at `execution.ts:1037-1038`).
+    #[test]
+    fn a_research_child_still_receives_the_acceptance_contract_block() {
+        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
+        let out = inject_acceptance_contract("Investigate the bug", &contract);
+        assert!(out.starts_with("Investigate the bug"));
+        assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
+        assert!(out.contains("acceptance-report"));
+        assert!(out.contains("Return concrete findings with file paths and severity"));
+        assert!(out.contains("review-findings"));
+    }
+
     #[test]
     fn required_contract_appends_a_machine_parseable_acceptance_contract_block() {
-        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["cargo test".to_string()]);
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("cargo test")]);
         let out = inject_acceptance_contract("Fix the bug", &contract);
         assert!(out.starts_with("Fix the bug"));
         assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
@@ -1024,7 +2148,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_command_that_exits_zero_is_recorded_as_passed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command("exit 0", dir.path(), Duration::from_secs(5)).await;
+        let result = run_one_verify_command(&vc("exit 0"), dir.path()).await;
         assert!(result.passed);
         assert_eq!(result.exit_code, Some(0));
         assert!(result.spawn_error.is_none());
@@ -1033,7 +2157,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_command_that_exits_nonzero_is_recorded_as_failed_with_real_exit_code() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command("exit 7", dir.path(), Duration::from_secs(5)).await;
+        let result = run_one_verify_command(&vc("exit 7"), dir.path()).await;
         assert!(!result.passed);
         assert_eq!(result.exit_code, Some(7));
     }
@@ -1042,9 +2166,8 @@ mod tests {
     async fn output_tail_captures_real_combined_stdout_and_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = run_one_verify_command(
-            "echo out-marker; echo err-marker 1>&2; exit 1",
+            &vc("echo out-marker; echo err-marker 1>&2; exit 1"),
             dir.path(),
-            Duration::from_secs(5),
         )
         .await;
         assert!(!result.passed);
@@ -1057,34 +2180,415 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("marker.txt"), "hi").expect("seed file");
         let result =
-            run_one_verify_command("test -f marker.txt", dir.path(), Duration::from_secs(5)).await;
+            run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
         assert!(result.passed, "the file must be visible relative to cwd");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hanging_command_times_out_and_is_recorded_as_failed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command(
-            "sleep 5",
-            dir.path(),
-            Duration::from_millis(100),
-        )
-        .await;
+        let result = run_one_verify_command(&vc_timeout("sleep 5", Duration::from_millis(100)), dir.path())
+            .await;
         assert!(!result.passed);
         assert!(result.spawn_error.as_deref().unwrap_or_default().contains("timeout"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-027 regression: a timed-out verify[] command must be KILLED, never abandoned.
+    //
+    // Before the fix, `run_one_verify_command` raced `tokio::time::timeout` against
+    // `child.wait_with_output()`, whose `self`-consuming future swallowed the only `Child`
+    // handle; the elapsed arm dropped it with no `kill_on_drop`, so a hung `cargo test` survived
+    // its own timeout for the machine's uptime — in a process group `process_group(0)` had
+    // deliberately detached from the terminal, so Ctrl-C could not reach it either. Every
+    // assertion below probes the OS directly with `kill(pid, 0)`, never this crate's bookkeeping.
+    // ---------------------------------------------------------------------------------------
+
+    /// Poll `kill(pid, 0)` until it reports ESRCH (the pid no longer exists), up to `timeout`.
+    /// Polling rather than probing once because a killed GRANDchild is reparented to init and
+    /// stays a zombie for the few microseconds before init reaps it.
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32, timeout: Duration) -> bool {
+        let target = nix::unistd::Pid::from_raw(pid);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if nix::sys::signal::kill(target, None).is_err() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll for `path` to contain a parseable pid, up to `timeout`.
+    #[cfg(unix)]
+    async fn wait_for_published_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fixture never published its pid to {} within {timeout:?}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The headline SUBA-027 assertion: after the timeout elapses, the command's own OS process
+    /// is gone. `exec` is load-bearing in the fixture — a shell that merely *forks* `sleep` would
+    /// let the pid we publish differ from the pid the shell holds, so the test would prove
+    /// nothing about which process actually got signalled.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_is_killed_not_abandoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let result = run_one_verify_command(
+            &vc_timeout("echo $$ > pid; exec sleep 300", Duration::from_millis(200)),
+            dir.path(),
+        )
+        .await;
+
+        assert!(!result.passed);
+        let pid = wait_for_published_pid(&pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "verify command pid {pid} must be gone once run_one_verify_command returns — a \
+             timed-out command has to be killed, not abandoned"
+        );
+    }
+
+    /// Group targeting is the whole reason `send_signal` negates the pid: the command's own
+    /// descendants must die with it. Here the shell stays alive in `wait` while a background
+    /// `sleep` (a grandchild of this test process, in the same group thanks to
+    /// `process_group(0)`) holds the real work. A pid-only kill would reap the shell and orphan
+    /// the sleep into a detached group nothing holds a handle to.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_kills_its_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_pid_file = dir.path().join("descendant");
+        let result = run_one_verify_command(
+            &vc_timeout("sleep 300 & echo $! > descendant; wait", Duration::from_millis(200)),
+            dir.path(),
+        )
+        .await;
+
+        assert!(!result.passed);
+        let pid = wait_for_published_pid(&descendant_pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "the descendant pid {pid} the verify command spawned must die with it — the kill \
+             targets the command's process GROUP, not just its direct pid"
+        );
+    }
+
+    /// SUBA-027 regression: a verify command that EXITS PROMPTLY but leaves a backgrounded
+    /// descendant holding the inherited stdout/stderr must still return inside its own timeout.
+    ///
+    /// This is the exact shape of a routine `verify[]` entry (`./server &`, `npm run dev &`,
+    /// anything that daemonises): `child.wait()` resolves at once because the DIRECT child is gone,
+    /// but `read_to_end` on the pipes sees EOF only when the LAST write end closes — which is the
+    /// descendant's whole lifetime. Awaiting the drain tasks outside the deadline therefore hung
+    /// `run_verify_commands` (sequential, no outer timeout) forever, silently ignoring `timeoutMs`.
+    /// Upstream is always bounded: its `"close"` event has the same stdio-EOF requirement, so it is
+    /// `abortVerification`'s `finish({status: "timed-out", …})` that resolves the promise at
+    /// `timeoutMs + 1000ms` (`acceptance.ts:742-759` @v0.34.0), and this asserts the same verdict on
+    /// the same schedule.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verify_command_that_daemonizes_still_returns_within_its_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_pid_file = dir.path().join("descendant");
+        let started = tokio::time::Instant::now();
+
+        // The outer guard turns "hangs forever" into a real, reportable failure instead of a wedged
+        // test binary — the pre-fix code never returned here at all.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_one_verify_command(
+                &vc_timeout(
+                    "sleep 300 & echo $! > descendant; exit 0",
+                    Duration::from_millis(200),
+                ),
+                dir.path(),
+            ),
+        )
+        .await
+        .expect(
+            "run_one_verify_command must honor its own timeout even when a backgrounded \
+             grandchild still holds the stdout/stderr pipe — an unbounded post-wait drain hangs \
+             acceptance evaluation with no error, no log line and no kill",
+        );
+
+        assert!(
+            !result.passed,
+            "a command whose pipes outlive its own timeout is reported as a timeout, exactly as \
+             upstream's abortVerification does, never as a pass"
+        );
+        let error = result.spawn_error.unwrap_or_default();
+        assert!(
+            error.contains("timeout"),
+            "the timed-out verdict must say so: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the call must return on its own deadline (200ms + the 1000ms hard-kill grace), not \
+             the descendant's lifetime, got {:?}",
+            started.elapsed()
+        );
+
+        // The descendant is deliberately NOT killed by the production path (upstream leaves a
+        // deliberately daemonised process alone), so this test cleans up its own `sleep 300`.
+        let pid = wait_for_published_pid(&descendant_pid_file, Duration::from_secs(5)).await;
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+
+    /// The hard `SIGKILL` rung really fires: a command that traps and ignores `SIGTERM` cannot be
+    /// stopped by upstream's first `child.kill(\"SIGTERM\")`, only by the 1000 ms-later
+    /// `child.kill(\"SIGKILL\")` (`acceptance.ts:742-758`). Also pins that this function does not
+    /// return until the process is CONFIRMED reaped, so the elapsed time covers the hard-kill
+    /// grace period rather than returning early and leaving the kill in flight.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_verify_command_that_ignores_sigterm_is_sigkilled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let started = tokio::time::Instant::now();
+        let result = run_one_verify_command(
+            &vc_timeout(
+                "trap '' TERM; echo $$ > pid; while true; do sleep 1; done",
+                Duration::from_millis(200),
+            ),
+            dir.path(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(!result.passed);
+        assert!(
+            elapsed >= crate::spawn::signal::TIMEOUT_SIGTERM_GRACE,
+            "a SIGTERM-ignoring command must cost the full hard-kill grace period before the \
+             SIGKILL rung fires, got {elapsed:?}"
+        );
+        let pid = wait_for_published_pid(&pid_file, Duration::from_secs(5)).await;
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(5)).await,
+            "a SIGTERM-ignoring verify command pid {pid} must still be gone — SIGKILL cannot be \
+             trapped"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_verify_commands_executes_every_command_in_order_and_never_short_circuits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let commands = vec![
-            "exit 1".to_string(), // fails
-            "exit 0".to_string(), // still runs, passes
+            vc("exit 1"), // fails
+            vc("exit 0"), // still runs, passes
         ];
         let results = run_verify_commands(&commands, dir.path()).await;
         assert_eq!(results.len(), 2, "both commands must run even though the first failed");
         assert!(!results[0].passed);
         assert!(results[1].passed);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-C12b regression: the per-command `verify[]` fields upstream's ACCEPTANCE_VERIFY_KEYS
+    // admits (`acceptance.ts:44` @v0.34.0 — id/command/timeoutMs/cwd/env/allowFailure) must
+    // actually REACH execution and the gate. `validate_verify_input` has always accepted and
+    // type-checked all six, but the contract carried only the command string, so five of them
+    // were validated and then silently discarded: a `cwd` ran in the wrong directory, an `env`
+    // pair was absent, a `timeoutMs` was replaced by a fixed 300 s, and an `allowFailure: true`
+    // command still rejected the run (rewriting its exit code to 1 via
+    // `apply_post_hoc_correction`) where upstream reports `allowed-failure` and succeeds.
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lower_acceptance_input_carries_every_declared_verify_field() {
+        let contract = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [{
+                "id": "lint",
+                "command": "npm run lint",
+                "timeoutMs": 5000,
+                "cwd": "packages/api",
+                "env": { "CI": "1" },
+                "allowFailure": true,
+            }],
+        }))
+        .expect("a well-formed acceptance policy must lower")
+        .expect("an explicit contract");
+
+        assert_eq!(contract.verify.len(), 1);
+        let declared = &contract.verify[0];
+        assert_eq!(declared.id, "lint");
+        assert_eq!(declared.command, "npm run lint");
+        assert_eq!(declared.timeout_ms, Some(5000), "timeoutMs must survive lowering");
+        assert_eq!(
+            declared.cwd.as_deref(),
+            Some("packages/api"),
+            "cwd must survive lowering"
+        );
+        assert_eq!(
+            declared.env.as_ref().and_then(|env| env.get("CI")).map(String::as_str),
+            Some("1"),
+            "env must survive lowering"
+        );
+        assert_eq!(
+            declared.allow_failure,
+            Some(true),
+            "allowFailure must survive lowering"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_cwd_resolves_against_the_run_level_cwd() {
+        // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:716`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("subdir");
+        std::fs::write(dir.path().join("sub/marker.txt"), "hi").expect("seed file");
+
+        let declared = VerifyCommand {
+            cwd: Some("sub".to_string()),
+            ..VerifyCommand::shell("test -f marker.txt")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        assert!(
+            result.passed,
+            "a declared relative cwd must resolve against the run-level cwd, got {result:?}"
+        );
+
+        // The same command WITHOUT the declared cwd must fail, proving the pass above came from
+        // the declared `cwd` and not from the file being visible at the run-level cwd anyway.
+        let undeclared = run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
+        assert!(!undeclared.passed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_env_is_layered_over_the_inherited_environment() {
+        // `env: { ...process.env, ...(command.env ?? {}) }` (`acceptance.ts:724`) — the declared
+        // pairs are added to the inherited environment, never a replacement of it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            env: Some([("CYRUP_VERIFY_MARKER".to_string(), "1".to_string())].into()),
+            ..VerifyCommand::shell(r#"test "$CYRUP_VERIFY_MARKER" = 1 && test -n "$PATH""#)
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        assert!(
+            result.passed,
+            "the declared env pair must be present AND the inherited PATH must survive, got \
+             {result:?}"
+        );
+
+        let undeclared =
+            run_one_verify_command(&vc(r#"test "$CYRUP_VERIFY_MARKER" = 1"#), dir.path()).await;
+        assert!(!undeclared.passed, "the marker must come from the declared env, not the harness");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_timeout_ms_bounds_the_command_instead_of_the_default() {
+        // `setTimeout(abortVerification, command.timeoutMs ?? 120_000)` (`acceptance.ts:759`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            timeout_ms: Some(150),
+            ..VerifyCommand::shell("sleep 30")
+        };
+        let started = std::time::Instant::now();
+        let result = run_one_verify_command(&declared, dir.path()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.status, model::VerifyRunStatus::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a declared 150ms timeoutMs must bound the command, not DEFAULT_VERIFY_TIMEOUT — took \
+             {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_failure_maps_a_nonzero_exit_to_allowed_failure_and_does_not_reject() {
+        // `status: … passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed"`
+        // (`acceptance.ts:766`) and `evaluateAcceptance`'s reject test, which never names
+        // `allowed-failure` (`acceptance.ts:842`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            allow_failure: Some(true),
+            ..VerifyCommand::shell("exit 1")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+
+        assert_eq!(result.exit_code, Some(1), "the real exit code is still observed");
+        assert!(!result.passed, "`passed` stays the raw exit observation");
+        assert_eq!(result.status, model::VerifyRunStatus::AllowedFailure);
+        assert!(!result.rejects(), "an allowed-failure command must not reject the run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_failure_never_rescues_a_timed_out_command() {
+        // Upstream tests `timedOut` FIRST in the status ternary (`acceptance.ts:766`), so a
+        // command that hangs is `"timed-out"` — which `evaluateAcceptance` DOES reject — even when
+        // it declared `allowFailure: true`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = VerifyCommand {
+            allow_failure: Some(true),
+            timeout_ms: Some(150),
+            ..VerifyCommand::shell("sleep 30")
+        };
+        let result = run_one_verify_command(&declared, dir.path()).await;
+
+        assert_eq!(result.status, model::VerifyRunStatus::TimedOut);
+        assert!(result.rejects(), "a timeout rejects regardless of allowFailure");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allow_failure_command_that_exits_nonzero_still_reaches_verified() {
+        // The end-to-end shape from the bug report: an authored
+        // `{ level: "verified", verify: [{ id: "lint", command: "…", allowFailure: true }] }`
+        // whose command exits nonzero must still be ACCEPTED, so `apply_post_hoc_correction`
+        // never rewrites the run's exit code to ACCEPTANCE_REJECTED_EXIT_CODE.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = lower_acceptance_input(&serde_json::json!({
+            "level": "verified",
+            "verify": [
+                { "id": "tests", "command": "exit 0" },
+                { "id": "lint", "command": "exit 1", "allowFailure": true },
+            ],
+        }))
+        .expect("a well-formed acceptance policy must lower")
+        .expect("an explicit contract");
+
+        let ledger = evaluate_acceptance(
+            &contract,
+            clean_gate(),
+            Some("Done.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
+            no_guard_trigger(),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(
+            ledger.status,
+            AcceptanceStatus::Verified,
+            "a verify[] command declaring allowFailure: true must not reject the run, got: \
+             {ledger:?}"
+        );
+        assert_eq!(ledger.verify_results.len(), 2);
+        assert_eq!(ledger.verify_results[1].status, model::VerifyRunStatus::AllowedFailure);
+        assert_eq!(
+            apply_post_hoc_correction(&ledger, contract.explicit, clean_gate(), None).exit_code,
+            0,
+            "an accepted run must not have its exit code rewritten to \
+             ACCEPTANCE_REJECTED_EXIT_CODE"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1113,7 +2617,7 @@ mod tests {
     async fn a_real_executed_passing_verify_command_reaches_verified() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 0".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
 
         let ledger = evaluate_acceptance(
             &contract,
@@ -1168,7 +2672,7 @@ mod tests {
     async fn a_real_executed_failing_verify_command_is_rejected_regardless_of_prose_claim() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 1".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 1")]);
 
         let ledger = evaluate_acceptance(
             &contract,
@@ -1191,7 +2695,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(
             AcceptanceStatus::Verified,
-            vec!["exit 0".to_string(), "exit 1".to_string(), "exit 0".to_string()],
+            vec![vc("exit 0"), vc("exit 1"), vc("exit 0")],
         );
         let ledger =
             evaluate_acceptance(&contract, clean_gate(), None, no_guard_trigger(), dir.path())
@@ -1204,7 +2708,7 @@ mod tests {
     async fn not_clean_gate_short_circuits_to_not_required_regardless_of_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract =
-            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec!["exit 0".to_string()]);
+            AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("exit 0")]);
         let dirty_gate = CleanCompletionGate {
             exit_code: 1,
             detached: false,
@@ -1515,7 +3019,13 @@ pub mod model {
             }
         }
 
-        fn from_wire(text: &str) -> Option<Self> {
+        /// Parse one authored `evidence[]` entry. `None` for anything not in
+        /// `AcceptanceEvidenceKind` (types.ts:250-259) — [`validate_acceptance_input`] has already
+        /// rejected such an entry with `evidence[i] is not a supported evidence kind.` by the time
+        /// [`super::lower_acceptance_input`] calls this, so the `None` arm is a total-function
+        /// guard rather than a reachable policy path.
+        #[must_use]
+        pub fn from_wire(text: &str) -> Option<Self> {
             match text {
                 "changed-files" => Some(AcceptanceEvidenceKind::ChangedFiles),
                 "tests-added" => Some(AcceptanceEvidenceKind::TestsAdded),
@@ -1574,6 +3084,60 @@ pub mod model {
         pub env: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub allow_failure: Option<bool>,
+    }
+
+    impl AcceptanceVerifyCommand {
+        /// A bare shell command with no per-command overrides — every optional field left unset so
+        /// [`super::run_one_verify_command`] applies the run-level `cwd`, the inherited
+        /// environment and [`super::DEFAULT_VERIFY_TIMEOUT`], exactly as an authored entry that
+        /// declares only `{ id, command }` does.
+        ///
+        /// `id` defaults to the command text itself. Upstream *requires* an explicit `id`
+        /// (`acceptance.ts:209` — `verify[i].id is required.`) and
+        /// [`validate_acceptance_input`] enforces that before [`super::lower_acceptance_input`]
+        /// runs, so this fallback is only ever reached by callers constructing a contract in Rust
+        /// rather than from an authored `acceptance` param.
+        #[must_use]
+        pub fn shell(command: impl Into<String>) -> Self {
+            let command = command.into();
+            Self {
+                id: command.clone(),
+                command,
+                timeout_ms: Option::None,
+                cwd: Option::None,
+                env: Option::None,
+                allow_failure: Option::None,
+            }
+        }
+    }
+
+    impl From<String> for AcceptanceVerifyCommand {
+        fn from(command: String) -> Self {
+            Self::shell(command)
+        }
+    }
+
+    impl From<&str> for AcceptanceVerifyCommand {
+        fn from(command: &str) -> Self {
+            Self::shell(command)
+        }
+    }
+
+    /// A declared command compares equal to the bare command string it runs, so callers that only
+    /// care about *which shell commands a contract will execute* (the property that mattered when
+    /// [`super::VerifyCommand`] was still a `String`) keep expressing that directly. The
+    /// per-command overrides are deliberately NOT part of this comparison — use the derived
+    /// `PartialEq` on two `AcceptanceVerifyCommand`s for full structural equality.
+    impl PartialEq<String> for AcceptanceVerifyCommand {
+        fn eq(&self, other: &String) -> bool {
+            self.command == *other
+        }
+    }
+
+    impl PartialEq<&str> for AcceptanceVerifyCommand {
+        fn eq(&self, other: &&str) -> bool {
+            self.command == *other
+        }
     }
 
     /// `AcceptanceReviewGate` (types.ts:277-281).
@@ -2059,7 +3623,13 @@ pub mod model {
     }
 
     /// `normalizeCriteria` (acceptance.ts:251-263).
-    fn normalize_criteria(
+    ///
+    /// Public because [`super::lower_acceptance_input`] resolves an authored `criteria[]` through
+    /// this exact function on its way onto [`super::AcceptanceContract::criteria`] — the ONE
+    /// normalization rule (id fallback `criterion-<n>`, evidence inheritance, blank-`must` drop)
+    /// must not be re-implemented on the live path.
+    #[must_use]
+    pub fn normalize_criteria(
         criteria: &[CriterionInput],
         evidence: &[AcceptanceEvidenceKind],
     ) -> Vec<ResolvedAcceptanceGate> {
@@ -2090,7 +3660,11 @@ pub mod model {
             .collect()
     }
 
-    fn unique_evidence(items: &[AcceptanceEvidenceKind]) -> Vec<AcceptanceEvidenceKind> {
+    /// Order-preserving de-duplication of an evidence list (`[...new Set(...)]`,
+    /// acceptance.ts:283-285). Shared with [`super::lower_acceptance_input`] so a policy declaring
+    /// the same kind twice produces one prompt line and one runtime check, not two.
+    #[must_use]
+    pub fn unique_evidence(items: &[AcceptanceEvidenceKind]) -> Vec<AcceptanceEvidenceKind> {
         let mut seen: Vec<AcceptanceEvidenceKind> = Vec::new();
         for item in items {
             if !seen.contains(item) {
@@ -2218,7 +3792,7 @@ pub mod model {
         }
         let mut lines: Vec<String> = vec![
             String::new(),
-            "## Acceptance Contract".to_string(),
+            super::ACCEPTANCE_CONTRACT_HEADING.to_string(),
             format!("Acceptance level: {}", acceptance.level.as_str()),
             "Completion is not accepted from prose alone. End with a structured acceptance report."
                 .to_string(),
@@ -3021,7 +4595,12 @@ pub mod model {
     }
 
     /// `checkCriteriaSatisfied` (acceptance.ts:622-630).
-    fn check_criteria_satisfied(
+    ///
+    /// Public because the live gate ([`super::evaluate_acceptance`]'s `Checked` rung) runs this
+    /// same check over [`super::AcceptanceContract::criteria`] — there is exactly one criteria
+    /// rule and both evaluators must share it.
+    #[must_use]
+    pub fn check_criteria_satisfied(
         criteria: &[ResolvedAcceptanceGate],
         report: &AcceptanceReport,
     ) -> Vec<AcceptanceRuntimeCheck> {
@@ -3125,13 +4704,20 @@ pub mod model {
     }
 
     /// `runStructuralChecks` (acceptance.ts:657-669).
-    async fn run_structural_checks(
-        acceptance: &ResolvedAcceptanceConfig,
+    ///
+    /// Takes the evidence list rather than the whole [`ResolvedAcceptanceConfig`] — upstream reads
+    /// nothing else off `acceptance` (`for (const kind of acceptance.evidence)` plus the
+    /// `acceptance.evidence.includes("no-staged-files")` branch) — so the live gate, whose contract
+    /// is an [`super::AcceptanceContract`] rather than a `ResolvedAcceptanceConfig`, can call this
+    /// exact function instead of growing a second copy of the evidence rules.
+    #[must_use]
+    pub async fn run_structural_checks(
+        evidence: &[AcceptanceEvidenceKind],
         report: &AcceptanceReport,
         cwd: &Path,
     ) -> Vec<AcceptanceRuntimeCheck> {
         let mut checks: Vec<AcceptanceRuntimeCheck> = Vec::new();
-        for kind in &acceptance.evidence {
+        for kind in evidence {
             let present = report_evidence_present(report, *kind);
             checks.push(AcceptanceRuntimeCheck {
                 id: format!("evidence:{}", kind.as_str()),
@@ -3147,7 +4733,7 @@ pub mod model {
                 },
             });
         }
-        if acceptance.evidence.contains(&AcceptanceEvidenceKind::NoStagedFiles) {
+        if evidence.contains(&AcceptanceEvidenceKind::NoStagedFiles) {
             checks.push(check_no_staged_files(cwd).await);
         }
         checks
@@ -3395,7 +4981,7 @@ pub mod model {
         }
 
         let cwd_str = Some(cwd.display().to_string());
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 return AcceptanceVerifyResult {
@@ -3416,9 +5002,68 @@ pub mod model {
         };
 
         let timeout = Duration::from_millis(command.timeout_ms.unwrap_or(DEFAULT_VERIFY_TIMEOUT_MS));
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code();
+
+        // Same shape as the enum-lattice API's `run_one_verify_command`: never race a
+        // `self`-consuming `wait_with_output()` against the timeout, because the elapsed arm then
+        // drops the only handle and abandons a live process group. Drain the pipes separately,
+        // keep the `Child`, and kill on expiry (`abortVerification`, acceptance.ts:742-758).
+        let stdout_task = child.stdout.take().map(super::spawn_pipe_drain);
+        let stderr_task = child.stderr.take().map(super::spawn_pipe_drain);
+
+        // ONE absolute deadline over exit AND output collection — see `super::drained_by` for why
+        // the post-`wait()` drain must be inside it (upstream `acceptance.ts:742-759`).
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        let waited = tokio::select! {
+            biased;
+            result = child.wait() => Some(result),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+
+        let Some(waited) = waited else {
+            let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
+            if let Some(task) = stdout_task {
+                task.abort();
+            }
+            if let Some(task) = stderr_task {
+                task.abort();
+            }
+            return AcceptanceVerifyResult {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: cwd_str,
+                exit_code: Option::None,
+                status: VerifyRunStatus::TimedOut,
+                stdout: Option::None,
+                stderr: Option::None,
+                duration_ms: started.elapsed().as_millis(),
+            };
+        };
+
+        // Same bound as the enum-lattice copy: a command that exits while a descendant still holds
+        // its pipes is reported TIMED OUT at the deadline, never awaited unbounded.
+        let Some((out_bytes, err_bytes)) = super::drained_by(
+            deadline + super::TIMEOUT_SIGTERM_GRACE,
+            stdout_task,
+            stderr_task,
+        )
+        .await
+        else {
+            return AcceptanceVerifyResult {
+                id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: cwd_str,
+                exit_code: Option::None,
+                status: VerifyRunStatus::TimedOut,
+                stdout: Option::None,
+                stderr: Option::None,
+                duration_ms: started.elapsed().as_millis(),
+            };
+        };
+
+        match waited {
+            Ok(status_code) => {
+                let exit_code = status_code.code();
                 let passed = exit_code == Some(0);
                 let status = if passed {
                     VerifyRunStatus::Passed
@@ -3433,12 +5078,12 @@ pub mod model {
                     cwd: cwd_str,
                     exit_code,
                     status,
-                    stdout: trim_output(&String::from_utf8_lossy(&output.stdout)),
-                    stderr: trim_output(&String::from_utf8_lossy(&output.stderr)),
+                    stdout: trim_output(&String::from_utf8_lossy(&out_bytes)),
+                    stderr: trim_output(&String::from_utf8_lossy(&err_bytes)),
                     duration_ms: started.elapsed().as_millis(),
                 }
             }
-            Ok(Err(err)) => AcceptanceVerifyResult {
+            Err(err) => AcceptanceVerifyResult {
                 id: command.id.clone(),
                 command: command.command.clone(),
                 cwd: cwd_str,
@@ -3450,16 +5095,6 @@ pub mod model {
                 },
                 stdout: Option::None,
                 stderr: Some(err.to_string()),
-                duration_ms: started.elapsed().as_millis(),
-            },
-            Err(_elapsed) => AcceptanceVerifyResult {
-                id: command.id.clone(),
-                command: command.command.clone(),
-                cwd: cwd_str,
-                exit_code: Option::None,
-                status: VerifyRunStatus::TimedOut,
-                stdout: Option::None,
-                stderr: Option::None,
                 duration_ms: started.elapsed().as_millis(),
             },
         }
@@ -3550,7 +5185,7 @@ pub mod model {
 
         if rank >= checked_rank {
             let mut checks = check_criteria_satisfied(&acceptance.criteria, &report);
-            checks.extend(run_structural_checks(acceptance, &report, input.cwd).await);
+            checks.extend(run_structural_checks(&acceptance.evidence, &report, input.cwd).await);
             ledger.runtime_checks = checks;
             if ledger
                 .runtime_checks
@@ -4137,6 +5772,70 @@ pub mod model {
             assert!(err.contains("criteriaSatisfied[0].id: expected string; got number 7"));
             assert!(err.contains("criteriaSatisfied[0].status: expected one of \"satisfied\", \"not-satisfied\", \"not-applicable\"; got \"done\""));
             assert!(err.contains("criteriaSatisfied[0].evidence: expected non-empty string; got \"\""));
+        }
+
+        // ---- runVerifyCommand (acceptance.ts:713-767) — the SECOND copy of the runner ----
+
+        /// SUBA-027 regression, mirror of
+        /// `super::super::tests::a_verify_command_that_daemonizes_still_returns_within_its_timeout`.
+        ///
+        /// This module is the second copy of the verify runner, so it carried the identical
+        /// unbounded post-`wait()` drain and the identical hang. Both copies now share
+        /// [`super::super::drained_by`], and this test is what keeps them from drifting apart
+        /// again: a command that exits 0 while a backgrounded descendant still holds its
+        /// stdout/stderr must settle as [`VerifyRunStatus::TimedOut`] on its own deadline, exactly
+        /// as upstream's `abortVerification` → `finish({status: "timed-out", …})` does
+        /// (`acceptance.ts:742-759` @v0.34.0).
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_daemonizing_verify_command_times_out_instead_of_hanging_the_model_copy() {
+            let dir = temp_dir();
+            let command = AcceptanceVerifyCommand {
+                id: "daemonizes".into(),
+                command: "sleep 300 & echo $! > descendant; exit 0".into(),
+                timeout_ms: Some(200),
+                cwd: Option::None,
+                env: Option::None,
+                allow_failure: Option::None,
+            };
+
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                run_verify_command(&command, dir.path()),
+            )
+            .await
+            .expect(
+                "run_verify_command must honor timeoutMs even when a backgrounded grandchild \
+                 still holds the stdout/stderr pipe",
+            );
+
+            assert_eq!(
+                result.status,
+                VerifyRunStatus::TimedOut,
+                "upstream resolves this shape through abortVerification's finish(), i.e. as \
+                 timed-out, never as a pass"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the call must return on its own deadline, not the descendant's lifetime, got {:?}",
+                started.elapsed()
+            );
+
+            // Clean up the deliberately-daemonised descendant this test created.
+            let pid_path = dir.path().join("descendant");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if let Ok(raw) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
 
         // ---- evaluateAcceptance (async, real subprocess / real git) ----

@@ -82,14 +82,21 @@ pub struct InstalledPackage {
     pub disabled: DisabledSet,
 }
 
-/// Per-resource include filters declared alongside a settings-declared package source (Pi
-/// `PackageFilter`, package-manager.ts:184-190, read off the object form of a `packages` entry).
+/// Per-resource filters declared alongside a settings-declared package source (Pi `PackageFilter`,
+/// package-manager.ts:184-190, read off the object form of a `packages` entry).
 ///
-/// `None` for a resource type means "take the package's default resources for that type"; `Some`
-/// carries `applyPatterns` patterns, and an explicitly EMPTY list disables the type outright (Pi
-/// `applyPackageFilter`, package-manager.ts:2156-2162).
+/// Two modes, chosen by [`Self::autoload`] (Pi `collectPackageResources`, package-manager.ts:2079-2092):
+///
+/// - **include filter** (`autoload` absent or `true`) — start from the package's default resources
+///   and narrow. `None` for a type keeps that type's defaults; `Some` carries `applyPatterns`
+///   patterns; an explicitly EMPTY list disables the type outright (`applyPackageFilter`, :2147-2171).
+/// - **delta** (`autoload == Some(false)`) — start from NOTHING and add back only what the patterns
+///   name (`applyPackageDeltaFilter`, :2173-2189). `None` or an empty list for a type therefore
+///   contributes nothing at all, which is the whole point of opting a package out.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageFilter {
+    /// Pi `PackageSource.autoload` (settings-manager.ts:79). Only `Some(false)` is load-bearing.
+    pub autoload: Option<bool>,
     pub extensions: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub prompts: Option<Vec<String>>,
@@ -98,10 +105,17 @@ pub struct PackageFilter {
 
 impl PackageFilter {
     pub fn is_empty(&self) -> bool {
-        self.extensions.is_none()
+        self.autoload.is_none()
+            && self.extensions.is_none()
             && self.skills.is_none()
             && self.prompts.is_none()
             && self.themes.is_none()
+    }
+
+    /// Whether this filter is the `autoload: false` DELTA form (Pi `filter.autoload === false`,
+    /// package-manager.ts:2084 — only an explicit `false` takes the branch).
+    pub fn is_delta(&self) -> bool {
+        self.autoload == Some(false)
     }
 }
 

@@ -7,7 +7,7 @@
 //! - Gap #5 — `terminate` still runs the post-turn path (hooks + steering/follow-up), Pi
 //!   `agent-loop.ts:210,218-262`.
 //! - Gap #6 — an uncontained run failure reports the real panic message + aborted-vs-error, Pi
-//!   `agent.ts:476-492`.
+//!   `agent.ts:496-511`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -255,7 +255,7 @@ async fn gap5_terminate_still_runs_post_turn_hooks_and_drains_follow_up() {
 }
 
 // ============================================================================
-// Gap #6 — uncontained run failure reports the REAL panic message (agent.ts:476-492).
+// Gap #6 — uncontained run failure reports the REAL panic message (agent.ts:496-511).
 // ============================================================================
 
 struct ExplodingHook;
@@ -291,6 +291,154 @@ async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
         Some("kaboom: hook detonated"),
         "the real panic message must be surfaced (Pi error.message)"
     );
+}
+
+// ============================================================================
+// AGENT-007 — a post-turn hook that RETURNS `Err` (Pi: throws) is a run FAILURE, not a quiet stop.
+//
+// Pi awaits `prepareNextTurn` (agent-loop.ts:231) and `shouldStopAfterTurn` (agent-loop.ts:246-252)
+// bare — no try/catch — so a rejection escapes `runLoop` into `runWithLifecycle`'s catch
+// (agent.ts:489-490) and reaches `handleRunFailure` (agent.ts:496-511), which emits a synthetic
+// errored assistant message through `message_start` → `message_end` → `turn_end` (empty
+// `toolResults`) → `agent_end` carrying `[failureMessage]`.
+// ============================================================================
+
+/// Records every event the AGENT (not the free-function loop) publishes, in order.
+#[derive(Default)]
+struct AgentRec {
+    events: Mutex<Vec<AgentEvent>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_agent::EventSubscriber for AgentRec {
+    async fn on_event(&self, event: &AgentEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+}
+
+impl AgentRec {
+    fn names(&self) -> Vec<String> {
+        self.events.lock().unwrap().iter().map(ev_name).collect()
+    }
+    fn snapshot(&self) -> Vec<AgentEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+/// `prepare_next_turn` fails (Pi: throws) after the first turn completes.
+struct FailingPrepareHook;
+
+#[async_trait::async_trait]
+impl Hooks for FailingPrepareHook {
+    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>) -> Result<Option<TurnUpdate>, HookError> {
+        Err(HookError::new("prepare exploded"))
+    }
+}
+
+/// `should_stop_after_turn` fails (Pi: throws) after the first turn completes.
+struct FailingStopHook;
+
+#[async_trait::async_trait]
+impl Hooks for FailingStopHook {
+    async fn should_stop_after_turn(&self, _ctx: PostTurn<'_>) -> Result<bool, HookError> {
+        Err(HookError::new("stop check exploded"))
+    }
+}
+
+fn last_assistant(events: &[AgentEvent]) -> cyrup_core::AssistantMessage {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => Some(a.clone()),
+            _ => None,
+        })
+        .expect("an assistant message_end")
+}
+
+#[tokio::test]
+async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
+    let rec = Arc::new(AgentRec::default());
+    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingPrepareHook)).build();
+    agent.subscribe(rec.clone());
+
+    let new = agent.prompt("go").await.unwrap().finished().await;
+    agent.wait_for_idle().await;
+
+    // The tail is Pi's `handleRunFailure` quartet, NOT a bare `agent_end` (agent.ts:508-511).
+    let names = rec.names();
+    let tail: Vec<&str> = names.iter().rev().take(4).rev().map(String::as_str).collect();
+    assert_eq!(
+        tail,
+        vec!["message_start", "message_end", "turn_end", "agent_end"],
+        "a failing prepare_next_turn must close with Pi's failure quartet, got {names:?}"
+    );
+
+    let events = rec.snapshot();
+    // The synthetic failure message: `stopReason: "error"` (uncancelled) + the real error text
+    // (agent.ts:504-505), one empty text block (agent.ts:499).
+    let failure = last_assistant(&events);
+    assert_eq!(failure.stop_reason, StopReason::Error);
+    assert_eq!(failure.error_message.as_deref(), Some("prepare exploded"));
+    assert_eq!(failure.content.len(), 1, "one EMPTY text block, not empty content");
+    assert!(matches!(&failure.content[0], Content::Text { text, .. } if text.is_empty()));
+
+    // `turn_end` carries the failure message and NO tool results (agent.ts:510).
+    let te = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::TurnEnd { message, tool_results } => {
+                Some((message.clone(), tool_results.clone()))
+            }
+            _ => None,
+        })
+        .expect("a turn_end");
+    assert!(te.1.is_empty(), "the failure turn_end carries no tool results");
+    assert!(matches!(&te.0, AgentMessage::Assistant(a) if a.stop_reason == StopReason::Error));
+
+    // `agent_end` carries EXACTLY `[failureMessage]` (agent.ts:511) — not the run's accumulator.
+    let end = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::AgentEnd { messages } => Some(messages.clone()),
+            _ => None,
+        })
+        .expect("an agent_end");
+    assert_eq!(end.len(), 1, "agent_end carries only the failure message, got {end:?}");
+    assert!(matches!(&end[0], AgentMessage::Assistant(a) if a.error_message.as_deref() == Some("prepare exploded")));
+
+    // The run's returned messages match `agent_end`, exactly as the catch_unwind twin settles.
+    assert_eq!(new.len(), 1);
+    assert!(matches!(&new[0], AgentMessage::Assistant(a) if a.stop_reason == StopReason::Error));
+
+    // The failure is visible on the agent's observable state, as it is for the panic path.
+    assert_eq!(agent.snapshot().await.error_message.as_deref(), Some("prepare exploded"));
+}
+
+#[tokio::test]
+async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet() {
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
+    let rec = Arc::new(AgentRec::default());
+    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingStopHook)).build();
+    agent.subscribe(rec.clone());
+
+    agent.prompt("go").await.unwrap().finished().await;
+    agent.wait_for_idle().await;
+
+    let names = rec.names();
+    let tail: Vec<&str> = names.iter().rev().take(4).rev().map(String::as_str).collect();
+    assert_eq!(
+        tail,
+        vec!["message_start", "message_end", "turn_end", "agent_end"],
+        "a failing should_stop_after_turn must close with Pi's failure quartet, got {names:?}"
+    );
+
+    let failure = last_assistant(&rec.snapshot());
+    assert_eq!(failure.stop_reason, StopReason::Error);
+    assert_eq!(failure.error_message.as_deref(), Some("stop check exploded"));
 }
 
 // ============================================================================

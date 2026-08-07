@@ -162,3 +162,31 @@ fn a_clean_stop_adds_no_notice() {
     assert!(!out.contains("aborted"), "no abort wording on a clean stop:\n{out}");
 }
 
+
+/// `Pending` is the in-flight sentinel (`cyrup_core::StopReason`), and Pi renders it like a clean
+/// stop: its chain is `if ("length") … else if (!hasToolCalls) { if ("aborted") … else if
+/// ("error") … }` (`assistant-message.ts:177-201`), and `"pending"` matches none of those, so no
+/// notice is appended while a message is still streaming.
+///
+/// This asserts the arm added when `StopReason::Pending` was introduced. A `_ => None` would have
+/// produced the same result today but would silently absorb the NEXT variant too; the match is
+/// exhaustive so the compiler forces the decision. The rendering path is the same one the live
+/// streaming partial takes, so a regression here would put an error banner under every in-flight
+/// turn.
+#[test]
+fn a_pending_in_flight_message_adds_no_notice() {
+    let msg = message(StopReason::Pending, None, vec![text("still typin")]);
+    let mut app = new_app();
+    app.ingest_event(&AgentSessionEvent::MessageUpdate {
+        message: AgentMessage::Assistant(msg.clone()),
+        assistant_message_event: Box::new(StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "still typin".to_string(),
+            partial: msg,
+        }),
+    });
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(!out.contains("Error:"), "an in-flight turn must not show a notice:\n{out}");
+    assert!(!out.contains("aborted"), "an in-flight turn must not show abort wording:\n{out}");
+}

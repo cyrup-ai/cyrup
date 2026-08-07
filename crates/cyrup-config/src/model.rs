@@ -1425,6 +1425,26 @@ pub fn restore_model_from_session(
     }
 }
 
+/// The OAuth auth mode a `models.json` provider block may declare (Pi
+/// `ProviderConfigSchema.oauth`, model-config.ts:194).
+///
+/// Pi types this as `Type.Literal("radius")` — `radius` is the ONLY accepted spelling, and any
+/// other value is a whole-file schema rejection (model-config.ts:265-272), not a silently ignored
+/// key. Modelling it as a single-variant enum reproduces that: serde fails the load, and
+/// [`load_models_file_reporting`] turns the failure into Pi's empty-snapshot-plus-one-message
+/// contract.
+///
+/// **[CYRUP-DELTA]** cyrup does not port the `radius` provider itself (`configureRadiusProviders`,
+/// model-runtime.ts:175-191, synthesizes a built-in from the block's `baseUrl`), so a `radius`
+/// block currently composes against no base models and contributes none. The composition-layer
+/// semantics below are ported regardless, so the block is ACCEPTED rather than rejected with a
+/// misleading "must specify baseUrl, headers, compat, modelOverrides, or models".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelsJsonOauth {
+    Radius,
+}
+
 /// A `models.json` provider request config (Pi `ProviderConfigSchema`, model-registry.ts:204-214):
 /// the request-auth-relevant fields. `apiKey`/`headers` carry unresolved config-value templates;
 /// resolve them with [`ProviderConfig::resolve_request_auth`].
@@ -1443,6 +1463,12 @@ pub struct ProviderConfig {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub auth_header: Option<bool>,
+    /// OAuth auth mode (Pi `ProviderConfigSchema.oauth`, model-config.ts:194). Setting it makes
+    /// `baseUrl` mandatory (provider-composer.ts:167-169) because that URL is the auth GATEWAY, and
+    /// for the same reason suppresses the provider-level rewrite of the built-ins' request
+    /// `baseUrl` (:188). It also counts as a distinguishing key in the empty-block guard (:178).
+    #[serde(default)]
+    pub oauth: Option<ModelsJsonOauth>,
     /// Provider-level compatibility overrides applied to every model of this provider (Pi
     /// `ProviderConfigSchema.compat`, model-config.ts:196).
     #[serde(default)]
@@ -1739,6 +1765,61 @@ impl ModelFile {
     }
 }
 
+/// Whether `provider` has configured auth, across BOTH credential channels Pi's `hasConfiguredAuth`
+/// sees — the credential store AND `models.json` (CFG-022).
+///
+/// Pi's `hasConfiguredAuth` (model-runtime.ts:372-374) is a set-membership test against
+/// `snapshot.configuredProviders`, and that set is filled by running `models.checkAuth` over EVERY
+/// composed provider. A provider that exists only in `models.json` is composed like any other, and
+/// its `check` closure is `composeApiKeyAuth`'s (provider-composer.ts:314-332). So a user-declared
+/// provider carrying its own `apiKey` counts as configured with nothing in `auth.json` at all.
+///
+/// cyrup had two disagreeing predicates: [`AuthStore::has_auth`] alone on the binary's default-launch
+/// path (which knows only `--api-key`, an `auth.json` entry, and the `env_keys` table of KNOWN
+/// provider ids, so a user-declared provider matched none of the three), and a second, models.json-
+/// aware one inside the session. This is the single predicate both call.
+///
+/// `env` is the optional provider-scoped override map; it is consulted ahead of the process
+/// environment by both tiers.
+pub fn provider_is_configured(
+    auth: &crate::auth::AuthStore,
+    models_json: &ModelFile,
+    provider: &ProviderId,
+    env: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    auth.has_auth(provider, env)
+        || models_json_provider_is_configured(models_json, provider.as_str(), env)
+}
+
+/// The `models.json` tier of [`provider_is_configured`]: a declared `apiKey` that is *configured*
+/// in the config-value sense (Pi `composeApiKeyAuth`'s `check`, provider-composer.ts:320-329).
+///
+/// **NEVER RESOLVES THE VALUE.** Pi's own check is deliberately pure — a `!command` value returns
+/// "configured API key" on the strength of *being* a command (`isCommandConfigValue`, :321) without
+/// running it, and a `$VAR` template is configured exactly when every name it references is defined
+/// (:322-328). Resolving here would execute a shell command out of `models.json` on a *status*
+/// query, on a predicate that runs inside filter loops; resolution belongs on the request path.
+///
+/// The env-var arm is what distinguishes this from a bare `api_key.is_some()`: a template naming an
+/// unset variable is NOT configured, which is the same judgement Pi makes.
+pub fn models_json_provider_is_configured(
+    models_json: &ModelFile,
+    provider_id: &str,
+    env: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    let Some(raw) = models_json
+        .providers
+        .get(provider_id)
+        .and_then(|c| c.api_key.as_deref())
+    else {
+        // Credential *acquisition* (an `oauth` block) is deliberately out of scope: Pi's
+        // `composeApiKeyAuth` returns `undefined` outright for an oauth-only provider (:302).
+        return false;
+    };
+    crate::config_value::is_command_config_value(raw)
+        || crate::config_value::is_config_value_configured(raw, env)
+}
+
 /// Pi `applyModelsJson` + `modelFromJson` + the `modelOverrides` map
 /// (provider-composer.ts:161-199, 124-159, 433-436), as one fallible composition over ONE provider's
 /// models. Returns the provider's effective model list, or Pi's own error string.
@@ -1747,6 +1828,14 @@ pub(crate) fn apply_models_json(
     base_models: &[Model],
     config: &ProviderConfig,
 ) -> Result<Vec<Model>, String> {
+    // `oauth` names an auth gateway, and the gateway has to live somewhere: Pi checks this FIRST,
+    // ahead of the empty-block guard, so `{"oauth":"radius"}` reports the missing `baseUrl` rather
+    // than the generic "must specify …" (provider-composer.ts:167-169).
+    if config.oauth.is_some() && config.base_url.is_none() {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when \"oauth\" is set."
+        ));
+    }
     let has_overrides = !config.model_overrides.is_empty();
     if config.models.is_empty()
         && config.base_url.is_none()
@@ -1754,6 +1843,8 @@ pub(crate) fn apply_models_json(
         && config.compat.is_none()
         && !has_overrides
         && config.api_key.is_none()
+        // `!config.oauth` (:178) — an oauth mode is itself a distinguishing key.
+        && config.oauth.is_none()
         && config.auth_header.is_none()
     {
         return Err(format!(
@@ -1767,7 +1858,13 @@ pub(crate) fn apply_models_json(
         .iter()
         .map(|m| {
             let mut m = m.clone();
-            if let Some(base_url) = &config.base_url {
+            // `config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl)`
+            // (:188): under an oauth mode the block's `baseUrl` is the auth gateway, so the models
+            // keep their own request endpoints. `oauth` is single-valued, so `is_none()` is the
+            // exact negation of Pi's `=== "radius"`.
+            if let Some(base_url) = &config.base_url
+                && config.oauth.is_none()
+            {
                 m.base_url = base_url.clone();
             }
             m.compat = merge_compat(m.compat.as_ref(), config.compat.as_ref());
@@ -2664,5 +2761,179 @@ mod tests {
         // A missing file is NOT an error (Pi returns an empty snapshot on ENOENT, model-config.ts:248).
         let (file, err) = load_models_file_reporting(&dir.join("absent.json"));
         assert!(file.providers.is_empty() && err.is_none());
+    }
+
+    /// CFG-022 — the ONE `hasConfiguredAuth` predicate, over an `auth.json` that does not exist.
+    ///
+    /// Pi fills `configuredProviders` by running `checkAuth` over every COMPOSED provider
+    /// (model-runtime.ts:372-374), so a provider declared only in `models.json` is configured on the
+    /// strength of its own `apiKey`. cyrup's launch path consulted the credential store alone, which
+    /// knows only `--api-key`, an `auth.json` entry and the `env_keys` table of KNOWN provider ids —
+    /// none of which a user-declared provider can match.
+    #[test]
+    fn models_json_api_key_configures_a_provider_with_no_stored_credential() {
+        let dir = crate::test_util::temp_dir();
+        let auth = crate::auth::AuthStore::at(dir.join("auth.json"));
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{
+                 "mycorp":  {"baseUrl":"https://g.test/v1","apiKey":"sk-literal","models":[{"id":"m"}]},
+                 "keyless": {"baseUrl":"https://k.test/v1","models":[{"id":"m"}]}
+               }}"#,
+        )
+        .unwrap();
+
+        assert!(provider_is_configured(
+            &auth,
+            &file,
+            &ProviderId::from("mycorp"),
+            None
+        ));
+        assert!(
+            !provider_is_configured(&auth, &file, &ProviderId::from("keyless"), None),
+            "a baseUrl-only overlay carries no credential of its own"
+        );
+        assert!(
+            !provider_is_configured(&auth, &file, &ProviderId::from("absent"), None),
+            "a provider the file does not mention is not configured"
+        );
+    }
+
+    /// The env-var arm of Pi's check (provider-composer.ts:322-328): a `$VAR` template is configured
+    /// exactly when every name it references is defined. A bare `api_key.is_some()` would call the
+    /// unset case configured.
+    #[test]
+    fn a_models_json_api_key_template_needs_its_env_vars_defined() {
+        let dir = crate::test_util::temp_dir();
+        let auth = crate::auth::AuthStore::at(dir.join("auth.json"));
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"mycorp":{"baseUrl":"https://g.test/v1","apiKey":"${MYCORP_TOKEN}",
+                 "models":[{"id":"m"}]}}}"#,
+        )
+        .unwrap();
+        let provider = ProviderId::from("mycorp");
+
+        let empty = std::collections::HashMap::new();
+        assert!(
+            !provider_is_configured(&auth, &file, &provider, Some(&empty)),
+            "MYCORP_TOKEN is not defined, so the key is not configured"
+        );
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("MYCORP_TOKEN".to_string(), "sk-from-env".to_string());
+        assert!(provider_is_configured(&auth, &file, &provider, Some(&env)));
+    }
+
+    /// A `!command` `apiKey` counts as configured on the strength of BEING a command
+    /// (`isCommandConfigValue`, provider-composer.ts:321) — the command must NOT run. This predicate
+    /// is a status query called inside filter loops; resolving here would execute a shell command
+    /// written in `models.json`.
+    #[test]
+    fn a_command_api_key_is_configured_without_ever_being_executed() {
+        let dir = crate::test_util::temp_dir();
+        let auth = crate::auth::AuthStore::at(dir.join("auth.json"));
+        let marker = dir.join("executed-marker");
+        let file: ModelFile = serde_json::from_str(&format!(
+            r#"{{"providers":{{"mycorp":{{"baseUrl":"https://g.test/v1",
+                 "apiKey":"!touch {}","models":[{{"id":"m"}}]}}}}}}"#,
+            marker.display()
+        ))
+        .unwrap();
+
+        assert!(provider_is_configured(
+            &auth,
+            &file,
+            &ProviderId::from("mycorp"),
+            None
+        ));
+        assert!(
+            !marker.exists(),
+            "the status predicate executed the `apiKey` command — it must never resolve the value"
+        );
+    }
+
+    /// CFG-002 — the `oauth` half of `applyModelsJson` (provider-composer.ts:167-169, :178, :188).
+    ///
+    /// `oauth` names an auth GATEWAY, so Pi rejects a block that sets it without the `baseUrl` that
+    /// gateway lives at, counts it as a distinguishing key in the empty-block guard, and — because
+    /// the gateway URL is an auth endpoint rather than a request endpoint — does NOT let it rewrite
+    /// the built-in models' `baseUrl`. cyrup modelled none of that: the key was not even a field, so
+    /// serde dropped it silently.
+    #[test]
+    fn models_json_oauth_requires_a_base_url() {
+        let base = vec![oai("acme", "m1")];
+        let file: ModelFile =
+            serde_json::from_str(r#"{"providers":{"acme":{"oauth":"radius"}}}"#).unwrap();
+        let (out, errors) = file.compose(&base);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0], r#"Provider acme: "baseUrl" is required when "oauth" is set."#,
+            "Pi's exact text, provider-composer.ts:168"
+        );
+        assert!(
+            out.iter().any(|m| m.id.as_str() == "m1"),
+            "a rejected block still keeps the provider's built-ins"
+        );
+    }
+
+    /// `oauth` alone (with its required `baseUrl`) is a COMPLETE block — Pi's empty-block guard
+    /// carries a `!config.oauth` term (provider-composer.ts:178) that cyrup omitted, so cyrup
+    /// rejected it with the misleading `must specify "baseUrl", "headers", …` message.
+    #[test]
+    fn models_json_oauth_satisfies_the_empty_block_guard_without_rewriting_base_urls() {
+        let base = vec![oai("acme", "m1")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"acme":{"oauth":"radius","baseUrl":"https://gateway.acme.test/v1"}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert!(
+            errors.is_empty(),
+            "an oauth block is a distinguishing key: {errors:?}"
+        );
+        let m = out
+            .iter()
+            .find(|m| m.id.as_str() == "m1")
+            .expect("built-in kept");
+        assert_eq!(
+            m.base_url, "https://builtin.example/v1",
+            "with `oauth` set the provider baseUrl is the AUTH gateway and must not become the \
+             request endpoint (provider-composer.ts:188)"
+        );
+    }
+
+    /// Without `oauth`, the very same `baseUrl` DOES rewrite the built-ins — the guard above must
+    /// not weaken the ordinary proxy-override path.
+    #[test]
+    fn models_json_base_url_still_rewrites_builtins_without_oauth() {
+        let base = vec![oai("acme", "m1")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"acme":{"baseUrl":"https://gateway.acme.test/v1"}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(out[0].base_url, "https://gateway.acme.test/v1");
+    }
+
+    /// Pi types `oauth` as `Type.Literal("radius")` (model-config.ts:194), so any other spelling is
+    /// a SCHEMA failure that empties the whole file and reports one error (model-config.ts:265-272)
+    /// — not a silently-ignored key. cyrup's serde loader reaches the same contract through
+    /// `load_models_file_reporting`.
+    #[test]
+    fn models_json_rejects_an_unknown_oauth_mode_for_the_whole_file() {
+        let dir = crate::test_util::temp_dir();
+        let path = dir.join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"acme":{"oauth":"anthropic","baseUrl":"https://x.test/v1"}}}"#,
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(
+            file.providers.is_empty(),
+            "an invalid schema empties the file"
+        );
+        let err = err.expect("and reports why");
+        assert!(err.contains("radius"), "the message names the legal value: {err}");
     }
 }

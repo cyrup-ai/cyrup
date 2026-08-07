@@ -44,7 +44,7 @@ pub use settings::{BranchSummarySettings, CompactionSettings};
 pub use summarize::{
     combine_usage, compact_default, complete_summarization, generate_summary,
     generate_turn_prefix_summary, summarization_reasoning, DefaultCompaction, ProviderSummarizer,
-    SummarizationRequest, SummaryOutput, Summarizer, SUMMARIZATION_PROMPT,
+    SummarizationRequest, SummaryOutput, Summarizer, PENDING_SUMMARY, SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use tokens::{
@@ -424,7 +424,11 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
             id: base.id.clone(),
             parent_id: base.parent_id.clone(),
             summary: summary.clone(),
-            first_kept_entry_id: first_kept_entry_id.clone(),
+            // `None` here means the on-disk entry carried an unresolvable v1 `firstKeptEntryIndex`
+            // (see `entry.rs`). Hook payloads are only ever built from an entry cyrup JUST
+            // appended, which always carries the id, so this fails closed rather than inventing one
+            // — the caller maps `None` to `CompactionError::MissingEntryId`.
+            first_kept_entry_id: first_kept_entry_id.clone()?,
             tokens_before: *tokens_before,
             from_hook: from_hook.unwrap_or(false),
             details: details.clone(),

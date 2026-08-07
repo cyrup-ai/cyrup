@@ -76,6 +76,29 @@ impl FilterMode {
         }
     }
 
+    /// Map the persisted `treeFilterMode` setting value to a mode.
+    ///
+    /// Pi seeds the `/tree` selector from `settingsManager.getTreeFilterMode()`
+    /// (`interactive-mode.ts:4644` → `TreeSelectorComponent(..., initialFilterMode)` →
+    /// `tree-selector.ts:137` `this.filterMode = initialFilterMode ?? "default"`), so a configured
+    /// filter is the one `/tree` OPENS with. The accepted values are the `FilterMode` union
+    /// (`settings-manager.ts:117`): `default` | `no-tools` | `user-only` | `labeled-only` | `all`;
+    /// anything else falls back to `default`, matching
+    /// [`cyrup_config::EffectiveSettings::tree_filter_mode`]'s own validation.
+    ///
+    /// Note the SETTING spellings (`user-only`/`labeled-only`) are not the header CHIP labels
+    /// [`Self::label`] renders (`user`/`labeled`) — Pi's chip text is likewise shortened.
+    #[must_use]
+    pub fn from_setting(value: &str) -> FilterMode {
+        match value {
+            "no-tools" => FilterMode::NoTools,
+            "user-only" => FilterMode::UserOnly,
+            "labeled-only" => FilterMode::LabeledOnly,
+            "all" => FilterMode::All,
+            _ => FilterMode::Default,
+        }
+    }
+
     /// Map a `1..=5` digit to a mode (the bespoke filter keys).
     pub fn from_digit(d: char) -> Option<FilterMode> {
         match d {
@@ -116,7 +139,15 @@ pub struct TreeNode {
     pub folded: bool,
     /// Whether the entry carries a user label (renders the `☆` star).
     pub has_label: bool,
-    /// The right-aligned relative-time column (e.g. `12:04`, `4h ago`); `None` hides it.
+    /// When this entry's **label** was last set, pre-formatted for display — Pi's
+    /// `FlatNode.node.labelTimestamp` (`session-manager.ts:165`, rendered at `tree-selector.ts:741-743`).
+    /// `None` hides the column.
+    ///
+    /// It is the *label-change* time, not the entry's own timestamp, and it is only ever shown on a
+    /// row that carries a label: Pi's render condition is
+    /// `showLabelTimestamps && node.label && node.labelTimestamp`, which [`TreeSelector::rows`]
+    /// reproduces as `show_time && has_label && time_label.is_some()`. A timestamp on an unlabeled
+    /// node is therefore ignored rather than rendered.
     pub time_label: Option<String>,
 }
 
@@ -157,7 +188,9 @@ pub struct TreeSelector {
     /// Index into the **visible** rows (filter + fold applied).
     selected: usize,
     filter: FilterMode,
-    /// Whether the time column is shown (`app.tree.toggleLabelTimestamp`).
+    /// Whether the label-timestamp column is shown (`app.tree.toggleLabelTimestamp`). **Off** by
+    /// default, as Pi's `private showLabelTimestamps = false` (`tree-selector.ts:116`) — the `t`
+    /// toggle turns it ON; it does not turn a default-on column off.
     show_time: bool,
     keymap: TreeKeymap,
     /// The inline label editor, present only while renaming (`e`); see [`LabelEdit`].
@@ -171,7 +204,7 @@ impl TreeSelector {
             nodes,
             selected: 0,
             filter: FilterMode::Default,
-            show_time: true,
+            show_time: false,
             keymap: TreeKeymap::default(),
             label_edit: None,
         }
@@ -222,6 +255,19 @@ impl TreeSelector {
     pub fn selected_id(&self) -> Option<String> {
         let visible = self.visible_indices();
         visible.get(self.selected).and_then(|&i| self.nodes.get(i)).map(|n| n.id.clone())
+    }
+
+    /// Move the highlight to `id` if it is currently visible — Pi's `showTreeSelector(entryId)`
+    /// re-show with the same selection (`interactive-mode.ts:4763,4807`). A no-op when the id is
+    /// filtered out, folded away, or gone (the selection stays wherever it was), never a panic.
+    pub fn select_id(&mut self, id: &str) {
+        if let Some(pos) = self
+            .visible_indices()
+            .into_iter()
+            .position(|i| self.nodes.get(i).is_some_and(|n| n.id == id))
+        {
+            self.selected = pos;
+        }
     }
 
     /// The current filter mode (inspection/tests).
@@ -469,6 +515,10 @@ impl TreeSelector {
             if is_sel {
                 right.push_str("◀ selected");
             } else if self.show_time
+                // Pi's render condition in full (`tree-selector.ts:741-743`): the column is a
+                // *label* timestamp, so an entry with no label never shows one even when the toggle
+                // is on and a timestamp happens to be attached.
+                && node.has_label
                 && let Some(t) = &node.time_label
             {
                 right.push_str(t);
@@ -484,17 +534,24 @@ impl TreeSelector {
         lines
     }
 
-    /// The header line: `Session Tree` + `Filter: <mode>   (visible/total)`.
+    /// The header line: `Session Tree` + `Filter: <mode>   (visible/total)`, plus Pi's
+    /// `[+label time]` marker while the label-timestamp column is on (`getStatusLabels`,
+    /// `tree-selector.ts:658-660`).
+    ///
+    /// That marker is what makes the `t` toggle discoverable at all now that the column is off by
+    /// default and empty on every unlabeled row: without it, pressing `t` in a session with no
+    /// labels changes nothing visible and reads as a dead key.
     fn header(&self, theme: &UiTheme) -> Line<'static> {
         let visible = self.visible_indices().len();
         let total = self.nodes.len();
+        let label_time = if self.show_time { " [+label time]" } else { "" };
         Line::from(vec![
             Span::styled(
                 " Session Tree".to_string(),
                 theme.accent_style().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("   Filter: {}   ({visible}/{total})", self.filter.label()),
+                format!("   Filter: {}   ({visible}/{total}){label_time}", self.filter.label()),
                 theme.dim_style(),
             ),
         ])

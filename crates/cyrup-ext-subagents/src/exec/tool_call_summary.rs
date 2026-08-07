@@ -75,6 +75,134 @@ pub fn format_tool_call(name: &str, args: &serde_json::Value, expanded: bool) ->
     }
 }
 
+/// pi `extractToolArgsPreview` (`pi-subagents/src/shared/utils.ts:521-573`): the SHORT argument
+/// preview pi stores on `AgentProgress.currentToolArgs` and then copies verbatim onto each
+/// `recentTools[].args` entry (`runs/foreground/execution.ts:794,807`). Distinct from
+/// [`format_tool_call`], which renders `<tool> <args>` for a transcript row; this renders the
+/// arguments ALONE for a live activity line.
+///
+/// The cascade is pi's, in pi's order: MCP `{server, tool, args}` first, then `queries[]`/`query`/
+/// `workflow`, then `url`/`urls[]`/`prompt`, then the fixed `previewKeys` list, then a final
+/// `key=value` fallback over the first string/array-valued member.
+///
+/// **[CYRUP-DELTA]** the final fallback's iteration order is `serde_json::Map`'s (alphabetical by
+/// key, since this workspace builds `serde_json` without `preserve_order`) where pi's is JS object
+/// insertion order. Every earlier rung of the cascade is keyed by explicit name and therefore
+/// order-independent, so this only shows up for an args object whose members are ALL unlisted keys
+/// and which has more than one string member.
+#[must_use]
+pub fn extract_tool_args_preview(args: &serde_json::Value) -> String {
+    let Some(map) = args.as_object() else {
+        return String::new();
+    };
+
+    // pi `stringifyPreviewValue` (`utils.ts:526-530`): a non-blank string, or a number/boolean
+    // rendered as a string; anything else is "no preview".
+    fn stringify_preview_value(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+
+    // pi `previewArray` (`utils.ts:532-538`): the first element's preview plus an `(+N more)`
+    // suffix when the array carries more than one entry.
+    fn preview_array(value: Option<&serde_json::Value>) -> Option<String> {
+        let items = value?.as_array()?;
+        let first = stringify_preview_value(items.first()?)?;
+        let suffix = if items.len() > 1 {
+            format!(" (+{} more)", items.len() - 1)
+        } else {
+            String::new()
+        };
+        Some(format!("{first}{suffix}"))
+    }
+
+    // pi `truncatePreview` (`utils.ts:522-523`): `slice(0, maxLength - 3) + "..."`, i.e. the
+    // ellipsis is INSIDE the budget (unlike `truncate_with_ellipsis`, which appends past it).
+    fn truncate_preview(value: &str, max_length: usize) -> String {
+        if value.chars().count() <= max_length {
+            return value.to_string();
+        }
+        let keep = max_length.saturating_sub(3);
+        let head: String = value.chars().take(keep).collect();
+        format!("{head}...")
+    }
+
+    let str_field = |key: &str| -> Option<&str> {
+        map.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    };
+
+    // MCP tool calls: `<server>/<tool> <args>` (`utils.ts:541-546`). Note pi's guard here is
+    // `args.tool && typeof args.tool === "string"`, i.e. a NON-EMPTY string (JS falsiness), so an
+    // empty `tool` falls through to the rest of the cascade.
+    if let Some(tool) = map.get("tool").and_then(serde_json::Value::as_str)
+        && !tool.is_empty()
+    {
+        let server = map
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{s}/"))
+            .unwrap_or_default();
+        let tool_args = map
+            .get("args")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" {}", s.chars().take(40).collect::<String>()))
+            .unwrap_or_default();
+        return format!("{server}{tool}{tool_args}");
+    }
+
+    if let Some(preview) = preview_array(map.get("queries")) {
+        return truncate_preview(&preview, 60);
+    }
+    if let Some(query) = str_field("query") {
+        return truncate_preview(query, 60);
+    }
+    if let Some(workflow) = str_field("workflow") {
+        return format!("workflow={}", truncate_preview(workflow, 48));
+    }
+    if let Some(url) = str_field("url") {
+        return truncate_preview(url, 60);
+    }
+    if let Some(preview) = preview_array(map.get("urls")) {
+        return truncate_preview(&preview, 60);
+    }
+    if let Some(prompt) = str_field("prompt") {
+        return truncate_preview(prompt, 60);
+    }
+
+    // pi `previewKeys` (`utils.ts:555`), in pi's own order. Note pi's guard here is
+    // `args[key] && typeof args[key] === "string"` — non-EMPTY, but NOT trim-checked, so a
+    // whitespace-only value wins this rung where it would have lost the named rungs above.
+    for key in ["command", "path", "file_path", "pattern", "query", "url", "task", "describe", "search"]
+    {
+        if let Some(value) = map.get(key).and_then(serde_json::Value::as_str)
+            && !value.is_empty()
+        {
+            return truncate_preview(value, 60);
+        }
+    }
+
+    // Fallback: the first array- or string-valued member, rendered `key=value` (`utils.ts:564-571`).
+    for (key, value) in map {
+        if let Some(preview) = preview_array(Some(value)) {
+            return format!("{key}={}", truncate_preview(&preview, 50));
+        }
+        if let Some(text) = value.as_str()
+            && !text.is_empty()
+        {
+            return format!("{key}={}", truncate_preview(text, 50));
+        }
+    }
+    String::new()
+}
+
 /// pi `shortenPath` (`formatters.ts:127-133`): replace a leading `$HOME` prefix with `~`.
 #[must_use]
 pub fn shorten_path(path: &str) -> String {

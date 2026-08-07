@@ -305,6 +305,27 @@ pub enum NdjsonEvent {
 /// Per arch-SA §5.1's ownership invariant, a `SpawnedChild` is owned by exactly one task at a
 /// time — never shared bare across threads (mirrors arch-08 §5.1's "single-thread-per-Store"
 /// invariant for WASM instances, applied here to child-process ownership instead).
+/// One step of a child's stdout read loop, as returned by [`SpawnedChild::next_event_or_exit`].
+///
+/// [`SpawnedChild::next_event`] can only ever report "a line" or "EOF", which silently assumes EOF
+/// always arrives once the child is done. It does not: stdout's write end is inherited by every
+/// descendant, so a child that exits while a surviving grandchild still holds that pipe produces
+/// **no EOF at all**. A read loop with only those two outcomes waits forever on something that can
+/// never happen. [`Self::Exited`] is the missing third outcome.
+#[derive(Debug)]
+pub enum ChildStep {
+    /// A stdout line arrived — or reading/teeing it failed, exactly as
+    /// [`SpawnedChild::next_event`] reports it.
+    Line(Result<NdjsonLine, SubagentError>),
+    /// stdout reached EOF: the ordinary end of a well-behaved child.
+    Eof,
+    /// The process exited while its stdout is STILL OPEN (a surviving grandchild inherited the
+    /// write end). Buffered lines written before the exit may still be readable, so the caller
+    /// should keep draining under a bounded window rather than stopping here — but it must no
+    /// longer wait on an EOF that will never come.
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
 pub struct SpawnedChild {
     child: tokio::process::Child,
     stdout_lines: Lines<BufReader<ChildStdout>>,
@@ -368,11 +389,66 @@ impl SpawnedChild {
     /// for a real-process proof of this ordering (not merely an assertion about `Command`'s
     /// documented behavior).
     ///
+    /// # Temp-file cleanup on the constructor's OWN failure paths (R-SA-067)
+    ///
+    /// This function takes `spec` BY VALUE, so on every early error return the
+    /// [`ChildSpawnSpec::temp_files`] list — which is the only record of the 0600 task/system-prompt
+    /// temp files written by [`ChildSpawnSpec::resolve_task_arg`] — would simply be dropped, with
+    /// no `SpawnedChild` ever constructed for [`SpawnedChild::terminate`]/[`SpawnedChild::finish`]
+    /// to clean up from. The production call site (`exec/mod.rs`'s attempt driver) turns an `Err`
+    /// here into a failed attempt record and moves on, so nothing downstream ever learns those
+    /// paths existed. A missing/non-executable `cyrup` binary is the ordinary way this happens, and
+    /// it happens once per fallback attempt — so a leak here is a *repeating* leak of world-
+    /// readable-to-the-owner prompt text into the scratch dir. Every error return therefore routes
+    /// through [`cleanup_temp_files`] first. This mirrors pi, which cleans the temp dir on the
+    /// spawn-error path exactly as it does on the normal close path (`execution.ts` v0.34.0:
+    /// `proc.on("error", …)` → `cleanupTempDir(tempDir)` at :797, matching :756 on `close`).
+    ///
     /// # Errors
     ///
     /// Returns [`SubagentError::Spawn`] if the child fails to spawn, or if the `.jsonl` tee
     /// artifact cannot be created.
-    pub async fn spawn(spec: ChildSpawnSpec, jsonl_path: &Path) -> Result<Self, SubagentError> {
+    pub async fn spawn(mut spec: ChildSpawnSpec, jsonl_path: &Path) -> Result<Self, SubagentError> {
+        // `temp_files` is lifted out of `spec` up front so the single `Err` arm below owns it on
+        // every failure path, and the `Ok` arm hands the very same list to the constructed child.
+        let temp_files = std::mem::take(&mut spec.temp_files);
+        match Self::spawn_wired(&spec, jsonl_path).await {
+            Ok((child, stdout, stderr, jsonl_writer)) => Ok(Self {
+                child,
+                stdout_lines: BufReader::new(stdout).lines(),
+                stderr_lines: Some(BufReader::new(stderr).lines()),
+                jsonl_writer,
+                temp_files,
+                exited: false,
+            }),
+            Err(err) => {
+                // R-SA-067: the child never came into existence (or never became observable), so
+                // this is the only cleanup opportunity these paths will ever get.
+                cleanup_temp_files(&temp_files);
+                Err(err)
+            }
+        }
+    }
+
+    /// The fallible half of [`SpawnedChild::spawn`]: everything that can fail, borrowing `spec` so
+    /// its `temp_files` stay owned by the caller and can be cleaned up on any error. Returns the
+    /// four pieces `spawn` assembles into a `SpawnedChild`.
+    ///
+    /// Note the ordering guarantee this split preserves: the child is spawned LAST-but-one and the
+    /// `.jsonl` writer is created after it, so a writer-creation failure leaves a live child. That
+    /// child is `start_kill`ed here rather than orphaned — see the call site below.
+    async fn spawn_wired(
+        spec: &ChildSpawnSpec,
+        jsonl_path: &Path,
+    ) -> Result<
+        (
+            tokio::process::Child,
+            ChildStdout,
+            ChildStderr,
+            BoundedJsonlWriter,
+        ),
+        SubagentError,
+    > {
         let argv = spec.build_argv();
 
         let mut command = tokio::process::Command::new(&spec.command.binary);
@@ -406,27 +482,26 @@ impl SpawnedChild {
 
         let mut child = command.spawn().map_err(SubagentError::Spawn)?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("child stdout not piped")))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("child stderr not piped")))?;
+        // Past this point a real OS process is alive but no `SpawnedChild` exists yet, so nothing
+        // downstream can ever reap or signal it — every remaining failure kills it here rather
+        // than orphaning a detached process group (see `command.process_group(0)` above) that
+        // would otherwise outlive the whole run holding its pipes open.
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = child.start_kill();
+            return Err(SubagentError::Spawn(std::io::Error::other(
+                "child stdout/stderr not piped",
+            )));
+        };
 
-        let jsonl_writer = BoundedJsonlWriter::create(jsonl_path)
-            .await
-            .map_err(SubagentError::Spawn)?;
+        let jsonl_writer = match BoundedJsonlWriter::create(jsonl_path).await {
+            Ok(writer) => writer,
+            Err(err) => {
+                let _ = child.start_kill();
+                return Err(SubagentError::Spawn(err));
+            }
+        };
 
-        Ok(Self {
-            child,
-            stdout_lines: BufReader::new(stdout).lines(),
-            stderr_lines: Some(BufReader::new(stderr).lines()),
-            jsonl_writer,
-            temp_files: spec.temp_files,
-            exited: false,
-        })
+        Ok((child, stdout, stderr, jsonl_writer))
     }
 
     /// The OS process id of the live child, when available (the child may already have exited
@@ -465,6 +540,59 @@ impl SpawnedChild {
 
         let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
         Some(Ok(NdjsonLine { raw: line, parsed }))
+    }
+
+    /// [`SpawnedChild::next_event`], plus the third outcome that method cannot express: the process
+    /// exiting while its stdout stays open. See [`ChildStep`] for why that is not hypothetical.
+    ///
+    /// The race lives INSIDE this method on purpose. A caller cannot put `next_event()` and
+    /// `wait()` in two arms of its own `tokio::select!` — both need `&mut SpawnedChild`, so the
+    /// borrow checker rejects it. That is why the executor's read loop had no exit arm at all: not
+    /// an oversight about the failure mode, a structural block on expressing it. Racing the two
+    /// disjoint fields behind a single `&mut` borrow is what unblocks it.
+    ///
+    /// `biased` with stdout FIRST is load-bearing: when a line and the exit are ready in the same
+    /// poll, the line wins, so a child's final output is never dropped in favour of its own exit
+    /// signal. Both halves are cancellation-safe (`Lines::next_line` retains partial data in its
+    /// buffer; `Child::wait` records the status), which the surrounding loop already depends on —
+    /// it has raced `next_event()` against cancel/deadline arms since it was written.
+    ///
+    /// After an [`ChildStep::Exited`] the child is marked reaped and this method degrades to a pure
+    /// stdout read, so a caller that keeps draining never double-`wait()`s.
+    pub async fn next_event_or_exit(&mut self) -> ChildStep {
+        let Self {
+            child,
+            stdout_lines,
+            jsonl_writer,
+            exited,
+            ..
+        } = self;
+
+        let read = if *exited {
+            stdout_lines.next_line().await
+        } else {
+            tokio::select! {
+                biased;
+                line = stdout_lines.next_line() => line,
+                status = child.wait() => {
+                    *exited = true;
+                    return ChildStep::Exited(status);
+                }
+            }
+        };
+
+        let line = match read {
+            Ok(Some(line)) => line,
+            Ok(None) => return ChildStep::Eof,
+            Err(err) => return ChildStep::Line(Err(SubagentError::Spawn(err))),
+        };
+
+        if let Err(err) = jsonl_writer.write_line(&line).await {
+            return ChildStep::Line(Err(SubagentError::Spawn(err)));
+        }
+
+        let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
+        ChildStep::Line(Ok(NdjsonLine { raw: line, parsed }))
     }
 
     /// Move the child's stderr reader out of this [`SpawnedChild`] so the executor can drain it
@@ -529,11 +657,29 @@ impl SpawnedChild {
     /// signal-send failures are swallowed by [`crate::spawn::signal::terminate`] per that
     /// function's own documented contract.
     pub async fn terminate(
-        mut self,
+        self,
         cancel: &CancelToken,
     ) -> std::io::Result<signal::TerminationOutcome> {
+        self.terminate_with_graces(cancel, signal::EscalationGraces::default())
+            .await
+    }
+
+    /// [`SpawnedChild::terminate`] with the ladder's two inter-rung grace periods supplied
+    /// explicitly — see [`signal::EscalationGraces`]. Production goes through
+    /// [`SpawnedChild::terminate`]; this exists so a test can assert WHICH escalation rung ended
+    /// the child without that assertion secretly depending on the OS reaping it inside a
+    /// one-second wall clock.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`SpawnedChild::terminate`]'s.
+    pub async fn terminate_with_graces(
+        mut self,
+        cancel: &CancelToken,
+        graces: signal::EscalationGraces,
+    ) -> std::io::Result<signal::TerminationOutcome> {
         self.exited = true;
-        let outcome = signal::terminate(self.child, cancel).await;
+        let outcome = signal::terminate_with_graces(self.child, cancel, graces).await;
         cleanup_temp_files(&self.temp_files); // R-SA-067: cleaned up on this (failure/cancel) path too
         outcome
     }
@@ -602,7 +748,12 @@ fn cleanup_temp_files(paths: &[PathBuf]) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use std::collections::HashMap as StdHashMap;
@@ -799,6 +950,60 @@ mod tests {
             binary: sh_path,
             base_args: vec!["-c".to_string(), script.to_string()],
         }
+    }
+
+    /// SUBA-S06: a child that exits while a surviving grandchild still holds its stdout open never
+    /// produces EOF, so a read loop whose only outcomes are "line" and "EOF" waits forever on
+    /// something that cannot happen. The executor's `drive_attempt` was exactly that loop: with no
+    /// `timeoutMs` and no terminal assistant stop from the child, not one of its arms could fire,
+    /// and the tool call hung permanently while the activity tick spun once a second.
+    ///
+    /// BOTH halves are asserted on purpose. A fix for a hang is only meaningful if the old shape
+    /// demonstrably hung, and a test that just checks the new call works would pass just as
+    /// happily against a child that closes stdout normally — i.e. against the case that was never
+    /// broken.
+    #[tokio::test]
+    async fn a_child_that_exits_holding_stdout_open_reports_exited_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        // `sleep 30 &` inherits stdout's write end; the direct child then exits immediately. The
+        // pipe stays open long after the process this crate waits on is gone.
+        let spec = ChildSpawnSpec {
+            command: sh_command("sleep 30 & exit 0"),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: StdHashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: Vec::new(),
+        };
+
+        // The pre-fix shape: EOF cannot arrive, so this waits out the whole budget.
+        let mut hung = SpawnedChild::spawn(spec.clone(), &dir.path().join("hang.jsonl"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), hung.next_event())
+                .await
+                .is_err(),
+            "next_event() must HANG here — if it ever starts returning, the failure mode SUBA-S06 \
+             fixes has changed shape, and next_event_or_exit()'s justification needs re-checking \
+             rather than the assertion being deleted"
+        );
+        let _ = hung.terminate(&CancelToken::new()).await;
+
+        // The fix: process exit is itself a wake condition, so the loop is never stranded.
+        let mut child = SpawnedChild::spawn(spec, &dir.path().join("exit.jsonl"))
+            .await
+            .unwrap();
+        let step = tokio::time::timeout(Duration::from_secs(5), child.next_event_or_exit())
+            .await
+            .expect("next_event_or_exit() must observe the exit rather than hang");
+        match step {
+            ChildStep::Exited(status) => {
+                assert!(status.unwrap().success(), "the child exited 0");
+            }
+            other => panic!("expected ChildStep::Exited, got {other:?}"),
+        }
+        let _ = child.terminate(&CancelToken::new()).await;
     }
 
     /// A real spawned child's argv is EXACTLY `base_args` then `args` then the task argument —
@@ -1208,9 +1413,21 @@ mod tests {
         let pid = child.id().expect("live child has a pid");
 
         let cancel = CancelToken::new();
+        // A GENEROUS stage-1 grace, deliberately not the 1000ms production constant. The
+        // behavioural claim under test is "a plain `sh` loop dies to SIGINT alone, so the ladder
+        // stops at rung 1" — asserting that against `SIGINT_GRACE` silently also asserts "and the
+        // OS reaps it, and this task gets scheduled, inside one second", which is false on a loaded
+        // machine: with all cores pinned this test escalated to `Sigterm` after exactly 1.01s, i.e.
+        // it failed on the wall clock while the SIGINT it claims to test had worked perfectly.
+        // `SIGINT_GRACE` itself stays at 1000ms — it is the production value and it is correct;
+        // only the test's assumption that reaping always beats it was wrong.
+        let graces = signal::EscalationGraces {
+            sigint: std::time::Duration::from_secs(30),
+            ..signal::EscalationGraces::default()
+        };
         let started = tokio::time::Instant::now();
         let outcome = child
-            .terminate(&cancel)
+            .terminate_with_graces(&cancel, graces)
             .await
             .expect("terminate confirms real exit");
 
@@ -1220,7 +1437,7 @@ mod tests {
             "a plain sh loop (no signal traps) must die to SIGINT alone"
         );
         assert!(
-            started.elapsed() < signal::SIGINT_GRACE,
+            started.elapsed() < graces.sigint,
             "a SIGINT-obeying child must not require escalation past stage 1"
         );
 

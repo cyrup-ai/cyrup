@@ -203,6 +203,25 @@ impl CyrupBuilder {
     /// the session tree, assembles the system prompt, and loads any extensions registered via
     /// [`CyrupBuilder::customize`] — all via [`cyrup_session_svc::SessionBuilder`].
     ///
+    /// The returned session is **bound**: SEAM-026/SEAM-001 — this calls
+    /// [`cyrup_session_svc::AgentSession::bind_extensions`], which announces
+    /// `session_start{reason:"startup"}` to every loaded extension, exactly as pi's hosts do right
+    /// after constructing a session (`bindExtensions()` from print-mode.ts:73, rpc-mode.ts:318 and
+    /// interactive-mode.ts:1698, whose tail emits `_sessionStartEvent`, agent-session.ts:389+2250).
+    /// Before this the documented one-call SDK path never bound at all, so anything initialising on
+    /// that hook — audit loggers, intercom identity registration, permission policy load — silently
+    /// no-op'd for embedders.
+    ///
+    /// Pair every built session with [`Session::close`], the `session_shutdown` mirror image.
+    ///
+    /// Runtime-tier control ops (`ctx.newSession()`/`fork()`/`switchSession()`/`reload()`) still
+    /// need a host that can REPLACE the session, which a single `Session` by construction cannot be;
+    /// they fail with `NoRuntimeHost` here. An embedder that needs them builds a
+    /// [`cyrup_session_svc::SessionFactory`] + [`cyrup_session_svc::AgentSessionRuntime`] instead
+    /// (both re-exported from this crate) — that is the same tier pi's own hosts sit on. This path
+    /// cannot construct one for you because a customizer is `FnOnce(SessionBuilder) -> SessionBuilder`
+    /// and a factory must re-apply it on every replacement.
+    ///
     /// # Errors
     /// Returns [`crate::SdkError`] if the underlying facade build fails (e.g. an unknown model
     /// pattern, an empty provider catalog, or a failing extension `init`).
@@ -215,7 +234,8 @@ impl CyrupBuilder {
     /// #     config: cyrup_sdk::SessionConfig,
     /// # ) -> cyrup_sdk::SdkResult<()> {
     /// let session = cyrup_sdk::Cyrup::builder().build_session(provider, config).await?;
-    /// # let _ = session;
+    /// // … drive the session …
+    /// session.close().await;
     /// # Ok(()) }
     /// ```
     pub async fn build_session(
@@ -227,7 +247,12 @@ impl CyrupBuilder {
         for customize in self.customizers {
             builder = customize(builder);
         }
-        Ok(Session::new(builder.build().await?))
+        let session = Session::new(builder.build().await?);
+        // SEAM-026/SEAM-001: announce the session to its extensions. Runs AFTER `Session::new`'s
+        // `into_shared()` so the self-handle (post-run driver) is already bound when a
+        // `session_start` handler runs — the same order `AgentSessionRuntime::create` uses.
+        session.agent_session().bind_extensions().await;
+        Ok(session)
     }
 
     /// Assemble a session, constructing the provider automatically from `config.model_pattern` via

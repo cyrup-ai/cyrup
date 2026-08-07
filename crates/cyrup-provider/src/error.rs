@@ -84,8 +84,25 @@ pub enum ProviderError {
     #[error("model source refresh failed: {0}")]
     ModelSource(#[source] BoxErr),
     /// Non-2xx HTTP response from the vendor. Code `http`.
+    ///
+    /// `message` is the response body, trimmed and capped at
+    /// [`MAX_PROVIDER_ERROR_BODY_CHARS`](crate::utils::error_body::MAX_PROVIDER_ERROR_BODY_CHARS)
+    /// by the transport before it gets here — it reaches the transcript verbatim through
+    /// [`into_error_message`](Self::into_error_message), so it must never be unbounded.
     #[error("http {status}: {message}")]
     Http { status: u16, message: String },
+    /// A server-requested retry delay exceeded `StreamOptions.max_retry_delay_ms`, so the request
+    /// failed immediately instead of sleeping (Pi `validateServerRetryDelayMs`,
+    /// provider-retry.ts:36-48). Code `http`.
+    ///
+    /// Pi throws a bare `Error` here, and its catch block runs the result through
+    /// `formatProviderError(normalizeProviderError(error))`, which — with no SDK status/body fields
+    /// to probe — returns `error.message` unchanged. The `Display` is therefore the message alone,
+    /// with no `"…: "` prefix, so `errorMessage` is byte-identical to Pi's. That wording is also
+    /// what makes the turn-level classifier retry it: `"retry delay"` is one of
+    /// [`crate::utils::retry`]'s retryable patterns (Pi `retry.ts:70-71`).
+    #[error("{0}")]
+    RetryDelay(String),
     /// Connection / TLS / request transport failure. Code `transport`.
     #[error("transport error: {0}")]
     Transport(#[source] BoxErr),
@@ -110,7 +127,7 @@ impl ProviderError {
             ProviderError::UnknownProvider(_) => "provider",
             ProviderError::NoApiImpl(_) => "stream",
             ProviderError::ModelSource(_) => "model_source",
-            ProviderError::Http { .. } => "http",
+            ProviderError::Http { .. } | ProviderError::RetryDelay(_) => "http",
             ProviderError::Transport(_) => "transport",
             ProviderError::Decode(_) => "decode",
             ProviderError::Aborted => "aborted",
@@ -142,6 +159,7 @@ impl ProviderError {
                 status: *status,
                 message: message.clone(),
             },
+            ProviderError::RetryDelay(s) => ProviderError::RetryDelay(s.clone()),
             ProviderError::Transport(e) => ProviderError::Transport(e.to_string().into()),
             ProviderError::Decode(s) => ProviderError::Decode(s.clone()),
             ProviderError::Aborted => ProviderError::Aborted,

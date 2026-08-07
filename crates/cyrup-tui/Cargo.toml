@@ -80,6 +80,10 @@ cyrup-agent = { workspace = true }
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true
+# Dev-only: `LiveHostServices::new` takes an `Arc<dyn ProcOps>`, which only `cyrup-tools` supplies —
+# the extension-UI-effect test builds a real `LiveHostServices` so it drives the SAME
+# `emit_ui_effect` drop/deliver seam production does, not a stand-in.
+cyrup-tools = { workspace = true }
 # EXT-006: the renderer-routing test declares a `NativeExtension` (an `#[async_trait]` trait) so it
 # can register a renderer the way a real built-in does.
 async-trait = { workspace = true }

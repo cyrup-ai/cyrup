@@ -1,13 +1,21 @@
-// cyrup:ext@0.1.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.3.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface mirrors Pi's 30-event catalog 1:1 (extensions/types.ts:1133-1171):
-// the host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
-package cyrup:ext@0.1.0;
+// The `events` interface exports 31 `on-*` event hooks, mirroring Pi's `pi.on(...)` catalog
+// (extensions/types.ts:1198-1239, 33 overloads — `session_info_changed` and
+// `before_provider_headers` have no export here). The host calls only the exports a guest
+// subscribed to (the subscription gate, R-08-034).
+//
+// VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
+// change to an EXPORT — added, removed, or RE-SIGNED — bumps the MINOR. A guest built against an
+// older MINOR either lacks the export or has it at the old signature, so it must be refused by
+// `ExtensionManifest::check_world` before instantiation rather than trapping inside wasmtime.
+// `crates/cyrup-ext/tests/wit_world_sync.rs` enforces that tie, in BOTH copies.
+package cyrup:ext@0.4.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -497,11 +505,19 @@ interface ext-tools {
   get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description}
 }
 
-// Read-only ctx state (Pi `ExtensionContext`, extensions/types.ts:329-346). Pi puts `isIdle`,
-// `hasPendingMessages`, `isProjectTrusted` and `getSystemPrompt` on the BASE context — available to
-// EVERY handler, not just command handlers — so these are deliberately NOT tier-gated. The native
-// built-in path reads the same four values off `HostCtx::rich()`.
+// Read-only ctx state (Pi `ExtensionContext`, extensions/types.ts:305-347). Pi puts `mode`, `hasUI`,
+// `isIdle`, `hasPendingMessages`, `isProjectTrusted` and `getSystemPrompt` on the BASE context —
+// available to EVERY handler, not just command handlers — so these are deliberately NOT tier-gated.
+// The native built-in path reads the same six values off `HostCtx` / `HostCtx::rich()`.
 interface ctx-state {
+  use types.{ext-mode};
+
+  // Pi `ctx.mode` (types.ts:311): the run mode — a guest guards terminal-only UI (custom
+  // components) on `tui`. A FIELD in Pi; a getter here because WIT imports are functions.
+  get-mode:             func() -> ext-mode;
+  // Pi `ctx.hasUI` (types.ts:313): "Whether dialog-capable UI is available (true in TUI and RPC
+  // modes)" — the guard a guest checks before `ui.confirm`/`input`/`select`.
+  has-ui:               func() -> bool;
   // Pi `ctx.isIdle()` (types.ts:333): false while an agent run is in flight.
   is-idle:              func() -> bool;
   // Pi `ctx.hasPendingMessages()` (types.ts:341): queued user messages awaiting the next turn.
@@ -524,7 +540,11 @@ interface control {
   fork:          func(entry-id: string, opts-json: string) -> result<_, string>;
   navigate:      func(entry-id: string, opts-json: string) -> result<_, string>;
   reload:        func() -> result<_, string>;
-  compact:       func() -> result<_, string>;
+  // compact (Pi `ctx.compact(options?)`, types.ts:344): opts-json carries `CompactOptions`
+  // (types.ts:296-300) — `{customInstructions}`. Pi's `onComplete`/`onError` callbacks cannot cross
+  // the component boundary as function values; a guest observes completion by subscribing to the
+  // `session_compact` event (Pi's own `SessionCompactEvent` carries the produced entry).
+  compact:       func(opts-json: string) -> result<_, string>;
   wait-idle:     func() -> result<_, string>;
   // send-message (types.ts:1223): opts-json carries {triggerTurn, deliverAs}.
   send-message:      func(message-json: string, opts-json: string) -> result<_, string>;

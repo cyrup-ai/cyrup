@@ -20,7 +20,10 @@ pub enum Credential {
     Oauth {
         refresh: String,
         access: String,
-        /// Unix seconds.
+        /// Expiry deadline in Unix **milliseconds** — the on-disk `auth.json` contract Pi writes
+        /// (`Date.now() + expires_in * 1000`, ai/src/auth/oauth/anthropic.ts:225) and compares
+        /// against `Date.now()` (ai/src/auth/resolve.ts:110). Not seconds; see
+        /// [`crate::auth::resolve`]'s clock.
         expires: i64,
         #[serde(flatten)]
         ext: serde_json::Map<String, serde_json::Value>,

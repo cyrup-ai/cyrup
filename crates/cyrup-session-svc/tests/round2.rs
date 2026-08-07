@@ -175,17 +175,32 @@ async fn builtin_prompt_snippets_and_guidelines_reach_the_system_prompt() {
     let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
     let p = session.system_prompt().to_string();
 
-    // (a) "Available tools" carries Pi's verbatim snippets, not the old paraphrases.
+    // (a) "Available tools" carries Pi's verbatim snippets, not the old paraphrases — for the
+    // DEFAULT-ACTIVE tools only. pi's own builder hardcodes the same four as its fallback:
+    // `const tools = selectedTools || ["read", "bash", "edit", "write"]` (`system-prompt.ts:80`),
+    // and lists a tool only if it is in that set.
     for want in [
         "- read: Read file contents",
         "- write: Create or overwrite files",
         "- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         "- bash: Execute bash commands (ls, grep, find, etc.)",
+    ] {
+        assert!(p.contains(want), "missing snippet {want:?} in system prompt:\n{p}");
+    }
+    // ...and NOT for the three built-ins pi does not activate by default. This assertion is the
+    // parity property: it previously required all seven, which is what encoded the divergence —
+    // cyrup advertised `grep`/`find`/`ls` in every request's tool array AND system prompt, so the
+    // model routed searches to them instead of `bash`, producing different transcripts than pi for
+    // identical inputs. They remain enable-able via `set_active_tools_by_name`.
+    for absent in [
         "- grep: Search file contents for patterns (respects .gitignore)",
         "- find: Find files by glob pattern (respects .gitignore)",
         "- ls: List directory contents",
     ] {
-        assert!(p.contains(want), "missing snippet {want:?} in system prompt:\n{p}");
+        assert!(
+            !p.contains(absent),
+            "{absent:?} must NOT be in the default system prompt (pi system-prompt.ts:80):\n{p}"
+        );
     }
     for gone in [
         "Read a file from the workspace",
@@ -293,6 +308,71 @@ async fn runtime_import_from_jsonl_switches_session() {
         Err(cyrup_session_svc::SessionServiceError::ImportFileNotFound(_)) => {}
         other => panic!("expected ImportFileNotFound, got {other:?}"),
     }
+}
+
+/// Pi `importFromJsonl` copies into `this.session.sessionManager.getSessionDir()`
+/// (agent-session-runtime.ts:367) — the ACTIVE session's own per-cwd directory
+/// (`<root>/--<enc-cwd>--`, session-manager.ts:484,999-1000), never the sessions ROOT. Landing it in
+/// the root leaves the imported session invisible to every listing path: `listing::list` scans
+/// `layout.dir()` and `list_all` only descends into per-project subdirectories.
+#[tokio::test]
+async fn runtime_import_lands_in_the_per_cwd_session_dir_and_is_listable() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux.clone();
+
+    // Source transcript exported to a standalone file outside the sessions tree.
+    let source = SessionBuilder::new(provider.clone(), base_config(&fx)).build().await.unwrap();
+    let _ = source.prompt("seed message").await.unwrap();
+    source.wait_for_idle().await;
+    let export_path = fx.cwd.join("exported.jsonl");
+    source.export_to_jsonl(Some(&export_path)).await.unwrap();
+    drop(source);
+
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+
+    // The live session's own directory — the per-cwd `--<enc-cwd>--` dir, one level below the root.
+    let sessions_root = fx.agent_dir.join("sessions");
+    let live_file = runtime.session().await.session_file().await.expect("persisted session");
+    let per_cwd_dir = live_file.parent().expect("session file has a parent").to_path_buf();
+    assert_ne!(
+        per_cwd_dir, sessions_root,
+        "fixture precondition: the default layout must nest a per-cwd dir under the root"
+    );
+
+    let result = runtime.import_from_jsonl(&export_path, None).await.expect("import");
+    assert!(!result.cancelled);
+
+    // The copy lands beside the live session, NOT in the sessions root.
+    assert!(
+        per_cwd_dir.join("exported.jsonl").exists(),
+        "import must copy into the per-cwd session dir {}",
+        per_cwd_dir.display()
+    );
+    assert!(
+        !sessions_root.join("exported.jsonl").exists(),
+        "import must NOT copy into the sessions root {}",
+        sessions_root.display()
+    );
+    // ...and the switched-to session is the copy in that dir.
+    let switched = runtime.session().await.session_file().await.expect("imported session file");
+    assert_eq!(switched, per_cwd_dir.join("exported.jsonl"));
+
+    // Consequence Pi relies on: the imported session is visible to both listing paths.
+    let listed = cyrup_session::listing::list_in_dir(&per_cwd_dir, None, None);
+    assert!(
+        listed.iter().any(|s| s.path == per_cwd_dir.join("exported.jsonl")),
+        "imported session missing from the per-cwd listing: {:?}",
+        listed.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+    );
+    let all = cyrup_session::listing::list_all(&cyrup_session::layout::SessionsRoot(sessions_root));
+    assert!(
+        all.iter().any(|s| s.path == per_cwd_dir.join("exported.jsonl")),
+        "imported session missing from the cross-project listing: {:?}",
+        all.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
+    );
 }
 
 // ------------------------------------------------------------- custom-message deliverAs ----

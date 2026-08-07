@@ -26,7 +26,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -132,6 +132,19 @@ pub struct InputEditor {
     /// (`interactive-mode.ts:3533-3541`, spec/tui/03 §3.3). Recolored green in bash mode. Updated by
     /// the app on `ThinkingLevelChanged`; `"medium"` until set.
     thinking_level: String,
+    /// Horizontal padding, in columns, applied INSIDE the top/bottom rules (Pi `editorPaddingX` →
+    /// `CustomEditor({paddingX})`, `tui/src/components/editor.ts:349,484-489`). `0` (Pi's default)
+    /// keeps the historical flush layout. The rules themselves still span the full width — Pi pads
+    /// only the text rows (`editor.ts:522` left/right pad vs `:530` `horizontal.repeat(width)`).
+    padding_x: u16,
+    /// Whether the terminal's real (hardware) cursor is placed on the caret each frame (Pi
+    /// `showHardwareCursor` → `TUI.setShowHardwareCursor`, `tui/src/tui.ts:346-352,1659-1663`).
+    /// **Off** by default, as Pi's (`tui.ts:312`, `settings-manager.ts:1182` — only an explicit
+    /// setting or `PI_HARDWARE_CURSOR=1` turns it on): the always-drawn reverse-video soft cursor is
+    /// the caret the user sees, and Pi calls `terminal.hideCursor()` on every frame while this is
+    /// false. Ratatui couples position and visibility (`Terminal::draw` hides the cursor whenever
+    /// `Frame::set_cursor_position` was not called), so this flag gates that call.
+    show_hardware_cursor: bool,
 }
 
 /// One **visual** line of the wrapped editor: a contiguous slice of a logical line that fits the
@@ -180,7 +193,57 @@ impl InputEditor {
             pastes: BTreeMap::new(),
             paste_counter: 0,
             thinking_level: "medium".to_string(),
+            padding_x: 0,
+            show_hardware_cursor: false,
         }
+    }
+
+    /// Set the horizontal editor padding (Pi `CustomEditor.setPaddingX`,
+    /// `tui/src/components/editor.ts:370-376`): non-finite → `0`, else `max(0, floor(padding))`.
+    /// The `/settings` grid cycles `0..=3` and [`cyrup_config::SettingsManager::set_editor_padding_x`]
+    /// clamps the persisted value to that range; this setter reproduces Pi's own coercion so a
+    /// hand-edited `editorPaddingX` can never render negative or fractional padding.
+    pub fn set_padding_x(&mut self, padding: i64) {
+        self.padding_x = padding.clamp(0, u16::MAX as i64) as u16;
+    }
+
+    /// The current horizontal padding (Pi `getPaddingX`, `editor.ts:365-367`).
+    #[must_use]
+    pub fn padding_x(&self) -> u16 {
+        self.padding_x
+    }
+
+    /// Show/hide the terminal's real cursor (Pi `TUI.setShowHardwareCursor`, `tui/src/tui.ts:346`).
+    /// See [`Self::show_hardware_cursor`] for why this lives on the editor in cyrup.
+    pub fn set_show_hardware_cursor(&mut self, enabled: bool) {
+        self.show_hardware_cursor = enabled;
+    }
+
+    /// Whether the hardware cursor is placed each frame (Pi `getShowHardwareCursor`, `tui.ts:342`).
+    ///
+    /// Cyrup has no standalone `TUI` object owning terminal state — ratatui's `Terminal` does, and
+    /// the ONLY component that asks for a cursor position is this editor
+    /// ([`Self::cursor_in`] is the sole `Frame::set_cursor_position` caller in the crate), so the
+    /// flag rides here rather than on a `TUI` port that does not exist.
+    #[must_use]
+    pub fn show_hardware_cursor(&self) -> bool {
+        self.show_hardware_cursor
+    }
+
+    /// The padding actually applied at render width `width`, clamped exactly as Pi clamps it
+    /// (`editor.ts:483-484`: `min(paddingX, floor((width - 1) / 2))`) so the content column can
+    /// never be squeezed out of existence on a narrow terminal.
+    fn effective_padding(&self, width: u16) -> u16 {
+        self.padding_x.min(width.saturating_sub(1) / 2)
+    }
+
+    /// The text layout width inside `width` columns, after padding (Pi `editor.ts:485-489`):
+    /// `contentWidth = max(1, width - 2 * paddingX)`, and one column is reserved for the
+    /// end-of-line cursor cell ONLY when there is no padding for it to overflow into.
+    fn layout_width(&self, width: u16) -> u16 {
+        let pad = self.effective_padding(width);
+        let content = width.saturating_sub(pad.saturating_mul(2)).max(1);
+        if pad > 0 { content } else { content.saturating_sub(1).max(1) }
     }
 
     /// Set the reasoning level driving the editor's rule color (spec/tui/03 §3.3). Called by the app
@@ -1413,8 +1476,11 @@ impl InputEditor {
         let vcol = self.col.saturating_sub(vl.start);
         // Only the first visual row carries the prompt-glyph offset (`› `); later rows start flush.
         let prompt = if vi == 0 { PROMPT_W } else { 0 };
+        // The text rows start `editorPaddingX` columns in (`Padding::horizontal` on the render
+        // block), so the caret must too — Pi prefixes the same `leftPadding` (`editor.ts:522`).
         let x = area
             .x
+            .saturating_add(self.effective_padding(area.width))
             .saturating_add(prompt)
             .saturating_add(vcol.min(u16::MAX as usize) as u16);
         let y = area.y.saturating_add(1).saturating_add(vi.min(u16::MAX as usize) as u16);
@@ -1510,8 +1576,10 @@ impl Component for InputEditor {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         // Record the layout width so vertical (visual-line) motion wraps the same way it is drawn.
         // The editor has no side borders; one column is reserved for the end-of-line cursor cell
-        // (`editor.ts:471` `layout_width = content_width - 1`).
-        self.view_width = (area.width.saturating_sub(1)).max(1) as usize;
+        // (`editor.ts:471` `layout_width = content_width - 1`) — unless `editorPaddingX` gave the
+        // caret padding to overflow into (`editor.ts:489`).
+        let pad = self.effective_padding(area.width);
+        self.view_width = self.layout_width(area.width) as usize;
         // The rule color is the primary always-visible mode signal (spec/tui/03 §3.3): bash-green
         // while the buffer starts with `!`, else the escalating thinking-level color. The previous
         // hardwired bright-blue accent-on-focus was wrong (audit #3).
@@ -1520,10 +1588,15 @@ impl Component for InputEditor {
         } else {
             theme.thinking_border_style(&self.thinking_level)
         };
+        // `editorPaddingX` insets the TEXT only: ratatui's `Block` draws its top/bottom rules across
+        // the full `area` and applies `Padding` to the inner area the `Paragraph` fills, which is
+        // exactly Pi's split (`editor.ts:522` pads the text rows; `:530` repeats the rule glyph
+        // `width` times).
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_set(border::PLAIN)
-            .border_style(rule_style);
+            .border_style(rule_style)
+            .padding(Padding::horizontal(pad));
         // An accent prompt glyph `›` anchors the editor's first line; a reverse-video soft cursor cell
         // makes the caret visible every idle frame (overview §1.1 glyph vocab `prompt ›`; spec/tui/03
         // §3.4 reverse-video cursor; Pi `editor.ts:545-551`). Without these the body row paints blank
@@ -1572,7 +1645,12 @@ impl Component for InputEditor {
         }
         let para = Paragraph::new(lines).block(block).style(base);
         frame.render_widget(para, area);
-        if let Some((x, y)) = self.cursor_in(area) {
+        // Pi hides the terminal's real cursor unless `showHardwareCursor` is on (`tui.ts:1659-1663`
+        // `if (this.showHardwareCursor) showCursor() else hideCursor()`); ratatui's `Terminal::draw`
+        // hides it for us whenever no position was set, so the gate is the call itself.
+        if self.show_hardware_cursor
+            && let Some((x, y)) = self.cursor_in(area)
+        {
             frame.set_cursor_position((x, y));
         }
     }

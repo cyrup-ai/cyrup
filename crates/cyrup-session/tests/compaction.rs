@@ -769,7 +769,7 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
     let e2 = Entry::known(KnownEntry::Compaction {
         base: base("e2", Some("e1")),
         summary: "PRIOR SUMMARY TEXT that was compacted earlier here ok".into(),
-        first_kept_entry_id: EntryId::from("e1"),
+        first_kept_entry_id: Some(EntryId::from("e1")),
         tokens_before: 1234,
         details: None,
         usage: None,
@@ -1034,7 +1034,7 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
             },
             summary: prior_summary,
-            first_kept_entry_id: EntryId::from("e0"),
+            first_kept_entry_id: Some(EntryId::from("e0")),
             tokens_before: 99_999,
             details: None,
             usage: None,
@@ -1414,7 +1414,7 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
             },
             summary: "prior".to_string(),
-            first_kept_entry_id: EntryId::from("m0"),
+            first_kept_entry_id: Some(EntryId::from("m0")),
             tokens_before: 10,
             details: None,
             usage: None,
@@ -2253,4 +2253,94 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
         .expect("a branch summary is appended");
     let wide_prompt = wide_compactor.summarizer().prompts().pop().expect("one call");
     assert!(wide_prompt.contains("ABANDONED-0 "), "a 400k window fits the whole branch");
+}
+
+// ------------------------------------------- StopReason::Pending guard ------------------------
+
+/// A summarizer whose response never settled (`StopReason::Pending`) with plausible-looking body
+/// text — the shape a truncated summarization stream produces.
+struct PendingSummarizer;
+
+impl Summarizer for PendingSummarizer {
+    async fn complete(
+        &self,
+        _req: SummarizationRequest<'_>,
+        _cancel: CancelToken,
+    ) -> Result<AssistantMessage, CompactionError> {
+        Ok(faux_assistant_message(
+            vec![faux_text("HALF A SUMMA")],
+            StopReason::Pending,
+        ))
+    }
+}
+
+/// Compaction REPLACES history with the summary, so accepting an unsettled response destroys the
+/// transcript it was supposed to preserve.
+///
+/// All three summarization call sites (`compaction::summarize` x2, `compaction::branch`, and the
+/// branch-summary copy in `cyrup-session-svc/src/session.rs`) previously matched
+/// `Error => .. , Aborted => .. , _ => Ok(summary)`. That `_` arm silently accepted
+/// `StopReason::Pending` once the variant existed, which is the exact class of catch-all the
+/// truncated-stream fix closed on the decoder side — so it is closed here too.
+#[tokio::test]
+async fn an_unsettled_summarizer_response_is_rejected_not_treated_as_a_summary() {
+    let msgs = vec![
+        AgentMessage::Core(user("q1")),
+        AgentMessage::Core(assistant("a1")),
+    ];
+
+    let err = cyrup_session::compaction::generate_summary(
+        &PendingSummarizer,
+        &msgs,
+        &faux_model(),
+        1000,
+        None,
+        None,
+        ModelThinkingLevel::Off,
+        CancelToken::new(),
+    )
+    .await
+    .expect_err("a pending summarization must not be accepted as a summary");
+    assert!(
+        matches!(err, CompactionError::Summarization(_)),
+        "expected a summarization failure, got {err:?}"
+    );
+
+    let err = cyrup_session::compaction::generate_turn_prefix_summary(
+        &PendingSummarizer,
+        &msgs,
+        &faux_model(),
+        1000,
+        ModelThinkingLevel::Off,
+        CancelToken::new(),
+    )
+    .await
+    .expect_err("a pending turn-prefix summarization must not be accepted");
+    assert!(
+        matches!(err, CompactionError::Summarization(_)),
+        "expected a summarization failure, got {err:?}"
+    );
+}
+
+/// The control: a SETTLED response on the same path is still accepted, so the guard above is not
+/// simply "reject everything".
+#[tokio::test]
+async fn a_settled_summarizer_response_is_still_accepted() {
+    let msgs = vec![
+        AgentMessage::Core(user("q1")),
+        AgentMessage::Core(assistant("a1")),
+    ];
+    let out = cyrup_session::compaction::generate_summary(
+        &RecordingSummarizer::new(vec!["REAL SUMMARY"]),
+        &msgs,
+        &faux_model(),
+        1000,
+        None,
+        None,
+        ModelThinkingLevel::Off,
+        CancelToken::new(),
+    )
+    .await
+    .expect("a settled summarization must succeed");
+    assert!(out.text.contains("REAL SUMMARY"));
 }

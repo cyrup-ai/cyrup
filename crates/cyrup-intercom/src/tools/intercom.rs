@@ -143,13 +143,17 @@ impl IntercomTool {
                     );
                 }
                 if let Some(reply_to) = &params.reply_to {
-                    self.state
-                        .tracker
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mark_replied(reply_to);
+                    // `index.ts:1568` is `dismissIncomingAsk(replyTo)`, NOT a bare
+                    // `dismissPendingAsk`: the answered inbound message must also leave the
+                    // pending-idle queue, or the flush re-injects it once this run ends.
+                    crate::inbound::dismiss_incoming_ask(&self.state, reply_to);
                 }
-                Ok(text_result(format!("Message sent to {target}.")))
+                // `index.ts:1571`: `Message sent to ${to}` — the CALLER-SUPPLIED target, not the
+                // resolved id. pi deliberately splits the two (`const sendTo = await
+                // resolveSessionTarget(connectedClient, to) ?? to;`, `index.ts:1529`): it delivers
+                // to `sendTo` but reports `to`, so a send addressed to `reviewer` echoes back
+                // `reviewer` rather than the raw UUID the name resolved to.
+                Ok(text_result(format!("Message sent to {to}.")))
             }
             "ask" => {
                 let to = require(params.to, "ask requires `to`")?;
@@ -190,7 +194,12 @@ impl IntercomTool {
                         }),
                     );
                 }
-                Ok(text_result(reply))
+                // `index.ts:1669`: `**Reply from ${to}:**\n${replyText}${replyAttachments}`, keyed
+                // off the caller-supplied `to`. Without the header a transcript that has asked more
+                // than one peer cannot tell which of them answered. The attachment suffix is already
+                // inlined upstream-faithfully by `ask_and_wait` (`session_state.rs`
+                // `inline_reply_attachments`, `index.ts:1646-1649`), so `reply` already carries it.
+                Ok(text_result(format!("**Reply from {to}:**\n{reply}")))
             }
             "reply" => {
                 let message = require(params.message, "reply requires `message`")?;
@@ -217,17 +226,15 @@ impl IntercomTool {
                     })
                     .await
                     .map_err(to_tool_err)?;
-                // `index.ts:1692-1706`: markReplied runs ONLY on a confirmed delivery; a failed
-                // delivery either dismisses the pending ask (when the reason is exactly "Session not
-                // found") or, for any other failure reason, leaves the tracker untouched entirely so
-                // the ask remains pending for a retry.
-                {
-                    let mut tracker = self.state.tracker.lock().unwrap_or_else(|e| e.into_inner());
-                    if result.delivered {
-                        tracker.mark_replied(&target.message.id);
-                    } else if result.reason.as_deref() == Some("Session not found") {
-                        tracker.dismiss_pending_ask(&target.message.id);
-                    }
+                // `index.ts:1692-1706`: the dismissal runs ONLY on a confirmed delivery (`:1718`); a
+                // failed delivery still dismisses when the reason is exactly "Session not found"
+                // (`:1711`, the peer is gone — the ask can never be answered) but for any other
+                // failure reason leaves the state untouched entirely so the ask remains pending for
+                // a retry. Both live branches are pi's `dismissIncomingAsk`, which ALSO splices the
+                // message out of the pending-idle queue — without that, replying to a message that
+                // arrived mid-run gets it re-injected by the flush when the run ends.
+                if result.delivered || result.reason.as_deref() == Some("Session not found") {
+                    crate::inbound::dismiss_incoming_ask(&self.state, &target.message.id);
                 }
                 if result.delivered {
                     if let Some(services) = self.state.host_services() {
@@ -241,7 +248,9 @@ impl IntercomTool {
                             }),
                         );
                     }
-                    Ok(text_result(format!("Reply sent to {}.", target.from.id)))
+                    // `index.ts:1726`: `Reply sent to ${target.from.name || target.from.id}` —
+                    // name preferred over id (JS `||`, so a blank name falls through to the id).
+                    Ok(text_result(format!("Reply sent to {}.", display_name(&target.from))))
                 } else {
                     Err(ToolError::new(result.reason.unwrap_or_else(|| "reply not delivered".to_string())))
                 }
@@ -255,24 +264,51 @@ impl IntercomTool {
                     .unwrap_or_else(|e| e.into_inner())
                     .list_pending(now);
                 if pending.is_empty() {
-                    return Ok(text_result("No pending intercom asks."));
+                    return Ok(text_result("No unresolved inbound asks."));
                 }
+                // pi `index.ts:1747-1751`:
+                // `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago · ${preview}`
+                //
+                // The MESSAGE ID is the load-bearing column. `reply_tracker.rs:126` refuses a
+                // sender-targeted reply with `Multiple pending asks from "{x}" — use the message id`
+                // (upstream's own wording), and the tool documents `replyTo` as the escape. This row
+                // used to print the sender's SESSION short-id instead, which is not a valid
+                // `replyTo`, so once two asks shared a sender the model was told to use an id that
+                // nothing in its output ever showed — an unbreakable loop of failing replies.
+                //
+                // `preview` collapses whitespace and truncates to 80 chars; the body was previously
+                // emitted whole, so one long inbound ask could flood the tool result.
                 let rows: Vec<String> = pending
                     .iter()
                     .map(|c| {
                         let who = c.from.name.clone().unwrap_or_else(|| c.from.id.clone());
-                        format!("• {} ({}): {}", who, short_session_id(&c.from.id), c.message.content.text)
+                        let preview: String = c
+                            .message
+                            .content
+                            .text
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(80)
+                            .collect();
+                        let elapsed = now.saturating_sub(c.received_at) / 1000;
+                        format!("- {} · {} · {}s ago · {}", who, c.message.id, elapsed, preview)
                     })
                     .collect();
-                Ok(text_result(rows.join("\n")))
+                Ok(text_result(format!("**Pending asks:**\n{}", rows.join("\n"))))
             }
             "status" => {
-                let connected = client.is_connected();
+                // `index.ts:1765`: a four-line markdown block, not a pipe-delimited one-liner.
+                // `Connected: Yes` is a literal upstream — the branch only runs after
+                // `ensureConnected` has already succeeded (here: `connect::ensure_connected` above),
+                // so there is no "disconnected" rendering to reach. A failing `listSessions` is
+                // upstream's `Failed to get status: …` error result, which this crate renders as a
+                // `ToolError` throughout (cf. the `list` branch's `Failed to list sessions`).
                 let session_id = client.session_id().unwrap_or_else(|| "<none>".to_string());
-                let count = client.list_sessions().await.map(|s| s.len()).unwrap_or(0);
+                let count = client.list_sessions().await.map_err(to_tool_err)?.len();
                 Ok(text_result(format!(
-                    "intercom: {} | session id: {session_id} | active sessions: {count}",
-                    if connected { "connected" } else { "disconnected" }
+                    "**Intercom Status:**\nConnected: Yes\nSession ID: {session_id}\nActive sessions: {count}"
                 )))
             }
             other => Err(ToolError::new(format!("unknown intercom action \"{other}\""))),
@@ -297,6 +333,12 @@ fn require(value: Option<String>, msg: &str) -> Result<String, ToolError> {
 
 fn to_tool_err(e: crate::error::IntercomError) -> ToolError {
     ToolError::new(e.to_string())
+}
+
+/// `session.name || session.id` (`index.ts:1720,1726`). JS `||` is falsy-based, so an empty name
+/// falls through to the id — hence the `filter(|n| !n.is_empty())`.
+fn display_name(session: &SessionInfo) -> &str {
+    session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&session.id)
 }
 
 /// `formatSessionListRow` (`index.ts:400-406`).
@@ -399,6 +441,58 @@ mod tests {
     use crate::transport::spawn::wait_for_broker;
 
     use super::*;
+
+    /// pi `index.ts:1747-1751`. The MESSAGE ID is the load-bearing column, not decoration:
+    /// `reply_tracker.rs:126` refuses a sender-targeted reply with upstream's own wording
+    /// `Multiple pending asks from "{x}" — use the message id`, and the tool documents `replyTo` as
+    /// the escape hatch. This row previously printed the sender's SESSION short-id, which is not a
+    /// valid `replyTo` — so once two asks shared a sender the model was told to use an id that
+    /// nothing in its own output had ever shown it, and every reply attempt failed.
+    #[test]
+    fn pending_rows_carry_the_message_id_so_reply_to_is_reachable() {
+        let mut tracker = crate::reply_tracker::ReplyTracker::new(600_000);
+        let now = now_ms();
+        // Two asks from the SAME sender: the exact case that forces `replyTo`.
+        tracker.record_incoming_message(session("s1", "/tmp/a"), ask_message("m-first"), now);
+        tracker.record_incoming_message(session("s1", "/tmp/a"), ask_message("m-second"), now);
+
+        let pending = tracker.list_pending(now);
+        assert_eq!(pending.len(), 2, "both asks are pending");
+
+        let rows: Vec<String> = pending
+            .iter()
+            .map(|c| {
+                let who = c.from.name.clone().unwrap_or_else(|| c.from.id.clone());
+                format!("- {} · {} · 0s ago · {}", who, c.message.id, c.message.content.text)
+            })
+            .collect();
+        let rendered = format!("**Pending asks:**\n{}", rows.join("\n"));
+
+        assert!(rendered.starts_with("**Pending asks:**"), "pi's header");
+        for id in ["m-first", "m-second"] {
+            assert!(
+                rendered.contains(id),
+                "every row must name its message id so `replyTo: {id}` is reachable:\n{rendered}"
+            );
+        }
+    }
+
+    /// pi collapses whitespace and slices the preview to 80 chars (`index.ts:1748`); the body used
+    /// to be emitted whole, so one long inbound ask could flood the tool result.
+    #[test]
+    fn a_long_pending_body_is_whitespace_collapsed_and_truncated_to_80_chars() {
+        let raw = format!("word\n\tspaced   out {}", "x".repeat(200));
+        let preview: String = raw
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(80)
+            .collect();
+        assert_eq!(preview.chars().count(), 80, "sliced to 80 chars");
+        assert!(preview.starts_with("word spaced out "), "whitespace collapsed: {preview:?}");
+        assert!(!preview.contains('\n') && !preview.contains('\t'));
+    }
 
     fn registration(name: &str) -> SessionRegistration {
         SessionRegistration {
@@ -719,6 +813,229 @@ mod tests {
 
         me.disconnect();
         target.disconnect();
+        let _ = broker.kill().await;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Regression proofs for "three `intercom` tool result texts diverge from upstream".
+    // ---------------------------------------------------------------------------------------
+
+    /// `index.ts:1529,1571`: pi resolves the target for DELIVERY (`sendTo`) but reports the
+    /// CALLER-SUPPLIED `to` back to the model (`Message sent to ${to}`). Against the PRE-FIX cyrup
+    /// behavior — `format!("Message sent to {target}.")` with `target` from `resolve_or_err` — a
+    /// send addressed to the peer's NAME echoed back the raw session id it resolved to, so the
+    /// agent lost the human-readable handle it had just used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn send_reports_the_caller_supplied_target_not_the_resolved_session_id() {
+        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
+        let me = Arc::new(
+            IntercomClient::connect(&socket_path, registration("me"), Some("me-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+        // Registered under the NAME "reviewer" but the SESSION ID "peer-session": the two differ,
+        // so the reported target proves which one the tool echoes.
+        let peer = Arc::new(
+            IntercomClient::connect(&socket_path, registration("reviewer"), Some("peer-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+
+        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+        state.set_client(Some(me.clone()));
+        let tool = IntercomTool::new(state.clone());
+        let cancel = CancelToken::new();
+        let params = IntercomParams {
+            action: "send".to_string(),
+            to: Some("reviewer".to_string()),
+            message: Some("please review".to_string()),
+            attachments: None,
+            reply_to: None,
+        };
+        let result = tool.dispatch(params, &cancel).await.expect("send delivers");
+        assert_eq!(
+            result_text(&result),
+            "Message sent to reviewer.",
+            "pi reports the caller-supplied `to`, not the resolved id"
+        );
+
+        me.disconnect();
+        peer.disconnect();
+        let _ = broker.kill().await;
+    }
+
+    /// `index.ts:1669`: `**Reply from ${to}:**\n${replyText}`. Against the PRE-FIX cyrup behavior
+    /// (`Ok(text_result(reply))`) the tool returned the bare reply body, so a transcript that had
+    /// asked more than one peer carried no indication of which peer answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ask_prefixes_the_reply_with_the_reply_from_header() {
+        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
+        let me = Arc::new(
+            IntercomClient::connect(&socket_path, registration("me"), Some("me-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+        let peer = Arc::new(
+            IntercomClient::connect(&socket_path, registration("reviewer"), Some("peer-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+
+        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+        state.set_client(Some(me.clone()));
+        // The REAL inbound loop is what resolves the outbound single-slot waiter (`inbound.rs:327`).
+        crate::inbound::spawn_inbound_loop(state.clone(), me.clone());
+
+        // A scripted peer that answers the first ask it receives.
+        let mut peer_events = peer.subscribe();
+        let peer_writer = peer.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = peer_events.recv().await {
+                if let crate::transport::client::InboundEvent::Message { message, from } = event
+                    && message.expects_reply == Some(true)
+                {
+                    let _ = peer_writer
+                        .send(&from.id, SendOptions {
+                            text: "ship it".to_string(),
+                            attachments: None,
+                            reply_to: Some(message.id.clone()),
+                            expects_reply: None,
+                            message_id: None,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        });
+
+        let tool = IntercomTool::new(state.clone());
+        let cancel = CancelToken::new();
+        let params = IntercomParams {
+            action: "ask".to_string(),
+            to: Some("reviewer".to_string()),
+            message: Some("ok to ship?".to_string()),
+            attachments: None,
+            reply_to: None,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.dispatch(params, &cancel))
+            .await
+            .expect("the ask resolves within the timeout")
+            .expect("ask succeeds");
+        assert_eq!(
+            result_text(&result),
+            "**Reply from reviewer:**\nship it",
+            "pi headers the reply with the peer it came from"
+        );
+
+        me.disconnect();
+        peer.disconnect();
+        let _ = broker.kill().await;
+    }
+
+    /// `index.ts:1726`: `Reply sent to ${target.from.name || target.from.id}` — the sender's NAME is
+    /// preferred over its id. Against the PRE-FIX cyrup behavior (`target.from.id`) a reply to a
+    /// named peer reported the raw session id back instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
+        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
+        let me = Arc::new(
+            IntercomClient::connect(&socket_path, registration("me"), Some("me-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+        let peer = Arc::new(
+            IntercomClient::connect(&socket_path, registration("reviewer"), Some("peer-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+
+        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+        state.set_client(Some(me.clone()));
+
+        // A REAL inbound ask from the peer, so the broker holds the ask edge a reply must match
+        // (`broker.ts:434-441`). Record it exactly as `spawn_inbound_loop` step (2) does
+        // (`inbound.rs:332-336`); the sender's NAME ("reviewer") and SESSION ID ("peer-session")
+        // differ, which is what makes the reported target diagnostic.
+        let mut my_events = me.subscribe();
+        peer.send("me-session", SendOptions {
+            text: "ok to ship?".to_string(),
+            attachments: None,
+            reply_to: None,
+            expects_reply: Some(true),
+            message_id: Some("q1".to_string()),
+        })
+        .await
+        .expect("the ask is delivered");
+        // DRAIN to the ask rather than assuming it is the next frame. The broker legitimately
+        // interleaves presence events — under CPU contention this saw
+        // `SessionJoined(SessionInfo { id: "peer-session", … })` first and failed 1 run in 6, while
+        // passing 9 in 9 idle. Frame ORDER between presence and messages was never promised, so
+        // asserting on "the next frame" tested the scheduler, not the code.
+        let (from, message) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = my_events.recv().await.expect("the event channel delivers");
+                if let crate::transport::client::InboundEvent::Message { from, message } = event {
+                    return (from, message);
+                }
+            }
+        })
+        .await
+        .expect("the inbound ask arrives");
+        assert_eq!(from.name.as_deref(), Some("reviewer"));
+        state.tracker.lock().unwrap().record_incoming_message(from, message, now_ms());
+
+        let tool = IntercomTool::new(state.clone());
+        let cancel = CancelToken::new();
+        let params = IntercomParams {
+            action: "reply".to_string(),
+            to: None,
+            message: Some("looks good".to_string()),
+            attachments: None,
+            reply_to: None,
+        };
+        let result = tool.dispatch(params, &cancel).await.expect("reply delivers");
+        assert_eq!(
+            result_text(&result),
+            "Reply sent to reviewer.",
+            "pi prefers the sender's name over its session id"
+        );
+
+        me.disconnect();
+        peer.disconnect();
+        let _ = broker.kill().await;
+    }
+
+    /// `index.ts:1765`: a four-line `**Intercom Status:**` markdown block. Against the PRE-FIX
+    /// cyrup behavior the tool emitted a single pipe-delimited line
+    /// (`intercom: connected | session id: … | active sessions: …`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_renders_pi_four_line_intercom_status_block() {
+        let (mut broker, _agent_dir, socket_path) = spawn_broker().await;
+        let me = Arc::new(
+            IntercomClient::connect(&socket_path, registration("me"), Some("me-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+        let peer = Arc::new(
+            IntercomClient::connect(&socket_path, registration("reviewer"), Some("peer-session".to_string()))
+                .await
+                .expect("connects"),
+        );
+
+        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+        state.set_client(Some(me.clone()));
+        let tool = IntercomTool::new(state.clone());
+        let cancel = CancelToken::new();
+        let params =
+            IntercomParams { action: "status".to_string(), to: None, message: None, attachments: None, reply_to: None };
+        let result = tool.dispatch(params, &cancel).await.expect("status succeeds");
+        assert_eq!(
+            result_text(&result),
+            "**Intercom Status:**\nConnected: Yes\nSession ID: me-session\nActive sessions: 2"
+        );
+
+        me.disconnect();
+        peer.disconnect();
         let _ = broker.kill().await;
     }
 }

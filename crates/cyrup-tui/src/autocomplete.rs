@@ -143,7 +143,7 @@ fn slash_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplet
     }
     let query = before.get(1..).unwrap_or("");
     let commands = registry.commands();
-    let matches = fuzzy::filter(commands, query, |c| c.name);
+    let matches = fuzzy::filter(commands, query, |c| c.name.as_ref());
     if matches.is_empty() {
         return None;
     }
@@ -152,12 +152,12 @@ fn slash_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplet
     for m in &matches {
         let Some(cmd) = commands.get(m.index) else { continue };
         // Description composition (`:315-322`): hint ? (desc ? "{hint} — {desc}" : hint) : desc.
-        let desc = match cmd.argument_hint {
+        let desc = match cmd.argument_hint.as_deref() {
             Some(hint) if !cmd.description.is_empty() => format!("{hint} — {}", cmd.description),
             Some(hint) => hint.to_string(),
             None => cmd.description.to_string(),
         };
-        items.push(SelectItem::new(cmd.name, Some(desc)));
+        items.push(SelectItem::new(cmd.name.to_string(), Some(desc)));
         completions.push(Completion { value: cmd.name.to_string(), is_dir: false });
     }
     let list = SelectList::new(items, ColumnLayout::SLASH).with_no_match("No matching commands");

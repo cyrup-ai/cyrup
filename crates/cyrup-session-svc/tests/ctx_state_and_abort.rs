@@ -109,7 +109,9 @@ fn faux_tool_then_more(turns: &Arc<AtomicUsize>) -> Arc<FauxProvider> {
     let first = FauxResponseStep::factory(move |_ctx, _o, _s, _m| {
         a.fetch_add(1, Ordering::SeqCst);
         faux_assistant_message(
-            vec![faux_tool_call("ls", json!({ "path": "." }))],
+            // `read` rather than `ls`: these tests are about ctx abort/state, and `ls` is not in
+            // pi's default-active set (`system-prompt.ts:80`), so a call to it never dispatches.
+            vec![faux_tool_call("read", json!({ "path": "." }))],
             StopReason::ToolUse,
         )
     });

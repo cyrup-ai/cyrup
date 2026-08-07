@@ -89,7 +89,16 @@ pub(crate) async fn run_bash(
     cancel: cyrup_core::CancelToken,
     mut on_chunk: BashChunkSink,
 ) -> Result<BashResult, cyrup_core::ToolError> {
-    let spec = ExecSpec { command, cwd, env: shell_env(bin_dir), shell: shell.clone() };
+    // Pi's immediate-bash seam (`executeBashWithOperations`, bash-executor.ts) does NOT resolve a
+    // spawn context and never touches the session env — only the `bash` TOOL does
+    // (`resolveSpawnContext`, bash.ts:158-184). So no scrub, no injection here.
+    let spec = ExecSpec {
+        command,
+        cwd,
+        env: shell_env(bin_dir),
+        env_remove: Vec::new(),
+        shell: shell.clone(),
+    };
     let mut buffer = BashOutputBuffer::new();
     let status = proc
         .exec(spec, cancel, None, &mut |data: &[u8]| {

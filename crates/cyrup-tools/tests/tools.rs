@@ -124,7 +124,11 @@ async fn read_missing_file_errors() {
         .execute(cid(), serde_json::json!({ "path": "nope.txt" }), CancelToken::new(), noop_sink())
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not found") || err.to_string().contains("unreadable"));
+    // Pi re-rejects Node's raw `fs.access` error (read.ts:241/321-324), so the message carries the
+    // errno and the resolved absolute path — see `tests/read_access_errno.rs`.
+    let msg = err.to_string();
+    assert!(msg.contains("nope.txt"), "got: {msg}");
+    assert!(msg.contains("No such file or directory"), "got: {msg}");
 }
 
 // ---------------------------------------------------------------- A-03-2 image
@@ -373,6 +377,15 @@ async fn write_creates_dirs_and_serializes() {
     assert_eq!(std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(), "hello");
 
     // Concurrent writes to the same path: no corruption (final == one full content).
+    //
+    // The two payloads have DIFFERENT LENGTHS on purpose. They used to be `"AAAA"`/`"BBBB"`, which
+    // made this half vacuous: two same-length writes can interleave arbitrarily and still land on a
+    // 4-byte file, and the temp-file+rename backend made the outcome atomic for free anyway. The
+    // backend is now an in-place `O_TRUNC` write (TOOL-004, matching pi's `fsWriteFile`), so the
+    // whole exclusion property rests on [`FileMutationLocks`] alone — pi's `withFileMutationQueue`
+    // (write.ts:9) plays the identical role. With unequal lengths any interleaving is observable:
+    // a lost lock leaves a short read (`"AAAA"` where `B` was last), a tail (`"AAAABBBB…"`), or a
+    // truncated prefix — none of which match either payload exactly.
     let w = Arc::new(WriteTool::new(fs(), locks, cwd.clone(), Default::default()));
     let a = {
         let w = w.clone();
@@ -391,7 +404,7 @@ async fn write_creates_dirs_and_serializes() {
         tokio::spawn(async move {
             w.execute(
                 cid(),
-                serde_json::json!({ "path": "race.txt", "content": "BBBB" }),
+                serde_json::json!({ "path": "race.txt", "content": "BBBBBBBBBBBBBBBB" }),
                 CancelToken::new(),
                 noop_sink(),
             )
@@ -401,7 +414,10 @@ async fn write_creates_dirs_and_serializes() {
     a.await.unwrap().unwrap();
     b.await.unwrap().unwrap();
     let final_content = std::fs::read_to_string(cwd.join("race.txt")).unwrap();
-    assert!(final_content == "AAAA" || final_content == "BBBB", "got: {final_content}");
+    assert!(
+        final_content == "AAAA" || final_content == "BBBBBBBBBBBBBBBB",
+        "the two concurrent writes interleaved; got: {final_content:?}"
+    );
 }
 
 // ---------------------------------------------------------------- A-03-5 bash
@@ -1100,8 +1116,8 @@ impl FsOps for CountingFs {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(path).await
     }
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-        self.inner.write_atomic(path, bytes).await
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        self.inner.write_in_place(path, bytes).await
     }
     async fn access(&self, path: &Path, mode: cyrup_tools::ops::Access) -> Result<(), ToolError> {
         self.inner.access(path, mode).await
@@ -1407,11 +1423,13 @@ async fn bash_timeout_empty_output_has_no_leading_newline() {
     assert_eq!(msg, "Command timed out after 1 seconds", "got: {msg}");
 }
 
-// UM-5 (corrected) — Pi `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206), so an
-// interior CR is a LINE BREAK, not a character to strip. ripgrep numbers the whole `foo\rNEEDLE\rbar`
-// as line 1 (it only breaks on `\n`), but Pi's folded src_lines are ["foo","NEEDLE","bar",""], so the
-// rendered line-1 block is `foo`. (The old cyrup split on `\n` only + stripped interior CR per line,
-// emitting the divergent `fooNEEDLEbar` — the exact UM-5 miss.) cyrup now matches Pi byte-for-byte.
+// UM-5 (re-corrected) — Pi `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206), so
+// an interior CR is a LINE BREAK, not a character to strip. ripgrep numbers the whole
+// `foo\rNEEDLE\rbar` as line 1 (it only breaks on `\n`), but Pi's folded src_lines are
+// ["foo","NEEDLE","bar",""], so the rendered line-1 block is `foo` and its `context` neighbour is
+// `NEEDLE`. `getFileLines` is reachable ONLY from `formatBlock`, i.e. only when `contextValue > 0`
+// (grep.ts:328-330) — this test therefore passes `context`. The DEFAULT context=0 path takes
+// `match.lineText` instead and is covered by `tests/grep_context_zero_line_text.rs`.
 #[tokio::test]
 async fn grep_folds_interior_carriage_returns_as_line_breaks() {
     let dir = tempfile::tempdir().unwrap();
@@ -1419,12 +1437,20 @@ async fn grep_folds_interior_carriage_returns_as_line_breaks() {
     std::fs::write(cwd.join("cr.txt"), "foo\rNEEDLE\rbar\n").unwrap();
     let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "NEEDLE" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     assert!(!text.contains('\r'), "no CR may survive folding: {text:?}");
-    assert_eq!(text, "cr.txt:1: foo", "Pi renders the folded line-1 segment, not the joined line");
+    assert_eq!(
+        text, "cr.txt:1: foo\ncr.txt-2- NEEDLE",
+        "Pi renders the folded segments, not the joined line"
+    );
 }
 
 // gap #9 — the edit access-error literal ends with a trailing period: Pi throws
@@ -1545,7 +1571,11 @@ async fn read_effective_access_skips_unreadable_candidate() {
         .execute(cid(), serde_json::json!({ "path": "secret.txt" }), CancelToken::new(), noop_sink())
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("File not found or unreadable"), "got: {err}");
+    // Pi re-rejects Node's raw `fs.access` error (read.ts:241 uncaught, :321-324 re-`reject`s), so
+    // the model sees the errno class and the RESOLVED path — see `tests/read_access_errno.rs`.
+    let msg = err.to_string();
+    assert!(msg.contains("secret.txt"), "must name the resolved path: {msg}");
+    assert!(msg.contains("Permission denied"), "must carry the EACCES errno: {msg}");
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
 }
 
@@ -1585,12 +1615,14 @@ async fn edit_effective_access_precheck_rejects_write_only_file() {
 // model-facing output equals Pi's, with the exact Pi behavior reconstructed from source.
 // ======================================================================================
 
-// UM-5 — grep `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206). The matcher
-// numbers lines on raw `\n`, so for a file using a LONE `\r` separator the context block keys off
-// the FOLDED segment. File bytes `x\rTARGET\n`: ripgrep (and grep_searcher) report the match on
-// line 1 (`x\rTARGET`), but Pi's getFileLines splits the folded text into ["x","TARGET",""] and
-// renders src_lines[0] = "x". So Pi prints `cr.txt:1: x` — NOT `xTARGET` (old cyrup, split-on-\n
-// only + per-line \r strip).
+// UM-5 (re-corrected) — grep `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206).
+// The matcher numbers lines on raw `\n`, so for a file using a LONE `\r` separator the CONTEXT
+// BLOCK keys off the FOLDED segment. File bytes `x\rTARGET\n`: ripgrep (and grep_searcher) report
+// the match on line 1 (`x\rTARGET`), but Pi's getFileLines splits the folded text into
+// ["x","TARGET",""], so the block renders src_lines[0] = "x" as the match row and src_lines[1] =
+// "TARGET" as its context row. `getFileLines` is only reachable via `formatBlock`, i.e. context>0
+// (grep.ts:328-330) — the original version of this test omitted `context` and so asserted the
+// folded rendering on the context=0 path, where Pi does not use it at all.
 #[tokio::test]
 async fn grep_folds_lone_cr_before_splitting_context() {
     let dir = tempfile::tempdir().unwrap();
@@ -1600,13 +1632,17 @@ async fn grep_folds_lone_cr_before_splitting_context() {
     let r = grep
         .execute(
             cid(),
-            serde_json::json!({ "pattern": "TARGET", "path": "cr.txt" }),
+            serde_json::json!({ "pattern": "TARGET", "path": "cr.txt", "context": 1 }),
             CancelToken::new(),
             noop_sink(),
         )
         .await
         .unwrap();
-    assert_eq!(first_text(&r), "cr.txt:1: x", "grep must fold lone CR like Pi getFileLines");
+    assert_eq!(
+        first_text(&r),
+        "cr.txt:1: x\ncr.txt-2- TARGET",
+        "grep must fold lone CR like Pi getFileLines"
+    );
 }
 
 // UM-4 — byte-limit NOTICE text hardcodes `formatSize(DEFAULT_MAX_BYTES)` (= 50.0KB) regardless of
@@ -1659,10 +1695,13 @@ async fn read_variant_probe_uses_existence_not_readability() {
         .await;
     let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o644));
     let err = res.expect_err("Pi errors: primary exists but is unreadable; no variant fall-through");
-    assert!(
-        err.to_string().contains("not found") || err.to_string().contains("unreadable"),
-        "got: {err}"
-    );
+    // The failure must be EACCES on the PRIMARY — proving the selection loop chose it (F_OK) and
+    // the readability check then failed on that same path rather than falling through to the
+    // readable curly variant. Pi propagates Node's errno text (read.ts:241/321-324).
+    let msg = err.to_string();
+    assert!(msg.contains("Permission denied"), "got: {msg}");
+    assert!(msg.contains("a'b.txt"), "must name the primary, not the variant: {msg}");
+    assert!(!msg.contains('\u{2019}'), "must not name the curly variant: {msg}");
 }
 
 // UM-7 — a malformed `edits` (missing / non-array) yields Pi's exact `validateEditInput` literal
@@ -1687,4 +1726,206 @@ async fn edit_malformed_edits_yields_pi_literal() {
         err.to_string(),
         "Edit tool input is invalid. edits must contain at least one replacement."
     );
+}
+
+// ---------------------------------------------------------- numeric-parameter coercion (jsnum)
+//
+// Every numeric tool parameter is a TypeBox `Type.Number` upstream — no `integer`, no `minimum`
+// (read.ts:22-23, grep.ts:31-34, ls.ts:16, find.ts:25) — and Pi never validates tool arguments at
+// runtime: `wrapToolDefinition` (tool-definition-wrapper.ts:16-18) hands the model's parsed JSON
+// straight to `execute`, which coerces at the point of use. So `10.0` and `-1` are inputs Pi
+// accepts and answers. cyrup modeled them as `usize`, so `serde_json::from_value` rejected the
+// whole call ("invalid type: floating point `10.0`" / "invalid value: integer `-1`") before the
+// tool ran — a hard error where Pi returns a result. These tests pin the coerced behavior per
+// tool, using Pi's own clamp expression as the oracle.
+
+// read — `startLine = offset ? Math.max(0, offset - 1) : 0` (read.ts:271) and
+// `endLine = Math.min(startLine + limit, allLines.length)` (read.ts:282).
+#[tokio::test]
+async fn read_accepts_float_and_negative_numeric_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let ten = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    std::fs::write(cwd.join("f.txt"), &ten).unwrap();
+    let read = ReadTool::new(fs(), cwd.clone(), ReadOpts::default());
+
+    // Integral floats must behave exactly like the integer spelling.
+    let float_args = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 2.0, "limit": 3.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float offset/limit must not fail the call");
+    let int_args = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 2, "limit": 3 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_text(&float_args), first_text(&int_args));
+    assert!(first_text(&float_args).starts_with("line2\nline3\nline4"));
+
+    // Negative offset: `Math.max(0, -5 - 1)` is 0, i.e. identical to reading from line 1.
+    let neg = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": -5 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative offset clamps to the start of the file, it does not fail the call");
+    assert_eq!(first_text(&neg), ten);
+
+    // Negative limit: Pi's unclamped `startLine + limit` selects nothing; cyrup clamps the window
+    // end to `start` and still reports the remainder, so the model gets an actionable result.
+    let neg_limit = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "\n\n[10 more lines in file. Use offset=1 to continue.]");
+
+    // The out-of-bounds message interpolates the RAW argument (read.ts:275); an integral float
+    // renders without a fraction in both JS and Rust.
+    let err = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 99.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Offset 99 is beyond end of file (10 lines total)");
+}
+
+// grep — `contextValue = context && context > 0 ? context : 0` and
+// `effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT)` (grep.ts:188-189).
+#[tokio::test]
+async fn grep_accepts_float_and_negative_numeric_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\nNEEDLE\nfive\nNEEDLE\n").unwrap();
+    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
+
+    // context: 1.0 must equal context: 1 — one line either side of the match.
+    let ctx_float = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": 1.0, "limit": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float context must not fail the call");
+    assert!(first_text(&ctx_float).contains("a.txt-1- one"), "got: {}", first_text(&ctx_float));
+
+    // Negative context collapses to 0 — the match line alone, no surrounding rows.
+    let ctx_neg = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": -1, "limit": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative context clamps to 0, it does not fail the call");
+    assert_eq!(first_text(&ctx_neg).lines().next().unwrap(), "a.txt:2: NEEDLE");
+    assert!(!first_text(&ctx_neg).contains("a.txt-1-"), "got: {}", first_text(&ctx_neg));
+
+    // Negative limit is absorbed by `Math.max(1, …)`: exactly one match, not an error.
+    let lim_neg = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit clamps to 1, it does not fail the call");
+    assert_eq!(first_text(&lim_neg).lines().filter(|l| l.contains("NEEDLE")).count(), 1);
+
+    // limit: 2.0 must equal limit: 2.
+    let lim_float = grep
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "limit": 2.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float limit must not fail the call");
+    assert_eq!(first_text(&lim_float).lines().filter(|l| l.contains("NEEDLE")).count(), 2);
+}
+
+// ls — `effectiveLimit = limit ?? DEFAULT_LIMIT` (ls.ts:125), unclamped: a non-positive limit
+// satisfies `results.length >= effectiveLimit` immediately (ls.ts:156) so nothing is collected and
+// Pi returns "(empty directory)".
+#[tokio::test]
+async fn ls_accepts_float_and_negative_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(cwd.join(n), "").unwrap();
+    }
+    let ls = LsTool::new(fs(), cwd.clone(), LsOpts::default());
+
+    let float_limit = ls
+        .execute(cid(), serde_json::json!({ "limit": 2.0 }), CancelToken::new(), noop_sink())
+        .await
+        .expect("float limit must not fail the call");
+    let text = first_text(&float_limit);
+    assert!(text.starts_with("a.txt\nb.txt\n\n[2 entries limit reached."), "got: {text}");
+
+    let neg_limit = ls
+        .execute(cid(), serde_json::json!({ "limit": -1 }), CancelToken::new(), noop_sink())
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "(empty directory)");
+}
+
+// find — `effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151) handed to `fd --max-results`
+// (find.ts:241); a non-positive count produces no rows, which is Pi's "No files found" branch.
+#[tokio::test]
+async fn find_accepts_float_and_negative_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(cwd.join(n), "").unwrap();
+    }
+    let find = FindTool::new(fs(), cwd.clone(), FindOpts::default());
+
+    let float_limit = find
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt", "limit": 2.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("float limit must not fail the call");
+    let text = first_text(&float_limit);
+    assert!(text.starts_with("a.txt\nb.txt\n\n[2 results limit reached."), "got: {text}");
+
+    let neg_limit = find
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt", "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("negative limit must not fail the call");
+    assert_eq!(first_text(&neg_limit), "No files found matching pattern");
 }

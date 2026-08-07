@@ -44,8 +44,19 @@ pub struct GenerationConfig {
     /// `applyHttpProxySettings`, main.ts:744). Empty/absent ⇒ the ambient process env is used.
     pub env: Option<cyrup_provider::ProviderEnv>,
     /// HTTP request idle timeout (ms) forwarded into `cyrup_provider::StreamOptions.timeout_ms` (Pi
-    /// `StreamOptions.timeoutMs` / `configureHttpDispatcher`, main.ts:745). Providers/SDKs that
-    /// support a request timeout honor it; others ignore it. `None`/`0` ⇒ no client-side cap.
+    /// `StreamOptions.timeoutMs` / `configureHttpDispatcher`, main.ts:745).
+    ///
+    /// Bounds the wait for the response head and, once streaming, the gap between body frames — it
+    /// is NOT a deadline on the whole generation. `None` inherits the process-global default that
+    /// `cyrup_provider::configure_http_idle_timeout` installs (Pi's global undici dispatcher, 5
+    /// minutes); `Some(0)` disables the timeout entirely, matching `httpIdleTimeoutMs: 0` /
+    /// `"disabled"` upstream.
+    ///
+    /// This previously claimed the value applied only to "providers that support it" and that
+    /// `None`/`0` meant "no cap". Both were wrong about Pi *and* about cyrup: Pi's
+    /// `configureHttpDispatcher` is called unconditionally at startup (`cli.ts:18`, `main.ts:538`)
+    /// and bounds every provider connection at 5 minutes by default, and cyrup now does the same
+    /// for every wire API — the value is honored by the shared SSE transport, not per provider.
     pub timeout_ms: Option<u64>,
 }
 
@@ -61,6 +72,12 @@ pub struct StateInner {
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<ToolCallId>,
     pub error_message: Option<String>,
+    /// Per-request header overlay (pi `SimpleStreamOptions.headers`), LIVE rather than fixed at
+    /// build. pi recomputes provider-attribution and session-affinity headers inside `streamFn`
+    /// (`sdk.ts:318-327`), dispatched on the model the request is actually going to; holding them in
+    /// `GenerationConfig` froze them at session build, so a cross-provider `/model` switch kept
+    /// sending the PREVIOUS provider's attribution headers.
+    pub headers: Option<cyrup_provider::HeaderMap>,
 }
 
 impl StateInner {
@@ -75,6 +92,7 @@ impl StateInner {
             streaming_message: self.streaming_message.clone(),
             pending_tool_calls: self.pending_tool_calls.iter().cloned().collect(),
             error_message: self.error_message.clone(),
+            headers: self.headers.clone(),
         }
     }
 }
@@ -92,6 +110,8 @@ pub struct AgentStateSnapshot {
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: Vec<ToolCallId>,
     pub error_message: Option<String>,
+    /// The live per-request header overlay (pi `SimpleStreamOptions.headers`).
+    pub headers: Option<cyrup_provider::HeaderMap>,
 }
 
 /// Reduce one event into managed state (arch-02 §5.1). Cheap and synchronous; called while the

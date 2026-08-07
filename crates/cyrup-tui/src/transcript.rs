@@ -62,6 +62,10 @@ pub enum Entry {
     /// or `Error: {message}`. Rendered as a blank spacer + one error-coloured line, matching Pi's
     /// `Spacer(1)` + `Text(theme.fg("error", …), outputPad, 0)`.
     Error(String),
+    /// A `warning`-styled notice — Pi `showWarning` (`interactive-mode.ts:3956-3960`): a `Spacer(1)`
+    /// then `Text(theme.fg("warning", "Warning: …"), 1, 0)`. Structurally identical to [`Self::Error`]
+    /// but in the warning colour; reached from an extension's `notify(msg, "warning")`.
+    Warning(String),
     /// A bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`): a top `DynamicBorder`,
     /// a bold-accent `title`, a blank, the `markdown` body, then a bottom `DynamicBorder`
     /// (interactive-mode.ts:5502-5507).
@@ -683,6 +687,17 @@ impl TranscriptView {
         self.tool_expanded
     }
 
+    /// Set the tool-output expansion absolutely — Pi `setToolsExpanded(expanded)`
+    /// (`interactive-mode.ts:3887-3903`), the extension-driven counterpart of the `Ctrl+O` toggle.
+    /// Returns whether the value actually changed (Pi's `if (expanded === this.toolOutputExpanded)
+    /// return` early-out, `:3888`), which the caller uses to decide whether to echo Pi's
+    /// `Tool output: expanded|collapsed` status line.
+    pub fn set_tool_expanded(&mut self, expanded: bool) -> bool {
+        let changed = self.tool_expanded != expanded;
+        self.tool_expanded = expanded;
+        changed
+    }
+
     /// Record a status / notification line.
     pub fn push_status(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Status(text.into()));
@@ -703,6 +718,11 @@ impl TranscriptView {
     /// [`push_status`](Self::push_status), which is dim and bulleted.
     pub fn push_error(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Error(text.into()));
+    }
+
+    /// Record a `warning`-styled notice line (Pi `showWarning`, `interactive-mode.ts:3956-3960`).
+    pub fn push_warning(&mut self, text: impl Into<String>) {
+        self.pending.push(Entry::Warning(text.into()));
     }
 
     /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).
@@ -1745,6 +1765,14 @@ pub(crate) fn entry_lines(
             labeled_message_lines("compaction", &header, summary, theme, width)
         }
         Entry::Status(text) => vec![Line::styled(format!("• {text}"), theme.dim_style())],
+        Entry::Warning(text) => {
+            // Pi `showWarning` (`interactive-mode.ts:3956-3960`): `Spacer(1)` then
+            // `Text(theme.fg("warning", …), 1, 0)` — the `Error` shape in the warning colour.
+            let mut out = vec![Line::styled(text.clone(), theme.warning_style())];
+            pad_lines(&mut out, output_pad);
+            out.insert(0, Line::default());
+            out
+        }
         Entry::Error(text) => {
             // Pi: `Spacer(1)` then `Text(theme.fg("error", text), outputPad, 0)`
             // (assistant-message.ts:178-188). One logical line — the scrollback flush wraps it at

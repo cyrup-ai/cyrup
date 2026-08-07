@@ -8,6 +8,14 @@
 //! against a real child process (arch-SA §1.1 item 3) — never a cooperative in-process token
 //! standing in for termination.
 //!
+//! [`terminate_on_timeout`] is the same module's *timeout* counterpart: `SIGTERM`, then a hard
+//! `SIGKILL` [`TIMEOUT_SIGTERM_GRACE`] later, matching upstream `abortVerification`
+//! (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0) and the kill-on-expiry
+//! semantics of `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
+//! (`pi-subagents/src/runs/shared/worktree.ts:290-296`). Both entry points share the one
+//! group-aware [`send_signal`] target-selection rule below; there is deliberately no second
+//! signalling path in this crate.
+//!
 //! Each grace-period wait is ALSO raced against the caller's `cyrup_core::CancelToken`
 //! (`tokio_util::sync::CancellationToken`) so that an already-cancelled run does not sit out a
 //! grace period it no longer needs to honor precisely — a cancellation firing mid-wait advances
@@ -46,6 +54,34 @@ pub const SIGINT_GRACE: Duration = Duration::from_millis(1000);
 /// Grace period after `SIGTERM` before escalating to `SIGKILL` (R-SA-059: "~3000-4000ms"; the
 /// midpoint of that range is used as the single concrete default).
 pub const SIGTERM_GRACE: Duration = Duration::from_millis(3500);
+
+/// The two inter-rung grace periods [`terminate`] pays out, as one injectable bundle.
+///
+/// Production always uses [`EscalationGraces::default`], i.e. the R-SA-059 constants above; nothing
+/// outside tests ever supplies a different value, and [`terminate`] itself is unchanged.
+///
+/// It exists because the *stage* a run reached is a real behavioural assertion (a SIGINT-obeying
+/// child must not be escalated to SIGTERM) while the grace period it was measured against is a
+/// WALL-CLOCK race against the OS reaping that child. On a machine loaded enough to preempt the
+/// waiter for a full second — routine when this crate's own suite is spawning dozens of real
+/// subprocesses in parallel — the child dies to `SIGINT` exactly as intended, but `child.wait()`
+/// does not get scheduled inside [`SIGINT_GRACE`], the ladder escalates, and a correct
+/// implementation reports [`EscalationStage::Sigterm`]. Injecting a generous grace lets a test keep
+/// the meaningful assertion (which rung ended it) without betting it on the scheduler; the
+/// production constants stay exactly where R-SA-059 puts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscalationGraces {
+    /// How long stage 1 waits after `SIGINT` before escalating to `SIGTERM`.
+    pub sigint: Duration,
+    /// How long stage 2 waits after `SIGTERM` before escalating to `SIGKILL`.
+    pub sigterm: Duration,
+}
+
+impl Default for EscalationGraces {
+    fn default() -> Self {
+        Self { sigint: SIGINT_GRACE, sigterm: SIGTERM_GRACE }
+    }
+}
 
 /// Which rung of the escalation ladder [`terminate`] reached before the child was confirmed
 /// gone. Exposed so callers/tests can assert the escalation actually walked through the stages
@@ -97,21 +133,38 @@ pub struct TerminationOutcome {
 /// `cyrup_tools::ops::local::terminate_pid`'s existing try-and-ignore convention for the same
 /// class of benign race.
 pub async fn terminate(
-    mut child: Child,
+    child: Child,
     cancel: &CancelToken,
 ) -> std::io::Result<TerminationOutcome> {
-    // Stage 1: SIGINT, raced against SIGINT_GRACE and `cancel`.
+    terminate_with_graces(child, cancel, EscalationGraces::default()).await
+}
+
+/// [`terminate`] with the two inter-rung grace periods supplied explicitly — see
+/// [`EscalationGraces`] for why that knob exists and why production never turns it.
+///
+/// The escalation itself is byte-identical to [`terminate`]'s: same signals, same order, same
+/// cancellation racing, same unconditional final `SIGKILL` whose `wait()` is never timed out.
+///
+/// # Errors
+///
+/// Identical to [`terminate`]'s: `Err` only from a genuine `child.wait()` I/O failure.
+pub async fn terminate_with_graces(
+    mut child: Child,
+    cancel: &CancelToken,
+    graces: EscalationGraces,
+) -> std::io::Result<TerminationOutcome> {
+    // Stage 1: SIGINT, raced against the SIGINT grace and `cancel`.
     send_sigint(&child);
-    if let Some(status) = race_wait(&mut child, SIGINT_GRACE, cancel).await? {
+    if let Some(status) = race_wait(&mut child, graces.sigint, cancel).await? {
         return Ok(TerminationOutcome {
             status,
             stage: EscalationStage::Sigint,
         });
     }
 
-    // Stage 2: SIGTERM, raced against SIGTERM_GRACE and `cancel`.
+    // Stage 2: SIGTERM, raced against the SIGTERM grace and `cancel`.
     send_sigterm(&child);
-    if let Some(status) = race_wait(&mut child, SIGTERM_GRACE, cancel).await? {
+    if let Some(status) = race_wait(&mut child, graces.sigterm, cancel).await? {
         return Ok(TerminationOutcome {
             status,
             stage: EscalationStage::Sigterm,
@@ -127,6 +180,71 @@ pub async fn terminate(
         status,
         stage: EscalationStage::Sigkill,
     })
+}
+
+/// Grace period between the timeout-triggered `SIGTERM` and the unconditional hard `SIGKILL` that
+/// follows it — upstream `abortVerification`
+/// (`pi-subagents/src/runs/shared/acceptance.ts:742-758` @v0.34.0) sends `child.kill("SIGTERM")`
+/// and immediately arms a `setTimeout(… , 1000)` that sends `child.kill("SIGKILL")`, so 1000ms is
+/// the ported constant, not a cyrup invention.
+pub const TIMEOUT_SIGTERM_GRACE: Duration = Duration::from_millis(1000);
+
+/// Hard-stop a child that blew through its OWN timeout: `SIGTERM`, then `SIGKILL` after
+/// [`TIMEOUT_SIGTERM_GRACE`], returning only once the OS process is CONFIRMED reaped.
+///
+/// This is the two-rung sibling of [`terminate`]'s three-rung ladder, and it exists because
+/// upstream draws the same distinction: a *cancellation* walks the polite
+/// `SIGINT -> SIGTERM -> SIGKILL` escalation, but a *timeout* is already the caller's declared
+/// patience running out, so upstream's `abortVerification` skips straight to `SIGTERM` + a 1s hard
+/// `SIGKILL` (`acceptance.ts:742-758`), and `runWorktreeSetupHook`'s `spawnSync(…, { timeout })`
+/// (`worktree.ts:290-296`) likewise kills on expiry rather than escalating gently.
+///
+/// Callers MUST still own the `Child` when they call this — the bug this function exists to make
+/// unrepresentable is racing `tokio::time::timeout(…, child.wait_with_output())`, whose
+/// `self`-consuming future swallows the only handle to the process, so the timeout arm drops it
+/// and (with no `kill_on_drop`) leaves the whole process group running for the machine's uptime.
+/// Take the child's pipes out and drain them separately, keep the `Child` binding, race
+/// `child.wait()`, and call this on expiry.
+///
+/// Signal delivery goes through [`send_signal`], so a child that leads its own process group
+/// (every `verify[]` command does — `exec::acceptance` sets `Command::process_group(0)`) is
+/// signalled as `kill(-pgid, …)`, reaching the descendants it spawned. A child that does not lead
+/// a group (the worktree setup hook) gets the bare pid, exactly as upstream's `spawnSync` timeout
+/// does.
+///
+/// # Errors
+///
+/// Returns `Err` only if `child.wait()` itself fails at the OS/tokio level. Signal-send failures
+/// (`ESRCH` for a process that exited in the race window) are swallowed, per [`send_signal`].
+pub async fn terminate_on_timeout(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    terminate_on_timeout_with_grace(child, TIMEOUT_SIGTERM_GRACE).await
+}
+
+/// [`terminate_on_timeout`] with the hard-kill grace supplied explicitly. Production always passes
+/// [`TIMEOUT_SIGTERM_GRACE`]; the parameter exists for the same reason [`EscalationGraces`] does —
+/// so a test can prove WHICH rung ended the child without racing the OS's reaping against a
+/// one-second wall clock.
+///
+/// # Errors
+///
+/// Identical to [`terminate_on_timeout`]'s.
+pub async fn terminate_on_timeout_with_grace(
+    child: &mut Child,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    // Rung 1: SIGTERM, raced against the hard-kill timer only — a timeout path has no grace period
+    // left to honor beyond the one upstream itself arms.
+    send_sigterm(child);
+    tokio::select! {
+        biased;
+        result = child.wait() => return result,
+        () = tokio::time::sleep(grace) => {}
+    }
+
+    // Rung 2: SIGKILL — unconditional, and its `wait()` is never raced, so this function's
+    // "confirmed gone" contract is bounded by the OS's own guarantee rather than another timer.
+    send_sigkill(child);
+    child.wait().await
 }
 
 /// Race `child.wait()` against a grace-period timer and `cancel` becoming cancelled.
@@ -256,9 +374,33 @@ mod tests {
 
     use super::*;
 
+    /// Production pins: the injectable [`EscalationGraces`] must not become a place where the
+    /// R-SA-059 constants quietly drift. Every non-test call goes through
+    /// [`EscalationGraces::default`], so this is what keeps the real ladder at 1000ms/3500ms while
+    /// the tests below deliberately run it at other values.
+    #[test]
+    fn the_default_graces_are_exactly_the_r_sa_059_constants() {
+        let graces = EscalationGraces::default();
+        assert_eq!(graces.sigint, SIGINT_GRACE);
+        assert_eq!(graces.sigterm, SIGTERM_GRACE);
+        assert_eq!(SIGINT_GRACE, Duration::from_millis(1000));
+        assert_eq!(SIGTERM_GRACE, Duration::from_millis(3500));
+        assert_eq!(TIMEOUT_SIGTERM_GRACE, Duration::from_millis(1000));
+    }
+
+    /// A generous stage-1 grace for the tests whose claim is "this child dies at rung 1", so the
+    /// claim is not silently also a bet that the OS reaps it inside the production 1000ms.
+    #[cfg(unix)]
+    const GENEROUS: Duration = Duration::from_secs(30);
+
     /// A normal child that traps NOTHING dies to plain `SIGINT` almost immediately — the
     /// escalation must not walk any further than stage 1 in that case, and the OS process must
     /// really be gone afterward (`kill -0` check, not just our own bookkeeping).
+    ///
+    /// Run against a deliberately generous [`EscalationGraces::sigint`]: the assertion that matters
+    /// is WHICH RUNG ended the child, and measuring that against the 1000ms production constant
+    /// turns it into a wall-clock race with process reaping that a loaded machine loses (observed:
+    /// escalation to `Sigterm` after exactly 1.01s, with SIGINT having worked perfectly).
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_stops_at_sigint_for_a_normal_child() {
@@ -271,8 +413,9 @@ mod tests {
         let pid = child.id().expect("live child has a pid");
 
         let cancel = CancelToken::new();
+        let graces = EscalationGraces { sigint: GENEROUS, ..EscalationGraces::default() };
         let started = tokio::time::Instant::now();
-        let outcome = terminate(child, &cancel)
+        let outcome = terminate_with_graces(child, &cancel, graces)
             .await
             .expect("terminate confirms real exit");
 
@@ -282,7 +425,7 @@ mod tests {
             "a SIGINT-obeying child (sleep has no trap) must not require escalation past stage 1"
         );
         assert!(
-            started.elapsed() < SIGINT_GRACE,
+            started.elapsed() < graces.sigint,
             "a plain SIGINT-obeying child dies well before the SIGINT grace period elapses, got {:?}",
             started.elapsed()
         );
@@ -325,8 +468,13 @@ mod tests {
         wait_for_marker(&marker_path, Duration::from_secs(10)).await;
 
         let cancel = CancelToken::new();
+        // Both graces must genuinely elapse here (the child ignores both signals), so they are
+        // injected SHORT — a lower bound is load-robust in a way an upper bound is not, and the
+        // production constants would cost this test 4.5s of pure sleeping for no extra proof.
+        let graces =
+            EscalationGraces { sigint: Duration::from_millis(200), sigterm: Duration::from_millis(300) };
         let started = tokio::time::Instant::now();
-        let outcome = terminate(child, &cancel)
+        let outcome = terminate_with_graces(child, &cancel, graces)
             .await
             .expect("terminate still confirms real exit via the SIGKILL escalation");
 
@@ -336,13 +484,13 @@ mod tests {
             "a SIGINT-and-SIGTERM-ignoring child must require the full escalation to SIGKILL"
         );
         assert!(
-            // Both grace periods (SIGINT_GRACE then SIGTERM_GRACE) genuinely elapsed before the
-            // SIGKILL stage fired — not just one, and not a short-circuited near-zero total.
-            started.elapsed() >= SIGINT_GRACE + SIGTERM_GRACE,
+            // BOTH grace periods genuinely elapsed before the SIGKILL stage fired — not just one,
+            // and not a short-circuited near-zero total.
+            started.elapsed() >= graces.sigint + graces.sigterm,
             "both grace-period legs must be genuinely waited out before escalating to SIGKILL, \
              got {:?} (expected >= {:?})",
             started.elapsed(),
-            SIGINT_GRACE + SIGTERM_GRACE
+            graces.sigint + graces.sigterm
         );
         assert_pid_gone(pid);
     }
@@ -375,8 +523,12 @@ mod tests {
         wait_for_marker(&marker_path, Duration::from_secs(10)).await;
 
         let cancel = CancelToken::new();
+        // Stage 1's grace is SHORT here because this test needs it to genuinely elapse (the child
+        // ignores SIGINT), and stage 2's is GENEROUS because the claim under test is that SIGTERM
+        // is what ended it — which must not double as a bet on reaping beating a 3500ms clock.
+        let graces = EscalationGraces { sigint: Duration::from_millis(200), sigterm: GENEROUS };
         let started = tokio::time::Instant::now();
-        let outcome = terminate(child, &cancel)
+        let outcome = terminate_with_graces(child, &cancel, graces)
             .await
             .expect("terminate confirms real exit");
 
@@ -386,12 +538,12 @@ mod tests {
             "a SIGINT-ignoring-but-SIGTERM-obeying child must stop at stage 2, no SIGKILL needed"
         );
         assert!(
-            started.elapsed() >= SIGINT_GRACE,
+            started.elapsed() >= graces.sigint,
             "the SIGINT grace period must be genuinely waited out first, got {:?}",
             started.elapsed()
         );
         assert!(
-            started.elapsed() < SIGINT_GRACE + SIGTERM_GRACE,
+            started.elapsed() < graces.sigint + graces.sigterm,
             "SIGTERM must kill it well within the SIGTERM grace period, no SIGKILL escalation, \
              got {:?}",
             started.elapsed()
@@ -430,16 +582,93 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
 
+        // Both graces are injected GENEROUS precisely so the "short-circuited" claim is provable
+        // without a tight wall-clock bound: paying out even one of these legs would take 30s, so
+        // returning in far less proves the cancellation skipped them — an assertion that holds no
+        // matter how badly loaded the machine is, unlike a `< 1000ms` bound on a real process kill.
+        let graces = EscalationGraces { sigint: GENEROUS, sigterm: GENEROUS };
         let started = tokio::time::Instant::now();
-        let outcome = terminate(child, &cancel)
+        let outcome = terminate_with_graces(child, &cancel, graces)
             .await
             .expect("terminate still confirms real exit via SIGKILL");
 
         assert_eq!(outcome.stage, EscalationStage::Sigkill);
         assert!(
-            started.elapsed() < SIGINT_GRACE,
+            started.elapsed() < graces.sigint,
             "an already-cancelled token must short-circuit both grace waits, not pay either out \
              in full: got {:?}",
+            started.elapsed()
+        );
+        assert_pid_gone(pid);
+    }
+
+    /// SUBA-027: the timeout path's own two-rung ladder. A child that does not trap anything dies
+    /// to the first `SIGTERM`, well inside [`TIMEOUT_SIGTERM_GRACE`] — the hard-kill timer must
+    /// not be paid out for a cooperative child.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_timeout_stops_at_sigterm_for_a_normal_child() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("sleep spawns");
+        let pid = child.id().expect("live child has a pid");
+
+        // Generous grace for the same reason as the SIGINT rung above: the claim is "SIGTERM alone
+        // ended it", not "the OS reaps it inside one second".
+        let started = tokio::time::Instant::now();
+        terminate_on_timeout_with_grace(&mut child, GENEROUS)
+            .await
+            .expect("terminate_on_timeout confirms a real exit");
+
+        assert!(
+            started.elapsed() < GENEROUS,
+            "a SIGTERM-obeying child must not cost the hard-kill grace period, got {:?}",
+            started.elapsed()
+        );
+        assert_pid_gone(pid);
+    }
+
+    /// SUBA-027: a child that traps and ignores `SIGTERM` still dies, via the unconditional
+    /// `SIGKILL` rung armed [`TIMEOUT_SIGTERM_GRACE`] later — this is the rung whose absence let a
+    /// hung `verify[]` command survive its own timeout indefinitely.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_timeout_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let marker = tempfile::NamedTempFile::new()
+            .expect("real tempfile for the trap-installed marker")
+            .into_temp_path();
+        let marker_path = marker.to_path_buf();
+        std::fs::remove_file(&marker_path).ok();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "trap '' TERM; touch '{}'; while true; do sleep 1; done",
+                marker_path.display()
+            ),
+        ]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("the SIGTERM-trapping shell spawns");
+        let pid = child.id().expect("live child has a pid");
+        wait_for_marker(&marker_path, Duration::from_secs(10)).await;
+
+        // A SHORT grace here: this test's assertion is a LOWER bound (the grace was genuinely paid
+        // out before SIGKILL), which stays true under any load.
+        let grace = Duration::from_millis(200);
+        let started = tokio::time::Instant::now();
+        terminate_on_timeout_with_grace(&mut child, grace)
+            .await
+            .expect("terminate_on_timeout still confirms a real exit via SIGKILL");
+
+        assert!(
+            started.elapsed() >= grace,
+            "the hard-kill grace period must be genuinely waited out before SIGKILL, got {:?}",
             started.elapsed()
         );
         assert_pid_gone(pid);

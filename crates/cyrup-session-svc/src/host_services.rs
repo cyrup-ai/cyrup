@@ -318,6 +318,18 @@ pub struct LiveHostServices {
     /// [`Self::attach_session_activity`]. `None` on the default/by-value host, where the trait
     /// defaults (idle, no pending messages, a no-op abort) are the honest answers.
     activity: Mutex<Option<Arc<dyn SessionActivity>>>,
+    /// EXT-005: `ctx.shutdown()` latched SYNCHRONOUSLY at the capability seam, exactly as Pi does
+    /// (`shutdownHandler` is literally `() => { shutdownRequested = true }`, rpc-mode.ts:344-346,
+    /// and interactive-mode.ts:1753-1757 sets the field before anything else).
+    ///
+    /// cyrup routes control ops through a queue that only drains at a turn boundary, which is right
+    /// for the ops that need an `async` session effect but WRONG for this one: a shutdown requested
+    /// from a background task while the session is idle (or in the window after a run's own drain
+    /// has already run) would sit in the queue with no boundary left to drain it, and the host would
+    /// never exit. The queued copy is still sent — the drain sets the session's own flag too, and
+    /// the latch is a monotone `bool`, so applying it twice is a no-op. Same precedent as
+    /// `ControlOp::Abort`, which likewise fires live at this seam AND queues.
+    shutdown_requested: std::sync::atomic::AtomicBool,
 }
 
 impl LiveHostServices {
@@ -332,6 +344,7 @@ impl LiveHostServices {
             http: HttpCaps::new(),
             proc_caps: ProcCaps::new(),
             snapshot: Mutex::new(LiveSnapshot::default()),
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
             ui_effect_sink: Mutex::new(None),
@@ -491,6 +504,15 @@ impl LiveHostServices {
             tx.send(op).map_err(|e| format!("control channel closed: {e}"))
         }));
         *Self::lock(&self.control_rx) = Some(rx);
+    }
+
+    /// Whether an extension has called `ctx.shutdown()` through this backend, latched at the moment
+    /// of the call (Pi's `shutdownHandler`, rpc-mode.ts:344-346). Read by
+    /// `AgentSession::shutdown_requested`, which ORs it with the flag the queued-op drain sets, so
+    /// the request is visible whether or not a turn boundary ever came round to drain the queue.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Drain every queued control op (non-blocking). The session applies the session-tier ops and
@@ -744,6 +766,14 @@ impl HostServices for LiveHostServices {
             && let Some(activity) = Self::lock(&self.activity).clone()
         {
             activity.abort();
+        }
+        // EXT-005, same rationale one rung further: Pi's `shutdownHandler` sets its flag the instant
+        // it is called, with no queue in between. Latch here so a request that arrives while the
+        // session is idle — or after the in-flight run's own control drain has already run — is
+        // still observable at the host's next settle point instead of stranded in the queue.
+        if matches!(op, ControlOp::Shutdown) {
+            self.shutdown_requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let sink = Self::lock(&self.control).clone();
         match sink {
@@ -1070,7 +1100,7 @@ mod tests {
             Ok(())
         }));
         svc.control(ControlOp::Reload).expect("control routes to the sink");
-        svc.control(ControlOp::Compact).expect("control routes to the sink");
+        svc.control(ControlOp::Compact { custom_instructions: None }).expect("control routes to the sink");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 

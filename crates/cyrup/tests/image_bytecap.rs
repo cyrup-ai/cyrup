@@ -58,7 +58,8 @@ async fn dense_sub_2000px_image_is_reencoded_below_the_byte_cap() {
         positionals: vec!["@big.png".to_string()],
         ..Cli::default()
     };
-    let inputs = build_inputs(&cli, dir.path()).await.unwrap();
+    // `true` = the `images.autoResize` default, which is what this byte-cap assertion is about.
+    let inputs = build_inputs(&cli, dir.path(), true).await.unwrap();
 
     assert_eq!(inputs.images.len(), 1, "the image is attached, not omitted");
     let Content::Image { data, mime_type } = &inputs.images[0] else {

@@ -120,10 +120,17 @@ pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
                 *tokens_before,
                 parse_entry_ts(&base.timestamp),
             ));
-            if let Some(before) = path.get(..cpos) {
+            // `first_kept_entry_id == None` (an unresolvable v1 `firstKeptEntryIndex`) keeps
+            // NOTHING: Pi's `entry.id === compaction.firstKeptEntryId` never matches an absent
+            // id, so `foundFirstKept` stays false for the whole `0..compactionIdx` loop
+            // (`session-manager.ts:443-451`); the harness fork spells the same rule as a guard,
+            // `if (compaction.firstKeptEntryId)` (`agent/src/harness/session/session.ts:80`).
+            if let Some(before) = path.get(..cpos)
+                && let Some(first_kept) = first_kept_entry_id
+            {
                 let mut keeping = false;
                 for e in before {
-                    if &e.id() == first_kept_entry_id {
+                    if &e.id() == first_kept {
                         keeping = true;
                     }
                     if keeping {
@@ -252,10 +259,13 @@ pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
                 tokens_before: *tokens_before,
                 timestamp: parse_entry_ts(&base.timestamp),
             }));
-            if let Some(before) = path.get(..cpos) {
+            // See [`build_context_messages`]: an unresolvable `first_kept_entry_id` keeps NOTHING.
+            if let Some(before) = path.get(..cpos)
+                && let Some(first_kept) = first_kept_entry_id
+            {
                 let mut keeping = false;
                 for e in before {
-                    if &e.id() == first_kept_entry_id {
+                    if &e.id() == first_kept {
                         keeping = true;
                     }
                     if keeping {

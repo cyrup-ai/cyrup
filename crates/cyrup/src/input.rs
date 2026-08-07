@@ -3,7 +3,9 @@
 //! A 1:1 port of Pi `cli/file-processor.ts` + `cli/initial-message.ts`: `@`-prefixed positionals are
 //! file references. Each text file is wrapped `<file name="ABS">\n{content}\n</file>\n`
 //! (file-processor.ts:77); each image file is MIME-sniffed, downscaled to fit 2000×2000 AND re-encoded
-//! below the 4.5MB base64 cap (Pi `resizeImage`), attached as a base64 `Content::Image`, and
+//! below the 4.5MB base64 cap (Pi `resizeImage`) WHEN the effective `images.autoResize` setting is on
+//! (Pi threads `settingsManager.getImageAutoResize()` main.ts:830 → file-processor.ts:53; when off,
+//! the normalized original bytes are inlined verbatim), attached as a base64 `Content::Image`, and
 //! referenced with an empty `<file name="ABS"></file>\n` tag
 //! (file-processor.ts:48-72). Empty files are skipped (file-processor.ts:43); a missing file is a
 //! hard error the bin maps to exit 1 (file-processor.ts:37). The initial message is
@@ -380,7 +382,11 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<Resized> {
 /// original WxH, displayed at WxH. Multiply coordinates by S …]` dimension note when a resize occurred
 /// (Pi `formatDimensionNote`, image-resize.ts:116-123). Returns [`ImageOmit`] on failure so the caller
 /// emits Pi's matching placeholder (image-process.ts:80-92).
-fn process_image(bytes: &[u8], detected_mime: &str) -> Result<ProcessedImage, ImageOmit> {
+fn process_image(
+    bytes: &[u8],
+    detected_mime: &str,
+    auto_resize: bool,
+) -> Result<ProcessedImage, ImageOmit> {
     // normalizeImage: keep the source format when supported inline, else convert to PNG.
     let (norm_mime, norm_bytes, converted_from): (String, Vec<u8>, Option<String>) =
         match supported_inline_mime(detected_mime) {
@@ -407,6 +413,23 @@ fn process_image(bytes: &[u8], detected_mime: &str) -> Result<ProcessedImage, Im
                 )
             }
         };
+
+    // `if (autoResizeImages) { … }` (image-process.ts). The FALSE branch skips `resizeImage`
+    // entirely and inlines the normalized original bytes: no byte-cap ladder, no dimension note, and
+    // the conversion hint compared against the NORMALIZED mime rather than a re-encoded one.
+    if !auto_resize {
+        let mut hints: Vec<String> = Vec::new();
+        if let Some(from) = converted_from.as_ref()
+            && from != &norm_mime
+        {
+            hints.push(format!("[Image converted from {from} to {norm_mime}.]"));
+        }
+        return Ok(ProcessedImage {
+            data: base64::engine::general_purpose::STANDARD.encode(&norm_bytes),
+            mime_type: norm_mime,
+            hints,
+        });
+    }
 
     // resizeImage: the byte-cap re-encode ladder. `None` ⇒ the "could not be resized" omission.
     let resized = resize_image(&norm_bytes, &norm_mime).ok_or(ImageOmit::Resize)?;
@@ -440,7 +463,14 @@ fn process_image(bytes: &[u8], detected_mime: &str) -> Result<ProcessedImage, Im
 }
 
 /// Process the `@file` references into wrapped text + image attachments (Pi `processFileArguments`).
-async fn process_file_args(files: &[String], cwd: &Path) -> anyhow::Result<ProcessedFiles> {
+/// `auto_resize` is Pi's `options.autoResizeImages` (file-processor.ts:24-25), threaded from
+/// `settingsManager.getImageAutoResize()` at main.ts:830 and handed to `processImage` at
+/// file-processor.ts:53.
+async fn process_file_args(
+    files: &[String],
+    cwd: &Path,
+    auto_resize: bool,
+) -> anyhow::Result<ProcessedFiles> {
     let mut out = ProcessedFiles::default();
     for spec in files {
         let abs = resolve_read_path(spec, cwd);
@@ -458,7 +488,7 @@ async fn process_file_args(files: &[String], cwd: &Path) -> anyhow::Result<Proce
             .with_context(|| format!("Could not read file {}", abs.display()))?;
         let name = abs.display();
         match detect_image_mime(&bytes) {
-            Some(mime) => match process_image(&bytes, mime) {
+            Some(mime) => match process_image(&bytes, mime, auto_resize) {
                 Ok(processed) => {
                     out.images
                         .push(Content::Image { data: processed.data, mime_type: processed.mime_type });
@@ -539,9 +569,16 @@ async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
 
 /// Build the prompt inputs from the CLI: split positionals, process `@file` text + images, merge
 /// piped stdin. `cwd` resolves relative `@file` paths (Pi uses `process.cwd()`).
-pub async fn build_inputs(cli: &Cli, cwd: &Path) -> anyhow::Result<Inputs> {
+///
+/// `auto_resize` is the effective `images.autoResize` setting, mirroring Pi's
+/// `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
+/// (main.ts:828-832 → :181 → file-processor.ts:53). It is a required argument rather than a
+/// defaulted option precisely because it used to be missing: `@screenshot.png` always downsampled to
+/// 2000px and injected a `[Image: original …, displayed at …]` note no matter what the settings
+/// panel's "Auto-resize images" toggle said.
+pub async fn build_inputs(cli: &Cli, cwd: &Path, auto_resize: bool) -> anyhow::Result<Inputs> {
     let (files, messages) = split_positionals(&cli.positionals);
-    let processed = process_file_args(&files, cwd).await?;
+    let processed = process_file_args(&files, cwd, auto_resize).await?;
     let file_text = if processed.text.is_empty() {
         None
     } else {
@@ -619,7 +656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("note.md");
         std::fs::write(&path, "hello world").unwrap();
-        let processed = process_file_args(&[path.to_string_lossy().into_owned()], dir.path())
+        let processed = process_file_args(&[path.to_string_lossy().into_owned()], dir.path(), true)
             .await
             .unwrap();
         let expected = format!("<file name=\"{}\">\nhello world\n</file>\n", path.display());
@@ -632,12 +669,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.txt");
         std::fs::write(&empty, "").unwrap();
-        let processed = process_file_args(&[empty.to_string_lossy().into_owned()], dir.path())
+        let processed = process_file_args(&[empty.to_string_lossy().into_owned()], dir.path(), true)
             .await
             .unwrap();
         assert!(processed.text.is_empty());
 
-        let err = process_file_args(&["does-not-exist.txt".to_string()], dir.path())
+        let err = process_file_args(&["does-not-exist.txt".to_string()], dir.path(), true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("File not found"));
@@ -650,7 +687,7 @@ mod tests {
         // A 1×1 PNG via the image crate so the magic bytes + decode path are real.
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
         img.save(&path).unwrap();
-        let processed = process_file_args(&[path.to_string_lossy().into_owned()], dir.path())
+        let processed = process_file_args(&[path.to_string_lossy().into_owned()], dir.path(), true)
             .await
             .unwrap();
         assert_eq!(processed.images.len(), 1);

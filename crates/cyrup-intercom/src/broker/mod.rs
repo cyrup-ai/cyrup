@@ -67,6 +67,12 @@ struct ConnHandle {
 /// every handler is synchronous and never holds the guard across an `.await`.
 struct BrokerState {
     sessions: HashMap<String, ConnectedSession>,
+    /// Registered session ids in **join order**. `broker.ts:133` holds the sessions in a JS `Map`,
+    /// which iterates in insertion order, so every consumer of the map — the `list` reply
+    /// (`broker.ts:408`), presence broadcasts and name resolution — observes a stable join order.
+    /// A `std::collections::HashMap` has no such guarantee, so the order is tracked alongside it,
+    /// the way `unregistered` already tracks connection insertion order below.
+    session_order: Vec<String>,
     ask_edges: HashMap<String, AskEdge>,
     connections: HashMap<u64, ConnHandle>,
     /// Unregistered connection ids in insertion order (for oldest-eviction, `broker.ts:256-268`).
@@ -129,6 +135,7 @@ impl BrokerState {
     fn new(ask_timeout_ms: u64, shutdown: Arc<Notify>) -> Self {
         Self {
             sessions: HashMap::new(),
+            session_order: Vec::new(),
             ask_edges: HashMap::new(),
             connections: HashMap::new(),
             unregistered: Vec::new(),
@@ -172,6 +179,28 @@ impl BrokerState {
         self.unregistered.retain(|&c| c != conn_id);
     }
 
+    /// The registered sessions in join order — the Rust equivalent of iterating pi's
+    /// `this.sessions` JS `Map` (`broker.ts:133`).
+    fn sessions_in_order(&self) -> impl Iterator<Item = (&String, &ConnectedSession)> {
+        self.session_order.iter().filter_map(|id| self.sessions.get_key_value(id))
+    }
+
+    /// `this.sessions.set(id, …)` (`broker.ts:376`). JS `Map.set` on an **existing** key keeps
+    /// that key's original position, so an identity takeover must not move the session to the back
+    /// of the join order.
+    fn insert_session(&mut self, id: String, session: ConnectedSession) {
+        if self.sessions.insert(id.clone(), session).is_none() {
+            self.session_order.push(id);
+        }
+    }
+
+    /// `this.sessions.delete(id)` (`broker.ts:243,394`).
+    fn remove_session(&mut self, id: &str) {
+        if self.sessions.remove(id).is_some() {
+            self.session_order.retain(|s| s != id);
+        }
+    }
+
     fn broadcast(&self, msg: &BrokerMessage, exclude: Option<&str>) {
         let frame = match encode_json(msg) {
             Ok(f) => f,
@@ -180,7 +209,7 @@ impl BrokerState {
                 return;
             }
         };
-        for (id, session) in &self.sessions {
+        for (id, session) in self.sessions_in_order() {
             if Some(id.as_str()) != exclude {
                 let _ = session.tx.send(frame.clone());
             }
@@ -196,8 +225,11 @@ impl BrokerState {
         self.ask_edges.retain(|_, edge| now.saturating_sub(edge.created_at) <= timeout);
     }
 
+    /// `Array.from(this.sessions.values()).map(s => s.info)` (`broker.ts:408`) — join-ordered,
+    /// because pi's `Map` iterates in insertion order and neither `index.ts`'s `list` handler nor
+    /// `ui/session-list.ts` re-sorts the reply.
     fn session_infos(&self) -> Vec<SessionInfo> {
-        self.sessions.values().map(|s| s.info.clone()).collect()
+        self.sessions_in_order().map(|(_, s)| s.info.clone()).collect()
     }
 
     /// Socket-close handler (`broker.ts:237-249`). Returns `true` if this owned session actually left
@@ -209,7 +241,7 @@ impl BrokerState {
         if let Some(sid) = session_id
             && self.sessions.get(sid).map(|s| s.conn_id) == Some(conn_id)
         {
-            self.sessions.remove(sid);
+            self.remove_session(sid);
             self.clear_ask_edges_for_session(sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(sid));
             return true;
@@ -325,7 +357,7 @@ impl BrokerState {
             // trustedLocal = unix && !win — broker-owned, never from the payload (broker.ts:374).
             trusted_local: Some(cfg!(unix)),
         };
-        self.sessions.insert(id.clone(), ConnectedSession {
+        self.insert_session(id.clone(), ConnectedSession {
             conn_id,
             info: info.clone(),
             tx: self_tx.clone(),
@@ -350,7 +382,7 @@ impl BrokerState {
         };
         let mut schedule = false;
         if self.sessions.get(&sid).map(|s| s.conn_id) == Some(conn_id) {
-            self.sessions.remove(&sid);
+            self.remove_session(&sid);
             self.clear_ask_edges_for_session(&sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(&sid));
             schedule = true;
@@ -414,10 +446,11 @@ impl BrokerState {
         self.prune_ask_edges(now);
         let reply_edge = message.reply_to.as_ref().and_then(|rt| self.ask_edges.get(rt).cloned());
 
+        // Join-ordered, matching `findSessions`' `Array.from(this.sessions.values()/.entries())`
+        // (`broker.ts:586-594`).
         let entries: Vec<(String, Option<String>)> = self
-            .sessions
-            .values()
-            .map(|s| (s.info.id.clone(), s.info.name.clone()))
+            .sessions_in_order()
+            .map(|(_, s)| (s.info.id.clone(), s.info.name.clone()))
             .collect();
         let targets = find_session_ids(&entries, &to);
 
@@ -768,6 +801,7 @@ fn shutdown_broker(state: &Arc<Mutex<BrokerState>>, socket_path: &std::path::Pat
             h.close.notify_one();
         }
         g.sessions.clear();
+        g.session_order.clear();
         g.ask_edges.clear();
         g.unregistered.clear();
     }
@@ -866,6 +900,41 @@ mod tests {
         });
         let result = state.handle_register(conn_id, &tx, &value, session_id, 0);
         assert!(matches!(result.outcome, FrameOutcome::Continue));
+    }
+
+    /// Regression test for "the broker session list is backed by a `HashMap`, so `intercom list`
+    /// returns sessions in an arbitrary order". `broker.ts:133` holds the sessions in a JS `Map`
+    /// and `broker.ts:408` answers `list` with `Array.from(this.sessions.values()).map(s => s.info)`
+    /// — a `Map` iterates in **insertion order**, and neither `index.ts`'s `list` handler nor
+    /// `ui/session-list.ts` re-sorts the reply, so pi's session list is deterministically ordered
+    /// by join time. Before the fix `session_infos()` iterated `self.sessions.values()` directly;
+    /// `std::collections::HashMap`'s iteration order is arbitrary (and randomly seeded per
+    /// process), so with 16 sessions this assertion would hold by luck at a rate of 1/16!.
+    #[test]
+    fn session_infos_are_returned_in_join_order() {
+        let mut state = make_state();
+
+        let joined: Vec<String> = (0..16u64).map(|i| format!("session-{i}")).collect();
+        for (conn_id, id) in joined.iter().enumerate() {
+            let mut sid = None;
+            register(&mut state, conn_id as u64, &mut sid, id);
+        }
+        let listed: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        assert_eq!(listed, joined, "`list` must report sessions in join order, like pi's Map");
+
+        // An identity takeover is `this.sessions.set(id, …)` on an EXISTING key, which in JS keeps
+        // that key's original position (`broker.ts:376`) — it must not jump to the back.
+        let mut sid = None;
+        register(&mut state, 900, &mut sid, "session-3");
+        let after_takeover: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        assert_eq!(after_takeover, joined, "a re-register must keep the session's original position");
+
+        // `this.sessions.delete(id)` drops it from the order and leaves the rest intact.
+        let mut sid = Some("session-7".to_string());
+        state.handle_unregister(7, &make_tx(), &mut sid);
+        let expected: Vec<String> = joined.iter().filter(|id| *id != "session-7").cloned().collect();
+        let after_leave: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        assert_eq!(after_leave, expected, "a departure must not disturb the surviving join order");
     }
 
     /// Regression test: pi's `armRegistrationTimeout` re-runs `evictOldestUnregisteredConnections`

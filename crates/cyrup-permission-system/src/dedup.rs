@@ -15,9 +15,13 @@
 //! `begin_pending` BEFORE awaiting the human, mirroring pi's ordering exactly; [`Self::get`]/
 //! [`Self::remember`] remain for a caller that only ever stores an already-resolved decision.
 //!
-//! Wired into the gate's `ask` path (`extension.rs`): the gate computes the cache key, checks the
-//! cache BEFORE invoking the [`crate::ask::AskChannel`], and remembers the resolved (or, to close the
-//! concurrent-duplicate window, the still-pending) decision after.
+//! Wired into `extension.rs`'s `prompt_decision` — the port of pi's `promptPermission`, and the
+//! single place EVERY ask surface funnels through. pi puts the cache inside `promptPermission` itself
+//! (`index.ts:1798-1815` lookup, `:1890-1892` store) rather than at any one call site, so all three
+//! surfaces — skill-read (`index.ts:2282`), external-directory (`:2369`) and the main check
+//! (`:2469`) — dedup identically; cyrup matches that placement. `prompt_decision` computes the cache
+//! key from its [`DedupDetails`], checks the cache BEFORE invoking the [`crate::ask::AskChannel`],
+//! and remembers the resolved decision after.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -52,9 +52,15 @@ async fn discover_trust_load_command_reload() {
     let cwd = temp_project("proj");
     let ext_dir = cwd.join(".cyrup").join("extensions").join("demo");
     std::fs::create_dir_all(&ext_dir).unwrap();
+    // EXT-028: interpolate `HOST_WORLD` rather than a literal — a fixture pinned to a stale world
+    // string stops reaching the real load path the moment the world is bumped (`check_world` would
+    // refuse it first, and this test would silently stop proving anything about instantiation).
     std::fs::write(
         ext_dir.join("extension.json"),
-        r#"{ "id": "demo", "version": "1.0.0", "world": "cyrup:ext@0.2" }"#,
+        format!(
+            r#"{{ "id": "demo", "version": "1.0.0", "world": "{}" }}"#,
+            cyrup_ext::HOST_WORLD
+        ),
     )
     .unwrap();
     std::fs::write(ext_dir.join("demo.wasm"), &bytes).unwrap();
@@ -94,10 +100,17 @@ async fn discover_trust_load_command_reload() {
     let comps = host.command_completions("greet", "te").await.expect("completions");
     assert_eq!(comps, vec!["team".to_string()]);
 
-    // the command's COMMAND-tier control op (`compact`) reached the NON-deny backend (R-08-008).
+    // the command's COMMAND-tier control op (`compact`) reached the NON-deny backend (R-08-008) —
+    // WITH its `CompactOptions.customInstructions` payload (Pi types.ts:296-300,344), which the
+    // guest passed to `ctx.compact_with(...)`. Asserting the payload and not just the variant is
+    // what keeps the opts-json leg of the `control.compact` import honest.
     assert!(
-        rec.control_ops().iter().any(|op| matches!(op, ControlOp::Compact)),
-        "non-deny backend recorded the command's control op: {:?}",
+        rec.control_ops().iter().any(|op| matches!(
+            op,
+            ControlOp::Compact { custom_instructions }
+                if custom_instructions.as_deref() == Some("demo: keep the greeting")
+        )),
+        "non-deny backend recorded the command's control op with its instructions: {:?}",
         rec.control_ops()
     );
 

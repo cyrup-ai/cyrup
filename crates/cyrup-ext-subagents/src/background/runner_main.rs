@@ -88,6 +88,7 @@ use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::parallel::GlobalConcurrencyLimit;
 
 use super::atomic::write_atomic_json;
+use super::cascade;
 use super::control::{self, ChainAppendRequest};
 use super::{
     ParallelGroupStatus, ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
@@ -260,6 +261,102 @@ pub struct RunnerConfig {
     /// on-disk config still deserialize — `None` keeps the pre-fix "no config cap" behavior.
     #[serde(default)]
     pub dynamic_fanout_max_items: Option<u32>,
+    /// SUBA-N05 — pi `config.controlConfig` (`subagent-runner.ts:153,1802` @v0.34.0): the
+    /// FULLY-RESOLVED live-control thresholds/channels this run was authorized with.
+    ///
+    /// Resolved ONCE, parent-side, by the orchestrator
+    /// ([`crate::exec::control::resolve_control_config`] over the extension-level
+    /// `subagents.control` block plus the call's own `control` override) and carried here verbatim,
+    /// exactly as upstream does — `runSinglePath` computes
+    /// `resolveControlConfig(deps.config.control, effectiveParams.control)` and passes the RESOLVED
+    /// object into `executeAsyncSingle` (`subagent-executor.ts:2845,2868-2870`), whose runner reads
+    /// it back as `config.controlConfig ?? DEFAULT_CONTROL_CONFIG`.
+    ///
+    /// Parent-side resolution is load-bearing rather than stylistic: this process has no settings
+    /// access by design (see [`Self::model_scope`]'s note), so re-resolving here could apply a
+    /// *different* `subagents.control` block than the one on disk when the run was authorized.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and is hop 2's
+    /// `?? DEFAULT_CONTROL_CONFIG` degrade: control tracking on, with stock thresholds.
+    #[serde(default)]
+    pub control: Option<crate::exec::control::ResolvedControlConfig>,
+    /// SUBA-N06 — this run's `includeProgress` flag (pi `params.includeProgress`,
+    /// `extension/schemas.ts:272` @v0.34.0), carried verbatim from the orchestrator and installed
+    /// on every dispatched step's [`crate::exec::RunOptions::include_progress`], so each persisted
+    /// [`crate::exec::SingleResult`] in the terminal result file carries its own progress snapshot.
+    ///
+    /// Upstream has no counterpart on this hop: pi never threads `includeProgress` into
+    /// `executeAsyncSingle` (`subagent-executor.ts:2845-2874` @v0.34.0) because its async return
+    /// is a "started" message with no results attached. cyrup's async run produces a retrievable
+    /// `SingleResult`, so the flag has somewhere real to land; dropping it here instead would be
+    /// the advertised-and-silently-dropped defect SUBA-041 names.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and is the
+    /// pre-existing behaviour: no snapshot, full R-SA-043 compaction.
+    #[serde(default)]
+    pub include_progress: Option<bool>,
+    /// SUBA-N03 — pi `config.timeoutMs` (`subagent-runner.ts:125` @v0.34.0, fed from
+    /// `async-execution.ts:982` `timeoutMs: params.timeoutMs`): the NOMINAL run-level timeout
+    /// budget in milliseconds this run was started with.
+    ///
+    /// This is only the figure [`crate::exec::format_timeout_message`] renders into a timed-out
+    /// step's error text — the same constant for every step, never a shrinking "time remaining"
+    /// value. The instant actually raced against is [`Self::deadline_at_ms`] below. pi keeps the
+    /// same two-value split (`timeoutMessage = \`Subagent timed out after ${config.timeoutMs}ms.\``,
+    /// `subagent-runner.ts:1339`, vs the `setTimeout(timeoutRunner, config.deadlineAt - Date.now())`
+    /// arm at `:2078-2081`).
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize and is the
+    /// pre-SUBA-N03 behaviour: an async run with no wall-clock budget at all.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// SUBA-N03 — pi `config.deadlineAt` (`subagent-runner.ts:126`, fed from
+    /// `async-execution.ts:924,983` `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
+    /// wall-clock instant this run must be finished by, as milliseconds since the Unix epoch.
+    ///
+    /// Absolute epoch-milliseconds rather than a `std::time::Instant` for the reason pi's is a
+    /// `number`: this value crosses a PROCESS boundary in a JSON file, and `Instant` is an opaque
+    /// monotonic reading with no serializable representation and no meaning in another process.
+    /// [`run`] converts it back to a local deadline once, on entry, by subtracting the current
+    /// wall clock — pi's own `Math.max(0, config.deadlineAt - Date.now())` (`:2079`) — so time
+    /// already burned by the hop-1 spawn and hop-2 startup is charged against the budget rather
+    /// than silently refunded.
+    ///
+    /// `#[serde(default)]` (`None`) = no deadline, the pre-SUBA-N03 behaviour.
+    #[serde(default)]
+    pub deadline_at_ms: Option<u64>,
+    /// SUBA-N03 — pi `config.share` (`subagent-runner.ts` config, fed from `async-execution.ts:965`
+    /// `share: shareEnabled`): the run's `share` opt-in, threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::share`].
+    ///
+    /// Its one load-bearing effect is pi's `sessionEnabled = Boolean(sessionFile || sessionDir) ||
+    /// share` term (`execution.ts:1027,1039`, ported at
+    /// [`crate::exec::build_attempt_spawn_plan`]): `Some(true)` keeps the child's session store on
+    /// where it would otherwise be spawned `--no-session`. `#[serde(default)]` (`None`) is
+    /// "omitted", which is NOT an enabling value (pi's term is `options.share === true`).
+    #[serde(default)]
+    pub share: Option<bool>,
+    /// SUBA-N03 — pi `config.artifactsDir` (`subagent-runner.ts:106`, fed from
+    /// `async-execution.ts:964` `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`):
+    /// the directory this run's per-step artifact quadruple is written into.
+    ///
+    /// `None` means "write no artifacts" — pi's own gate is `if (ctx.artifactsDir &&
+    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:879`), i.e. an absent dir is
+    /// exactly as disabling as `enabled: false`, which is why the orchestrator sets this to `None`
+    /// for `artifacts: false`. `#[serde(default)]` (`None`) is therefore also the pre-SUBA-N03
+    /// behaviour: before this field existed the hop-2 runner wrote no artifacts at all.
+    #[serde(default)]
+    pub artifacts_dir: Option<PathBuf>,
+    /// SUBA-N03 — pi `config.artifactConfig` (`subagent-runner.ts:107`, fed from
+    /// `async-execution.ts:965`): WHICH of the four artifact files each step writes.
+    ///
+    /// Read together with [`Self::artifacts_dir`] by [`ExecSingleStepExecutor::run_single`], which
+    /// gates on `artifacts_dir.is_some() && artifact_config.enabled`, matching pi's own two-term
+    /// gate. `#[serde(default)]` is pi's `DEFAULT_ARTIFACT_CONFIG`; the orchestrator sends
+    /// [`crate::artifacts::ArtifactConfig::foreground`] so an async run leaves the same full
+    /// quadruple (including the `.jsonl` event stream) a foreground run does.
+    #[serde(default)]
+    pub artifact_config: crate::artifacts::ArtifactConfig,
 }
 
 // =================================================================================================
@@ -559,6 +656,21 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // single long-running step's child and a no-op. `ExecSingleStepExecutor` clones this same token
     // into every dispatched step's `RunOptions::interrupt`.
     let interrupt_cancel = cyrup_core::CancelToken::new();
+    // The second control-inbox verb (`control/timeout.json`, pi `TimeoutRequest`): an ancestor
+    // whose own deadline expired cascades one of these into every live descendant's inbox, and it
+    // gets the identical synchronous-startup-check-then-watch treatment the interrupt flag does,
+    // for the identical reason — a request written in the race window before the watcher attaches
+    // must not be missed.
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if control::check_timeout_inbox_now(run_paths)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupt_cancel.cancel();
+    }
     if control::check_control_inbox_now(run_paths)
         .await
         .ok()
@@ -571,9 +683,13 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         // child is torn down mid-flight, not merely noticed after it finishes.
         interrupt_cancel.cancel();
     }
+    let control_flags = ControlFlags {
+        interrupted: Arc::clone(&interrupted),
+        timed_out: Arc::clone(&timed_out),
+    };
     let _watcher_task = spawn_control_watcher(
         run_paths.clone(),
-        Arc::clone(&interrupted),
+        control_flags.clone(),
         interrupt_cancel.clone(),
     );
 
@@ -614,7 +730,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         &config,
         run_paths,
         &shared_status,
-        &interrupted,
+        &control_flags,
         &interrupt_cancel,
         telemetry_tx,
         &mut events,
@@ -655,6 +771,24 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             )
             .await;
             (RunState::Paused, results, None)
+        }
+        Ok(LoopOutcome::TimedOut { results, message }) => {
+            // pi `subagent.run.timed_out` (`subagent-runner.ts:2053-2060` @v0.34.0), carrying both
+            // the nominal budget and the absolute deadline so a reader can tell a run that used
+            // its whole budget from one an ancestor cut short.
+            append_event(
+                &mut events,
+                "subagent.run.timed_out",
+                Some(serde_json::json!({
+                    "runId": run_id_str,
+                    "timeoutMs": config.timeout_ms,
+                    "deadlineAt": config.deadline_at_ms,
+                    "message": message,
+                    "durationMs": duration_ms,
+                })),
+            )
+            .await;
+            (RunState::Failed, results, Some(message))
         }
         Err(err) => {
             append_event(
@@ -815,6 +949,34 @@ enum LoopOutcome {
     /// no live child to signal mid-step since interrupts are only checked BETWEEN steps, see this
     /// function's own doc note on that scope boundary).
     Interrupted { results: Vec<SingleResult> },
+    /// A wall-clock deadline expired — either this run's own (`config.deadline_at_ms`, observed as
+    /// a step whose child was killed by the deadline) or an ancestor's, delivered as a
+    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2029-2062`
+    /// @v0.34.0).
+    ///
+    /// Deliberately NOT folded into `Interrupted`: an interrupt is a resumable pause (`Paused`,
+    /// every unfinished step `Paused`, `resume` can pick it up), whereas a timeout is terminal
+    /// failure (`Failed`, `timedOut`, every unfinished step `Failed` with the timeout message,
+    /// nothing to resume). Collapsing the two would make an expired deadline look resumable and
+    /// leave a permanently-`Paused` record nothing ever revisits.
+    TimedOut {
+        results: Vec<SingleResult>,
+        /// The message stamped onto the run's terminal error and every step it failed.
+        message: String,
+    },
+}
+
+/// The two control-inbox verbs' pending flags, shared between the watcher task that SETS them and
+/// the step loop that consumes them. Bundled into one struct rather than passed as two loose
+/// `Arc<AtomicBool>`s so adding the timeout verb did not push [`run_inner`] past clippy's argument
+/// ceiling — and so the pair stays visibly a pair (they are always created, cloned and read
+/// together, and the loop's ordering between them is load-bearing).
+#[derive(Clone)]
+struct ControlFlags {
+    /// A `control/interrupt.json` is pending (soft, resumable pause).
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
+    /// A `control/timeout.json` is pending (terminal deadline failure).
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // =================================================================================================
@@ -926,11 +1088,13 @@ async fn run_inner(
     config: &RunnerConfig,
     run_paths: &RunPaths,
     status: &SharedStatus,
-    interrupted: &Arc<std::sync::atomic::AtomicBool>,
+    flags: &ControlFlags,
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     events: &mut Option<BoundedJsonlWriter>,
 ) -> Result<LoopOutcome, SubagentError> {
+    let interrupted = &flags.interrupted;
+    let timed_out = &flags.timed_out;
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
     let mut results: Vec<SingleResult> = Vec::new();
@@ -992,11 +1156,44 @@ async fn run_inner(
         // the one-shot config for the same reason as the two fields above — this process performs
         // no discovery and reads no settings.
         model_scope: config.model_scope.clone(),
+        // SUBA-N05 (pi `const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG`,
+        // `subagent-runner.ts:1802` @v0.34.0): the live-control config resolved parent-side and
+        // carried in the one-shot config, so an async run's `control` override genuinely changes
+        // the thresholds each step's child stream is judged against instead of being dropped.
+        control: config.control.clone(),
+        // SUBA-N06: R-SA-043 compaction's opt-out, carried the same way and for the same reason.
+        include_progress: config.include_progress,
+        // SUBA-N03: the run's `share` opt-in and artifact destination/selection, carried from the
+        // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
+        // quadruple a foreground run does (pi `subagent-runner.ts:879-889,1117-1133` @v0.34.0).
+        share: config.share,
+        artifacts_dir: config.artifacts_dir.clone(),
+        artifact_config: config.artifact_config,
+    });
+    // SUBA-N03 — pi `subagent-runner.ts:2078-2081`: `const remainingMs = Math.max(0,
+    // config.deadlineAt - Date.now())`. The orchestrator stamped an ABSOLUTE epoch deadline into
+    // the one-shot config; convert it back to a local `Instant` ONCE here, charging the elapsed
+    // hop-1 spawn + hop-2 startup time against the budget rather than refunding it. An
+    // already-passed deadline collapses to `now` (`max(0, …)`), so the first step is refused
+    // immediately instead of the subtraction wrapping into a far-future instant.
+    //
+    // This replaces a hardcoded `None` justified as "R-SA-036: background runs have no built-in
+    // wall-clock timeout". That remains true of the DEFAULT — `timeout_ms`/`deadline_at_ms` are
+    // `None` unless the caller asked for a timeout — but it was never a reason to DROP an explicit
+    // one, and upstream has always honoured `timeoutMs` on the async path (`schemas.ts:265-266`
+    // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
+    // async/background runs"; `async-execution.ts:924,982-983` arms the deadline).
+    let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
+        let remaining_ms = deadline_ms.saturating_sub(crate::background::now_epoch_ms());
+        std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
     });
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
-        deadline_at: None, // R-SA-036: background runs have no built-in wall-clock timeout.
-        timeout_ms: None, // Same R-SA-036 rationale: `timeoutMs`/`maxRuntimeMs` are foreground-only.
+        deadline_at,
+        // The NOMINAL budget, rendered into a timed-out step's message and never re-derived per
+        // step (pi's `timeoutMessage = \`Subagent timed out after ${config.timeoutMs}ms.\``,
+        // `subagent-runner.ts:1339`).
+        timeout_ms: config.timeout_ms,
         cancel: cancel_root.clone(),
         global_limit,
         worktree_base_dir: config.worktree_base_dir.clone(),
@@ -1016,6 +1213,36 @@ async fn run_inner(
     };
 
     loop {
+        // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
+        // (`control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+        // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
+        // both land together — an ancestor that timed out cascades a timeout to this run while a
+        // user may simultaneously be interrupting it, and the terminal record must be the harder
+        // of the two verdicts (`Failed`/timed-out, not a resumable `Paused`).
+        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(request) = control::consume_timeout_request(run_paths).await? {
+                let message = request.reason.clone().unwrap_or_else(|| {
+                    timeout_message(config.timeout_ms, &request.source)
+                });
+                {
+                    let mut guard = lock_status(status);
+                    let s = &mut *guard;
+                    mark_remaining_timed_out(s, cursor, steps.len(), &message);
+                    refresh_workflow_graph(s, &steps);
+                    s.touch();
+                }
+                write_shared_status(run_paths, status)
+                    .await
+                    .map_err(SubagentError::Spawn)?;
+                // Fail the whole subtree, not just this run — see `background::cascade`.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+                return Ok(LoopOutcome::TimedOut { results, message });
+            }
+            // Same idempotent absorption the interrupt branch below documents: a watch
+            // notification with nothing actually pending clears the flag rather than looping.
+            timed_out.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // R-SA-084: check interrupted FIRST, before consuming appends or dispatching further
         // work — an interrupt that lands must stop new-step dispatch as soon as this loop next
         // observes it, not after one more (possibly append-extended) step has already started.
@@ -1049,6 +1276,9 @@ async fn run_inner(
                     .await
                     .map_err(SubagentError::Spawn)?;
                 let _ = request; // consumed; contents already reflected via status/event log.
+                // R-SA-084 stops THIS run; without the cascade every background run this one
+                // spawned would keep running, detached and unreachable — see `background::cascade`.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
                 return Ok(LoopOutcome::Interrupted { results });
             }
             // The watcher observed a notification but a synchronous re-check found nothing
@@ -1148,6 +1378,20 @@ async fn run_inner(
                 final_output: Some(imported.output.clone()),
                 error: imported.error.clone(),
                 interrupted: false,
+                // An IMPORTED async root's control events belong to the run that was attached, and
+                // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
+                // deliberately carries only the identity/output fields
+                // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
+                // here (matching pi's `runSingleStep`, `subagent-runner.ts:695-709`).
+                control_events: Vec::new(),
+                // Same reasoning for the per-child detail fields: an imported root's real exit code
+                // is carried on `ImportedAsyncRootResult` and reproduced by
+                // `imported_root_to_single_result`; an `ImportAsyncRoot` step can never be a
+                // dynamic-fanout child, so no collect record ever reads these.
+                exit_code: None,
+                timed_out: false,
+                saved_output_path: None,
+                artifact_paths: None,
             };
             // Register the imported output under its named key (pi's `outputName`/`as`) so a later
             // `{outputs.name}` reference in this chain resolves to it — a validated structured
@@ -1259,10 +1503,47 @@ async fn run_inner(
             .map_err(SubagentError::Spawn)?;
 
         if interrupted_mid_flight {
+            // Disambiguate WHICH verb tore this child down. Both share one cancellation token, so
+            // `step_result.interrupted` is true for a timeout too — and returning `Interrupted`
+            // here would end a timed-out run as a resumable `Paused`, silently swallowing the
+            // deadline. A still-pending `control/timeout.json` means it was the timeout: fall
+            // through to the top of the loop WITHOUT advancing the cursor and let the timeout
+            // branch there produce the terminal record (it re-marks this same step `Failed`,
+            // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
+            // Checked against the file rather than the flag so a stale flag can never spin this
+            // loop: only this branch's own consumption removes the file.
+            if control::check_timeout_inbox_now(run_paths).await?.is_some() {
+                continue;
+            }
             // Consume the interrupt request file (idempotent) so it is not left dangling on the run
             // dir, then end the run `Paused` — the child was already torn down mid-flight.
             let _ = control::consume_interrupt_request(run_paths).await;
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
             return Ok(LoopOutcome::Interrupted { results });
+        }
+
+        // A step whose child was killed by the wall clock means the RUN-WIDE deadline
+        // (`config.deadline_at_ms`, converted to `ctx.deadline_at` once above) has passed — it is
+        // not a per-step budget, so every remaining step would be born already over its deadline.
+        // pi ends the whole run here (`timeoutRunner` marks the run `failed`/`timedOut` and fails
+        // every still-running-or-pending step, `subagent-runner.ts:2029-2062` @v0.34.0) rather than
+        // marching the cursor through steps that cannot succeed. This is the ORIGIN of the timeout
+        // cascade: the run whose own deadline expired is what turns a bounded background run into
+        // a bounded background SUBTREE.
+        if step_result.timed_out {
+            let message = timeout_message(config.timeout_ms, "deadline");
+            {
+                let mut guard = lock_status(status);
+                let s = &mut *guard;
+                mark_remaining_timed_out(s, cursor + 1, steps.len(), &message);
+                refresh_workflow_graph(s, &steps);
+                s.touch();
+            }
+            write_shared_status(run_paths, status)
+                .await
+                .map_err(SubagentError::Spawn)?;
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+            return Ok(LoopOutcome::TimedOut { results, message });
         }
 
         cursor += 1;
@@ -1278,6 +1559,86 @@ async fn run_inner(
 /// moved out of `Pending` into `Paused` rather than left looking like they simply never got a
 /// turn, since R-SA-084 does not distinguish "was mid-flight" from "was about to start" for the
 /// purpose of this marking.
+/// pi's `timeoutMessage` (`subagent-runner.ts:1339` @v0.34.0): `Subagent timed out after
+/// ${config.timeoutMs}ms.`, falling back to the bare `"Subagent timed out."` upstream's
+/// `timeoutRunner` uses when no nominal budget is known — which is exactly the ancestor-cascade
+/// case, where the deadline that expired belonged to a different run and this one has no
+/// `timeout_ms` of its own to name.
+fn timeout_message(timeout_ms: Option<u64>, source: &str) -> String {
+    match timeout_ms {
+        Some(ms) => format!("Subagent timed out after {ms}ms."),
+        None if source == "ancestor-timeout" => {
+            "Subagent timed out: an ancestor run's deadline expired.".to_string()
+        }
+        None => "Subagent timed out.".to_string(),
+    }
+}
+
+/// The timeout counterpart of [`mark_remaining_paused`] (pi `timeoutRunner`'s step sweep,
+/// `subagent-runner.ts:2038-2049` @v0.34.0): every step from `from_index` that is not already
+/// terminal becomes `Failed` with the timeout `message` and an end timestamp.
+///
+/// `Failed`, not `Paused`, is the whole point — see [`LoopOutcome::TimedOut`]. A reader must be
+/// able to tell "this run stopped and can be resumed" from "this run ran out of time and is over".
+fn mark_remaining_timed_out(
+    status: &mut RunStatus,
+    from_index: usize,
+    total: usize,
+    message: &str,
+) {
+    let now = super::now_epoch_millis_pub();
+    for index in from_index..total {
+        if let Some(step) = status.steps.get_mut(index)
+            && !step.status.is_terminal()
+        {
+            step.status = StepState::Failed;
+            step.error = Some(message.to_string());
+            step.ended_at.get_or_insert(now);
+        }
+    }
+    if let Some(groups) = &mut status.parallel_groups {
+        for group in groups {
+            if group.group_step_index >= from_index {
+                for child in &mut group.children {
+                    if !child.status.is_terminal() {
+                        child.status = StepState::Failed;
+                        child.error = Some(message.to_string());
+                        child.ended_at.get_or_insert(now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deliver `verb` to every live nested async descendant of this run, logging each failed delivery
+/// into this run's own `events.jsonl` under pi's `subagent.nested.{interrupt,timeout}_failed`
+/// event types (`subagent-runner.ts:1539-1573` @v0.34.0).
+///
+/// A run with no `nested_route` has no descendants to reach and this is a no-op — that is the
+/// common case (a leaf background run), so the cascade costs nothing on the path that does not
+/// need it.
+async fn cascade_to_descendants(
+    config: &RunnerConfig,
+    events: &mut Option<BoundedJsonlWriter>,
+    verb: cascade::CascadeVerb,
+) {
+    let Some(route) = config.nested_route.as_ref() else {
+        return;
+    };
+    let report = cascade::cascade_to_nested_async_descendants(route, verb).await;
+    for failure in report.failures {
+        let mut payload = serde_json::json!({
+            "runId": config.run_id.as_str(),
+            "message": failure.message,
+        });
+        if let (Some(target), Some(map)) = (failure.target_run_id, payload.as_object_mut()) {
+            map.insert("targetRunId".to_string(), serde_json::Value::String(target));
+        }
+        append_event(events, verb.failure_event_type(), Some(payload)).await;
+    }
+}
+
 fn mark_remaining_paused(status: &mut RunStatus, from_index: usize, total: usize) {
     let now = super::now_epoch_millis_pub();
     for index in from_index..total {
@@ -1390,7 +1751,14 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
     SingleResult {
         agent,
         task,
-        exit_code: i32::from(!result.success),
+        // The child's real code when the executor ran one; the success/failure mapping only as the
+        // fallback for a step whose executor spawned nothing (mocks, and every group aggregate).
+        // pi's async runner records the real code too (`subagent-runner.ts` stores the
+        // `SingleResult` its step produced, exit code and all), so a `ResultFile` reader sees `2`
+        // or `137` rather than a flattened `1`.
+        exit_code: result
+            .exit_code
+            .unwrap_or_else(|| i32::from(!result.success)),
         usage: cyrup_core::Usage::default(),
         model: None,
         attempted_models: Vec::new(),
@@ -1403,10 +1771,19 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // `SingleResult` (pi's `interrupted` field), so a `ResultFile` reader sees which step was
         // the pause point rather than a hard-coded `false`.
         interrupted: result.interrupted,
-        timed_out: false,
+        // Same rationale as `interrupted` above, one field over: a deadline kill is now visible on
+        // the terminal per-step `SingleResult` instead of being flattened into an anonymous
+        // non-zero exit.
+        timed_out: result.timed_out,
         error: result.error.clone(),
+        saved_output_path: result.saved_output_path.clone(),
         tool_calls: Vec::new(),
         output_truncated: false,
+        // SUBA-N05: the step's raised control events, carried through `StepResult` rather than
+        // dropped — this is the only channel by which an ASYNC run's control events reach the
+        // orchestrator, which reads them off the terminal `ResultFile`.
+        control_events: result.control_events.clone(),
+        progress: None,
     }
 }
 
@@ -1435,8 +1812,11 @@ fn imported_root_to_single_result(
         interrupted: false,
         timed_out: false,
         error: imported.error.clone(),
+        saved_output_path: None,
         tool_calls: Vec::new(),
         output_truncated: false,
+        control_events: Vec::new(),
+        progress: None,
     }
 }
 
@@ -1516,6 +1896,37 @@ pub(crate) struct ExecSingleStepExecutor {
     /// outside the scope FAILS the step (fail-closed, pi's `explicit` severity) rather than being
     /// quietly replaced by an allowed model. `None` = enforcement off.
     pub(crate) model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-N05 — the run's FULLY-RESOLVED live-control config (pi `controlConfig`,
+    /// `subagent-runner.ts:1802` / `chain-execution.ts:388,1064` @v0.34.0), carried from
+    /// [`RunnerConfig::control`] (background) or handed by [`Self::with_control`] (foreground
+    /// `/chain`, `/parallel`, `/run-chain`). Threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::control_config`], so an explicit `control` override really does
+    /// move the attention/long-running thresholds each child stream is judged against.
+    ///
+    /// `None` is pi's `?? DEFAULT_CONTROL_CONFIG` degrade, applied inside `run_sync`.
+    pub(crate) control: Option<crate::exec::control::ResolvedControlConfig>,
+    /// SUBA-N06 — the run's `includeProgress` flag, carried from
+    /// [`RunnerConfig::include_progress`] (background) or handed by [`Self::with_control`]'s
+    /// sibling [`Self::with_include_progress`] (foreground `/chain`, `/parallel`, `/run-chain`).
+    /// Threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`], so each
+    /// step's [`crate::exec::SingleResult`] carries its own progress snapshot.
+    pub(crate) include_progress: Option<bool>,
+    /// SUBA-N03 — the run's `share` opt-in (pi `config.share` ← `params.share`), threaded onto
+    /// every dispatched step's [`crate::exec::RunOptions::share`]. Its one effect is pi's
+    /// `sessionEnabled = Boolean(sessionFile || sessionDir) || share` term
+    /// (`runs/foreground/execution.ts:1027,1039`): `Some(true)` keeps a child's session store on
+    /// where it would otherwise be spawned `--no-session`. `None`/`Some(false)` is not enabling.
+    pub(crate) share: Option<bool>,
+    /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
+    /// `runs/background/subagent-runner.ts:877-889,1117-1133` @v0.34.0), paired with
+    /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
+    /// own first gate term (`if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`) and
+    /// is how an explicit `artifacts: false` reaches this hop.
+    pub(crate) artifacts_dir: Option<PathBuf>,
+    /// SUBA-N03 — which of the four artifact files each dispatched step writes (pi
+    /// `ctx.artifactConfig`). Read together with [`Self::artifacts_dir`]; `enabled: false` disables
+    /// the write just as an absent dir does.
+    pub(crate) artifact_config: crate::artifacts::ArtifactConfig,
 }
 
 impl ExecSingleStepExecutor {
@@ -1574,7 +1985,49 @@ impl ExecSingleStepExecutor {
             run_id,
             inherited_session_model,
             model_scope,
+            // Set separately via `with_control` rather than as a seventh positional argument — see
+            // that method's doc.
+            control: None,
+            // Same rationale, via `with_include_progress`.
+            include_progress: None,
+            // SUBA-N03: a FOREGROUND `/chain`//`/parallel`//`/run-chain` walk carries no run-level
+            // `share`/artifacts config of its own — those three slash commands expose no such flag
+            // (only the `subagent` tool's SINGLE mode does, and that path never builds this
+            // executor), and neither does pi's own foreground chain path. Deliberately NOT given a
+            // `with_*` builder: an unused one would be dead code, and the background runner sets
+            // these three directly in its own `ExecSingleStepExecutor` literal from `RunnerConfig`.
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
         }
+    }
+
+    /// Install this run's `includeProgress` flag (SUBA-N06) — R-SA-043 compaction's opt-out,
+    /// threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`].
+    ///
+    /// A builder step for the same two reasons [`Self::with_control`] is one: [`Self::foreground`]
+    /// stays at six positional arguments, and the value is not a product of the single discovery
+    /// pass those six all come from.
+    #[must_use]
+    pub(crate) fn with_include_progress(mut self, include_progress: Option<bool>) -> Self {
+        self.include_progress = include_progress;
+        self
+    }
+
+    /// Install this run's already-resolved live-control config (SUBA-N05).
+    ///
+    /// A builder step rather than a [`Self::foreground`] parameter for two reasons: it keeps that
+    /// constructor at six arguments (clippy's `too_many_arguments` threshold is seven), and it
+    /// mirrors how the value actually flows — every caller resolves it with
+    /// [`crate::exec::control::resolve_control_config`] at a different point in its own plan phase,
+    /// whereas the six positional arguments are all products of the single discovery pass.
+    #[must_use]
+    pub(crate) fn with_control(
+        mut self,
+        control: Option<crate::exec::control::ResolvedControlConfig>,
+    ) -> Self {
+        self.control = control;
+        self
     }
 }
 
@@ -1650,6 +2103,45 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             Err(violation) => return Ok(StepResult::failure(violation.message)),
         };
 
+        // SUBA-N04: lower THIS step's declared acceptance contract (pi `chain-execution.ts:400`
+        // `acceptance: task.acceptance` for a parallel task / `:1335` `acceptance:
+        // seqStep.acceptance` for a sequential step — both handed straight into the same `runSync`
+        // call the SINGLE path uses) through the SAME
+        // `exec::acceptance::lower_acceptance_input` the `subagent` tool's SINGLE-mode `acceptance`
+        // param goes through (`extension.rs::route_single`). `run_sync` then resolves the effective
+        // contract (R-SA-023), injects the `## Acceptance Contract` block into the task text,
+        // EXECUTES any declared `verify[]` command as a real subprocess (R-SA-032/DI-SA-5), and —
+        // because an explicitly-declared contract sets `AcceptanceContract::explicit` — applies
+        // R-SA-033's post-hoc exit-code correction, so a rejected gate turns this step's `exit_code`
+        // nonzero and therefore its `StepResult` into a FAILURE below.
+        //
+        // This field was previously a hard `None`. A chain/parallel/background step that declared
+        // `acceptance` was parsed, carried all the way here, and then discarded with no warning: the
+        // step ran completely UNVERIFIED and reported success on the exact same path an accepted run
+        // reports it — silent, unlike a refusal, and reachable through the `tasks:[{…}]` surface
+        // SUBA-041 documents as the workaround for the background SINGLE surface.
+        //
+        // A malformed policy FAILS the step (pi's own verbatim `validateAcceptanceInput` message)
+        // rather than degrading to "no contract" — the same fail-closed choice the `modelScope`
+        // violation directly above makes, and for the same reason: silently running a gate-less
+        // child is the defect, not the remedy. The tool boundary
+        // (`extension.rs::execute` -> `validate_execution_acceptance`, pi
+        // `subagent-executor.ts:1534`) normally refuses such a policy before any child spawns; this
+        // is the last line of defence for a step reaching the runner from a config file that was
+        // hand-edited after validation.
+        let acceptance = match step.acceptance.as_ref() {
+            Some(raw) => match crate::exec::acceptance::lower_acceptance_input(raw) {
+                Ok(contract) => contract,
+                Err(message) => {
+                    return Ok(StepResult::failure(format!(
+                        "subagent step '{}' has an invalid acceptance policy: {message}",
+                        step.agent
+                    )));
+                }
+            },
+            None => None,
+        };
+
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:458-466,1583-1609`): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
         // control-inbox watcher cancels `self.interrupt_cancel`) actually tears the child down via
@@ -1721,24 +2213,49 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             available_models,
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,
-            share: None,
-            session_dir: None,
-            // The step's skills come from the resolved persona's own `skills` list (carried on the
-            // `AgentConfig` built from the persona above); `run_sync` reads `opts.skills ??
-            // agent.skills`. The orchestrator/runtime fallback cwd is not threaded through the
-            // one-shot runner config, so a background step resolves skills against its own step cwd.
-            skills: None,
+            // SUBA-N03 — pi `share: shareEnabled` (`async-execution.ts:965`) reaching this run's
+            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039`). Carried
+            // from `RunnerConfig::share`; `None` is "omitted", which is NOT enabling.
+            share: self.share,
+            // SUBA-N03 — this step's own already-resolved session directory (pi's `--session-dir`,
+            // `pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
+            // derived here from a run-level root: see `SingleStepSpec::session_dir`'s
+            // [CYRUP-DELTA] note for why an index-derived path would be unsafe at this seam.
+            session_dir: step.session_dir.clone(),
+            // SUBA-N03 — this step's own SKILL override (pi's runner-step `skills`,
+            // `subagent-runner.ts:872` ← `async-execution.ts:990`). `run_sync` applies pi's
+            // `opts.skills ?? agent.skills` fallthrough, so `None` still defers to the resolved
+            // persona's own `skills:` list (carried on the `AgentConfig` built above) and
+            // `Some(vec![])` is the explicit `skill: false` "no skills" form. The orchestrator/
+            // runtime fallback cwd is not threaded through the one-shot runner config, so a
+            // background step resolves skill NAMES against its own step cwd.
+            skills: step.skills.clone(),
             runtime_cwd: None,
-            include_progress: None,
+            // SUBA-N06: the run's `includeProgress`, carried from `RunnerConfig::include_progress`
+            // through this executor, so a background step's persisted `SingleResult` carries the
+            // same progress snapshot the foreground path returns.
+            include_progress: self.include_progress,
             agent_scope: step.agent_scope,
-            acceptance: None,
+            // SUBA-N04: the step's own lowered contract (resolved above), NOT a hard `None`.
+            acceptance,
             fork_context,
             live_events,
-            // R-SA-P1: the detached hop-2 runner is a separate process that inherited
-            // `CYRUP_SUBAGENT_PARENT_SESSION` in its OWN env from the hop-1 spawn; defer to that
-            // INHERITED value (`None` here → the spawn site reads `std::env::var`), never overwriting
-            // it with a value this headless runner has no live session id to supply.
-            parent_session_id: None,
+            // R-SA-P1 / PERM-001: the anchor the hop-1 spawn injected into THIS runner's own
+            // environment (`background::spawn_detached`'s `env_overlay`, sourced from
+            // `background::parent_anchor::detached_runner_env_overlay`), resolved explicitly here
+            // and threaded on rather than left to the spawn site's fallback.
+            //
+            // The comment this replaces asserted that the runner "inherited
+            // `CYRUP_SUBAGENT_PARENT_SESSION` in its OWN env from the hop-1 spawn" — which was
+            // simply untrue: until PERM-001 the hop-1 spawn added NO env overlay whatsoever, and
+            // the only writer of that variable anywhere in the workspace is
+            // `exec::build_attempt_spawn_plan`, which no process ever runs against itself. A root
+            // orchestrator's background run therefore reached here with no anchor in scope, every
+            // hop-3 child was spawned without one, and `cyrup-permission-system`'s child gate
+            // fail-closed denied every `ask` against a null forwarding target with no prompt ever
+            // shown to the operator. Hop 1 now really does inject it, so the claim is finally true
+            // — and this call site states the dependency instead of assuming it.
+            parent_session_id: crate::background::parent_anchor::resolve_parent_session_anchor(),
             // The detached hop-2 runner has no live orchestrator human session to surface a clarify
             // ask to; a child's blocking `contact_supervisor` ask routes over the broker to whichever
             // supervisor its intercom metadata names, not through this headless runner's exec loop.
@@ -1754,9 +2271,85 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
             child_index: Some(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            // SUBA-N05: the run's resolved live-control config, threaded from
+            // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
+            // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
+            // per-step `runSync` call (`chain-execution.ts:388,1064,1323` @v0.34.0), and
+            // `config.controlConfig ?? DEFAULT_CONTROL_CONFIG` in the async runner
+            // (`subagent-runner.ts:1802`). `None` still degrades to `DEFAULT_CONTROL_CONFIG` inside
+            // `run_sync`, so an omitted config keeps control tracking ON with stock thresholds
+            // rather than turning it off.
+            control_config: self.control.clone(),
+            // No live notice SINK on this path: the detached runner has no orchestrator transcript
+            // to inject into, and a foreground chain/parallel walk's notices are surfaced by the
+            // parent from `SingleResult::control_events`. Events are still RAISED — they land on
+            // each step's `SingleResult::control_events` and travel back in the result file — which
+            // is what `notifyChannels: ["async"]` describes upstream, where the runner appends them
+            // to the async dir's control-event log for the parent tracker to replay
+            // (`subagent-runner.ts:2270-2280` → `async-job-tracker.ts:138-166` @v0.34.0). That
+            // replay hop is not ported; the events themselves are not lost.
+            on_control_event: None,
         };
 
+        // SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
+        // @v0.34.0: the artifact quadruple is written by the ASYNC runner too, not only by the
+        // foreground path, and its `_input.md` is written BEFORE the child spawns (`:882-885`,
+        // `mkdirSync` then `writeFileSync(inputPath, …)`) precisely so a child that crashes still
+        // leaves a record of what it was asked to do. The gate is pi's own two-term one:
+        // `ctx.artifactsDir && ctx.artifactConfig?.enabled !== false` (`:879`) — an absent dir is
+        // exactly as disabling as `enabled: false`, which is how the SINGLE-mode `artifacts: false`
+        // param reaches this hop.
+        //
+        // Best-effort throughout: a failed artifact write must never alter the `StepResult` the
+        // walker observes, matching pi (whose artifact writes are un-guarded side-effects) and the
+        // foreground path's identical convention.
+        //
+        // Index: pi passes the step's own index into `getArtifactPaths` so a chain's steps do not
+        // overwrite each other's files. `current_flat_index` is the value `run_inner` publishes
+        // immediately before each dispatch — the SAME index `RunOptions::child_index` above uses.
+        let artifact_paths = self.artifacts_dir.as_ref().filter(|_| self.artifact_config.enabled).map(
+            |dir| {
+                let index = self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst);
+                let run_token = self.run_id.as_ref().map_or("run", RunId::as_str).to_string();
+                let paths =
+                    crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
+                let _ = crate::artifacts::ensure_artifacts_dir(dir);
+                if self.artifact_config.include_input {
+                    let _ = crate::artifacts::write_artifact(
+                        &paths.input_path,
+                        &format!("# Task for {}\n\n{resolved_task}", step.agent),
+                    );
+                }
+                (paths, run_token)
+            },
+        );
+
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
+
+        // SUBA-N03 / T6: the after-run half (pi `subagent-runner.ts:1117-1134` — `_output.md`,
+        // `_meta.json`, and this crate's reconstructed `.jsonl`). Shares ONE implementation with
+        // the foreground path via `artifacts::run_artifact_metadata`/`run_artifact_jsonl_lines`,
+        // so an async run's artifacts are byte-shaped identically to a foreground run's rather
+        // than being a second, drifting hand-rolled emitter.
+        if let Some((paths, run_token)) = &artifact_paths {
+            if self.artifact_config.include_output {
+                let _ = crate::artifacts::write_artifact(
+                    &paths.output_path,
+                    result.final_output.as_deref().unwrap_or(""),
+                );
+            }
+            if self.artifact_config.include_metadata {
+                let _ = crate::artifacts::write_metadata(
+                    &paths.metadata_path,
+                    &crate::artifacts::run_artifact_metadata(run_token, &result),
+                );
+            }
+            if self.artifact_config.include_jsonl {
+                for line in crate::artifacts::run_artifact_jsonl_lines(&result) {
+                    let _ = crate::artifacts::append_jsonl(&paths.jsonl_path, &line);
+                }
+            }
+        }
 
         // R-SA-084: carry the mid-flight interrupt flag up so `run_inner` treats an interrupted
         // step as the pause point (`Paused`, not `Complete`). An interrupted `run_sync` reports
@@ -1770,6 +2363,29 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             }))
         };
         step_result.interrupted = result.interrupted;
+        // Carry the per-child detail pi's `collectDynamicResults` copies verbatim onto a dynamic
+        // fan-out's collect records (`runs/shared/dynamic-fanout.ts:278-284` @v0.34.0). All four
+        // are known HERE and nowhere upstream of here: the walker sees only `StepResult`, so
+        // without this hop a timed-out child is indistinguishable from an ordinary failure, every
+        // failure reports exactly `1` rather than its real code, and a later chain step cannot
+        // locate the files its fanned-out siblings wrote.
+        step_result.exit_code = Some(result.exit_code);
+        step_result.timed_out = result.timed_out;
+        step_result.saved_output_path = result.saved_output_path;
+        // pi stamps `result.artifactPaths` from the quadruple it computed for this same step
+        // (`runs/foreground/execution.ts:1114`, gated on the run having an artifacts dir at all).
+        // `artifact_paths` above is precisely that quadruple, under precisely pi's gate
+        // (`artifactsDir && artifactConfig?.enabled !== false`), so reuse it rather than
+        // recomputing — a second `artifact_paths()` call would have to re-read `current_flat_index`
+        // after it has already advanced.
+        step_result.artifact_paths = artifact_paths
+            .as_ref()
+            .and_then(|(paths, _)| serde_json::to_value(paths).ok());
+        // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
+        // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
+        // hop the whole async control path is inert: the thresholds are honoured, the events are
+        // raised, and then they die here.
+        step_result.control_events = result.control_events;
         Ok(step_result)
     }
 }
@@ -1860,9 +2476,13 @@ impl Drop for SigUsr2Guard {
 /// installing any asynchronous watch" contract.
 fn spawn_control_watcher(
     run_paths: RunPaths,
-    interrupted: Arc<std::sync::atomic::AtomicBool>,
+    flags: ControlFlags,
     interrupt_cancel: cyrup_core::CancelToken,
 ) -> ControlWatcherHandle {
+    let ControlFlags {
+        interrupted,
+        timed_out,
+    } = flags;
     let handle = tokio::spawn(async move {
         let (watcher, mut rx) = match control::watch_control_inbox(&run_paths) {
             Ok(pair) => pair,
@@ -1880,13 +2500,43 @@ fn spawn_control_watcher(
         // — held in this local binding rather than discarded.
         let _watcher = watcher;
         while rx.recv().await.is_some() {
-            interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
-            // R-SA-084 mid-flight interrupt: cancelling the run-wide shared interrupt token tears
-            // down whatever child is running RIGHT NOW (via `run_sync`'s `opts.interrupt` race),
-            // rather than waiting for the step loop's next between-steps `interrupted` check — the
-            // difference between an interrupt that actually stops a single long-running step's child
-            // and one that is a no-op until the (never-arriving) next step.
-            interrupt_cancel.cancel();
+            // The control inbox now holds TWO distinct request files (`interrupt.json` and
+            // `timeout.json`), so a notification is no longer self-describing: this task must ask
+            // WHICH one is pending rather than blindly assuming "interrupt". Blindly setting
+            // `interrupted` on a timeout delivery would tear the live child down under the wrong
+            // verdict and end the run `Paused` (resumable) when it must end `Failed`/timed-out.
+            //
+            // Timeout is checked first, matching pi's own drain order (`control-channel.ts:608-609`
+            // @v0.34.0) and this run loop's own top-of-iteration ordering.
+            let mut wake = false;
+            if control::check_timeout_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
+            if control::check_control_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
+            if wake {
+                // R-SA-084 mid-flight interrupt: cancelling the run-wide shared interrupt token
+                // tears down whatever child is running RIGHT NOW (via `run_sync`'s
+                // `opts.interrupt` race), rather than waiting for the step loop's next
+                // between-steps check — the difference between a control request that actually
+                // stops a single long-running step's child and one that is a no-op until the
+                // (never-arriving) next step. pi does the same for both verbs (`interruptRunner`
+                // signals the live children; `timeoutRunner` aborts via `timeoutAbortController`).
+                interrupt_cancel.cancel();
+            }
         }
     });
     ControlWatcherHandle { handle }
@@ -2005,8 +2655,11 @@ async fn finish_run(
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
             error: Some(error.clone()),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         });
     }
 
@@ -2094,6 +2747,8 @@ mod tests {
 
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: task.to_string(),
             cwd: None,
@@ -2136,11 +2791,16 @@ mod tests {
             interrupt_cancel: cyrup_core::CancelToken::new(),
             current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,
             inherited_session_model: None,
             model_scope: None,
+            control: None,
+            include_progress: None,
         };
         let ctx = ChainRunContext {
             cwd: dir.path().to_path_buf(),
@@ -2186,6 +2846,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token("run00001"),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
@@ -2208,6 +2875,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2228,6 +2897,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token("run00002"),
             mode: RunMode::Single,
             steps: vec![],
@@ -2250,6 +2926,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         write_atomic_json(&cfg_path, &config).await.expect("write config");
 
@@ -2342,6 +3020,13 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: run_id.clone(),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
@@ -2364,6 +3049,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");
@@ -2429,8 +3116,11 @@ mod tests {
                 interrupted: false,
                 timed_out: false,
                 error: None,
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
             }],
             dir.path().to_path_buf(),
             None,
@@ -2620,8 +3310,11 @@ mod tests {
                 interrupted: false,
                 timed_out: false,
                 error: None,
+                saved_output_path: None,
                 tool_calls: Vec::new(),
                 output_truncated: false,
+                control_events: Vec::new(),
+                progress: None,
             }],
         };
         write_atomic_json(&target_paths.result, &target_result)
@@ -2637,6 +3330,13 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: run_id.clone(),
             mode: RunMode::Chain,
             steps: vec![RunnerStep::ImportAsyncRoot(
@@ -2665,6 +3365,8 @@ mod tests {
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
         };
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         write_atomic_json(&cfg_path, &config).await.expect("write config");

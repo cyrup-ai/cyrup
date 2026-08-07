@@ -453,7 +453,7 @@ fn first_200_chars(text: &str) -> String {
 /// `{"content":[{"type":"text","text":…}],"details":…,"terminate":…}` (`cyrup-agent`
 /// `result_value_of`, `agent.rs:113-115`). Tolerant of the shapes a real/scripted child can emit: a
 /// bare string result, a `{content:[…]}` object, or a bare `[…]` array of content parts.
-fn extract_tool_result_text(result: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_tool_result_text(result: &serde_json::Value) -> Option<String> {
     fn first_text_part(parts: &[serde_json::Value]) -> Option<String> {
         parts.iter().find_map(|part| {
             if part.get("type").and_then(serde_json::Value::as_str) == Some("text") {

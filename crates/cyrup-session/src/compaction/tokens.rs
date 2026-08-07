@@ -129,6 +129,10 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextUsageEstimate {
     let mut usage_tokens = 0;
     for (i, m) in messages.iter().enumerate() {
         if let Message::Assistant(a) = m {
+            // Byte-faithful to Pi's `getAssistantUsage`: `stopReason !== "aborted" &&
+            // stopReason !== "error"` (compaction.ts:186-191). `pending` is deliberately NOT
+            // excluded — Pi admits it, and a partial's `usage.input` is a real context reading.
+            // Do not "tighten" this to `is_settled()`; that would be a divergence, not a fix.
             let valid = !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted);
             let tok = context_tokens_from_usage(&a.usage);
             if valid && tok > 0 {
@@ -163,6 +167,10 @@ pub fn estimate_context_tokens_raw(messages: &[AgentMessage]) -> ContextUsageEst
     let mut usage_tokens = 0;
     for (i, m) in messages.iter().enumerate() {
         if let AgentMessage::Core(Message::Assistant(a)) = m {
+            // Byte-faithful to Pi's `getAssistantUsage`: `stopReason !== "aborted" &&
+            // stopReason !== "error"` (compaction.ts:186-191). `pending` is deliberately NOT
+            // excluded — Pi admits it, and a partial's `usage.input` is a real context reading.
+            // Do not "tighten" this to `is_settled()`; that would be a divergence, not a fix.
             let valid = !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted);
             let tok = context_tokens_from_usage(&a.usage);
             if valid && tok > 0 {

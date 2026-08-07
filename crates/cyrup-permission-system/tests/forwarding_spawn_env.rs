@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyrup_core::{CancelToken, ModelId, ToolCallId};
@@ -205,6 +205,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        control_config: None,
+        on_control_event: None,
     };
     let plan = build_attempt_spawn_plan(
         &agent,
@@ -213,6 +215,10 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         &opts,
         DepthEnvelope { current_depth: 1, max_depth: 5 },
         cwd,
+        // SUBA-S01: no `outputSchema` declared here — this test asserts the PERMISSION
+        // forwarding env, and a structured-output runtime would add two unrelated vars to the
+        // overlay it inspects.
+        None,
     )
     .expect("the production spawn planner must build a plan");
     plan.spec.env_overlay
@@ -365,7 +371,7 @@ async fn spawn_env_alone_lets_the_parents_human_answer_a_child_ask() {
     let watcher = spawn_forwarding_watcher(
         agent_dir.path().to_path_buf(),
         services,
-        ExtensionConfig::default(),
+        Arc::new(Mutex::new(ExtensionConfig::default())),
     );
 
     let child = spawn_child(agent_dir.path(), &parent_id, &sentinel, 20_000);

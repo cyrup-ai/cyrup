@@ -38,6 +38,7 @@ pub mod fork_context;
 /// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
 /// event log. See [`jsonl`] for the full contract.
 pub mod jsonl;
+pub mod prompt_runtime;
 pub mod registration;
 pub mod spawn;
 pub mod tui;
@@ -48,8 +49,18 @@ pub mod tui;
 // cross-crate as BUILDING BLOCKS (not as the subagents interrupt channel — permission replicates
 // pi's own nonce-bound request/response spool on top of these). These are already `pub` at
 // `background::control::*`/`exec::*`; the flat re-export is the ergonomic P-5 surface the port doc
-// names. This crate only ever WRITES the anchor (`build_attempt_spawn_plan`); permission reads it.
+// names. This crate WRITES the anchor into every spawn env (`build_attempt_spawn_plan`,
+// `background::spawn_detached`) and permission reads it back in the child.
+//
+// PERM-001 adds the one flow in the other direction: pi's orchestrator publishes the anchor into
+// its OWN `process.env` at `SessionStart` (`pi-subagents/src/extension/index.ts:599` @v0.34.0,
+// deleted at `:619`) so that even a DETACHED descendant inherits it, and this crate cannot do that
+// (`#![forbid(unsafe_code)]` vs. 2024-edition `unsafe std::env::set_var`). The
+// [`background::parent_anchor`] register stands in for that `process.env` slot, and the anchor's
+// sole consumer — `cyrup-permission-system`, in its PARENT role — is what publishes into it. These
+// two re-exports are that publish/clear pair.
 pub use background::control::{
     validate_contains_root, validate_safe_token, watch_control_inbox, CONTROL_INBOX_POLL_INTERVAL,
 };
+pub use background::parent_anchor::{clear_parent_session_anchor, publish_parent_session_anchor};
 pub use exec::{AGENT_NAME_ENV_VAR, PARENT_SESSION_ENV_VAR};

@@ -1335,9 +1335,10 @@ fn is_non_negative_integer(value: &Value) -> bool {
 /// exactly mirroring `registration::slash_commands::step_token_to_spec`'s established mapping. Like
 /// that converter, it defers to a later phase (T0.1 plan-time enrichment): the per-step `model`
 /// string is not resolved to a `ModelId` here (`model: None` -> the persona's own model), a
-/// path-form `outputSchema` is not loaded into `structured_output_schema`, an object-form
-/// `acceptance` is not lowered into a runtime contract, and a static `parallel`/`dynamic` group's
-/// `concurrency` falls back to `default_concurrency` when the step omits it.
+/// path-form `outputSchema` is not loaded into `structured_output_schema`, and a static
+/// `parallel`/`dynamic` group's `concurrency` falls back to `default_concurrency` when the step
+/// omits it. The step's `acceptance` IS carried through verbatim (SUBA-N04) — lowering it to a
+/// runtime contract is `run_single`'s job, at dispatch, exactly as upstream does it.
 pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u32) -> RunnerStep {
     if let Some(Value::Array(items)) = &step.parallel {
         let steps: Vec<SingleStepSpec> = items.iter().filter_map(value_to_single_step_spec).collect();
@@ -1363,6 +1364,14 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
                 .unwrap_or_default()
                 .to_string(),
             concurrency: chain_concurrency(step, default_concurrency),
+            // `failFast` is a legal dynamic-step key at the ported baseline
+            // (`dynamic-fanout.ts:44` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
+            // `DYNAMIC_STEP_KEYS`) and upstream forwards it verbatim when it lowers the dynamic
+            // step to a `ParallelStep` (`chain-execution.ts:897-901`: `failFast: step.failFast`),
+            // where `runParallelChainTasks` applies pi's `?? false` default
+            // (`chain-execution.ts:231`). Reading it here — exactly as the static-`parallel` arm
+            // above does — is what keeps the validator's acceptance of the key honest.
+            fail_fast: step.fail_fast.unwrap_or(false),
             // C16: carry pi's `expand.{item,key,maxItems,onEmpty}` and `collect.outputSchema`
             // through to the runtime `DynamicGroupSpec` so the walker can substitute each item's
             // task, cap/dedup the fan-out, and validate the collect record shape.
@@ -1380,6 +1389,16 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
                 _ => OnEmpty::Skip,
             },
             collect_schema: collect.get("outputSchema").cloned(),
+            // SUBA-C14: the GROUP-level `acceptance` gate, carried RAW exactly as the single-step
+            // arm below carries its own (SUBA-N04). `acceptance` is a legal dynamic-step key
+            // upstream (`dynamic-fanout.ts:45` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
+            // `DYNAMIC_STEP_KEYS`) and `chain-execution.ts:1034-1055` evaluates it against the
+            // aggregate child report once the group settles, failing the whole chain on rejection.
+            // Dropping it here — as this arm did before — left a validator-accepted gate inert.
+            acceptance: step
+                .acceptance
+                .clone()
+                .filter(|value| !value.is_null()),
         });
     }
 
@@ -1423,6 +1442,8 @@ fn empty_single_step_spec() -> SingleStepSpec {
 /// [`chain_step_to_runner_step`] for the deferral rationale).
 fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: step.agent.clone().unwrap_or_default(),
         task: step.task.clone().unwrap_or_default(),
         cwd: step
@@ -1453,11 +1474,18 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
             }
             Some(ChainListBinding::Toggle(_)) | None => None,
         },
+        // SUBA-N04: the RAW acceptance value, carried whole. This used to be
+        // `.and_then(Value::as_str)`, which kept only the level-string form and silently discarded
+        // the `false` shorthand AND every `{ level, verify: [{ command }], … }` object — i.e. the
+        // only forms that can declare a `verify[]` command at all. `run_single` lowers whatever is
+        // here through `exec::acceptance::lower_acceptance_input` (pi `chain-execution.ts:1335`
+        // passes `seqStep.acceptance` into `runSync` unmodified for exactly this reason). `null` is
+        // normalized to `None` so an explicit JSON `null` reads as pi's `undefined`.
         acceptance: step
             .acceptance
             .as_ref()
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .filter(|value| !value.is_null())
+            .cloned(),
         context: None,
         agent_scope: None,
     }
@@ -1958,6 +1986,93 @@ mod tests {
                 assert_eq!(group.template.agent, "reviewer");
             }
             other => panic!("expected DynamicGroup, got {other:?}"),
+        }
+    }
+
+    /// A dynamic-fanout step's `failFast` must survive lowering. `DYNAMIC_STEP_KEYS` accepts the
+    /// key (mirroring `dynamic-fanout.ts:44` @v0.34.0) and `ChainStepConfig::fail_fast` parses it,
+    /// but this bridge previously read it ONLY on the static-`parallel` arm and dropped it on the
+    /// dynamic arm — so an author's `failFast: true` was validated as legal and then silently
+    /// ignored. Upstream forwards it verbatim when it lowers the dynamic step to a `ParallelStep`
+    /// (`chain-execution.ts:897-901` @v0.34.0: `failFast: step.failFast`), and applies pi's `??
+    /// false` default only at dispatch (`chain-execution.ts:231`).
+    #[test]
+    fn chain_step_to_runner_step_carries_fail_fast_onto_a_dynamic_group() {
+        let dynamic = |fail_fast: Option<bool>| ChainStepConfig {
+            expand: Some(serde_json::json!({ "from": { "output": "targets", "path": "/items" } })),
+            parallel: Some(serde_json::json!({ "agent": "reviewer", "task": "review" })),
+            collect: Some(serde_json::json!({ "as": "reviews" })),
+            fail_fast,
+            ..ChainStepConfig::default()
+        };
+
+        match chain_step_to_runner_step(&dynamic(Some(true)), 8) {
+            RunnerStep::DynamicGroup(group) => assert!(
+                group.fail_fast,
+                "`failFast: true` on a dynamic step must reach DynamicGroupSpec::fail_fast"
+            ),
+            other => panic!("expected DynamicGroup, got {other:?}"),
+        }
+
+        // Absent and explicit-`false` both lower to pi's `?? false`.
+        for omitted in [None, Some(false)] {
+            match chain_step_to_runner_step(&dynamic(omitted), 8) {
+                RunnerStep::DynamicGroup(group) => assert!(
+                    !group.fail_fast,
+                    "a dynamic step without `failFast: true` must default to false ({omitted:?})"
+                ),
+                other => panic!("expected DynamicGroup, got {other:?}"),
+            }
+        }
+    }
+
+    /// SUBA-N04: a saved chain file's per-step `acceptance` reaches the runtime step spec WHOLE, in
+    /// every form — including the `{ level, verify: [{ command }] }` object, which is the only form
+    /// that can declare a `verify[]` command and which this bridge previously discarded outright
+    /// (`.and_then(Value::as_str)` kept the bare level string and nothing else). Lowering it to a
+    /// contract stays `run_single`'s job, exactly as upstream hands `seqStep.acceptance` to `runSync`
+    /// unmodified (pi `chain-execution.ts:1335` @v0.34.0).
+    #[test]
+    fn chain_step_to_runner_step_carries_every_acceptance_form_onto_the_step_spec() {
+        let policy = serde_json::json!({
+            "level": "verified",
+            "verify": [{ "id": "unit", "command": "cargo test" }]
+        });
+        let step = ChainStepConfig {
+            agent: Some("builder".to_string()),
+            task: Some("fix it".to_string()),
+            acceptance: Some(policy.clone()),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&step, 4) {
+            RunnerStep::SingleStep(spec) => assert_eq!(spec.acceptance, Some(policy)),
+            other => panic!("expected SingleStep, got {other:?}"),
+        }
+
+        // A static parallel task's own policy survives the per-item `Value` -> spec hop too.
+        let group = ChainStepConfig {
+            parallel: Some(serde_json::json!([
+                { "agent": "a", "task": "ta", "acceptance": false },
+                { "agent": "b", "task": "tb", "acceptance": "checked" }
+            ])),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&group, 8) {
+            RunnerStep::ParallelGroup(group) => {
+                assert_eq!(group.steps[0].acceptance, Some(serde_json::json!(false)));
+                assert_eq!(group.steps[1].acceptance, Some(serde_json::json!("checked")));
+            }
+            other => panic!("expected ParallelGroup, got {other:?}"),
+        }
+
+        // No policy at all stays `None` — pi's `undefined`, which defers to the heuristic default.
+        let bare = ChainStepConfig {
+            agent: Some("c".to_string()),
+            ..ChainStepConfig::default()
+        };
+        match chain_step_to_runner_step(&bare, 4) {
+            RunnerStep::SingleStep(spec) => assert_eq!(spec.acceptance, None),
+            other => panic!("expected SingleStep, got {other:?}"),
         }
     }
 }

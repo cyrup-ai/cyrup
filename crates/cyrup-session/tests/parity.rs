@@ -791,7 +791,11 @@ fn g2_v1_to_v2_converts_first_kept_entry_index_to_id() {
     let kept_id = entries[1].id();
     match &entries[2] {
         Entry::Known(KnownEntry::Compaction { first_kept_entry_id, summary, tokens_before, .. }) => {
-            assert_eq!(first_kept_entry_id, &kept_id, "index resolved to the kept entry's id");
+            assert_eq!(
+                first_kept_entry_id.as_ref(),
+                Some(&kept_id),
+                "index resolved to the kept entry's id"
+            );
             assert_eq!(summary, "SUM");
             assert_eq!(*tokens_before, 42);
         }
@@ -892,7 +896,7 @@ fn g5_summary_messages_carry_entry_timestamp() {
         Entry::known(KnownEntry::Compaction {
             base: base("e1", Some("e0"), "2026-01-01T00:00:01Z"),
             summary: "SUM".into(),
-            first_kept_entry_id: EntryId::from("e0"),
+            first_kept_entry_id: Some(EntryId::from("e0")),
             tokens_before: 9,
             details: None,
             usage: None,
@@ -1163,4 +1167,136 @@ fn sess001_normalized_empty_content_still_counts_as_a_cut_point_and_round_trips(
     assert_eq!(find_valid_cut_points(std::slice::from_ref(&entry), 0, 1), vec![0]);
     let line = entry.to_line().unwrap();
     assert!(line.contains("\"content\":[]"), "writes the array form back, got {line}");
+}
+
+// ------------------------------------- SESS-015 unresolvable firstKeptEntryIndex ---------------
+
+/// Write a realistic v1 (no `version`, no `id`/`parentId`) session file whose compaction points at
+/// its first-kept entry by NUMERIC `firstKeptEntryIndex`, and open it.
+fn write_v1_session_with_first_kept_index(dir: &std::path::Path, index: Value) -> PathBuf {
+    let path = dir.join("v1.jsonl");
+    let msg = |ts: &str, body: &str| {
+        json!({
+            "type": "message",
+            "timestamp": ts,
+            "message": serde_json::to_value(AgentMessage::Core(user(body))).unwrap(),
+        })
+        .to_string()
+    };
+    let mut lines = vec![
+        // v1 header: no `version` key at all.
+        json!({
+            "type": "session",
+            "id": "sess-v1-sess015",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/proj/sess015",
+        })
+        .to_string(),
+        // file index 1..=3 — the pre-compaction history that the compaction summarized away.
+        msg("2026-01-01T00:00:01Z", "OLD-ONE how do I parse a PEM key"),
+        msg("2026-01-01T00:00:02Z", "OLD-TWO now add error handling"),
+        msg("2026-01-01T00:00:03Z", "OLD-THREE and write the tests"),
+        // file index 4 — the compaction itself.
+        json!({
+            "type": "compaction",
+            "timestamp": "2026-01-01T00:00:04Z",
+            "summary": "THE SUMMARY of everything before the cut",
+            "tokensBefore": 4242,
+            "firstKeptEntryIndex": index,
+        })
+        .to_string(),
+        // file index 5 — after the compaction, always kept.
+        msg("2026-01-01T00:00:05Z", "NEW-ONE what did we decide"),
+    ];
+    lines.push(String::new());
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    path
+}
+
+/// SESS-015 — a v1 compaction whose `firstKeptEntryIndex` CANNOT be resolved must still be read as
+/// a compaction: the summary reaches the model and the summarized history stays OUT of the context.
+///
+/// Pi `migrateV1ToV2` (`session-manager.ts:245-255`) deletes `firstKeptEntryIndex` unconditionally
+/// but assigns `firstKeptEntryId` only when the index resolves to a non-`session` entry, so index 0
+/// (the header) and an out-of-range index leave the key ABSENT. Pi keeps the entry as a compaction
+/// regardless, and `buildContextEntries`' `entry.id === compaction.firstKeptEntryId` test
+/// (`session-manager.ts:445`) never matches an absent id, so its `0..compactionIdx` loop pushes
+/// NOTHING. The harness fork states the same contract as an explicit guard —
+/// `if (compaction.firstKeptEntryId)` (`agent/src/harness/session/session.ts:80`).
+///
+/// Before the fix, `first_kept_entry_id: EntryId` (non-optional) made the entry fail to parse as a
+/// `KnownEntry`, so it landed as `Entry::Unknown`: `latest_compaction` returned `None`, both
+/// builders took the "no compaction" arm, and the WHOLE pre-compaction history was re-admitted —
+/// while the summary itself, being `Unknown`, contributed nothing at all.
+#[test]
+fn sess015_unresolvable_first_kept_index_keeps_the_compacted_history_out_of_context() {
+    for (label, index) in [("header (index 0)", json!(0)), ("out of range", json!(99))] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_v1_session_with_first_kept_index(dir.path(), index);
+        let m = SessionManager::open(&path).unwrap();
+
+        // Observable behavior #1 — the LLM-rendered context.
+        let texts: Vec<String> = m.build_context().messages.iter().map(text_of).collect();
+        let joined = texts.join("\n---\n");
+        assert!(
+            joined.contains("THE SUMMARY of everything before the cut"),
+            "[{label}] the summary must reach the model; got:\n{joined}"
+        );
+        for dropped in ["OLD-ONE", "OLD-TWO", "OLD-THREE"] {
+            assert!(
+                !joined.contains(dropped),
+                "[{label}] {dropped} was summarized away and must NOT be re-admitted; got:\n{joined}"
+            );
+        }
+        assert!(
+            joined.contains("NEW-ONE what did we decide"),
+            "[{label}] entries after the compaction are always kept; got:\n{joined}"
+        );
+        assert_eq!(
+            texts.len(),
+            2,
+            "[{label}] exactly the summary + the post-compaction message: {texts:?}"
+        );
+
+        // Observable behavior #2 — the RAW projection compaction/token accounting runs on.
+        let raw = m.build_context_raw();
+        assert_eq!(raw.len(), 2, "[{label}] raw context is summary + post-compaction: {raw:?}");
+        assert!(
+            matches!(raw.first(), Some(AgentMessage::CompactionSummary(_))),
+            "[{label}] the raw context leads with the compaction summary: {raw:?}"
+        );
+
+        // Mechanism: the entry survives as an INTERPRETED compaction (it used to degrade to
+        // `Entry::Unknown`, which is what re-admitted the history), carrying NO `firstKeptEntryId`.
+        let path_entries = m.branch_path(None);
+        let comp = path_entries
+            .iter()
+            .find(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+            .unwrap_or_else(|| panic!("[{label}] compaction must parse as a KnownEntry"));
+        let line = comp.to_line().unwrap();
+        assert!(
+            !line.contains("firstKeptEntryId"),
+            "[{label}] the index is unresolvable, so no id is assigned: {line}"
+        );
+        assert!(
+            !line.contains("firstKeptEntryIndex"),
+            "[{label}] the v1 index field is dropped on migration: {line}"
+        );
+    }
+}
+
+/// The resolvable case must be untouched by the SESS-015 fix: index 2 → the second history entry,
+/// so `OLD-TWO` onward are kept and only `OLD-ONE` is dropped.
+#[test]
+fn sess015_resolvable_first_kept_index_still_keeps_the_tail_of_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_v1_session_with_first_kept_index(dir.path(), json!(2));
+    let m = SessionManager::open(&path).unwrap();
+    let joined =
+        m.build_context().messages.iter().map(text_of).collect::<Vec<_>>().join("\n---\n");
+    assert!(joined.contains("THE SUMMARY of everything before the cut"), "{joined}");
+    assert!(!joined.contains("OLD-ONE"), "index 2 cuts before OLD-TWO: {joined}");
+    assert!(joined.contains("OLD-TWO"), "{joined}");
+    assert!(joined.contains("OLD-THREE"), "{joined}");
+    assert!(joined.contains("NEW-ONE"), "{joined}");
 }

@@ -132,6 +132,16 @@ pub struct FanOutResult<R, E> {
     /// opposed to [`SkipReason::Cancelled`]) — useful for a chain-step summary line without a
     /// separate scan.
     pub fail_fast_skipped_count: usize,
+    /// One entry per input task, positionally aligned with [`Self::slots`]: `Some(reason)` for a
+    /// slot that stayed `None` because it was never dispatched, `None` for a slot that actually
+    /// ran (whether it succeeded or failed).
+    ///
+    /// [`Self::fail_fast_skipped_count`] answers "how many", this answers "which ones, and why" —
+    /// the distinction matters to the chain driver because pi synthesizes a *fail-fast-specific*
+    /// placeholder result for the un-run siblings (`chain-execution.ts:238-246`: `task:
+    /// "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`) and has no analog for a
+    /// cancellation skip, which is a cyrup-side concept.
+    pub skip_reasons: Vec<Option<SkipReason>>,
 }
 
 /// Fan a `Vec` of `tasks` out across a bounded worker pool of real child OS processes
@@ -219,6 +229,7 @@ where
             slots: Vec::new(),
             any_failed: false,
             fail_fast_skipped_count: 0,
+            skip_reasons: Vec::new(),
         };
     }
 
@@ -477,6 +488,7 @@ fn finalize<R, E>(
     let mut any_failed = false;
     let mut fail_fast_skipped_count = 0usize;
     let mut result_slots = Vec::with_capacity(total);
+    let mut result_skip_reasons = Vec::with_capacity(total);
 
     for (outcome_slot, reason_slot) in slots.into_iter().zip(skip_reasons) {
         let outcome = match outcome_slot.into_inner() {
@@ -494,12 +506,16 @@ fn finalize<R, E>(
                     any_failed = true;
                 }
                 result_slots.push(Some(res));
+                // A real outcome always wins over an informational skip marker for the same
+                // index, so this slot reports "not skipped" even if a marker was written.
+                result_skip_reasons.push(None);
             }
             None => {
                 if reason == Some(SkipReason::FailFastSkipped) {
                     fail_fast_skipped_count += 1;
                 }
                 result_slots.push(None);
+                result_skip_reasons.push(reason);
             }
         }
     }
@@ -508,6 +524,7 @@ fn finalize<R, E>(
         slots: result_slots,
         any_failed,
         fail_fast_skipped_count,
+        skip_reasons: result_skip_reasons,
     }
 }
 

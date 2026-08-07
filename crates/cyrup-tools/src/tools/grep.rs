@@ -4,7 +4,7 @@
 
 use crate::config::GrepOpts;
 use crate::ops::{FsOps, WalkOpts};
-use crate::tools::globmatch::{to_posix, PatternMatcher};
+use crate::tools::globmatch::{to_posix, RgGlob};
 use crate::truncate::{format_size, truncate_head, truncate_line, GREP_MAX_LINE_LENGTH, TruncOpts};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
@@ -22,8 +22,12 @@ struct GrepInput {
     glob: Option<String>,
     ignore_case: Option<bool>,
     literal: Option<bool>,
-    context: Option<usize>,
-    limit: Option<usize>,
+    // Pi's TypeBox `Type.Number` (grep.ts:31-34) carries no `integer` and no `minimum`, and Pi
+    // never validates tool arguments at runtime — it clamps them at the point of use instead
+    // (grep.ts:188-189). Modeling these as `usize` rejected `context: 0.0` / `limit: -1` at
+    // deserialization, where Pi returns a normal result. See [`crate::jsnum`].
+    context: Option<f64>,
+    limit: Option<f64>,
 }
 
 pub struct GrepTool {
@@ -54,13 +58,18 @@ impl GrepTool {
     }
 }
 
-/// Collects the 1-based line number of every match in a file, capping the GLOBAL match count at
-/// `limit`. Pi counts each rg `match` event (one per matching line) and stops the child once
-/// `matchCount >= effectiveLimit` (grep.ts:280-292). Context is NOT gathered here — Pi re-reads the
-/// file and formats an INDEPENDENT block per match afterwards (grep.ts:250-268,316-331), so
-/// overlapping context windows DUPLICATE shared lines (one copy per block) rather than merging.
+/// Collects the 1-based line number AND the raw bytes of every match in a file, capping the GLOBAL
+/// match count at `limit`. Pi counts each rg `match` event (one per matching line) and stops the
+/// child once `matchCount >= effectiveLimit` (grep.ts:280-292).
+///
+/// The bytes are Pi's `event.data.lines.text` (grep.ts:307, kept on the match record at :310): at
+/// `context == 0` Pi formats the row straight from that captured text and never re-reads the file
+/// (grep.ts:318-326). Only the context>0 path — and the non-UTF-8 fallback, where ripgrep emits
+/// `lines.bytes` instead of `lines.text` so `match.lineText` is `undefined` — goes through
+/// `formatBlock` → `getFileLines` (grep.ts:250-268), which re-reads and formats an INDEPENDENT
+/// block per match, so overlapping context windows DUPLICATE shared lines rather than merging.
 struct MatchSink<'a> {
-    lines: &'a mut Vec<u64>,
+    matches: &'a mut Vec<(u64, Vec<u8>)>,
     count: &'a mut usize,
     limit: usize,
 }
@@ -69,7 +78,9 @@ impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
-        self.lines.push(m.line_number().unwrap_or(0));
+        // `SinkMatch::bytes` is the matched line INCLUDING its terminator, which is exactly what
+        // ripgrep serialises into `data.lines.text` — hence Pi's `.replace(/\n$/,"")` below.
+        self.matches.push((m.line_number().unwrap_or(0), m.bytes().to_vec()));
         *self.count += 1;
         Ok(*self.count < self.limit)
     }
@@ -119,14 +130,24 @@ impl Tool for GrepTool {
             .build(&input.pattern)
             .map_err(|e| error::invalid(format!("grep: invalid pattern: {e}")))?;
 
-        let context = input.context.unwrap_or(0);
+        // Pi: `const contextValue = context && context > 0 ? context : 0` (grep.ts:188) — a
+        // negative, zero or NaN `context` all collapse to 0 instead of failing. `to_count` folds
+        // the fraction the way `lineNumber ± contextValue` indexing would (grep.ts:254-255).
+        let context = input.context.map_or(0, crate::jsnum::to_count);
         // Pi: `effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT)` (grep.ts:189). The JSON-schema
-        // `minimum:1` is advisory only, so an explicit `limit: 0` must still yield up to one match
-        // rather than short-circuiting to "No matches found".
-        let limit = input.limit.unwrap_or(self.opts.limit).max(1);
+        // `minimum:1` is advisory only, so an explicit `limit: 0` — or a negative one, which the
+        // same `Math.max` absorbs — must still yield up to one match rather than short-circuiting
+        // to "No matches found". `??` is null/undefined-only, so a JSON `null` also takes the
+        // default.
+        let limit = input.limit.map_or(self.opts.limit, crate::jsnum::to_count).max(1);
 
+        // Pi hands `glob` to ripgrep verbatim (grep.ts:218), so it parses as ONE gitignore-style
+        // override line — anchored when it contains a `/`, basename-matched when it does not. That
+        // is the opposite of the `**/`-prefix rule fd needs, which `find` uses
+        // (find.ts:243-252 / [`PatternMatcher`]); wiring `grep` through fd's rule un-anchored every
+        // path glob, so `glob: "src/**/*.ts"` also matched `vendor/src/a.ts`.
         let glob = match input.glob.as_deref() {
-            Some(g) => Some(PatternMatcher::build(g)?),
+            Some(g) => RgGlob::build(g)?,
             None => None,
         };
 
@@ -154,12 +175,18 @@ impl Tool for GrepTool {
                             Some(Ok(w)) if !w.is_dir => {
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
-                                let basename = w.path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| rel.clone());
+                                // The glob is matched against the path relative to the OVERRIDE
+                                // ROOT, which for ripgrep is its own cwd — Pi spawns `rg` with no
+                                // `cwd` option and passes `searchPath` positionally, so a `path`
+                                // argument narrows the walk but does NOT re-anchor the glob
+                                // (ignore-0.4.33 gitignore.rs:286-315 `strip`). A candidate outside
+                                // the root keeps its full path, as `strip` leaves it.
+                                let glob_rel = w
+                                    .path
+                                    .strip_prefix(&self.cwd)
+                                    .map_or_else(|_| to_posix(&w.path), to_posix);
                                 if let Some(g) = &glob
-                                    && !g.is_match(&rel, &basename) {
+                                    && !g.keeps_file(&glob_rel) {
                                         continue;
                                     }
                                 files.push((w.path, rel));
@@ -212,26 +239,68 @@ impl Tool for GrepTool {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let mut match_lines: Vec<u64> = Vec::new();
+            let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
             {
-                let sink = MatchSink { lines: &mut match_lines, count: &mut count, limit };
+                let sink = MatchSink { matches: &mut matches, count: &mut count, limit };
                 let _ = searcher.search_slice(&matcher, &bytes, sink);
             }
-            if match_lines.is_empty() {
+            if matches.is_empty() {
                 continue;
             }
-            // Pi: `content.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n")` then a per-line
-            // `replace(/\r/g,"")` (grep.ts:206,259). Splitting the same bytes the searcher numbered
-            // on `\n` keeps line numbers aligned; CR removal happens per output line below.
-            let content = String::from_utf8_lossy(&bytes);
-            // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
-            // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using lone-`\r`
-            // separators yields context blocks that key off these folded segments — matching Pi
-            // even where that diverges from the matcher's `\n`-based numbering.
-            let folded = content.replace("\r\n", "\n").replace('\r', "\n");
-            let src_lines: Vec<&str> = folded.split('\n').collect();
-            for &ln in &match_lines {
-                let l = ln as usize;
+            // Which matches take Pi's `formatBlock` path (grep.ts:328-330) rather than the direct
+            // `match.lineText` path (grep.ts:318-327)? Pi's condition is
+            // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
+            // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
+            // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
+            let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
+            // `formatBlock` reads through `getFileLines`, a **second, independent** read of the file
+            // (grep.ts:200-213) — ripgrep's own read was a different process against the real
+            // filesystem — cached for the rest of the invocation by `fileCache`. Do it at most once
+            // per file, and ONLY if some match actually needs it, so that at context==0 the file is
+            // never re-read (Pi does not) yet the read-your-latest-writes semantics and the failure
+            // path below stay reachable exactly where Pi has them.
+            //
+            // `None` is Pi's `catch { lines = [] }` (grep.ts:207-209). A successfully-read EMPTY
+            // file is NOT that case — `"".split("\n")` is `[""]`, length 1.
+            let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
+                match self.fs.read(file).await {
+                    // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
+                    // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using
+                    // lone-`\r` separators yields context blocks that key off these folded segments
+                    // — matching Pi even where that diverges from the matcher's numbering.
+                    Ok(b) => {
+                        let content = String::from_utf8_lossy(&b);
+                        let folded = content.replace("\r\n", "\n").replace('\r', "\n");
+                        Some(folded.split('\n').map(str::to_owned).collect())
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            for (ln, raw) in &matches {
+                let l = *ln as usize;
+                if !takes_block(raw) {
+                    // Pi grep.ts:319-326: format straight from the captured line text —
+                    // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
+                    // what `getFileLines` does), then strip ONE trailing `\n`.
+                    let stripped =
+                        String::from_utf8_lossy(raw).replace("\r\n", "\n").replace('\r', "");
+                    let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
+                    let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
+                    if tr {
+                        any_line_truncated = true;
+                    }
+                    out.push(format!("{rel}:{l}: {capped}"));
+                    continue;
+                }
+                // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row
+                // per match (grep.ts:253). The rows still count as output, so they participate in
+                // byte truncation like any other line.
+                let Some(src_lines) = src_lines.as_ref() else {
+                    out.push(format!("{rel}:{l}: (unable to read file)"));
+                    continue;
+                };
                 // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
                 // context > 0, else just the single match line (grep.ts:255-256).
                 let (start, end) = if context > 0 {
@@ -240,7 +309,8 @@ impl Tool for GrepTool {
                     (l, l)
                 };
                 for current in start..=end {
-                    let raw = src_lines.get(current.saturating_sub(1)).copied().unwrap_or("");
+                    let raw = src_lines.get(current.saturating_sub(1)).map_or("", String::as_str);
+                    // Pi's per-line `replace(/\r/g,"")` (grep.ts:259).
                     let text = raw.replace('\r', "");
                     let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
                     if tr {
@@ -316,5 +386,200 @@ impl Tool for GrepTool {
             terminate: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::GrepTool;
+    use crate::config::GrepOpts;
+    use crate::ops::local::LocalFs;
+    use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
+    use cyrup_core::{CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolUpdate};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// `LocalFs` that serves the first `read()` of any path normally and fails every later one.
+    ///
+    /// This models Pi's two-reader shape exactly: ripgrep matches the file from its own process
+    /// while the format pass re-reads it through the injectable `ops.readFile` (grep.ts:200-213),
+    /// so the format read can fail on a file that demonstrably matched — the file is unlinked, its
+    /// mode is dropped to `0000`, or a custom `readFile` backend goes away between the two reads.
+    struct FailSecondRead {
+        inner: LocalFs,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FsOps for FailSecondRead {
+        async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.inner.read(path).await
+            } else {
+                Err(ToolError::new("EACCES"))
+            }
+        }
+        async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+            self.inner.write_in_place(path, bytes).await
+        }
+        async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError> {
+            self.inner.access(path, mode).await
+        }
+        async fn metadata(&self, path: &Path) -> Result<Meta, ToolError> {
+            self.inner.metadata(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError> {
+            self.inner.read_dir(path).await
+        }
+        fn walk(&self, root: &Path, opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>> {
+            self.inner.walk(root, opts)
+        }
+    }
+
+    /// Pi `formatBlock` (grep.ts:250-253): when `getFileLines` cannot produce lines it emits ONE
+    /// `<path>:<line>: (unable to read file)` row per match in place of the context block, rather
+    /// than dropping the file from the output. cyrup previously `continue`d on a read failure, so
+    /// the file vanished silently and the marker string appeared nowhere in the workspace.
+    #[tokio::test]
+    async fn context_block_emits_unable_to_read_marker_when_reread_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\n").unwrap();
+
+        let fs = Arc::new(FailSecondRead { inner: LocalFs, reads: AtomicUsize::new(0) });
+        let grep = GrepTool::new(fs, cwd.clone(), GrepOpts::default());
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                serde_json::json!({ "pattern": "NEEDLE", "context": 1 }),
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await
+            .unwrap();
+
+        let text = match r.content.first() {
+            Some(Content::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        // Exactly Pi's row: match separator `:`, then the parenthesized marker. No context rows
+        // (`a.txt-1-` / `a.txt-3-`) accompany it, because the block was replaced, not augmented.
+        assert_eq!(text, "a.txt:2: (unable to read file)");
+    }
+
+    /// The context==0 path must NOT re-read: Pi formats it from ripgrep's own captured
+    /// `data.lines.text` and never calls `getFileLines` (grep.ts:316-326), so a backend that would
+    /// fail a second read still renders the real line.
+    #[tokio::test]
+    async fn zero_context_never_rereads_and_so_never_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\n").unwrap();
+
+        let fs = Arc::new(FailSecondRead { inner: LocalFs, reads: AtomicUsize::new(0) });
+        let grep = GrepTool::new(fs, cwd.clone(), GrepOpts::default());
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                serde_json::json!({ "pattern": "NEEDLE" }),
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await
+            .unwrap();
+
+        let text = match r.content.first() {
+            Some(Content::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(text, "a.txt:2: NEEDLE");
+    }
+
+    async fn grep_text(cwd: &Path, args: serde_json::Value) -> String {
+        let grep = GrepTool::new(Arc::new(LocalFs), cwd.to_path_buf(), GrepOpts::default());
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                args,
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await
+            .unwrap();
+        match r.content.first() {
+            Some(Content::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// `glob` goes to ripgrep verbatim (grep.ts:218), so a pattern containing `/` is ANCHORED at
+    /// the override root (ignore-0.4.33 gitignore.rs:513-522 prefixes `**/` only when the pattern
+    /// has no `/`). `grep` used to compile the pattern with fd's opposite rule — the one `find`
+    /// needs (find.ts:243-252) — which un-anchored it, so `src/**/*.ts` also matched
+    /// `vendor/src/*.ts` and those extra hits crowd out real ones against the 100-match cap.
+    #[tokio::test]
+    async fn path_glob_is_anchored_at_the_override_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("vendor/src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
+
+        let text =
+            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "src/**/*.ts" })).await;
+        assert_eq!(text, "src/a.ts:1: NEEDLE");
+    }
+
+    /// gitignore.rs:492-498 strips a leading `/` and anchors on it. Passing it through to globset
+    /// untouched matched it against a root-relative path that never starts with `/`, so the whole
+    /// query silently returned "No matches found".
+    #[tokio::test]
+    async fn leading_slash_glob_anchors_instead_of_matching_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("vendor/src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
+
+        let text =
+            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "/src/*.ts" })).await;
+        assert_eq!(text, "src/a.ts:1: NEEDLE");
+    }
+
+    /// A `path` argument narrows the walk but does NOT re-anchor the glob: Pi spawns `rg` with no
+    /// `cwd` option, so ripgrep's override root stays the agent's cwd and the glob is matched
+    /// against the cwd-relative path (gitignore.rs:286-315 `strip`). Output paths remain relative
+    /// to the search root, as `rg` prints what it was given.
+    #[tokio::test]
+    async fn glob_is_matched_against_the_cwd_relative_path_not_the_search_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "path": "src", "glob": "src/*.ts" }),
+        )
+        .await;
+        assert_eq!(text, "a.ts:1: NEEDLE");
+    }
+
+    /// A bare pattern (no `/`) is basename-matched at any depth in BOTH rules — the schema's own
+    /// first example (`'*.ts'`, grep.rs description) must keep working.
+    #[tokio::test]
+    async fn bare_glob_still_matches_basenames_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src/deep")).unwrap();
+        std::fs::write(cwd.join("src/deep/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("b.js"), "NEEDLE\n").unwrap();
+
+        let text = grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "*.ts" })).await;
+        assert_eq!(text, "src/deep/a.ts:1: NEEDLE");
     }
 }

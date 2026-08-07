@@ -171,10 +171,10 @@ impl FsOps for RecordingFs {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(path).await
     }
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         *self.last_write.lock().unwrap() = Some(path.to_path_buf());
-        self.inner.write_atomic(path, bytes).await
+        self.inner.write_in_place(path, bytes).await
     }
     async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError> {
         self.inner.access(path, mode).await

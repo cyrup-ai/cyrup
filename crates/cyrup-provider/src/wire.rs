@@ -112,6 +112,7 @@ impl Provider for WireProvider {
             let overrides = AuthOverrides {
                 api_key: options.api_key.as_deref(),
                 env: options.env.as_ref(),
+                min_oauth_validity_ms: None,
             };
             let mut auth_result = match resolve_provider_auth(
                 &id,
@@ -473,7 +474,16 @@ mod tests {
                 }
             };
             let req = SseRequest::post_json(url, serde_json::json!({"stream": true}));
-            let mut frames = match open_sse(&client, req, cancel, None, None).await {
+            let mut frames = match open_sse(
+                &client,
+                req,
+                cancel,
+                None,
+                None,
+                crate::utils::provider_retry::ProviderRetry::NONE,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)

@@ -30,10 +30,22 @@
 //! nonce-bound request into the PARENT's spool (addressed by the `CYRUP_SUBAGENT_PARENT_SESSION`
 //! anchor `cyrup-ext-subagents` emits, `exec/mod.rs` `PARENT_SESSION_ENV_VAR`) and BLOCKS on the bound
 //! response under the P-3 `begin_human_wait` guard. The PARENT ([`Self::new_forwarding_parent`])
-//! installs a spawned [`forwarding::spawn_forwarding_watcher`] task on `SessionStart` that surfaces
+//! installs a spawned [`forwarding::spawn_forwarding_watcher`] task — on `SessionStart` AND, from
+//! PERM-005, re-entrantly on `BeforeAgentStart` / `Input` / `ToolCall`, matching pi's four
+//! `startForwardedPermissionPolling` call sites (`index.ts:2084,2137,2194,2210`) — that surfaces
 //! each forwarded prompt to its human (the SAME `select`/`input` dialog + C3 human-interaction lock a
 //! local ask uses) and writes the decision back; the child's `apply_decision` then persists an
 //! "Allow Always" into the child's session store exactly like a local ask (pi `index.ts:905`).
+//!
+//! Two PERM-001 repairs sit on that path. (1) The parent role now PUBLISHES its own session id as
+//! the process-wide anchor at `SessionStart` and clears it at `SessionShutdown`
+//! (`PermissionSystemExtension::publish_parent_session_anchor`) — cyrup's placement of pi's
+//! `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId` / `delete`
+//! (`pi-subagents/src/extension/index.ts:599,619` @v0.34.0), which `cyrup-ext-subagents` cannot do itself
+//! (`#![forbid(unsafe_code)]`). Without it the DETACHED background hop carried no anchor and every
+//! background child's ask fail-closed denied against a null target. (2) The child-role predicate is
+//! pi's `hasSubagentEnvHint` (`index.ts:93-103`) — ANY of [`SUBAGENT_ENV_HINT_KEYS`] non-empty —
+//! not a strict `== "1"` on one key.
 //!
 //! FOUR SUPPLEMENTARY LAYERS (all wired + enforcing, pi `index.ts:2208-2499`): [`Self::decide`] runs
 //! the agent + projectAgent policy layers (keyed by [`resolve_agent_name_from_env`], the
@@ -99,6 +111,30 @@ const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 /// bought nothing and could silently drift out of agreement with the writer — which is exactly the
 /// failure mode PERM-001 was: the gate read a name nothing on the spawn path ever wrote.
 pub const CHILD_ENV_VAR: &str = cyrup_ext_subagents::spawn::nested_events::CHILD_ENV;
+
+/// pi `SUBAGENT_ENV_HINT_KEYS` (`permission-forwarding.ts:9`) — the env keys whose presence means
+/// "this process is running as a subagent child", ORed on any NON-EMPTY value by
+/// [`is_subagent_child`] (pi `hasSubagentEnvHint`, `index.ts:93-103`).
+///
+/// The cyrup analogs, in upstream order, all three written into every child's spawn overlay by the
+/// single chokepoint `cyrup_ext_subagents::exec::build_attempt_spawn_plan` (and aliased from that
+/// crate rather than re-typed, for the same anti-drift reason as [`CHILD_ENV_VAR`]):
+///
+/// | pi | cyrup | what writes it |
+/// |---|---|---|
+/// | `PI_IS_SUBAGENT` | `CYRUP_SUBAGENT_CHILD` | `nested_events::child_role_env`, on EVERY spawn |
+/// | `PI_SUBAGENT_SESSION_ID` | `CYRUP_SUBAGENT_RUN_ID` | the run-identity overlay, when the spawn belongs to a run |
+/// | `PI_AGENT_ROUTER_SUBAGENT` | `CYRUP_SUBAGENT_AGENT_NAME` | the resolved persona name, when non-blank |
+///
+/// A ROOT orchestrator has none of them; the detached hop-2 `__subagent-runner` process has none
+/// of them either (its hop-1 spawn overlays only the R-SA-P1 anchor), so it correctly keeps the
+/// PARENT role and can host the forwarding watcher.
+pub const SUBAGENT_ENV_HINT_KEYS: [&str; 3] = [
+    CHILD_ENV_VAR,
+    cyrup_ext_subagents::spawn::nested_events::RUN_ID_ENV,
+    cyrup_ext_subagents::AGENT_NAME_ENV_VAR,
+];
+
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
 
@@ -171,11 +207,17 @@ pub struct PermissionSystemExtension {
     permanent_approvals: Mutex<PermanentApprovalStore>,
     dedup: Mutex<DedupCache>,
     /// The extension `config.json` snapshot. `yolo_mode` is read on the live `ask` path (below);
-    /// `debug`/`forwarded_prompt_timeout_seconds` are consumed by later phases (logging / forwarding
-    /// P-4) — the public fields carry them without any callerless primitive. `Mutex`-wrapped because
+    /// `debug` gates the audit/debug JSONL trail ([`Self::logger`], pi `logging.ts:89,97`) AND the
+    /// forwarding "child is waiting" notice (`forwarding.rs`); `forwarded_prompt_timeout_seconds` is
+    /// consumed by forwarding (P-4). `Mutex`-wrapped because
     /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
     /// `resources_discover` reload (pi `refreshExtensionConfig`, `index.ts:1600-1608`).
-    config: Mutex<ExtensionConfig>,
+    ///
+    /// PERM-005: `Arc`-wrapped so the spawned forwarding watcher holds the SAME mutex and re-reads
+    /// it once per poll iteration, the way pi's polling closure reads the module-scope
+    /// `extensionConfig` binding `refreshExtensionConfig` reassigns. Handing the watcher a snapshot
+    /// by value froze `yoloMode` / `forwardedPromptTimeoutSeconds` at spawn time.
+    config: crate::forwarding::SharedExtensionConfig,
     /// The fail-closed FALLBACK ask channel ([`NoOpAskChannel`] in production; a scripted channel in
     /// unit tests via [`Self::from_parts`]). Used when no live UI is reachable — the live in-session
     /// dialog goes through [`LocalAskChannel`] over [`Self::host_services`] instead.
@@ -220,6 +262,15 @@ pub struct PermissionSystemExtension {
     /// a repeated refresh that keeps failing the same way notifies once and a refresh that STOPS
     /// failing re-arms the report (`refreshExtensionConfig`, `index.ts:1610-1618`).
     last_config_warning: Mutex<Option<String>>,
+    /// pi `extensionLogger` (`index.ts:148-150`): the `debug`-gated audit/debug JSONL trail
+    /// ([`crate::logging`], pi `logging.ts`). Shares the SAME `config` `Arc` above, so the operator
+    /// flipping `"debug": true` in `config.json` arms it on the next
+    /// `session_start` / `resources_discover` reload with no restart.
+    logger: crate::logging::PermissionSystemLogger,
+    /// pi `reportedLoggingWarnings` (`index.ts:151`): a logging failure (an unwritable log dir) is
+    /// surfaced ONCE per distinct message, so a broken trail cannot spam the human on every gated
+    /// tool call (`reportLoggingWarning`, `index.ts:162-169`).
+    reported_logging_warnings: Mutex<HashSet<String>>,
 }
 
 impl PermissionSystemExtension {
@@ -242,8 +293,9 @@ impl PermissionSystemExtension {
     }
 
     /// The wired PARENT (root, `CYRUP_SUBAGENT_DEPTH == 0`) constructor: like [`Self::new`] but marks
-    /// `install_watcher` so `on_event(SessionStart)` spawns the [`forwarding::spawn_forwarding_watcher`]
-    /// task that services subagent children's forwarded asks.
+    /// `install_watcher` so `on_event` spawns the [`forwarding::spawn_forwarding_watcher`] task that
+    /// services subagent children's forwarded asks — from `SessionStart`, `BeforeAgentStart`, `Input`
+    /// and `ToolCall` alike (PERM-005; idempotently, so the per-turn hooks do not stack watchers).
     #[must_use]
     pub fn new_forwarding_parent(agent_dir: PathBuf, cwd: PathBuf) -> Self {
         let (paths, permanent_path, config) = Self::derive_parts(&agent_dir, cwd);
@@ -299,6 +351,16 @@ impl PermissionSystemExtension {
         agent_dir.join(CONFIG_DIR).join(CONFIG_FILE)
     }
 
+    /// The default audit/debug log directory for `agent_dir` (pi `LOGS_DIR =
+    /// join(EXTENSION_ROOT, "logs")`, `extension-config.ts:38`). cyrup's analog of pi's
+    /// `EXTENSION_ROOT` is `<agent_dir>/cyrup-permission-system/` — the directory
+    /// [`Self::config_path_for`] puts `config.json` in — so the trail lands beside the config that
+    /// enables it. Overridable per write via `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`
+    /// ([`crate::logging::resolve_logs_dir`]).
+    fn logs_dir_for(agent_dir: &Path) -> PathBuf {
+        agent_dir.join(CONFIG_DIR).join(crate::logging::LOGS_DIR_NAME)
+    }
+
     /// Derive the [`ManagerPaths`] + permanent-store path + extension config from `agent_dir` + `cwd`
     /// (shared by every constructor).
     fn derive_parts(agent_dir: &Path, cwd: PathBuf) -> (ManagerPaths, PathBuf, ExtensionConfig) {
@@ -321,8 +383,22 @@ impl PermissionSystemExtension {
         // pi order (`refreshSessionRuntimeState`, `index.ts:2077-2085`): config first, manager
         // second.
         let loaded = ExtensionConfig::load_with_result(&Self::config_path_for(&self.agent_dir));
+        let (created, debug, yolo_mode) =
+            (loaded.created, loaded.config.debug, loaded.config.yolo_mode);
         *guard(&self.config) = loaded.config;
-        self.report_config_warning(loaded.warning);
+        self.report_config_warning(loaded.warning.clone());
+        // pi `refreshExtensionConfig`'s tail (`index.ts:1619-1624`) — emitted AFTER the new config
+        // is installed, so a reload that turns `debug` ON records its own arrival as the trail's
+        // first line.
+        self.write_debug_entry(
+            "config.loaded",
+            &json!({
+                "created": created,
+                "warning": loaded.warning,
+                "debug": debug,
+                "yoloMode": yolo_mode,
+            }),
+        );
         *guard(&self.manager) =
             manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
         guard(&self.active_skill_entries).clear();
@@ -392,13 +468,21 @@ impl PermissionSystemExtension {
         // observes the backend the host attaches LATER (`set_host_services` runs after
         // construction).
         let warnings = Arc::new(WarningSink::new(Arc::clone(&host_services)));
+        // Built here so the logger and `self.config` are the SAME `Arc` — pi's `extensionLogger`
+        // reads the module-scope `extensionConfig` binding `refreshExtensionConfig` reassigns
+        // (`index.ts:146-150`), so a reload must be observable through both.
+        let shared_config: crate::forwarding::SharedExtensionConfig = Arc::new(Mutex::new(config));
+        let logger = crate::logging::PermissionSystemLogger::new(
+            Arc::clone(&shared_config),
+            Self::logs_dir_for(&agent_dir),
+        );
         Self {
             id: ExtensionId::from(EXTENSION_ID),
             manager: Mutex::new(manager_with_warnings(paths, &warnings)),
             session_approvals: Mutex::new(SessionApprovalStore::new()),
             permanent_approvals: Mutex::new(PermanentApprovalStore::new(permanent_path)),
             dedup: Mutex::new(DedupCache::new()),
-            config: Mutex::new(config),
+            config: shared_config,
             ask_channel,
             host_services,
             agent_dir,
@@ -409,7 +493,85 @@ impl PermissionSystemExtension {
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
             warnings,
             last_config_warning: Mutex::new(None),
+            logger,
+            reported_logging_warnings: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// pi `writeDebugEntry` (`index.ts:171-176`): the diagnostic stream, with the logger's own
+    /// failure funnelled into the dedup-once warning reporter.
+    fn write_debug_entry(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.debug(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `writeReviewEntry` (`index.ts:178-183`): the SECURITY-relevant decision stream — the
+    /// "why was this blocked / who approved this" trail. Same warning funnel.
+    fn write_review_entry(&self, event: &str, details: &Value) {
+        if let Some(warning) = self.logger.review(event, details) {
+            self.report_logging_warning(&warning);
+        }
+    }
+
+    /// pi `reportLoggingWarning` (`index.ts:162-169`): surface a NEW logging failure once through
+    /// the same `ui.notify` channel every other warning uses, and remember it so a persistently
+    /// broken trail cannot notify on every gated tool call.
+    fn report_logging_warning(&self, message: &str) {
+        // Scoped so the memo lock is released before the sink is touched — `notify` takes its own
+        // lock and reaches the host.
+        let is_new = guard(&self.reported_logging_warnings).insert(message.to_string());
+        if is_new {
+            self.warnings.notify(message);
+        }
+    }
+
+    /// pi `reviewPermissionDecision` (`index.ts:1767-1793`): the ONE shaped `review` record every
+    /// decision-point entry is built from — the prompt and denial reason accompanied by their
+    /// `createSensitiveLogMetadata` digests, plus the resolution / persistence / scope fields.
+    ///
+    /// `details` is the same [`DedupDetails`] the dedup fingerprint is built from, which already
+    /// mirrors pi's `PermissionPromptDetails` field for field (`dedup.rs:36-50`).
+    fn review_permission_decision(&self, event: &str, details: &DedupDetails, tail: Value) {
+        let mut record = json!({
+            "requestId": details.request_id,
+            "source": details.source,
+            "agentName": details.agent_name,
+            "prompt": details.message,
+            "promptMetadata": crate::logging::sensitive_log_metadata(Some(&details.message)),
+            "toolCallId": details.tool_call_id,
+            "toolName": details.tool_name,
+            "skillName": details.skill_name,
+            "path": details.path,
+            "command": details.command,
+            "commandMetadata": crate::logging::sensitive_log_metadata(details.command.as_deref()),
+            "target": details.target,
+            "toolInput": details.tool_input,
+        });
+        // pi spreads `...details` then the per-call-site resolution/persistence keys; the tail
+        // overwrites, matching JS object-literal ordering.
+        if let (Value::Object(base), Value::Object(extra)) = (&mut record, &tail) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        self.write_review_entry(event, &record);
+    }
+
+    /// pi `getPermissionDecisionScope` (`index.ts:876-888`): the first non-empty of
+    /// `target`, `command`, `path`, `toolName`, `skillName`.
+    fn permission_decision_scope(details: &DedupDetails) -> Value {
+        [
+            details.target.as_deref(),
+            details.command.as_deref(),
+            details.path.as_deref(),
+            details.tool_name.as_deref(),
+            details.skill_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map_or(Value::Null, |s| Value::String(s.to_string()))
     }
 
     /// Override the resolved persona name (deterministic tests / an embedder that resolves the name
@@ -455,8 +617,12 @@ impl PermissionSystemExtension {
         // (3) SKILL-READ bypass (pi `index.ts:2230-2303`): a `read` whose path lands on a tracked skill
         // is governed by the SKILL policy (allow → proceed; ask → prompt; deny → block), bypassing the
         // read-tool policy. `None` = no skill matched → fall through to the external-dir + main checks.
+        // The per-call identity every gated layer audits against (pi threads `event.toolCallId` /
+        // `toolName` / `input` / `ctx.cwd` / `agentName` into each `writeReviewEntry` by hand).
+        let call = GateCall { call_id, tool_name: normalized, input, cwd: &cwd, agent_name };
+
         if normalized == "read"
-            && let Some(outcome) = self.resolve_skill_read(input, agent_name, &cwd, ctx).await
+            && let Some(outcome) = self.resolve_skill_read(&call, ctx).await
         {
             return outcome;
         }
@@ -468,8 +634,7 @@ impl PermissionSystemExtension {
         if !cwd.is_empty()
             && let Some(path) = gate::get_path_bearing_tool_path(normalized, input)
             && gate::is_path_outside_working_directory(&path, &cwd)
-            && let Some(outcome) =
-                self.resolve_external_directory(normalized, &path, &cwd, agent_name, ctx).await
+            && let Some(outcome) = self.resolve_external_directory(&call, &path, ctx).await
         {
             return outcome;
         }
@@ -484,6 +649,20 @@ impl PermissionSystemExtension {
 
         match check.state {
             PermissionState::Deny => {
+                // pi `index.ts:2422-2439`: the policy-denied audit entry, then `flush()` before the
+                // block is returned (`[CYRUP-DELTA]` — the write is already durable here).
+                let details = dedup_details(call_id, input, &check, agent_name);
+                self.review_permission_decision(
+                    "permission_request.blocked",
+                    &details,
+                    json!({
+                        "source": "tool_call",
+                        "resolution": "policy_denied",
+                        "decisionPersistence": "none",
+                        "decisionScope": Self::permission_decision_scope(&details),
+                    }),
+                );
+                self.logger.flush();
                 HookOutcome::Block { reason: Some(gate::format_deny_reason(&check, agent_name)) }
             }
             PermissionState::Allow => HookOutcome::Noop,
@@ -505,13 +684,8 @@ impl PermissionSystemExtension {
     /// `ask` → live prompt (fail-closed / user-deny → block), `allow`/approved → proceed. Returns
     /// `Some(HookOutcome)` when a skill matched (a terminal decision, allow via `Noop`), `None` when no
     /// skill matched (the caller falls through to the external-dir + main checks).
-    async fn resolve_skill_read(
-        &self,
-        input: &Value,
-        agent_name: Option<&str>,
-        cwd: &str,
-        ctx: &HostCtx,
-    ) -> Option<HookOutcome> {
+    async fn resolve_skill_read(&self, call: &GateCall<'_>, ctx: &HostCtx) -> Option<HookOutcome> {
+        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
         let read_path =
             to_record(input).get("path").and_then(Value::as_str).unwrap_or("").to_string();
         let normalized_read_path = common::normalize_path_for_comparison(&read_path, cwd);
@@ -546,6 +720,20 @@ impl PermissionSystemExtension {
         if !explicitly_requested {
             match read_skill.state {
                 PermissionState::Deny => {
+                    // pi `index.ts:2243-2255`.
+                    self.write_review_entry(
+                        "permission_request.blocked",
+                        &json!({
+                            "source": "skill_read",
+                            "toolCallId": call_id,
+                            "toolName": tool_name,
+                            "skillName": read_skill.name,
+                            "agentName": agent_name,
+                            "path": read_path,
+                            "toolInput": input,
+                            "resolution": "policy_denied",
+                        }),
+                    );
                     return Some(HookOutcome::Block {
                         reason: Some(skill::format_skill_path_deny_reason(&read_skill, agent_name)),
                     });
@@ -553,8 +741,38 @@ impl PermissionSystemExtension {
                 PermissionState::Ask => {
                     let message =
                         skill::format_skill_path_ask_prompt(&read_skill, &read_path, agent_name);
-                    match self.prompt_decision(&message, ctx).await {
+                    // pi `index.ts:2282-2291`'s `promptPermission` details record.
+                    let details = DedupDetails {
+                        request_id: call_id.to_string(),
+                        source: "skill_read".to_string(),
+                        agent_name: agent_name.map(str::to_string),
+                        message: message.clone(),
+                        tool_call_id: Some(call_id.to_string()),
+                        tool_name: Some(tool_name.to_string()),
+                        skill_name: Some(read_skill.name.clone()),
+                        path: Some(read_path.clone()),
+                        command: None,
+                        target: None,
+                        tool_input: input.clone(),
+                    };
+                    match self.prompt_decision(&details, ctx).await {
                         AskOutcome::NoLiveChannel => {
+                            // pi `index.ts:2262-2276`.
+                            self.write_review_entry(
+                                "permission_request.blocked",
+                                &json!({
+                                    "source": "skill_read",
+                                    "toolCallId": call_id,
+                                    "toolName": tool_name,
+                                    "skillName": read_skill.name,
+                                    "agentName": agent_name,
+                                    "path": read_path,
+                                    "prompt": message,
+                                    "promptMetadata": crate::logging::sensitive_log_metadata(Some(&message)),
+                                    "toolInput": input,
+                                    "resolution": "confirmation_unavailable",
+                                }),
+                            );
                             return Some(HookOutcome::Block {
                                 reason: Some(skill::skill_ask_unavailable_reason()),
                             });
@@ -582,12 +800,11 @@ impl PermissionSystemExtension {
     /// then fall through); `allow` → fall through. `None` = allowed (proceed to the main check).
     async fn resolve_external_directory(
         &self,
-        tool_name: &str,
+        call: &GateCall<'_>,
         path: &str,
-        cwd: &str,
-        agent_name: Option<&str>,
         ctx: &HostCtx,
     ) -> Option<HookOutcome> {
+        let GateCall { call_id, tool_name, input, cwd, agent_name } = *call;
         let ext_input = json!({ "path": path, "cwd": cwd });
         let raw = guard(&self.manager).check_permission("external_directory", &ext_input, agent_name);
         // pi `:2319-2321`: the session/permanent overlay is applied ONLY on an `ask` result.
@@ -600,18 +817,65 @@ impl PermissionSystemExtension {
         };
 
         match ext_check.state {
-            PermissionState::Deny => Some(HookOutcome::Block {
-                reason: Some(gate::format_external_directory_deny_reason(
-                    tool_name, path, cwd, agent_name,
-                )),
-            }),
+            PermissionState::Deny => {
+                // pi `index.ts:2323-2333`.
+                self.write_review_entry(
+                    "permission_request.blocked",
+                    &json!({
+                        "source": "tool_call",
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "agentName": agent_name,
+                        "path": path,
+                        "toolInput": input,
+                        "resolution": "policy_denied",
+                    }),
+                );
+                Some(HookOutcome::Block {
+                    reason: Some(gate::format_external_directory_deny_reason(
+                        tool_name, path, cwd, agent_name,
+                    )),
+                })
+            }
             PermissionState::Ask => {
                 let message =
                     gate::format_external_directory_ask_prompt(tool_name, path, cwd, agent_name);
-                match self.prompt_decision(&message, ctx).await {
-                    AskOutcome::NoLiveChannel => Some(HookOutcome::Block {
-                        reason: Some(gate::format_external_directory_unavailable_reason(path)),
-                    }),
+                // pi `index.ts:2368-2377`'s `promptPermission` details record — note `source` is
+                // `"tool_call"` here, not `"skill_read"`, and no `skillName`/`command`/`target`.
+                let details = DedupDetails {
+                    request_id: call_id.to_string(),
+                    source: "tool_call".to_string(),
+                    agent_name: agent_name.map(str::to_string),
+                    message: message.clone(),
+                    tool_call_id: Some(call_id.to_string()),
+                    tool_name: Some(tool_name.to_string()),
+                    skill_name: None,
+                    path: Some(path.to_string()),
+                    command: None,
+                    target: None,
+                    tool_input: input.clone(),
+                };
+                match self.prompt_decision(&details, ctx).await {
+                    AskOutcome::NoLiveChannel => {
+                        // pi `index.ts:2351-2362`.
+                        self.write_review_entry(
+                            "permission_request.blocked",
+                            &json!({
+                                "source": "tool_call",
+                                "toolCallId": call_id,
+                                "toolName": tool_name,
+                                "agentName": agent_name,
+                                "path": path,
+                                "prompt": message,
+                                "promptMetadata": crate::logging::sensitive_log_metadata(Some(&message)),
+                                "toolInput": input,
+                                "resolution": "confirmation_unavailable",
+                            }),
+                        );
+                        Some(HookOutcome::Block {
+                            reason: Some(gate::format_external_directory_unavailable_reason(path)),
+                        })
+                    }
                     AskOutcome::Decided(d) if !d.approved => Some(HookOutcome::Block {
                         reason: Some(gate::format_external_directory_user_denied_reason(
                             tool_name,
@@ -627,6 +891,25 @@ impl PermissionSystemExtension {
                             if !subject.is_empty() {
                                 guard(&self.session_approvals)
                                     .approve_always(&ext_check.tool_name, &subject);
+                                // pi `index.ts:2397-2409`: the persist is audited only when a
+                                // subject was actually recorded, and names the SPECIAL tool
+                                // `external_directory` rather than the calling tool.
+                                self.write_review_entry(
+                                    "permission_request.approval_persisted",
+                                    &json!({
+                                        "source": "tool_call",
+                                        "toolCallId": call_id,
+                                        "toolName": "external_directory",
+                                        "agentName": agent_name,
+                                        "path": path,
+                                        "toolInput": input,
+                                        "resolution": decision_state_str(d.state),
+                                        "decisionPersistence": "session",
+                                        "approvalPersistence": "session",
+                                        "approvalScope": subject,
+                                    }),
+                                );
+                                self.logger.flush();
                             }
                         }
                         None
@@ -637,27 +920,100 @@ impl PermissionSystemExtension {
         }
     }
 
-    /// Prompt the human for a bespoke `message` (the skill-read + external-dir asks, which manage their
-    /// own persistence — no dedup/`Always` tail): the pi `canResolveAskPermissionRequest` fail-fast
-    /// pre-check (`yolo-mode.ts:21-23`, consulted via `canRequestPermissionConfirmation` BEFORE any
-    /// prompt/lock work at `index.ts:2263,2351,2452`) — `hasUI || isSubagent || yoloMode` — then yolo
-    /// auto-approve (pi `shouldAutoApprovePermissionState`), the C3 human-interaction lock, the
-    /// live-vs-fallback channel selection, and the P-3 dispatch-budget-forgiveness guard held across
-    /// the BLOCKING dialog — the SAME machinery [`Self::resolve_ask`] uses. `AskOutcome::NoLiveChannel`
-    /// = fail-CLOSED (no reachable human), returned IMMEDIATELY by the pre-check when none of the three
-    /// conditions hold — zero lock/dialog work touched, exactly like pi's early return.
-    async fn prompt_decision(&self, message: &str, ctx: &HostCtx) -> AskOutcome {
+    /// Remember a resolved decision under `key` (pi `rememberPermissionPromptDecision`,
+    /// `index.ts:1890-1892`) so an identical re-emission reuses it instead of re-prompting. A `None`
+    /// key is pi's uncacheable case (empty `requestId`, `createPermissionPromptCacheKey`
+    /// `index.ts:728-737`) — nothing is stored.
+    fn remember_prompt_decision(&self, key: Option<&String>, decision: &PermissionPromptDecision) {
+        if let Some(k) = key {
+            guard(&self.dedup).remember(k, decision.clone());
+        }
+    }
+
+    /// pi `promptPermission` (`index.ts:1794-1902`), the shared prompting core EVERY ask surface goes
+    /// through: the dedup cache, then the `canResolveAskPermissionRequest` fail-fast pre-check
+    /// (`yolo-mode.ts:21-23`, consulted via `canRequestPermissionConfirmation` BEFORE any prompt/lock
+    /// work at `index.ts:2263,2351,2452`) — `hasUI || isSubagent || yoloMode` — then yolo auto-approve
+    /// (pi `shouldAutoApprovePermissionState`), the C3 human-interaction lock, the live-vs-fallback
+    /// channel selection, and the P-3 dispatch-budget-forgiveness guard held across the BLOCKING
+    /// dialog. `AskOutcome::NoLiveChannel` = fail-CLOSED (no reachable human), returned IMMEDIATELY by
+    /// the pre-check when none of the three conditions hold — zero lock/dialog work touched, exactly
+    /// like pi's early return.
+    ///
+    /// The DEDUP cache lives here, not in any one caller, because pi puts it inside `promptPermission`
+    /// itself (`index.ts:1798-1815` lookup, `:1890-1892` store): all three ask surfaces — skill-read
+    /// (`index.ts:2282`), external-directory (`:2369`) and the main check (`:2469`) — are therefore
+    /// deduplicated identically, so a re-emitted IDENTICAL `tool_call` renders ZERO additional prompts
+    /// on ANY of them (`tests/edit-decision-deduplication-red.test.ts` is upstream's regression proof).
+    ///
+    /// Also emits pi `promptPermission`'s five audit entries (`index.ts:1805,1820,1843,1855-1857`):
+    /// `permission_request.duplicate_reused` (cache hit), `.auto_approved` (yolo), `.waiting` (before
+    /// the dialog opens) and `.approved`/`.denied` (after the human answers). `details` is pi's
+    /// `PermissionPromptDetails` — `details.message` IS the prompt text, so this takes the record
+    /// rather than a bare string, and is also what the cache key is fingerprinted from.
+    async fn prompt_decision(&self, details: &DedupDetails, ctx: &HostCtx) -> AskOutcome {
+        let message = details.message.as_str();
         let yolo_mode = guard(&self.config).yolo_mode;
         if !(ctx.has_ui || is_subagent_child() || yolo_mode) {
+            // The caller's `confirmation_unavailable` entry covers this branch (pi audits it at
+            // each of its three `canRequestPermissionConfirmation` sites, not inside
+            // `promptPermission`). Ordered BEFORE the cache lookup to match pi, whose callers run
+            // `canRequestPermissionConfirmation` before ever entering `promptPermission`.
             return AskOutcome::NoLiveChannel;
         }
+
+        // Dedup hit: reuse the prior decision (collapsed to Allow-Once by `create_duplicate_decision`,
+        // so a re-emitted approval never re-persists an `Always` grant) — zero additional prompts.
+        let key = details.cache_key();
+        if let Some(k) = &key {
+            let cached = guard(&self.dedup).get(k);
+            if let Some(decision) = cached {
+                // pi `index.ts:1804-1812`: a reused decision is STILL audited — otherwise a
+                // re-emitted tool call looks like it was never gated at all.
+                self.review_permission_decision(
+                    "permission_request.duplicate_reused",
+                    details,
+                    json!({
+                        "resolution": decision_state_str(decision.state),
+                        "denialReason": decision.denial_reason,
+                        "denialReasonMetadata":
+                            crate::logging::sensitive_log_metadata(decision.denial_reason.as_deref()),
+                        "decisionPersistence": "none",
+                        "approvalPersistence": "none",
+                        "decisionScope": Self::permission_decision_scope(details),
+                    }),
+                );
+                self.logger.flush();
+                return AskOutcome::Decided(decision);
+            }
+        }
+
         if yolo_mode {
-            return AskOutcome::Decided(PermissionPromptDecision {
+            // pi `index.ts:1820-1826`.
+            self.review_permission_decision(
+                "permission_request.auto_approved",
+                details,
+                json!({
+                    "resolution": "auto_response",
+                    "decisionPersistence": "none",
+                    "decisionScope": "yolo_mode",
+                }),
+            );
+            self.logger.flush();
+            let decision = PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Approved,
                 denial_reason: None,
-            });
+            };
+            // pi caches the yolo auto-approval too: `rememberPermissionPromptDecision`
+            // (`index.ts:1890`) is handed the SAME `decisionPromise` whose body took the
+            // `shouldAutoApprovePermissionState` early return at `:1817-1841`.
+            self.remember_prompt_decision(key.as_ref(), &decision);
+            return AskOutcome::Decided(decision);
         }
+        // pi `index.ts:1843` — recorded BEFORE the dialog opens, so a session killed mid-prompt
+        // still leaves evidence of what was asked.
+        self.review_permission_decision("permission_request.waiting", details, json!({}));
         let human_lock = self.host_services.get().and_then(|s| s.human_interaction_lock());
         let _human_guard = match human_lock {
             Some(lock) => Some(lock.acquire().await),
@@ -667,15 +1023,44 @@ impl PermissionSystemExtension {
             (true, Some(services)) => Arc::new(LocalAskChannel::new(services.clone())),
             _ => self.ask_channel.clone(),
         };
-        let _human_wait = ctx.begin_human_wait();
-        channel.confirm("Permission Required", message, PromptOpts::default()).await
+        let outcome = {
+            let _human_wait = ctx.begin_human_wait();
+            channel.confirm("Permission Required", message, PromptOpts::default()).await
+        };
+
+        // pi `index.ts:1855-1868`: the resolved decision, with the "Allow Always" session-persist
+        // intent recorded alongside it.
+        if let AskOutcome::Decided(ref d) = outcome {
+            let always = d.state == PermissionDecisionState::Always;
+            let scope = Self::permission_decision_scope(details);
+            self.review_permission_decision(
+                if d.approved { "permission_request.approved" } else { "permission_request.denied" },
+                details,
+                json!({
+                    "resolution": decision_state_str(d.state),
+                    "denialReason": d.denial_reason,
+                    "denialReasonMetadata":
+                        crate::logging::sensitive_log_metadata(d.denial_reason.as_deref()),
+                    "decisionPersistence": if always { "session" } else { "none" },
+                    "approvalPersistence": if d.approved && always { "session" } else { "none" },
+                    "decisionScope": scope,
+                    "approvalScope": if d.approved && always { scope.clone() } else { Value::Null },
+                }),
+            );
+            // pi `index.ts:1890-1892` — the resolved decision enters the cache, so the NEXT identical
+            // request (same `toolCallId` + same fingerprint) short-circuits at the lookup above.
+            self.remember_prompt_decision(key.as_ref(), d);
+        }
+        outcome
     }
 
-    /// The main-check `ask` branch (pi `:2444-2496` + `promptPermission :1794-1902` + `confirmPermission
-    /// :1506-1513`): dedup → the shared [`Self::prompt_decision`] core (yolo → C3 human-interaction lock
-    /// → live dialog under a P-3 budget-forgiveness guard) → fail-CLOSED when no human is reachable →
-    /// remember + apply (the `Always` session-persist tail). The prompt subject now names the resolved
-    /// persona (real `agent_name`, pi `formatAskPrompt(check, agentName, input)`).
+    /// The main-check `ask` branch (pi `:2444-2496` + `confirmPermission :1506-1513`): the shared
+    /// [`Self::prompt_decision`] core (pi `promptPermission :1794-1902` — dedup lookup → yolo → C3
+    /// human-interaction lock → live dialog under a P-3 budget-forgiveness guard → dedup store) →
+    /// fail-CLOSED when no human is reachable → apply (the `Always` session-persist tail). The prompt
+    /// subject names the resolved persona (real `agent_name`, pi `formatAskPrompt(check, agentName,
+    /// input)`). Dedup is NOT done here: pi keeps it inside `promptPermission` so every ask surface
+    /// shares it, and cyrup follows (see [`Self::prompt_decision`]).
     async fn resolve_ask(
         &self,
         call_id: &str,
@@ -686,32 +1071,46 @@ impl PermissionSystemExtension {
         let agent_name = self.agent_name.as_deref();
 
         let details = dedup_details(call_id, input, check, agent_name);
-        let key = details.cache_key();
-
-        // Dedup hit: reuse the prior decision (collapsed to Allow-Once) — zero additional prompts.
-        if let Some(k) = &key {
-            let cached = guard(&self.dedup).get(k);
-            if let Some(decision) = cached {
-                return self.apply_decision(decision, check, input);
-            }
-        }
 
         // pi `formatAskPrompt` (`index.ts:570-590`) — the human-facing prompt (NOT the headless reason).
-        // The shared prompting core applies yolo auto-approve (pi `shouldAutoApprovePermissionState`),
-        // the C3 human lock, the live-vs-fallback channel, and the P-3 dispatch-budget guard.
-        let message = gate::format_ask_prompt(check, agent_name, input);
-        let decision = match self.prompt_decision(&message, ctx).await {
+        // The shared prompting core applies the dedup cache, yolo auto-approve (pi
+        // `shouldAutoApprovePermissionState`), the C3 human lock, the live-vs-fallback channel, and the
+        // P-3 dispatch-budget guard. `details.message` already IS `format_ask_prompt(check, agent_name,
+        // input)` (built by `dedup_details` above), which is what `prompt_decision` prompts with.
+        let decision = match self.prompt_decision(&details, ctx).await {
             AskOutcome::Decided(d) => d,
             // Fail-CLOSED: no reachable human (headless / no live UI) → Block, never proceed
             // (pi `confirmPermission` headless `{approved:false}` :1509-1513 / `:2452-2467`).
             AskOutcome::NoLiveChannel => {
+                // pi `index.ts:2452-2464`.
+                self.review_permission_decision(
+                    "permission_request.blocked",
+                    &details,
+                    json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
+                );
                 return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)) };
             }
         };
 
-        if let Some(k) = &key {
-            guard(&self.dedup).remember(k, decision.clone());
+        // pi `index.ts:2481-2494`: audit the SESSION persist an approved-Always produces (only when
+        // a real subject was recorded), then `flush()`.
+        if decision.approved && decision.state == PermissionDecisionState::Always {
+            let subject = gate::get_pattern_approval_subject(check, input);
+            if !subject.is_empty() {
+                self.review_permission_decision(
+                    "permission_request.approval_persisted",
+                    &details,
+                    json!({
+                        "source": "tool_call",
+                        "resolution": decision_state_str(decision.state),
+                        "decisionPersistence": "session",
+                        "approvalPersistence": "session",
+                        "approvalScope": subject,
+                    }),
+                );
+            }
         }
+        self.logger.flush();
         self.apply_decision(decision, check, input)
     }
 
@@ -840,12 +1239,31 @@ impl PermissionSystemExtension {
         false
     }
 
-    /// pi `startForwardedPermissionPolling` (`index.ts:1904-2031`): in the PARENT role (`install_watcher`),
-    /// on a session WITH a UI and a captured live backend, spawn the forwarding watcher ONCE. No-op for a
-    /// child, a headless session (pi's `!ctx.hasUI` early return, `:1361`/`:1912`), a missing backend, or
-    /// when a watcher is already running (a session rebuild must not double-spawn).
+    /// pi `startForwardedPermissionPolling` (`index.ts:1983-2031`): in the PARENT role
+    /// (`install_watcher`), on a session WITH a UI and a captured live backend, ensure the forwarding
+    /// watcher is running.
+    ///
+    /// **IDEMPOTENT** — this is the crux of PERM-005. Upstream re-enters this function on FOUR hooks
+    /// (`refreshSessionRuntimeState`/`session_start` `:2084`, `before_agent_start` `:2137`, `input`
+    /// `:2194`, `tool_call` `:2210`), and cyrup now calls it from the same four places, so it fires on
+    /// every turn. The `is_finished()` check below makes N calls yield exactly ONE live watcher — pi's
+    /// analog is `if (permissionForwardingWatcher && watchedPermissionForwardingRequestsDir ===
+    /// location.requestsDir) { …; return; }` (`index.ts:1996-2000`), which likewise keeps the existing
+    /// watcher rather than re-arming one per hook.
+    ///
+    /// **STOPS on the disqualifying branch** (PERM-005): pi's early return is
+    /// `if (!ctx.hasUI || isSubagentExecutionContext(ctx)) { stopForwardedPermissionPolling(); return; }`
+    /// (`index.ts:1984-1987`) — it TEARS DOWN a live watcher rather than leaving one orphaned. Cyrup's
+    /// guard used to return without stopping, so a UI that detached mid-session left the watcher
+    /// prompting into a dead backend.
+    ///
+    /// A missing `host_services` backend is NOT a disqualifier — it is the "cannot attach yet" case
+    /// (pi's `if (!location) return;`, `:1991-1993`), which upstream leaves running for the next hook.
     fn maybe_start_forwarding_watcher(&self, ctx: &HostCtx) {
         if !self.install_watcher || !ctx.has_ui {
+            // pi `:1985`: a non-parent / headless context tears the watcher DOWN, it does not merely
+            // decline to start one.
+            self.stop_forwarding_watcher();
             return;
         }
         let Some(services) = self.host_services.get() else {
@@ -859,14 +1277,84 @@ impl PermissionSystemExtension {
         *slot = Some(forwarding::spawn_forwarding_watcher(
             self.agent_dir.clone(),
             services.clone(),
-            guard(&self.config).clone(),
+            Arc::clone(&self.config),
         ));
     }
 
-    /// pi watcher teardown (`index.ts:2131`): abort the forwarding watcher task on session shutdown.
+    /// pi `stopForwardedPermissionPolling` (`index.ts:1970-1981`, called from `session_shutdown`
+    /// `:2131` and from the disqualified branch of `startForwardedPermissionPolling` `:1985`): abort
+    /// the forwarding watcher task. Idempotent — a no-op when no watcher is installed.
     fn stop_forwarding_watcher(&self) {
         if let Some(handle) = guard(&self.watcher).take() {
             handle.abort();
+        }
+    }
+
+    /// Test seam: is a live (unfinished) forwarding-watcher task currently installed? Used by the
+    /// PERM-005 idempotence regression tests to assert that N `maybe_start_forwarding_watcher` calls
+    /// yield exactly one watcher.
+    #[cfg(test)]
+    fn has_live_forwarding_watcher(&self) -> bool {
+        guard(&self.watcher).as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Test seam (PERM-005): how many watcher TASKS currently exist, counted independently of the
+    /// `watcher` slot.
+    ///
+    /// Every spawned watcher moves its own clone of the shared `config` handle into the task future,
+    /// synchronously at `tokio::spawn` time, so `Arc::strong_count` MINUS the non-watcher holders is
+    /// the number of watcher futures still alive. This is the assertion that would catch a
+    /// non-idempotent start: the slot only ever holds ONE `JoinHandle`, so overwriting it would hide
+    /// a leaked task, whereas the leaked task's `Arc` clone cannot hide.
+    ///
+    /// The non-watcher holders are exactly two and are structural, not incidental: the extension's
+    /// own `self.config` field, and `self.logger`, which must share the SAME handle so a config
+    /// reload re-arms the audit trail (pi's `extensionLogger` reads the module-scope
+    /// `extensionConfig` binding, `index.ts:146-150`). Adding a THIRD holder without updating this
+    /// constant makes the count read one watcher too many — which is precisely how this seam is
+    /// meant to fail: loudly, at the assertion, rather than silently under-counting a leak.
+    #[cfg(test)]
+    fn live_watcher_task_count(&self) -> usize {
+        /// `self.config` + `self.logger` — see the note above.
+        const NON_WATCHER_CONFIG_HOLDERS: usize = 2;
+        Arc::strong_count(&self.config).saturating_sub(NON_WATCHER_CONFIG_HOLDERS)
+    }
+
+    /// PERM-001 — publish this PARENT session's own id as the process-wide parent-session anchor
+    /// (`cyrup_ext_subagents::publish_parent_session_anchor`), the address a subagent child's
+    /// forwarded ask writes to.
+    ///
+    /// This is the cyrup placement of pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
+    /// (`pi-subagents/src/extension/index.ts:599` @v0.34.0). Upstream, the SUBAGENTS extension does it, into
+    /// the real process environment, so every descendant — foreground, background, detached, at any
+    /// hop — inherits the anchor for free. `cyrup-ext-subagents` cannot: it is
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition 2024, so it keeps
+    /// the captured anchor in a private executor field and threads it explicitly — which reaches
+    /// only the FOREGROUND spawn path. A background run crosses two OS process boundaries, and
+    /// neither carried the anchor, so a background child's `ask` addressed a null target and
+    /// `forwarding::wait_for_forwarded_approval` fail-closed DENIED it with no prompt ever reaching
+    /// the operator.
+    ///
+    /// This crate is the anchor's sole consumer and, unlike `cyrup-ext-subagents`, sits in the root
+    /// process with the live session id in hand at exactly pi's moment (`SessionStart`), so it is
+    /// the natural publisher of the memory-safe register that stands in for pi's `process.env`
+    /// slot. `cyrup_ext_subagents::background::spawn_detached` reads it back when it builds the
+    /// hop-1 env overlay, restoring the inheritance chain pi gets for free.
+    ///
+    /// PARENT role only (`install_watcher`). A CHILD must never publish its own id: a depth-2
+    /// grandchild would then address its immediate parent's spool instead of continuing to thread
+    /// the root's anchor, which is the direct-parent depth-1 semantics
+    /// `cyrup_ext_subagents::PARENT_SESSION_ENV_VAR` documents. Publishing is also unconditional in
+    /// `has_ui` (pi's `index.ts:599` is), so a UI-less parent that later gains one still has a
+    /// correctly-addressed anchor in place; the watcher, not the anchor, is what `has_ui` gates.
+    fn publish_parent_session_anchor(&self) {
+        if !self.install_watcher {
+            return;
+        }
+        if let Some(services) = self.host_services.get()
+            && let Some(id) = services.session_id()
+        {
+            cyrup_ext_subagents::publish_parent_session_anchor(&id);
         }
     }
 }
@@ -892,6 +1380,39 @@ fn dedup_details(
         command: check.command.clone(),
         target: check.target.clone(),
         tool_input: input.clone(),
+    }
+}
+
+/// The per-`tool_call` identity the layered gate threads into every branch — the borrowed subset of
+/// pi's `event` + `ctx` its `writeReviewEntry` records are built from (`toolCallId`, `toolName`,
+/// `input`, `ctx.cwd`, `agentName`). Bundled rather than passed loose so the layer resolvers keep a
+/// two-argument shape as the audit fields grew.
+#[derive(Clone, Copy)]
+struct GateCall<'a> {
+    /// pi `event.toolCallId` — also the `requestId` of any prompt this call raises.
+    call_id: &'a str,
+    /// The trimmed tool name (pi `toolName`).
+    tool_name: &'a str,
+    /// The `cwd`-injected input (pi's `input` after `index.ts:2305-2309`).
+    input: &'a Value,
+    /// pi `ctx.cwd`.
+    cwd: &'a str,
+    /// The resolved persona (pi `agentName`), `None` at top level.
+    agent_name: Option<&'a str>,
+}
+
+/// The on-the-wire `state` string pi writes into a `resolution` field — the SAME strings the
+/// `serde(rename_all = "snake_case")` derive on [`PermissionDecisionState`] produces
+/// (`ask.rs:27-42`, pi `permission-dialog.ts:1`), spelled out here so the audit trail cannot drift
+/// from the derive silently.
+fn decision_state_str(state: PermissionDecisionState) -> &'static str {
+    match state {
+        PermissionDecisionState::Approved => "approved",
+        PermissionDecisionState::Denied => "denied",
+        PermissionDecisionState::DeniedWithReason => "denied_with_reason",
+        PermissionDecisionState::Once => "once",
+        PermissionDecisionState::Always => "always",
+        PermissionDecisionState::Reject => "reject",
     }
 }
 
@@ -968,6 +1489,11 @@ impl NativeExtension for PermissionSystemExtension {
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::ToolCall { call_id, name, input } => {
+                // PERM-005 / pi `tool_call` (`index.ts:2210`): every tool call re-enters
+                // `startForwardedPermissionPolling`, so a watcher that could not attach at session
+                // start (unresolved session id, UI attached late) is armed here instead of never.
+                // Idempotent — see `maybe_start_forwarding_watcher`.
+                self.maybe_start_forwarding_watcher(ctx);
                 self.decide(call_id.as_str(), name, input, ctx).await
             }
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
@@ -976,9 +1502,17 @@ impl NativeExtension for PermissionSystemExtension {
                 // bullets, and hide ask/deny skills while caching the enforcement entries the skill-read
                 // gate reads at every `tool_call`), and sync the yolo status pill — returning the
                 // sanitized prompt as a `[mutate]`.
+                //
+                // PERM-005 / pi `before_agent_start` (`index.ts:2137`): re-enter
+                // `startForwardedPermissionPolling` first, so each turn re-arms the forwarding
+                // watcher (and tears it down if the UI has gone away). Idempotent.
+                self.maybe_start_forwarding_watcher(ctx);
                 self.on_before_agent_start(system_prompt, ctx)
             }
             HostEvent::Input { text, .. } => {
+                // PERM-005 / pi `input` (`index.ts:2194`): re-enter `startForwardedPermissionPolling`
+                // on every user turn. Idempotent.
+                self.maybe_start_forwarding_watcher(ctx);
                 // pi `index.ts:2192-2206`: a `/skill:<name>` slash command is a direct user action —
                 // remember it so its skill-file reads bypass the skill-read ask/deny (pi `:2243`).
                 if let Some(name) = skill::extract_skill_name_from_input(text) {
@@ -1003,9 +1537,17 @@ impl NativeExtension for PermissionSystemExtension {
                 // the one the extension was constructed with. Also invalidates the agent-start cache
                 // (clears `active_skill_entries`), superseding the plain clear this arm did before.
                 self.refresh_config_and_manager(&ctx.cwd);
-                // pi `startForwardedPermissionPolling` (`index.ts:1904-2031`): in the PARENT role, on a
-                // session WITH a UI, spawn the forwarding watcher (a detached tokio task, OUTSIDE the 5s
-                // dispatch budget) that services subagent children's forwarded asks.
+                // PERM-001 / pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
+                // (`pi-subagents/src/extension/index.ts:599` @v0.34.0): publish this parent session's id as
+                // the process-wide anchor a subagent child's forwarded ask addresses, BEFORE the
+                // watcher that services those asks starts. Without it the detached background hop
+                // spawns children with no anchor and every one of their asks fail-closed denies.
+                self.publish_parent_session_anchor();
+                // pi `startForwardedPermissionPolling` via `refreshSessionRuntimeState`
+                // (`index.ts:2084`): in the PARENT role, on a session WITH a UI, spawn the forwarding
+                // watcher (a detached tokio task, OUTSIDE the 5s dispatch budget) that services
+                // subagent children's forwarded asks. This is the FIRST of four re-entry points
+                // (PERM-005) — see the `BeforeAgentStart` / `Input` / `ToolCall` arms.
                 self.maybe_start_forwarding_watcher(ctx);
                 // pi `syncPermissionSystemStatus` (`index.ts:2091` via `refreshSessionRuntimeState`):
                 // reflect the yolo pill on the live status bar at session start.
@@ -1039,6 +1581,15 @@ impl NativeExtension for PermissionSystemExtension {
                 // pi `resetShownWarnings()` (`index.ts:2125`).
                 self.warnings.reset();
                 self.stop_forwarding_watcher();
+                // PERM-001 / pi `delete process.env[SUBAGENT_PARENT_SESSION_ENV]`
+                // (`pi-subagents/src/extension/index.ts:619` @v0.34.0): drop the published anchor so a stale
+                // id from the session that just ended never addresses a subsequently-started
+                // session's spool on this same long-lived process. PARENT role only, symmetric with
+                // `publish_parent_session_anchor` — a CHILD never published and must not clear the
+                // anchor its own descendants still need.
+                if self.install_watcher {
+                    cyrup_ext_subagents::clear_parent_session_anchor();
+                }
                 HookOutcome::Noop
             }
             _ => HookOutcome::Noop,
@@ -1048,8 +1599,48 @@ impl NativeExtension for PermissionSystemExtension {
 
 // ================================================================================= binary wiring
 
+/// pi `hasSubagentEnvHint` (`index.ts:93-103`, over
+/// `permission-forwarding.ts:9`'s `SUBAGENT_ENV_HINT_KEYS`): this process is running AS a subagent
+/// child if ANY of the hint keys is set to a non-empty (post-trim) value.
+///
+/// Three deliberate points of fidelity to upstream:
+///
+/// - **Any of three keys, not one.** pi ORs `PI_IS_SUBAGENT` / `PI_SUBAGENT_SESSION_ID` /
+///   `PI_AGENT_ROUTER_SUBAGENT`; [`SUBAGENT_ENV_HINT_KEYS`] is the cyrup analog set, all three
+///   written by the same spawn chokepoint (`exec::build_attempt_spawn_plan`).
+/// - **Non-empty, not `== "1"`.** pi tests `entry.length > 0`. The old strict `== Some("1")`
+///   silently classified a child spawned by any path that wrote a different truthy value (or by an
+///   external router setting only the persona/run keys) as a ROOT — which selected the LOCAL ask
+///   dialog in a process with no human attached, so its `ask` died instead of forwarding.
+/// - **Trimmed.** pi's `process.env[key]?.trim() ?? ""`.
+///
+/// Not ported: pi's `subagent-sessions` session-directory containment fallback
+/// (`index.ts:696-709`). That branch keys on pi's in-process subagent sessions living under a
+/// dedicated directory of the agent dir; cyrup's subagent is always a separate OS process carrying
+/// these env keys (`lib.rs`'s non-negotiable process-per-subagent mechanism), so there is no
+/// same-process session-dir signal to test. Note also that pi's `isSubagentExecutionContext` is a
+/// per-`ctx` RUNTIME predicate while this is consulted both at wiring time
+/// ([`permission_extension_for_env`]) and per call — the env keys are process-lifetime constants in
+/// cyrup, so the two coincide.
 fn is_subagent_child() -> bool {
-    std::env::var(CHILD_ENV_VAR).ok().as_deref() == Some("1")
+    has_subagent_env_hint(|key| std::env::var(key).ok())
+}
+
+/// The injectable core of [`is_subagent_child`] — pi `hasSubagentEnvHint`'s body
+/// (`index.ts:100`, `values.some((entry) => entry.length > 0)` over the trimmed values).
+///
+/// Parameterized over the env reader so the predicate is directly testable without
+/// `unsafe { std::env::set_var }` and the cross-test races a process-global mutation brings, the
+/// same injectable-core convention `cyrup-ext-subagents`' `spawn::depth`/`spawn::mod` use.
+///
+/// Not ported: pi caches the answer keyed on a `\0`-joined signature of the values
+/// (`index.ts:94-102`). That cache exists because pi re-evaluates this on every `ctx` predicate
+/// call inside a hot per-tool-call path; cyrup consults it at wiring time plus once per ask, over
+/// three `getenv`s, so a cache would be pure complexity — and a stale one is a correctness hazard.
+fn has_subagent_env_hint(get: impl Fn(&str) -> Option<String>) -> bool {
+    SUBAGENT_ENV_HINT_KEYS
+        .iter()
+        .any(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1205,6 +1796,30 @@ mod tests {
         ext.init(&mut api).await.unwrap();
     }
 
+    /// Drive `body` to completion with the crate-wide env lock held for the WHOLE test.
+    ///
+    /// Any test that asserts on config it wrote into its own tempdir must take this lock.
+    /// `ExtensionConfig::load` resolves its path through `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`
+    /// first ([`crate::ext_config::ExtensionConfig::resolve_config_path`]), and
+    /// `ext_config::tests::env_var_overrides_default_config_path` sets that variable PROCESS-WIDE
+    /// while it runs. A concurrent test then loads the OTHER test's fixture instead of its own and
+    /// fails on an assertion that has nothing to do with the code under test. Measured on this
+    /// binary: 8 failures in 300 runs before this guard, 0 in 300 after; and exporting the variable
+    /// by hand reproduces the same failure 100% of the time.
+    ///
+    /// The lock is `crate::ext_config::env_lock` — the same one the mutator holds — and it is taken
+    /// in a SYNCHRONOUS frame around `block_on` rather than inside an `async` test body, so the
+    /// guard is never held across an `.await` point.
+    fn with_config_env_lock<F: std::future::Future>(body: F) -> F::Output {
+        let _lock =
+            crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body)
+    }
+
     fn bash_call(call_id: &str) -> HostEvent {
         HostEvent::ToolCall {
             call_id: cyrup_core::ToolCallId::from(call_id),
@@ -1217,8 +1832,12 @@ mod tests {
     /// invalidates the agent-start cache. BEFORE this fix, `EventKind::ResourcesDiscover` was never
     /// subscribed and `on_event` fell through to its catch-all `Noop` arm, so neither the config nor
     /// the cached skill-enforcement entries ever refreshed — this test fails against that behavior.
-    #[tokio::test]
-    async fn resources_discover_reloads_config_and_invalidates_skill_cache() {
+    #[test]
+    fn resources_discover_reloads_config_and_invalidates_skill_cache() {
+        with_config_env_lock(resources_discover_reloads_config_and_invalidates_skill_cache_body());
+    }
+
+    async fn resources_discover_reloads_config_and_invalidates_skill_cache_body() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
@@ -1461,8 +2080,12 @@ mod tests {
     /// back to "ask everything", which looks exactly like a policy that genuinely says ask. This
     /// test drives a real session lifecycle + tool call and asserts the messages actually arrive at
     /// the host boundary.
-    #[tokio::test]
-    async fn malformed_policy_and_config_files_notify_the_host() {
+    #[test]
+    fn malformed_policy_and_config_files_notify_the_host() {
+        with_config_env_lock(malformed_policy_and_config_files_notify_the_host_body());
+    }
+
+    async fn malformed_policy_and_config_files_notify_the_host_body() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         // Present, but truncated mid-object: exists (so it is not the silent ENOENT case) and does
@@ -1510,5 +2133,416 @@ mod tests {
             "a new session must re-report a still-broken file; got {:?}",
             host.warnings()
         );
+    }
+    // ------------------------------------------------------------ PERM-001: subagent env hints
+
+    /// PERM-001 (second gap). pi ORs the three [`SUBAGENT_ENV_HINT_KEYS`] on ANY non-empty value
+    /// (`index.ts:93-103`, `permission-forwarding.ts:9`). The pre-fix predicate was a strict
+    /// `std::env::var(CHILD_ENV_VAR) == Some("1")` on ONE key, so every case below except the very
+    /// first classified a real subagent child as a ROOT — which wires the LOCAL ask dialog into a
+    /// process with no human attached, and its `ask` dies there instead of forwarding to the
+    /// parent's spool.
+    #[test]
+    fn subagent_env_hint_ors_any_non_empty_value_across_all_three_keys() {
+        let hint = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> =
+                pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            has_subagent_env_hint(|key| {
+                owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            })
+        };
+
+        // The one case the old strict `== Some("1")` predicate already got right.
+        assert!(hint(&[(CHILD_ENV_VAR, "1")]));
+
+        // pi tests `entry.length > 0`, not equality with "1" — any non-empty value is a hint.
+        assert!(hint(&[(CHILD_ENV_VAR, "0")]));
+        assert!(hint(&[(CHILD_ENV_VAR, "true")]));
+        assert!(hint(&[(CHILD_ENV_VAR, "yes")]));
+
+        // ...and either of the two sibling keys alone is enough (pi's OR over three keys).
+        assert!(hint(&[(SUBAGENT_ENV_HINT_KEYS[1], "run-abc123")]));
+        assert!(hint(&[(SUBAGENT_ENV_HINT_KEYS[2], "reviewer")]));
+
+        // Negatives: nothing set, and set-but-blank (pi trims before the length test).
+        assert!(!hint(&[]));
+        assert!(!hint(&[(CHILD_ENV_VAR, "")]));
+        assert!(!hint(&[(CHILD_ENV_VAR, "   ")]));
+        assert!(!hint(&[
+            (CHILD_ENV_VAR, ""),
+            (SUBAGENT_ENV_HINT_KEYS[1], "  "),
+            (SUBAGENT_ENV_HINT_KEYS[2], "\t"),
+        ]));
+
+        // An unrelated var is never a hint.
+        assert!(!hint(&[("CYRUP_SOMETHING_ELSE", "1")]));
+    }
+
+    /// The hint keys are exactly the strings `cyrup-ext-subagents` writes into a child's spawn
+    /// overlay. Pinned so a rename on either side fails here rather than silently producing a gate
+    /// that never recognizes a child (aliasing already prevents drift for two of the three; this
+    /// pins the resulting VALUES, which are also the cross-crate contract).
+    #[test]
+    fn subagent_env_hint_keys_match_the_spawn_overlay_contract() {
+        assert_eq!(
+            SUBAGENT_ENV_HINT_KEYS,
+            ["CYRUP_SUBAGENT_CHILD", "CYRUP_SUBAGENT_RUN_ID", "CYRUP_SUBAGENT_AGENT_NAME"]
+        );
+        assert_eq!(CHILD_ENV_VAR, SUBAGENT_ENV_HINT_KEYS[0]);
+    }
+
+    /// PERM-001 (first gap), the publisher half: a PARENT-role extension publishes its live session
+    /// id into `cyrup-ext-subagents`' process-wide anchor register on `SessionStart` (pi
+    /// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `pi-subagents/src/extension/
+    /// index.ts:599` @v0.34.0) and clears it on `SessionShutdown` (`:619`), so the hop-1 detached spawn has
+    /// an anchor to overlay onto the background runner. Before this, nothing in the workspace ever
+    /// published the root's id anywhere a spawn could read it, and the detached path resolved an
+    /// empty target on every hop.
+    ///
+    /// The anchor register (`cyrup_ext_subagents::background::parent_anchor`) is PROCESS-global and
+    /// cargo runs this crate's unit tests as parallel threads of one process, so every test that
+    /// mutates it must hold this lock for its whole body. (This module used to carry a single
+    /// anchor test for exactly that reason — "one test, not several". A lock is the honest version
+    /// of that constraint, and lets the CHILD-role gate below be its own test rather than an
+    /// appendix to the PARENT-role one. Mirrors `parent_anchor.rs`'s own `REGISTER_LOCK`.)
+    ///
+    /// A `tokio::sync::Mutex`, not a `std` one: every holder below is an `async` test that awaits
+    /// `on_event` while holding the guard, and a `std::sync::MutexGuard` held across an await point
+    /// is `clippy::await_holding_lock`. (`parent_anchor.rs`'s `REGISTER_LOCK` can be a `std` mutex
+    /// because its tests are synchronous.) It also drops the poison handling `std` would force at
+    /// every call site — a tokio mutex has no poisoning, so a panicking test releases the lock
+    /// cleanly instead of leaving siblings to recover from a `PoisonError`.
+    static ANCHOR_REGISTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A [`HostServices`] whose only override is a fixed `session_id` — the single input
+    /// `publish_parent_session_anchor` reads.
+    struct AnchorHost(&'static str);
+    impl HostServices for AnchorHost {
+        fn session_id(&self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_role_publishes_and_clears_the_process_parent_session_anchor() {
+        let _guard = ANCHOR_REGISTER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        let ext = PermissionSystemExtension::new_forwarding_parent(
+            agent_dir.clone(),
+            dir.path().to_path_buf(),
+        );
+        ext.set_host_services(Arc::new(AnchorHost("session-root-perm001")));
+        let ctx = event_ctx(dir.path().to_path_buf());
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx).await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
+                .as_deref(),
+            Some("session-root-perm001"),
+            "a PARENT-role SessionStart must publish the live session id as the spawn anchor"
+        );
+
+        let _ = ext
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
+            None,
+            "SessionShutdown must clear the anchor (pi's `delete process.env[...]`)"
+        );
+    }
+
+    /// PERM-001 follow-up — the CHILD half of the publisher gate, and the cross-crate invariant the
+    /// published-first anchor ladder rests on.
+    ///
+    /// `cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor` resolves
+    /// PUBLISHED before INHERITED, emulating pi's single-cell ASSIGNMENT
+    /// (`process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`, `pi-subagents/src/extension/
+    /// index.ts:599` @v0.34.0). That ordering is safe for a NESTED orchestrator — one that was
+    /// itself spawned as a subagent and must keep threading the ROOT's anchor downward rather than
+    /// substituting its own id — for exactly ONE reason: such a process never publishes, so its
+    /// register stays empty and the inherited root anchor wins regardless of rung order.
+    ///
+    /// Upstream enforces that with `if (!process.env[SUBAGENT_CHILD_ENV])` wrapped around the
+    /// assignment (`index.ts:596-601` @v0.34.0). Cyrup's analog is `install_watcher`, which
+    /// [`PermissionSystemExtension::new_forwarding_child`] sets to `false` and which
+    /// `publish_parent_session_anchor` early-returns on — and `permission_extension_for_env` builds
+    /// exactly that role whenever [`is_subagent_child`] sees a [`SUBAGENT_ENV_HINT_KEYS`] hint.
+    ///
+    /// NOTHING pinned that gate. If it regressed — a flipped flag, a second publisher, a refactor
+    /// of `new_forwarding_child` — a nested orchestrator would publish its own id, the register
+    /// would shadow the inherited root anchor, and a depth-2 grandchild would address its immediate
+    /// parent's forwarding spool instead of the root's. Every forwarded ask from that subtree would
+    /// then land on a spool with no watcher on it and fail-closed DENY, silently and with no
+    /// prompt. This test is the guard for that.
+    #[tokio::test]
+    async fn a_subagent_child_never_publishes_or_clears_the_parent_session_anchor() {
+        let _guard = ANCHOR_REGISTER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        // A nested orchestrator: itself a subagent child, so `permission_extension_for_env` builds
+        // it with `new_forwarding_child` (`install_watcher: false`). It has a perfectly good live
+        // session id of its own — the gate, not the absence of an id, is what must stop it.
+        let child = PermissionSystemExtension::new_forwarding_child(
+            agent_dir.clone(),
+            dir.path().to_path_buf(),
+        );
+        child.set_host_services(Arc::new(AnchorHost("nested-orchestrator-own-id")));
+        let ctx = event_ctx(dir.path().to_path_buf());
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
+        let _ = child
+            .on_event(&HostEvent::SessionStart { reason: "startup".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
+            None,
+            "a CHILD-role SessionStart must NOT publish its own id (pi's \
+             `if (!process.env[SUBAGENT_CHILD_ENV])` guard, `index.ts:596`) — publishing here is \
+             what would make the published-first ladder hand a grandchild the WRONG ancestor"
+        );
+
+        // The consequence that makes the reorder safe, asserted directly rather than inferred: with
+        // nothing published, the inherited ROOT anchor is what a spawn from this process resolves.
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor_from(
+                Some("root-session-anchor".to_string())
+            ),
+            Some("root-session-anchor".to_string()),
+            "a nested orchestrator keeps threading the ROOT's anchor downward — this is the case \
+             the published-first reorder had to leave untouched, and it holds because the register \
+             above is empty"
+        );
+
+        // The mirror gate (`SessionShutdown`): a child never published, so it must never CLEAR
+        // either — otherwise a child sharing a process with a parent-role session would wipe the
+        // anchor out from under it.
+        cyrup_ext_subagents::publish_parent_session_anchor("root-session-anchor");
+        let _ = child
+            .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string() }, &ctx)
+            .await;
+        assert_eq!(
+            cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
+                .as_deref(),
+            Some("root-session-anchor"),
+            "a CHILD-role SessionShutdown must leave a published anchor alone (it never published \
+             one), or it would clear an anchor that is not its to clear"
+        );
+
+        cyrup_ext_subagents::clear_parent_session_anchor();
+    }
+
+    // ============================================================================================
+    // PERM-005 — the forwarding watcher must be (re)armed on EVERY hook pi arms it on, idempotently,
+    // and torn down when the context stops qualifying.
+    //
+    // Upstream calls `startForwardedPermissionPolling(ctx)` from four places —
+    // `refreshSessionRuntimeState` (`index.ts:2084`, reached from `session_start`),
+    // `before_agent_start` (`:2137`), `input` (`:2194`) and `tool_call` (`:2210`) — and calls
+    // `stopForwardedPermissionPolling()` from `session_shutdown` (`:2131`) AND from the
+    // disqualified branch of the start function itself (`:1985`).
+    //
+    // Cyrup had exactly ONE caller (`SessionStart`) and a guard that returned without stopping.
+    // ============================================================================================
+
+    /// A [`HostServices`] with a fixed session id, standing in for a live parent backend.
+    struct WatcherHost(String);
+    impl HostServices for WatcherHost {
+        fn session_id(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn ui_ctx(cwd: &Path) -> HostCtx {
+        HostCtx::event(cyrup_ext::ExtMode::Tui, true, cwd.to_path_buf())
+    }
+
+    fn headless_ctx(cwd: &Path) -> HostCtx {
+        HostCtx::event(cyrup_ext::ExtMode::Tui, false, cwd.to_path_buf())
+    }
+
+    /// Builds a PARENT-role extension AND takes [`ANCHOR_REGISTER_LOCK`], returning the guard the
+    /// caller must hold for the rest of the test.
+    ///
+    /// The guard is bundled rather than left to each caller because the coupling is INVISIBLE at
+    /// the call site: none of these PERM-005 watcher tests mentions the parent-session anchor, but
+    /// every one of them fires a PARENT-role `SessionStart`, and that hook calls
+    /// `publish_parent_session_anchor` as a SIDE EFFECT — writing the process-global register that
+    /// `parent_role_publishes_and_clears_the_process_parent_session_anchor` and
+    /// `a_subagent_child_never_publishes_or_clears_the_parent_session_anchor` assert on. Four
+    /// unsynchronized writers against two asserting readers in one test binary is a live race: it
+    /// was observed failing the child-gate assertion with `Some("perm005-detach")` — this helper's
+    /// own session id — leaking in from `a_detaching_ui_tears_the_forwarding_watcher_down`.
+    ///
+    /// Returning the guard makes that safety automatic for any FUTURE watcher test too, instead of
+    /// depending on its author noticing an anchor coupling nothing in the test text mentions.
+    async fn parent_ext(
+        dir: &Path,
+        session: &str,
+    ) -> (tokio::sync::MutexGuard<'static, ()>, PermissionSystemExtension) {
+        let guard = ANCHOR_REGISTER_LOCK.lock().await;
+        let agent_dir = dir.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let ext = PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.to_path_buf());
+        ext.set_host_services(Arc::new(WatcherHost(session.to_string())));
+        (guard, ext)
+    }
+
+    /// PERM-005, the crux: the three per-turn hooks fire on EVERY turn, so a non-idempotent start
+    /// would spawn one watcher per turn. N calls must yield exactly ONE live watcher task.
+    #[tokio::test]
+    async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-idem").await;
+        let ctx = ui_ctx(dir.path());
+
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        assert!(ext.has_live_forwarding_watcher(), "SessionStart must arm the watcher");
+
+        // Ten more turns' worth of hooks — the exact re-entry pi performs.
+        for _ in 0..10 {
+            let _ = ext
+                .on_event(
+                    &HostEvent::BeforeAgentStart {
+                        prompt: String::new(),
+                        images: json!(null),
+                        system_prompt: String::new(),
+                        options: json!(null),
+                        injected: Vec::new(),
+                    },
+                    &ctx,
+                )
+                .await;
+            let _ = ext
+                .on_event(&HostEvent::Input {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                }, &ctx)
+                .await;
+            let _ = ext
+                .on_event(
+                    &HostEvent::ToolCall {
+                        call_id: cyrup_core::ToolCallId::from("c1"),
+                        name: "read".into(),
+                        input: json!({}),
+                    },
+                    &ctx,
+                )
+                .await;
+        }
+
+        assert!(ext.has_live_forwarding_watcher(), "the watcher must still be live");
+        assert_eq!(
+            ext.live_watcher_task_count(),
+            1,
+            "31 hook re-entries must leave EXACTLY one watcher task — a non-idempotent start would \
+             have leaked one per turn (pi `index.ts:1996-2000` keeps the existing watcher)"
+        );
+
+        ext.stop_forwarding_watcher();
+    }
+
+    /// PERM-005 failure mode (2): a UI that attaches AFTER `SessionStart` must still get a watcher.
+    /// Pre-fix, `SessionStart` was the only caller, so a session that was headless at start never
+    /// armed one for its whole life and every forwarded child ask sat in the spool until it failed
+    /// closed.
+    #[tokio::test]
+    async fn a_later_hook_arms_the_watcher_a_headless_session_start_could_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-late-ui").await;
+
+        let _ = ext
+            .on_event(
+                &HostEvent::SessionStart { reason: "startup".into() },
+                &headless_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            !ext.has_live_forwarding_watcher(),
+            "a headless SessionStart must not arm a watcher (pi `:1726`)"
+        );
+
+        // The UI attaches; the very next turn's `tool_call` re-enters the start function.
+        let _ = ext
+            .on_event(
+                &HostEvent::ToolCall {
+                    call_id: cyrup_core::ToolCallId::from("c1"),
+                    name: "read".into(),
+                    input: json!({}),
+                },
+                &ui_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            ext.has_live_forwarding_watcher(),
+            "pi re-enters `startForwardedPermissionPolling` from `tool_call` (`index.ts:2210`), so \
+             a late-attaching UI must arm the watcher"
+        );
+
+        ext.stop_forwarding_watcher();
+    }
+
+    /// PERM-005 failure mode (3): a UI that DETACHES mid-session must tear the watcher down. pi's
+    /// disqualified branch calls `stopForwardedPermissionPolling()` before returning
+    /// (`index.ts:1984-1987`); cyrup's guard used to `return` and leave the task prompting into a
+    /// backend with no human behind it.
+    #[tokio::test]
+    async fn a_detaching_ui_tears_the_forwarding_watcher_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-detach").await;
+
+        let _ = ext
+            .on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ui_ctx(dir.path()))
+            .await;
+        assert!(ext.has_live_forwarding_watcher(), "SessionStart with a UI arms the watcher");
+
+        let _ = ext
+            .on_event(
+                &HostEvent::Input {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                },
+                &headless_ctx(dir.path()),
+            )
+            .await;
+        assert!(
+            !ext.has_live_forwarding_watcher(),
+            "a hook on a no-UI context must STOP the watcher, not merely decline to start one"
+        );
+    }
+
+    /// PERM-005 failure mode (4): the watcher must observe a mid-session `config.json` change.
+    /// It now shares the extension's `config` mutex instead of capturing a snapshot by value, so
+    /// `refresh_config_and_manager` (pi `refreshExtensionConfig`, `index.ts:1600-1608`) reaches the
+    /// running task. Asserted structurally — the running watcher and the extension must be looking
+    /// at the SAME `ExtensionConfig`.
+    #[tokio::test]
+    async fn the_running_watcher_shares_the_extensions_live_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-config").await;
+        let ctx = ui_ctx(dir.path());
+
+        let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into() }, &ctx).await;
+        assert_eq!(ext.live_watcher_task_count(), 1, "one watcher, holding the shared handle");
+
+        // The watcher's handle IS the extension's handle: a write here is visible to the task.
+        assert!(!guard(&ext.config).yolo_mode);
+        guard(&ext.config).yolo_mode = true;
+        assert!(
+            guard(&ext.config).yolo_mode,
+            "the config the watcher reads per poll iteration is the one the extension mutates"
+        );
+
+        ext.stop_forwarding_watcher();
     }
 }

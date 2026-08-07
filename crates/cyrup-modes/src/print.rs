@@ -12,7 +12,7 @@
 use std::io::Write;
 
 use cyrup_core::{Content, Message, StopReason};
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, UserInput};
+use cyrup_session_svc::{AgentSessionEvent, AgentSessionRuntime, UserInput};
 use futures::StreamExt;
 
 use crate::error::ModesError;
@@ -43,8 +43,20 @@ pub struct PrintOptions {
 ///
 /// The process exit code is derived separately by the caller from the same terminal stop reason
 /// (arch-11 §6.6), so this returns `()` on success.
+///
+/// ## Why this takes the RUNTIME, not a bare session (SEAM-006)
+/// Pi's entry point is `runPrintMode(runtimeHost: AgentSessionRuntime, options)`
+/// (print-mode.ts:32) — it has no bare-session host at all. Two things follow, both of which cyrup
+/// lost by binding print/json to a standalone `AgentSession`:
+/// 1. A loaded extension's `ctx.newSession()`/`ctx.fork()`/`ctx.switchSession()`/`ctx.reload()`
+///    needs a runtime to act on. Without one, `AgentSession` answers
+///    `SessionServiceError::NoRuntimeHost` and the failure is only `tracing::warn!`-ed. This matters
+///    well beyond `cyrup -p`: the print/json arm is what a spawned subagent child re-execs into.
+/// 2. When a replacement DOES happen, the host must re-read the active session — Pi's
+///    `rebindSession` does exactly `session = runtimeHost.session` (print-mode.ts:72). That is why
+///    the send loop below re-acquires the session per message instead of hoisting it.
 pub async fn run_print<W, E>(
-    session: &AgentSession,
+    runtime: &AgentSessionRuntime,
     messages: impl IntoIterator<Item = UserInput>,
     out: &mut W,
     err: &mut E,
@@ -54,10 +66,24 @@ where
     W: Write,
     E: Write,
 {
+    // Pi's `await rebindSession()` at print-mode.ts:119 — the FIRST statement of the mode's `try`
+    // block and strictly ahead of the send loop at :121. `rebindSession` ends in
+    // `session.bindExtensions(...)` (:73), whose tail emits `_sessionStartEvent`
+    // (agent-session.ts:2250). SEAM-033: the announcement belongs HERE and not in the runtime
+    // constructor, because `main.ts` applies `--name` (:650) and `--models` (:742-750) between
+    // building the session and running the mode; announcing at construction time would show every
+    // `session_start` handler an unconfigured session. Idempotent per session
+    // (`AgentSession::emit_session_start` latches on `start_announced`), so a host that already
+    // announced via `AgentSessionRuntime::create` is unaffected.
+    runtime.session().await.bind_extensions().await;
+
     // Send loop (Pi print-mode.ts:121-127): prompt each message to completion, in order, producing
     // no assistant output. Each run stream terminates at `agent_end`; `wait_for_idle` then confirms
     // the agent is settled before the next prompt is submitted.
     for input in messages {
+        // Pi's `rebindSession` (print-mode.ts:71-72) — re-read the runtime's active session, so a
+        // message submitted after an extension replaced it addresses the NEW session.
+        let session = runtime.session().await;
         let mut stream = session.prompt(input).await?;
         while let Some(ev) = stream.next().await {
             if opts.show_tools
@@ -70,8 +96,10 @@ where
     }
 
     // Terminal output block (Pi print-mode.ts:129-146): read the FINAL transcript message once,
-    // outside the loop. Only an assistant final message produces output.
-    let transcript = session.messages().await;
+    // outside the loop — from the session that is active NOW (Pi's `const state = session.state`
+    // reads the rebound `session`, print-mode.ts:130). Only an assistant final message produces
+    // output.
+    let transcript = runtime.session().await.messages().await;
     if let Some(Message::Assistant(assistant)) = transcript.last() {
         match assistant.stop_reason {
             // A failed/aborted turn: the error goes to stderr and the assistant stdout is suppressed

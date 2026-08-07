@@ -482,6 +482,8 @@ fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
 /// all-other-fields-`None` [`SingleStepSpec`] for `agent`/`task`.
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: agent.to_string(),
         task: task.to_string(),
         cwd: None,
@@ -530,6 +532,13 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -553,6 +562,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -732,6 +743,13 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         steps: vec![
@@ -758,6 +776,8 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     dynamic_fanout_max_items: None,
     // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
     model_scope: None,
+    control: None,
+    include_progress: None,
 };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &runner_config)
@@ -877,5 +897,118 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     assert!(
         !result_file.success,
         "a paused run is not a success: {result_file:?}"
+    );
+}
+
+// =================================================================================================
+// PERM-001: the hop-1 detached spawn carries the R-SA-P1 parent-session anchor
+// =================================================================================================
+
+/// End-to-end proof of the PERM-001 repair, probed at the OS level rather than through this
+/// crate's own bookkeeping: with a published parent-session anchor (what
+/// `cyrup-permission-system`'s PARENT-role `SessionStart` installs — pi's
+/// `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`,
+/// `pi-subagents/src/extension/index.ts:599` @v0.34.0), the REAL detached `__subagent-runner` process
+/// spawned by the production entry point [`spawn_detached_runner`] has
+/// `CYRUP_SUBAGENT_PARENT_SESSION` in its own environment — read straight out of
+/// `/proc/<pid>/environ`, i.e. the kernel's copy, not ours.
+///
+/// This is the whole background half of permission ask-forwarding. Against the pre-fix code the
+/// assertion below cannot pass: `spawn_detached_runner` applied no env overlay at all, so the
+/// runner had no anchor, so `exec::build_attempt_spawn_plan`'s "explicit → inherited env → empty"
+/// ladder resolved EMPTY for every child the runner went on to spawn, so a background subagent
+/// that hit an `ask` addressed a null forwarding target and was fail-closed denied with no prompt
+/// ever reaching the operator.
+///
+/// Linux-only because `/proc/<pid>/environ` is the probe; the platform-independent halves of the
+/// same contract are pinned by `background::spawn_detached`'s own unit tests.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_runner_process_inherits_the_published_parent_session_anchor() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // Sleep long enough that `/proc/<pid>/environ` is still readable when this test probes it.
+    let script = serde_json::json!({
+        "steps": [{"kind": "sleep_ms", "ms": 3000}],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var(FIXTURE_SCRIPT_ENV_VAR, &script_path);
+    }
+
+    let cfg_path = dir.path().join("runner-config.json");
+    std::fs::write(&cfg_path, "{}").expect("write placeholder config");
+    let stdout_log = dir.path().join("runner.stdout.log");
+    let stderr_log = dir.path().join("runner.stderr.log");
+
+    // The register is process-global; it is mutated only here, under the same lock that guards
+    // this file's env mutations, and cleared before the lock is released.
+    cyrup_ext_subagents::publish_parent_session_anchor("session-perm001-e2e");
+    let spawn_result = spawn_detached_runner(&cfg_path, &stdout_log, &stderr_log);
+    cyrup_ext_subagents::clear_parent_session_anchor();
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var(FIXTURE_SCRIPT_ENV_VAR);
+    }
+
+    let pid = spawn_result.expect("detached spawn succeeds");
+
+    // Wait for the child to have actually `execve`'d before reading the kernel's copy of its
+    // environment — otherwise this probe measures the PARENT's environ, not the child's, and this
+    // test is a load-dependent flake.
+    //
+    // Mechanism (reproduced directly, 84/200 trials under `nproc` busy-loops): glibc's
+    // `posix_spawn` — which `std::process::Command` uses on Linux for a plain spawn — implements
+    // the fork half as `clone(CLONE_VM | CLONE_VFORK)`, so between `spawn()` returning and the
+    // child reaching `execve` the child SHARES the parent's address space and `/proc/<pid>/environ`
+    // reports the parent's LIVE environment. This test removes `CYRUP_SUBAGENT_BINARY` /
+    // `CYRUP_SUBAGENT_FIXTURE_SCRIPT` from its own environment a few lines above, so a pre-exec
+    // read yields the parent env MINUS those vars and MINUS the overlay — which is exactly the
+    // observed failure (`got: [...]` with no `CYRUP_*` entry at all). Under an idle box the child
+    // execs first and the race never shows.
+    //
+    // `/proc/<pid>/exe` is the discriminator: pre-exec it resolves to the PARENT's binary, post-exec
+    // to the spawned one. Polling it (rather than sleeping a fixed amount, or relaxing the
+    // assertion) is what makes the probe measure the thing the test claims to measure. The
+    // production overlay itself is unchanged and correct — `.envs(env_overlay)` is handed to
+    // `execve`, which is precisely why the value only becomes observable after that `execve`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut entries: Vec<String> = Vec::new();
+    loop {
+        let exec_done = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|target| target != std::env::current_exe().unwrap_or_default())
+            .unwrap_or(false);
+        if exec_done {
+            let environ =
+                std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
+            entries = environ
+                .split(|b| *b == 0)
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached runner never reached execve within 5s; /proc/{pid}/exe still resolves to \
+             this test binary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    kill_pid_for_cleanup(pid);
+
+    assert!(
+        entries.iter().any(|e| e == "CYRUP_SUBAGENT_PARENT_SESSION=session-perm001-e2e"),
+        "the detached runner's own environment must carry the published R-SA-P1 anchor so every \
+         child it spawns can address the root's ask-forwarding inbox; got: {entries:?}"
     );
 }

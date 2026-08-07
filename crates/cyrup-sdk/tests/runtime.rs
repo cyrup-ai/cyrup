@@ -116,12 +116,11 @@ async fn sdk_run_print_over_the_active_session() {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(vec![faux_text("hello from print")], cyrup_sdk::core::StopReason::Stop)]);
     let runtime = build_runtime(&fx, faux).await;
-    let session = runtime.session().await;
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     run_print(
-        &session,
+        &runtime,
         std::iter::once(cyrup_sdk::UserInput::text("hi", cyrup_sdk::InputSource::Cli)),
         &mut out,
         &mut err,

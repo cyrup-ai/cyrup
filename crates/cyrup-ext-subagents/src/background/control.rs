@@ -411,8 +411,16 @@ pub async fn interrupt(
 /// regardless of whether the signal itself was delivered (R-SA-081's explicit "opportunistically…
 /// best-effort").
 async fn deliver_wakeup_signal(paths: &RunPaths, pid: Option<u32>) -> Result<(), SubagentError> {
+    deliver_wakeup_signal_to(&paths.control_inbox, pid).await;
+    Ok(())
+}
+
+/// [`deliver_wakeup_signal`] addressed by the request-file path rather than a whole [`RunPaths`],
+/// so the nested-descendant cascade (which only ever holds a descendant's directory) sends the
+/// identical best-effort signal with the identical ESRCH-removes-the-stale-request semantics.
+async fn deliver_wakeup_signal_to(control_inbox: &Path, pid: Option<u32>) {
     let Some(pid) = pid else {
-        return Ok(());
+        return;
     };
 
     #[cfg(unix)]
@@ -426,7 +434,7 @@ async fn deliver_wakeup_signal(paths: &RunPaths, pid: Option<u32>) -> Result<(),
                 // itself racing a concurrent removal (e.g. a second interrupt call, or the runner
                 // itself finishing an in-flight consumption) is swallowed: "already gone" is a
                 // success outcome for a removal, not a failure to propagate.
-                let _ = tokio::fs::remove_file(&paths.control_inbox).await;
+                let _ = tokio::fs::remove_file(control_inbox).await;
             }
             Err(_other) => {
                 // EPERM-class or any other ambiguous failure: swallowed per R-SA-081's
@@ -440,11 +448,188 @@ async fn deliver_wakeup_signal(paths: &RunPaths, pid: Option<u32>) -> Result<(),
         // "signal unsupported" case R-SA-081 explicitly distinguishes from "process gone" — the
         // request file is deliberately left in place (the runner's poll-fallback watch, R-SA-082,
         // still picks it up within its fixed interval even with no signal wake-up).
-        let _ = paths;
+        let _ = control_inbox;
         let _ = pid;
     }
+}
 
-    Ok(())
+// =================================================================================================
+// TimeoutRequest — the second control-inbox verb (pi `control-channel.ts` @v0.34.0)
+// =================================================================================================
+
+/// The on-disk `control/timeout.json` request record — pi's `TimeoutRequest`
+/// (`src/runs/background/control-channel.ts:41` @v0.34.0): `{ type: "timeout", ts, source,
+/// reason }`, the exact sibling shape of [`InterruptRequest`], sitting in the exact same control
+/// inbox directory under a different file name.
+///
+/// # Why a second verb rather than reusing `interrupt`
+///
+/// The two verbs are NOT interchangeable and the difference is observable in the run's terminal
+/// record. An interrupt is a soft, *resumable* pause: the run ends `Paused`, every unfinished
+/// step is marked `Paused`, and `resume` can pick it back up. A timeout is *terminal failure*:
+/// the run ends `Failed` with `timedOut`, every unfinished step is marked `Failed` with the
+/// timeout message, and there is nothing to resume. Upstream keeps them as two files precisely so
+/// an ancestor whose OWN deadline expired can fail its whole subtree rather than leave a forest of
+/// descendants sitting in a resumable-but-never-resumed `Paused` state (see
+/// `background::cascade`, which is this verb's production writer).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeoutRequest {
+    /// Always `"timeout"` — the discriminant, kept as a plain string field for the same
+    /// byte-for-byte on-disk-shape reason [`InterruptRequest::kind`] is.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Wall-clock creation time (epoch milliseconds).
+    pub ts: i64,
+    /// Who/what imposed the timeout — `"ancestor-timeout"` for the cascade path, matching pi's
+    /// own literal (`subagent-runner.ts:1585` @v0.34.0).
+    pub source: String,
+    /// Optional human-readable reason, surfaced in the timed-out run's error text.
+    pub reason: Option<String>,
+}
+
+impl TimeoutRequest {
+    /// Constructs a fresh timeout request stamped with the current wall-clock time.
+    #[must_use]
+    pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
+        Self {
+            kind: "timeout".to_string(),
+            ts: now_epoch_millis(),
+            source: source.into(),
+            reason,
+        }
+    }
+}
+
+/// `<run_dir>/control/` — the control inbox directory (pi `controlInboxDir`).
+#[must_use]
+pub fn control_inbox_dir(run_dir: &Path) -> PathBuf {
+    run_dir.join("control")
+}
+
+/// `<run_dir>/control/interrupt.json` (pi `interruptRequestPath`). Identical to
+/// [`RunPaths::control_inbox`] but derived from a bare run directory, which is what the
+/// nested-descendant cascade has to work with: a descendant's async dir is discovered from the
+/// nested-run registry, never resolved through this run's own `async_root`/`results_dir` pair.
+#[must_use]
+pub fn interrupt_request_path(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("interrupt.json")
+}
+
+/// `<run_dir>/control/timeout.json` (pi `timeoutRequestPath`).
+#[must_use]
+pub fn timeout_request_path(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("timeout.json")
+}
+
+/// Parent side, addressed by run DIRECTORY: atomically write an [`InterruptRequest`] into
+/// `run_dir`'s control inbox and send the same best-effort `SIGUSR2` wake-up [`interrupt`] does
+/// (pi `deliverInterruptRequest`, `control-channel.ts` @v0.34.0).
+///
+/// This is the lower-level sibling of [`interrupt`]: no reconciliation gate, no
+/// already-pending check, no `run_id` token resolution — the caller has already established that
+/// the target is a live descendant and holds its directory directly. [`interrupt`] remains the
+/// entry point for every *externally* addressed run.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the control directory cannot be created or the request
+/// cannot be written.
+pub async fn deliver_interrupt_request(
+    run_dir: &Path,
+    pid: Option<u32>,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<PathBuf, SubagentError> {
+    let path = interrupt_request_path(run_dir);
+    write_control_request(&path, &InterruptRequest::new(source, reason)).await?;
+    deliver_wakeup_signal_to(&path, pid).await;
+    Ok(path)
+}
+
+/// Parent side, addressed by run DIRECTORY: atomically write a [`TimeoutRequest`] into `run_dir`'s
+/// control inbox (pi `deliverTimeoutRequest`, `control-channel.ts:536-545` @v0.34.0).
+///
+/// Note the deliberate asymmetry with [`deliver_interrupt_request`], faithful to upstream:
+/// `deliverTimeoutRequest` sends NO wake-up signal. `SIGUSR2` is the interrupt fast-path only; a
+/// timeout is picked up on the target's next control-inbox watch/poll tick
+/// ([`CONTROL_INBOX_POLL_INTERVAL`]), because a timeout is by construction not latency-critical —
+/// the deadline it enforces has already passed.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the control directory cannot be created or the request
+/// cannot be written.
+pub async fn deliver_timeout_request(
+    run_dir: &Path,
+    source: impl Into<String>,
+    reason: Option<String>,
+) -> Result<PathBuf, SubagentError> {
+    let path = timeout_request_path(run_dir);
+    write_control_request(&path, &TimeoutRequest::new(source, reason)).await?;
+    Ok(path)
+}
+
+/// Shared "mkdir -p the control dir, then atomically write the request" step both dir-addressed
+/// deliver functions perform.
+async fn write_control_request<T: serde::Serialize + Sync>(
+    path: &Path,
+    request: &T,
+) -> Result<(), SubagentError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(SubagentError::Spawn)?;
+    }
+    write_atomic_json(path, request)
+        .await
+        .map_err(SubagentError::Spawn)
+}
+
+/// Non-consuming read of a pending [`TimeoutRequest`] — [`check_control_inbox_now`]'s sibling,
+/// with the identical "the file's existence IS the state, reading never deletes" contract.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] if the file exists but cannot be read or parsed.
+pub async fn check_timeout_inbox_now(
+    paths: &RunPaths,
+) -> Result<Option<TimeoutRequest>, SubagentError> {
+    read_control_request(&timeout_request_path(&paths.run_dir)).await
+}
+
+/// Idempotent, at-most-once consumption of a pending [`TimeoutRequest`] — pi
+/// `consumeTimeoutRequest` (`control-channel.ts:209` @v0.34.0), and the exact
+/// read-then-unconditionally-delete discipline [`consume_interrupt_request`] documents at length.
+/// A missing file is `Ok(None)`, never an error; losing the delete race against a concurrent
+/// consumer still returns the contents this caller observed.
+///
+/// # Errors
+///
+/// Returns [`SubagentError::Spawn`] for a genuine I/O failure other than "file does not exist".
+pub async fn consume_timeout_request(
+    paths: &RunPaths,
+) -> Result<Option<TimeoutRequest>, SubagentError> {
+    let path = timeout_request_path(&paths.run_dir);
+    let request = match read_control_request::<TimeoutRequest>(&path).await? {
+        Some(request) => request,
+        None => return Ok(None),
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) | Err(_) => Ok(Some(request)),
+    }
+}
+
+async fn read_control_request<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, SubagentError> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| SubagentError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SubagentError::Spawn(e)),
+    }
 }
 
 // =================================================================================================
@@ -1535,6 +1720,8 @@ mod tests {
 
     fn single_step(agent: &str, output: Option<&str>) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: format!("do {agent}"),
             cwd: None,
@@ -2275,8 +2462,11 @@ mod tests {
             interrupted: false,
             timed_out: false,
             error: error.map(str::to_string),
+            saved_output_path: None,
             tool_calls: Vec::new(),
             output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
         }
     }
 

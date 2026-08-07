@@ -60,7 +60,11 @@ unicode-normalization = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-# Dispatch integration tests build a real AgentSession over a scripted faux provider in a tempdir.
+# Dispatch integration tests build a real AgentSessionRuntime over a scripted faux provider in a
+# tempdir. `cyrup-ext` is TEST-only here: SEAM-001/002 are asserted from an EXTENSION's point of
+# view (the `session_start`/`session_shutdown` consumer Pi's `bindExtensions` serves), which needs
+# the `NativeExtension` trait.
+cyrup-ext = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 # `tests/catalog_refresh_modes.rs` proves the DRIFT-007 mode gate against a raw loopback listener

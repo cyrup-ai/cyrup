@@ -100,27 +100,55 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
     }
 }
 
-/// The most recent non-aborted/non-error assistant message carrying usage (Pi
-/// `getLastAssistantUsageInfo`, estimate.ts:63-72).
-fn last_assistant_usage_info(messages: &[Message]) -> Option<(&Usage, usize)> {
-    for (i, message) in messages.iter().enumerate().rev() {
-        if let Message::Assistant(assistant) = message {
-            use cyrup_core::StopReason;
-            if matches!(
-                assistant.stop_reason,
-                StopReason::Aborted | StopReason::Error
-            ) {
-                continue;
-            }
-            if calculate_context_tokens(&assistant.usage) > 0 {
-                return Some((&assistant.usage, i));
-            }
-        }
+/// `Message.timestamp` for any arm (Pi's `Message` union has `timestamp` on every member,
+/// types.ts:379/402 and `AssistantMessage`).
+fn message_timestamp(message: &Message) -> i64 {
+    match message {
+        Message::User { timestamp, .. } | Message::ToolResult { timestamp, .. } => *timestamp,
+        Message::Assistant(assistant) => assistant.timestamp,
     }
-    None
 }
 
-/// Estimate over a raw message list (Pi `estimateMessages`, estimate.ts:74-88).
+/// The most recent *applicable* non-aborted/non-error assistant message carrying usage (Pi
+/// `getLastAssistantUsageInfo`, estimate.ts:63-87).
+///
+/// Scans FORWARD (not in reverse) because Pi's `latestPrefixTimestamp` guard is order-dependent: an
+/// assistant response only describes the current prefix when its own timestamp is `>=` the newest
+/// timestamp seen among the messages *before* it. A newer prefix message inserted ahead of an older
+/// response — most commonly a compaction summary, which is written with `Date.now()` but spliced in
+/// at the head of the message list — invalidates that response's usage, so it must be skipped rather
+/// than reported as the live figure.
+fn last_assistant_usage_info(messages: &[Message]) -> Option<(&Usage, usize)> {
+    use cyrup_core::StopReason;
+
+    // Pi `let latestPrefixTimestamp = Number.NEGATIVE_INFINITY` (estimate.ts:64).
+    let mut latest_prefix_timestamp = i64::MIN;
+    let mut usage_info: Option<(&Usage, usize)> = None;
+
+    for (i, message) in messages.iter().enumerate() {
+        if let Message::Assistant(assistant) = message {
+            // A newer prefix message was inserted after this response (for example, a
+            // compaction summary), so its usage cannot describe the current prefix.
+            let usage_applies_to_prefix = assistant.timestamp >= latest_prefix_timestamp;
+            if usage_applies_to_prefix
+                && !matches!(
+                    assistant.stop_reason,
+                    StopReason::Aborted | StopReason::Error
+                )
+                && calculate_context_tokens(&assistant.usage) > 0
+            {
+                usage_info = Some((&assistant.usage, i));
+            }
+        }
+        // Pi `latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp)`
+        // (estimate.ts:83) — runs for EVERY message, including the assistant just examined.
+        latest_prefix_timestamp = latest_prefix_timestamp.max(message_timestamp(message));
+    }
+
+    usage_info
+}
+
+/// Estimate over a raw message list (Pi `estimateMessages`, estimate.ts:89-103).
 fn estimate_messages(messages: &[Message]) -> ContextUsageEstimate {
     if let Some((usage, index)) = last_assistant_usage_info(messages) {
         let usage_tokens = calculate_context_tokens(usage);

@@ -113,8 +113,12 @@ const PI_EDIT_GUIDELINES: &[&str] = &[
     "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 ];
 
-// bash.ts:327-331. `promptGuidelines` is `undefined` unless `exposeSessionEnvironment` is set — a
-// flag cyrup does not port (gap 04, TOOL-008) — so the guideline set is empty here.
+// bash.ts:327-331. `promptGuidelines` is present whenever `exposeSessionEnvironment` is on, and
+// bash.ts:322 defaults that flag to TRUE (`options?.exposeSessionEnvironment ?? true`) — so the
+// DEFAULT `BashOpts` must carry the guideline. Renamed `PI_*` -> `CYRUP_*` because that is the
+// family cyrup's `resolveSpawnContext` port actually publishes (TOOL-008).
+const PI_BASH_GUIDELINES: &[&str] =
+    &["Inspect CYRUP_* environment variables for current model and session details."];
 const PI_BASH_DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.";
 const PI_BASH_SNIPPET: &str = "Execute bash commands (ls, grep, find, etc.)";
 
@@ -184,7 +188,7 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
         "bash",
         PI_BASH_DESCRIPTION,
         PI_BASH_SNIPPET,
-        &[],
+        PI_BASH_GUIDELINES,
     );
     assert_meta(
         Arc::new(GrepTool::new(fs(), cwd(), GrepOpts::default())),

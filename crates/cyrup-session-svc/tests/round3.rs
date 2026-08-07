@@ -571,3 +571,44 @@ async fn clone_at_creates_new_file_and_runtime_surfaces_fallback() {
         .unwrap();
     assert!(runtime.model_fallback_message().await.is_none(), "clean model resolve = no fallback");
 }
+
+/// The bash tool the MODEL calls must get the same PATH as the user-facing `/bash` seam.
+///
+/// pi's `getShellEnv()` (`utils/shell.ts:122-134`) unconditionally prepends `getBinDir()` for every
+/// bash child (`tools/bash.ts:100,165`) — there is no pi path where the bash tool spawns without it.
+/// cyrup set `bin_dir` only on `execute_bash` (asserted by
+/// `execute_bash_prepends_agent_bin_dir_to_path` above), so the agent-loop tool inherited the parent
+/// PATH unchanged and a binary managed into `<agent_dir>/bin` was `command not found` for the model
+/// while the identical command succeeded through `/bash`.
+///
+/// Deliberately end-to-end through a real tool call rather than inspecting `BashOpts`: the defect
+/// was that two seams DISAGREED, so the test has to exercise the seam that was wrong.
+#[tokio::test]
+async fn the_agent_loop_bash_tool_also_prepends_the_agent_bin_dir_to_path() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(
+            vec![faux_tool_call(
+                "bash",
+                serde_json::json!({ "command": r#"printf '%s' "$PATH""# }),
+            )],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+
+    let _ = session.prompt("print the path").await.expect("prompt");
+    session.wait_for_idle().await;
+
+    let bin_dir = fx.agent_dir.join("bin").to_string_lossy().into_owned();
+    let saw_bin_dir = session.messages().await.iter().any(|m| {
+        format!("{m:?}").contains(&bin_dir)
+    });
+    assert!(
+        saw_bin_dir,
+        "the agent-loop bash tool's PATH must contain the managed bin dir {bin_dir:?}"
+    );
+}

@@ -49,6 +49,14 @@ use crate::tools::{DynamicToolState, ToolInfo};
 /// indefinitely. The op is bounded and its expiry reported rather than hanging the drain.
 const WAIT_IDLE_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Upper bound on the `await this.waitForIdle()` tail of [`AgentSession::abort_and_settle`]
+/// (SEAM-024). Pi's `abort()` awaits unboundedly (agent-session.ts:1545), but its callers are a
+/// browser-style event loop; here the same await sits on `dispose`, i.e. on every `quit`, every
+/// session replacement and the RPC `abort` verb, so a tool wedged in an uninterruptible syscall
+/// would otherwise make the process unkillable-by-Ctrl-C. On expiry the caller continues exactly as
+/// the pre-SEAM-024 fire-and-forget `abort()` did — never worse than the old behaviour.
+const ABORT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The op's Pi-facing name, for the SEAM-003 failure diagnostic.
 fn control_op_name(op: &ControlOp) -> &'static str {
     match op {
@@ -57,7 +65,7 @@ fn control_op_name(op: &ControlOp) -> &'static str {
         ControlOp::Fork { .. } => "fork",
         ControlOp::Navigate { .. } => "navigate_tree",
         ControlOp::Reload => "reload",
-        ControlOp::Compact => "compact",
+        ControlOp::Compact { .. } => "compact",
         ControlOp::WaitIdle => "wait_idle",
         ControlOp::SendMessage { .. } => "send_message",
         ControlOp::SendUserMessage { .. } => "send_user_message",
@@ -274,6 +282,15 @@ pub(crate) struct SessionExtras {
     pub dynamic_tools: Arc<Mutex<DynamicToolState>>,
     /// The shared self-handle the builder also handed to the persist+fan-out subscriber.
     pub handle: Arc<SessionHandle>,
+    /// The live session metadata the `bash` tool publishes to every child as `CYRUP_*`
+    /// (Pi `resolveSpawnContext`, bash.ts:171-181). Shared with the `bash` tool the builder
+    /// registered; [`AgentSession`] mutates it whenever the model or the thinking level changes, so
+    /// the NEXT command sees the new values without a rebuild
+    /// (Pi docs/environment-variables.md:27).
+    pub bash_session_env: cyrup_tools::config::SessionEnvHandle,
+    /// `read`'s view of whether the ACTIVE model accepts image input, re-pushed on every `/model`
+    /// switch so the tool's non-vision warning tracks the live model rather than the startup one.
+    pub read_model_vision: cyrup_tools::config::ModelVisionHandle,
 }
 
 /// A settable, weak self-reference so the persist+fan-out subscriber (which the agent owns) and the
@@ -308,6 +325,16 @@ pub struct AgentSession {
     model: Mutex<ModelRef>,
     /// The resolved summarization/compaction model (kept in lockstep with `model`).
     compaction_model: Mutex<cyrup_provider::Model>,
+    /// The LIVE base system prompt — the value a run falls back to when no `before_agent_start`
+    /// handler replaced it (Pi `private _baseSystemPrompt`, agent-session.ts:371).
+    ///
+    /// Seeded from the builder-assembled `services.system_prompt`, but MUTABLE thereafter: a
+    /// tool-set rebuild rewrites it ([`Self::push_active_tools`]), exactly as Pi reassigns
+    /// `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)` inside
+    /// `setActiveToolsByName` (agent-session.ts:939). `services.system_prompt` is owned by value on
+    /// an all-`&self` type and so is frozen at build time; reading the reset path from it made every
+    /// run with a `before_agent_start` subscriber revert the prompt to the startup tool set.
+    base_system_prompt: Mutex<String>,
     compaction_settings: CompactionSettings,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
@@ -379,6 +406,16 @@ pub struct AgentSession {
     bash_cancel: Mutex<Option<CancelToken>>,
     /// Bash messages deferred while a run streams, flushed after the turn (Pi `_pendingBashMessages`).
     pending_bash: Mutex<Vec<AgentMessage>>,
+    /// The live session metadata the `bash` TOOL publishes to every child as `CYRUP_*` (Pi
+    /// `resolveSpawnContext`, bash.ts:171-181). The same handle the builder gave the registered
+    /// `BashTool`; Pi reads these off a per-call `ExtensionContext`, so they track the session
+    /// automatically. cyrup's `Tool::execute` takes no context, so the values are PUSHED here
+    /// whenever the model or the thinking level changes — which is what makes "the values are
+    /// resolved when each command starts. Switching models or changing the reasoning level
+    /// therefore affects the next bash command" (docs/environment-variables.md:27) true of cyrup
+    /// too, rather than only of the tool in isolation.
+    bash_session_env: cyrup_tools::config::SessionEnvHandle,
+    read_model_vision: cyrup_tools::config::ModelVisionHandle,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
     /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
@@ -432,6 +469,7 @@ impl AgentSession {
         extras: SessionExtras,
     ) -> Self {
         let compaction_model = services.model.clone();
+        let base_system_prompt = services.system_prompt.clone();
         // Seed the queue-mode mirrors from the resolved settings (the builder wired the same modes
         // into the agent), so the getters report the live mode without an agent-side getter.
         let eff = services.settings.effective();
@@ -448,6 +486,7 @@ impl AgentSession {
             services,
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
+            base_system_prompt: Mutex::new(base_system_prompt),
             compaction_settings: extras.compaction_settings,
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
@@ -480,6 +519,8 @@ impl AgentSession {
             shell_command_prefix: extras.shell_command_prefix,
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
+            bash_session_env: extras.bash_session_env,
+            read_model_vision: extras.read_model_vision,
             dynamic_tools: extras.dynamic_tools,
             handle: extras.handle,
             last_assistant: Mutex::new(None),
@@ -503,8 +544,15 @@ impl AgentSession {
     /// `shutdownHandler` setting `shutdownRequested = true`, rpc-mode.ts:344-346). A host checks
     /// this at its settle point — see `AgentSessionEvent::AgentSettled` (SEAM-005), which is where
     /// Pi checks it (rpc-mode.ts:355-358).
+    /// ORs two latches on purpose. The backend's is set SYNCHRONOUSLY inside
+    /// `HostServices::control(ControlOp::Shutdown)` (Pi's `shutdownHandler`, rpc-mode.ts:344-346);
+    /// this session's own is set by the turn-boundary control drain. Reading only the latter made
+    /// the answer depend on whether a turn boundary happened to follow the request — a shutdown
+    /// asked for from a background task on an idle session, or in the window after the in-flight
+    /// run's drain had already run, stayed queued forever and the host never exited.
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+            || self.services.host_services.shutdown_requested()
     }
 
     /// Wrap a freshly-built session in its owning `Arc` and bind the self-handle so the persist+fan-out
@@ -1068,7 +1116,11 @@ impl AgentSession {
         // agent-session.ts:1099-1103); they are injected AFTER the user message in the run input.
         let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_next_turn));
 
-        let base = &self.services.system_prompt;
+        // The LIVE base (Pi reads the mutable field: `this._baseSystemPrompt`, agent-session.ts:1228
+        // into `emitBeforeAgentStart`, :1252 for the reset) — NOT the frozen builder-assembled
+        // `services.system_prompt`, which predates every `set_active_tools_by_name` /
+        // `refresh_extension_tools` rebuild this session performed.
+        let base = self.base_system_prompt();
         // Fast path: no extension listens for `before_agent_start` — keep the assembled base prompt.
         if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
         {
@@ -1108,7 +1160,7 @@ impl AgentSession {
             && let HostEvent::BeforeAgentStart { system_prompt, injected, .. } = *ev
         {
             // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base otherwise.
-            if &system_prompt == base {
+            if system_prompt == base {
                 self.agent.set_system_prompt(base.clone()).await;
             } else {
                 self.agent.set_system_prompt(system_prompt).await;
@@ -1239,8 +1291,41 @@ impl AgentSession {
     }
 
     /// Interrupt the active run (idempotent, R-11-018 / func-02 R-02-045).
+    ///
+    /// SEAM-023 — the retry backoff is cancelled FIRST, exactly as Pi's `abort()` does
+    /// (`abortRetry(); this.agent.abort(); await this.waitForIdle();`, agent-session.ts:1542-1546).
+    /// `agent.abort()` cancels the PER-RUN token; the auto-retry backoff sleeps on a *separate*
+    /// child of `session_cancel` ([`Self::prepare_retry`]), so without this an Escape / SIGINT /
+    /// RPC `abort` landing during provider-retry backoff left the backoff running and the retry
+    /// fired later against a session the user had already aborted.
+    ///
+    /// This is the SYNCHRONOUS half (what a signal handler and `ctx.abort()` need). Callers that
+    /// must observe the run actually settle — teardown, compaction, the RPC `abort` verb — use
+    /// [`Self::abort_and_settle`], which adds Pi's `await this.waitForIdle()` tail.
     pub fn abort(&self) {
+        self.abort_retry();
         self.agent.abort();
+    }
+
+    /// Interrupt the active run **and await its settlement** — the full Pi `abort()`
+    /// (agent-session.ts:1542-1546: `this.abortRetry(); this.agent.abort(); await
+    /// this.waitForIdle();`), in that exact order.
+    ///
+    /// SEAM-024. The order is load-bearing and the reason this is not simply
+    /// `wait_for_idle().await` after a plain abort: the retry backoff sleeps on a child of
+    /// `session_cancel` that `agent.abort()` does not touch, so awaiting idle BEFORE cancelling it
+    /// would block for the whole remaining backoff (up to `retry.baseDelayMs * 2^attempt`).
+    ///
+    /// Pi's `teardownCurrent` states why teardown must await: "Settle any active response first so
+    /// the aborted turn (including tool results) is persisted to the outgoing session before it is
+    /// replaced" (agent-session-runtime.ts:167-169), and its RPC `abort` verb likewise replies only
+    /// after `await session.abort()` (rpc-mode.ts:427-430).
+    ///
+    /// Unlike Pi the wait is BOUNDED ([`ABORT_SETTLE_TIMEOUT`]): a wedged tool must not make `quit`
+    /// hang forever. On expiry the caller proceeds exactly as the old fire-and-forget `abort()` did.
+    pub async fn abort_and_settle(&self) {
+        self.abort();
+        let _ = tokio::time::timeout(ABORT_SETTLE_TIMEOUT, self.wait_for_idle()).await;
     }
 
     // ------------------------------------------------------------------- compaction ----
@@ -1260,8 +1345,12 @@ impl AgentSession {
         custom_instructions: Option<String>,
     ) -> Result<crate::state::CompactionResult, SessionServiceError> {
         let reason = CompactionReason::Manual;
-        // Disconnect/abort dance: stop the active run before compacting (agent-session.ts:1648-1649).
-        self.abort();
+        // Disconnect/abort dance: stop the active run before compacting AND wait for it to settle
+        // — Pi is `this._disconnectFromAgent(); await this.abort();` (agent-session.ts:1784-1785),
+        // and its `abort()` ends in `await this.waitForIdle()`. SEAM-024: compaction installs its
+        // own cancel token and rewrites the branch immediately below, so starting that while the
+        // aborted turn was still writing tool results raced the transcript it is about to compact.
+        self.abort_and_settle().await;
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.compaction_cancel) = Some(cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
@@ -1369,13 +1458,47 @@ impl AgentSession {
             )
             .await;
         // Estimate the rebuilt context size for the result payload (Pi `estimateMessagesTokens`).
-        let estimated_tokens_after: u64 = guard
-            .build_context()
-            .messages
-            .iter()
-            .map(cyrup_provider::estimate_message_tokens)
-            .sum();
+        let compacted_ctx = guard.build_context();
+        // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
+        // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
+        // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
+        // over `buildSessionContext().messages`, and that list is
+        // `buildContextEntries().flatMap(sessionEntryToContextMessages)` with every role intact
+        // (session-manager.ts:461-469 composed with :383-408). So a retained `compactionSummary`
+        // costs `summary.length/4` with NO wrapper prose, and an `excludeFromContext` (`!!`) bash
+        // execution still costs `(command.length + output.length)/4`.
+        //
+        // Measuring `compacted_ctx` instead billed the ~107-char COMPACTION_SUMMARY wrapper that
+        // `push_as_message` adds (cyrup-session/src/context.rs:16-18) — ~27 tokens, and a compacted
+        // context ALWAYS leads with one — while silently dropping every `excludeFromContext` bash
+        // entry, which `AgentMessage::push_llm` removes at the LLM boundary. It also disagreed with
+        // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
+        // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
+        let estimated_tokens_after: u64 = u64::from(
+            guard
+                .build_context_raw()
+                .iter()
+                .map(cyrup_session::compaction::tokens::estimate_agent_message)
+                .fold(0u32, u32::saturating_add),
+        );
         drop(guard);
+        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
+        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
+        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
+        //
+        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
+        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
+        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
+        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
+        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
+        // reducing context or switching to a larger-context model", blaming the model for a
+        // compaction that had never taken effect.
+        //
+        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
+        // the two compaction paths were the ones that built the context only to COUNT it.
+        let compacted_messages: Vec<AgentMessage> =
+            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
@@ -1695,10 +1818,17 @@ impl AgentSession {
             }
         }
 
-        // Phase 3 (guard re-held): summarize the abandoned branch (unless the extension supplied the
-        // summary) + apply the navigation, threading the (possibly overridden) instructions/label.
-        let mut guard = self.manager.lock().await;
-
+        // Phase 3 (STILL no guard): summarize the abandoned branch (unless the extension supplied
+        // the summary), threading the (possibly overridden) instructions.
+        //
+        // The manager mutex is deliberately NOT held across this leg. Branch summarization is a full
+        // provider round-trip plus its retry backoff — holding `self.manager` across it would stall
+        // every other session-manager consumer (the tree/DAG readers a TUI polls, an extension's
+        // `getEntries`, a concurrent `compact`) for the whole call. `AgentSession::compact` already
+        // scopes its guard for exactly this reason; this path used to take the guard first and hold
+        // it through the `.await`, which was invisible only because no front end could reach the
+        // summarize branch (SESS-023). Pi has no equivalent hazard: its session manager is not
+        // mutex-guarded.
         let mut from_extension_summary = false;
         // (text, details, usage) — `usage` is the summarization call's token spend, persisted on the
         // appended `branch_summary` entry (Pi `BranchSummaryEntry.usage`). An extension-supplied
@@ -1749,7 +1879,8 @@ impl AgentSession {
             }
         }
 
-        // Apply the navigation + summary/label (agent-session.ts:2845-2868).
+        // Phase 4 (guard re-held): apply the navigation + summary/label (agent-session.ts:2845-2868).
+        let mut guard = self.manager.lock().await;
         let summary_entry = match &summary_payload {
             Some((text, details, usage)) => {
                 let id = guard.branch_with_summary(
@@ -1883,7 +2014,18 @@ impl AgentSession {
             cyrup_core::StopReason::Aborted => {
                 Err(cyrup_session::compaction::CompactionError::Aborted)
             }
-            _ => {
+            // An unsettled response is NOT a summary — same guard as
+            // `cyrup_session::compaction::{summarize,branch}`.
+            cyrup_core::StopReason::Pending => {
+                Err(cyrup_session::compaction::CompactionError::Summarization(
+                    resp.error_message.unwrap_or_else(|| {
+                        cyrup_session::compaction::PENDING_SUMMARY.to_string()
+                    }),
+                ))
+            }
+            cyrup_core::StopReason::Stop
+            | cyrup_core::StopReason::Length
+            | cyrup_core::StopReason::ToolUse => {
                 let body = resp
                     .content
                     .iter()
@@ -1907,6 +2049,22 @@ impl AgentSession {
         }
     }
 
+    /// Republish `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` from the LIVE manager for the next `bash`
+    /// child.
+    ///
+    /// Pi never needs this: `resolveSpawnContext` calls `ctx.sessionManager.getSessionId()` /
+    /// `getSessionFile()` at spawn time (bash.ts:172-174), so a `createBranchedSession` that mutates
+    /// the manager in place is picked up automatically. cyrup's `Tool::execute` has no session
+    /// context, so the branching paths — `fork`, `clone_at`, `fork_at_entry` — push instead.
+    /// Without this a `bash` child run after `/fork` would report the PRE-fork session id and a
+    /// session file that is no longer the one being appended to.
+    fn republish_session_identity(&self, guard: &SessionManager) {
+        let mut info = self.bash_session_env.get();
+        info.session_id = Some(guard.session_id().to_string());
+        info.session_file = guard.session_file().map(Path::to_path_buf);
+        self.bash_session_env.set(info);
+    }
+
     /// Fork the current persisted session into a new file under the same cwd (R-04-020/021).
     pub async fn fork(&self) -> Result<SessionId, SessionServiceError> {
         // A fork clones the active path through the current leaf into a new file.
@@ -1921,6 +2079,7 @@ impl AgentSession {
             )
         })?;
         guard.create_branched_session(&leaf, &layout)?;
+        self.republish_session_identity(&guard);
         let id = guard.session_id().clone();
         Ok(id)
     }
@@ -1947,6 +2106,7 @@ impl AgentSession {
         };
         let layout = branch_layout(&guard);
         guard.create_branched_session(&leaf, &layout)?;
+        self.republish_session_identity(&guard);
         Ok(guard.session_id().clone())
     }
 
@@ -1968,6 +2128,7 @@ impl AgentSession {
             Some(leaf) => {
                 let layout = branch_layout(&guard);
                 guard.create_branched_session(&leaf, &layout)?;
+                self.republish_session_identity(&guard);
                 let id = guard.session_id().clone();
                 Ok(ForkOutcome { session_id: Some(id), selected_text })
             }
@@ -2160,10 +2321,21 @@ impl AgentSession {
     // ------------------------------------------------------------------- lifecycle ----
 
     /// Dispose the session (Pi `AgentSession.dispose` via runtime `dispose`,
-    /// agent-session-runtime.ts:390): abort any in-flight run, emit `session_shutdown`, and cancel
-    /// the long-lived session token so the extension subscriber unwinds.
+    /// agent-session-runtime.ts:390): abort any in-flight run **and wait for it to settle**, emit
+    /// `session_shutdown`, and cancel the long-lived session token so the extension subscriber
+    /// unwinds.
+    ///
+    /// SEAM-024 — the settle is not optional. Pi's `teardownCurrent` opens with
+    /// `await this.session.abort()` and the comment "Settle any active response first so the
+    /// aborted turn (including tool results) is persisted to the outgoing session before it is
+    /// replaced" (agent-session-runtime.ts:167-169), and only then emits `session_shutdown` and
+    /// disposes. cyrup collapses pi's `teardownCurrent` + `runtime.dispose` + `session.dispose`
+    /// into this one method, so the await belongs here: it is on EVERY teardown path (`run.rs`,
+    /// `main.rs`) and every replacement (`runtime.rs`). Previously the fire-and-forget `abort()`
+    /// let `session_shutdown` be announced — and `session_cancel` fired — while the aborted turn
+    /// was still writing its tool results.
     pub async fn dispose(&self, reason: &str) {
-        self.abort();
+        self.abort_and_settle().await;
         self.fanout_emit(AgentSessionEvent::SessionShutdown { reason: reason.to_string() }).await;
         // Notify extensions, then release the long-lived token.
         let cancel = self.session_cancel.child_token();
@@ -2173,6 +2345,76 @@ impl AgentSession {
             .dispatch_notify(&HostEvent::SessionShutdown { reason: reason.to_string() }, &cancel)
             .await;
         self.session_cancel.cancel();
+    }
+
+    /// Resolve a fork anchor against the **live** session manager (SEAM-009).
+    ///
+    /// Pi resolves the anchor BEFORE it splits on persistence: `getEntry(entryId)` +
+    /// `throw new Error("Invalid entry ID for forking")` at agent-session-runtime.ts:275-276 and
+    /// :282-283, i.e. strictly above the `isPersisted()` branch at :290. cyrup used to resolve it
+    /// against a throwaway manager reopened from the session FILE, which meant an unsaved session
+    /// had no validation at all (a bogus entry id "succeeded") and no anchor to branch at.
+    ///
+    /// Reading the live manager is also strictly more correct for the persisted case: a branched
+    /// session defers its first file write until an assistant message exists
+    /// (`create_branched_session`), so the on-disk copy can legitimately lag the in-memory entries.
+    pub(crate) async fn fork_anchor_live(
+        &self,
+        entry: &EntryId,
+        position: ForkPosition,
+    ) -> Result<(Option<EntryId>, Option<String>), SessionServiceError> {
+        let mgr = self.manager.lock().await;
+        fork_anchor(&mgr, entry, position)
+    }
+
+    /// Branch the **live, non-persisted** session manager at `target_leaf`, IN PLACE (SEAM-009).
+    ///
+    /// Pi's in-memory fork branch mutates the very object the outgoing session still holds:
+    /// `const sessionManager = this.session.sessionManager; …
+    /// sessionManager.createBranchedSession(targetLeafId); await this.teardownCurrent("fork", …)`
+    /// (agent-session-runtime.ts:333-341). Branching first and tearing down second is not
+    /// incidental: the outgoing run is still writing, and everything it appends while it settles
+    /// lands in the *already-branched* manager — which is the manager the fork is built from. That
+    /// is how Pi honours its own teardown contract, "the aborted turn (including tool results) is
+    /// persisted to the outgoing session before it is replaced" (:167-169), on the fork path.
+    ///
+    /// So this method deliberately does NOT hand the manager over; [`Self::take_manager`] does, and
+    /// the caller must settle the outgoing run in between. Merging the two (branch + move in one
+    /// step, as this used to) re-opens the data loss from the other side: every append made between
+    /// the move and the teardown goes to the throwaway placeholder and is dropped with it.
+    ///
+    /// Before any of this, the in-memory arm built a `SessionTarget::New` session and the whole
+    /// transcript was silently discarded — unrecoverable, since a non-persisted session has no file
+    /// to recover it from.
+    pub(crate) async fn branch_live_manager(
+        &self,
+        target_leaf: &EntryId,
+    ) -> Result<(), SessionServiceError> {
+        let mut guard = self.manager.lock().await;
+        // `create_branched_session` returns early for a non-persisted manager (adopting the branch
+        // in memory and returning `None`), so the layout is unused here — pass the manager's own,
+        // which is what the persisted arm would use too.
+        let layout = branch_layout(&guard);
+        guard.create_branched_session(target_leaf, &layout)?;
+        Ok(())
+    }
+
+    /// Move this session's manager out from behind its lock, leaving a fresh empty in-memory
+    /// manager in its place, so `SessionFactory::build_from_manager` (which takes the manager by
+    /// value) can adopt it — cyrup's stand-in for Pi passing `this.session.sessionManager` straight
+    /// into `createRuntime` (agent-session-runtime.ts:341).
+    ///
+    /// **The caller must have settled this session's run first.** Anything the session writes after
+    /// this call lands in the placeholder and is lost when the session is dropped. The sole caller
+    /// (the runtime's non-persisted fork arm) awaits `abort_and_settle()` immediately before, then
+    /// disposes and replaces the session.
+    pub(crate) async fn take_manager(&self) -> Result<SessionManager, SessionServiceError> {
+        let mut guard = self.manager.lock().await;
+        let placeholder = SessionManager::in_memory(
+            guard.cwd(),
+            cyrup_session::manager::NewSessionOpts::default(),
+        )?;
+        Ok(std::mem::replace(&mut *guard, placeholder))
     }
 
     /// Invalidate every live subscription on replacement (R-11-021): emit the terminal
@@ -2304,31 +2546,6 @@ impl AgentSession {
         if self.services.guest_providers.has_provider(model.provider.as_str()) {
             return true;
         }
-        // A `models.json` provider that supplies its own `apiKey` is configured, exactly as Pi's
-        // `hasConfiguredAuth` counts a provider request config that carries a key
-        // (model-registry.ts:659-662; `composeApiKeyAuth`, provider-composer.ts:439).
-        //
-        // PRESENCE ONLY — deliberately does NOT resolve the value. The key is written in cyrup's
-        // config-value language (`${env:...}`/`${cmd:...}`), and resolving a `${cmd:...}` here would
-        // execute a shell command out of `models.json` on a *status* query. Pi never does that on
-        // this path: `hasConfiguredAuth` is a pure set-membership test against a precomputed
-        // snapshot (model-runtime.ts:372-374), and the snapshot is built once per refresh
-        // (:257-261), not per call — while this predicate is called inside filter loops
-        // (model-resolver.ts:480). Resolution stays where it belongs, on the request path.
-        // Consequence, accepted: a provider whose template turns out to be unresolvable still counts
-        // as configured here and fails later at request time, which is also what Pi does.
-        //
-        // Credential *acquisition* (OAuth) is deliberately out of scope: an `oauth`-only
-        // models.json provider is not counted as configured.
-        if let Some(cfg) = self
-            .services
-            .model_config
-            .providers
-            .get(model.provider.as_str())
-            && cfg.api_key.is_some()
-        {
-            return true;
-        }
         self.provider
             .current()
             .models()
@@ -2336,12 +2553,25 @@ impl AgentSession {
             .any(|m| m.provider == model.provider && m.id == model.id)
     }
 
-    /// Whether `provider` has configured auth in the Pi sense (stored credential / runtime `--api-key`
-    /// / known env var), via `cyrup-config`'s [`cyrup_config::AuthStore::has_auth`] (which consults
-    /// `env_keys`, e.g. `together` → `TOGETHER_API_KEY`). Does NOT count the offline faux
-    /// accommodation — [`Self::has_configured_auth`] adds that separately.
+    /// Whether `provider` has configured auth in the Pi sense — a stored credential / runtime
+    /// `--api-key` / known env var (`env_keys`, e.g. `together` → `TOGETHER_API_KEY`), **or** a
+    /// `models.json` block of its own carrying a configured `apiKey`.
+    ///
+    /// Both tiers live in one place, [`cyrup_config::provider_is_configured`], shared with the
+    /// binary's default-launch predicate (`main.rs`) — the two used to be written out separately and
+    /// had drifted, which is CFG-022. The models.json tier stays PRESENCE-ONLY: it never resolves the
+    /// value, so a `!command` `apiKey` cannot execute a shell command on a status query; see that
+    /// function's docs for why Pi's own check (provider-composer.ts:320-329) is pure too.
+    ///
+    /// Does NOT count the offline faux accommodation or guest-registered providers —
+    /// [`Self::has_configured_auth`] adds those separately.
     fn provider_has_configured_auth(&self, provider: &ProviderId) -> bool {
-        self.services.auth.has_auth(provider, None)
+        cyrup_config::provider_is_configured(
+            &self.services.auth,
+            &self.services.model_config,
+            provider,
+            None,
+        )
     }
 
     /// Public view of [`Self::full_model_registry`] — every model the session can resolve, before
@@ -2454,7 +2684,22 @@ impl AgentSession {
     ) -> Result<(), SessionServiceError> {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = model_ref;
+        *Self::lock(&self.model) = model_ref.clone();
+        self.bash_session_env.set_model(provider.to_string(), model.to_string());
+        // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
+        // path has only the `ModelRef`, so resolve the full `Model` to recompute; if it cannot be
+        // resolved the overlay is cleared rather than left stale — sending the OLD provider's
+        // attribution is worse than sending none.
+        let resolved = self
+            .provider
+            .current()
+            .models()
+            .iter()
+            .find(|m| m.id == model_ref.model && m.provider == model_ref.provider)
+            .cloned();
+        self.agent
+            .set_headers(resolved.as_ref().and_then(|m| self.attribution_headers(m)))
+            .await;
         self.manager.lock().await.append_model_change(provider, model)?;
         Ok(())
     }
@@ -2520,7 +2765,12 @@ impl AgentSession {
                     // sized (E0733) without adding indirection to the hot prompt path.
                     Box::pin(self.send_user_message(content, None)).await.map(|_| ())
                 }
-                ControlOp::Compact => self.compact(None).await.map(|_| ()),
+                // Pi `ctx.compact(options)` (extensions/types.ts:344): `customInstructions`
+                // (types.ts:296-300) rides the op through to the summarizer — the same
+                // `Option<String>` a `/compact <instructions>` slash command passes.
+                ControlOp::Compact { custom_instructions } => {
+                    self.compact(custom_instructions).await.map(|_| ())
+                }
                 // ---- session-local runtime ops (no runtime host needed) ----
                 ControlOp::Navigate { entry_id, opts } => {
                     Box::pin(self.control_navigate(&entry_id, &opts)).await
@@ -2755,6 +3005,11 @@ impl AgentSession {
         let effective = cyrup_provider::clamp_thinking_level(&model, level);
         let previous = self.agent.snapshot().await.thinking_level;
         self.agent.set_thinking_level(effective).await;
+        // Republish `CYRUP_REASONING_LEVEL` for the NEXT `bash` child (Pi re-reads `ctx.thinkingLevel`
+        // on every `resolveSpawnContext`, bash.ts:180). Pushed BEFORE the no-change early return so
+        // the handle is authoritative even when this call is a clamp-to-the-same-value no-op.
+        self.bash_session_env
+            .set_reasoning_level(crate::builder::thinking_level_to_str(effective));
         if effective == previous {
             return Ok(effective);
         }
@@ -2932,13 +3187,32 @@ impl AgentSession {
         self.services.agent_dir.join("sessions")
     }
 
-    /// List the persisted sessions for this session's cwd, newest-first (Pi `SessionManager.list`,
-    /// session-manager.ts:1507 → the `/resume` selector). Reads the cwd-scoped layout dir under the
-    /// sessions root; an absent/empty dir yields an empty list (never an error).
+    /// The directory THIS session's files live in — Pi `sessionManager.getSessionDir()`
+    /// (session-manager.ts:999). Under an explicit `--session-dir`, or after resuming a file from
+    /// somewhere else, this is NOT `<sessions_root>/--<encoded-cwd>--`.
+    pub fn session_dir(&self) -> &Path {
+        &self.services.session_dir
+    }
+
+    /// List the persisted sessions for this session, newest-first (Pi `SessionManager.list`,
+    /// session-manager.ts:1638 → the `/resume` selector). Reads the session's OWN directory, exactly
+    /// as Pi's picker does — `SessionManager.list(this.sessionManager.getCwd(),
+    /// this.sessionManager.getSessionDir())` (interactive-mode.ts:4867) — so an explicit
+    /// `--session-dir` (or a session resumed from elsewhere) lists the sessions actually next to
+    /// this one rather than the cwd-encoded default dir, which may be empty or hold an unrelated set.
+    ///
+    /// A custom directory may pool SEVERAL projects' sessions in one flat dir, so Pi filters it by
+    /// cwd — `filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd)`
+    /// (session-manager.ts:1639-1643); the picker always passes `getSessionDir()`, so the predicate
+    /// reduces to "not the cwd-encoded default". The default dir already isolates by cwd and so is
+    /// never filtered. Same predicate the CLI `--resume` path computes (`session_list_cwd_filter`,
+    /// crates/cyrup/src/main.rs:1132-1138). An absent/empty dir yields an empty list, never an error.
     pub fn list_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
-        let layout =
-            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone());
-        cyrup_session::listing::list(&layout)
+        let dir = &self.services.session_dir;
+        let default_dir =
+            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone()).dir();
+        let cwd_filter = (*dir != default_dir).then_some(self.services.cwd.as_path());
+        cyrup_session::listing::list_in_dir(dir, cwd_filter, None)
     }
 
     /// Delete a persisted session **file** by path (Pi `/resume` in-list delete → `app.session.delete`
@@ -2986,9 +3260,19 @@ impl AgentSession {
         self.manager.try_lock().ok().and_then(|g| g.session_file().map(Path::to_path_buf))
     }
 
-    /// The assembled *base* system prompt for this session (arch-06). Stable across the session.
+    /// The system prompt the builder assembled at session start (arch-06). Frozen — it does NOT
+    /// track mid-session tool-set rebuilds; use [`Self::base_system_prompt`] for the live base or
+    /// [`Self::current_system_prompt`] for the agent's in-flight value.
     pub fn system_prompt(&self) -> &str {
         &self.services.system_prompt
+    }
+
+    /// The LIVE base system prompt (Pi `this._baseSystemPrompt`, agent-session.ts:371) — the value a
+    /// run falls back to when no `before_agent_start` handler replaced it. Equal to
+    /// [`Self::system_prompt`] until a tool-set rebuild (`/tools` toggle, a guest `setActiveTools`,
+    /// or EXT-004 late tool registration) rewrites it via [`Self::push_active_tools`].
+    pub fn base_system_prompt(&self) -> String {
+        Self::lock(&self.base_system_prompt).clone()
     }
 
     /// The agent's *current* system prompt — equal to the base unless a `before_agent_start` handler
@@ -3032,6 +3316,22 @@ impl AgentSession {
         self.manager.lock().await.leaf_id().cloned()
     }
 
+    /// The handle the `read` tool reads to decide whether the ACTIVE model accepts image input
+    /// (pi `tools/read.ts`'s non-vision warning). Seeded from the resolved model at build and
+    /// re-pushed by `apply_model_change`, so the warning tracks `/model` switches rather than the
+    /// startup model.
+    #[must_use]
+    pub fn read_model_vision(&self) -> &cyrup_tools::config::ModelVisionHandle {
+        &self.read_model_vision
+    }
+
+    /// The agent's LIVE per-request header overlay (pi `SimpleStreamOptions.headers`, recomputed
+    /// per request in `streamFn`, `sdk.ts:318-327`). Tracks the active model via
+    /// [`Self::attribution_headers`] on both model-change paths.
+    pub async fn agent_headers(&self) -> Option<cyrup_provider::HeaderMap> {
+        self.agent.snapshot().await.headers
+    }
+
     /// The agent's current in-memory transcript (includes the streaming partial).
     pub async fn agent_messages(&self) -> Vec<cyrup_agent::AgentMessage> {
         self.agent.snapshot().await.messages
@@ -3057,10 +3357,96 @@ impl AgentSession {
 
     // -------------------------------------------------------------------- state views ----
 
-    /// Aggregate transcript stats for the current branch (Pi `getSessionStats`,
-    /// agent-session.ts:2932; RPC `get_session_stats`).
+    /// Aggregate session stats (Pi `getSessionStats`, agent-session.ts:3112; RPC
+    /// `get_session_stats`).
+    ///
+    /// SEAM-031: computed from `sessionManager.getEntries()` — ALL entries, including history a
+    /// compaction replaced — not from the rebuilt LLM context, so token/cost totals reflect what was
+    /// actually billed across the session (Pi's own docstring, agent-session.ts:3107-3111).
     pub async fn session_stats(&self) -> crate::state::SessionStats {
-        crate::state::SessionStats::from_messages(&self.messages().await)
+        let context_usage = self.stats_context_usage().await;
+        let mgr = self.manager.lock().await;
+        crate::state::SessionStats::from_entries(
+            mgr.entries(),
+            self.session_id.to_string(),
+            mgr.session_file().map(|p| p.display().to_string()),
+            context_usage,
+        )
+    }
+
+    /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
+    /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
+    /// no known context window — Pi's `getContextUsage` returns `undefined` there
+    /// (agent-session.ts:3165-3170).
+    async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
+        let usage = self.context_usage().await;
+        if usage.context_window == 0 {
+            return None;
+        }
+        // Pi's post-compaction guard (agent-session.ts:3175-3197). After a compaction the last
+        // assistant `usage` still describes the PRE-compaction context, so reporting it would show a
+        // stale — and much larger — occupancy as if it were current. Pi only trusts a usage from an
+        // assistant that responded AFTER the latest compaction on this branch, and where that
+        // assistant neither aborted nor errored and actually consumed context. With no such
+        // assistant the count is genuinely unknown, and Pi returns `{tokens: null, percent: null}`
+        // while still reporting the window.
+        //
+        // Without this branch `tokens`/`percent` were unconditionally `Some`, so the `null` case the
+        // struct's own doc comment describes was unreachable.
+        if !self.has_post_compaction_usage().await {
+            return Some(crate::state::StatsContextUsage {
+                tokens: None,
+                context_window: usage.context_window,
+                percent: None,
+            });
+        }
+        Some(crate::state::StatsContextUsage {
+            tokens: Some(usage.used_tokens),
+            context_window: usage.context_window,
+            percent: Some(usage.fraction * 100.0),
+        })
+    }
+
+    /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
+    /// on the branch, or an assistant has responded since the latest one (Pi
+    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3178-3195).
+    ///
+    /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
+    /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
+    /// accounts for a non-zero context.
+    async fn has_post_compaction_usage(&self) -> bool {
+        use cyrup_core::StopReason;
+        use cyrup_session::entry::{Entry, KnownEntry};
+        use cyrup_session::AgentMessage;
+
+        let guard = self.manager.lock().await;
+        let entries = guard.entries();
+        let Some(compaction_idx) = entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
+        else {
+            // No compaction on this branch: the last assistant usage is current by construction.
+            return true;
+        };
+        entries
+            .iter()
+            .skip(compaction_idx + 1)
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Known(KnownEntry::Message {
+                    message: AgentMessage::Core(Message::Assistant(a)),
+                    ..
+                }) => Some(a),
+                _ => None,
+            })
+            .any(|a| {
+                // Same four-field sum `ContextUsage::from_last_assistant` uses, so "consumed
+                // context" means the same thing in both places (Pi `calculateContextTokens`).
+                let context_tokens =
+                    a.usage.input + a.usage.cache_read + a.usage.cache_write + a.usage.output;
+                !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error)
+                    && context_tokens > 0
+            })
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
@@ -3078,8 +3464,8 @@ impl AgentSession {
     /// A serializable snapshot of the session for RPC `get_state` (Pi `state` getter,
     /// agent-session.ts:753).
     pub async fn state_view(&self) -> crate::state::SessionStateView {
+        let stats = self.session_stats().await;
         let messages = self.messages().await;
-        let stats = crate::state::SessionStats::from_messages(&messages);
         let last = messages.iter().rev().find_map(|m| match m {
             Message::Assistant(a) => Some(a),
             _ => None,
@@ -3364,6 +3750,21 @@ impl AgentSession {
         *Self::lock(&self.model) = model_ref.clone();
         *Self::lock(&self.compaction_model) = next.clone();
         self.services.host_services.update_model(model_ref, next.context_window, None);
+        // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
+        // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
+        self.bash_session_env.set_model(next.provider.to_string(), next.id.to_string());
+        // ...and re-push the new model's image capability for the same reason: `read`'s
+        // non-vision warning must describe the model the NEXT read will actually run against,
+        // not the one resolved at startup.
+        self.read_model_vision.set(next.supports_image_input());
+        // pi recomputes provider-attribution + opencode session-affinity headers INSIDE `streamFn`,
+        // dispatched on the model the request is actually going to (`sdk.ts:318-327`). cyrup merged
+        // them once at session build and pinned them via `AgentBuilder::headers`, so a
+        // cross-provider `/model` switch kept sending the PREVIOUS provider's attribution — an
+        // OpenRouter `HTTP-Referer`/`X-Title` on an Anthropic request, or a stale opencode
+        // session-affinity header. `attribution_headers()` existed and computed this correctly
+        // per-model; it simply had no caller.
+        self.agent.set_headers(self.attribution_headers(next)).await;
         self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model (explicit override or current session level).
         let level = match explicit_thinking {
@@ -3787,13 +4188,47 @@ impl AgentSession {
         // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload. Hoisted
         // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released
         // on ONE path, before the retry queue is flushed.
-        let estimated_tokens_after: u64 = guard
-            .build_context()
-            .messages
-            .iter()
-            .map(cyrup_provider::estimate_message_tokens)
-            .sum();
+        let compacted_ctx = guard.build_context();
+        // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
+        // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
+        // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
+        // over `buildSessionContext().messages`, and that list is
+        // `buildContextEntries().flatMap(sessionEntryToContextMessages)` with every role intact
+        // (session-manager.ts:461-469 composed with :383-408). So a retained `compactionSummary`
+        // costs `summary.length/4` with NO wrapper prose, and an `excludeFromContext` (`!!`) bash
+        // execution still costs `(command.length + output.length)/4`.
+        //
+        // Measuring `compacted_ctx` instead billed the ~107-char COMPACTION_SUMMARY wrapper that
+        // `push_as_message` adds (cyrup-session/src/context.rs:16-18) — ~27 tokens, and a compacted
+        // context ALWAYS leads with one — while silently dropping every `excludeFromContext` bash
+        // entry, which `AgentMessage::push_llm` removes at the LLM boundary. It also disagreed with
+        // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
+        // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
+        let estimated_tokens_after: u64 = u64::from(
+            guard
+                .build_context_raw()
+                .iter()
+                .map(cyrup_session::compaction::tokens::estimate_agent_message)
+                .fold(0u32, u32::saturating_add),
+        );
         drop(guard);
+        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
+        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
+        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
+        //
+        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
+        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
+        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
+        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
+        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
+        // reducing context or switching to a larger-context model", blaming the model for a
+        // compaction that had never taken effect.
+        //
+        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
+        // the two compaction paths were the ones that built the context only to COUNT it.
+        let compacted_messages: Vec<AgentMessage> =
+            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
@@ -4132,6 +4567,12 @@ impl AgentSession {
     async fn push_active_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>, prompt: String) {
         self.agent.set_tools(tools).await;
         self.agent.set_system_prompt(prompt.clone()).await;
+        // The rebuilt prompt is the new BASE, not just this turn's value (Pi
+        // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
+        // Without this write the next run's `before_agent_start` reset in
+        // [`Self::assemble_run_messages`] would restore the startup prompt and the model would be
+        // described the startup tool set for the rest of the session.
+        *Self::lock(&self.base_system_prompt) = prompt.clone();
         // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the agent —
         // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
         // and a guest reading it back must see the rebuilt one.

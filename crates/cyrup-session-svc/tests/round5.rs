@@ -327,3 +327,71 @@ async fn navigate_tree_via_command_seam() {
         other => panic!("expected TreeNavigation, got {other:?}"),
     }
 }
+
+// ============================================ SESS-023 blast radius: the manager lock ============
+
+/// Branch summarization must NOT hold the session-manager mutex across its provider round-trip.
+///
+/// `navigate_tree`'s summarize leg used to run inside `let mut guard = self.manager.lock().await`,
+/// so a summarization stalled EVERY other session-manager consumer (a TUI polling `session_dag`, an
+/// extension's `getEntries`, a concurrent `compact`) for the full model call plus its retry backoff
+/// — `AgentSession::compact` already scopes its guard for exactly this reason. It was invisible only
+/// because no front end could reach the summarize branch at all (SESS-023); making `/tree` reach it
+/// makes the stall reachable, so the guard now spans only the append.
+///
+/// The summarizer is gated on a channel, so this is deterministic rather than timing-dependent:
+/// with the lock held, `session_dag()` cannot return until the gate is released, which happens only
+/// after the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branch_summarization_does_not_hold_the_manager_lock() {
+    let fx = fixture();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let gate_rx = Mutex::new(gate_rx);
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)),
+        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a2")], StopReason::Stop)),
+        // The branch summarizer: announce, then block until the test releases the gate.
+        FauxResponseStep::factory(move |_ctx, _o, _s, _m| {
+            let _ = entered_tx.send(());
+            let _ = gate_rx.lock().unwrap().recv();
+            faux_assistant_message(vec![faux_text("BRANCH-BODY")], StopReason::Stop)
+        }),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = Arc::new(SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap());
+
+    let _ = session.prompt("first").await.unwrap();
+    session.wait_for_idle().await;
+    let _ = session.prompt("second").await.unwrap();
+    session.wait_for_idle().await;
+    let u1: EntryId = session.user_messages_for_forking().await[0].entry_id.clone();
+
+    let nav_session = session.clone();
+    let nav = tokio::spawn(async move {
+        nav_session
+            .navigate_tree(u1, NavigateTreeOptions { summarize: true, ..Default::default() })
+            .await
+    });
+
+    // Wait until the summarizer call is genuinely in flight.
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .unwrap()
+        .expect("the branch summarizer was invoked");
+
+    // THE ASSERTION: another manager consumer must still be serviceable.
+    let dag = tokio::time::timeout(std::time::Duration::from_secs(5), session.session_dag())
+        .await
+        .expect(
+            "session_dag() blocked while a branch summarization was running — the manager mutex is \
+             being held across the provider round-trip",
+        );
+    assert!(!dag.is_empty(), "the tree is readable mid-summarization");
+
+    let _ = gate_tx.send(());
+    let outcome = nav.await.unwrap().unwrap();
+    assert!(outcome.summary_entry.is_some(), "the summary still lands once the gate opens");
+}

@@ -23,7 +23,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyrup_core::ToolCallId;
@@ -230,8 +230,11 @@ async fn forwarded_allow_crosses_process_and_lets_child_proceed() {
 
     // The REAL parent watcher against a scripted human that ALLOWS.
     let (services, selects) = scripted_parent(&parent_id, "Allow Once");
-    let watcher =
-        spawn_forwarding_watcher(agent_dir.path().to_path_buf(), services, ExtensionConfig::default());
+    let watcher = spawn_forwarding_watcher(
+        agent_dir.path().to_path_buf(),
+        services,
+        Arc::new(Mutex::new(ExtensionConfig::default())),
+    );
 
     let child = spawn_child(agent_dir.path(), &parent_id, "echo hi", &sentinel, 20_000);
     let code = wait_child(child, Duration::from_secs(30)).await;
@@ -254,8 +257,11 @@ async fn forwarded_deny_crosses_process_and_blocks_child() {
 
     // The REAL parent watcher against a scripted human that REJECTS.
     let (services, selects) = scripted_parent(&parent_id, "Reject");
-    let watcher =
-        spawn_forwarding_watcher(agent_dir.path().to_path_buf(), services, ExtensionConfig::default());
+    let watcher = spawn_forwarding_watcher(
+        agent_dir.path().to_path_buf(),
+        services,
+        Arc::new(Mutex::new(ExtensionConfig::default())),
+    );
 
     let child = spawn_child(agent_dir.path(), &parent_id, "rm -rf /", &sentinel, 20_000);
     let code = wait_child(child, Duration::from_secs(30)).await;

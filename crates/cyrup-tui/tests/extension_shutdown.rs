@@ -182,3 +182,46 @@ async fn a_shutdown_requested_mid_run_waits_for_the_settle_point() {
         "the settle point honours the pending request (Pi interactive-mode.ts:3137-3138)"
     );
 }
+
+/// EXT-005: a shutdown request with NO turn boundary behind it must still be observed.
+///
+/// cyrup forwards control ops onto a queue that drains only at a turn boundary. `ctx.shutdown()`
+/// cannot afford that: Pi's `shutdownHandler` is literally `() => { shutdownRequested = true }`
+/// (rpc-mode.ts:344-346) and interactive-mode.ts:1753-1757 sets the field synchronously and then
+/// exits immediately if the session is already idle. A queued-only cyrup latch is unobservable
+/// whenever no boundary follows — an extension background task on an idle session, or a request
+/// that lands in the window AFTER the in-flight run's own drain has already run. The latter is what
+/// made `a_shutdown_requested_mid_run_waits_for_the_settle_point` above fail intermittently under
+/// parallel load: the faux run finished before the test's `control(...)` call, so the op was queued
+/// with no drain left to see it. `HostServices::control` now latches at the seam, exactly like it
+/// already fires `ControlOp::Abort` live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_requested_with_no_turn_boundary_left_is_still_observed() {
+    let fx = fixture();
+    let ext = Arc::new(QuitExt::default());
+    let session = SessionBuilder::new(faux_ok(), base_config(&fx))
+        .with_native_extension(ext.clone() as Arc<dyn NativeExtension>)
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+
+    let svc = ext.services.lock().unwrap().clone().expect("the native captured the backend");
+    assert!(!session.shutdown_requested(), "nothing requested yet");
+
+    // No prompt, no run, no settle — nothing in this test will EVER drain the control queue.
+    svc.control(ControlOp::Shutdown).unwrap();
+
+    assert!(
+        session.shutdown_requested(),
+        "ctx.shutdown() latches at the capability seam, not at a turn boundary that may never come"
+    );
+    assert!(
+        should_honor_extension_shutdown(&session, false),
+        "an idle host with a pending request exits at once (Pi interactive-mode.ts:1753-1757)"
+    );
+    assert!(
+        should_honor_extension_shutdown(&session, true),
+        "and the settle point honours it too (Pi interactive-mode.ts:3137-3138)"
+    );
+}

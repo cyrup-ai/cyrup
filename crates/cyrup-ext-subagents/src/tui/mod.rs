@@ -207,18 +207,39 @@ pub struct NestedRunSummary {
 // Control notices (func-SA §4.6/§5.5; arch-SA §3.7; R-SA-114-122)
 // =================================================================================================
 
-/// The distinguishing key for a control notice: which run it concerns, and which of the two
-/// notice kinds it is. Dedup (R-SA-115: at most once per distinct `(run_id, attention_state)`
-/// pair; R-SA-122: persists across a hot-reload of the orchestrating extension for the process's
-/// lifetime) is keyed on this type — `tui/notices.rs`'s `ControlNoticeState.delivered:
-/// HashSet<ControlNoticeKey>` (a later phase) is the sole consumer of that dedup contract, but
-/// the key type itself lives here since [`ControlNotice`] embeds it.
+/// The distinguishing key for a control notice: which run it concerns, which of the two notice
+/// kinds it is, and upstream's own `controlNotificationKey` discriminant. Dedup (R-SA-115: at most
+/// once per distinct attention identity; R-SA-122: persists across a hot-reload of the
+/// orchestrating extension for the process's lifetime) is keyed on this type — `tui/notices.rs`'s
+/// `ControlNoticeState.delivered: HashSet<ControlNoticeKey>` is the sole consumer of that dedup
+/// contract, but the key type itself lives here since [`ControlNotice`] embeds it.
+///
+/// # Why `notification_key` exists (SUBA-N05)
+///
+/// Upstream keys its `visibleControlNotices` dedup set on
+/// `controlNotificationKey(event, childIntercomTarget)` (`shared/subagent-control.ts:141-144`
+/// @v0.34.0) — `"{childKey}:{type}:{reason}"`, where `childKey` is the child's intercom target when
+/// the bridge is live, else `"{runId}:{index}"` (or bare `runId` for an index-less event). Its
+/// pending-timer map is keyed on `"{runId}:{that}"` (`extension/control-notices.ts:23-26`).
+///
+/// Before SUBA-N05 this struct was only `(run_id, kind)`, which is STRICTLY coarser on two axes
+/// upstream distinguishes: the `reason` (an `idle` attention notice and a later
+/// `mutating_failures`/`supervisor_request` one about the same run collapsed into a single
+/// delivery) and the child index (every step of a chain/parallel run shared one key). Carrying
+/// upstream's rendered key verbatim restores both. `run_id` is retained alongside it because it is
+/// also the id [`ControlNotice`]'s actionability re-check looks up in the live-run projection, and
+/// because it is upstream's own timer-key prefix; it is redundant *as dedup input* (`childKey` is
+/// derived from the run id either way), so including it in the hash cannot merge or split any
+/// upstream key class.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ControlNoticeKey {
     /// The run this notice concerns.
     pub run_id: background::RunId,
     /// Which kind of notice this is.
     pub kind: ControlNoticeKind,
+    /// pi `controlNotificationKey(event, childIntercomTarget)` — see the type doc. Built by
+    /// [`crate::exec::control::control_notification_key`], never hand-formatted at a call site.
+    pub notification_key: String,
 }
 
 /// The two control-notice kinds this subsystem surfaces (func-SA §5.5).

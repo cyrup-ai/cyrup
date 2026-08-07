@@ -12,6 +12,7 @@
 //! touches real I/O, so tests draw into a `TestBackend` buffer and assert on cells.
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,19 +28,18 @@ use cyrup_session_svc::{
     UserInput,
 };
 use cyrup_session_svc::{
-    AgentSessionRuntime, ForkPosition, NavigateTreeOptions, SessionDagKind, SessionDagNode,
+    AgentSessionRuntime, ForkPosition, NavigateTreeOptions, NavigateTreeOutcome, SessionDagKind,
+    SessionDagNode,
 };
-use cyrup_session_svc::{UiKind, UiReply, UiRequest};
+use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
-    EndSynchronizedUpdate,
+    enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
 };
 use ratatui::crossterm::{execute, queue, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
@@ -63,6 +63,8 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
+use crate::stray_reply::StrayReplyFilter;
+use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
 use crate::transcript::{content_text, entry_lines, thinking_text, TranscriptView};
@@ -99,6 +101,12 @@ pub enum AppAction {
     /// dropped. The run loop drains ([`AgentSession::drain_queue`]), hands the result to
     /// [`App::restore_queued_to_editor`], and only then aborts.
     InterruptRestoreQueued,
+    /// Esc pressed **while a `/tree` branch summarization is in flight** — Pi's rebound
+    /// `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
+    /// (`interactive-mode.ts:4792-4795`). Distinct from [`Self::Interrupt`] because it must NOT tear
+    /// down streaming state or kill a bash child: the only effect is cancelling the summarization,
+    /// which resolves the spawned navigation with `aborted: true` and re-shows the tree.
+    AbortBranchSummary,
     /// The user requested to quit the session.
     Quit,
     /// The user requested to suspend the process to the background (Ctrl+Z / SIGTSTP). The run loop
@@ -291,6 +299,56 @@ pub struct AppState {
     /// [`App::handle_selector_key`]'s `Cancel` arm take + resolve it. `None` whenever no extension
     /// dialog is open (including every ordinary first-party selector).
     pending_ui_reply: Option<PendingUiReply>,
+    /// The `/tree` target the user confirmed, held while the "Summarize branch?" prompt (and, on its
+    /// third option, the custom-instructions editor) is open — Pi keeps the same values in the
+    /// `entryId` / `wantsSummary` / `customInstructions` locals of its `while (true)` prompt loop
+    /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
+    /// prompt is escaped back to the tree.
+    pending_tree_nav: Option<PendingTreeNav>,
+    /// The window title currently asked for — either by an extension (Pi `setTitle` →
+    /// `ui.terminal.setTitle`, `interactive-mode.ts:2238` → `terminal.ts:504-507`) or by the
+    /// automatic session/cwd title ([`App::update_terminal_title`], Pi `updateTerminalTitle`,
+    /// `interactive-mode.ts:818-826`). Retained so the value is observable in tests and after a
+    /// redraw; the crossterm run loop is what actually writes the OSC 0 sequence.
+    pub terminal_title: Option<String>,
+    /// The working directory whose basename goes into the automatic terminal title — Pi
+    /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Seeded from the process cwd and
+    /// re-pointed at the live session's cwd by [`App::run`] (and on every session swap), since a
+    /// `/resume` of a session recorded elsewhere moves it.
+    pub title_cwd: PathBuf,
+    /// The custom header content an extension published (Pi `setHeader`, `interactive-mode.ts:2237`).
+    /// Delivered (no longer dropped) and retained here — cyrup's TUI has no extension chrome slot to
+    /// render it in yet, which is TUI-014's remaining half.
+    pub extension_header: Option<String>,
+    /// The custom footer content an extension published (Pi `setFooter`, `interactive-mode.ts:2236`).
+    /// Same status as [`Self::extension_header`].
+    pub extension_footer: Option<String>,
+    /// The most recent extension widget payload (Pi `setWidget`, `interactive-mode.ts:2235`). Cyrup's
+    /// WIT collapses Pi's `{key, content, options}` into one opaque JSON blob, so there is no key to
+    /// map by; the latest payload wins. Same "delivered, not rendered" status as the header/footer —
+    /// this is exactly TUI-014, which the sink wiring alone does NOT close.
+    pub extension_widget: Option<serde_json::Value>,
+    /// Whether a branch summarization spawned by [`App::begin_tree_navigation`] is still in flight.
+    /// While set, `Esc` routes to `AgentSession::abort_branch_summary` instead of the turn abort —
+    /// Pi's `defaultEditor.onEscape = () => this.session.abortBranchSummary()`
+    /// (`interactive-mode.ts:4792-4795`), restored in its `finally`.
+    branch_summary_in_flight: bool,
+}
+
+/// Row values of the "Summarize branch?" prompt. Pi compares the returned LABELS
+/// (`summaryChoice !== "No summary"`, `=== "Summarize with custom prompt"`,
+/// `interactive-mode.ts:4767,4769`); cyrup's [`ListSelector`] carries a separate value column, so
+/// the labels stay Pi-exact for display while the routing keys stay stable.
+const BRANCH_SUMMARY_NONE: &str = "none";
+const BRANCH_SUMMARY_YES: &str = "summarize";
+const BRANCH_SUMMARY_CUSTOM: &str = "custom";
+
+/// The `/tree` navigation awaiting the "Summarize branch?" answer (see
+/// [`AppState::pending_tree_nav`]).
+#[derive(Clone, Debug)]
+struct PendingTreeNav {
+    /// The confirmed tree row's entry id.
+    target: String,
 }
 
 impl AppState {
@@ -328,7 +386,22 @@ impl AppState {
                 hyperlinks: false,
             },
             pending_ui_reply: None,
+            pending_tree_nav: None,
+            terminal_title: None,
+            // Pi reads `sessionManager.getCwd()` at title time; the process cwd is the same value
+            // until a session with a recorded cwd is bound, which re-points it ([`App::run`]).
+            title_cwd: std::env::current_dir().unwrap_or_default(),
+            extension_header: None,
+            extension_footer: None,
+            extension_widget: None,
+            branch_summary_in_flight: false,
         }
+    }
+
+    /// Whether a `/tree` branch summarization is still running (test/inspection access; drives the
+    /// `Esc`→`abort_branch_summary` routing).
+    pub fn branch_summary_in_flight(&self) -> bool {
+        self.branch_summary_in_flight
     }
 
     /// Install the extension-registered keyboard shortcuts (R-08-017): each raw key-id is parsed to a
@@ -497,6 +570,33 @@ pub struct App<B: Backend> {
     /// repaint, eliminating the per-tool-call FLICKER. Reset to `0` the instant the turn goes idle so
     /// the region collapses back to the compact editor/footer (the void-fix is preserved).
     live_floor: u16,
+    /// Where a spawned `/tree` navigation posts its outcome back to the run loop. Installed by
+    /// [`App::install_tree_nav_channel`], which [`App::run`] calls once at startup. `None` when no
+    /// run loop is present (an embedder or a test driving `execute_command` directly), in which case
+    /// [`App::begin_tree_navigation`] falls back to awaiting the navigation inline — correct for a
+    /// non-summarizing navigation (no model call, so no abort to deliver and nothing to keep the
+    /// loop free for) and the only thing a caller without a loop can do.
+    tree_nav_tx: Option<tokio::sync::mpsc::UnboundedSender<TreeNavMsg>>,
+}
+
+/// A spawned `/tree` navigation's outcome, posted back to [`App::run`]'s `select!` so the summarize
+/// leg never runs on the loop task (the `bash_rx` / `shortcut_status_rx` channel-back pattern).
+/// Keeping it off-task is what makes Pi's Escape→`abortBranchSummary` binding deliverable at all:
+/// awaited inline, the loop would service no key events for the whole provider round-trip.
+#[derive(Debug)]
+pub struct TreeNavMsg {
+    /// The navigated-to entry id, so an aborted summarization can re-show the tree there.
+    target: String,
+    outcome: Result<NavigateTreeOutcome, String>,
+}
+
+impl TreeNavMsg {
+    /// Pair a settled navigation with the entry it targeted. `pub` so `tests/*.rs` can hand
+    /// [`App::apply_tree_nav_outcome`] a synthetic outcome (notably the abort case, which is
+    /// otherwise a race to provoke) — the crate's established run-loop-only testing seam.
+    pub fn new(target: impl Into<String>, outcome: Result<NavigateTreeOutcome, String>) -> Self {
+        TreeNavMsg { target: target.into(), outcome }
+    }
 }
 
 impl<B: Backend> App<B> {
@@ -515,7 +615,48 @@ impl<B: Backend> App<B> {
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
         // `Terminal` is top-anchored at the backend's initial cursor; the rebuild fixes the anchor).
-        Ok(App { terminal, state, viewport_height: 0, live_floor: 0 })
+        Ok(App { terminal, state, viewport_height: 0, live_floor: 0, tree_nav_tx: None })
+    }
+
+    /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
+    /// cursor. Total and idempotent so an error path always leaves a usable terminal.
+    ///
+    /// The escape sequence itself lives in [`crate::panic_hook::restore_terminal_best_effort`] and
+    /// this method is a thin delegation to it, deliberately: the panic hook runs the *same*
+    /// teardown, and two hand-maintained copies would silently drift the first time
+    /// [`App::into_stdout`] learned to enable a fourth mode — a drift only ever discovered by a
+    /// user whose terminal was already broken. Note the release profile sets `panic = "abort"`, so
+    /// no `Drop` guard can stand in for the hook (`Cargo.toml:215`).
+    ///
+    /// Generic over the backend rather than confined to the crossterm one it is *used* from: nothing
+    /// in it is crossterm-specific (the escapes go straight to stdout; `show_cursor` is a `Backend`
+    /// method), and a `CrosstermBackend<Stdout>` cannot be constructed in a test without a
+    /// controlling terminal — which would leave the pairing below with no way to assert itself.
+    pub fn restore(&mut self) -> Result<(), TuiError> {
+        crate::panic_hook::restore_terminal_best_effort();
+        // Not a second `Show`-for-its-own-sake: ratatui's `Terminal` tracks `hidden_cursor` itself
+        // and its `Drop` re-emits `Show` when that flag is still set, so the flag is synced through
+        // the API rather than left stale by the raw-stdout write above.
+        let _ = self.terminal.show_cursor();
+        Ok(())
+    }
+
+    /// The **exit** teardown: drain stdin, then [`Self::restore`] — Pi's `shutdown()`, which runs
+    /// `await this.ui.terminal.drainInput(1000)` immediately before `this.stop()`
+    /// (`interactive-mode.ts:3578`/`:3589` then `:3591`, both the signal and the interactive-quit
+    /// branch). `crates/cyrup/src/main.rs` calls it at the single exit from the interactive loop.
+    ///
+    /// This is a distinct method rather than a change to [`Self::restore`] because the drain is only
+    /// correct on the way out. `restore` also runs on [`App::suspend`] (Ctrl+Z) and around the
+    /// external editor, where the terminal is handed to someone else and taken back — anything the
+    /// user types there is theirs to keep, and discarding it would be a new bug. Pi draws the line in
+    /// exactly the same place: `handleCtrlZ` calls a bare `ui.stop()` (`:3722`) and never `drainInput`.
+    ///
+    /// See [`crate::drain`] for what the drain protects against (buffered Kitty key-release reports
+    /// and the quit keystroke itself leaking to the parent shell once raw mode is off).
+    pub fn drain_and_restore(&mut self) -> Result<(), TuiError> {
+        let _ = crate::drain::drain_stdin_before_exit();
+        self.restore()
     }
 
     /// Immutable state access.
@@ -660,7 +801,24 @@ impl<B: Backend> App<B> {
     pub fn detect_image_support(&mut self) {
         let caps = crate::image::detect_capabilities();
         self.state.capabilities = caps;
-        self.state.image_renderer = ImageRenderer::from_capabilities(caps);
+        // …and, when the terminal HAS an image protocol, measure its font cell instead of guessing
+        // it (Pi `queryCellSize`, `tui.ts:647`/`:679-686`, gated on `getCapabilities().images` at
+        // `:681`). Without this every inline image is laid out against `ratatui-image`'s `10x20`
+        // placeholder cell, so a Kitty/iTerm2 image that is not width-clamped reserves the wrong
+        // number of rows and is drawn at the wrong scale.
+        //
+        // Called by the binary from the SAME pre-reader-thread window as the theme probe (see
+        // `crate::terminal_query`'s module docs for the timeout / input-safety contract); off a real
+        // terminal `stdin_is_queryable` short-circuits it to `None` in microseconds, which is what
+        // keeps this callable from tests.
+        let cell_size = if caps.images.is_some() {
+            use crate::terminal_query::TerminalProbe as _;
+            crate::terminal_query::StdinTerminalProbe
+                .query_cell_size(crate::terminal_query::CELL_SIZE_TIMEOUT)
+        } else {
+            None
+        };
+        self.state.image_renderer = ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is
@@ -686,6 +844,39 @@ impl<B: Backend> App<B> {
     /// The app's active color mode (test/inspection).
     pub fn color_mode(&self) -> ColorMode {
         self.state.color_mode
+    }
+
+    /// Point the automatic terminal title at the live session's working directory — Pi's
+    /// `sessionManager.getCwd()` (`interactive-mode.ts:819`). Does NOT write anything on its own;
+    /// [`Self::update_terminal_title`] is what recomputes the title.
+    pub fn set_title_cwd(&mut self, cwd: PathBuf) {
+        self.state.title_cwd = cwd;
+    }
+
+    /// Recompute the automatic window title from the session name + cwd — Pi `updateTerminalTitle`
+    /// (`interactive-mode.ts:818-826`) — and store it on [`AppState::terminal_title`].
+    ///
+    /// Returns the new title **only when it changed**, so a caller writes the OSC 0 sequence no more
+    /// often than Pi calls `setTitle`. Pi's four call sites are startup (`:860`), a session
+    /// (re-)bind (`:1761`), unbinding the extension set (`:1995`) and `session_info_changed`
+    /// (`:2901`); [`App::run`] drives the first, second and fourth — the third has no cyrup
+    /// counterpart, since extension chrome here is not torn down per session. Never per stream
+    /// event. The write itself is the crossterm run loop's job
+    /// ([`write_terminal_title`]), for the same reason the extension `SetTitle` effect is written
+    /// there: a `TestBackend` app must not emit escape sequences onto the real stdout.
+    ///
+    /// The session name is read from the footer's [`StatusLine::session_name`], which is where the
+    /// live value already lands (Pi reads the same value the footer does, `footer.ts:116-130`).
+    pub fn update_terminal_title(&mut self) -> Option<String> {
+        let title = session_terminal_title(
+            self.state.status.session_name.as_deref(),
+            &self.state.title_cwd,
+        );
+        if self.state.terminal_title.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.state.terminal_title = Some(title.clone());
+        Some(title)
     }
 
     /// Re-bind the UI to a freshly-installed runtime session (arch-11 §3.4 replacement; Pi's
@@ -1240,6 +1431,14 @@ impl<B: Backend> App<B> {
                 AppAction::Quit
             }
             Action::Interrupt => {
+                // Pi REBINDS `defaultEditor.onEscape` to `() => this.session.abortBranchSummary()`
+                // for the duration of a `/tree` branch summarization (`interactive-mode.ts:4792-4795`,
+                // restored in the `finally` at `:4832`), so Escape cancels the summarization and
+                // nothing else — no stream teardown, no bash kill. Checked FIRST for the same reason
+                // Pi's rebind shadows the default handler.
+                if self.state.branch_summary_in_flight {
+                    return AppAction::AbortBranchSummary;
+                }
                 // A running `!`/`!!` bash block is cancelled first (the run loop kills the child),
                 // mirroring Pi's `tui.select.cancel` on the bash component.
                 if self.state.transcript.bash_running() {
@@ -1561,6 +1760,158 @@ impl<B: Backend> App<B> {
         self.state.selector.as_ref().map(|s| s.kind)
     }
 
+    /// Install the off-task `/tree` navigation channel and hand back its receiver.
+    ///
+    /// [`App::run`] calls this once at startup; without it [`Self::begin_tree_navigation`] falls
+    /// back to awaiting the navigation inline, which is only ever correct for a NON-summarizing
+    /// navigation. `pub` so `tests/*.rs` can exercise the spawned path (and therefore the
+    /// Escape→abort routing and the live `IndicatorKind::BranchSummary` indicator) without standing
+    /// up a whole run loop.
+    pub fn install_tree_nav_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<TreeNavMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TreeNavMsg>();
+        self.tree_nav_tx = Some(tx);
+        rx
+    }
+
+    /// Open Pi's three-option "Summarize branch?" prompt (`interactive-mode.ts:4755-4760`). Pi uses
+    /// its generic `showExtensionSelector`; cyrup renders the same three options through a
+    /// first-party [`ListSelector`] so the answer arrives as an ordinary
+    /// [`AppCommand::ConfirmSelection`] rather than occupying the single extension-dialog reply slot.
+    pub fn open_branch_summary_prompt(&mut self) {
+        let rows = vec![
+            (BRANCH_SUMMARY_NONE.to_string(), "No summary".to_string(), None),
+            (BRANCH_SUMMARY_YES.to_string(), "Summarize".to_string(), None),
+            (
+                BRANCH_SUMMARY_CUSTOM.to_string(),
+                "Summarize with custom prompt".to_string(),
+                None,
+            ),
+        ];
+        let title = SelectorKind::BranchSummary.title().to_string();
+        self.open_boxed_selector(
+            SelectorKind::BranchSummary,
+            Box::new(ListSelector::prompt(title, rows, 0)),
+        );
+    }
+
+    /// Open the custom-instructions editor (Pi `showExtensionEditor("Custom summarization
+    /// instructions")`, `interactive-mode.ts:4769`) — the same INLINE editor component Pi's default
+    /// `ExtensionEditorComponent` provides, never a teardown to `$EDITOR`.
+    fn open_branch_summary_instructions(&mut self) {
+        let title = SelectorKind::BranchSummaryInstructions.title().to_string();
+        self.open_boxed_selector(
+            SelectorKind::BranchSummaryInstructions,
+            Box::new(ExtensionEditorSelector::new(title, "")),
+        );
+    }
+
+    /// Dispatch the `/tree` navigation the user committed to (Pi `interactive-mode.ts:4781-4820`).
+    ///
+    /// Pi aborts an in-flight response FIRST — "the user committed to navigating: stop the active
+    /// response" (`:4781-4785`), restoring the queued messages to the editor on the way — then runs
+    /// `navigateTree`. cyrup did neither before SESS-023.
+    ///
+    /// The navigation itself is SPAWNED whenever a run loop is present, never awaited on the loop
+    /// task. A summarizing navigation is a provider round-trip plus retry backoff; awaited inline in
+    /// `App::run`'s `select!` it would freeze the loop for the whole call, so no keystroke could
+    /// reach `abort_branch_summary` and no `IndicatorKind::BranchSummary` frame could ever render —
+    /// exactly the residual `execute_command`'s own doc comment flags. The outcome comes back over
+    /// [`Self::tree_nav_tx`] and is applied by [`Self::apply_tree_nav_outcome`].
+    async fn begin_tree_navigation(
+        &mut self,
+        session: &Arc<AgentSession>,
+        target: String,
+        summarize: bool,
+        custom_instructions: Option<String>,
+    ) {
+        // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
+        if session.is_streaming().await {
+            let (steering, follow_up) = session.drain_queue().await;
+            let queued: Vec<String> = steering.into_iter().chain(follow_up).collect();
+            self.restore_queued_to_editor(&queued);
+            session.abort();
+        }
+        let opts = NavigateTreeOptions {
+            summarize,
+            custom_instructions,
+            ..NavigateTreeOptions::default()
+        };
+        let entry = cyrup_core::EntryId::from(target.as_str());
+        let Some(tx) = self.tree_nav_tx.clone() else {
+            // No run loop (unit/embedder driving `execute_command` directly): await inline. Safe
+            // for the non-summarizing path, which makes no model call.
+            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            self.apply_tree_nav_outcome(TreeNavMsg { target, outcome });
+            return;
+        };
+        if summarize {
+            // Pi shows the `BranchSummaryStatusIndicator` and rebinds Escape for the duration
+            // (`:4796-4799`, `:4792-4795`); both are torn down in `apply_tree_nav_outcome`.
+            self.state.branch_summary_in_flight = true;
+            self.state
+                .indicator
+                .set(IndicatorKind::BranchSummary, Some("Summarizing branch…".to_string()));
+        }
+        let session = session.clone();
+        tokio::spawn(async move {
+            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            let _ = tx.send(TreeNavMsg { target, outcome });
+        });
+    }
+
+    /// Apply a settled `/tree` navigation (Pi `interactive-mode.ts:4805-4820`).
+    ///
+    /// The arm ORDER is load-bearing and was wrong before SESS-023: cyrup returns
+    /// `{cancelled: true, aborted: true}` on an aborted summarization (matching Pi
+    /// `agent-session.ts:3000-3001`), and the old code tested `cancelled` first — so aborting a
+    /// summarization printed "tree navigation cancelled" and silently swallowed the tree. Pi tests
+    /// `result.aborted` first (`:4805`) and re-shows the tree at the same entry, then `cancelled`
+    /// (`:4809`).
+    ///
+    /// `pub` so `tests/*.rs` can drive the settle half without a live run loop, the same reason
+    /// [`Self::open_extension_dialog`] is public.
+    pub fn apply_tree_nav_outcome(&mut self, msg: TreeNavMsg) -> Option<AppCommand> {
+        let TreeNavMsg { target, outcome } = msg;
+        // Pi's `finally` (`:4830-4833`): clear the indicator and restore the Escape binding
+        // regardless of how the navigation ended.
+        if self.state.branch_summary_in_flight {
+            self.state.branch_summary_in_flight = false;
+            if self.state.indicator.kind() == IndicatorKind::BranchSummary
+                || self.state.indicator.kind() == IndicatorKind::Retry
+            {
+                if self.state.status.streaming {
+                    self.state.indicator.working();
+                } else {
+                    self.state.indicator.idle();
+                }
+            }
+        }
+        match outcome {
+            Ok(o) if o.aborted => {
+                // Pi `:4805-4808` — status, then re-show the tree at the same entry.
+                self.state.transcript.push_status("Branch summarization cancelled");
+                self.state.pending_tree_nav = Some(PendingTreeNav { target });
+                return Some(AppCommand::OpenSelector(SelectorKind::Tree));
+            }
+            Ok(o) if o.cancelled => {
+                self.state.transcript.push_status("Navigation cancelled");
+            }
+            Ok(o) => {
+                if let Some(text) = o.editor_text {
+                    self.state.editor.set_text(&text);
+                }
+                // A summarized branch navigation records a branch-summary message
+                // (`branch-summary-message.ts`) into the transcript.
+                if let Some(entry) = o.summary_entry {
+                    self.state.transcript.push_branch_summary(entry.summary);
+                }
+                self.state.transcript.push_status("navigated session tree");
+            }
+            Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+        }
+        None
+    }
+
     /// Render a loaded extension's `ui.{confirm,select,input}` dialog request in the input slot (L4
     /// review §2.1; `ui.editor` is handled synchronously by the caller, never reaching here — see
     /// [`App::run`]'s `ui_rx` arm). Mirrors Pi's `createExtensionUIContext`
@@ -1659,6 +2010,144 @@ impl<B: Backend> App<B> {
         }
         self.open_boxed_selector(selector_kind, inner);
         self.state.pending_ui_reply = Some(PendingUiReply { kind, reply, base_title, deadline });
+    }
+
+    /// Bind BOTH extension-UI seams of a session's host services to this run loop — the single place
+    /// [`App::run`] and its session-swap arm attach the TUI, mirroring `cyrup-modes`' `run_rpc` /
+    /// `rebind_session`, which install the same pair for RPC mode.
+    ///
+    /// The pair is not optional: [`UiSink`] carries the request/reply dialogs
+    /// (`ui.{confirm,input,select,editor}`) and [`UiEffectSink`] carries the fire-and-forget mutators
+    /// (`ui.{notify,set-status,set-widget,set-header,set-footer,set-title,set-editor-text,
+    /// paste-editor-text,set-tools-expanded}`). `LiveHostServices` drops an effect outright when the
+    /// effect sink is `None` — its headless (print/json) policy, Pi's `noOpUIContext`
+    /// (`extensions/runner.ts:230-265`). Interactive is not headless in Pi: it passes a real
+    /// `uiContext` (`interactive-mode.ts:2223-2268`), so installing only the dialog half made every
+    /// fire-and-forget extension UI call vanish in the DEFAULT mode while working over RPC (TUI-S01).
+    ///
+    /// Must be re-run against every swapped-in session (`/new`, `/resume`, `/fork`, `/reload`,
+    /// `/import`, or a runtime-side `SessionReplaced`): a replacement session brings a fresh
+    /// `LiveHostServices` whose sinks are both `None`.
+    pub fn install_ui_sinks(
+        services: &cyrup_session_svc::LiveHostServices,
+        ui: cyrup_session_svc::UiSink,
+        effects: cyrup_session_svc::UiEffectSink,
+    ) {
+        services.set_ui_sink(ui);
+        services.set_ui_effect_sink(effects);
+    }
+
+    /// Bind the THIRD extension seam of a session — the contained-fault listener Pi's interactive
+    /// mode passes as `bindExtensions({ … onError })` (`interactive-mode.ts:1700-1701`:
+    /// `onError: (error) => { this.showExtensionError(error.extensionPath, error.error,
+    /// error.stack); }`).
+    ///
+    /// A guest handler fault is CONTAINED by the dispatcher (R-08-036) — the handler is skipped
+    /// (fail open) or the action is blocked (fail closed) and the host survives either way — and is
+    /// then reported to every registered listener. `cyrup-modes`' `run_rpc` registers one
+    /// (`rpc.rs`'s `error_listener`, emitting an `extension_error` line) and its `rebind_session`
+    /// re-registers it on every swap; the interactive TUI registered NONE, so with no listener
+    /// `Dispatcher::report` degraded to a `tracing::warn!` that no TUI user ever sees. A broken
+    /// extension therefore silently ate its own hook — or silently DENIED a tool — in the DEFAULT
+    /// mode while an RPC client on the same session saw the fault (TUI-S02).
+    ///
+    /// The listener is invoked SYNCHRONOUSLY from whatever worker thread the faulting dispatch ran
+    /// on, so it only forwards onto an unbounded channel the run loop drains; the drain arm calls
+    /// [`Self::show_extension_error`].
+    ///
+    /// Must be re-run against every swapped-in session for the same reason
+    /// [`Self::install_ui_sinks`] must: a replacement session brings a fresh `ExtensionHost` with an
+    /// empty listener list (Pi re-binds `onError` from `rebindSession` too).
+    pub fn install_error_listener(
+        ext_host: &cyrup_ext::ExtensionHost,
+        errors: tokio::sync::mpsc::UnboundedSender<cyrup_ext::ExtensionError>,
+    ) {
+        ext_host.add_error_listener(std::sync::Arc::new(
+            move |err: &cyrup_ext::ExtensionError| {
+                let _ = errors.send(err.clone());
+            },
+        ));
+    }
+
+    /// Render one contained extension fault into the transcript — Pi `showExtensionError`
+    /// (`interactive-mode.ts:2545-2560`), whose copy is
+    /// `Extension "${extensionPath}" error: ${error}` in the `error` colour.
+    ///
+    /// Pi appends a dimmed, indented stack trace when the thrown value carried one; cyrup's
+    /// [`cyrup_ext::ExtensionError`] has no `stack` field (a contained fault is an `ExtError`
+    /// string, not a JS `Error` object), so only the message line is emitted.
+    ///
+    /// `pub` for the same reason [`Self::apply_ui_effect`] is: `tests/*.rs` drive the run loop's
+    /// drain arm directly, since `App::run` needs a real terminal event source.
+    pub fn show_extension_error(&mut self, err: &cyrup_ext::ExtensionError) {
+        self.state
+            .transcript
+            .push_error(format!("Extension \"{}\" error: {}", err.extension.as_str(), err.error));
+    }
+
+    /// Apply one fire-and-forget extension UI effect — the interactive-TUI half of the
+    /// [`UiEffectSink`] seam `cyrup-modes`' `run_rpc` already drives for RPC mode.
+    ///
+    /// Pi builds a real `uiContext` for interactive mode (`interactive-mode.ts:2223-2268`) whose
+    /// mutators land on concrete TUI state; only headless modes get `noOpUIContext`
+    /// (`extensions/runner.ts:230-265`). Cyrup installed the request/reply [`UiSink`] here but never
+    /// the effect sink, so every `notify`/`setStatus`/`setTitle`/`setEditorText`/`pasteToEditor`/
+    /// `setToolsExpanded`/`setWidget`/`setHeader`/`setFooter` call was dropped by
+    /// `LiveHostServices::emit_ui_effect` in the DEFAULT mode while working over RPC.
+    ///
+    /// Per-variant mapping (each cites the Pi interactive handler it ports):
+    /// * `Notify` → `showExtensionNotify` (`:2518-2526`): `error` → `showError`, `warning` →
+    ///   `showWarning`, otherwise `showStatus`.
+    /// * `SetStatus` → `setExtensionStatus` (`:1920-1923`) → the footer's extension-status line.
+    /// * `SetEditorText` → `this.editor.setText(text)` (`:2241`); `is_paste` (`pasteToEditor`,
+    ///   `:2240`, which wraps the text in bracketed-paste markers and re-feeds the editor) → the
+    ///   editor's real paste path, so the same sanitization applies.
+    /// * `SetToolsExpanded` → `setToolsExpanded` (`:3887-3903`), including its no-op early-out and
+    ///   its `Tool output: expanded|collapsed` status echo.
+    /// * `SetTitle` → retained on [`AppState::terminal_title`]; the crossterm run loop writes the
+    ///   OSC 0 sequence (`terminal.ts:504-507`), which a `TestBackend` app must not do.
+    /// * `SetWidget`/`SetHeader`/`SetFooter` → retained on [`AppState`]. These now ARRIVE (they used
+    ///   to be discarded before leaving `LiveHostServices`) but cyrup's TUI has no extension chrome
+    ///   slot to draw them in, so TUI-014 stays open — see those fields' docs.
+    ///
+    /// `pub` for the same reason [`Self::open_extension_dialog`] is: `tests/*.rs` drive it directly.
+    pub fn apply_ui_effect(&mut self, effect: UiEffect) {
+        match effect {
+            UiEffect::Notify { message, kind } => match kind {
+                NotifyKind::Error => {
+                    // Pi `showError` prefixes the copy (`interactive-mode.ts:3952`).
+                    self.state.transcript.push_error(format!("Error: {message}"));
+                }
+                NotifyKind::Warning => {
+                    self.state.transcript.push_warning(format!("Warning: {message}"));
+                }
+                NotifyKind::Info => self.state.transcript.push_status(message),
+            },
+            UiEffect::SetStatus { key, text } => {
+                // `text: None` clears the key — `StatusLine::set_extension_status` already treats an
+                // empty value as a removal (Pi `footer.ts:233`).
+                self.state.status.set_extension_status(key, text.unwrap_or_default());
+            }
+            UiEffect::SetEditorText { text, is_paste } => {
+                if is_paste {
+                    self.state.editor.handle_paste(&text);
+                } else {
+                    self.state.editor.set_text(&text);
+                }
+            }
+            UiEffect::SetToolsExpanded { expanded } => {
+                if self.state.transcript.set_tool_expanded(expanded) {
+                    self.state.transcript.push_status(format!(
+                        "Tool output: {}",
+                        if expanded { "expanded" } else { "collapsed" }
+                    ));
+                }
+            }
+            UiEffect::SetTitle { title } => self.state.terminal_title = Some(title),
+            UiEffect::SetHeader { content } => self.state.extension_header = Some(content),
+            UiEffect::SetFooter { content } => self.state.extension_footer = Some(content),
+            UiEffect::SetWidget { widget } => self.state.extension_widget = Some(widget),
+        }
     }
 
     /// Advance the open extension-UI dialog's countdown by one tick (Pi's `CountdownTimer`'s 1s
@@ -1766,6 +2255,23 @@ impl<B: Backend> App<B> {
                     let _ = pending.reply.send(default_ui_reply(pending.kind));
                 }
                 self.close_selector(true);
+                // The two `/tree` summarization prompts each have their OWN Escape destination in Pi
+                // (`interactive-mode.ts:4761-4765`, `:4770-4773`), not a plain dismiss:
+                match kind {
+                    // "Summarize branch?" → back to the tree selector, same selection (`:4763`).
+                    // `pending_tree_nav` is deliberately LEFT SET: the tree-open arm consumes it as
+                    // the initial selection, which is what `showTreeSelector(entryId)` means.
+                    SelectorKind::BranchSummary => {
+                        return AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree));
+                    }
+                    // The custom-instructions editor → back to the prompt (Pi's `continue`, `:4772`),
+                    // NOT out of the flow: the pending target is deliberately kept.
+                    SelectorKind::BranchSummaryInstructions => {
+                        self.open_branch_summary_prompt();
+                        return AppAction::Redraw;
+                    }
+                    _ => {}
+                }
                 AppAction::Redraw
             }
             // A `/settings` submenu row (Pi `SettingItem.submenu`, settings-selector.ts:603-610):
@@ -1921,6 +2427,20 @@ impl<B: Backend> App<B> {
                         dag.iter().map(tree_node_from_dag).collect();
                     let mut tree = TreeSelector::new(nodes);
                     tree.set_keymap(self.state.tree_keymap.clone());
+                    // `treeFilterMode` — the filter `/tree` OPENS with (Pi reads
+                    // `settingsManager.getTreeFilterMode()` into `initialFilterMode` at
+                    // `interactive-mode.ts:4644` and hands it to `TreeSelectorComponent`, which seeds
+                    // `this.filterMode` at `tree-selector.ts:137`). Read per open, not cached, so a
+                    // `/settings` change takes effect on the next `/tree` exactly as it does in Pi.
+                    tree.set_filter(crate::tree_selector::FilterMode::from_setting(
+                        &session.services().settings.effective().tree_filter_mode(),
+                    ));
+                    // Pi re-shows the tree AT THE SAME ENTRY after an escaped summarize prompt or an
+                    // aborted summarization (`showTreeSelector(entryId)`,
+                    // `interactive-mode.ts:4763,4807`); both paths park the id here.
+                    if let Some(pending) = self.state.pending_tree_nav.take() {
+                        tree.select_id(&pending.target);
+                    }
                     self.open_boxed_selector(SelectorKind::Tree, Box::new(tree));
                 }
             }
@@ -2049,27 +2569,41 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
             }
             C::ConfirmSelection { kind: SelectorKind::Tree, value } => {
-                // Confirming a tree row navigates the leaf to that entry (Pi `navigateTree`,
-                // agent-session.ts:2704). A user/custom target re-roots at its parent and yields the
-                // target text as re-editable `editor_text`; cancel/no-op is surfaced as a status line.
-                let entry = cyrup_core::EntryId::from(value.as_str());
-                match session.navigate_tree(entry, NavigateTreeOptions::default()).await {
-                    Ok(outcome) if outcome.cancelled => {
-                        self.state.transcript.push_status("tree navigation cancelled");
-                    }
-                    Ok(outcome) => {
-                        if let Some(text) = outcome.editor_text {
-                            self.state.editor.set_text(&text);
-                        }
-                        // A summarized branch navigation records a branch-summary message
-                        // (`branch-summary-message.ts`) into the transcript.
-                        if let Some(entry) = outcome.summary_entry {
-                            self.state.transcript.push_branch_summary(entry.summary);
-                        }
-                        self.state.transcript.push_status("navigated session tree");
-                    }
-                    Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+                // Confirming a tree row ASKS ABOUT SUMMARIZATION FIRST (Pi
+                // `interactive-mode.ts:4744-4779`), then navigates. Before SESS-023 this arm called
+                // `navigate_tree(.., NavigateTreeOptions::default())` — `summarize` hard-false — so
+                // the entire branch-summary stack was unreachable from the shipped binary and
+                // `branchSummary.skipPrompt` was a no-op.
+                //
+                // Pi's `getBranchSummarySkipPrompt()` gate (`:4753`) is a FRONT-END decision: when
+                // set, skip the prompt entirely and navigate with `wantsSummary = false`.
+                if session.services().settings.effective().branch_summary_skip_prompt() {
+                    self.begin_tree_navigation(session, value, false, None).await;
+                } else {
+                    self.state.pending_tree_nav = Some(PendingTreeNav { target: value });
+                    self.open_branch_summary_prompt();
                 }
+            }
+            C::ConfirmSelection { kind: SelectorKind::BranchSummary, value } => {
+                // The three-option answer (Pi `:4755-4777`). `custom` opens the instructions editor
+                // and keeps the pending target; the other two dispatch the navigation directly.
+                // `wantsSummary = summaryChoice !== "No summary"` (`:4767`).
+                if value == BRANCH_SUMMARY_CUSTOM {
+                    self.open_branch_summary_instructions();
+                } else {
+                    let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                    let summarize = value != BRANCH_SUMMARY_NONE;
+                    self.begin_tree_navigation(session, pending.target, summarize, None).await;
+                }
+            }
+            C::ConfirmSelection { kind: SelectorKind::BranchSummaryInstructions, value } => {
+                // Pi `showExtensionEditor` returned a string (`:4769`): a complete choice, so the
+                // prompt loop breaks and the navigation runs with `summarize: true`. An EMPTY string
+                // is still a value (only `undefined`/Escape loops back), so it is forwarded as
+                // `None` custom instructions rather than an empty override.
+                let Some(pending) = self.state.pending_tree_nav.take() else { return };
+                let instructions = (!value.trim().is_empty()).then_some(value);
+                self.begin_tree_navigation(session, pending.target, true, instructions).await;
             }
             C::ConfirmSelection { kind: SelectorKind::Model, value } => {
                 match session.set_model(&value).await {
@@ -2324,6 +2858,33 @@ impl<B: Backend> App<B> {
                 {
                     self.state.transcript.set_image_width_cells(cells);
                 }
+                // `editorPaddingX` is live in Pi too — `onEditorPaddingChange` writes the setting and
+                // then calls `setPaddingX` on the live editor (`settings-selector.ts:687-689` →
+                // `interactive-mode.ts:5393-5399`), so the rules re-inset on the very next frame.
+                if id == "editorPaddingX"
+                    && let Ok(pad) = value.parse::<i64>()
+                {
+                    self.state.editor.set_padding_x(pad);
+                }
+                // Same for `showHardwareCursor` (Pi `onShowHardwareCursorChange` →
+                // `ui.setShowHardwareCursor(enabled)`, `tui.ts:346-352`, which hides the cursor
+                // immediately when turned off rather than waiting for a rebind).
+                if id == "showHardwareCursor" {
+                    self.state.editor.set_show_hardware_cursor(value == "true");
+                }
+                // `enableSkillCommands` gates the `skill:<name>` half of the `/` menu
+                // (`interactive-mode.ts:613`); Pi rebuilds the autocomplete provider on the change,
+                // so rebuild the registry from the SAME catalog with the new gate.
+                if id == "enableSkillCommands" {
+                    self.state
+                        .editor
+                        .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                            crate::commands::dynamic_commands_from_catalog_gated(
+                                &session.slash_command_catalog(),
+                                value == "true",
+                            ),
+                        ));
+                }
                 match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
@@ -2401,19 +2962,30 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
             C::SessionInfo => {
+                // Pi's `/session` renderer (interactive-mode.ts:5724-5763) reads exactly these
+                // fields off `getSessionStats()`; cyrup renders them as its own markdown table.
                 let stats = session.session_stats().await;
                 let body = format!(
                     "| Field | Value |\n|-------|-------|\n\
+                     | file | {} |\n| id | {} |\n\
                      | messages | {} |\n| user | {} |\n| assistant | {} |\n\
-                     | tool results | {} |\n| input tokens | {} |\n| output tokens | {} |\n\
-                     | cache tokens | {} |\n",
-                    stats.message_count,
-                    stats.user_message_count,
-                    stats.assistant_message_count,
-                    stats.tool_result_count,
-                    stats.input_tokens,
-                    stats.output_tokens,
-                    stats.cache_tokens,
+                     | tool calls | {} |\n| tool results | {} |\n\
+                     | input tokens | {} |\n| output tokens | {} |\n\
+                     | cache read | {} |\n| cache write | {} |\n| total tokens | {} |\n\
+                     | cost | ${:.3} |\n",
+                    stats.session_file.as_deref().unwrap_or("In-memory"),
+                    stats.session_id,
+                    stats.total_messages,
+                    stats.user_messages,
+                    stats.assistant_messages,
+                    stats.tool_calls,
+                    stats.tool_results,
+                    stats.tokens.input,
+                    stats.tokens.output,
+                    stats.tokens.cache_read,
+                    stats.tokens.cache_write,
+                    stats.tokens.total,
+                    stats.cost,
                 );
                 self.state.transcript.push_block("Session", body);
             }
@@ -2776,6 +3348,13 @@ impl<B: Backend> App<B> {
                 // Pi `interactive-mode.ts:2784` mirrors the renamed session into the header/status.
                 let label = name.clone().unwrap_or_default();
                 self.state.transcript.push_status(format!("session renamed → {label}"));
+                // Pi's `session_info_changed` arm (`interactive-mode.ts:2900-2903`) is
+                // `updateTerminalTitle()` + `footer.invalidate()`: the new name reaches BOTH the
+                // footer's location line (` • {name}`, footer.ts:116-130) and the window title. The
+                // recomputed title is written by the crossterm run loop (see
+                // [`Self::update_terminal_title`]).
+                self.state.status.set_session_name(name.clone());
+                let _ = self.update_terminal_title();
             }
             AgentSessionEvent::EntryAppended { entry } => {
                 // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
@@ -2909,7 +3488,12 @@ fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Option<String> 
                 _ => "Unknown error",
             }
         )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
+        // `Pending` is the in-flight sentinel, so it must render like Pi's: Pi's chain is
+        // `if (stopReason === "length") … else if (!hasToolCalls) { if ("aborted") … else if
+        // ("error") … }` (assistant-message.ts:177-201), and `"pending"` matches none of them —
+        // no notice. Grouped explicitly rather than via a `_ =>` so a future variant still breaks
+        // this match, which is how this arm got written in the first place.
+        StopReason::Pending | StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
     }
 }
 
@@ -3281,7 +3865,13 @@ fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> Option<Stri
     None
 }
 
-fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
+/// Project one flattened [`SessionDagNode`] into the `/tree` selector's [`TreeNode`].
+///
+/// `pub` so the projection can be driven directly from a test with a hand-built `SessionDagNode`:
+/// it is the production converter (`App::run`'s `/tree` arm maps the whole `session_dag()` through
+/// it, `:2338`), and the alternative — standing a real multi-branch `AgentSession` up inside a TUI
+/// test — would exercise the session layer rather than this mapping.
+pub fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
     let kind = match n.kind {
         SessionDagKind::Message | SessionDagKind::Other => TreeKind::Message,
         SessionDagKind::Tool => TreeKind::ToolGroup,
@@ -3297,7 +3887,26 @@ fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
         foldable: n.foldable,
         folded: false,
         has_label: n.has_label,
-        time_label: n.is_leaf.then(|| "current".to_string()),
+        // Pi's column here is `labelTimestamp` — WHEN the entry's label was set — and the row it
+        // decorates is a labeled one (`tree-selector.ts:741-743`). It was previously fed the literal
+        // string `"current"` on the branch tip, which is neither: the `t` toggle
+        // (`app.tree.toggleLabelTimestamp`) rendered the word "current" where Pi renders a clock
+        // time, and did so on an unlabeled row, in a column Pi leaves off by default.
+        //
+        // Pi does mark the active path, just not here: `pathMarker` is a `•` prefix ahead of the
+        // entry text, driven by an `activePathIds` SET covering the whole root→tip path
+        // (`tree-selector.ts:736-738`). `SessionDagNode` carries only `is_leaf`, so that marker is
+        // not portable from here either; it is not a substitute this column can hold.
+        //
+        // Set to `None` until the value exists to put here. It is dropped one and two layers down,
+        // not in this crate: `cyrup_session::TreeNode` (manager.rs:29-34) has no timestamp field
+        // even though `SessionManager::labels` already holds `(label, label-change timestamp)`
+        // (manager.rs:43-44), so `SessionDagNode` (cyrup-session-svc session.rs:136-155) has nothing
+        // to carry — its `timestamp` is the ENTRY's, a different quantity. Threading the label
+        // timestamp through those two crates is the remaining half of this fix; the render side
+        // (Pi's gate, Pi's default, Pi's `[+label time]` marker) is done and will display it the
+        // moment a producer sets it.
+        time_label: None,
     }
 }
 
@@ -3678,7 +4287,14 @@ fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppStat
 impl App<CrosstermBackend<Stdout>> {
     /// Build the production app: raw mode on, bracketed paste + Kitty keyboard flags enabled
     /// (best-effort, with graceful fallback, R-ARCH-TUI-008), inline viewport on stdout.
+    ///
+    /// The panic hook goes in FIRST, before a single terminal mode is touched, so the window it
+    /// covers is a superset of the window that can leave the terminal broken — a panic between
+    /// `enable_raw_mode` and the return of this function is exactly as fatal to the user's shell as
+    /// one during the event loop. Ports pi's `uncaughtCrash` install
+    /// (`interactive-mode.ts:3684-3686`, handler at `:3622-3638`).
     pub fn into_stdout(theme: UiTheme) -> Result<Self, TuiError> {
+        crate::panic_hook::install_panic_hook();
         enable_raw_mode()?;
         let mut out = io::stdout();
         out.execute(ratatui::crossterm::event::EnableBracketedPaste)?;
@@ -3687,6 +4303,14 @@ impl App<CrosstermBackend<Stdout>> {
             out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+        // …and then ASK whether the push took, instead of assuming it did (Pi
+        // `queryAndEnableKittyProtocol`, `tui/src/terminal.ts:213-226`). The query has to follow the
+        // push — `CSI ? u` reports the top of the terminal's flag stack — and it has to run HERE:
+        // this is the one window where raw mode is on and no crossterm reader thread is competing
+        // for the reply (see `crate::keyboard_protocol`'s module docs, and
+        // `crate::terminal_query`'s for the read's timeout/input-safety contract). The recorded
+        // outcome is what the re-entry paths below re-apply and what the startup diagnostics read.
+        let _ = crate::keyboard_protocol::negotiate();
         App::new(CrosstermBackend::new(out), theme)
     }
 
@@ -3697,17 +4321,6 @@ impl App<CrosstermBackend<Stdout>> {
         let res = self.draw();
         let _ = out.execute(EndSynchronizedUpdate);
         res
-    }
-
-    /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
-    /// cursor. Total and idempotent so a `Drop` guard / error path always leaves a usable terminal.
-    pub fn restore(&mut self) -> Result<(), TuiError> {
-        let mut out = io::stdout();
-        let _ = execute!(out, PopKeyboardEnhancementFlags);
-        let _ = out.execute(ratatui::crossterm::event::DisableBracketedPaste);
-        let _ = disable_raw_mode();
-        let _ = self.terminal.show_cursor();
-        Ok(())
     }
 
     /// Suspend the process to the background (Ctrl+Z / `app.suspend`, `core/keybindings.ts`): tear the
@@ -3726,7 +4339,10 @@ impl App<CrosstermBackend<Stdout>> {
             let pid = std::process::id().to_string();
             let _ = std::process::Command::new("kill").args(["-s", "TSTP", &pid]).status();
         }
-        // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region.
+        // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region. The flags
+        // are re-pushed unconditionally, exactly as Pi's `start()` does (`terminal.ts:164-166`) —
+        // NOT re-negotiated: the crossterm reader thread is live by now, so a `CSI ? u` reply would
+        // race it (`crate::keyboard_protocol` module docs). The startup decision still stands.
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
@@ -3809,7 +4425,8 @@ impl App<CrosstermBackend<Stdout>> {
         let result = run_editor_over_file(editor_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
 
-        // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws.
+        // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws. Re-pushed, never
+        // re-negotiated — same reason as `suspend` above.
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
@@ -3847,7 +4464,59 @@ impl App<CrosstermBackend<Stdout>> {
         // (only when a TUI is present — `App::run` is never invoked headless) and re-installed on every
         // session swap below, since a replacement session brings a fresh `LiveHostServices`.
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
-        session.services().host_services.set_ui_sink(ui_tx.clone());
+        // The FIRE-AND-FORGET sibling of `ui_tx` (TUI-S01). `LiveHostServices::emit_ui_effect` drops
+        // every `ui.{notify,set-status,set-widget,set-header,set-footer,set-title,set-editor-text,
+        // paste-editor-text,set-tools-expanded}` call when this sink is unset, which is exactly Pi's
+        // headless `noOpUIContext` policy (`extensions/runner.ts:230-265`) — but interactive is NOT
+        // headless in Pi: it passes a real `uiContext` (`interactive-mode.ts:2223-2268`). Cyrup's RPC
+        // mode already installs this (`crates/cyrup-modes/src/rpc.rs`'s `run_rpc`); without the same
+        // install here every fire-and-forget extension UI call vanished in the DEFAULT mode. Also
+        // re-installed on session swap below, for the same reason `ui_tx` is.
+        let (ui_effect_tx, mut ui_effect_rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        // The THIRD extension seam (TUI-S02): the contained-fault listener Pi's interactive mode
+        // passes as `bindExtensions({ … onError })` (`interactive-mode.ts:1700-1701`). Every guest
+        // handler fault the dispatcher contains + skips — or contains and turns into a BLOCK — is
+        // reported here and drawn into the transcript by the `ext_error_rx` arm below
+        // (`show_extension_error`). RPC mode has had this since `run_rpc` was written; interactive
+        // had nothing, so `Dispatcher::report` degraded to a `tracing::warn!` and the fault was
+        // invisible in the DEFAULT mode. Re-installed on session swap below, for the same reason
+        // `ui_tx` is: a replacement session brings a fresh `ExtensionHost`.
+        let (ext_error_tx, mut ext_error_rx) =
+            tokio::sync::mpsc::unbounded_channel::<cyrup_ext::ExtensionError>();
+        Self::install_ui_sinks(
+            &session.services().host_services,
+            ui_tx.clone(),
+            ui_effect_tx.clone(),
+        );
+        Self::install_error_listener(&session.services().ext_host, ext_error_tx.clone());
+        // The `/` menu's dynamic half (pi `interactive-mode.ts:1240-1300`). `slash_command_catalog()`
+        // already merges registered extension commands, prompt templates and skills — it was just
+        // never consumed outside RPC mode, so the interactive `/` list showed builtins only while an
+        // RPC client saw everything from the SAME session. Re-installed on session swap below, for
+        // the same reason the sinks are: a replacement session brings different extensions.
+        // …gated by `enableSkillCommands`, which Pi applies at exactly this seam
+        // (`interactive-mode.ts:613`) and nowhere else.
+        self.state
+            .editor
+            .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                crate::commands::dynamic_commands_from_catalog_gated(
+                    &session.slash_command_catalog(),
+                    session.services().settings.effective().enable_skill_commands(),
+                ),
+            ));
+        // `editorPaddingX` + `showHardwareCursor` — Pi seeds both while CONSTRUCTING the editor and
+        // the TUI (`interactive-mode.ts:459` `new TUI(terminal, getShowHardwareCursor(), …)` and
+        // `:470-474` `new CustomEditor(…, { paddingX: getEditorPaddingX(), … })`), so the very first
+        // frame must already honour them. Re-applied on `/settings` cycle and on session swap below.
+        {
+            let eff = session.services().settings.effective();
+            self.state.editor.set_padding_x(eff.editor_padding_x());
+            self.state
+                .editor
+                .set_show_hardware_cursor(
+                    eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
+                );
+        }
         // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
         // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
         // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
@@ -3868,6 +4537,20 @@ impl App<CrosstermBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // The automatic window title (Pi `updateTerminalTitle`, interactive-mode.ts:818-826, called
+        // at `:860` right after `init()`): `cyrup - <session name> - <cwd basename>`. Both inputs are
+        // read from the LIVE session here — the name Pi reads via `sessionManager.getSessionName()`
+        // and the cwd via `getCwd()` (the runtime's, which a `/resume` of a session recorded
+        // elsewhere moves; the process cwd is the fallback seeded in `AppState::new`). Refreshed on
+        // `session_info_changed` (`ingest_event`) and on every session swap (the `session_swapped`
+        // arm below), which is exactly Pi's `:2901` / `:1761` call sites.
+        if let Some(rt) = runtime.as_ref() {
+            self.state.title_cwd = rt.cwd().to_path_buf();
+        }
+        self.state.status.set_session_name(session.session_name().await);
+        if let Some(title) = self.update_terminal_title() {
+            write_terminal_title(&title);
+        }
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -3889,6 +4572,28 @@ impl App<CrosstermBackend<Stdout>> {
         // `AppAction::ExtensionShortcut` arm below for why); this channel carries its status/error
         // line back to the transcript once it settles, mirroring the `bash_rx` pattern above.
         let (shortcut_status_tx, mut shortcut_status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // The tmux keyboard-setup diagnostic (Pi `checkTmuxKeyboardSetup`, interactive-mode.ts:940-988,
+        // wired at `:865-869`). Spawned, never awaited: Pi starts it alongside the version/package
+        // checks and shows the warning whenever it settles, so a wedged `tmux show` (bounded at 2 s)
+        // delays no frame. The sender is kept alive HERE, as a run-loop local, for the same reason
+        // `shortcut_status_tx` is: a closed channel would make its `select!` arm's `Some(..)` pattern
+        // fail on every iteration.
+        let (tmux_warning_tx, mut tmux_warning_rx) =
+            tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        {
+            let tx = tmux_warning_tx.clone();
+            tokio::spawn(async move {
+                if let Some(warning) = crate::tmux::check_keyboard_setup().await {
+                    let _ = tx.send(warning);
+                }
+            });
+        }
+        // A `/tree` navigation runs on its OWN task (see `App::begin_tree_navigation`) and posts its
+        // outcome back here, so a branch summarization's provider round-trip never blocks this loop
+        // — the same channel-back shape as `bash_rx` / `shortcut_status_rx`. Installing the sender is
+        // what makes the spawned path (and therefore Escape→abort and the live
+        // `IndicatorKind::BranchSummary` spinner) reachable at all.
+        let mut tree_nav_rx = self.install_tree_nav_channel();
         loop {
             let theme_changed = async {
                 match theme_rx.as_mut() {
@@ -3956,6 +4661,12 @@ impl App<CrosstermBackend<Stdout>> {
                             if let Some(c) = bash_cancel.take() {
                                 c.cancel();
                             }
+                        }
+                        AppAction::AbortBranchSummary => {
+                            // Pi `:4793` — cancel the summarization only. The spawned navigation
+                            // resolves with `{cancelled: true, aborted: true}`, and the `tree_nav_rx`
+                            // arm re-shows the tree; the indicator/Escape rebind are torn down there.
+                            session.abort_branch_summary();
                         }
                         AppAction::RunBash { command, .. } => {
                             // Replace any prior job (its token is dropped → child orphaned-but-exits).
@@ -4111,8 +4822,47 @@ impl App<CrosstermBackend<Stdout>> {
                     self.open_extension_dialog(req);
                     self.draw_synchronized()?;
                 }
+                Some(effect) = ui_effect_rx.recv() => {
+                    // The fire-and-forget counterpart of the `ui_rx` arm above: a loaded guest pushed
+                    // a `ui.*` mutator and did NOT block on a reply, so there is nothing to answer —
+                    // just apply it and redraw (Pi's mutators end in `this.ui.requestRender()`).
+                    if let UiEffect::SetTitle { title } = &effect {
+                        // Pi `setTitle` reaches the terminal, not a component
+                        // (`interactive-mode.ts:2238` → `terminal.ts:504-507`), so it is written here
+                        // on the crossterm path rather than inside the backend-generic
+                        // `apply_ui_effect`.
+                        write_terminal_title(title);
+                    }
+                    self.apply_ui_effect(effect);
+                    self.draw_synchronized()?;
+                }
+                Some(err) = ext_error_rx.recv() => {
+                    // A guest handler faulted and the dispatcher CONTAINED it (R-08-036). Pi shows
+                    // it: `onError: (error) => this.showExtensionError(...)`
+                    // (`interactive-mode.ts:1700-1701`). Without this arm the fault reached only
+                    // `tracing`, so a broken extension silently ate its hook — or silently denied a
+                    // tool — with nothing on screen (TUI-S02).
+                    self.show_extension_error(&err);
+                    self.draw_synchronized()?;
+                }
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
+                    self.draw_synchronized()?;
+                }
+                Some(warning) = tmux_warning_rx.recv() => {
+                    // Pi `:866-868` — `showWarning`, whose copy is `Warning: {message}`
+                    // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
+                    // path uses in `apply_ui_effect`.
+                    self.state.transcript.push_warning(format!("Warning: {warning}"));
+                    self.draw_synchronized()?;
+                }
+                Some(msg) = tree_nav_rx.recv() => {
+                    // A spawned `/tree` navigation settled (Pi `interactive-mode.ts:4805-4820`). An
+                    // ABORTED summarization asks for the tree to be re-shown at the same entry, which
+                    // needs the session (`session_dag`), so it comes back as a follow-up command.
+                    if let Some(cmd) = self.apply_tree_nav_outcome(msg) {
+                        self.execute_command(cmd, &session, runtime.as_ref()).await;
+                    }
                     self.draw_synchronized()?;
                 }
                 maybe_ev = events.next() => {
@@ -4122,6 +4872,14 @@ impl App<CrosstermBackend<Stdout>> {
                     // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
                     let ext_host = session.services().ext_host.clone();
                     self.ingest_event_with_extensions(&ev, &ext_host).await;
+                    // A rename recomputed the window title inside `ingest_event`; the OSC 0 write is
+                    // this loop's (Pi `session_info_changed` → `updateTerminalTitle`, `:2900-2903`).
+                    // Gated on the event kind so no other event pays for a title recomputation.
+                    if matches!(ev, AgentSessionEvent::SessionInfoChanged { .. })
+                        && let Some(title) = self.state.terminal_title.clone()
+                    {
+                        write_terminal_title(&title);
+                    }
                     // SEAM-005 / EXT-005: a guest's `ctx.shutdown()` is honored at the settle point
                     // (Pi interactive-mode.ts:3137-3138 `case "agent_settled": await
                     // this.checkShutdownRequested()`), and only there — `agent_end` cannot tell us
@@ -4151,11 +4909,46 @@ impl App<CrosstermBackend<Stdout>> {
                         events = new_session.subscribe();
                         session = new_session;
                         self.rebind_session();
+                        // Pi re-titles the window from the newly bound session (`bindSession` →
+                        // `updateTerminalTitle`, interactive-mode.ts:1761): a `/new`, `/resume` or
+                        // `/fork` almost always changes the name, and a swap must never leave the
+                        // previous session's name in the tab. The cwd is the runtime's factory base
+                        // and does not move with the swap, so only the name is re-read.
+                        self.state.status.set_session_name(session.session_name().await);
+                        if let Some(title) = self.update_terminal_title() {
+                            write_terminal_title(&title);
+                        }
                         // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
                         // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
                         // same re-install this run loop's `AppAction::Command` rebind mirrors from
                         // `crates/cyrup-modes/src/rpc.rs`'s `run_rpc`).
-                        session.services().host_services.set_ui_sink(ui_tx.clone());
+                        Self::install_ui_sinks(
+                            &session.services().host_services,
+                            ui_tx.clone(),
+                            ui_effect_tx.clone(),
+                        );
+                        // ...and the fault listener, whose `ExtensionHost` is likewise brand new on
+                        // the swapped-in session (Pi re-binds `onError` from `rebindSession`, and
+                        // `crates/cyrup-modes/src/rpc.rs`'s `rebind_session` does the same).
+                        Self::install_error_listener(
+                            &session.services().ext_host,
+                            ext_error_tx.clone(),
+                        );
+                        // ...and the same for the `/` menu: a replacement session can load a
+                        // DIFFERENT extension set (`/reload` exists precisely to change it), so a
+                        // registry built from the previous session's catalog would be stale.
+                        self.state.editor.set_registry(
+                            crate::commands::CommandRegistry::with_dynamic(
+                                crate::commands::dynamic_commands_from_catalog_gated(
+                                    &session.slash_command_catalog(),
+                                    session
+                                        .services()
+                                        .settings
+                                        .effective()
+                                        .enable_skill_commands(),
+                                ),
+                            ),
+                        );
                         // `rebind_session` reset the transcript to Pi's default pad; re-read the
                         // swapped-in session's `outputPad` so a configured value survives the swap.
                         self.state.transcript.set_output_pad(
@@ -4169,6 +4962,15 @@ impl App<CrosstermBackend<Stdout>> {
                         self.state.transcript.set_show_images(self.state.show_images);
                         self.state.transcript.set_image_width_cells(
                             eff.image_width_cells().clamp(1, u16::MAX as i64) as u16,
+                        );
+                        // `editorPaddingX` / `showHardwareCursor` are per-settings-layer, and a swap
+                        // can move the project scope (`/resume` of a session recorded elsewhere), so
+                        // re-apply both — Pi does exactly this from `rebindSession`
+                        // (`interactive-mode.ts:1721-1732`: `ui.setShowHardwareCursor(...)` then
+                        // `defaultEditor.setPaddingX(getEditorPaddingX())`).
+                        self.state.editor.set_padding_x(eff.editor_padding_x());
+                        self.state.editor.set_show_hardware_cursor(
+                            eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
                         );
                                         // TUI-003: seed the view from the swapped-in session's conversation (Pi
                         // re-runs `renderInitialMessages()` after a tree/fork navigation,
@@ -4194,7 +4996,12 @@ impl App<CrosstermBackend<Stdout>> {
                 break;
             }
         }
-        self.restore()
+        // pi `interactive-mode.ts:3589-3591`: drain, THEN stop. The drain MUST happen here, before
+        // this function's own restore, not at the caller — `run` disables raw mode on the way out,
+        // so a drain after it returns is a guaranteed no-op on the exact path it exists for, and
+        // whatever is still queued (a late Kitty key-release report, or the Ctrl+D that asked for
+        // this quit) has already been handed to the parent shell.
+        self.drain_and_restore()
     }
 }
 
@@ -4270,26 +5077,63 @@ fn spawn_bash(command: String) -> (tokio::sync::mpsc::UnboundedReceiver<BashMsg>
     (rx, cancel)
 }
 
+/// Write the OSC 0 window-title sequence — Pi `ProcessTerminal.setTitle`
+/// (`pi/packages/tui/src/terminal.ts:504-507`, `\x1b]0;${title}\x07`).
+///
+/// `[CYRUP-DELTA]`: control characters are stripped first. Pi interpolates the extension-supplied
+/// string verbatim, so a title containing `BEL`/`ESC` would close the OSC early and let the rest of
+/// the string be interpreted as terminal commands. Stripping keeps an extension from driving the
+/// terminal through a title.
+pub fn write_terminal_title(title: &str) {
+    use std::io::Write;
+    let safe: String = title.chars().filter(|c| !c.is_control()).collect();
+    let mut out = io::stdout();
+    let _ = out.write_all(format!("\x1b]0;{safe}\x07").as_bytes());
+    let _ = out.flush();
+}
+
+/// How long the reader thread idles between `event::poll` rounds when nothing is held.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The much shorter poll used while [`StrayReplyFilter`] is holding events. A held opener (a bare
+/// `Esc`, or `Alt+]`) is released after at most this long, so a real `Escape` press costs one
+/// imperceptible tick rather than a full [`INPUT_POLL_INTERVAL`] — the standard escape-timeout
+/// trade every terminal app makes to tell `ESC` from an escape *sequence*.
+const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+
 /// A terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
 /// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
 /// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
+///
+/// Every event first passes through [`StrayReplyFilter`], the port of Pi's
+/// `consumeOsc11BackgroundResponse` guard (`tui/src/tui.ts:788-794`): a terminal that answers the
+/// boot-time OSC 11 probe *after* [`crate::terminal_query`]'s deadline would otherwise have its
+/// reply decoded by crossterm into keystrokes and typed into the prompt. The filter only ever
+/// removes a complete, terminated OSC 11 frame; anything it holds is replayed the moment the match
+/// fails or the input goes idle — see that module's safety contract.
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
-        while !cancel.is_cancelled() {
-            match event::poll(Duration::from_millis(100)) {
+        let mut filter = StrayReplyFilter::new();
+        let mut released: Vec<Event> = Vec::new();
+        'reader: while !cancel.is_cancelled() {
+            let wait =
+                if filter.is_holding() { HELD_FLUSH_INTERVAL } else { INPUT_POLL_INTERVAL };
+            match event::poll(wait) {
                 Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if let Some(mapped) = map_event(ev)
-                            && tx.send(mapped).is_err()
-                        {
-                            break;
-                        }
-                    }
+                    Ok(ev) => filter.push(ev, &mut released),
                     Err(_) => break,
                 },
-                Ok(false) => {}
+                // Idle: nothing more is coming, so release whatever the filter is holding.
+                Ok(false) => filter.flush(&mut released),
                 Err(_) => break,
+            }
+            for ev in released.drain(..) {
+                if let Some(mapped) = map_event(ev)
+                    && tx.send(mapped).is_err()
+                {
+                    break 'reader;
+                }
             }
         }
     });
@@ -4306,6 +5150,82 @@ fn map_event(ev: Event) -> Option<InputEvent> {
         Event::FocusGained => Some(InputEvent::FocusGained),
         Event::FocusLost => Some(InputEvent::FocusLost),
         Event::Mouse(_) => None,
+    }
+}
+
+/// The production input pipeline end-to-end: what [`crossterm_input_stream`]'s reader thread does
+/// to a burst of raw crossterm events, i.e. [`StrayReplyFilter`] followed by [`map_event`], with the
+/// idle flush at the end of the burst.
+#[cfg(test)]
+fn input_pipeline(raw: Vec<Event>) -> Vec<InputEvent> {
+    let mut filter = StrayReplyFilter::new();
+    let mut released: Vec<Event> = Vec::new();
+    let mut out: Vec<InputEvent> = Vec::new();
+    for ev in raw {
+        filter.push(ev, &mut released);
+        out.extend(released.drain(..).filter_map(map_event));
+    }
+    // Input has gone quiet: the reader thread's `Ok(false)` poll arm.
+    filter.flush(&mut released);
+    out.extend(released.drain(..).filter_map(map_event));
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod stray_reply_pipeline_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ch(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// A user launched cyrup and got `11;rgb:0c0c/0b0b/1313` typed into their prompt: the terminal
+    /// answered the boot OSC 11 probe after `terminal_query`'s 100 ms deadline, so the reply reached
+    /// the crossterm reader and was shredded into keys. Drive the exact shredded burst through the
+    /// real reader-thread pipeline and then through the real editor, and assert the prompt is empty.
+    #[test]
+    fn a_late_osc11_reply_never_reaches_the_editor() {
+        let mut raw = vec![Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT))];
+        raw.extend("11;rgb:0c0c/0b0b/1313".chars().map(ch));
+        // BEL (0x07) reaches crossterm's C0 arm as Ctrl+G.
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+
+        let delivered = input_pipeline(raw);
+        assert!(delivered.is_empty(), "no input event may survive the frame, got {delivered:?}");
+
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        for ev in &delivered {
+            app.handle_input(ev);
+        }
+        assert_eq!(app.state().editor.text(), "", "the prompt must be untouched");
+    }
+
+    /// The safety half: the same pipeline must deliver ordinary typing byte-for-byte, including the
+    /// two keys the filter is allowed to hold (`Escape` and `Alt+]`).
+    #[test]
+    fn ordinary_typing_survives_the_pipeline_intact() {
+        let mut raw: Vec<Event> = "hello 11; world".chars().map(ch).collect();
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        raw.push(Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT)));
+
+        let delivered = input_pipeline(raw.clone());
+        assert_eq!(delivered.len(), raw.len(), "every key must be delivered: {delivered:?}");
+        for (i, (got, want)) in delivered.iter().zip(raw.iter()).enumerate() {
+            match (got, want) {
+                (InputEvent::Key(a), Event::Key(b)) => assert_eq!(a, b, "event {i} differs"),
+                other => panic!("event {i} changed shape: {other:?}"),
+            }
+        }
+
+        // And it lands in the editor as the literal text the user typed.
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        for ev in &delivered {
+            app.handle_input(ev);
+        }
+        assert_eq!(app.state().editor.text(), "hello 11; world");
     }
 }
 
@@ -4475,25 +5395,46 @@ mod live_floor_tests {
 mod external_editor_tests {
     use super::*;
 
+    /// Write a shell script into `dir` and return the multi-token editor command that runs it.
+    ///
+    /// The command is `"/bin/sh <script>"`, NOT the script path alone, and the script is
+    /// deliberately left non-executable. Exec'ing a file this process itself just wrote is racy in
+    /// a multi-threaded test binary: `std::fs::write` opens the file for writing, and any OTHER
+    /// thread that forks (every `Command::spawn` in this binary) during that window hands its child
+    /// an inherited write-fd, which makes the later `execve` of that same path fail with `ETXTBSY`.
+    /// That surfaced as `run_editor_over_file` returning `None` about 9% of the time
+    /// (`Os { code: 26, kind: ExecutableFileBusy }`, observed by instrumenting the spawn). Handing
+    /// the script to `/bin/sh` as an ARGUMENT means only `/bin/sh` is exec'd and the script is
+    /// merely opened for reading, so there is no window at all.
+    ///
+    /// It also exercises `run_editor_over_file`'s `split_whitespace` on a genuinely multi-token
+    /// command (`sh`, the script, then the appended file), which is the realistic `$EDITOR` shape.
+    #[cfg(unix)]
+    fn sh_editor(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        format!("/bin/sh {}", script.display())
+    }
+
     /// F14: the RESOLVED editor command is exactly what runs over the temp file — proving
     /// `edit_in_external_editor` spawns the command it is handed (which `App::run` resolves via
     /// `resolve_external_editor` → `EffectiveSettings::external_editor`, honoring settings
-    /// `externalEditor` over `$VISUAL`/`$EDITOR`) rather than an inline env-only chain. A no-arg
-    /// executable script (so `split_whitespace` yields just the script path + the appended file arg)
+    /// `externalEditor` over `$VISUAL`/`$EDITOR`) rather than an inline env-only chain. The script
     /// rewrites the file; the reloaded text is the script's output.
     #[test]
     #[cfg(unix)]
     fn resolved_editor_command_is_the_one_that_runs() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-editor.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'REWRITTEN BY EDITOR' > \"$1\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = sh_editor(
+            dir.path(),
+            "fake-editor.sh",
+            "printf 'REWRITTEN BY EDITOR' > \"$1\"\n",
+        );
 
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "original text").unwrap();
 
-        let out = run_editor_over_file(script.to_str().unwrap(), &file);
+        let out = run_editor_over_file(&editor, &file);
         assert_eq!(
             out.as_deref(),
             Some("REWRITTEN BY EDITOR"),
@@ -4515,13 +5456,10 @@ mod external_editor_tests {
     #[test]
     #[cfg(unix)]
     fn trailing_newline_is_stripped_once() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("nl-editor.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'line one\\n' > \"$1\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = sh_editor(dir.path(), "nl-editor.sh", "printf 'line one\\n' > \"$1\"\n");
         let file = dir.path().join("buffer.md");
         std::fs::write(&file, "x").unwrap();
-        assert_eq!(run_editor_over_file(script.to_str().unwrap(), &file).as_deref(), Some("line one"));
+        assert_eq!(run_editor_over_file(&editor, &file).as_deref(), Some("line one"));
     }
 }

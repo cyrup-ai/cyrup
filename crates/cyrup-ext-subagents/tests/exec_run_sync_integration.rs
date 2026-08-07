@@ -118,6 +118,8 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
         orchestrator_intercom_target: None,
         run_id: None,
         child_index: None,
+        control_config: None,
+        on_control_event: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -1086,5 +1088,286 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
         error.contains(STDERR_DETAIL),
         "the child's stderr must be surfaced into the result error (pi execution.ts:686), not \
          drained-and-discarded — got: {error}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-N06 — `includeProgress`: R-SA-043 compaction's ONE documented opt-out.
+//
+// pi gates its `details.progress` array on the flag and nothing else
+// (`progress: params.includeProgress ? allProgress : undefined`,
+// `runs/foreground/subagent-executor.ts:3008` @v0.34.0 for SINGLE, `:2679` for PARALLEL). cyrup's
+// SINGLE-mode `details` IS the serialized `SingleResult`, so the snapshot lands on
+// `SingleResult::progress` and surfaces at the same JSON path a pi caller reads.
+//
+// These three tests fail against the pre-fix tree, where `run_sync` had `let _ =
+// opts.include_progress;` and a hardcoded `progress: None`:
+//   * the flag-ON test finds `None` where a snapshot must be;
+//   * the byte-identity test passes there but is the guard that keeps the default path clean;
+//   * the interrupt test finds `None` where pi's uncompacted `running` snapshot must be.
+// -------------------------------------------------------------------------------------------
+
+/// A three-tool, two-turn script whose child text is deliberately chatty, so the settled
+/// snapshot's counters are non-trivial AND the compaction assertions have something to erase.
+fn progress_script() -> serde_json::Value {
+    serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": tool_execution_start_line("c1", "read")},
+            {"kind": "emit", "line": tool_execution_end_line("c1", "read")},
+            {"kind": "emit", "line": message_end_line("thinking out loud", 10, 5)},
+            {"kind": "emit", "line": tool_execution_start_line("c2", "edit")},
+            {"kind": "emit", "line": tool_execution_end_line("c2", "edit")},
+            {"kind": "emit", "line": tool_execution_start_line("c3", "bash")},
+            {"kind": "emit", "line": tool_execution_end_line("c3", "bash")},
+            {"kind": "emit", "line": message_end_line("Done: the change is applied.", 30, 7)},
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_end"}"#.to_string())}
+        ],
+        "exit_code": 0
+    })
+}
+
+/// Run `progress_script()` once with the given `include_progress` value, returning the result.
+async fn run_progress_fixture(
+    dir: &std::path::Path,
+    script_name: &str,
+    include_progress: Option<bool>,
+) -> cyrup_ext_subagents::exec::SingleResult {
+    let script_path = write_script(dir, script_name, &progress_script());
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc. Every caller
+    // below holds `ENV_MUTATION_LOCK` for the whole call.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir, "fixture-model");
+    opts.include_progress = include_progress;
+    // A stable child index + skill list, so the snapshot's launch-context fields are assertable
+    // rather than all-default (pi seeds `progress.index`/`progress.skills` at construction,
+    // `runs/foreground/execution.ts:259,263` @v0.34.0).
+    opts.child_index = Some(3);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "chatty task", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast, well-behaved fixture child");
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_progress_true_returns_a_compacted_pi_shaped_snapshot() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = run_progress_fixture(dir.path(), "script-progress-on.json", Some(true)).await;
+
+    assert_eq!(result.exit_code, 0, "the fixture child exits clean: {result:?}");
+    let progress = result
+        .progress
+        .clone()
+        .expect("includeProgress: true must populate SingleResult::progress");
+
+    // pi's launch-context fields, seeded at construction (`execution.ts:258-270` @v0.34.0).
+    assert_eq!(progress.index, 3, "pi `progress.index` ← options.index");
+    assert_eq!(progress.agent.as_deref(), Some("worker"));
+    assert_eq!(progress.task, "chatty task");
+    assert_eq!(
+        progress.status,
+        cyrup_ext_subagents::tui::events::LiveProgressStatus::Complete,
+        "exit 0 with no error is pi's `completed` (`execution.ts:907`)"
+    );
+
+    // pi's live counters: three `tool_execution_start`s, two ASSISTANT turns, and
+    // `tokens = usage.input + usage.output` (`execution.ts:646`).
+    assert_eq!(progress.tool_count, 3);
+    assert_eq!(progress.tokens, 10 + 5 + 30 + 7);
+    assert!(progress.error.is_none(), "a clean run names no error");
+    assert!(
+        progress.failed_tool.is_none(),
+        "pi sets `failedTool` only when there is BOTH an error and a tool in flight"
+    );
+
+    // pi `compactCompletedProgress` (`shared/utils.ts:329-345`): a SETTLED snapshot keeps eleven
+    // keys and empties the two growth terms, dropping every other field from its object literal.
+    assert!(
+        progress.recent_tools.is_empty(),
+        "compactCompletedProgress resets recentTools to []: {:?}",
+        progress.recent_tools
+    );
+    assert!(
+        progress.recent_output.is_empty(),
+        "compactCompletedProgress resets recentOutput to []: {:?}",
+        progress.recent_output
+    );
+    assert!(progress.current_tool.is_none(), "absent from pi's literal");
+    assert_eq!(progress.turn_count, 0, "absent from pi's literal");
+    assert!(progress.model.is_none(), "absent from pi's literal");
+    assert!(progress.input_tokens.is_none(), "absent from pi's literal");
+    assert!(progress.output_tokens.is_none(), "absent from pi's literal");
+
+    // ...and it really is on the wire, at the JSON path a pi caller reads for a SINGLE run.
+    let wire = serde_json::to_value(&result).expect("SingleResult serializes");
+    assert_eq!(wire["progress"]["agent"], serde_json::json!("worker"));
+    assert_eq!(wire["progress"]["status"], serde_json::json!("completed"));
+    assert_eq!(wire["progress"]["toolCount"], serde_json::json!(3));
+    assert!(
+        wire["progress"].get("recentTools").is_none(),
+        "an emptied ring is skipped on the wire, not serialized as []"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_progress_omitted_or_false_is_byte_identical_to_the_pre_flag_result() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // R-SA-043 compaction is the DEFAULT and `includeProgress` is precisely its opt-out, so both
+    // falsy forms must produce a result whose serialization is byte-for-byte what it was before
+    // the `progress` field existed — i.e. the key is absent entirely, not `null`, not `{}`.
+    let omitted = run_progress_fixture(dir.path(), "script-progress-omitted.json", None).await;
+    let explicit_false =
+        run_progress_fixture(dir.path(), "script-progress-false.json", Some(false)).await;
+
+    assert!(omitted.progress.is_none(), "an omitted flag populates nothing");
+    assert!(
+        explicit_false.progress.is_none(),
+        "pi's gate is truthiness — `includeProgress: false` is the same as omitting it"
+    );
+
+    // Byte identity, asserted on the real serialized bytes. `duration_ms` is wall-clock and lives
+    // on the snapshot (which is absent here), never on `SingleResult` itself, so the two runs of
+    // the same script serialize identically.
+    let a = serde_json::to_string(&omitted).expect("serialize");
+    let b = serde_json::to_string(&explicit_false).expect("serialize");
+    assert_eq!(
+        a, b,
+        "an omitted and an explicitly-false includeProgress must serialize identically"
+    );
+    assert!(
+        !a.contains("\"progress\""),
+        "the compacted default must not carry a `progress` key at all: {a}"
+    );
+
+    // The flag must change NOTHING else about the result — the same run with the flag ON differs
+    // in exactly one key.
+    let on = run_progress_fixture(dir.path(), "script-progress-on2.json", Some(true)).await;
+    let mut on_wire = serde_json::to_value(&on).expect("serialize");
+    let off_wire = serde_json::to_value(&omitted).expect("serialize");
+    assert!(
+        on_wire
+            .as_object_mut()
+            .expect("object")
+            .remove("progress")
+            .is_some(),
+        "the flag-ON run must carry a progress key to remove"
+    );
+    assert_eq!(
+        on_wire, off_wire,
+        "includeProgress must add the `progress` key and change nothing else"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_running_snapshot() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // pi leaves an interrupt-paused run's progress at `"running"` (`execution.ts:828`, returning at
+    // `:861` before the `completed`/`failed` assignment at `:907`), and
+    // `compactCompletedProgress` deliberately refuses to compact a `running` snapshot — the caller
+    // is expected to RESUME the run, so its live detail is exactly what it needs. This asserts
+    // cyrup reproduces that, and — the adversarial half — that the rings it therefore keeps are
+    // BOUNDED, which upstream's are not.
+    let mut steps = vec![serde_json::json!({"kind": "emit", "line": r#"{"type":"agent_start"}"#})];
+    // Far more tool calls than RECENT_TOOLS_CAP (32) and far more output lines than
+    // RECENT_OUTPUT_CAP (50), all before the child blocks.
+    for i in 0..80 {
+        steps.push(serde_json::json!({"kind": "emit", "line": tool_execution_start_line(&format!("c{i}"), "bash")}));
+        steps.push(serde_json::json!({"kind": "emit", "line": tool_execution_end_line(&format!("c{i}"), "bash")}));
+        steps.push(serde_json::json!({"kind": "emit", "line": message_end_line(&format!("chatter line {i}"), 1, 1)}));
+    }
+    steps.push(serde_json::json!({"kind": "sleep_ms", "ms": 30_000}));
+    let script = serde_json::json!({ "steps": steps, "exit_code": 0 });
+    let script_path = write_script(dir.path(), "script-progress-interrupt.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.include_progress = Some(true);
+    let interrupt = CancelToken::new();
+    opts.interrupt = interrupt.clone();
+    let canceller = tokio::spawn({
+        let interrupt = interrupt.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            interrupt.cancel();
+        }
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        cyrup_ext_subagents::exec::run_sync(&agent, "chatty long task", &opts),
+    )
+    .await
+    .expect("run_sync must return once the interrupt terminates the child");
+    let _ = canceller.await;
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert!(result.interrupted, "the run must be interrupt-paused: {result:?}");
+    let progress = result
+        .progress
+        .expect("includeProgress: true must populate progress even on a paused run");
+    assert_eq!(
+        progress.status,
+        cyrup_ext_subagents::tui::events::LiveProgressStatus::Running,
+        "pi leaves an interrupt-paused run at `running`, which is why it is not compacted"
+    );
+
+    // ADVERSARIAL: a chatty long-running child cannot inflate this snapshot without bound. pi's
+    // live arrays grow unbounded here (it slices only when streaming); this port evicts at push.
+    assert!(
+        progress.recent_tools.len() <= cyrup_ext_subagents::tui::events::RECENT_TOOLS_CAP,
+        "recentTools must stay within MAX_STREAMED_RECENT_TOOLS, got {}",
+        progress.recent_tools.len()
+    );
+    assert!(
+        progress.recent_output.len() <= cyrup_ext_subagents::exec::RECENT_OUTPUT_CAP,
+        "recentOutput must stay within pi's 50-line window, got {}",
+        progress.recent_output.len()
+    );
+    for line in &progress.recent_output {
+        assert!(
+            line.chars().count()
+                <= cyrup_ext_subagents::exec::RECENT_OUTPUT_LINE_CHARS + "… [truncated]".chars().count(),
+            "no single recentOutput line may exceed the per-line cap: {} chars",
+            line.chars().count()
+        );
+        assert!(
+            !line.contains("\"type\":\"message_end\""),
+            "recentOutput carries EXTRACTED text, never the raw NDJSON envelope: {line}"
+        );
+    }
+    assert!(
+        progress.recent_output.iter().any(|l| l.starts_with("chatter line ")),
+        "the child's own extracted text must be what survived: {:?}",
+        progress.recent_output
     );
 }

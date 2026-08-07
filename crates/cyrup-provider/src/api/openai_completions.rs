@@ -23,6 +23,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::hash::short_hash;
+use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ToolCall, ToolCallId, Usage,
@@ -114,10 +115,14 @@ impl ApiImpl for OpenAiCompletionsApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -132,7 +137,16 @@ impl ApiImpl for OpenAiCompletionsApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
@@ -1360,8 +1374,10 @@ struct Decoder {
 impl Decoder {
     /// Build the live `partial` snapshot (Pi `output`, the mutated AssistantMessage attached to
     /// every non-terminal event, openai-completions.ts:158-175 + `partial: output`). Mirrors
-    /// [`build_final_message`] but borrows (the stream is still in progress, so `stop_reason`
-    /// defaults to `Stop` until a `finish_reason` arrives — Pi inits `output.stopReason = "stop"`).
+    /// [`build_final_message`] but borrows: the stream is still in progress, so `stop_reason` is
+    /// the in-flight sentinel until a `finish_reason` arrives — Pi seeds
+    /// `output.stopReason = "pending"` (openai-completions.ts:218) and attaches that same `output`
+    /// as every non-terminal event's `partial`.
     fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
         let mut usage = self.usage.clone().unwrap_or_default();
         apply_cost(&model.cost, &mut usage);
@@ -1374,7 +1390,7 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }
@@ -1497,22 +1513,29 @@ where
     }
 
     let saw_finish_reason = dec.saw_finish_reason;
-    let mut message = build_final_message(dec, model, api);
+    let settled = dec.stop_reason;
+    let message = build_final_message(dec, model, api);
 
-    // Stream-end guard (Pi openai-completions.ts:452-454): if the stream ended ([DONE] or EOF)
-    // without ever receiving a `finish_reason`, and we are not already in an error/aborted terminal,
-    // surface a protocol error instead of a (defaulted) success.
-    if !saw_finish_reason
-        && message.stop_reason != StopReason::Error
-        && message.stop_reason != StopReason::Aborted
-    {
-        message.stop_reason = StopReason::Error;
-        message.error_message = Some("Stream ended without finish_reason".to_string());
-    }
+    // Which stop reason the provider actually DELIVERED — `None` is Pi's still-`"pending"` output.
+    // Pi's end-of-stream ladder (openai-completions.ts:567-582), with `compat.supportsFinishReason`
+    // at its default `true` (cyrup exposes no such knob):
+    //   1. `aborted`/`error` already settled by an abort or an error chunk → throw with THAT
+    //      message, so the reason and the recorded `error_message` are used verbatim;
+    //   2. a `finish_reason` actually arrived → use it;
+    //   3. otherwise `(supportsFinishReason && !hasFinishReason) || stopReason === "pending"`
+    //      → throw "Stream ended without finish_reason".
+    let delivered = match settled {
+        Some(r @ (StopReason::Error | StopReason::Aborted)) => Some(r),
+        other if saw_finish_reason => other,
+        _ => None,
+    };
 
-    // `StreamEvent::terminal` narrows `stop_reason` into the `done`/`error` reason (error/aborted →
-    // error terminal, everything else → done) exactly as before, but with Pi's narrowed reason types.
-    sink.send(StreamEvent::terminal(message)).await;
+    sink.send(StreamEvent::end_of_stream(
+        message,
+        delivered,
+        "Stream ended without finish_reason",
+    ))
+    .await;
 }
 
 /// Process one decoded chunk. Returns `false` if the consumer dropped the stream.
@@ -1877,7 +1900,11 @@ fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> AssistantMes
     let mut usage = dec.usage.unwrap_or_default();
     apply_cost(&model.cost, &mut usage);
 
-    let stop_reason = dec.stop_reason.unwrap_or(StopReason::Stop);
+    // Pi's `output.stopReason` when no `finish_reason` ever arrived: still the `"pending"` seed
+    // (openai-completions.ts:218). The sole caller hands this straight to
+    // `StreamEvent::end_of_stream`, which rewrites it — but seeding `Stop` here would have made a
+    // truncated message look complete to anyone who called this helper directly.
+    let stop_reason = dec.stop_reason.unwrap_or(StopReason::Pending);
 
     AssistantMessage {
         content,
@@ -2571,8 +2598,24 @@ mod tests {
             .expect("a text_delta");
         assert_eq!(last_delta.content, vec![Content::text("Hello")]);
         assert_eq!(last_delta.response_id.as_deref(), Some("resp-1"));
-        // Still streaming → partial keeps the default stop reason until the terminal arrives.
-        assert_eq!(last_delta.stop_reason, StopReason::Stop);
+        // PROV-010 / AGENT-014 / DRIFT-012, wire half — CLOSED. Pi's in-flight `partial` carries
+        // `stopReason: "pending"` (openai-completions.ts:218), and cyrup now does too. This
+        // assertion previously pinned `Stop` and said so in its own comment ("pins the CURRENT wire
+        // value; it is NOT a statement that `stop` is meaningful mid-stream") — i.e. it pinned the
+        // defect. It is REWRITTEN, not removed: a mid-stream partial that claims a completed turn
+        // is the bug, so the correct value is the one Pi emits.
+        //
+        // The containment invariant it used to gesture at still holds and is enforced elsewhere:
+        // `Pending` can never reach a TERMINAL event, because `decode_stream` routes end-of-stream
+        // through `StreamEvent::end_of_stream` and `StreamEvent::terminal` normalizes a surviving
+        // `Pending` to `Error` (see `api::truncation_parity` and
+        // `stream_end_without_finish_reason_is_an_error` below).
+        assert_eq!(last_delta.stop_reason, StopReason::Pending);
+        assert_eq!(
+            serde_json::to_value(last_delta).unwrap()["stopReason"],
+            "pending",
+            "wire spelling must be Pi's"
+        );
     }
 
     #[tokio::test]

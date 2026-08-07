@@ -26,7 +26,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cyrup_core::ModelId;
+
 use crate::background::{cwd_key, subagents_home};
+use crate::exec::SingleResult;
 
 /// Project-local artifact root (pi `PROJECT_ARTIFACT_ROOT = ".pi-subagents"`, rebranded).
 const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
@@ -47,7 +50,14 @@ const ONE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_CLEANUP_DAYS: u64 = 7;
 
 /// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `types.ts:464-469`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Serialize` (camelCase, matching pi's own field names) because pi carries this bundle onto a
+/// result as `SingleResult.artifactPaths` (`shared/types.ts:488`) and spreads it verbatim into a
+/// dynamic fan-out's collect records (`runs/shared/dynamic-fanout.ts:284`), where a chain author
+/// reads it through `{outputs.<collect.as>}`. Only serialization is derived: nothing reads one of
+/// these back off the wire, and pi's fifth field (`transcriptPath`) has no analogue in this port.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArtifactPaths {
     /// `<base>_input.md` — the task the child was given.
     pub input_path: PathBuf,
@@ -62,7 +72,17 @@ pub struct ArtifactPaths {
 /// Which of the four artifact files to write + the cleanup horizon (pi `ArtifactConfig`,
 /// `types.ts:471-478`). The [`Default`] impl reproduces pi's `DEFAULT_ARTIFACT_CONFIG`
 /// (`types.ts:893-900`) exactly: input/output/metadata on, **jsonl off**, 7-day cleanup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// SUBA-N03: `Serialize`/`Deserialize` (camelCase, matching pi's own `artifactConfig` wire shape)
+/// because the async SINGLE path carries this whole config to the detached hop-2 runner on
+/// [`crate::background::runner_main::RunnerConfig::artifact_config`] — pi's `spawnRunner({ …,
+/// artifactsDir, artifactConfig, … })` (`runs/background/async-execution.ts:966-968` @v0.34.0),
+/// read back by its runner as `ctx.artifactConfig?.enabled !== false`
+/// (`runs/background/subagent-runner.ts:879-889,1117-1133`). Every field is `#[serde(default)]`ed
+/// through a whole-struct `Default` so an older on-disk config that omits the block still
+/// deserializes to pi's own `DEFAULT_ARTIFACT_CONFIG`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ArtifactConfig {
     /// Master switch: when `false`, nothing is written at all (pi `enabled`).
     pub enabled: bool,
@@ -393,6 +413,90 @@ pub fn write_run_artifacts(
         }
     }
     Some(paths)
+}
+
+/// Build the `_meta.json` metadata value for one completed run (T6, pi
+/// `runs/foreground/execution.ts:1053-1068` and the identical `metadataPath` write in the async
+/// runner, `runs/background/subagent-runner.ts:1121-1134` @v0.34.0). Carries the fields this
+/// crate's [`SingleResult`] actually knows: `runId`/`agent`/`task`/`exitCode`/`usage`/`model`/
+/// `attemptedModels`/`modelAttempts`/`toolCount`/`error`/`timestamp`. Pi additionally records
+/// `durationMs`/`skills`/`skillsWarning`, which `SingleResult` does not carry in this crate (they
+/// live on pi's richer `progressSummary`/skill-resolution shapes); those keys are omitted rather
+/// than faked.
+///
+/// SUBA-N03 moved this out of `extension.rs` (where it was `foreground_artifact_metadata`, private
+/// to the foreground path) so the detached hop-2 runner's own per-step artifact write emits the
+/// BYTE-IDENTICAL metadata shape rather than a second, drifting hand-rolled one — pi likewise has
+/// exactly one artifact-metadata shape shared by its foreground and async paths.
+#[must_use]
+pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serde_json::Value {
+    let attempted: Vec<&str> = result.attempted_models.iter().map(ModelId::as_str).collect();
+    let model_attempts: Vec<serde_json::Value> = result
+        .model_attempts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "model": a.model.as_str(),
+                "success": a.success,
+                "exitCode": a.exit_code,
+                "error": a.error,
+                "usage": serde_json::to_value(&a.usage).unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "runId": run_id,
+        "agent": result.agent,
+        "task": result.task,
+        "exitCode": result.exit_code,
+        "usage": serde_json::to_value(&result.usage).unwrap_or(serde_json::Value::Null),
+        "model": result.model.as_ref().map(ModelId::as_str),
+        "attemptedModels": attempted,
+        "modelAttempts": model_attempts,
+        "toolCount": result.tool_calls.len(),
+        "error": result.error,
+        "timestamp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    })
+}
+
+/// The `.jsonl` event lines for one completed run (T6). pi's `.jsonl` is the raw NDJSON the child
+/// streamed to stdout; this crate's [`SingleResult`] is the already-compacted shape (it does not
+/// retain the raw per-event stream — that lives transiently in the per-attempt tee under the run's
+/// scratch dir, R-SA-058), so the `.jsonl` is reconstructed from the run's observable, retained
+/// events: one line per summarized tool call, then a terminal `result` line. A genuine, non-empty
+/// NDJSON record of the run — see the crate's T6 report for the documented divergence from pi's
+/// byte-identical child stream.
+///
+/// SUBA-N03 moved this out of `extension.rs` for the same reason as
+/// [`run_artifact_metadata`] directly above: one shape, both run paths.
+#[must_use]
+pub(crate) fn run_artifact_jsonl_lines(result: &SingleResult) -> Vec<String> {
+    let mut lines = Vec::with_capacity(result.tool_calls.len() + 1);
+    for call in &result.tool_calls {
+        lines.push(
+            serde_json::json!({
+                "type": "tool_call",
+                "text": call.text,
+                "expandedText": call.expanded_text,
+            })
+            .to_string(),
+        );
+    }
+    lines.push(
+        serde_json::json!({
+            "type": "result",
+            "agent": result.agent,
+            "exitCode": result.exit_code,
+            "model": result.model.as_ref().map(ModelId::as_str),
+            "output": result.final_output,
+            "error": result.error,
+        })
+        .to_string(),
+    );
+    lines
 }
 
 #[cfg(test)]

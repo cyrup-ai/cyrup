@@ -7,11 +7,22 @@
 //! that fits). Required fields and types are enforced; on an unrecoverable mismatch a typed
 //! [`ToolValidationError`] describing the failure is returned.
 //!
+//! The coercion table is Pi's `coercePrimitiveByType`
+//! (`pi/packages/ai/src/utils/validation.ts:58-126`) — including the falsy cross-coercions
+//! `null`→`0`/`false`/`""`, `true`/`false`→`1`/`0`, `1`/`0`→`true`/`false` and
+//! `""`/`0`/`false`→`null`. Recursion into containers follows `applySchemaObjectCoercion`
+//! (`validation.ts:129-147`, which also coerces keys *not* named in `properties` through an
+//! `additionalProperties` sub-schema) and `applySchemaArrayCoercion` (`validation.ts:150-166`,
+//! which supports both the single-schema and the tuple form of `items`).
+//!
 //! Union disambiguation runs in two passes: first a **strict** pass that accepts a branch only when
 //! the value already has the exact JSON type the branch wants (so a value that is already the right
 //! shape is never lossily re-coerced), then a **lenient** pass that allows scalar coercion. This
 //! keeps e.g. an object from being stringified just because a `{type:"string"}` branch appears
-//! first in the union.
+//! first in the union. A multi-entry `"type"` array is a union too and gets the same two passes —
+//! Pi's `matchesUnionMember` guard (`validation.ts:204-214`) suppresses primitive coercion outright
+//! whenever the value already satisfies one member, so `{"type":["number","null"]}` must leave
+//! `null` as `null` rather than folding it to `0`.
 //!
 //! Authoring guidance (R-01-035): prefer a `StringEnum` (`{"type":"string","enum":[…]}`) over a
 //! tagged enum for Google compatibility.
@@ -120,15 +131,29 @@ fn coerce_object_schema(
     let coerced = match schema.get("type") {
         Some(Value::String(t)) => coerce_to_type(schema, t, value, path, strict)?,
         Some(Value::Array(types)) => {
+            // A `"type"` array is a union, so it gets the same strict-then-lenient treatment as
+            // `anyOf` above: a type the value *already is* wins before any cross-type coercion is
+            // attempted. This is Pi's `matchesUnionMember` guard (validation.ts:204-214) — with a
+            // multi-member type list, a value that already matches one member is not run through
+            // `coercePrimitiveByType` at all, which is what keeps `{"type":["number","null"]}`
+            // from folding a `null` into `0` via the leading `"number"`.
             let mut done = None;
             let mut last_err = None;
             for t in types.iter().filter_map(Value::as_str) {
-                match coerce_to_type(schema, t, value.clone(), path, strict) {
-                    Ok(v) => {
-                        done = Some(v);
-                        break;
+                if let Ok(v) = coerce_to_type(schema, t, value.clone(), path, true) {
+                    done = Some(v);
+                    break;
+                }
+            }
+            if done.is_none() && !strict {
+                for t in types.iter().filter_map(Value::as_str) {
+                    match coerce_to_type(schema, t, value.clone(), path, false) {
+                        Ok(v) => {
+                            done = Some(v);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
                     }
-                    Err(e) => last_err = Some(e),
                 }
             }
             match done {
@@ -178,13 +203,7 @@ fn coerce_to_type(
         "boolean" => coerce_boolean(value, path, strict),
         "object" => coerce_object(schema, value, path, strict),
         "array" => coerce_array(schema, value, path, strict),
-        "null" => {
-            if value.is_null() {
-                Ok(value)
-            } else {
-                Err(ToolValidationError::schema(path, "expected null"))
-            }
-        }
+        "null" => coerce_null(value, path, strict),
         // Unknown type keyword: nothing to enforce.
         _ => Ok(value),
     }
@@ -199,11 +218,43 @@ fn coerce_string(value: Value, path: &str, strict: bool) -> Result<Value, ToolVa
         )),
         Value::Number(n) => Ok(Value::String(n.to_string())),
         Value::Bool(b) => Ok(Value::String(b.to_string())),
+        // `case "string"` null arm, validation.ts:112-114 — `null` becomes the empty string.
+        Value::Null => Ok(Value::String(String::new())),
         other => Err(ToolValidationError::schema(
             path,
             format!("cannot coerce {} to string", type_name(&other)),
         )),
     }
+}
+
+/// `case "null"`, validation.ts:117-122: the three falsy JSON values `""`, `0` and `false` coerce
+/// to `null`; everything else is left for the caller to reject.
+fn coerce_null(value: Value, path: &str, strict: bool) -> Result<Value, ToolValidationError> {
+    match value {
+        Value::Null => Ok(value),
+        _ if strict => Err(ToolValidationError::schema(
+            path,
+            format!("expected null, got {}", type_name(&value)),
+        )),
+        Value::String(ref s) if s.is_empty() => Ok(Value::Null),
+        Value::Bool(false) => Ok(Value::Null),
+        Value::Number(ref n) if is_js_zero(n) => Ok(Value::Null),
+        other => Err(ToolValidationError::schema(
+            path,
+            format!("cannot coerce {} to null", type_name(&other)),
+        )),
+    }
+}
+
+/// `n === 0` in JS terms, for a `serde_json::Number` that may be stored as `i64`, `u64` or `f64`
+/// (`0`, `0.0` and `-0.0` are all `=== 0`).
+fn is_js_zero(n: &Number) -> bool {
+    n.as_f64().is_some_and(|f| f == 0.0)
+}
+
+/// `n === 1` in JS terms; see [`is_js_zero`].
+fn is_js_one(n: &Number) -> bool {
+    n.as_f64().is_some_and(|f| f == 1.0)
 }
 
 fn coerce_integer(value: Value, path: &str, strict: bool) -> Result<Value, ToolValidationError> {
@@ -224,6 +275,9 @@ fn coerce_integer(value: Value, path: &str, strict: bool) -> Result<Value, ToolV
         Value::String(s) => parse_integer(s.trim()).ok_or_else(|| {
             ToolValidationError::schema(path, format!("cannot coerce {s:?} to integer"))
         }),
+        // `case "integer"` null/boolean arms, validation.ts:76-87.
+        Value::Null => Ok(Value::Number(Number::from(0))),
+        Value::Bool(b) => Ok(Value::Number(Number::from(i64::from(b)))),
         other => Err(ToolValidationError::schema(
             path,
             format!("cannot coerce {} to integer", type_name(&other)),
@@ -241,6 +295,9 @@ fn coerce_number(value: Value, path: &str, strict: bool) -> Result<Value, ToolVa
         Value::String(s) => parse_number(s.trim()).ok_or_else(|| {
             ToolValidationError::schema(path, format!("cannot coerce {s:?} to number"))
         }),
+        // `case "number"` null/boolean arms, validation.ts:60-73.
+        Value::Null => Ok(Value::Number(Number::from(0))),
+        Value::Bool(b) => Ok(Value::Number(Number::from(i64::from(b)))),
         other => Err(ToolValidationError::schema(
             path,
             format!("cannot coerce {} to number", type_name(&other)),
@@ -263,6 +320,12 @@ fn coerce_boolean(value: Value, path: &str, strict: bool) -> Result<Value, ToolV
                 format!("cannot coerce {s:?} to boolean"),
             )),
         },
+        // `case "boolean"` null/number arms, validation.ts:89-109: `null` is `false`, and only the
+        // two numbers `1` and `0` convert (Pi compares `value === 1` / `value === 0`, so `2` is
+        // left alone rather than being treated as truthy).
+        Value::Null => Ok(Value::Bool(false)),
+        Value::Number(ref n) if is_js_one(n) => Ok(Value::Bool(true)),
+        Value::Number(ref n) if is_js_zero(n) => Ok(Value::Bool(false)),
         other => Err(ToolValidationError::schema(
             path,
             format!("cannot coerce {} to boolean", type_name(&other)),
@@ -286,11 +349,33 @@ fn coerce_object(
         }
     };
 
-    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+    let props = schema.get("properties").and_then(Value::as_object);
+    if let Some(props) = props {
         for (key, subschema) in props {
             if let Some(v) = obj.remove(key) {
                 let child = format!("{path}.{key}");
                 obj.insert(key.clone(), coerce(subschema, v, &child, strict)?);
+            }
+        }
+    }
+
+    // `applySchemaObjectCoercion`'s second loop (validation.ts:139-146): when
+    // `additionalProperties` carries a *sub-schema*, every key not named in `properties` is coerced
+    // through it. Pi guards on `typeof … === "object"`, so a bare `true`/`false` — which declares
+    // only whether extra keys are allowed, not their shape — is skipped here as it is there.
+    if let Some(extra) = schema.get("additionalProperties").filter(|s| s.is_object()) {
+        let keys: Vec<String> = obj
+            .keys()
+            .filter(|k| !props.is_some_and(|p| p.contains_key(k.as_str())))
+            .cloned()
+            .collect();
+        for key in keys {
+            // Coerce in place: `remove`/`insert` would move the key to the end of the map under
+            // serde_json's `preserve_order` feature.
+            if let Some(slot) = obj.get_mut(&key) {
+                let child = format!("{path}.{key}");
+                let taken = slot.take();
+                *slot = coerce(extra, taken, &child, strict)?;
             }
         }
     }
@@ -326,6 +411,22 @@ fn coerce_array(
     };
 
     let coerced = match schema.get("items") {
+        // Tuple form (`applySchemaArrayCoercion`, validation.ts:151-158): element *i* is coerced by
+        // sub-schema *i*, and an element past the end of the tuple has no schema, so Pi's
+        // `if (!itemSchema) continue` leaves it untouched.
+        Some(Value::Array(tuple)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.into_iter().enumerate() {
+                match tuple.get(i) {
+                    Some(item_schema) => {
+                        let child = format!("{path}[{i}]");
+                        out.push(coerce(item_schema, v, &child, strict)?);
+                    }
+                    None => out.push(v),
+                }
+            }
+            out
+        }
         Some(item_schema) if item_schema.is_object() || item_schema.is_boolean() => {
             let mut out = Vec::with_capacity(arr.len());
             for (i, v) in arr.into_iter().enumerate() {
@@ -518,6 +619,147 @@ mod tests {
         });
         let out = validate_tool_call(&schema, json!({ "n": "1", "extra": "keep" })).unwrap();
         assert_eq!(out, json!({ "n": 1, "extra": "keep" }));
+    }
+
+    // ------------------------------------------------------------------ pi coercion-table parity
+    // Ground truth for every case below is `coercePrimitiveByType`
+    // (pi/packages/ai/src/utils/validation.ts:58-126), `applySchemaObjectCoercion` (:129-147) and
+    // `applySchemaArrayCoercion` (:150-166) at the ported tag v0.83.0.
+
+    /// validation.ts:139-146 — keys absent from `properties` are coerced through an
+    /// `additionalProperties` sub-schema, and keys present in `properties` are not run through it.
+    #[test]
+    fn additional_properties_subschema_coerces_undeclared_keys() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "additionalProperties": { "type": "number" },
+        });
+        let out = validate_tool_call(&schema, json!({ "n": "1", "x": "2.5", "y": true })).unwrap();
+        assert_eq!(out, json!({ "n": 1, "x": 2.5, "y": 1 }));
+    }
+
+    /// validation.ts:139 guards on `typeof … === "object"`, so a boolean `additionalProperties`
+    /// declares only *whether* extra keys are allowed and coerces nothing.
+    #[test]
+    fn boolean_additional_properties_coerces_nothing() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "additionalProperties": true,
+        });
+        let out = validate_tool_call(&schema, json!({ "n": "1", "x": "2.5" })).unwrap();
+        assert_eq!(out, json!({ "n": 1, "x": "2.5" }));
+    }
+
+    /// validation.ts:151-158 — tuple-form `items`: element *i* uses sub-schema *i*, and an element
+    /// past the end of the tuple has no schema and is left alone.
+    #[test]
+    fn tuple_form_items_coerce_positionally() {
+        let schema = json!({
+            "type": "array",
+            "items": [{ "type": "integer" }, { "type": "string" }, { "type": "boolean" }],
+        });
+        let out = validate_tool_call(&schema, json!(["1", 2, "true", { "keep": 1 }])).unwrap();
+        assert_eq!(out, json!([1, "2", true, { "keep": 1 }]));
+    }
+
+    /// validation.ts:61-63,77-79,90-92,112-114 — `null` folds to each type's zero value.
+    #[test]
+    fn null_coerces_to_each_types_zero_value() {
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "number" }), json!(null)).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "integer" }), json!(null)).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "boolean" }), json!(null)).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "string" }), json!(null)).unwrap(),
+            json!("")
+        );
+    }
+
+    /// validation.ts:69-71,84-86 — `true`/`false` become `1`/`0` for number and integer.
+    #[test]
+    fn booleans_coerce_to_one_and_zero() {
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "number" }), json!(true)).unwrap(),
+            json!(1)
+        );
+        assert_eq!(
+            validate_tool_call(&json!({ "type": "integer" }), json!(false)).unwrap(),
+            json!(0)
+        );
+    }
+
+    /// validation.ts:100-107 — only the exact numbers `1` and `0` become booleans; Pi compares
+    /// `value === 1` / `value === 0`, so `2` is *not* treated as truthy.
+    #[test]
+    fn only_one_and_zero_coerce_to_boolean() {
+        let schema = json!({ "type": "boolean" });
+        assert_eq!(validate_tool_call(&schema, json!(1)).unwrap(), json!(true));
+        assert_eq!(validate_tool_call(&schema, json!(0)).unwrap(), json!(false));
+        assert_eq!(validate_tool_call(&schema, json!(1.0)).unwrap(), json!(true));
+        assert!(validate_tool_call(&schema, json!(2)).is_err());
+    }
+
+    /// validation.ts:117-122 — the three falsy JSON values coerce to `null`; nothing else does.
+    #[test]
+    fn falsy_values_coerce_to_null() {
+        let schema = json!({ "type": "null" });
+        assert_eq!(validate_tool_call(&schema, json!("")).unwrap(), json!(null));
+        assert_eq!(validate_tool_call(&schema, json!(0)).unwrap(), json!(null));
+        assert_eq!(
+            validate_tool_call(&schema, json!(false)).unwrap(),
+            json!(null)
+        );
+        assert_eq!(
+            validate_tool_call(&schema, json!(null)).unwrap(),
+            json!(null)
+        );
+        assert!(validate_tool_call(&schema, json!("x")).is_err());
+        assert!(validate_tool_call(&schema, json!(1)).is_err());
+    }
+
+    /// validation.ts:204-214 `matchesUnionMember` — with a multi-entry `"type"`, a value that
+    /// already matches one member is never run through `coercePrimitiveByType`, so the leading
+    /// member does not get to claim it.
+    #[test]
+    fn multi_type_union_keeps_a_value_that_already_matches() {
+        assert_eq!(
+            validate_tool_call(&json!({ "type": ["number", "null"] }), json!(null)).unwrap(),
+            json!(null)
+        );
+        assert_eq!(
+            validate_tool_call(&json!({ "type": ["string", "number"] }), json!(42)).unwrap(),
+            json!(42)
+        );
+        // With no exact member the lenient pass still runs, left to right.
+        assert_eq!(
+            validate_tool_call(&json!({ "type": ["string", "number"] }), json!(true)).unwrap(),
+            json!("true")
+        );
+    }
+
+    /// The container coercions recurse, so a tuple entry and an `additionalProperties` value are
+    /// themselves coerced by the full table rather than only at the top level.
+    #[test]
+    fn container_coercions_recurse() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": {
+                "type": "array",
+                "items": [{ "type": "boolean" }, { "type": "integer" }],
+            },
+        });
+        let out = validate_tool_call(&schema, json!({ "a": [1, null], "b": [0, "7"] })).unwrap();
+        assert_eq!(out, json!({ "a": [true, 0], "b": [false, 7] }));
     }
 
     #[test]

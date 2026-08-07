@@ -17,7 +17,11 @@ use std::sync::Arc;
 struct FindInput {
     pattern: String,
     path: Option<String>,
-    limit: Option<usize>,
+    // Pi's TypeBox `Type.Number` (find.ts:25) carries no `integer` and no `minimum`, and Pi never
+    // validates tool arguments at runtime, so `limit: 1000.0` and `limit: -1` are inputs Pi
+    // accepts. Modeling this as `usize` rejected the whole call at deserialization. See
+    // [`crate::jsnum`].
+    limit: Option<f64>,
 }
 
 pub struct FindTool {
@@ -101,7 +105,12 @@ impl Tool for FindTool {
             .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&search_root))))?;
 
         let matcher = PatternMatcher::build(&input.pattern)?;
-        let limit = input.limit.unwrap_or(self.opts.limit);
+        // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151), handed straight to
+        // `fd --max-results ${effectiveLimit}` (find.ts:241). A non-positive count yields no rows
+        // from that cap, so folding negatives to 0 reproduces the observable result — an empty
+        // match set — without the deserialization failure. `??` is null/undefined-only, so a JSON
+        // `null` takes the default.
+        let limit = input.limit.map_or(self.opts.limit, crate::jsnum::to_count);
 
         // Pi (find.ts:226-240, issue #5960): fd normally ignores `.gitignore` OUTSIDE a git repo, so
         // it passes `--no-require-git` there. INSIDE a repo it uses fd's default git-aware behavior
@@ -142,6 +151,15 @@ impl Tool for FindTool {
             }
         }
 
+        results.sort();
+        if results.len() > limit {
+            results.truncate(limit);
+        }
+
+        // Pi's `results.length === 0` check (find.ts:172,297) runs on rows that `fd` has ALREADY
+        // capped with `--max-results` (find.ts:241), so the cap is applied before the empty test —
+        // hence the truncation above this block. Only reachable with `limit` folded to 0 (a
+        // non-positive argument); for every positive limit the two orders agree.
         if results.is_empty() {
             return Ok(ToolResult {
                 content: vec![Content::text("No files found matching pattern")],
@@ -151,10 +169,6 @@ impl Tool for FindTool {
             });
         }
 
-        results.sort();
-        if results.len() > limit {
-            results.truncate(limit);
-        }
         // Pi: `resultLimitReached = relativized.length >= effectiveLimit` (find.ts:322).
         let limit_reached = results.len() >= limit;
 
