@@ -694,7 +694,12 @@ fn cleanup_temp_files(paths: &[PathBuf]) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use std::collections::HashMap as StdHashMap;

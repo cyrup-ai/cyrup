@@ -34,7 +34,7 @@ impl std::fmt::Display for ResourceKey {
 
 impl std::fmt::Debug for ResourceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ResourceKey({:?})", &self.0)
+        write!(f, "ResourceKey({:?})", self.0)
     }
 }
 
