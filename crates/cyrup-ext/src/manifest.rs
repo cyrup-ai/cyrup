@@ -48,7 +48,10 @@ pub struct Capabilities {
 /// [`ExtensionManifest::check_world`] is minor-aware for exactly that reason, and it only helps if
 /// this constant actually moves.
 ///
-/// IMPORTS are additive from the guest's point of view and need no bump on their own.
+/// ADDED imports are additive from the guest's point of view and need no bump on their own. A
+/// RE-SIGNED or REMOVED import does: the guest's own import list is baked into its component, so it
+/// asks the host for a function the host no longer has and fails to link identically to a stale
+/// export.
 ///
 /// History:
 /// - 0.1 → 0.2 (SEAM-005): ADDED the `events.on-agent-settled` export. (The `ctx-state` /
@@ -57,7 +60,13 @@ pub struct Capabilities {
 ///   a trailing `usage-json: option<string>` (Pi `ToolResultEventBase.usage`, types.ts:919-921).
 ///   `f777e44` changed `world.wit` without touching this constant, so a pre-`f777e44` guest still
 ///   declaring `cyrup:ext@0.2` passed the gate and then died inside wasmtime. This bump is the fix.
-pub const HOST_WORLD: &str = "cyrup:ext@0.3";
+/// - 0.3 → 0.4: RE-SIGNED the `control.compact` IMPORT, which gained `opts-json: string` (Pi
+///   `ctx.compact(options?: CompactOptions)`, types.ts:296-300,344). An import re-signing is
+///   normally the guest's problem alone — but a guest built against 0.3 imports `compact` at the
+///   ZERO-argument signature, which the 0.4 host no longer provides, so it fails to LINK exactly
+///   the way a stale export does. (The `ctx-state.get-mode`/`has-ui` additions in the same batch
+///   were purely additive imports and would not have required a bump on their own.)
+pub const HOST_WORLD: &str = "cyrup:ext@0.4";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

@@ -338,7 +338,11 @@ pub fn build() -> ExtensionApi {
             ctx.ui().set_status("greet", Some("greeting…"));
             ctx.ui().clear_status("greet");
             // A COMMAND-tier control op (R-08-008): legal here, recorded by the host backend.
-            let _ = ctx.compact();
+            // Carries Pi's `CompactOptions.customInstructions` (types.ts:296-300) so the host-side
+            // op is proved to arrive with its payload, not just to arrive.
+            let _ = ctx.compact_with(&crate::CompactOptions {
+                custom_instructions: Some("demo: keep the greeting".into()),
+            });
             Ok(Some(format!("hello, {}!", args.trim())))
         },
         |prefix: &str| {
@@ -347,6 +351,19 @@ pub fn build() -> ExtensionApi {
                 .filter(|c| c.starts_with(prefix))
                 .map(|c| c.to_string())
                 .collect()
+        },
+    );
+
+    // Report the host's run mode + dialog capability back out as command output (Pi `ctx.mode` /
+    // `ctx.hasUI`, extensions/types.ts:311,313). A guest guards terminal-only UI on these, so the
+    // pair has to reflect the mode the HOST was actually configured with — which is what
+    // `crates/cyrup-ext/tests/guest_host_mode.rs` reads this command's output to prove.
+    api.register_command(
+        "hostmode",
+        CommandDescriptor::new("Report ctx.mode + ctx.hasUI (demo)."),
+        |_args: &str, ctx: &crate::CommandCtx| {
+            let base = ctx.ctx();
+            Ok(Some(format!("mode={} has_ui={}", base.mode().as_str(), base.has_ui())))
         },
     );
 

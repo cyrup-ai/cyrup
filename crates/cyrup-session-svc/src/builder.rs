@@ -674,6 +674,11 @@ impl SessionBuilder {
             ToolsOptions {
                 read: cyrup_tools::config::ReadOpts {
                     model_vision: Some(read_model_vision.clone()),
+                    // `images.autoResize` (Pi `_buildRuntime`: `const autoResizeImages =
+                    // this.settingsManager.getImageAutoResize()` → `read: { autoResizeImages }`,
+                    // agent-session.ts:2553,2564). Without this the setting had no consumer at all
+                    // and `read` downsampled every image to 2000px regardless.
+                    auto_resize_images: settings.effective().image_auto_resize(),
                     ..cyrup_tools::config::ReadOpts::default()
                 },
                 bash: BashOpts {
@@ -1164,9 +1169,16 @@ impl SessionBuilder {
         .messages(seed)
         .hooks(policy_hooks)
         .session_id(session_id.clone())
-        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + custom thinking budgets.
+        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + transport + custom thinking budgets.
         .steering_mode(parse_queue_mode(&eff.steering_mode()))
-        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()));
+        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()))
+        // `transport` (Pi sdk.ts:357 `transport: settingsManager.getTransport()`). The setting was
+        // parsed, migrated from the legacy `websockets` boolean and offered in the `/settings` grid,
+        // but never reached the agent — so `AgentBuilder::transport` had no non-test caller and the
+        // value died in the config layer. It now rides `StreamOptions.transport` into every
+        // `StreamFn::stream` call (agent.rs `gen_config.transport`), which is the seam an
+        // embedder-supplied `StreamFn` (e.g. `ProxyStreamFn`) and every wire API read from.
+        .transport(parse_transport(&eff.transport()));
         if let Some(h) = attribution_headers {
             agent_builder = agent_builder.headers(h);
         }
@@ -1392,6 +1404,20 @@ impl SessionBuilder {
 /// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:698-710). Any non-`all` value ⇒ one-at-a-time.
 pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
     if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
+}
+
+/// Parse the settings `transport` string into the provider [`Transport`] Pi hands the agent
+/// (`sdk.ts:357` `transport: settingsManager.getTransport()`; the `TransportSetting` union is
+/// `"auto" | "sse" | "websocket" | "websocket-cached"`, types.ts:98). The strings are byte-1:1 with
+/// Pi because `Transport` is `#[serde(rename_all = "kebab-case")]`. An unrecognized value falls back
+/// to `auto`, matching `getTransport()`'s `?? "auto"` and the settings dialog's fixed choice set.
+pub(crate) fn parse_transport(s: &str) -> cyrup_provider::Transport {
+    match s {
+        "sse" => cyrup_provider::Transport::Sse,
+        "websocket" => cyrup_provider::Transport::Websocket,
+        "websocket-cached" => cyrup_provider::Transport::WebsocketCached,
+        _ => cyrup_provider::Transport::Auto,
+    }
 }
 
 /// Serialize a [`ModelThinkingLevel`] to its persisted snake/camel key (`off`/`minimal`/…/`xhigh`/`max`).

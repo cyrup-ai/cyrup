@@ -43,6 +43,13 @@ pub mod atomic;
 /// doc.
 pub mod control;
 
+/// Ancestor→descendant interrupt/timeout cascade (pi `interruptNestedAsyncDescendants` /
+/// `timeoutNestedAsyncDescendants`, `subagent-runner.ts:1535-1594` @v0.34.0): walks the
+/// nested-run registry and drops the same control-inbox request file into every live background
+/// descendant's own directory, because process-group signalling cannot cross the deliberate
+/// detachment boundary a background run is defined by. See [`cascade`] for the full rationale.
+pub mod cascade;
+
 /// Hop-1 detached second-process spawn (`spawn_detached_runner`, R-SA-070/071): launches the
 /// `cyrup` binary's internal `__subagent-runner --config <path>` subcommand as a genuinely
 /// detached OS process (new process group / `DETACHED_PROCESS`, stdio redirected to files, the

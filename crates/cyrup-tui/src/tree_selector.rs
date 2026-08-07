@@ -76,6 +76,29 @@ impl FilterMode {
         }
     }
 
+    /// Map the persisted `treeFilterMode` setting value to a mode.
+    ///
+    /// Pi seeds the `/tree` selector from `settingsManager.getTreeFilterMode()`
+    /// (`interactive-mode.ts:4644` → `TreeSelectorComponent(..., initialFilterMode)` →
+    /// `tree-selector.ts:137` `this.filterMode = initialFilterMode ?? "default"`), so a configured
+    /// filter is the one `/tree` OPENS with. The accepted values are the `FilterMode` union
+    /// (`settings-manager.ts:117`): `default` | `no-tools` | `user-only` | `labeled-only` | `all`;
+    /// anything else falls back to `default`, matching
+    /// [`cyrup_config::EffectiveSettings::tree_filter_mode`]'s own validation.
+    ///
+    /// Note the SETTING spellings (`user-only`/`labeled-only`) are not the header CHIP labels
+    /// [`Self::label`] renders (`user`/`labeled`) — Pi's chip text is likewise shortened.
+    #[must_use]
+    pub fn from_setting(value: &str) -> FilterMode {
+        match value {
+            "no-tools" => FilterMode::NoTools,
+            "user-only" => FilterMode::UserOnly,
+            "labeled-only" => FilterMode::LabeledOnly,
+            "all" => FilterMode::All,
+            _ => FilterMode::Default,
+        }
+    }
+
     /// Map a `1..=5` digit to a mode (the bespoke filter keys).
     pub fn from_digit(d: char) -> Option<FilterMode> {
         match d {

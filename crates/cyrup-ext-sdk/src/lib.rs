@@ -41,11 +41,12 @@ pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
 };
 pub use ctx::{
-    CommandCtx, Ctx, ExecResult, HttpRequest, HttpResponse, HttpStreamResponse, Models, NotifyKind,
-    ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, Ui,
+    CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse, HttpStreamResponse, Models,
+    NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, Ui,
 };
 pub use descriptor::{
-    CommandDescriptor, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition,
+    CommandDescriptor, CompactOptions, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions,
+    ForkPosition,
     ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions, ProviderConfig,
     ProviderModelConfig, RenderShell,
     SwitchSessionOptions, ToolDescriptor,
@@ -66,12 +67,12 @@ pub mod prelude {
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
     };
     pub use crate::ctx::{
-        CommandCtx, Ctx, HttpRequest, HttpResponse, HttpStreamResponse, Models, NotifyKind,
+        CommandCtx, Ctx, ExtMode, HttpRequest, HttpResponse, HttpStreamResponse, Models, NotifyKind,
         ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, Ui,
     };
     pub use crate::descriptor::{
-        CommandDescriptor, DialogOptions, ExecMode, FlagSpec, ForkOptions, ForkPosition,
-        NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig,
+        CommandDescriptor, CompactOptions, DialogOptions, ExecMode, FlagSpec, ForkOptions,
+        ForkPosition, NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig,
         SwitchSessionOptions, ToolDescriptor,
     };
     pub use crate::events::*;

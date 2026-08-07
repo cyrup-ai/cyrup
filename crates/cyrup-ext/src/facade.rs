@@ -962,7 +962,12 @@ impl ExtensionHost {
                 // Wire the guest onto the HOST-OWNED shared bus (not a fresh per-guest one) so its
                 // `bus.subscribe`/`bus.emit` reach other guests (Pi's single shared EventBus,
                 // gap-08 §5.3).
-                .with_bus(self.bus.clone()),
+                .with_bus(self.bus.clone())
+                // Pi `ctx.mode` / `ctx.hasUI` (extensions/types.ts:311,313) are host configuration,
+                // not session state: copy them in from the SAME [`HostConfig`] the native path
+                // hands to `HostCtx::event`/`::command` above, so a WASM guest's `ctx.mode()` and a
+                // built-in's `ctx.mode` cannot disagree about the mode the host is running in.
+                .with_host_mode(self.config.mode, self.config.has_ui),
         );
         let ext = crate::host::LiveExtension::load(
             wasm.engine(),

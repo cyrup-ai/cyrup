@@ -389,11 +389,66 @@ impl SpawnedChild {
     /// for a real-process proof of this ordering (not merely an assertion about `Command`'s
     /// documented behavior).
     ///
+    /// # Temp-file cleanup on the constructor's OWN failure paths (R-SA-067)
+    ///
+    /// This function takes `spec` BY VALUE, so on every early error return the
+    /// [`ChildSpawnSpec::temp_files`] list — which is the only record of the 0600 task/system-prompt
+    /// temp files written by [`ChildSpawnSpec::resolve_task_arg`] — would simply be dropped, with
+    /// no `SpawnedChild` ever constructed for [`SpawnedChild::terminate`]/[`SpawnedChild::finish`]
+    /// to clean up from. The production call site (`exec/mod.rs`'s attempt driver) turns an `Err`
+    /// here into a failed attempt record and moves on, so nothing downstream ever learns those
+    /// paths existed. A missing/non-executable `cyrup` binary is the ordinary way this happens, and
+    /// it happens once per fallback attempt — so a leak here is a *repeating* leak of world-
+    /// readable-to-the-owner prompt text into the scratch dir. Every error return therefore routes
+    /// through [`cleanup_temp_files`] first. This mirrors pi, which cleans the temp dir on the
+    /// spawn-error path exactly as it does on the normal close path (`execution.ts` v0.34.0:
+    /// `proc.on("error", …)` → `cleanupTempDir(tempDir)` at :797, matching :756 on `close`).
+    ///
     /// # Errors
     ///
     /// Returns [`SubagentError::Spawn`] if the child fails to spawn, or if the `.jsonl` tee
     /// artifact cannot be created.
-    pub async fn spawn(spec: ChildSpawnSpec, jsonl_path: &Path) -> Result<Self, SubagentError> {
+    pub async fn spawn(mut spec: ChildSpawnSpec, jsonl_path: &Path) -> Result<Self, SubagentError> {
+        // `temp_files` is lifted out of `spec` up front so the single `Err` arm below owns it on
+        // every failure path, and the `Ok` arm hands the very same list to the constructed child.
+        let temp_files = std::mem::take(&mut spec.temp_files);
+        match Self::spawn_wired(&spec, jsonl_path).await {
+            Ok((child, stdout, stderr, jsonl_writer)) => Ok(Self {
+                child,
+                stdout_lines: BufReader::new(stdout).lines(),
+                stderr_lines: Some(BufReader::new(stderr).lines()),
+                jsonl_writer,
+                temp_files,
+                exited: false,
+            }),
+            Err(err) => {
+                // R-SA-067: the child never came into existence (or never became observable), so
+                // this is the only cleanup opportunity these paths will ever get.
+                cleanup_temp_files(&temp_files);
+                Err(err)
+            }
+        }
+    }
+
+    /// The fallible half of [`SpawnedChild::spawn`]: everything that can fail, borrowing `spec` so
+    /// its `temp_files` stay owned by the caller and can be cleaned up on any error. Returns the
+    /// four pieces `spawn` assembles into a `SpawnedChild`.
+    ///
+    /// Note the ordering guarantee this split preserves: the child is spawned LAST-but-one and the
+    /// `.jsonl` writer is created after it, so a writer-creation failure leaves a live child. That
+    /// child is `start_kill`ed here rather than orphaned — see the call site below.
+    async fn spawn_wired(
+        spec: &ChildSpawnSpec,
+        jsonl_path: &Path,
+    ) -> Result<
+        (
+            tokio::process::Child,
+            ChildStdout,
+            ChildStderr,
+            BoundedJsonlWriter,
+        ),
+        SubagentError,
+    > {
         let argv = spec.build_argv();
 
         let mut command = tokio::process::Command::new(&spec.command.binary);
@@ -427,27 +482,26 @@ impl SpawnedChild {
 
         let mut child = command.spawn().map_err(SubagentError::Spawn)?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("child stdout not piped")))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("child stderr not piped")))?;
+        // Past this point a real OS process is alive but no `SpawnedChild` exists yet, so nothing
+        // downstream can ever reap or signal it — every remaining failure kills it here rather
+        // than orphaning a detached process group (see `command.process_group(0)` above) that
+        // would otherwise outlive the whole run holding its pipes open.
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = child.start_kill();
+            return Err(SubagentError::Spawn(std::io::Error::other(
+                "child stdout/stderr not piped",
+            )));
+        };
 
-        let jsonl_writer = BoundedJsonlWriter::create(jsonl_path)
-            .await
-            .map_err(SubagentError::Spawn)?;
+        let jsonl_writer = match BoundedJsonlWriter::create(jsonl_path).await {
+            Ok(writer) => writer,
+            Err(err) => {
+                let _ = child.start_kill();
+                return Err(SubagentError::Spawn(err));
+            }
+        };
 
-        Ok(Self {
-            child,
-            stdout_lines: BufReader::new(stdout).lines(),
-            stderr_lines: Some(BufReader::new(stderr).lines()),
-            jsonl_writer,
-            temp_files: spec.temp_files,
-            exited: false,
-        })
+        Ok((child, stdout, stderr, jsonl_writer))
     }
 
     /// The OS process id of the live child, when available (the child may already have exited

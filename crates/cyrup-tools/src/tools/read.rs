@@ -262,7 +262,12 @@ impl ReadTool {
 
         #[cfg(feature = "inline-images")]
         {
-            match image_proc::process_image(&bytes, mime, self.opts.max_image_dim) {
+            match image_proc::process_image(
+                &bytes,
+                mime,
+                self.opts.max_image_dim,
+                self.opts.auto_resize_images,
+            ) {
                 image_proc::Processed::Ok { data, mime: out_mime, hints } => {
                     // `Read image file [${processed.mimeType}]` + hints + nonVisionNote.
                     let mut note = format!("Read image file [{out_mime}]");
@@ -355,8 +360,17 @@ mod image_proc {
         was_resized: bool,
     }
 
-    /// `processImage` (image-process.ts:72-119) with `autoResizeImages = true` (Pi's read default).
-    pub fn process_image(orig: &[u8], detected: ImageMime, max_dim: u32) -> Processed {
+    /// `processImage` (image-process.ts:72-119). `auto_resize` is Pi's `options.autoResizeImages`,
+    /// threaded down from the `images.autoResize` setting: `true` runs `normalizeImage` then the
+    /// `resizeImage` ladder; `false` normalizes ONLY and inlines the original bytes, with the
+    /// conversion hint compared against the NORMALIZED mime (never a re-encoded one) and no
+    /// dimension note, exactly like image-process.ts's trailing else-branch.
+    pub fn process_image(
+        orig: &[u8],
+        detected: ImageMime,
+        max_dim: u32,
+        auto_resize: bool,
+    ) -> Processed {
         // normalizeImage (image-process.ts:49-65): keep supported inline formats as-is; convert
         // everything else (bmp) to PNG, baking EXIF orientation in.
         let (norm_bytes, norm_mime, converted_from): (std::borrow::Cow<[u8]>, &str, Option<&str>) =
@@ -376,6 +390,22 @@ mod image_proc {
                     }
                 },
             };
+
+        // `if (autoResizeImages) { … }` — the false path returns the normalized bytes base64-encoded
+        // with no resize, no byte-cap ladder and no dimension note (image-process.ts, final block).
+        if !auto_resize {
+            let mut hints: Vec<String> = Vec::new();
+            if let Some(from) = converted_from
+                && from != norm_mime
+            {
+                hints.push(format!("[Image converted from {from} to {norm_mime}.]"));
+            }
+            return Processed::Ok {
+                data: base64_encode(&norm_bytes),
+                mime: norm_mime.to_string(),
+                hints,
+            };
+        }
 
         match resize_image(&norm_bytes, norm_mime, max_dim) {
             Some(r) => {

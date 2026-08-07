@@ -12,12 +12,38 @@
 #![allow(clippy::needless_return)]
 
 use crate::descriptor::{
-    DialogOptions, ExecOptions, ForkOptions, NavigateOptions, NewSessionOptions, SwitchSessionOptions,
+    CompactOptions, DialogOptions, ExecOptions, ForkOptions, NavigateOptions, NewSessionOptions,
+    SwitchSessionOptions,
 };
 use core::cell::RefCell;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+/// The mode the host is running in (Pi `ExtensionMode`, types.ts:305 — `"tui" | "rpc" | "json" |
+/// "print"`); the WIT `types.ext-mode` enum. Mirrored here rather than re-exported from the
+/// generated bindings so the type also exists when the SDK is compiled for the host target (unit
+/// tests), where the bindings module does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExtMode {
+    #[default]
+    Tui,
+    Rpc,
+    Json,
+    Print,
+}
+
+impl ExtMode {
+    /// The Pi wire spelling (`ExtensionMode`, types.ts:305).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtMode::Tui => "tui",
+            ExtMode::Rpc => "rpc",
+            ExtMode::Json => "json",
+            ExtMode::Print => "print",
+        }
+    }
+}
 
 /// The capability context handed to every handler (event tier: no session mutation).
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,9 +99,39 @@ impl Ctx {
         let _ = tool;
     }
 
-    // --- base-context state + lifecycle (Pi `ExtensionContext`, types.ts:329-346). Pi puts ALL of
+    // --- base-context state + lifecycle (Pi `ExtensionContext`, types.ts:305-347). Pi puts ALL of
     // these on the base context — "Available in all contexts" — so they live on `Ctx`, not on
     // `CommandCtx`, and the host does not tier-gate them (EXT-005). ---
+
+    /// The mode the host is running in (Pi `ctx.mode`, types.ts:311). Pi's guidance: "Use `tui` to
+    /// guard terminal-only UI such as custom components" — a widget or a custom renderer is
+    /// meaningless under `json`/`print`, so branch on this before registering one.
+    pub fn mode(&self) -> ExtMode {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::guest::bindings::cyrup::ext::types::ExtMode as Wit;
+            return match crate::guest::bindings::cyrup::ext::ctx_state::get_mode() {
+                Wit::Tui => ExtMode::Tui,
+                Wit::Rpc => ExtMode::Rpc,
+                Wit::Json => ExtMode::Json,
+                Wit::Print => ExtMode::Print,
+            };
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        ExtMode::Tui
+    }
+
+    /// Whether dialog-capable UI is available (Pi `ctx.hasUI`, types.ts:313 — "true in TUI and RPC
+    /// modes"). Check this before [`Ui::confirm`]/[`Ui::input`]/[`Ui::select`]: with no UI those
+    /// answer with their inert default rather than reaching a human.
+    pub fn has_ui(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ctx_state::has_ui();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        true
+    }
 
     /// Whether no agent run is in flight (Pi `ctx.isIdle()`, types.ts:333).
     pub fn is_idle(&self) -> bool {
@@ -1018,8 +1074,19 @@ impl CommandCtx {
     pub fn reload(&self) -> Result<(), String> {
         control(Control::Reload)
     }
+    /// Trigger a compaction with no extra guidance (Pi `ctx.compact()`, types.ts:344).
     pub fn compact(&self) -> Result<(), String> {
-        control(Control::Compact)
+        self.compact_with(&CompactOptions::default())
+    }
+
+    /// Trigger a compaction with typed options (Pi `ctx.compact(options)`, types.ts:344 +
+    /// `CompactOptions`, types.ts:296-300). `custom_instructions` reaches the summarizer that
+    /// writes the compaction summary. Fire-and-forget, exactly as in Pi: the call returns once the
+    /// host has queued the op — subscribe to the `session_compact` event for the result (see
+    /// [`CompactOptions`] on why the `onComplete`/`onError` callbacks have no cross-boundary form).
+    pub fn compact_with(&self, opts: &CompactOptions) -> Result<(), String> {
+        let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
+        control(Control::Compact(&opts_json))
     }
     pub fn wait_idle(&self) -> Result<(), String> {
         control(Control::WaitIdle)
@@ -1055,7 +1122,7 @@ enum Control<'a> {
     Fork(&'a str, &'a str),
     Navigate(&'a str, &'a str),
     Reload,
-    Compact,
+    Compact(&'a str),
     WaitIdle,
     SendMessage(&'a str, &'a str),
     SendUserMessage(&'a str, &'a str),
@@ -1071,7 +1138,7 @@ fn control(op: Control<'_>) -> Result<(), String> {
             Control::Fork(id, o) => c::fork(id, o),
             Control::Navigate(id, o) => c::navigate(id, o),
             Control::Reload => c::reload(),
-            Control::Compact => c::compact(),
+            Control::Compact(o) => c::compact(o),
             Control::WaitIdle => c::wait_idle(),
             Control::SendMessage(m, o) => c::send_message(m, o),
             Control::SendUserMessage(co, o) => c::send_user_message(co, o),

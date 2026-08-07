@@ -100,10 +100,17 @@ async fn discover_trust_load_command_reload() {
     let comps = host.command_completions("greet", "te").await.expect("completions");
     assert_eq!(comps, vec!["team".to_string()]);
 
-    // the command's COMMAND-tier control op (`compact`) reached the NON-deny backend (R-08-008).
+    // the command's COMMAND-tier control op (`compact`) reached the NON-deny backend (R-08-008) —
+    // WITH its `CompactOptions.customInstructions` payload (Pi types.ts:296-300,344), which the
+    // guest passed to `ctx.compact_with(...)`. Asserting the payload and not just the variant is
+    // what keeps the opts-json leg of the `control.compact` import honest.
     assert!(
-        rec.control_ops().iter().any(|op| matches!(op, ControlOp::Compact)),
-        "non-deny backend recorded the command's control op: {:?}",
+        rec.control_ops().iter().any(|op| matches!(
+            op,
+            ControlOp::Compact { custom_instructions }
+                if custom_instructions.as_deref() == Some("demo: keep the greeting")
+        )),
+        "non-deny backend recorded the command's control op with its instructions: {:?}",
         rec.control_ops()
     );
 

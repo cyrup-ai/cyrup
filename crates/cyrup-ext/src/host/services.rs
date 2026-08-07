@@ -5,7 +5,7 @@
 //! capability (no ambient authority, R-ARCH-EXT-011); the session service injects a real one.
 
 use crate::event::{EventKind, Subscriptions};
-use crate::native::CtxTier;
+use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{json, Value};
@@ -89,7 +89,14 @@ pub enum ControlOp {
     Fork { entry_id: String, opts: Value },
     Navigate { entry_id: String, opts: Value },
     Reload,
-    Compact,
+    /// Trigger a manual compaction (Pi `ctx.compact(options?)`, extensions/types.ts:344). Carries
+    /// Pi's `CompactOptions.customInstructions` (types.ts:296-300) — the extra guidance handed to
+    /// the summarizer — or `None` when the guest passed no options. Pi's `onComplete`/`onError`
+    /// callbacks have no cross-boundary analog; a guest observes completion through the
+    /// `session_compact` event it can already subscribe to.
+    Compact {
+        custom_instructions: Option<String>,
+    },
     WaitIdle,
     SendMessage { message: Value, opts: Value },
     SendUserMessage { content: String, opts: Value },
@@ -1020,6 +1027,15 @@ pub struct GuestState {
     pub registry: Arc<ExtensionRegistry>,
     pub services: Arc<dyn HostServices>,
     pub fs: FsCaps,
+    /// The host's run mode + dialog-capability, i.e. Pi's `ctx.mode` / `ctx.hasUI` base-context
+    /// FIELDS (extensions/types.ts:311,313). Unlike the `ctx-state` values above these are not
+    /// session state — they are fixed host configuration, so they are copied in from
+    /// [`crate::HostConfig`] at load time rather than read off [`HostServices`], exactly as the
+    /// native path copies them into `HostCtx` (`native.rs:91-92`). Defaults match
+    /// `HostConfig::default()` (`tui` + UI available) so a standalone `GuestState` is not silently
+    /// claiming a headless host.
+    mode: ExtMode,
+    has_ui: bool,
     /// The current dispatch tier; control ops are legal only at [`CtxTier::Command`] (R-08-008).
     tier: Mutex<CtxTier>,
     /// Subscriptions declared via the `subscribe` import (read back after `init`).
@@ -1144,6 +1160,8 @@ impl GuestState {
             registry,
             services,
             fs: FsCaps::default(),
+            mode: ExtMode::default(),
+            has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
             subs: Mutex::new(Subscriptions::empty()),
             commands: Mutex::new(Vec::new()),
@@ -1173,6 +1191,28 @@ impl GuestState {
     pub fn with_fs(mut self, root: PathBuf) -> Self {
         self.fs = FsCaps { root: Some(root) };
         self
+    }
+
+    /// Copy the host's run mode + dialog capability in from [`crate::HostConfig`] (Pi `ctx.mode` /
+    /// `ctx.hasUI`, extensions/types.ts:311,313). Called by [`crate::ExtensionHost::load_wasm`]
+    /// before `init`, so a guest reads the SAME pair the native built-ins get through `HostCtx`
+    /// instead of the standalone default.
+    pub fn with_host_mode(mut self, mode: ExtMode, has_ui: bool) -> Self {
+        self.mode = mode;
+        self.has_ui = has_ui;
+        self
+    }
+
+    /// The host's run mode (Pi `ctx.mode`, types.ts:311): what the `ctx-state.get-mode` import
+    /// answers.
+    pub fn mode(&self) -> ExtMode {
+        self.mode
+    }
+
+    /// Whether dialog-capable UI is available (Pi `ctx.hasUI`, types.ts:313 — "true in TUI and RPC
+    /// modes"): what the `ctx-state.has-ui` import answers.
+    pub fn has_ui(&self) -> bool {
+        self.has_ui
     }
 
     /// Wire this guest onto the host-owned shared bus (Pi's single `createEventBus()` threaded to

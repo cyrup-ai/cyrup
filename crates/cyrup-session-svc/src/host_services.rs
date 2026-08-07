@@ -1100,7 +1100,7 @@ mod tests {
             Ok(())
         }));
         svc.control(ControlOp::Reload).expect("control routes to the sink");
-        svc.control(ControlOp::Compact).expect("control routes to the sink");
+        svc.control(ControlOp::Compact { custom_instructions: None }).expect("control routes to the sink");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 

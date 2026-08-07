@@ -283,8 +283,33 @@ fn prefix_autocomplete_description(description: &str, tag: &str) -> String {
 /// interactive half of the same seam: without it the TUI's `/` menu listed builtins alone, so the
 /// 13 slash commands the subagents extension registers (and every prompt template and skill) were
 /// invisible in the default mode while an RPC client saw all of them from the same session.
+///
+/// Equivalent to [`dynamic_commands_from_catalog_gated`] with skill commands enabled; prefer that
+/// entry point from the app so the `enableSkillCommands` setting is honored.
 #[must_use]
 pub fn dynamic_commands_from_catalog(catalog: &[serde_json::Value]) -> Vec<SlashCommand> {
+    dynamic_commands_from_catalog_gated(catalog, true)
+}
+
+/// [`dynamic_commands_from_catalog`], with the `enableSkillCommands` setting applied.
+///
+/// Pi builds the interactive autocomplete list in `createBaseAutocompleteProvider`
+/// (`interactive-mode.ts:610-622`) and wraps the `skill:<name>` half in
+/// `if (this.settingsManager.getEnableSkillCommands())` — so a `false` setting removes every skill
+/// from the `/` menu while leaving extension commands and prompt templates alone. The gate is
+/// **interactive-only**: Pi's `get_commands` RPC (`rpc-mode.ts:676-690`) emits skills
+/// unconditionally, which is why `AgentSession::slash_command_catalog()` — the port of that RPC
+/// handler — stays ungated and the filtering happens here, at the one consumer Pi gates.
+///
+/// Note the gate is autocomplete visibility only, in cyrup as in Pi: dynamic commands are never
+/// added to `dispatch_names`, and `/skill:<name>` expansion happens server-side in
+/// `AgentSession::expand_slash_command`, so a hidden skill typed out in full still runs — exactly
+/// as Pi's `skillCommands` map (populated at `:616`, read nowhere) leaves it.
+#[must_use]
+pub fn dynamic_commands_from_catalog_gated(
+    catalog: &[serde_json::Value],
+    enable_skill_commands: bool,
+) -> Vec<SlashCommand> {
     catalog
         .iter()
         .filter_map(|row| {
@@ -296,7 +321,8 @@ pub fn dynamic_commands_from_catalog(catalog: &[serde_json::Value]) -> Vec<Slash
             let kind = match source {
                 "extension" => CommandSource::Extension,
                 "prompt" => CommandSource::Prompt,
-                "skill" => CommandSource::Skill,
+                "skill" if enable_skill_commands => CommandSource::Skill,
+                "skill" => return None,
                 _ => return None,
             };
             let description = row

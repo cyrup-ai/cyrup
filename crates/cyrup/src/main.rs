@@ -512,7 +512,11 @@ async fn run() -> anyhow::Result<i32> {
             return Ok(0);
         }
         timings.print();
-        let inputs = build_inputs(&cli, &dirs.cwd).await?;
+        // Pi `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
+        // (main.ts:828-832): the `images.autoResize` setting decides whether an `@image.png`
+        // positional is downsampled to 2000px or inlined at full resolution.
+        let auto_resize_images = session.services().settings.effective().image_auto_resize();
+        let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
         let interactive =
             run_interactive(runtime.clone(), session.clone(), inputs, cli.verbose, cancel).await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
@@ -719,6 +723,9 @@ async fn run() -> anyhow::Result<i32> {
             let session = runtime.session().await;
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
+            // `settingsManager.getImageAutoResize()` for the `@file` image path (Pi main.ts:830),
+            // read before `session` moves into the signal guard.
+            let auto_resize_images = session.services().settings.effective().image_auto_resize();
             let _signals = spawn_abort_on_signal(session, cancel.clone());
             // NO prompt-required guard here: Pi has none. `buildInitialMessage` answers
             // `initialMessage: undefined` for a run with no stdin/`@file`/message
@@ -727,7 +734,7 @@ async fn run() -> anyhow::Result<i32> {
             // The `ensure_prompt` bail that used to sit here inverted the exit code of every
             // prompt-less one-shot invocation — `cyrup -c -p`, `cyrup --session <id> --mode json` —
             // and suppressed JSON mode's session header entirely. See `run::turn_inputs`.
-            let inputs = build_inputs(&cli, &dirs.cwd).await?;
+            let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images).await?;
             let mut out = io::stdout();
             let dispatch = if let AppMode::Json = mode {
                 run_json_dispatch(&runtime, &inputs, &mut out).await

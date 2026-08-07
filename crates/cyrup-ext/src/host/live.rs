@@ -20,7 +20,7 @@ use crate::host::services::{
     ControlOp, DialogOptions, ExecOutput, GuestState, NotifyKind, OAuthEvent,
 };
 use crate::host::store_state::HostState;
-use crate::native::CtxTier;
+use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
 use cyrup_core::{
     CancelToken, Content, ExtensionId, Message, Tool, ToolCallId, ToolError, ToolResult,
@@ -798,10 +798,21 @@ impl bindings::cyrup::ext::control::Host for HostState {
         guest.require_command_tier()?;
         guest.services.control(ControlOp::Reload)
     }
-    async fn compact(&mut self) -> Result<(), String> {
+    /// Pi `ctx.compact(options?: CompactOptions)` (extensions/types.ts:344). `opts-json` carries
+    /// `{customInstructions}` (types.ts:296-300) — the extra guidance the summarizer receives; a
+    /// malformed or empty bag degrades to "no instructions" rather than erroring, matching Pi's
+    /// optional-argument shape. `onComplete`/`onError` cannot cross the component boundary as
+    /// function values; the guest's completion signal is the `session_compact` event.
+    async fn compact(&mut self, opts_json: String) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
-        guest.services.control(ControlOp::Compact)
+        let custom_instructions = serde_json::from_str::<Value>(&opts_json)
+            .ok()
+            .and_then(|v| {
+                v.get("customInstructions").and_then(Value::as_str).map(str::to_string)
+            })
+            .filter(|s| !s.is_empty());
+        guest.services.control(ControlOp::Compact { custom_instructions })
     }
     async fn wait_idle(&mut self) -> Result<(), String> {
         let guest = guest_of(self)?;
@@ -840,11 +851,31 @@ impl bindings::cyrup::ext::control::Host for HostState {
     }
 }
 
-/// Read-only base-context state (Pi `ExtensionContext`, extensions/types.ts:329-346). Served
-/// straight off the injected [`crate::host::HostServices`] backend, so a guest reads the LIVE
-/// session's answer instead of a hard-coded default (EXT-005). Untiered: Pi puts all four on the
-/// base context, available to every handler.
+/// Read-only base-context state (Pi `ExtensionContext`, extensions/types.ts:305-347). The four
+/// session-state answers are served straight off the injected [`crate::host::HostServices`] backend,
+/// so a guest reads the LIVE session's answer instead of a hard-coded default (EXT-005);
+/// `get-mode`/`has-ui` are host CONFIGURATION rather than session state and come off the
+/// [`GuestState`] copy of [`crate::HostConfig`] — the same pair the native path reads from
+/// `HostCtx` (`native.rs:91-92`). Untiered: Pi puts all six on the base context, available to every
+/// handler.
 impl bindings::cyrup::ext::ctx_state::Host for HostState {
+    /// Pi `ctx.mode` (types.ts:311). A guest with no live [`GuestState`] gets the default `tui`
+    /// rather than an error — `mode` is a plain field in Pi and cannot fail.
+    async fn get_mode(&mut self) -> wit_types::ExtMode {
+        let mode = guest_of(self).map(|g| g.mode()).unwrap_or_default();
+        match mode {
+            ExtMode::Tui => wit_types::ExtMode::Tui,
+            ExtMode::Rpc => wit_types::ExtMode::Rpc,
+            ExtMode::Json => wit_types::ExtMode::Json,
+            ExtMode::Print => wit_types::ExtMode::Print,
+        }
+    }
+    /// Pi `ctx.hasUI` (types.ts:313): "Whether dialog-capable UI is available (true in TUI and RPC
+    /// modes)". Degrades to `false` with no live guest — claiming UI that is not there would send a
+    /// guest into a dialog that can never be answered.
+    async fn has_ui(&mut self) -> bool {
+        guest_of(self).map(|g| g.has_ui()).unwrap_or(false)
+    }
     async fn is_idle(&mut self) -> bool {
         guest_of(self).map(|g| g.services.is_idle()).unwrap_or(true)
     }

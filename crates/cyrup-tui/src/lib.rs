@@ -92,8 +92,8 @@ pub use resume_hint::{
     format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
 };
 pub use commands::{
-    dynamic_commands_from_catalog, CommandRegistry, CommandSource, Dispatch, SlashCommand,
-    BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+    dynamic_commands_from_catalog, dynamic_commands_from_catalog_gated, CommandRegistry,
+    CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;

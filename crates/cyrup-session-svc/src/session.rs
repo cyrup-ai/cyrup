@@ -65,7 +65,7 @@ fn control_op_name(op: &ControlOp) -> &'static str {
         ControlOp::Fork { .. } => "fork",
         ControlOp::Navigate { .. } => "navigate_tree",
         ControlOp::Reload => "reload",
-        ControlOp::Compact => "compact",
+        ControlOp::Compact { .. } => "compact",
         ControlOp::WaitIdle => "wait_idle",
         ControlOp::SendMessage { .. } => "send_message",
         ControlOp::SendUserMessage { .. } => "send_user_message",
@@ -2765,7 +2765,12 @@ impl AgentSession {
                     // sized (E0733) without adding indirection to the hot prompt path.
                     Box::pin(self.send_user_message(content, None)).await.map(|_| ())
                 }
-                ControlOp::Compact => self.compact(None).await.map(|_| ()),
+                // Pi `ctx.compact(options)` (extensions/types.ts:344): `customInstructions`
+                // (types.ts:296-300) rides the op through to the summarizer — the same
+                // `Option<String>` a `/compact <instructions>` slash command passes.
+                ControlOp::Compact { custom_instructions } => {
+                    self.compact(custom_instructions).await.map(|_| ())
+                }
                 // ---- session-local runtime ops (no runtime host needed) ----
                 ControlOp::Navigate { entry_id, opts } => {
                     Box::pin(self.control_navigate(&entry_id, &opts)).await

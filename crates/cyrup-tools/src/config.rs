@@ -151,6 +151,16 @@ pub struct ReadOpts {
     pub model_vision: Option<ModelVisionHandle>,
     /// Max image bound (both dimensions) before resize.
     pub max_image_dim: u32,
+    /// `images.autoResize` (Pi `ReadToolOptions.autoResizeImages`, read.ts:58-60, defaulted at
+    /// read.ts:207 with `?? true`). When `false`, `read` skips `resizeImage` entirely and inlines the
+    /// NORMALIZED original bytes with no dimension note (image-process.ts's else-branch), so a vision
+    /// model sees the full-resolution screenshot.
+    ///
+    /// Static, not a live handle, on purpose: Pi reads `settingsManager.getImageAutoResize()` once in
+    /// `_buildRuntime` and bakes it into the tool definition (agent-session.ts:2553,2564), so a
+    /// mid-session toggle only reaches the tool when the runtime is rebuilt. See
+    /// [`ModelVisionHandle`] for the cases where Pi genuinely IS per-call.
+    pub auto_resize_images: bool,
 }
 
 impl ReadOpts {
@@ -169,6 +179,8 @@ impl Default for ReadOpts {
             supports_images: true,
             model_vision: None,
             max_image_dim: 2000,
+            // Pi `options?.autoResizeImages ?? true` (read.ts:207).
+            auto_resize_images: true,
         }
     }
 }

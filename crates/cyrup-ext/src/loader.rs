@@ -118,8 +118,13 @@ pub fn discover(roots: &DiscoveryRoots) -> Vec<DiscoveredExtension> {
         scan_dir(&dir, ExtOrigin::Global, &mut seen, &mut out);
     }
     for p in &roots.configured {
-        // A configured path may be a single extension dir, or a directory of extensions.
-        if is_extension_dir(p) {
+        // A configured path may be a bare prebuilt `.wasm` artifact, a single extension dir, or a
+        // directory of extensions. Pi takes a non-directory configured path verbatim
+        // (`loader.ts:704-717` — the `addPaths([resolved])` fall-through after the `isDirectory()`
+        // branch), so a directly-named artifact must not be dropped.
+        if is_component_file(p) {
+            push_file(p, ExtOrigin::Configured, &mut seen, &mut out);
+        } else if is_extension_dir(p) {
             push_dir(p, ExtOrigin::Configured, &mut seen, &mut out);
         } else {
             scan_dir(p, ExtOrigin::Configured, &mut seen, &mut out);
@@ -144,7 +149,17 @@ fn first_wasm(dir: &Path) -> Option<PathBuf> {
     wasms.into_iter().next()
 }
 
-/// Scan one root directory for extension subdirectories (one level, no recursion — Pi rule).
+/// True iff `path` is a bare prebuilt component artifact (a plain `*.wasm` file). `is_file()`
+/// follows symlinks, so a symlinked artifact counts — matching Pi's `entry.isFile() ||
+/// entry.isSymbolicLink()` (loader.ts:649-650).
+fn is_component_file(path: &Path) -> bool {
+    path.extension().map(|x| x == "wasm").unwrap_or(false) && path.is_file()
+}
+
+/// Scan one root directory for extensions (one level, no recursion — Pi rule). Two entry shapes are
+/// accepted, mirroring Pi's `discoverExtensionsInDir` (loader.ts:628-666): rule 1 "Direct files" —
+/// a bare artifact sitting straight in the root (`extensions/mytool.wasm`, the analog of Pi's
+/// `extensions/*.ts`) — and rules 2/3, a subdirectory holding a manifest or an artifact.
 fn scan_dir(
     dir: &Path,
     origin: ExtOrigin,
@@ -155,10 +170,54 @@ fn scan_dir(
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort(); // deterministic order (R-08-004)
     for path in entries {
-        if path.is_dir() && is_extension_dir(&path) {
-            push_dir(&path, origin, seen, out);
+        if path.is_dir() {
+            if is_extension_dir(&path) {
+                push_dir(&path, origin, seen, out);
+            }
+        } else if is_component_file(&path) {
+            push_file(&path, origin, seen, out);
         }
     }
+}
+
+/// Push a bare prebuilt `.wasm` artifact that lives directly in a discovery root (Pi's "direct
+/// file" rule). There is no `extension.json` to read beside it — the root is shared with every
+/// other entry — so the manifest is synthesized exactly as [`push_dir`] does for a manifest-less
+/// extension dir: id from the artifact stem, host world, no `entry` (nothing to build; the artifact
+/// IS the component). The EXT-028 caveat there applies here too — claiming [`HOST_WORLD`] makes
+/// `check_world` a tautology, so a stale artifact surfaces as a wasmtime link error instead.
+///
+/// `dir` is the containing root, used only to resolve a manifest `entry` for a Tier-1 build, which
+/// this path never has. The dedup key is therefore the ARTIFACT path, not the root, so several bare
+/// artifacts in one root are distinct extensions rather than collapsing into one.
+fn push_file(
+    file: &Path,
+    origin: ExtOrigin,
+    seen: &mut HashSet<PathBuf>,
+    out: &mut Vec<DiscoveredExtension>,
+) {
+    let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    if !seen.insert(key) {
+        return; // de-dup (Pi `seen` set)
+    }
+    let id = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("extension")
+        .to_string();
+    let manifest = ExtensionManifest {
+        id,
+        version: "0.0.0".into(),
+        world: HOST_WORLD.into(),
+        entry: None,
+        capabilities: Default::default(),
+    };
+    out.push(DiscoveredExtension {
+        dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+        manifest,
+        wasm: Some(file.to_path_buf()),
+        origin,
+    });
 }
 
 /// Parse the manifest for one extension dir and push it (deduplicated). A missing/invalid manifest

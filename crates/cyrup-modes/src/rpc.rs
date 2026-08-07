@@ -508,8 +508,7 @@ struct LoopSinks {
 /// rebinds: the active session + its event subscription are re-acquired from the runtime (Pi
 /// `rebindSession`). Returns once the reader reaches EOF *and* no run is in flight *and* no
 /// concurrently-dispatched command is still running. A dedicated reader task keeps line parsing
-/// cancel-safe against the concurrent event stream; the writer is owned by the loop so its writes
-/// never interleave.
+/// cancel-safe against the concurrent event stream.
 ///
 /// ## Command concurrency (Pi `void handleInputLine`, rpc-mode.ts:782; G1)
 /// Blocking commands (`bash`/`compact`/`export_html`) and session-replacing ones
@@ -519,6 +518,32 @@ struct LoopSinks {
 /// forget `handleInputLine` promise chains. Fast run-control commands (`prompt`/`steer`/`follow_up`)
 /// stay inline (they own `in_flight`). Contained extension faults surface as `extension_error` lines
 /// (Pi `onError`, rpc-mode.ts:347-349; G2).
+///
+/// ## Output decoupling (Pi `writeRawStdout`, output-guard.ts:85-90; G3)
+/// Pi's `output()` is FIRE-AND-FORGET: `writeRawStdout` appends the chunk to a
+/// `rawStdoutWriteTail` promise chain and returns synchronously (`output-guard.ts:85-90`), so the
+/// RPC host's command handling never sits on the actual `write(2)`. Cyrup awaited every emission
+/// **inline inside the command `select!`** — `write_out(writer, …).await?` in eight arms — which
+/// meant a client that stopped reading its end of the pipe filled the socket buffer, parked the
+/// whole loop inside `write_all`, and made `abort` / `abort_bash` / a guest's `ctx.shutdown()`
+/// structurally undeliverable: no further stdin line could even be *read*, let alone serviced. The
+/// commands that exist to rescue a wedged session were the exact ones a wedged client disabled.
+///
+/// The writer is therefore driven by [`write_pump`], a SEPARATE future composed here with
+/// [`rpc_driver`] (same task — no `Send`/`'static` bound is added to `W`, and `writer` stays a
+/// `&mut`). The driver only enqueues onto an unbounded channel, so no arm can ever block on the
+/// peer. `write_pump` owns the writer for its whole lifetime and is never dropped mid-`write_all`,
+/// which a `select!` arm holding the writer *would* be — that would truncate a JSONL line and
+/// corrupt the stream. Because the two run concurrently, output ordering is unchanged (one FIFO
+/// channel, one writer).
+///
+/// Backpressure is unaffected: it lives where Pi puts it — on the AGENT, via
+/// `cyrup-session-svc`'s bounded-1024 awaited subscriber channel (Pi's
+/// `session.agent.subscribe(async () => await waitForRawStdoutBackpressure())`,
+/// rpc-mode.ts:360-362) — not on the command loop, whose emissions Pi never awaits either.
+/// Shutdown still flushes everything: the driver returning drops the sender, the pump drains the
+/// remaining queue and is awaited before `run_rpc` returns (Pi's `await flushRawStdout()`,
+/// rpc-mode.ts:737).
 pub async fn run_rpc<R, W>(
     runtime: &AgentSessionRuntime,
     reader: R,
@@ -527,6 +552,64 @@ pub async fn run_rpc<R, W>(
 where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
+{
+    let (out, out_rx) = mpsc::unbounded_channel::<RpcOut>();
+    let mut pump = std::pin::pin!(write_pump(writer, out_rx));
+    // Set only when the pump finished FIRST, which can only mean a write error (it otherwise runs
+    // until the driver drops the sender). Distinguishes "already completed" from "still to await".
+    let mut pump_failed: Option<Result<(), ModesError>> = None;
+    let driven = {
+        let mut driver = std::pin::pin!(rpc_driver(runtime, reader, out));
+        tokio::select! {
+            res = &mut driver => res,
+            res = &mut pump => {
+                pump_failed = Some(res);
+                Ok(())
+            }
+        }
+    };
+    // Leaving the block dropped `driver` and with it the sender, so the pump's channel is now
+    // closed and it will return as soon as the backlog is on the wire.
+    driven?;
+    match pump_failed {
+        Some(res) => res,
+        None => pump.await,
+    }
+}
+
+/// Own `writer` for the whole run and drain [`run_rpc`]'s emission queue onto it — cyrup's spelling
+/// of Pi's `rawStdoutWriteTail` chain (`output-guard.ts:11`, `:85-90`), which serializes every
+/// `writeRawStdout` behind the previous one while the caller returns immediately.
+///
+/// Returns `Ok(())` when the sender is dropped (the driver finished) and the queue is empty — i.e.
+/// once everything the session ever emitted is flushed, Pi's `await flushRawStdout()` on the
+/// shutdown path (rpc-mode.ts:737). A write error ends the pump and is surfaced by `run_rpc`.
+///
+/// This must be a long-lived future rather than a `select!` arm: `AsyncWriteExt::write_all` is not
+/// cancel-safe, so an arm dropped mid-write would leave a half-written JSONL line on the stream.
+async fn write_pump<W>(
+    writer: &mut W,
+    mut queue: mpsc::UnboundedReceiver<RpcOut>,
+) -> Result<(), ModesError>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(record) = queue.recv().await {
+        write_out(writer, &record).await?;
+    }
+    Ok(())
+}
+
+/// The command/event loop proper: everything [`run_rpc`] does except touch the writer. Emissions go
+/// to `out` (never awaited — see `run_rpc`'s "Output decoupling"), which [`write_pump`] drains
+/// concurrently.
+async fn rpc_driver<R>(
+    runtime: &AgentSessionRuntime,
+    reader: R,
+    out: mpsc::UnboundedSender<RpcOut>,
+) -> Result<(), ModesError>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
 {
     // The active session + its event subscription (re-acquired on every replacement).
     let mut session = runtime.session().await;
@@ -638,7 +721,7 @@ where
                             // which the generation check at the top of the next iteration settles.
                             let dispatched =
                                 dispatch(runtime, &session, &line, &mut in_flight).await;
-                            write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                            let _ = out.send(RpcOut::Response(dispatched.response));
                             // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786).
                             shutdown_checkpoint = true;
                         } else {
@@ -659,7 +742,7 @@ where
                 // only here + the inline arm, both on this single loop task, so the writer is never
                 // shared across the concurrent dispatch futures (they only compute a response). If
                 // the command replaced the active session, the generation arm rebinds.
-                write_out(writer, &RpcOut::Response(dispatched.response)).await?;
+                let _ = out.send(RpcOut::Response(dispatched.response));
                 // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786) — the
                 // concurrent-dispatch twin of the inline arm above.
                 shutdown_checkpoint = true;
@@ -675,7 +758,7 @@ where
             Some(wire) = error_rx.recv() => {
                 // A dispatcher-contained extension fault: surface it as an `extension_error` line
                 // (Pi `onError` → `output({type:"extension_error", …})`, rpc-mode.ts:347-349).
-                write_out(writer, &RpcOut::ExtensionError(wire)).await?;
+                let _ = out.send(RpcOut::ExtensionError(wire));
             }
             Some(req) = ui_rx.recv() => {
                 // A guest opened a dialog: allocate a correlation id, emit the Pi `extension_ui_request`
@@ -688,7 +771,7 @@ where
                 let id = new_request_id();
                 let wire = extension_ui_request_json(&id, &req);
                 pending.insert(id, PendingUi { kind: req.kind, reply: req.reply });
-                write_out(writer, &RpcOut::ExtensionUiRequest(wire)).await?;
+                let _ = out.send(RpcOut::ExtensionUiRequest(wire));
             }
             Some(effect) = ui_effect_rx.recv() => {
                 // A guest pushed a fire-and-forget ui effect: emit it immediately (no correlation
@@ -697,7 +780,7 @@ where
                 // (rpc-mode.ts:149-241). `setHeader`/`setFooter`/`setToolsExpanded` are dropped here
                 // (Pi doesn't forward them over RPC either — see `extension_ui_effect_json`'s doc).
                 if let Some(wire) = extension_ui_effect_json(&effect) {
-                    write_out(writer, &RpcOut::ExtensionUiRequest(wire)).await?;
+                    let _ = out.send(RpcOut::ExtensionUiRequest(wire));
                 }
             }
             maybe_ev = events.next() => {
@@ -721,7 +804,7 @@ where
                     let settled = matches!(ev, AgentSessionEvent::AgentSettled);
                     // The internal `SessionReplaced` terminal is a rebind signal, not a Pi event.
                     if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
-                        write_out(writer, &RpcOut::Event(Box::new(ev))).await?;
+                        let _ = out.send(RpcOut::Event(Box::new(ev)));
                     }
                     if settled {
                         shutdown_checkpoint = true;
@@ -744,11 +827,11 @@ where
             // shutdown, then shut down cleanly.
             while let Some(Some(ev)) = events.next().now_or_never() {
                 if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
-                    write_out(writer, &RpcOut::Event(Box::new(ev))).await?;
+                    let _ = out.send(RpcOut::Event(Box::new(ev)));
                 }
             }
             while let Ok(wire) = error_rx.try_recv() {
-                write_out(writer, &RpcOut::ExtensionError(wire)).await?;
+                let _ = out.send(RpcOut::ExtensionError(wire));
             }
             break;
         }

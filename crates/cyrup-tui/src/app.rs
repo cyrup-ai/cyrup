@@ -2037,6 +2037,54 @@ impl<B: Backend> App<B> {
         services.set_ui_effect_sink(effects);
     }
 
+    /// Bind the THIRD extension seam of a session — the contained-fault listener Pi's interactive
+    /// mode passes as `bindExtensions({ … onError })` (`interactive-mode.ts:1700-1701`:
+    /// `onError: (error) => { this.showExtensionError(error.extensionPath, error.error,
+    /// error.stack); }`).
+    ///
+    /// A guest handler fault is CONTAINED by the dispatcher (R-08-036) — the handler is skipped
+    /// (fail open) or the action is blocked (fail closed) and the host survives either way — and is
+    /// then reported to every registered listener. `cyrup-modes`' `run_rpc` registers one
+    /// (`rpc.rs`'s `error_listener`, emitting an `extension_error` line) and its `rebind_session`
+    /// re-registers it on every swap; the interactive TUI registered NONE, so with no listener
+    /// `Dispatcher::report` degraded to a `tracing::warn!` that no TUI user ever sees. A broken
+    /// extension therefore silently ate its own hook — or silently DENIED a tool — in the DEFAULT
+    /// mode while an RPC client on the same session saw the fault (TUI-S02).
+    ///
+    /// The listener is invoked SYNCHRONOUSLY from whatever worker thread the faulting dispatch ran
+    /// on, so it only forwards onto an unbounded channel the run loop drains; the drain arm calls
+    /// [`Self::show_extension_error`].
+    ///
+    /// Must be re-run against every swapped-in session for the same reason
+    /// [`Self::install_ui_sinks`] must: a replacement session brings a fresh `ExtensionHost` with an
+    /// empty listener list (Pi re-binds `onError` from `rebindSession` too).
+    pub fn install_error_listener(
+        ext_host: &cyrup_ext::ExtensionHost,
+        errors: tokio::sync::mpsc::UnboundedSender<cyrup_ext::ExtensionError>,
+    ) {
+        ext_host.add_error_listener(std::sync::Arc::new(
+            move |err: &cyrup_ext::ExtensionError| {
+                let _ = errors.send(err.clone());
+            },
+        ));
+    }
+
+    /// Render one contained extension fault into the transcript — Pi `showExtensionError`
+    /// (`interactive-mode.ts:2545-2560`), whose copy is
+    /// `Extension "${extensionPath}" error: ${error}` in the `error` colour.
+    ///
+    /// Pi appends a dimmed, indented stack trace when the thrown value carried one; cyrup's
+    /// [`cyrup_ext::ExtensionError`] has no `stack` field (a contained fault is an `ExtError`
+    /// string, not a JS `Error` object), so only the message line is emitted.
+    ///
+    /// `pub` for the same reason [`Self::apply_ui_effect`] is: `tests/*.rs` drive the run loop's
+    /// drain arm directly, since `App::run` needs a real terminal event source.
+    pub fn show_extension_error(&mut self, err: &cyrup_ext::ExtensionError) {
+        self.state
+            .transcript
+            .push_error(format!("Extension \"{}\" error: {}", err.extension.as_str(), err.error));
+    }
+
     /// Apply one fire-and-forget extension UI effect — the interactive-TUI half of the
     /// [`UiEffectSink`] seam `cyrup-modes`' `run_rpc` already drives for RPC mode.
     ///
@@ -2379,6 +2427,14 @@ impl<B: Backend> App<B> {
                         dag.iter().map(tree_node_from_dag).collect();
                     let mut tree = TreeSelector::new(nodes);
                     tree.set_keymap(self.state.tree_keymap.clone());
+                    // `treeFilterMode` — the filter `/tree` OPENS with (Pi reads
+                    // `settingsManager.getTreeFilterMode()` into `initialFilterMode` at
+                    // `interactive-mode.ts:4644` and hands it to `TreeSelectorComponent`, which seeds
+                    // `this.filterMode` at `tree-selector.ts:137`). Read per open, not cached, so a
+                    // `/settings` change takes effect on the next `/tree` exactly as it does in Pi.
+                    tree.set_filter(crate::tree_selector::FilterMode::from_setting(
+                        &session.services().settings.effective().tree_filter_mode(),
+                    ));
                     // Pi re-shows the tree AT THE SAME ENTRY after an escaped summarize prompt or an
                     // aborted summarization (`showTreeSelector(entryId)`,
                     // `interactive-mode.ts:4763,4807`); both paths park the id here.
@@ -2801,6 +2857,33 @@ impl<B: Backend> App<B> {
                     && let Ok(cells) = value.parse::<u16>()
                 {
                     self.state.transcript.set_image_width_cells(cells);
+                }
+                // `editorPaddingX` is live in Pi too — `onEditorPaddingChange` writes the setting and
+                // then calls `setPaddingX` on the live editor (`settings-selector.ts:687-689` →
+                // `interactive-mode.ts:5393-5399`), so the rules re-inset on the very next frame.
+                if id == "editorPaddingX"
+                    && let Ok(pad) = value.parse::<i64>()
+                {
+                    self.state.editor.set_padding_x(pad);
+                }
+                // Same for `showHardwareCursor` (Pi `onShowHardwareCursorChange` →
+                // `ui.setShowHardwareCursor(enabled)`, `tui.ts:346-352`, which hides the cursor
+                // immediately when turned off rather than waiting for a rebind).
+                if id == "showHardwareCursor" {
+                    self.state.editor.set_show_hardware_cursor(value == "true");
+                }
+                // `enableSkillCommands` gates the `skill:<name>` half of the `/` menu
+                // (`interactive-mode.ts:613`); Pi rebuilds the autocomplete provider on the change,
+                // so rebuild the registry from the SAME catalog with the new gate.
+                if id == "enableSkillCommands" {
+                    self.state
+                        .editor
+                        .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                            crate::commands::dynamic_commands_from_catalog_gated(
+                                &session.slash_command_catalog(),
+                                value == "true",
+                            ),
+                        ));
                 }
                 match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
@@ -4390,21 +4473,50 @@ impl App<CrosstermBackend<Stdout>> {
         // install here every fire-and-forget extension UI call vanished in the DEFAULT mode. Also
         // re-installed on session swap below, for the same reason `ui_tx` is.
         let (ui_effect_tx, mut ui_effect_rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        // The THIRD extension seam (TUI-S02): the contained-fault listener Pi's interactive mode
+        // passes as `bindExtensions({ … onError })` (`interactive-mode.ts:1700-1701`). Every guest
+        // handler fault the dispatcher contains + skips — or contains and turns into a BLOCK — is
+        // reported here and drawn into the transcript by the `ext_error_rx` arm below
+        // (`show_extension_error`). RPC mode has had this since `run_rpc` was written; interactive
+        // had nothing, so `Dispatcher::report` degraded to a `tracing::warn!` and the fault was
+        // invisible in the DEFAULT mode. Re-installed on session swap below, for the same reason
+        // `ui_tx` is: a replacement session brings a fresh `ExtensionHost`.
+        let (ext_error_tx, mut ext_error_rx) =
+            tokio::sync::mpsc::unbounded_channel::<cyrup_ext::ExtensionError>();
         Self::install_ui_sinks(
             &session.services().host_services,
             ui_tx.clone(),
             ui_effect_tx.clone(),
         );
+        Self::install_error_listener(&session.services().ext_host, ext_error_tx.clone());
         // The `/` menu's dynamic half (pi `interactive-mode.ts:1240-1300`). `slash_command_catalog()`
         // already merges registered extension commands, prompt templates and skills — it was just
         // never consumed outside RPC mode, so the interactive `/` list showed builtins only while an
         // RPC client saw everything from the SAME session. Re-installed on session swap below, for
         // the same reason the sinks are: a replacement session brings different extensions.
+        // …gated by `enableSkillCommands`, which Pi applies at exactly this seam
+        // (`interactive-mode.ts:613`) and nowhere else.
         self.state
             .editor
             .set_registry(crate::commands::CommandRegistry::with_dynamic(
-                crate::commands::dynamic_commands_from_catalog(&session.slash_command_catalog()),
+                crate::commands::dynamic_commands_from_catalog_gated(
+                    &session.slash_command_catalog(),
+                    session.services().settings.effective().enable_skill_commands(),
+                ),
             ));
+        // `editorPaddingX` + `showHardwareCursor` — Pi seeds both while CONSTRUCTING the editor and
+        // the TUI (`interactive-mode.ts:459` `new TUI(terminal, getShowHardwareCursor(), …)` and
+        // `:470-474` `new CustomEditor(…, { paddingX: getEditorPaddingX(), … })`), so the very first
+        // frame must already honour them. Re-applied on `/settings` cycle and on session swap below.
+        {
+            let eff = session.services().settings.effective();
+            self.state.editor.set_padding_x(eff.editor_padding_x());
+            self.state
+                .editor
+                .set_show_hardware_cursor(
+                    eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
+                );
+        }
         // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
         // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
         // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
@@ -4724,6 +4836,15 @@ impl App<CrosstermBackend<Stdout>> {
                     self.apply_ui_effect(effect);
                     self.draw_synchronized()?;
                 }
+                Some(err) = ext_error_rx.recv() => {
+                    // A guest handler faulted and the dispatcher CONTAINED it (R-08-036). Pi shows
+                    // it: `onError: (error) => this.showExtensionError(...)`
+                    // (`interactive-mode.ts:1700-1701`). Without this arm the fault reached only
+                    // `tracing`, so a broken extension silently ate its hook — or silently denied a
+                    // tool — with nothing on screen (TUI-S02).
+                    self.show_extension_error(&err);
+                    self.draw_synchronized()?;
+                }
                 Some(msg) = shortcut_status_rx.recv() => {
                     self.state.transcript.push_status(msg);
                     self.draw_synchronized()?;
@@ -4806,13 +4927,25 @@ impl App<CrosstermBackend<Stdout>> {
                             ui_tx.clone(),
                             ui_effect_tx.clone(),
                         );
+                        // ...and the fault listener, whose `ExtensionHost` is likewise brand new on
+                        // the swapped-in session (Pi re-binds `onError` from `rebindSession`, and
+                        // `crates/cyrup-modes/src/rpc.rs`'s `rebind_session` does the same).
+                        Self::install_error_listener(
+                            &session.services().ext_host,
+                            ext_error_tx.clone(),
+                        );
                         // ...and the same for the `/` menu: a replacement session can load a
                         // DIFFERENT extension set (`/reload` exists precisely to change it), so a
                         // registry built from the previous session's catalog would be stale.
                         self.state.editor.set_registry(
                             crate::commands::CommandRegistry::with_dynamic(
-                                crate::commands::dynamic_commands_from_catalog(
+                                crate::commands::dynamic_commands_from_catalog_gated(
                                     &session.slash_command_catalog(),
+                                    session
+                                        .services()
+                                        .settings
+                                        .effective()
+                                        .enable_skill_commands(),
                                 ),
                             ),
                         );
@@ -4829,6 +4962,15 @@ impl App<CrosstermBackend<Stdout>> {
                         self.state.transcript.set_show_images(self.state.show_images);
                         self.state.transcript.set_image_width_cells(
                             eff.image_width_cells().clamp(1, u16::MAX as i64) as u16,
+                        );
+                        // `editorPaddingX` / `showHardwareCursor` are per-settings-layer, and a swap
+                        // can move the project scope (`/resume` of a session recorded elsewhere), so
+                        // re-apply both — Pi does exactly this from `rebindSession`
+                        // (`interactive-mode.ts:1721-1732`: `ui.setShowHardwareCursor(...)` then
+                        // `defaultEditor.setPaddingX(getEditorPaddingX())`).
+                        self.state.editor.set_padding_x(eff.editor_padding_x());
+                        self.state.editor.set_show_hardware_cursor(
+                            eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
                         );
                                         // TUI-003: seed the view from the swapped-in session's conversation (Pi
                         // re-runs `renderInitialMessages()` after a tree/fork navigation,

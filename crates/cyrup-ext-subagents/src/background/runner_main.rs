@@ -88,6 +88,7 @@ use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::parallel::GlobalConcurrencyLimit;
 
 use super::atomic::write_atomic_json;
+use super::cascade;
 use super::control::{self, ChainAppendRequest};
 use super::{
     ParallelGroupStatus, ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
@@ -655,6 +656,21 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // single long-running step's child and a no-op. `ExecSingleStepExecutor` clones this same token
     // into every dispatched step's `RunOptions::interrupt`.
     let interrupt_cancel = cyrup_core::CancelToken::new();
+    // The second control-inbox verb (`control/timeout.json`, pi `TimeoutRequest`): an ancestor
+    // whose own deadline expired cascades one of these into every live descendant's inbox, and it
+    // gets the identical synchronous-startup-check-then-watch treatment the interrupt flag does,
+    // for the identical reason — a request written in the race window before the watcher attaches
+    // must not be missed.
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if control::check_timeout_inbox_now(run_paths)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupt_cancel.cancel();
+    }
     if control::check_control_inbox_now(run_paths)
         .await
         .ok()
@@ -667,9 +683,13 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         // child is torn down mid-flight, not merely noticed after it finishes.
         interrupt_cancel.cancel();
     }
+    let control_flags = ControlFlags {
+        interrupted: Arc::clone(&interrupted),
+        timed_out: Arc::clone(&timed_out),
+    };
     let _watcher_task = spawn_control_watcher(
         run_paths.clone(),
-        Arc::clone(&interrupted),
+        control_flags.clone(),
         interrupt_cancel.clone(),
     );
 
@@ -710,7 +730,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         &config,
         run_paths,
         &shared_status,
-        &interrupted,
+        &control_flags,
         &interrupt_cancel,
         telemetry_tx,
         &mut events,
@@ -751,6 +771,24 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             )
             .await;
             (RunState::Paused, results, None)
+        }
+        Ok(LoopOutcome::TimedOut { results, message }) => {
+            // pi `subagent.run.timed_out` (`subagent-runner.ts:2053-2060` @v0.34.0), carrying both
+            // the nominal budget and the absolute deadline so a reader can tell a run that used
+            // its whole budget from one an ancestor cut short.
+            append_event(
+                &mut events,
+                "subagent.run.timed_out",
+                Some(serde_json::json!({
+                    "runId": run_id_str,
+                    "timeoutMs": config.timeout_ms,
+                    "deadlineAt": config.deadline_at_ms,
+                    "message": message,
+                    "durationMs": duration_ms,
+                })),
+            )
+            .await;
+            (RunState::Failed, results, Some(message))
         }
         Err(err) => {
             append_event(
@@ -911,6 +949,34 @@ enum LoopOutcome {
     /// no live child to signal mid-step since interrupts are only checked BETWEEN steps, see this
     /// function's own doc note on that scope boundary).
     Interrupted { results: Vec<SingleResult> },
+    /// A wall-clock deadline expired — either this run's own (`config.deadline_at_ms`, observed as
+    /// a step whose child was killed by the deadline) or an ancestor's, delivered as a
+    /// `control/timeout.json` request (pi `timeoutRunner`, `subagent-runner.ts:2029-2062`
+    /// @v0.34.0).
+    ///
+    /// Deliberately NOT folded into `Interrupted`: an interrupt is a resumable pause (`Paused`,
+    /// every unfinished step `Paused`, `resume` can pick it up), whereas a timeout is terminal
+    /// failure (`Failed`, `timedOut`, every unfinished step `Failed` with the timeout message,
+    /// nothing to resume). Collapsing the two would make an expired deadline look resumable and
+    /// leave a permanently-`Paused` record nothing ever revisits.
+    TimedOut {
+        results: Vec<SingleResult>,
+        /// The message stamped onto the run's terminal error and every step it failed.
+        message: String,
+    },
+}
+
+/// The two control-inbox verbs' pending flags, shared between the watcher task that SETS them and
+/// the step loop that consumes them. Bundled into one struct rather than passed as two loose
+/// `Arc<AtomicBool>`s so adding the timeout verb did not push [`run_inner`] past clippy's argument
+/// ceiling — and so the pair stays visibly a pair (they are always created, cloned and read
+/// together, and the loop's ordering between them is load-bearing).
+#[derive(Clone)]
+struct ControlFlags {
+    /// A `control/interrupt.json` is pending (soft, resumable pause).
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
+    /// A `control/timeout.json` is pending (terminal deadline failure).
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // =================================================================================================
@@ -1022,11 +1088,13 @@ async fn run_inner(
     config: &RunnerConfig,
     run_paths: &RunPaths,
     status: &SharedStatus,
-    interrupted: &Arc<std::sync::atomic::AtomicBool>,
+    flags: &ControlFlags,
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     events: &mut Option<BoundedJsonlWriter>,
 ) -> Result<LoopOutcome, SubagentError> {
+    let interrupted = &flags.interrupted;
+    let timed_out = &flags.timed_out;
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
     let mut results: Vec<SingleResult> = Vec::new();
@@ -1145,6 +1213,36 @@ async fn run_inner(
     };
 
     loop {
+        // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
+        // (`control-channel.ts:608-609` @v0.34.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+        // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
+        // both land together — an ancestor that timed out cascades a timeout to this run while a
+        // user may simultaneously be interrupting it, and the terminal record must be the harder
+        // of the two verdicts (`Failed`/timed-out, not a resumable `Paused`).
+        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(request) = control::consume_timeout_request(run_paths).await? {
+                let message = request.reason.clone().unwrap_or_else(|| {
+                    timeout_message(config.timeout_ms, &request.source)
+                });
+                {
+                    let mut guard = lock_status(status);
+                    let s = &mut *guard;
+                    mark_remaining_timed_out(s, cursor, steps.len(), &message);
+                    refresh_workflow_graph(s, &steps);
+                    s.touch();
+                }
+                write_shared_status(run_paths, status)
+                    .await
+                    .map_err(SubagentError::Spawn)?;
+                // Fail the whole subtree, not just this run — see `background::cascade`.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+                return Ok(LoopOutcome::TimedOut { results, message });
+            }
+            // Same idempotent absorption the interrupt branch below documents: a watch
+            // notification with nothing actually pending clears the flag rather than looping.
+            timed_out.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // R-SA-084: check interrupted FIRST, before consuming appends or dispatching further
         // work — an interrupt that lands must stop new-step dispatch as soon as this loop next
         // observes it, not after one more (possibly append-extended) step has already started.
@@ -1178,6 +1276,9 @@ async fn run_inner(
                     .await
                     .map_err(SubagentError::Spawn)?;
                 let _ = request; // consumed; contents already reflected via status/event log.
+                // R-SA-084 stops THIS run; without the cascade every background run this one
+                // spawned would keep running, detached and unreachable — see `background::cascade`.
+                cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
                 return Ok(LoopOutcome::Interrupted { results });
             }
             // The watcher observed a notification but a synchronous re-check found nothing
@@ -1402,10 +1503,47 @@ async fn run_inner(
             .map_err(SubagentError::Spawn)?;
 
         if interrupted_mid_flight {
+            // Disambiguate WHICH verb tore this child down. Both share one cancellation token, so
+            // `step_result.interrupted` is true for a timeout too — and returning `Interrupted`
+            // here would end a timed-out run as a resumable `Paused`, silently swallowing the
+            // deadline. A still-pending `control/timeout.json` means it was the timeout: fall
+            // through to the top of the loop WITHOUT advancing the cursor and let the timeout
+            // branch there produce the terminal record (it re-marks this same step `Failed`,
+            // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
+            // Checked against the file rather than the flag so a stale flag can never spin this
+            // loop: only this branch's own consumption removes the file.
+            if control::check_timeout_inbox_now(run_paths).await?.is_some() {
+                continue;
+            }
             // Consume the interrupt request file (idempotent) so it is not left dangling on the run
             // dir, then end the run `Paused` — the child was already torn down mid-flight.
             let _ = control::consume_interrupt_request(run_paths).await;
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
             return Ok(LoopOutcome::Interrupted { results });
+        }
+
+        // A step whose child was killed by the wall clock means the RUN-WIDE deadline
+        // (`config.deadline_at_ms`, converted to `ctx.deadline_at` once above) has passed — it is
+        // not a per-step budget, so every remaining step would be born already over its deadline.
+        // pi ends the whole run here (`timeoutRunner` marks the run `failed`/`timedOut` and fails
+        // every still-running-or-pending step, `subagent-runner.ts:2029-2062` @v0.34.0) rather than
+        // marching the cursor through steps that cannot succeed. This is the ORIGIN of the timeout
+        // cascade: the run whose own deadline expired is what turns a bounded background run into
+        // a bounded background SUBTREE.
+        if step_result.timed_out {
+            let message = timeout_message(config.timeout_ms, "deadline");
+            {
+                let mut guard = lock_status(status);
+                let s = &mut *guard;
+                mark_remaining_timed_out(s, cursor + 1, steps.len(), &message);
+                refresh_workflow_graph(s, &steps);
+                s.touch();
+            }
+            write_shared_status(run_paths, status)
+                .await
+                .map_err(SubagentError::Spawn)?;
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+            return Ok(LoopOutcome::TimedOut { results, message });
         }
 
         cursor += 1;
@@ -1421,6 +1559,86 @@ async fn run_inner(
 /// moved out of `Pending` into `Paused` rather than left looking like they simply never got a
 /// turn, since R-SA-084 does not distinguish "was mid-flight" from "was about to start" for the
 /// purpose of this marking.
+/// pi's `timeoutMessage` (`subagent-runner.ts:1339` @v0.34.0): `Subagent timed out after
+/// ${config.timeoutMs}ms.`, falling back to the bare `"Subagent timed out."` upstream's
+/// `timeoutRunner` uses when no nominal budget is known — which is exactly the ancestor-cascade
+/// case, where the deadline that expired belonged to a different run and this one has no
+/// `timeout_ms` of its own to name.
+fn timeout_message(timeout_ms: Option<u64>, source: &str) -> String {
+    match timeout_ms {
+        Some(ms) => format!("Subagent timed out after {ms}ms."),
+        None if source == "ancestor-timeout" => {
+            "Subagent timed out: an ancestor run's deadline expired.".to_string()
+        }
+        None => "Subagent timed out.".to_string(),
+    }
+}
+
+/// The timeout counterpart of [`mark_remaining_paused`] (pi `timeoutRunner`'s step sweep,
+/// `subagent-runner.ts:2038-2049` @v0.34.0): every step from `from_index` that is not already
+/// terminal becomes `Failed` with the timeout `message` and an end timestamp.
+///
+/// `Failed`, not `Paused`, is the whole point — see [`LoopOutcome::TimedOut`]. A reader must be
+/// able to tell "this run stopped and can be resumed" from "this run ran out of time and is over".
+fn mark_remaining_timed_out(
+    status: &mut RunStatus,
+    from_index: usize,
+    total: usize,
+    message: &str,
+) {
+    let now = super::now_epoch_millis_pub();
+    for index in from_index..total {
+        if let Some(step) = status.steps.get_mut(index)
+            && !step.status.is_terminal()
+        {
+            step.status = StepState::Failed;
+            step.error = Some(message.to_string());
+            step.ended_at.get_or_insert(now);
+        }
+    }
+    if let Some(groups) = &mut status.parallel_groups {
+        for group in groups {
+            if group.group_step_index >= from_index {
+                for child in &mut group.children {
+                    if !child.status.is_terminal() {
+                        child.status = StepState::Failed;
+                        child.error = Some(message.to_string());
+                        child.ended_at.get_or_insert(now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deliver `verb` to every live nested async descendant of this run, logging each failed delivery
+/// into this run's own `events.jsonl` under pi's `subagent.nested.{interrupt,timeout}_failed`
+/// event types (`subagent-runner.ts:1539-1573` @v0.34.0).
+///
+/// A run with no `nested_route` has no descendants to reach and this is a no-op — that is the
+/// common case (a leaf background run), so the cascade costs nothing on the path that does not
+/// need it.
+async fn cascade_to_descendants(
+    config: &RunnerConfig,
+    events: &mut Option<BoundedJsonlWriter>,
+    verb: cascade::CascadeVerb,
+) {
+    let Some(route) = config.nested_route.as_ref() else {
+        return;
+    };
+    let report = cascade::cascade_to_nested_async_descendants(route, verb).await;
+    for failure in report.failures {
+        let mut payload = serde_json::json!({
+            "runId": config.run_id.as_str(),
+            "message": failure.message,
+        });
+        if let (Some(target), Some(map)) = (failure.target_run_id, payload.as_object_mut()) {
+            map.insert("targetRunId".to_string(), serde_json::Value::String(target));
+        }
+        append_event(events, verb.failure_event_type(), Some(payload)).await;
+    }
+}
+
 fn mark_remaining_paused(status: &mut RunStatus, from_index: usize, total: usize) {
     let now = super::now_epoch_millis_pub();
     for index in from_index..total {
@@ -2258,9 +2476,13 @@ impl Drop for SigUsr2Guard {
 /// installing any asynchronous watch" contract.
 fn spawn_control_watcher(
     run_paths: RunPaths,
-    interrupted: Arc<std::sync::atomic::AtomicBool>,
+    flags: ControlFlags,
     interrupt_cancel: cyrup_core::CancelToken,
 ) -> ControlWatcherHandle {
+    let ControlFlags {
+        interrupted,
+        timed_out,
+    } = flags;
     let handle = tokio::spawn(async move {
         let (watcher, mut rx) = match control::watch_control_inbox(&run_paths) {
             Ok(pair) => pair,
@@ -2278,13 +2500,43 @@ fn spawn_control_watcher(
         // — held in this local binding rather than discarded.
         let _watcher = watcher;
         while rx.recv().await.is_some() {
-            interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
-            // R-SA-084 mid-flight interrupt: cancelling the run-wide shared interrupt token tears
-            // down whatever child is running RIGHT NOW (via `run_sync`'s `opts.interrupt` race),
-            // rather than waiting for the step loop's next between-steps `interrupted` check — the
-            // difference between an interrupt that actually stops a single long-running step's child
-            // and one that is a no-op until the (never-arriving) next step.
-            interrupt_cancel.cancel();
+            // The control inbox now holds TWO distinct request files (`interrupt.json` and
+            // `timeout.json`), so a notification is no longer self-describing: this task must ask
+            // WHICH one is pending rather than blindly assuming "interrupt". Blindly setting
+            // `interrupted` on a timeout delivery would tear the live child down under the wrong
+            // verdict and end the run `Paused` (resumable) when it must end `Failed`/timed-out.
+            //
+            // Timeout is checked first, matching pi's own drain order (`control-channel.ts:608-609`
+            // @v0.34.0) and this run loop's own top-of-iteration ordering.
+            let mut wake = false;
+            if control::check_timeout_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
+            if control::check_control_inbox_now(&run_paths)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake = true;
+            }
+            if wake {
+                // R-SA-084 mid-flight interrupt: cancelling the run-wide shared interrupt token
+                // tears down whatever child is running RIGHT NOW (via `run_sync`'s
+                // `opts.interrupt` race), rather than waiting for the step loop's next
+                // between-steps check — the difference between a control request that actually
+                // stops a single long-running step's child and one that is a no-op until the
+                // (never-arriving) next step. pi does the same for both verbs (`interruptRunner`
+                // signals the live children; `timeoutRunner` aborts via `timeoutAbortController`).
+                interrupt_cancel.cancel();
+            }
         }
     });
     ControlWatcherHandle { handle }

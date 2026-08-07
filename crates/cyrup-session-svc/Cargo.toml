@@ -57,3 +57,8 @@ cyrup-config = { workspace = true }
 cyrup-tools = { workspace = true }
 # Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
+# `tests/read_image_auto_resize.rs` builds a real >2000px PNG fixture and compares the `read` tool's
+# attached base64 against the file's own bytes. Both are already in the lockfile (`image` via
+# cyrup-tools' default `inline-images`, `base64` via cyrup-provider), so this adds no new crate.
+image = { workspace = true }
+base64 = { workspace = true }
