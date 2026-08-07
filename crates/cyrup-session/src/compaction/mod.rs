@@ -44,7 +44,7 @@ pub use settings::{BranchSummarySettings, CompactionSettings};
 pub use summarize::{
     combine_usage, compact_default, complete_summarization, generate_summary,
     generate_turn_prefix_summary, summarization_reasoning, DefaultCompaction, ProviderSummarizer,
-    SummarizationRequest, SummaryOutput, Summarizer, SUMMARIZATION_PROMPT,
+    SummarizationRequest, SummaryOutput, Summarizer, PENDING_SUMMARY, SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use tokens::{

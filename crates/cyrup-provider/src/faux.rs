@@ -395,7 +395,9 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
         response_id: message.response_id.clone(),
         diagnostics: None,
         usage: message.usage.clone(),
-        stop_reason: StopReason::Stop,
+        // Pi builds the partial prototype as `{ ...message, content: [], stopReason: "pending" }`
+        // (faux.ts:316) — the sentinel, NOT the scripted message's settled reason.
+        stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: message.timestamp,
     };
@@ -507,7 +509,16 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
         }
     }
 
-    events.push(StreamEvent::terminal(message.clone()));
+    // Pi's own truncation guard: a scripted response whose `stopReason` is still `"pending"` makes
+    // `streamWithDeltas` throw `"Faux response ended without a stop reason"` (faux.ts:393-395),
+    // which its catch re-emits as `{type:"error", reason:"error"}`. Route through the same
+    // `end_of_stream` seam as the five real wire APIs so the faux provider — which nine crates use
+    // as their offline oracle — cannot disagree with them about what a truncated stream means.
+    events.push(StreamEvent::end_of_stream(
+        message.clone(),
+        Some(message.stop_reason),
+        "Faux response ended without a stop reason",
+    ));
     events
 }
 
@@ -542,7 +553,9 @@ pub fn faux_event_stream(
     let proto_empty = {
         let mut p = message;
         p.content = Vec::new();
-        p.stop_reason = StopReason::Stop;
+        // The abort fallback is a PARTIAL (it is only read before the first event lands), so it
+        // carries Pi's `"pending"` seed, not a settled reason (faux.ts:316).
+        p.stop_reason = StopReason::Pending;
         p.error_message = None;
         p
     };
@@ -917,7 +930,12 @@ pub fn faux_assistant_message_with(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::stream::collect_message;
@@ -940,6 +958,79 @@ mod tests {
         assert!(msg.usage.total_tokens >= msg.usage.output);
         assert_eq!(faux.call_count(), 1);
         assert_eq!(faux.pending_count(), 0);
+    }
+
+    /// Nine crates use the faux provider as their offline oracle, so it must not disagree with the
+    /// five real wire APIs about what an unfinished stream means. Pi's `streamWithDeltas` throws
+    /// `"Faux response ended without a stop reason"` for a still-`"pending"` scripted response
+    /// (faux.ts:393-395), and the catch re-emits `{type:"error", reason:"error"}`.
+    #[tokio::test]
+    async fn a_scripted_pending_response_is_an_error_terminal_not_a_done() {
+        let faux = FauxProvider::new();
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text("hello")],
+            StopReason::Pending,
+        )]);
+        let model = faux.model().clone();
+        let mut stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev);
+        }
+
+        // Every in-flight partial carries Pi's sentinel (faux.ts:316).
+        for (i, p) in events.iter().filter_map(StreamEvent::partial).enumerate() {
+            assert_eq!(p.stop_reason, StopReason::Pending, "partial #{i}");
+        }
+
+        match events.last() {
+            Some(StreamEvent::Error { reason, error }) => {
+                assert_eq!(*reason, crate::stream::ErrorReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("Faux response ended without a stop reason")
+                );
+                // Pi's catch re-emits `output` with its accumulated blocks intact.
+                assert_eq!(error.content, vec![faux_text("hello")]);
+            }
+            other => panic!("a pending scripted response must not settle cleanly, got {other:?}"),
+        }
+    }
+
+    /// The in-flight `partial` of a perfectly normal faux stream must report `"pending"` on the
+    /// wire, matching Pi's `{ ...message, content: [], stopReason: "pending" }` (faux.ts:316) — the
+    /// terminal is unaffected.
+    #[tokio::test]
+    async fn faux_partials_report_pending_and_the_terminal_still_reports_stop() {
+        let faux = FauxProvider::new();
+        faux.set_responses(vec![faux_assistant_message(
+            vec![faux_text("hello world")],
+            StopReason::Stop,
+        )]);
+        let model = faux.model().clone();
+        let mut stream = faux.stream(&model, &Context::default(), &StreamOptions::default());
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev);
+        }
+        let partials: Vec<_> = events.iter().filter_map(StreamEvent::partial).collect();
+        assert!(!partials.is_empty());
+        for p in &partials {
+            assert_eq!(p.stop_reason, StopReason::Pending);
+            assert_eq!(
+                serde_json::to_value(*p).unwrap()["stopReason"],
+                "pending",
+                "wire spelling must be Pi's"
+            );
+        }
+        match events.last() {
+            Some(StreamEvent::Done { reason, message }) => {
+                assert_eq!(*reason, crate::stream::DoneReason::Stop);
+                assert_eq!(message.stop_reason, StopReason::Stop);
+            }
+            other => panic!("expected done/stop, got {other:?}"),
+        }
     }
 
     #[tokio::test]

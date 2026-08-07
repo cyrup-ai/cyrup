@@ -86,6 +86,8 @@ fn read_attempt_tee(cwd: &Path) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: agent.to_string(),
         task: task.to_string(),
         cwd: None,
@@ -174,6 +176,13 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         steps: vec![RunnerStep::SingleStep(single_step("reviewer", "Review the diff"))],
@@ -312,6 +321,13 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         // The step template references `{task}` — it must be substituted with `original_task`.
@@ -578,6 +594,13 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         steps: vec![RunnerStep::SingleStep(single_step("reviewer", "review at the ceiling"))],
@@ -696,6 +719,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
 
     // The step carries an `output` FILE path (relative — resolved against the run cwd).
     let step = SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: "reporter".to_string(),
         task: "Summarize the analysis.".to_string(),
         cwd: None,
@@ -823,6 +848,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     resolved_agents.insert("reporter".to_string(), reporter);
 
     let step = SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: "reporter".to_string(),
         task: "Summarize the analysis.".to_string(),
         cwd: None,
@@ -918,6 +945,8 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
     let executor = ext.executor();
 
     let step = SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: "worker".to_string(),
         task: "do something".to_string(),
         cwd: None,
@@ -940,6 +969,13 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         .spawn_background_steps(
             dir.path(),
             BackgroundStepsSpec {
+                // SUBA-N03: this fixture drives the generic step-graph entry point, which
+                // carries none of the SINGLE-mode overrides.
+                run_id: cyrup_ext_subagents::background::RunId::new(),
+                timeout_ms: None,
+                share: None,
+                artifacts_dir: None,
+                artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Chain,
                 session_file: None,

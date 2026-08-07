@@ -1959,7 +1959,18 @@ impl AgentSession {
             cyrup_core::StopReason::Aborted => {
                 Err(cyrup_session::compaction::CompactionError::Aborted)
             }
-            _ => {
+            // An unsettled response is NOT a summary — same guard as
+            // `cyrup_session::compaction::{summarize,branch}`.
+            cyrup_core::StopReason::Pending => {
+                Err(cyrup_session::compaction::CompactionError::Summarization(
+                    resp.error_message.unwrap_or_else(|| {
+                        cyrup_session::compaction::PENDING_SUMMARY.to_string()
+                    }),
+                ))
+            }
+            cyrup_core::StopReason::Stop
+            | cyrup_core::StopReason::Length
+            | cyrup_core::StopReason::ToolUse => {
                 let body = resp
                     .content
                     .iter()

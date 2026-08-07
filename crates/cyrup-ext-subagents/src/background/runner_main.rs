@@ -294,6 +294,68 @@ pub struct RunnerConfig {
     /// pre-existing behaviour: no snapshot, full R-SA-043 compaction.
     #[serde(default)]
     pub include_progress: Option<bool>,
+    /// SUBA-N03 — pi `config.timeoutMs` (`subagent-runner.ts:125` @v0.34.0, fed from
+    /// `async-execution.ts:982` `timeoutMs: params.timeoutMs`): the NOMINAL run-level timeout
+    /// budget in milliseconds this run was started with.
+    ///
+    /// This is only the figure [`crate::exec::format_timeout_message`] renders into a timed-out
+    /// step's error text — the same constant for every step, never a shrinking "time remaining"
+    /// value. The instant actually raced against is [`Self::deadline_at_ms`] below. pi keeps the
+    /// same two-value split (`timeoutMessage = \`Subagent timed out after ${config.timeoutMs}ms.\``,
+    /// `subagent-runner.ts:1339`, vs the `setTimeout(timeoutRunner, config.deadlineAt - Date.now())`
+    /// arm at `:2078-2081`).
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize and is the
+    /// pre-SUBA-N03 behaviour: an async run with no wall-clock budget at all.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// SUBA-N03 — pi `config.deadlineAt` (`subagent-runner.ts:126`, fed from
+    /// `async-execution.ts:924,983` `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
+    /// wall-clock instant this run must be finished by, as milliseconds since the Unix epoch.
+    ///
+    /// Absolute epoch-milliseconds rather than a `std::time::Instant` for the reason pi's is a
+    /// `number`: this value crosses a PROCESS boundary in a JSON file, and `Instant` is an opaque
+    /// monotonic reading with no serializable representation and no meaning in another process.
+    /// [`run`] converts it back to a local deadline once, on entry, by subtracting the current
+    /// wall clock — pi's own `Math.max(0, config.deadlineAt - Date.now())` (`:2079`) — so time
+    /// already burned by the hop-1 spawn and hop-2 startup is charged against the budget rather
+    /// than silently refunded.
+    ///
+    /// `#[serde(default)]` (`None`) = no deadline, the pre-SUBA-N03 behaviour.
+    #[serde(default)]
+    pub deadline_at_ms: Option<u64>,
+    /// SUBA-N03 — pi `config.share` (`subagent-runner.ts` config, fed from `async-execution.ts:965`
+    /// `share: shareEnabled`): the run's `share` opt-in, threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::share`].
+    ///
+    /// Its one load-bearing effect is pi's `sessionEnabled = Boolean(sessionFile || sessionDir) ||
+    /// share` term (`execution.ts:1027,1039`, ported at
+    /// [`crate::exec::build_attempt_spawn_plan`]): `Some(true)` keeps the child's session store on
+    /// where it would otherwise be spawned `--no-session`. `#[serde(default)]` (`None`) is
+    /// "omitted", which is NOT an enabling value (pi's term is `options.share === true`).
+    #[serde(default)]
+    pub share: Option<bool>,
+    /// SUBA-N03 — pi `config.artifactsDir` (`subagent-runner.ts:106`, fed from
+    /// `async-execution.ts:964` `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`):
+    /// the directory this run's per-step artifact quadruple is written into.
+    ///
+    /// `None` means "write no artifacts" — pi's own gate is `if (ctx.artifactsDir &&
+    /// ctx.artifactConfig?.enabled !== false)` (`subagent-runner.ts:879`), i.e. an absent dir is
+    /// exactly as disabling as `enabled: false`, which is why the orchestrator sets this to `None`
+    /// for `artifacts: false`. `#[serde(default)]` (`None`) is therefore also the pre-SUBA-N03
+    /// behaviour: before this field existed the hop-2 runner wrote no artifacts at all.
+    #[serde(default)]
+    pub artifacts_dir: Option<PathBuf>,
+    /// SUBA-N03 — pi `config.artifactConfig` (`subagent-runner.ts:107`, fed from
+    /// `async-execution.ts:965`): WHICH of the four artifact files each step writes.
+    ///
+    /// Read together with [`Self::artifacts_dir`] by [`ExecSingleStepExecutor::run_single`], which
+    /// gates on `artifacts_dir.is_some() && artifact_config.enabled`, matching pi's own two-term
+    /// gate. `#[serde(default)]` is pi's `DEFAULT_ARTIFACT_CONFIG`; the orchestrator sends
+    /// [`crate::artifacts::ArtifactConfig::foreground`] so an async run leaves the same full
+    /// quadruple (including the `.jsonl` event stream) a foreground run does.
+    #[serde(default)]
+    pub artifact_config: crate::artifacts::ArtifactConfig,
 }
 
 // =================================================================================================
@@ -1033,11 +1095,37 @@ async fn run_inner(
         control: config.control.clone(),
         // SUBA-N06: R-SA-043 compaction's opt-out, carried the same way and for the same reason.
         include_progress: config.include_progress,
+        // SUBA-N03: the run's `share` opt-in and artifact destination/selection, carried from the
+        // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
+        // quadruple a foreground run does (pi `subagent-runner.ts:879-889,1117-1133` @v0.34.0).
+        share: config.share,
+        artifacts_dir: config.artifacts_dir.clone(),
+        artifact_config: config.artifact_config,
+    });
+    // SUBA-N03 — pi `subagent-runner.ts:2078-2081`: `const remainingMs = Math.max(0,
+    // config.deadlineAt - Date.now())`. The orchestrator stamped an ABSOLUTE epoch deadline into
+    // the one-shot config; convert it back to a local `Instant` ONCE here, charging the elapsed
+    // hop-1 spawn + hop-2 startup time against the budget rather than refunding it. An
+    // already-passed deadline collapses to `now` (`max(0, …)`), so the first step is refused
+    // immediately instead of the subtraction wrapping into a far-future instant.
+    //
+    // This replaces a hardcoded `None` justified as "R-SA-036: background runs have no built-in
+    // wall-clock timeout". That remains true of the DEFAULT — `timeout_ms`/`deadline_at_ms` are
+    // `None` unless the caller asked for a timeout — but it was never a reason to DROP an explicit
+    // one, and upstream has always honoured `timeoutMs` on the async path (`schemas.ts:265-266`
+    // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
+    // async/background runs"; `async-execution.ts:924,982-983` arms the deadline).
+    let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
+        let remaining_ms = deadline_ms.saturating_sub(crate::background::now_epoch_ms());
+        std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
     });
     let ctx = ChainRunContext {
         cwd: config.cwd.clone(),
-        deadline_at: None, // R-SA-036: background runs have no built-in wall-clock timeout.
-        timeout_ms: None, // Same R-SA-036 rationale: `timeoutMs`/`maxRuntimeMs` are foreground-only.
+        deadline_at,
+        // The NOMINAL budget, rendered into a timed-out step's message and never re-derived per
+        // step (pi's `timeoutMessage = \`Subagent timed out after ${config.timeoutMs}ms.\``,
+        // `subagent-runner.ts:1339`).
+        timeout_ms: config.timeout_ms,
         cancel: cancel_root.clone(),
         global_limit,
         worktree_base_dir: config.worktree_base_dir.clone(),
@@ -1585,6 +1673,22 @@ pub(crate) struct ExecSingleStepExecutor {
     /// Threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`], so each
     /// step's [`crate::exec::SingleResult`] carries its own progress snapshot.
     pub(crate) include_progress: Option<bool>,
+    /// SUBA-N03 — the run's `share` opt-in (pi `config.share` ← `params.share`), threaded onto
+    /// every dispatched step's [`crate::exec::RunOptions::share`]. Its one effect is pi's
+    /// `sessionEnabled = Boolean(sessionFile || sessionDir) || share` term
+    /// (`runs/foreground/execution.ts:1027,1039`): `Some(true)` keeps a child's session store on
+    /// where it would otherwise be spawned `--no-session`. `None`/`Some(false)` is not enabling.
+    pub(crate) share: Option<bool>,
+    /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
+    /// `runs/background/subagent-runner.ts:877-889,1117-1133` @v0.34.0), paired with
+    /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
+    /// own first gate term (`if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`) and
+    /// is how an explicit `artifacts: false` reaches this hop.
+    pub(crate) artifacts_dir: Option<PathBuf>,
+    /// SUBA-N03 — which of the four artifact files each dispatched step writes (pi
+    /// `ctx.artifactConfig`). Read together with [`Self::artifacts_dir`]; `enabled: false` disables
+    /// the write just as an absent dir does.
+    pub(crate) artifact_config: crate::artifacts::ArtifactConfig,
 }
 
 impl ExecSingleStepExecutor {
@@ -1648,6 +1752,15 @@ impl ExecSingleStepExecutor {
             control: None,
             // Same rationale, via `with_include_progress`.
             include_progress: None,
+            // SUBA-N03: a FOREGROUND `/chain`//`/parallel`//`/run-chain` walk carries no run-level
+            // `share`/artifacts config of its own — those three slash commands expose no such flag
+            // (only the `subagent` tool's SINGLE mode does, and that path never builds this
+            // executor), and neither does pi's own foreground chain path. Deliberately NOT given a
+            // `with_*` builder: an unused one would be dead code, and the background runner sets
+            // these three directly in its own `ExecSingleStepExecutor` literal from `RunnerConfig`.
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
         }
     }
 
@@ -1862,13 +1975,23 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             available_models,
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,
-            share: None,
-            session_dir: None,
-            // The step's skills come from the resolved persona's own `skills` list (carried on the
-            // `AgentConfig` built from the persona above); `run_sync` reads `opts.skills ??
-            // agent.skills`. The orchestrator/runtime fallback cwd is not threaded through the
-            // one-shot runner config, so a background step resolves skills against its own step cwd.
-            skills: None,
+            // SUBA-N03 — pi `share: shareEnabled` (`async-execution.ts:965`) reaching this run's
+            // children as one of the two `sessionEnabled` terms (`execution.ts:1027,1039`). Carried
+            // from `RunnerConfig::share`; `None` is "omitted", which is NOT enabling.
+            share: self.share,
+            // SUBA-N03 — this step's own already-resolved session directory (pi's `--session-dir`,
+            // `pi-args.ts:109-111`). Resolved PARENT-side and carried on the step rather than
+            // derived here from a run-level root: see `SingleStepSpec::session_dir`'s
+            // [CYRUP-DELTA] note for why an index-derived path would be unsafe at this seam.
+            session_dir: step.session_dir.clone(),
+            // SUBA-N03 — this step's own SKILL override (pi's runner-step `skills`,
+            // `subagent-runner.ts:872` ← `async-execution.ts:990`). `run_sync` applies pi's
+            // `opts.skills ?? agent.skills` fallthrough, so `None` still defers to the resolved
+            // persona's own `skills:` list (carried on the `AgentConfig` built above) and
+            // `Some(vec![])` is the explicit `skill: false` "no skills" form. The orchestrator/
+            // runtime fallback cwd is not threaded through the one-shot runner config, so a
+            // background step resolves skill NAMES against its own step cwd.
+            skills: step.skills.clone(),
             runtime_cwd: None,
             // SUBA-N06: the run's `includeProgress`, carried from `RunnerConfig::include_progress`
             // through this executor, so a background step's persisted `SingleResult` carries the
@@ -1930,7 +2053,65 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             on_control_event: None,
         };
 
+        // SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
+        // @v0.34.0: the artifact quadruple is written by the ASYNC runner too, not only by the
+        // foreground path, and its `_input.md` is written BEFORE the child spawns (`:882-885`,
+        // `mkdirSync` then `writeFileSync(inputPath, …)`) precisely so a child that crashes still
+        // leaves a record of what it was asked to do. The gate is pi's own two-term one:
+        // `ctx.artifactsDir && ctx.artifactConfig?.enabled !== false` (`:879`) — an absent dir is
+        // exactly as disabling as `enabled: false`, which is how the SINGLE-mode `artifacts: false`
+        // param reaches this hop.
+        //
+        // Best-effort throughout: a failed artifact write must never alter the `StepResult` the
+        // walker observes, matching pi (whose artifact writes are un-guarded side-effects) and the
+        // foreground path's identical convention.
+        //
+        // Index: pi passes the step's own index into `getArtifactPaths` so a chain's steps do not
+        // overwrite each other's files. `current_flat_index` is the value `run_inner` publishes
+        // immediately before each dispatch — the SAME index `RunOptions::child_index` above uses.
+        let artifact_paths = self.artifacts_dir.as_ref().filter(|_| self.artifact_config.enabled).map(
+            |dir| {
+                let index = self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst);
+                let run_token = self.run_id.as_ref().map_or("run", RunId::as_str).to_string();
+                let paths =
+                    crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
+                let _ = crate::artifacts::ensure_artifacts_dir(dir);
+                if self.artifact_config.include_input {
+                    let _ = crate::artifacts::write_artifact(
+                        &paths.input_path,
+                        &format!("# Task for {}\n\n{resolved_task}", step.agent),
+                    );
+                }
+                (paths, run_token)
+            },
+        );
+
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
+
+        // SUBA-N03 / T6: the after-run half (pi `subagent-runner.ts:1117-1134` — `_output.md`,
+        // `_meta.json`, and this crate's reconstructed `.jsonl`). Shares ONE implementation with
+        // the foreground path via `artifacts::run_artifact_metadata`/`run_artifact_jsonl_lines`,
+        // so an async run's artifacts are byte-shaped identically to a foreground run's rather
+        // than being a second, drifting hand-rolled emitter.
+        if let Some((paths, run_token)) = &artifact_paths {
+            if self.artifact_config.include_output {
+                let _ = crate::artifacts::write_artifact(
+                    &paths.output_path,
+                    result.final_output.as_deref().unwrap_or(""),
+                );
+            }
+            if self.artifact_config.include_metadata {
+                let _ = crate::artifacts::write_metadata(
+                    &paths.metadata_path,
+                    &crate::artifacts::run_artifact_metadata(run_token, &result),
+                );
+            }
+            if self.artifact_config.include_jsonl {
+                for line in crate::artifacts::run_artifact_jsonl_lines(&result) {
+                    let _ = crate::artifacts::append_jsonl(&paths.jsonl_path, &line);
+                }
+            }
+        }
 
         // R-SA-084: carry the mid-flight interrupt flag up so `run_inner` treats an interrupted
         // step as the pause point (`Paused`, not `Complete`). An interrupted `run_sync` reports
@@ -2275,6 +2456,8 @@ mod tests {
 
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: task.to_string(),
             cwd: None,
@@ -2317,6 +2500,9 @@ mod tests {
             interrupt_cancel: cyrup_core::CancelToken::new(),
             current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,
@@ -2369,6 +2555,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token("run00001"),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
@@ -2413,6 +2606,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token("run00002"),
             mode: RunMode::Single,
             steps: vec![],
@@ -2529,6 +2729,13 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: run_id.clone(),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(single_step("worker", "do it"))],
@@ -2830,6 +3037,13 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: run_id.clone(),
             mode: RunMode::Chain,
             steps: vec![RunnerStep::ImportAsyncRoot(

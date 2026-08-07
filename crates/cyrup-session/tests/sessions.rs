@@ -375,6 +375,193 @@ fn a04_10_corrupt_trailing_line_loads_valid_prefix() {
     assert_eq!(recovered.entries().len(), good_count, "valid prefix recovered");
 }
 
+// -------------------------------------------------- StopReason wire compatibility -------------
+
+/// ADVERSARIAL guard for adding `StopReason::Pending` (PROV-010 / AGENT-014 / DRIFT-012): the
+/// variant changes a SERIALIZED shape, so an existing on-disk session must keep loading unchanged.
+///
+/// The five pre-existing spellings are byte-identical before and after, so this asserts against
+/// literal JSON rather than a round-trip — a round-trip would pass even if both directions had
+/// shifted together.
+#[test]
+fn an_existing_session_jsonl_still_loads_after_the_pending_variant_was_added() {
+    use std::io::Write as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/wirecompat");
+    let lay = layout(root.path(), &cwd);
+
+    // The session file is deferred-flushed until an assistant message lands (see a04_10), so seed
+    // one turn before hand-writing raw lines onto the end.
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("seed")).unwrap();
+    m.append_message(assistant("seed")).unwrap();
+    let path = m.session_file().unwrap().to_path_buf();
+    let base = m.entries().len();
+    drop(m);
+
+    // Hand-written entries in the pre-change on-disk shape, one per settled stop reason.
+    let wire = ["stop", "length", "toolUse", "error", "aborted"];
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for (i, w) in wire.iter().enumerate() {
+            let line = serde_json::json!({
+                "type": "message",
+                "id": format!("m{i}"),
+                "parentId": null,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": w,
+                    "content": [{"type": "text", "text": format!("turn {i}")}],
+                    "api": "faux",
+                    "provider": "faux",
+                    "model": "faux-1",
+                    "usage": {
+                        "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                                 "cacheWrite": 0.0, "total": 0.0}
+                    },
+                    "timestamp": 0
+                }
+            });
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
+    let reopened = SessionManager::open(&path).unwrap();
+    assert_eq!(
+        reopened.entries().len(),
+        base + wire.len(),
+        "an old-shape session lost entries — the new variant broke the read path"
+    );
+
+    let got: Vec<StopReason> = reopened
+        .entries()
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Known(KnownEntry::Message {
+                message: AgentMessage::Core(m @ Message::Assistant(_)),
+                ..
+            }) if first_text(m).starts_with("turn ") => match m {
+                Message::Assistant(a) => Some(a.stop_reason),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            StopReason::Stop,
+            StopReason::Length,
+            StopReason::ToolUse,
+            StopReason::Error,
+            StopReason::Aborted,
+        ],
+        "every pre-existing wire spelling must still decode to the same variant"
+    );
+
+    // Re-export must reproduce the same bytes — no variant renamed itself on the way out.
+    for (i, w) in wire.iter().enumerate() {
+        let a = AssistantMessage { stop_reason: got[i], ..match assistant("x") {
+            Message::Assistant(a) => a,
+            _ => unreachable!(),
+        } };
+        assert_eq!(serde_json::to_value(a).unwrap()["stopReason"], *w);
+    }
+}
+
+/// The interop gap the variant closes. A Pi-produced payload can carry `"stopReason":"pending"` —
+/// `agent-loop.ts:314-318` emits `message_start` as `{...partialMessage}`, whose `stopReason` is
+/// the `"pending"` seed every Pi stream function sets.
+///
+/// The pre-fix failure mode was neither "the load errors out" nor "the line is dropped": `Entry`
+/// has an `Unknown(Value)` fallback for a known tag with an unparseable body, so the entry survived
+/// in the FILE verbatim and round-tripped on export — but `build_context` only walks
+/// `KnownEntry::Message` (context.rs:60,175), so the message was invisible to the model and to
+/// every consumer that reads the transcript rather than the raw entries. Silent, and worse than a
+/// drop, because the file kept looking intact. This test pins both halves: it decodes as a real
+/// message AND reaches the built context.
+#[test]
+fn a_pi_pending_entry_is_no_longer_silently_dropped_on_load() {
+    use std::io::Write as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/pending-import");
+    let lay = layout(root.path(), &cwd);
+
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("seed")).unwrap();
+    m.append_message(assistant("seed")).unwrap();
+    let path = m.session_file().unwrap().to_path_buf();
+    let base = m.entries().len();
+    drop(m);
+
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let line = serde_json::json!({
+            "type": "message",
+            "id": "p0",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "stopReason": "pending",
+                "content": [{"type": "text", "text": "half a thou"}],
+                "api": "anthropic-messages",
+                "provider": "anthropic",
+                "model": "claude-x",
+                "usage": {
+                    "input": 10, "output": 3, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 13,
+                    "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                             "cacheWrite": 0.0, "total": 0.0}
+                },
+                "timestamp": 0
+            }
+        });
+        writeln!(f, "{line}").unwrap();
+    }
+
+    let reopened = SessionManager::open(&path).unwrap();
+    assert_eq!(
+        reopened.entries().len(),
+        base + 1,
+        "the pending entry was dropped instead of imported"
+    );
+    let last = reopened.entries().last().unwrap();
+    match last {
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::Assistant(a)),
+            ..
+        }) => {
+            assert_eq!(a.stop_reason, StopReason::Pending);
+            assert_eq!(serde_json::to_value(a).unwrap()["stopReason"], "pending");
+        }
+        other => panic!("expected an assistant message entry, got {other:?}"),
+    }
+
+    // The half that actually mattered: it reaches the built context. An `Entry::Unknown` would
+    // have been skipped here while still occupying a line in the file.
+    let ctx = reopened.build_context();
+    assert!(
+        ctx.messages.iter().any(|m| first_text(m) == "half a thou"),
+        "the imported message never reached the context: {:?}",
+        ctx.messages.iter().map(first_text).collect::<Vec<_>>()
+    );
+}
+
+/// The strictness half of the same decision: there is deliberately NO `#[serde(other)]` fallback,
+/// so a value outside Pi's closed union (`types.ts:391`) is still rejected rather than absorbed
+/// into a catch-all that a `_ =>` success arm would then mistake for a completed turn. Behaviour is
+/// unchanged from before the variant — asserted so a future "just make it tolerant" patch has to
+/// argue with a test.
+#[test]
+fn an_unknown_stop_reason_is_still_rejected_not_absorbed() {
+    assert!(serde_json::from_value::<StopReason>(serde_json::json!("someNewReason")).is_err());
+    assert!(serde_json::from_value::<StopReason>(serde_json::json!("Pending")).is_err());
+}
+
 // ----------------------------------------------------------------- extras ---------------------
 
 #[test]

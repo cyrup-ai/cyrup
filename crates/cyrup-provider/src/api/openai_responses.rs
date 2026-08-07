@@ -872,7 +872,10 @@ impl Default for RDecoder {
             slots: HashMap::new(),
             usage: Usage::default(),
             response_id: None,
-            stop_reason: StopReason::Stop,
+            // Pi's seed is `"pending"` (openai-responses.ts:124); only a terminal `response.*`
+            // event overwrites it (and sets `saw_terminal`). Seeding `Stop` made the in-flight
+            // `partial` claim a completed turn.
+            stop_reason: StopReason::Pending,
             saw_terminal: false,
         }
     }

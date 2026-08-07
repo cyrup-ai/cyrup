@@ -1112,6 +1112,8 @@ pub fn step_token_to_spec(
     // which likewise only ever attaches `count` to a task INSIDE a parallel group.
 
     Ok(SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: step.name.clone(),
         task,
         cwd,
@@ -1475,6 +1477,8 @@ pub fn parse_parallel_command(raw_args: &str) -> Result<ParsedParallelCommand, S
         .map(|step| {
             let task = step.task.clone().unwrap_or_else(|| parsed.task.clone());
             SingleStepSpec {
+                skills: None,
+                session_dir: None,
                 agent: step.name.clone(),
                 task,
                 cwd: step.config.cwd.as_ref().map(PathBuf::from),

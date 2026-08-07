@@ -3297,7 +3297,12 @@ fn stop_reason_notice(message: &cyrup_core::AssistantMessage) -> Option<String> 
                 _ => "Unknown error",
             }
         )),
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
+        // `Pending` is the in-flight sentinel, so it must render like Pi's: Pi's chain is
+        // `if (stopReason === "length") … else if (!hasToolCalls) { if ("aborted") … else if
+        // ("error") … }` (assistant-message.ts:177-201), and `"pending"` matches none of them —
+        // no notice. Grouped explicitly rather than via a `_ =>` so a future variant still breaks
+        // this match, which is how this arm got written in the first place.
+        StopReason::Pending | StopReason::Stop | StopReason::Length | StopReason::ToolUse => None,
     }
 }
 

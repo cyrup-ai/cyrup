@@ -18,6 +18,12 @@ use crate::compaction::files::format_file_operations;
 use crate::compaction::prepare::CompactionPreparation;
 use crate::compaction::serialize::serialize_conversation;
 
+/// Diagnostic for a summarization whose response never settled ([`StopReason::Pending`]). Used
+/// only when the summarizer left no `error_message` of its own — a truncated summarizer stream
+/// normally arrives already stamped by `StreamEvent::end_of_stream` with the per-api text Pi
+/// throws.
+pub const PENDING_SUMMARY: &str = "summarization stream ended without a stop reason";
+
 /// System prompt steering the model to summarize rather than continue (R-05-012). Byte-1:1 with Pi
 /// `SUMMARIZATION_SYSTEM_PROMPT` (`utils.ts:168-170`).
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task \
@@ -371,7 +377,15 @@ pub async fn generate_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         StopReason::Aborted => Err(CompactionError::Aborted),
-        _ => Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage }),
+        // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
+        // `Pending` message's partial text as a finished summary and compacted the transcript
+        // against it — silently losing history to a truncated stream.
+        StopReason::Pending => Err(CompactionError::Summarization(
+            resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
+        )),
+        StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
+            Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage })
+        }
     }
 }
 
@@ -406,7 +420,15 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
             Err(CompactionError::Summarization(resp.error_message.unwrap_or_default()))
         }
         StopReason::Aborted => Err(CompactionError::Aborted),
-        _ => Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage }),
+        // An unsettled response is NOT a summary. The `_ =>` this replaces would have accepted a
+        // `Pending` message's partial text as a finished summary and compacted the transcript
+        // against it — silently losing history to a truncated stream.
+        StopReason::Pending => Err(CompactionError::Summarization(
+            resp.error_message.unwrap_or_else(|| PENDING_SUMMARY.to_string()),
+        )),
+        StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
+            Ok(SummaryOutput { text: join_text(&resp.content), usage: resp.usage })
+        }
     }
 }
 

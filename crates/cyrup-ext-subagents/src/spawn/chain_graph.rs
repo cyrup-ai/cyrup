@@ -136,6 +136,44 @@ pub struct SingleStepSpec {
     /// the way in and was then hard-dropped to `None` on the way out, so a step declaring an
     /// acceptance contract ran completely UNVERIFIED and reported success on the accepted-run path.
     pub acceptance: Option<Value>,
+    /// Per-step SKILL-name override (pi's runner-step `skills`, `subagent-runner.ts:872` fed from
+    /// `async-execution.ts:990` `skills: resolvedSkills.map((r) => r.name)` @v0.34.0). Threaded onto
+    /// [`crate::exec::RunOptions::skills`] by
+    /// [`crate::background::runner_main::ExecSingleStepExecutor::run_single`], where `run_sync`
+    /// applies pi's own `opts.skills ?? agent.skills` fallthrough.
+    ///
+    /// Tri-state, matching [`crate::extension::SingleRunOverrides::skills`] exactly: `None` =
+    /// "no override, inherit the persona's own `skills:`"; `Some(vec![])` = the explicit
+    /// `skill: false` "no skills at all" form; `Some(names)` = replace the persona's list.
+    ///
+    /// SUBA-N03 added this field. Before it, an async SINGLE run's `skill` param had nowhere to
+    /// land on the second hop, which is why `route_single`'s background branch refused the param
+    /// outright rather than dropping it silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// Per-step session DIRECTORY (pi `sessionDir`, `runs/shared/pi-args.ts:109-111` → the child's
+    /// `--session-dir` argv), already fully resolved: tilde-expanded, absolutized, and scoped to
+    /// this step. Threaded onto [`crate::exec::RunOptions::session_dir`] by
+    /// [`crate::background::runner_main::ExecSingleStepExecutor::run_single`], where it is one of
+    /// the two terms of pi's `sessionEnabled = Boolean(sessionFile || sessionDir) || share`
+    /// (`runs/foreground/execution.ts:1039`) and is `mkdir -p`'d before the child spawns.
+    ///
+    /// **[CYRUP-DELTA], deliberate.** pi carries a single run-level `config.sessionDir` and derives
+    /// each child's directory at the DISPATCH site — verbatim for a sequential step
+    /// (`subagent-runner.ts:2793`), `<root>/parallel-<taskIdx>` for a parallel member (`:2587-2596`),
+    /// `<root>/dynamic-<step>-<item>` for a dynamic one (`:2309`). cyrup's `run_single` is the ONE
+    /// dispatch adapter all three shapes funnel through and it is handed no per-member index it can
+    /// trust (`current_flat_index` is published once per GROUP, so every concurrently-running member
+    /// of a parallel group reads the same value), so deriving the per-child directory there would
+    /// hand two concurrent siblings the same session store. Resolving it per step, parent-side,
+    /// where the layout is actually known, is collision-free by construction — and is the same shape
+    /// [`Self::output_path`] already has for exactly the same reason.
+    ///
+    /// `None` = this step contributes no `sessionDir` term; the child is spawned `--no-session`
+    /// unless its own [`Self::session_file`] or the run's
+    /// [`crate::background::runner_main::RunnerConfig::share`] enables sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<PathBuf>,
     /// Fork-vs-fresh session context for this step. `None` defers to the agent's own
     /// `default_context` (func-SA §4.1).
     pub context: Option<ContextMode>,
@@ -1211,6 +1249,8 @@ pub async fn walk_chain(
                 for s in &spec.steps {
                     let task = resolve_step_task(&s.task, registry, ctx, s)?;
                     resolved_steps.push(SingleStepSpec {
+                        skills: None,
+                        session_dir: None,
                         task,
                         ..s.clone()
                     });
@@ -1342,6 +1382,8 @@ pub async fn walk_chain(
                         let resolved =
                             resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
                         expanded.push(SingleStepSpec {
+                            skills: None,
+                            session_dir: None,
                             task: resolved,
                             ..(*spec.template).clone()
                         });
@@ -1609,6 +1651,8 @@ mod tests {
 
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: task.to_string(),
             cwd: None,

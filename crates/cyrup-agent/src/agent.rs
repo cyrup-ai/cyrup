@@ -95,7 +95,12 @@ fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         response_id: None,
         diagnostics: None,
         usage: Usage::default(),
-        stop_reason: StopReason::Stop,
+        // This message is only ever a PARTIAL — it seeds `partial` before the first `start` event
+        // and is replaced wholesale by `event.partial()` thereafter (agent-loop.ts:313-314). Pi's
+        // corresponding seed is `stopReason: "pending"` in each stream function's `output`; a
+        // `Stop` seed made a `message_start` emitted on a pre-first-event abort claim a completed
+        // turn. It never reaches `message_end`: every return path stamps a settled reason.
+        stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: 0,
     }

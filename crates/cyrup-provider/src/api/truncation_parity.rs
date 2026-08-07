@@ -191,8 +191,8 @@ impl Wire {
     }
 }
 
-/// Drive one wire API's decoder over `raw` and return the terminal event.
-async fn terminal(wire: Wire, raw: &str) -> StreamEvent {
+/// Drive one wire API's decoder over `raw` and return **every** event it emitted, in order.
+async fn events(wire: Wire, raw: &str) -> Vec<StreamEvent> {
     let (sink, mut rx) = channel(256);
     let model = model_for(wire.api_id(), wire.provider());
     let api = ApiId::from(wire.api_id());
@@ -221,13 +221,18 @@ async fn terminal(wire: Wire, raw: &str) -> StreamEvent {
         }
     });
 
-    let mut events = Vec::new();
+    let mut out = Vec::new();
     while let Some(ev) = rx.recv().await {
-        events.push(ev);
+        out.push(ev);
     }
     task.await.unwrap();
+    out
+}
 
-    let last = events
+/// Drive one wire API's decoder over `raw` and return the terminal event.
+async fn terminal(wire: Wire, raw: &str) -> StreamEvent {
+    let mut evs = events(wire, raw).await;
+    let last = evs
         .pop()
         .unwrap_or_else(|| panic!("{wire:?}: decoder emitted no events at all"));
     assert!(
@@ -336,6 +341,186 @@ async fn mistral_null_or_empty_finish_reason_is_truncation_not_stop() {
             other => panic!("falsy finishReason must not settle the turn, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The `pending` half of PROV-010 / AGENT-014 / DRIFT-012: the in-flight sentinel.
+// ---------------------------------------------------------------------------
+
+/// Every converter's IN-FLIGHT `partial` must report Pi's `"pending"` sentinel, not a fabricated
+/// `"stop"`. Pi seeds `output.stopReason = "pending"` and attaches that same mutable `output` to
+/// every non-terminal event (anthropic-messages.ts:509, google-generative-ai.ts:73,
+/// openai-responses.ts:124, openai-completions.ts:218, mistral-conversations.ts:153), so a consumer
+/// reading `message_start` / `message_update` off cyrup's event stream — an extension guest
+/// (`cyrup-ext/src/event.rs`), the RPC/SDK fan-out, or a Pi-shaped client — used to be told the
+/// turn had completed cleanly before a single token arrived.
+///
+/// Asserted on the SERIALIZED bytes, because the wire spelling is the whole point.
+#[tokio::test]
+async fn in_flight_partials_report_pending_on_the_wire() {
+    for wire in Wire::ALL {
+        // Use the *complete* transcript: this is about healthy in-flight events, not truncation.
+        let evs = events(wire, wire.complete()).await;
+        let non_terminal: Vec<_> = evs.iter().filter_map(StreamEvent::partial).collect();
+        assert!(
+            !non_terminal.is_empty(),
+            "{wire:?}: no non-terminal events to inspect"
+        );
+
+        // The FIRST partial is always pre-stop-reason, for every api.
+        let first = non_terminal[0];
+        assert_eq!(
+            first.stop_reason,
+            StopReason::Pending,
+            "{wire:?}: the seed partial claims a settled outcome"
+        );
+        let json = serde_json::to_value(first).unwrap();
+        assert_eq!(
+            json["stopReason"], "pending",
+            "{wire:?}: wire spelling must be Pi's `\"pending\"`"
+        );
+
+        // On the TRUNCATED twin the provider never delivers a stop reason at all, so no partial may
+        // EVER claim one — this is the strong form, and all five must agree on it. (The complete
+        // twin cannot be asserted this way: Google's fixture carries its text and its
+        // `finishReason` in a single chunk, so its later partials legitimately settle mid-stream,
+        // exactly as Pi's `output.stopReason` does once the candidate is processed.)
+        let truncated = events(wire, wire.truncated()).await;
+        let truncated_partials: Vec<_> = truncated.iter().filter_map(StreamEvent::partial).collect();
+        assert!(
+            !truncated_partials.is_empty(),
+            "{wire:?}: truncated fixture produced no non-terminal events"
+        );
+        for (i, p) in truncated_partials.iter().enumerate() {
+            assert_eq!(
+                p.stop_reason,
+                StopReason::Pending,
+                "{wire:?}: partial #{i} of a stream that NEVER delivered a stop reason claims {:?}",
+                p.stop_reason
+            );
+        }
+    }
+}
+
+/// `Pending` must be structurally incapable of reaching a `done` event. This is the invariant that
+/// makes the variant safe to add: Pi enforces it with a `throw`, cyrup with these two seams.
+#[test]
+fn pending_can_never_reach_a_done_terminal() {
+    // 1. The narrowing itself refuses it, with `error` (not `aborted`) — Pi's catch sets
+    //    `output.stopReason = "error"` for the non-abort throw (anthropic-messages.ts:765).
+    assert_eq!(DoneReason::try_from(StopReason::Pending), Err(ErrorReason::Error));
+
+    // 2. `terminal()` normalizes rather than propagating, so a `Pending` value cannot survive into
+    //    `message_end` / the settled transcript / a session file even if a caller bypasses
+    //    `end_of_stream` entirely.
+    let mut msg = cyrup_core::AssistantMessage::errored(
+        "p".into(),
+        "m",
+        Some(ApiId::from("a")),
+        StopReason::Pending,
+        "",
+    );
+    msg.error_message = None;
+    match StreamEvent::terminal(msg) {
+        StreamEvent::Error { reason, error } => {
+            assert_eq!(reason, ErrorReason::Error);
+            assert_eq!(
+                error.stop_reason,
+                StopReason::Error,
+                "a terminal must never carry the in-flight sentinel"
+            );
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some(crate::stream::PENDING_AT_TERMINAL),
+                "the normalization must leave a diagnostic, not swallow the bug"
+            );
+        }
+        other => panic!("expected error terminal, got {other:?}"),
+    }
+
+    // 3. …but a diagnostic the decoder already recorded is NOT clobbered.
+    let mut msg = cyrup_core::AssistantMessage::errored(
+        "p".into(),
+        "m",
+        Some(ApiId::from("a")),
+        StopReason::Pending,
+        "",
+    );
+    msg.error_message = Some("Anthropic stream ended without a stop reason".into());
+    let ev = StreamEvent::terminal(msg);
+    assert_eq!(
+        ev.terminal_message().unwrap().error_message.as_deref(),
+        Some("Anthropic stream ended without a stop reason")
+    );
+}
+
+/// `end_of_stream` must treat an explicit `Some(Pending)` exactly like `None`. Pi's guard is a
+/// VALUE test on the sentinel (`output.stopReason === "pending"`), not a "was anything assigned"
+/// test — `openai_responses` tracks its reason as a plain `StopReason`, so this is the arm that
+/// keeps it honest.
+#[test]
+fn end_of_stream_treats_an_explicit_pending_like_no_reason_at_all() {
+    let base = cyrup_core::AssistantMessage::errored(
+        "p".into(),
+        "m",
+        Some(ApiId::from("a")),
+        StopReason::Stop,
+        "",
+    );
+    for delivered in [None, Some(StopReason::Pending)] {
+        match StreamEvent::end_of_stream(base.clone(), delivered, "boom") {
+            StreamEvent::Error { reason, error } => {
+                assert_eq!(reason, ErrorReason::Error, "{delivered:?}");
+                assert_eq!(error.stop_reason, StopReason::Error, "{delivered:?}");
+                assert_eq!(error.error_message.as_deref(), Some("boom"), "{delivered:?}");
+            }
+            other => panic!("{delivered:?}: expected error terminal, got {other:?}"),
+        }
+    }
+}
+
+/// Adding a variant changes a serialized shape, so pin BOTH directions of the wire contract.
+///
+/// - the five pre-existing values still serialize to the exact bytes an OLD session JSONL holds,
+///   so an old transcript still loads (the change is purely additive);
+/// - `"pending"` now DESERIALIZES, which is the interop gap that motivated the variant: a
+///   Pi-produced `message_start` payload (agent-loop.ts:314-318 emits `{...partialMessage}`, whose
+///   `stopReason` is the `"pending"` seed) previously failed to parse.
+#[test]
+fn stop_reason_wire_shape_is_additive_and_accepts_pi_pending() {
+    for (reason, wire) in [
+        (StopReason::Pending, "pending"),
+        (StopReason::Stop, "stop"),
+        (StopReason::Length, "length"),
+        (StopReason::ToolUse, "toolUse"),
+        (StopReason::Error, "error"),
+        (StopReason::Aborted, "aborted"),
+    ] {
+        assert_eq!(serde_json::to_value(reason).unwrap(), wire, "serialize {reason:?}");
+        let back: StopReason = serde_json::from_value(serde_json::json!(wire)).unwrap();
+        assert_eq!(back, reason, "deserialize {wire:?}");
+    }
+
+    // A whole Pi-shaped `message_start` message payload round-trips.
+    let pi_partial = serde_json::json!({
+        "role": "assistant",
+        "stopReason": "pending",
+        "content": [],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-x",
+        "usage": {
+            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+        },
+        "timestamp": 0
+    });
+    let parsed: cyrup_core::AssistantMessage = serde_json::from_value(pi_partial).unwrap();
+    assert_eq!(parsed.stop_reason, StopReason::Pending);
+
+    // And an unknown FUTURE value is still rejected rather than silently absorbed — the deliberate
+    // absence of `#[serde(other)]`. See the `StopReason` docs for why.
+    assert!(serde_json::from_value::<StopReason>(serde_json::json!("someNewReason")).is_err());
 }
 
 /// `StreamEvent::end_of_stream` is the single seam the rule lives in; pin its contract directly so a

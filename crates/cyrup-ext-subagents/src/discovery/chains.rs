@@ -1424,6 +1424,8 @@ fn empty_single_step_spec() -> SingleStepSpec {
 /// [`chain_step_to_runner_step`] for the deferral rationale).
 fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: step.agent.clone().unwrap_or_default(),
         task: step.task.clone().unwrap_or_default(),
         cwd: step

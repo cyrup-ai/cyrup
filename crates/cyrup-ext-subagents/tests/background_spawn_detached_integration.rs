@@ -482,6 +482,8 @@ fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
 /// all-other-fields-`None` [`SingleStepSpec`] for `agent`/`task`.
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: agent.to_string(),
         task: task.to_string(),
         cwd: None,
@@ -530,6 +532,13 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -734,6 +743,13 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         steps: vec![

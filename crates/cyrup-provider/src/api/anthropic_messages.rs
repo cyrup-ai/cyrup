@@ -1315,7 +1315,12 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            // In-flight: Pi's `output.stopReason` is still its `"pending"` seed until a
+            // `message_delta` carries one (anthropic-messages.ts:509,714-717), and `output` IS the
+            // `partial` attached to every non-terminal event. The TERMINAL never takes this value —
+            // it goes through `StreamEvent::end_of_stream`, which rewrites `Pending` to the `error`
+            // terminal Pi's throw produces.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }

@@ -885,10 +885,10 @@ impl Decoder {
             diagnostics: None,
             usage,
             // Pi's live `partial` carries the raw `output.stopReason`, i.e. `"pending"` until a
-            // `finishReason` lands. cyrup has no `pending` variant (see `cyrup_core::StopReason`),
-            // so an in-flight snapshot reports `Stop`; the TERMINAL event never takes this path —
-            // it goes through `StreamEvent::end_of_stream`, which routes `None` to `error`.
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            // `finishReason` lands (google-generative-ai.ts:73,229). The TERMINAL event never takes
+            // this value — it goes through `StreamEvent::end_of_stream`, which routes
+            // `None`/`Pending` to the `error` terminal.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }

@@ -714,10 +714,10 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            // In-flight snapshots report `Stop` (cyrup has no `pending` variant — see
-            // `cyrup_core::StopReason`). The TERMINAL event never takes this path: it goes through
-            // `StreamEvent::end_of_stream`, which routes a `None` stop reason to `error`.
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
+            // In-flight snapshots carry Pi's `"pending"` seed (mistral-conversations.ts:153). The
+            // TERMINAL event never takes this value: it goes through
+            // `StreamEvent::end_of_stream`, which routes `None`/`Pending` to the `error` terminal.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }

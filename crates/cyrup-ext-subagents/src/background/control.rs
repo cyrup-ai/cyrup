@@ -1535,6 +1535,8 @@ mod tests {
 
     fn single_step(agent: &str, output: Option<&str>) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: format!("do {agent}"),
             cwd: None,

@@ -1115,6 +1115,28 @@ const ASYNC_SUBDIR: &str = "async";
 /// `RESULTS_DIR` leaf (`shared/types.ts:958`).
 const RESULTS_SUBDIR: &str = "results";
 
+/// The current wall-clock time as whole milliseconds since the Unix epoch, saturating to `u64`.
+///
+/// Two callers need the SAME reading, on opposite sides of a process boundary, which is why this
+/// lives here rather than privately in either of them: `extension.rs` stamps
+/// `RunnerConfig::deadline_at_ms` with it when a background run carries a `timeoutMs`
+/// (pi `deadlineAt = Date.now() + params.timeoutMs`, `runs/background/async-execution.ts:924`
+/// @v0.34.0), and `runner_main::run` subtracts it back out in the detached hop-2 process
+/// (pi `Math.max(0, config.deadlineAt - Date.now())`, `runs/background/subagent-runner.ts:2079`).
+/// It also stamps per-provider catalog freshness
+/// (`registration::profiles::ProviderModelCatalog`) and gates the `--force`/staleness check.
+///
+/// Never panics: a pre-epoch clock reads as `0`, and a value beyond `u64::MAX` ms
+/// (year ~584 million) saturates rather than overflowing.
+#[must_use]
+pub(crate) fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// The per-user root every subagent run-artifact directory hangs off: `<home>/.cyrup/subagents`,
 /// where `<home>` resolves from `CYRUP_HOME`, then `HOME`, then the OS temp dir. This is the
 /// single, shared resolution the orchestrator's own `default_async_root`/`default_results_dir`

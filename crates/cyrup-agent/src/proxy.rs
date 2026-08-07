@@ -96,7 +96,7 @@ pub struct ProxyMessageBuilder {
 
 impl ProxyMessageBuilder {
     /// Seed the empty partial from the model identity (Pi `partial: AssistantMessage = {...}`,
-    /// proxy.ts:121-137). `stopReason` starts at `stop`; `usage` is zeroed; content is empty.
+    /// proxy.ts:121-137). `stopReason` starts at `pending`; `usage` is zeroed; content is empty.
     pub fn new(model: &ModelRef) -> Self {
         Self { partial: empty_partial(model), tool_json: HashMap::new() }
     }
@@ -281,7 +281,10 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
         response_id: None,
         diagnostics: None,
         usage: Usage::default(),
-        stop_reason: cyrup_core::StopReason::Stop,
+        // Pi seeds the client-rebuilt partial with `stopReason: "pending"` verbatim
+        // (proxy.ts:121-137, specifically `:123`). This is the client side of a Pi-server wire, so
+        // the seed is directly observable interop, not an internal detail.
+        stop_reason: cyrup_core::StopReason::Pending,
         error_message: None,
         timestamp: 0,
     }
@@ -668,6 +671,52 @@ mod tests {
     }
 
     // --- client-side partial rebuild (Pi processProxyEvent, proxy.ts:238-367) -
+
+    /// Pi seeds the client-rebuilt partial with `stopReason: "pending"` verbatim (proxy.ts:123),
+    /// and every non-terminal event re-emits that same object as `partial`. Seeding `stop` told
+    /// anyone watching the reconstructed stream that the turn had completed before the first token
+    /// landed — and this is a Pi-SERVER wire, so the seed is directly observable interop.
+    #[test]
+    fn rebuilt_partial_is_seeded_pending_and_stays_pending_until_the_terminal() {
+        let mut b = ProxyMessageBuilder::new(&model());
+        assert_eq!(b.partial().stop_reason, StopReason::Pending);
+        assert_eq!(
+            serde_json::to_value(b.partial()).unwrap()["stopReason"],
+            "pending",
+            "wire spelling must be Pi's"
+        );
+
+        for e in [
+            serde_json::json!({"type": "start"}),
+            serde_json::json!({"type": "text_start", "contentIndex": 0}),
+            serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "Hi"}),
+            serde_json::json!({"type": "text_end", "contentIndex": 0}),
+        ] {
+            let out = b.process(ev(e)).unwrap();
+            if let Some(forwarded) = out.as_ref().and_then(StreamEvent::partial) {
+                assert_eq!(
+                    forwarded.stop_reason,
+                    StopReason::Pending,
+                    "a non-terminal partial must not claim a settled outcome"
+                );
+            }
+            assert_eq!(b.partial().stop_reason, StopReason::Pending);
+        }
+
+        // The terminal settles it — `Pending` never escapes past here.
+        let done = b
+            .process(ev(
+                serde_json::json!({"type": "done", "reason": "stop", "usage": usage_json()}),
+            ))
+            .unwrap();
+        match done {
+            Some(StreamEvent::Done { reason, message }) => {
+                assert_eq!(reason, DoneReason::Stop);
+                assert_eq!(message.stop_reason, StopReason::Stop);
+            }
+            other => panic!("expected done/stop, got {other:?}"),
+        }
+    }
 
     #[test]
     fn rebuilds_text_block_across_start_delta_end() {

@@ -131,6 +131,8 @@ fn message_end_line(text: &str) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: agent.to_string(),
         task: task.to_string(),
         cwd: None,
@@ -213,6 +215,13 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("happyrun1"),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -311,6 +320,13 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
 
     // The config carries the orchestrator's ABSOLUTE roots — the T0.4 fix.
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -445,6 +461,13 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("eventsrun1"),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -556,6 +579,13 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         "exit_code": 7
     });
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("failrun001"),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
@@ -668,6 +698,13 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Chain,
         steps: vec![RunnerStep::SingleStep(single_step("first", "first task"))],
@@ -787,6 +824,13 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     // exactly the shape needed to race an interrupt against natural completion with nothing left
     // to legitimately pause.
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("only", "only task"))],
@@ -923,6 +967,13 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do something"))],
@@ -1044,6 +1095,13 @@ async fn status_json_carries_live_current_tool_during_a_run() {
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("worker", "grep the code"))],
@@ -1149,6 +1207,13 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+        // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
@@ -1268,6 +1333,11 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
 
     fn config_for(dir: &Path, token: &str, control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>) -> RunnerConfig {
         RunnerConfig {
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token(token),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(single_step("worker", "idle a while"))],
@@ -1331,5 +1401,253 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
         "with no control config the stock 60s attention window applies, so the same ~1.8s idle \
          must raise nothing; got {:?}",
         stock.results[0].control_events
+    );
+}
+
+/// SUBA-N03, the hop-2 half, end to end: the detached runner must actually CONSUME the new
+/// `RunnerConfig`/`SingleStepSpec` fields — write the artifact quadruple, create the child's
+/// session directory, and pass `--session-dir` on the child's real argv.
+///
+/// The orchestrator-side tests (`extension::tests::a_background_single_run_honours_the_nine_*`)
+/// prove these values reach `runner-config.json`. That is only half the contract: a value that
+/// lands in the handoff file and is then ignored by the runner is still an
+/// advertised-and-silently-dropped param, which is the exact defect SUBA-041 names. This drives
+/// the REAL `run()` against the REAL fixture subprocess and asserts on real on-disk side effects.
+///
+/// Upstream equivalents @v0.34.0: the artifact quadruple is written by the async runner itself
+/// (`runs/background/subagent-runner.ts:877-889` writes `_input.md` BEFORE the child spawns, then
+/// `:1117-1133` writes `_output.md`/`_meta.json` after), and `sessionDir` becomes the child's
+/// `--session-dir` after an `fs.mkdirSync` (`runs/shared/pi-args.ts:109-111`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_share() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let artifacts_dir = dir.path().join("arts");
+    let session_dir = dir.path().join("sessions").join("run-0");
+
+    let script = serde_json::json!({
+        // Echo the child's real argv into its stdout stream, which `exec::run_sync` tees to
+        // `<cwd>/.cyrup-subagent-scratch/attempt-0.jsonl` (R-SA-058) — the crate's own standing
+        // observation channel for "what argv did the child actually receive".
+        "echo_argv": true,
+        "steps": [
+            {"kind": "emit", "line": message_end_line("delivered answer")},
+        ],
+        "exit_code": 0
+    });
+
+    let mut step = single_step("worker", "do the thing");
+    step.session_dir = Some(session_dir.clone());
+    step.skills = Some(Vec::new());
+
+    let config = RunnerConfig {
+        // The three fields under test, plus the timeout pair left at its default.
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: Some(true),
+        artifacts_dir: Some(artifacts_dir.clone()),
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::foreground(),
+        run_id: RunId::from_token("artifactsrun1"),
+        mode: RunMode::Single,
+        steps: vec![RunnerStep::SingleStep(step)],
+        cwd: dir.path().to_path_buf(),
+        session_file: None,
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: dir.path().join("async"),
+        results_dir: dir.path().join("results"),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+
+    let (_status, result_file) = run_against_fixture(dir.path(), &script, config).await;
+    assert!(result_file.success, "the fixture run must succeed: {result_file:?}");
+
+    // --- the artifact quadruple (pi `getArtifactPaths(ctx.artifactsDir, ctx.id, step.agent, index)`)
+    let paths = cyrup_ext_subagents::artifacts::artifact_paths(
+        &artifacts_dir,
+        "artifactsrun1",
+        "worker",
+        Some(0),
+    );
+    assert!(
+        paths.input_path.exists(),
+        "the hop-2 runner must write `_input.md` BEFORE the child spawns (crash safety), at {}",
+        paths.input_path.display()
+    );
+    let input = std::fs::read_to_string(&paths.input_path).expect("read _input.md");
+    assert!(
+        input.contains("# Task for worker") && input.contains("do the thing"),
+        "the input artifact carries pi's `# Task for <agent>\\n\\n<task>` body: {input}"
+    );
+    assert!(paths.output_path.exists(), "`_output.md` must be written after the run");
+    assert_eq!(
+        std::fs::read_to_string(&paths.output_path).expect("read _output.md"),
+        "delivered answer",
+        "the output artifact carries the child's delivered answer"
+    );
+    assert!(paths.metadata_path.exists(), "`_meta.json` must be written after the run");
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&paths.metadata_path).expect("read _meta.json"),
+    )
+    .expect("_meta.json parses");
+    assert_eq!(
+        meta["runId"], "artifactsrun1",
+        "the metadata shape is the SAME one the foreground path emits: {meta}"
+    );
+    assert_eq!(meta["agent"], "worker");
+    assert_eq!(meta["exitCode"], 0);
+    assert!(paths.jsonl_path.exists(), "`.jsonl` must be written (foreground() enables it)");
+
+    // --- sessionDir: created up front and handed to the child as real argv.
+    assert!(
+        session_dir.exists(),
+        "the step's session directory must be created before the child spawns (pi's `mkdirSync` \
+         ahead of `--session-dir`), at {}",
+        session_dir.display()
+    );
+    let tee = std::fs::read_to_string(dir.path().join(".cyrup-subagent-scratch/attempt-0.jsonl"))
+        .expect("the R-SA-058 raw-stdout tee must exist");
+    assert!(
+        tee.contains("--session-dir"),
+        "the child's real argv must carry `--session-dir`: {tee}"
+    );
+    assert!(
+        tee.contains(&session_dir.display().to_string()),
+        "…pointing at THIS step's resolved directory: {tee}"
+    );
+    // `share: true` is one of the two `sessionEnabled` terms, and a session-enabled child must NOT
+    // be spawned `--no-session` (pi `execution.ts:1027,1039`).
+    assert!(
+        !tee.contains("--no-session"),
+        "a run with `share: true` / an explicit sessionDir must not spawn the child \
+         `--no-session`: {tee}"
+    );
+}
+
+/// SUBA-N03: `artifacts: false` reaching hop 2 as an absent `artifacts_dir` must leave NO artifact
+/// files behind — pi's own first gate term (`if (ctx.artifactsDir && …)`,
+/// `runs/background/subagent-runner.ts:879`). The complement of the test directly above; without
+/// it, that one would still pass if the runner wrote artifacts unconditionally into some default
+/// location.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let artifacts_dir = dir.path().join("arts");
+    let script = serde_json::json!({
+        "steps": [{"kind": "emit", "line": message_end_line("done")}],
+        "exit_code": 0
+    });
+    let config = RunnerConfig {
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        // Both halves of pi's two-term gate say "off", which is exactly what an explicit
+        // `artifacts: false` produces on the orchestrator side.
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig {
+            enabled: false,
+            ..cyrup_ext_subagents::artifacts::ArtifactConfig::foreground()
+        },
+        run_id: RunId::from_token("noartifacts1"),
+        mode: RunMode::Single,
+        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        cwd: dir.path().to_path_buf(),
+        session_file: None,
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: dir.path().join("async"),
+        results_dir: dir.path().join("results"),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+
+    let (_status, result_file) = run_against_fixture(dir.path(), &script, config).await;
+    assert!(result_file.success);
+    assert!(
+        !artifacts_dir.exists(),
+        "a run with artifacts disabled must leave no artifact directory at all"
+    );
+}
+
+/// SUBA-N03: an ABSOLUTE `deadline_at_ms` in the one-shot config really arms the run's deadline in
+/// the detached process — pi `const remainingMs = Math.max(0, config.deadlineAt - Date.now())`
+/// (`runs/background/subagent-runner.ts:2078-2081` @v0.34.0).
+///
+/// Proven with an ALREADY-PASSED deadline, which is the case that distinguishes a real port from a
+/// field that merely deserializes: `saturating_sub` must collapse it to "no time left" so the step
+/// times out, rather than the subtraction wrapping into a far-future instant (which would look
+/// exactly like the pre-SUBA-N03 "background runs have no timeout" behaviour and pass any test
+/// using a generous future deadline). The fixture is scripted to sleep well past the budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_wrapping() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 30_000},
+            {"kind": "emit", "line": message_end_line("should never be delivered")},
+        ],
+        "exit_code": 0
+    });
+    let config = RunnerConfig {
+        timeout_ms: Some(1),
+        // One hour in the PAST: `deadline_at_ms - now` underflows, and only a saturating
+        // subtraction yields the correct "already expired" deadline.
+        deadline_at_ms: Some(1),
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
+        run_id: RunId::from_token("expiredrun1"),
+        mode: RunMode::Single,
+        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        cwd: dir.path().to_path_buf(),
+        session_file: None,
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: dir.path().join("async"),
+        results_dir: dir.path().join("results"),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+
+    let (_status, result_file) = run_against_fixture(dir.path(), &script, config).await;
+    assert!(
+        !result_file.success,
+        "an expired deadline must fail the run, not be silently ignored: {result_file:?}"
+    );
+    let rendered = serde_json::to_string(&result_file).expect("serialize ResultFile");
+    assert!(
+        rendered.contains("timed out") || rendered.contains("timeout"),
+        "the failure must be reported as a TIMEOUT (pi's `Subagent timed out after {{n}}ms.`), \
+         not some other error: {rendered}"
     );
 }

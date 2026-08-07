@@ -453,6 +453,66 @@ pub struct BackgroundSingleRequest<'a> {
     /// available here are "honour it" and "silently drop it" — and a silent drop is the exact
     /// defect SUBA-041 names.
     pub include_progress: Option<bool>,
+    /// SUBA-N03: pi `params.output` (`OutputOverride`, `extension/schemas.ts:42-48`) — the RAW wire
+    /// value. `spawn_background` normalizes it against the resolved persona's own `output:` through
+    /// the SAME [`normalize_single_output_override`]/[`resolve_single_output_path`] pair the
+    /// foreground path uses, then lands the resolved absolute path on
+    /// [`crate::spawn::chain_graph::SingleStepSpec::output_path`] for hop 2 to honour.
+    ///
+    /// Upstream does exactly this on its async SINGLE path: `executeAsyncSingle` receives
+    /// `output: effectiveOutput` + `outputBaseDir: resolveSingleRunOutputBaseDir(deps, artifactsDir,
+    /// id)` (`runs/foreground/subagent-executor.ts:2857-2859` @v0.34.0) and resolves the same
+    /// `normalizeSingleOutputOverride`/`resolveSingleOutputPath` pair at
+    /// `runs/background/async-execution.ts:905-907`.
+    pub output: Option<serde_json::Value>,
+    /// SUBA-N03: pi `params.outputMode` (`extension/schemas.ts:50-53`) — `"inline"` (pi's default)
+    /// or `"file-only"`. Lands on
+    /// [`crate::spawn::chain_graph::SingleStepSpec::output_mode`]. Upstream:
+    /// `outputMode: effectiveOutputMode` (`subagent-executor.ts:2860`), consumed at
+    /// `async-execution.ts:908-910` where it also drives `validateFileOnlyOutputMode`.
+    pub output_mode: Option<String>,
+    /// SUBA-N03: pi `params.skill` (`SkillOverride`, `extension/schemas.ts:33-40`), already
+    /// normalized through [`normalize_skill_input`] into the same tri-state
+    /// [`SingleRunOverrides::skills`] carries. Lands on
+    /// [`crate::spawn::chain_graph::SingleStepSpec::skills`]. Upstream: `skills: skillOverride ===
+    /// false ? [] : skillOverride` (`subagent-executor.ts:2856`) → `params.skills ??
+    /// agentConfig.skills` (`async-execution.ts:876`) → the runner step's own `skills`
+    /// (`async-execution.ts:990`).
+    pub skills: Option<Vec<String>>,
+    /// SUBA-N03: pi `params.share` (`shareEnabled`, `subagent-executor.ts:3354`). Carried to hop 2
+    /// on [`crate::background::runner_main::RunnerConfig::share`] and thence to every step's
+    /// [`crate::exec::RunOptions::share`]. Upstream: `shareEnabled` →
+    /// `spawnRunner({ share: shareEnabled })` (`async-execution.ts:965`).
+    pub share: Option<bool>,
+    /// SUBA-N03: pi `params.sessionDir` (`subagent-executor.ts:3393-3401`), still the RAW string.
+    /// `spawn_background` resolves it through the SAME
+    /// [`resolve_single_run_session_root`] the foreground path uses and lands
+    /// `<root>/run-0` on [`crate::spawn::chain_graph::SingleStepSpec::session_dir`]. Upstream:
+    /// `sessionRoot` → `sessionDir: path.join(sessionRoot, \`async-${id}\`)`
+    /// (`async-execution.ts:966`).
+    pub session_dir: Option<String>,
+    /// SUBA-N03: pi `params.artifacts` (`subagent-executor.ts:3387-3390`): `enabled = artifacts
+    /// !== false`, so only an explicit `Some(false)` turns the artifact quadruple off. Reaches hop
+    /// 2 as [`crate::background::runner_main::RunnerConfig::artifacts_dir`] = `None` plus an
+    /// `enabled: false` [`crate::artifacts::ArtifactConfig`] — pi's own two-term gate
+    /// (`artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`,
+    /// `async-execution.ts:964`, read back as `if (ctx.artifactsDir &&
+    /// ctx.artifactConfig?.enabled !== false)`, `subagent-runner.ts:879`).
+    pub artifacts: Option<bool>,
+    /// SUBA-N03: pi `params.timeoutMs`/`params.maxRuntimeMs`, already validated and de-aliased by
+    /// [`resolve_foreground_timeout`]. Carried to hop 2 as the nominal
+    /// [`crate::background::runner_main::RunnerConfig::timeout_ms`] plus an ABSOLUTE
+    /// [`crate::background::runner_main::RunnerConfig::deadline_at_ms`] stamped at spawn time.
+    ///
+    /// **This corrects an inverted claim, not merely a missing feature.** The refusal this field
+    /// replaces cited "pi's own precedent of erroring on timeoutMs + async
+    /// (subagent-executor.ts:3022)". No such precedent exists at v0.34.0: `:3015-3030` is
+    /// foreground intercom-receipt construction, and `git grep` over the whole of v0.34.0 `src/`
+    /// finds no timeout-vs-async refusal anywhere. Upstream HONOURS it —
+    /// `extension/schemas.ts:265-266` and `extension/tool-description.ts:25,:73` all say `timeoutMs`
+    /// applies to "foreground and async/background runs", and `async-execution.ts:924,982-983` arms
+    /// a real deadline from it.
+    pub timeout_ms: Option<u64>,
 }
 
 /// The already-resolved, plan-shaped inputs [`SubagentExecutor::spawn_background_steps`] takes from
@@ -497,6 +557,33 @@ pub struct BackgroundStepsSpec {
     /// [`crate::exec::RunOptions::include_progress`]. `None`/`Some(false)` is pi's default —
     /// R-SA-043 compaction with no per-step progress snapshot.
     pub include_progress: Option<bool>,
+    /// SUBA-N03: the run's identity, MINTED BY THE CALLER rather than by `spawn_background_steps`.
+    ///
+    /// Hoisted for exactly the reason pi hoists its own (`const id = randomUUID();` at
+    /// `subagent-executor.ts:2834`, used at `:2861` to build `outputBaseDir` and only then handed
+    /// to `executeAsyncSingle(id, …)`): the run-scoped SINGLE-mode output base directory is
+    /// `<artifactsDir>/outputs/<runId>`, so a caller that must resolve `params.output` against it
+    /// needs the id BEFORE the spawn call, not after.
+    ///
+    /// `spawn_background_steps` uses this id verbatim — it never mints its own — so the id a
+    /// caller resolved paths against is provably the id the run directory, the results file, the
+    /// tracker entry, and every child's intercom target are keyed by. [`RunId::new`] is 128 bits
+    /// of fresh entropy per call, so two concurrent callers cannot collide on a run-scoped dir;
+    /// and the run directory is created by `ensure_accessible_dir` before the config is written,
+    /// which is where a collision would surface as an error rather than a silent share.
+    pub run_id: RunId,
+    /// SUBA-N03: pi `config.timeoutMs` — the nominal run-level timeout budget, carried to hop 2 on
+    /// [`crate::background::runner_main::RunnerConfig::timeout_ms`]. `None` = no budget.
+    pub timeout_ms: Option<u64>,
+    /// SUBA-N03: pi `params.share` (`shareEnabled`), carried to hop 2 on
+    /// [`crate::background::runner_main::RunnerConfig::share`].
+    pub share: Option<bool>,
+    /// SUBA-N03: pi `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`
+    /// (`async-execution.ts:964`) — `None` is how an explicit `artifacts: false` reaches hop 2.
+    pub artifacts_dir: Option<PathBuf>,
+    /// SUBA-N03: pi `artifactConfig` (`async-execution.ts:965`) — which of the four files each
+    /// step's artifact write emits.
+    pub artifact_config: crate::artifacts::ArtifactConfig,
 }
 
 impl SubagentExecutor {
@@ -1539,13 +1626,8 @@ impl SubagentExecutor {
         // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
         // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
-        let output_base_dir = match cfg.single_run_output_base_dir.as_deref() {
-            Some(configured) => {
-                let expanded = expand_tilde(&configured.to_string_lossy());
-                resolve_against_process_cwd(&expanded).unwrap_or(expanded)
-            }
-            None => art_dir.join("outputs").join(run_id.as_str()),
-        };
+        let output_base_dir =
+            resolve_single_run_output_base_dir(&cfg, &art_dir, &run_id);
         // pi `runSinglePath` (`subagent-executor.ts:2789-2791,2882`): the persona's own `output:` is
         // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
         // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
@@ -1576,26 +1658,9 @@ impl SubagentExecutor {
         // [`crate::exec::build_attempt_spawn_plan`] falls to pi's own `--no-session` branch
         // (`pi-args.ts:105-106`). The isolation outcome is the same one pi's scoped root buys: the
         // child never writes into the orchestrator's session store.
-        let session_dir = overrides
-            .session_dir
-            .as_deref()
-            .filter(|raw| !raw.is_empty())
-            .map(|raw| {
-                let expanded = expand_tilde(raw);
-                resolve_against_process_cwd(&expanded).unwrap_or(expanded)
-            })
-            .or_else(|| {
-                cfg.default_session_dir
-                    .as_deref()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .map(|path| {
-                        let expanded = expand_tilde(&path.to_string_lossy());
-                        resolve_against_process_cwd(&expanded)
-                            .unwrap_or(expanded)
-                            .join(run_id.as_str())
-                    })
-            })
-            .map(|root| root.join("run-0"));
+        let session_dir =
+            resolve_single_run_session_root(&cfg, overrides.session_dir.as_deref(), &run_id)
+                .map(|root| root.join("run-0"));
 
         let run_options = RunOptions {
             cwd: cwd.to_path_buf(),
@@ -1825,6 +1890,13 @@ impl SubagentExecutor {
             acceptance,
             control,
             include_progress,
+            output,
+            output_mode,
+            skills,
+            share,
+            session_dir,
+            artifacts,
+            timeout_ms,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -1851,6 +1923,75 @@ impl SubagentExecutor {
         // R-SA-137: eager fork-context resolution before ANY process is spawned for this batch.
         let fork_context = self.resolve_context(cwd, effective_context).await?;
 
+        // SUBA-N03 — the run id is minted HERE, not inside `spawn_background_steps`, because the
+        // SINGLE-mode output base directory is run-scoped (`<artifactsDir>/outputs/<runId>`) and a
+        // relative `output` must resolve against it BEFORE the spawn call. pi hoists it for exactly
+        // this reason: `const id = randomUUID()` (`subagent-executor.ts:2834` @v0.34.0) feeds
+        // `resolveSingleRunOutputBaseDir(deps, artifactsDir, id)` at `:2861` and only then reaches
+        // `executeAsyncSingle(id, …)`. `RunId::new` is 128 bits of fresh entropy per call and
+        // `spawn_background_steps` `mkdir`s the run dir before writing anything into it, so two
+        // concurrent background runs cannot share a run-scoped directory.
+        let run_id = RunId::new();
+
+        // SUBA-N03 / T6 — pi `subagent-executor.ts:3387-3391`: `enabled: params.artifacts !== false`,
+        // so ONLY an explicit `artifacts: false` turns the quadruple off. The same
+        // `ArtifactConfig::foreground()` shape the foreground path uses, so an async run leaves the
+        // identical four files.
+        //
+        // Note the artifacts DIRECTORY is resolved either way: pi likewise computes `artifactsDir`
+        // unconditionally and only gates what it PASSES (`artifactsDir: artifactConfig.enabled ?
+        // artifactsDir : undefined`, `async-execution.ts:964`), because the same directory is also
+        // the root of the run-scoped output base dir below — turning artifact FILES off must not
+        // move where a relative `output:` lands.
+        let art_cfg = crate::artifacts::ArtifactConfig {
+            enabled: artifacts != Some(false),
+            ..crate::artifacts::ArtifactConfig::foreground()
+        };
+        let art_dir = crate::artifacts::temp_artifacts_dir(cwd);
+        let output_base_dir = resolve_single_run_output_base_dir(&cfg, &art_dir, &run_id);
+
+        // pi `async-execution.ts:905-907` (`normalizeSingleOutputOverride(params.output,
+        // agentConfig.output)` → `resolveSingleOutputPath(effectiveOutput, …, params.outputBaseDir)`):
+        // the persona's own `output:` is the fallback for an omitted param and the referent of
+        // `output: true`. Resolved parent-side here rather than in the detached runner because only
+        // this process knows the persona and the configured `singleRunOutputBaseDir`.
+        let output_path = resolve_single_output_path(
+            normalize_single_output_override(
+                output.as_ref(),
+                agent
+                    .output
+                    .as_ref()
+                    .and_then(|spec| spec.path.as_deref())
+                    .and_then(Path::to_str),
+            )
+            .as_deref(),
+            &output_base_dir,
+        );
+        // pi `async-execution.ts:908`: `const outputMode = params.outputMode ?? "inline"` — from the
+        // PARAM alone; pi never consults the persona's own mode here.
+        let effective_output_mode = parse_tool_output_mode(output_mode.as_deref())
+            .unwrap_or(crate::discovery::types::OutputMode::Inline);
+        // pi `validateFileOnlyOutputMode(outputMode, outputPath, \`Async single run (${agent})\`)`
+        // (`async-execution.ts:909-910`, via `single-output.ts:85-90`): `file-only` with no
+        // resolvable output path is refused BEFORE any spawn, and on the async path it is refused
+        // HERE — the detached runner's own R-SA-025 `validate_file_only_requires_path` would
+        // otherwise only surface it as a hop-2 step failure the caller never sees synchronously.
+        if effective_output_mode == crate::discovery::types::OutputMode::FileOnly
+            && output_path.is_none()
+        {
+            return Err(SubagentError::OutputPathRequired);
+        }
+
+        // pi `sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined`
+        // (`async-execution.ts:966`). cyrup's per-run scoping already lives inside
+        // `resolve_single_run_session_root` (the configured-default rung joins `run_id`), and the
+        // per-CHILD leaf is pi's own `sessionDirForIndex(0)` → `run-0`, the identical leaf the
+        // foreground single path appends — so an async run's child session store is scoped exactly
+        // as a foreground one's is, keyed by this run's id.
+        let step_session_dir =
+            resolve_single_run_session_root(&cfg, session_dir.as_deref(), &run_id)
+                .map(|root| root.join("run-0"));
+
         let step = SingleStepSpec {
             agent: agent_name.to_string(),
             task: task.to_string(),
@@ -1866,8 +2007,19 @@ impl SubagentExecutor {
             max_depth_override: None,
             structured_output_schema: None,
             output: None,
-            output_path: None,
-            output_mode: None,
+            // SUBA-N03: the resolved output FILE path + mode (pi's runner step `outputPath`/
+            // `outputMode`, `async-execution.ts:988-989`). Previously hardcoded `None` — which is
+            // why `route_single` refused `output`/`outputMode` on this branch rather than let hop 2
+            // drop them.
+            output_path: output_path.map(|p| p.display().to_string()),
+            output_mode: Some(effective_output_mode),
+            // SUBA-N03: the per-call `skill` override (pi's runner step `skills`,
+            // `async-execution.ts:990`), already normalized by `normalize_skill_input` at the tool
+            // boundary. `None` still defers to the persona's own `skills:` inside `run_sync`.
+            skills,
+            // SUBA-N03: this child's own session directory (pi `config.sessionDir` →
+            // `--session-dir`), resolved parent-side; see `SingleStepSpec::session_dir`.
+            session_dir: step_session_dir,
             reads: None,
             // SUBA-N04: an async SINGLE run's declared acceptance policy rides to the detached
             // runner on its own step, exactly like the `model` override directly above — pi
@@ -1901,6 +2053,19 @@ impl SubagentExecutor {
                 // SUBA-N06: the caller's `includeProgress`, carried verbatim to hop 2 (there is no
                 // config-level base to fold it against — pi has none either).
                 include_progress,
+                // SUBA-N03: the id this call already resolved paths against.
+                run_id,
+                // SUBA-N03: `timeoutMs`/`maxRuntimeMs` (pi `timeoutMs: data.timeoutMs`,
+                // `subagent-executor.ts:2871`). `spawn_background_steps` stamps the absolute
+                // `deadline_at_ms` from it at spawn time.
+                timeout_ms,
+                // SUBA-N03: `share` (pi `share: shareEnabled`, `async-execution.ts:965`).
+                share,
+                // SUBA-N03: pi's `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`
+                // (`async-execution.ts:964`) — an explicit `artifacts: false` reaches hop 2 as BOTH
+                // an absent dir and a disabled config, matching pi's own two-term runner gate.
+                artifacts_dir: art_cfg.enabled.then(|| art_dir.clone()),
+                artifact_config: art_cfg,
             },
         )
         .await
@@ -1939,6 +2104,11 @@ impl SubagentExecutor {
             chain_dir,
             control,
             include_progress,
+            run_id,
+            timeout_ms,
+            share,
+            artifacts_dir,
+            artifact_config,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -1955,7 +2125,18 @@ impl SubagentExecutor {
             });
         }
 
-        let run_id = RunId::new();
+        // SUBA-N03: the run id is the CALLER'S (`BackgroundStepsSpec::run_id`), never minted here.
+        // pi hoists it the same way and for the same reason — `const id = randomUUID()` at
+        // `subagent-executor.ts:2834` feeds `resolveSingleRunOutputBaseDir(deps, artifactsDir, id)`
+        // at `:2861` BEFORE `executeAsyncSingle(id, …)` is called — so a caller that must resolve a
+        // run-scoped output path can do so against the very id this run will be keyed by.
+        //
+        // pi's own deadline arithmetic (`async-execution.ts:924` `deadlineAt = Date.now() +
+        // params.timeoutMs`) is done HERE, parent-side, and carried as an absolute epoch stamp: the
+        // detached hop-2 process cannot be handed a `std::time::Instant` (opaque, monotonic,
+        // process-local), and computing the deadline on the far side would silently refund every
+        // millisecond the hop-1 spawn and hop-2 startup consumed.
+        let deadline_at_ms = timeout_ms.map(|ms| crate::background::now_epoch_ms().saturating_add(ms));
 
         // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:585-589,826-830`): a
         // background run started from WITHIN an already-nested run (this process inherited a nested
@@ -2063,6 +2244,17 @@ impl SubagentExecutor {
             // SUBA-N06: R-SA-043 compaction's opt-out, carried to hop 2 for the same reason — the
             // detached runner cannot ask anyone what the caller requested.
             include_progress,
+            // SUBA-N03 (pi `spawnRunner({ …, timeoutMs: params.timeoutMs, deadlineAt, share:
+            // shareEnabled, sessionDir, artifactsDir, artifactConfig, … })`,
+            // `async-execution.ts:960-983` @v0.34.0): the five run-level knobs whose absence from
+            // this boundary was the whole reason `route_single` refused them on the async branch.
+            // Every one is resolved parent-side (this process has settings + `$HOME` context; the
+            // detached runner has neither) and carried verbatim.
+            timeout_ms,
+            deadline_at_ms,
+            share,
+            artifacts_dir,
+            artifact_config,
         };
 
         let cfg_path = run_paths.run_dir.join("runner-config.json");
@@ -2349,11 +2541,17 @@ impl SubagentExecutor {
         background: bool,
         task: Option<String>,
         cancel: CancelToken,
-        // pi `subagent-executor.ts:3022-3023`: a foreground-only timeout cannot be honored by a
-        // detached background run. `None` for every slash-command caller (which exposes no timeout
-        // param at all) and for `route_parallel_mode` (timeout wiring for bare PARALLEL is a
-        // separate unit); `route_chain_mode` is the one caller that resolves a real value from the
-        // tool's `timeoutMs`/`maxRuntimeMs` params.
+        // pi `timeoutMs` — the run-level wall-clock budget, honoured on BOTH outcomes: the
+        // foreground walk races it via `ChainRunContext::deadline_at`, and (SUBA-N03) a background
+        // run carries it to the detached hop-2 runner on `RunnerConfig::timeout_ms` +
+        // `deadline_at_ms`, exactly as upstream's `executeAsyncChain(id, { …, timeoutMs:
+        // data.timeoutMs, … })` does (`subagent-executor.ts:2568` @v0.34.0; the deadline is armed
+        // at `async-execution.ts:677`).
+        //
+        // `None` for every slash-command caller (which exposes no timeout param at all) and for
+        // `route_parallel_mode` (timeout wiring for bare PARALLEL is a separate unit);
+        // `route_chain_mode` is the one caller that resolves a real value from the tool's
+        // `timeoutMs`/`maxRuntimeMs` params.
         timeout_ms: Option<u64>,
         // SUBA-N05: the RAW per-call `control` override (pi `params.control`), folded here against
         // the extension-level `subagents.control` block by
@@ -2452,6 +2650,24 @@ impl SubagentExecutor {
                         )),
                         // SUBA-N06.
                         include_progress,
+                        // SUBA-N03: no path needs to be resolved against this run's id before the
+                        // spawn call (a chain step declares its own `output:` per step), so it is
+                        // simply minted here.
+                        run_id: RunId::new(),
+                        // SUBA-N03: the run-level timeout the caller resolved, honoured on the
+                        // BACKGROUND outcome too — pi `executeAsyncChain(id, { …, timeoutMs:
+                        // data.timeoutMs, … })` (`subagent-executor.ts:2568` @v0.34.0) →
+                        // `deadlineAt = Date.now() + params.timeoutMs` (`async-execution.ts:677`) →
+                        // `spawnRunner({ timeoutMs, deadlineAt })` (`:723,798`). `route_chain_mode`
+                        // used to REFUSE this combination outright, citing a pi precedent that does
+                        // not exist; see the note at `route_single`'s background branch.
+                        timeout_ms,
+                        // The `/chain`//`/parallel`//`/run-chain --bg` surface and the tool's CHAIN/
+                        // PARALLEL modes expose no `share`/`artifacts` param — those are
+                        // `subagent`-tool SINGLE-mode only, per pi's own schema.
+                        share: None,
+                        artifacts_dir: None,
+                        artifact_config: crate::artifacts::ArtifactConfig::default(),
                     },
                 )
                 .await?;
@@ -3176,6 +3392,8 @@ impl SubagentExecutor {
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
         let step = SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.clone(),
             task: revived_task,
             cwd: None,
@@ -3216,6 +3434,16 @@ impl SubagentExecutor {
                     // SUBA-N06: a revival exposes no `includeProgress` param either, for the same
                     // reason — the `resume` action's params carry no such field.
                     include_progress: None,
+                    // SUBA-N03: the `resume` action's params carry none of the SINGLE-mode
+                    // overrides either — a revival re-runs an EXISTING run's persona against a
+                    // follow-up, and pi's revive path likewise forwards no `output`/`skill`/
+                    // `share`/`sessionDir`/`artifacts`/`timeoutMs`. The revived run's own session
+                    // file (above) is what keeps its transcript continuous.
+                    run_id: RunId::new(),
+                    timeout_ms: None,
+                    share: None,
+                    artifacts_dir: None,
+                    artifact_config: crate::artifacts::ArtifactConfig::default(),
                 },
             )
             .await?;
@@ -3313,6 +3541,8 @@ impl SubagentExecutor {
         self.resolve_agent(cwd, agent, AgentReadScope::Both)
             .map_err(|e| format!("Cannot append step to run '{run_id}': {e}"))?;
         let step = SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task,
             cwd: None,
@@ -3628,89 +3858,6 @@ fn format_configured_session_dir(
     }
 }
 
-/// The current wall-clock time as whole milliseconds since the Unix epoch, saturating to `u64`.
-/// Used to stamp per-provider catalog freshness (`registration::profiles::ProviderModelCatalog`)
-/// and to evaluate the `--force`/staleness gate. Never panics: a pre-epoch clock reads as `0`, and
-/// a value beyond `u64::MAX` ms (year ~584 million) saturates rather than overflowing.
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
-}
-
-/// Build the `_meta.json` metadata value for a completed foreground run (T6, pi
-/// `runs/foreground/execution.ts:1053-1068`). Carries the fields this crate's [`SingleResult`]
-/// actually knows: `runId`/`agent`/`task`/`exitCode`/`usage`/`model`/`attemptedModels`/
-/// `modelAttempts`/`toolCount`/`error`/`timestamp`. Pi additionally records `durationMs`/`skills`/
-/// `skillsWarning`, which `SingleResult` does not carry in this crate (they live on pi's richer
-/// `progressSummary`/skill-resolution shapes); those keys are omitted rather than faked.
-fn foreground_artifact_metadata(run_id: &str, result: &SingleResult) -> serde_json::Value {
-    let attempted: Vec<&str> = result.attempted_models.iter().map(ModelId::as_str).collect();
-    let model_attempts: Vec<serde_json::Value> = result
-        .model_attempts
-        .iter()
-        .map(|a| {
-            serde_json::json!({
-                "model": a.model.as_str(),
-                "success": a.success,
-                "exitCode": a.exit_code,
-                "error": a.error,
-                "usage": serde_json::to_value(&a.usage).unwrap_or(serde_json::Value::Null),
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "runId": run_id,
-        "agent": result.agent,
-        "task": result.task,
-        "exitCode": result.exit_code,
-        "usage": serde_json::to_value(&result.usage).unwrap_or(serde_json::Value::Null),
-        "model": result.model.as_ref().map(ModelId::as_str),
-        "attemptedModels": attempted,
-        "modelAttempts": model_attempts,
-        "toolCount": result.tool_calls.len(),
-        "error": result.error,
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    })
-}
-
-/// The `.jsonl` event lines for a completed foreground run (T6). pi's `.jsonl` is the raw NDJSON the
-/// child streamed to stdout; this crate's [`SingleResult`] is the already-compacted shape (it does
-/// not retain the raw per-event stream — that lives transiently in the per-attempt tee under the
-/// run's scratch dir, R-SA-058, which is cleaned up), so the foreground `.jsonl` is reconstructed
-/// from the run's observable, retained events: one line per summarized tool call, then a terminal
-/// `result` line. A genuine, non-empty NDJSON record of the run — see the crate's T6 report for the
-/// documented divergence from pi's byte-identical child stream.
-fn foreground_artifact_jsonl_lines(result: &SingleResult) -> Vec<String> {
-    let mut lines = Vec::with_capacity(result.tool_calls.len() + 1);
-    for call in &result.tool_calls {
-        lines.push(
-            serde_json::json!({
-                "type": "tool_call",
-                "text": call.text,
-                "expandedText": call.expanded_text,
-            })
-            .to_string(),
-        );
-    }
-    lines.push(
-        serde_json::json!({
-            "type": "result",
-            "agent": result.agent,
-            "exitCode": result.exit_code,
-            "model": result.model.as_ref().map(ModelId::as_str),
-            "output": result.final_output,
-            "error": result.error,
-        })
-        .to_string(),
-    );
-    lines
-}
 
 /// Write a completed foreground run's output/metadata/event-stream artifacts (T6, the after-run half
 /// of pi `runs/foreground/execution.ts:1047-1069`). The `_input.md` is written by the caller BEFORE
@@ -3734,11 +3881,11 @@ fn write_foreground_output_artifacts(
     if cfg.include_metadata {
         let _ = crate::artifacts::write_metadata(
             &paths.metadata_path,
-            &foreground_artifact_metadata(run_id, result),
+            &crate::artifacts::run_artifact_metadata(run_id, result),
         );
     }
     if cfg.include_jsonl {
-        for line in foreground_artifact_jsonl_lines(result) {
+        for line in crate::artifacts::run_artifact_jsonl_lines(result) {
             let _ = crate::artifacts::append_jsonl(&paths.jsonl_path, &line);
         }
     }
@@ -3981,7 +4128,7 @@ EXECUTION (use exactly ONE mode):
 • CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
 • PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
 • Optional context: { context: "fresh" | "fork" } (explicit value overrides every child; when omitted, each requested agent uses its own defaultContext, otherwise "fresh"; inspect agent defaults via { action: "list" })
-• Optional timeout: { timeoutMs } or { maxRuntimeMs } only for foreground runs; omit for async/background runs or set async:false if you need a foreground timeout
+• Optional timeout: { timeoutMs } or { maxRuntimeMs } sets a run-level max runtime for foreground and async/background runs
 • If { action: "list" } shows proactive skill subagent suggestions, consider a small fresh-context fanout for broad tasks where one of those skills would materially help
 
 CHAIN TEMPLATE VARIABLES (use in task strings):
@@ -4400,6 +4547,8 @@ fn tool_output_path_string(output: Option<&serde_json::Value>) -> Option<String>
 /// `ExecSingleStepExecutor::run_single`'s `model_override`), exactly as the slash `[model=…]` path.
 fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
     SingleStepSpec {
+        skills: None,
+        session_dir: None,
         agent: item.agent.clone(),
         task: item.task.clone().unwrap_or_default(),
         cwd: item.cwd.as_ref().map(PathBuf::from),
@@ -4421,6 +4570,74 @@ fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
         context: None,
         agent_scope: None,
     }
+}
+
+/// pi `resolveSingleRunOutputBaseDir` (`runs/foreground/subagent-executor.ts:2203-2207` @v0.34.0):
+/// the base directory a RELATIVE SINGLE-mode `output` path resolves against — the configured
+/// `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) when set, else
+/// `<artifactsDir>/outputs/<runId>`.
+///
+/// Deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
+///
+/// SUBA-N03 extracted this out of `run_foreground_impl`. Upstream calls the SAME function from
+/// three sites — its foreground path (`:2882`), its `runInBackground` async-single branch
+/// (`:2861`), and its collapsed-fanout branch (`:1946`) — all passing that call's own `runId`. Now
+/// that cyrup's async SINGLE path also resolves an output path, one implementation with a `run_id`
+/// parameter is the only way the two paths cannot drift.
+fn resolve_single_run_output_base_dir(
+    cfg: &SubagentExtensionConfig,
+    artifacts_dir: &Path,
+    run_id: &RunId,
+) -> PathBuf {
+    match cfg.single_run_output_base_dir.as_deref() {
+        Some(configured) => {
+            let expanded = expand_tilde(&configured.to_string_lossy());
+            resolve_against_process_cwd(&expanded).unwrap_or(expanded)
+        }
+        None => artifacts_dir.join("outputs").join(run_id.as_str()),
+    }
+}
+
+/// pi's SINGLE-mode session-ROOT resolution (`runs/foreground/subagent-executor.ts:3393-3401`
+/// @v0.34.0): an explicit `sessionDir` param is tilde-expanded and `path.resolve`d and becomes the
+/// root VERBATIM; a configured `default_session_dir` is instead scoped per run
+/// (`path.join(base, runId)`) so two runs sharing one configured base cannot share a session store.
+///
+/// Returns the ROOT, not a child's directory — the caller appends pi's own per-index leaf
+/// (`sessionDirForIndex(i)` → `run-<i>`), because that leaf differs between the foreground path
+/// (which knows it is index 0) and a background run (whose steps are numbered by the hop-2 walker).
+///
+/// **[CYRUP-DELTA]** pi's third rung — `deps.getSubagentSessionRoot(parentSessionFile)`, an
+/// always-present default derived from the PARENT session file — has no analog at this seam (no
+/// parent-session-file plumbing reaches the extension), so with neither an explicit `sessionDir`
+/// nor a configured default this returns `None` and [`crate::exec::build_attempt_spawn_plan`] falls
+/// to pi's own `--no-session` branch (`runs/shared/pi-args.ts:105-106`). The isolation outcome is
+/// the same one pi's scoped root buys: the child never writes into the orchestrator's session store.
+///
+/// SUBA-N03 extracted this out of `run_foreground_impl` so the async SINGLE path resolves the
+/// identical root from the identical inputs rather than growing a second copy.
+fn resolve_single_run_session_root(
+    cfg: &SubagentExtensionConfig,
+    requested: Option<&str>,
+    run_id: &RunId,
+) -> Option<PathBuf> {
+    requested
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            let expanded = expand_tilde(raw);
+            resolve_against_process_cwd(&expanded).unwrap_or(expanded)
+        })
+        .or_else(|| {
+            cfg.default_session_dir
+                .as_deref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| {
+                    let expanded = expand_tilde(&path.to_string_lossy());
+                    resolve_against_process_cwd(&expanded)
+                        .unwrap_or(expanded)
+                        .join(run_id.as_str())
+                })
+        })
 }
 
 fn parse_tool_output_mode(raw: Option<&str>) -> Option<crate::discovery::types::OutputMode> {
@@ -4954,50 +5171,48 @@ fn sj_control_overrides() -> serde_json::Value {
 /// matching upstream's `executeAsyncSingle(id, { …, controlConfig, … })`
 /// (`subagent-executor.ts:2845,2868-2870` @v0.34.0).
 ///
-/// SIX of those nine (`output`, `outputMode`, `skill`, `share`, `sessionDir`, `artifacts`) are
-/// still refused — loudly and by name — when the same call resolves to a BACKGROUND run
-/// (`async: true`, or `asyncByDefault`/`forceTopLevelAsync` making a top-level call background).
-/// That is a MODE-CONDITIONAL refusal of an honoured parameter, which is a shape upstream itself
-/// ships: `timeoutMs`/`maxRuntimeMs` are advertised and then refused for async runs at
-/// `pi-subagents/src/runs/foreground/subagent-executor.ts:3022` @v0.34.0, and this crate mirrors
-/// that refusal directly above the six-param one.
+/// # SUBA-N03: the mode-conditional refusal is gone too
 ///
-/// `control` is one of the three exceptions, and its async support is REAL rather than a refusal: the
-/// resolved config rides to hop 2 on `RunnerConfig::control`, hop 2 installs it on every step's
-/// `RunOptions::control_config`, and the events each step raises travel back on
-/// [`crate::spawn::chain_graph::StepResult::control_events`] → the terminal `ResultFile`'s
-/// `SingleResult::control_events`. (What an async run does NOT get is a live transcript notice —
-/// that is the `notifyChannels: ["async"]` replay hop, `subagent-runner.ts:2270-2280` →
-/// `async-job-tracker.ts:138-166` @v0.34.0, which is unported; the events themselves are not lost.)
+/// All nine also reach hop 2 on the BACKGROUND path now (`async: true`, or `asyncByDefault`/
+/// `forceTopLevelAsync` making a top-level call background). SIX of them — `output`, `outputMode`,
+/// `skill`, `share`, `sessionDir`, `artifacts` — used to be refused loudly and by name there,
+/// alongside a seventh refusal covering `timeoutMs`/`maxRuntimeMs`.
 ///
-/// `includeProgress` is the second, and its async support is likewise real: the flag rides to hop 2
-/// on `RunnerConfig::include_progress`, hop 2 installs it on every step's
-/// `RunOptions::include_progress`, and each step's snapshot travels back on the terminal
-/// `ResultFile`'s `SingleResult::progress`.
+/// **The justification for that refusal was a fabricated upstream citation.** The comment claimed
+/// it mirrored "pi's own precedent of erroring on timeoutMs + async
+/// (`subagent-executor.ts:3022`)". At v0.34.0 `subagent-executor.ts:3015-3030` is FOREGROUND
+/// intercom-receipt construction, and `git grep` over the whole of v0.34.0 `src/` finds no
+/// timeout-vs-async refusal anywhere. Upstream does the OPPOSITE: `extension/schemas.ts:265-266`
+/// and `extension/tool-description.ts:25,:73` all say `timeoutMs`/`maxRuntimeMs` apply to
+/// "foreground and async/background runs", `runs/background/async-execution.ts:924` arms
+/// `deadlineAt = Date.now() + params.timeoutMs` for `executeAsyncSingle`, and `:677` does the same
+/// for `executeAsyncChain`.
 ///
-/// `acceptance` is the third, and it is NO LONGER refused (SUBA-N04). It was on that list for one
-/// reason only — the detached hop-2 runner dropped `SingleStepSpec::acceptance` on the floor — and
-/// that reason is gone: [`SubagentExecutor::spawn_background`] now writes the raw policy onto the
-/// step in `runner-config.json`, and
-/// [`crate::background::runner_main::ExecSingleStepExecutor::run_single`] lowers it through
-/// [`crate::exec::acceptance::lower_acceptance_input`] and evaluates it exactly as the foreground
-/// path does. Upstream honours it on the async path too (`runs/background/async-execution.ts:1282-1289`
-/// resolves `explicit: params.acceptance` with `async: true`, and `:1319` persists it on the
-/// steering recovery descriptor), so refusing it was parity debt rather than a design choice.
+/// The other six were refused for one honest, now-removed reason: the second-hop `RunnerConfig`
+/// boundary was strictly NARROWER than the foreground `RunOptions`, so accepting them would have
+/// meant the detached runner silently dropping them — the exact defect SUBA-041 names. That
+/// boundary now carries upstream's own field set (`spawnRunner({ …, share, sessionDir,
+/// artifactsDir, artifactConfig, timeoutMs, deadlineAt, … })` plus the step's own `outputPath`/
+/// `outputMode`/`skills`, `runs/background/async-execution.ts:930-996` @v0.34.0):
 ///
-/// # Known parity debt this comment must not paper over
+/// * `output`/`outputMode` — resolved parent-side against the run-scoped output base dir
+///   ([`resolve_single_run_output_base_dir`], pi `resolveSingleRunOutputBaseDir` `:2203-2207`) onto
+///   [`crate::spawn::chain_graph::SingleStepSpec::output_path`]/`output_mode`;
+/// * `skill` — [`crate::spawn::chain_graph::SingleStepSpec::skills`];
+/// * `sessionDir` — resolved parent-side onto
+///   [`crate::spawn::chain_graph::SingleStepSpec::session_dir`];
+/// * `share`, `artifacts`, `timeoutMs` — [`crate::background::runner_main::RunnerConfig::share`],
+///   `artifacts_dir`/`artifact_config`, and `timeout_ms`/`deadline_at_ms`.
 ///
-/// Upstream honours the remaining six on the async path — `executeAsyncSingle`
-/// (`subagent-executor.ts:2845-2874` @v0.34.0) threads `artifactConfig`, `shareEnabled`,
-/// `sessionRoot`, `skills`, `output`, `outputMode` and `outputBaseDir` into the background run.
-/// cyrup's background hop hands a `RunnerConfig` to a detached second-hop runner that has no fields
-/// for share/sessionDir/artifacts and no `skill` on
-/// [`crate::spawn::chain_graph::SingleStepSpec`], so closing THOSE is still a real port, not a
-/// tweak. Until then the refusal is the honest behaviour — an advertised-and-silently-dropped param
-/// is the defect SUBA-041 names; an advertised-and-loudly-refused-in-one-mode param is upstream's
-/// own `timeoutMs` precedent. The refusal is pinned by
-/// `tests::a_background_single_run_refuses_the_six_foreground_only_overrides_by_name`, so this
-/// contract cannot drift silently in either direction.
+/// `acceptance` (SUBA-N04), `control` (SUBA-N05) and `includeProgress` (SUBA-N06) were wired to hop
+/// 2 by their own units. The async path additionally now writes the SAME artifact quadruple the
+/// foreground path does (pi `runs/background/subagent-runner.ts:879-889,1117-1133`), which is what
+/// gives `artifacts: false` something real to switch off.
+///
+/// The former refusal was pinned by a test; that test was RE-SCOPED, not deleted — see
+/// `tests::a_background_single_run_honours_the_nine_single_mode_overrides`, which asserts the
+/// replacement behaviour at the `runner-config.json` filesystem boundary (the entire hop-1 -> hop-2
+/// contract), so this schema-vs-behaviour contract still cannot drift silently in either direction.
 fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
     // `json!` object overflows the macro's default `recursion_limit` at expansion time. Each insert
@@ -5039,8 +5254,12 @@ fn subagent_tool_parameters() -> serde_json::Value {
     }));
     props.insert("chainDir".to_string(), serde_json::json!({ "type": "string", "description": "Persistent chain artifact directory; defaults to user-scoped temp storage." }));
     props.insert("async".to_string(), serde_json::json!({ "type": "boolean", "description": "Run in background (default: false, or per config)" }));
-    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional foreground-only timeout in ms; omit for async/background runs. Alias of maxRuntimeMs." }));
-    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Alias of timeoutMs for optional foreground-only timeout; omit for async/background runs." }));
+    // SUBA-N03: pi's VERBATIM descriptions (`extension/schemas.ts:265-266` @v0.34.0). These two
+    // read "Optional foreground-only timeout in ms; omit for async/background runs" until now —
+    // an instruction to the model that was both false upstream and, once the async branch started
+    // refusing the param, a self-fulfilling one. Upstream has always said the opposite.
+    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Alias of maxRuntimeMs." }));
+    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Alias of timeoutMs for optional run-level timeout in foreground and async/background runs." }));
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
     props.insert("cwd".to_string(), serde_json::json!({ "type": "string" }));
     props.insert("artifacts".to_string(), serde_json::json!({ "type": "boolean", "description": "Write debug artifacts (default: true)" }));
@@ -5441,44 +5660,42 @@ impl SubagentTool {
         let cfg = self.executor.config_snapshot().await;
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
         if p.is_background(&cfg, depth) {
-            // pi (`subagent-executor.ts:3022-3023`): a foreground-only timeout cannot be honored by
-            // a detached background run, so requesting both is an explicit error, not a silent drop.
-            if timeout_ms.is_some() {
-                return Err(ToolError::new(
-                    "timeoutMs/maxRuntimeMs are only supported for foreground runs; set \
-                     async: false or omit the timeout for background runs.",
-                ));
-            }
-            // SUBA-041: the remaining SIX overrides ride on `RunOptions`, which only the FOREGROUND
-            // path builds — `spawn_background` hands a `RunnerConfig` to a detached second-hop
-            // runner (pi's `executeAsyncSingle`, a separate options plumbing this crate has not
-            // ported). Same rule as the `timeoutMs` refusal directly above: name them and refuse,
-            // rather than accept a param the background hop would drop on the floor.
+            // SUBA-N03 — there is NO foreground-only refusal on this branch any more, because
+            // every one of the nine advertised SINGLE-mode params now genuinely reaches hop 2.
             //
-            // SUBA-N04 removed `acceptance` from this list. It was refused for exactly one reason —
-            // `SingleStepSpec::acceptance` was dropped on the floor by the runner — and that reason
-            // is gone: the step now carries the raw policy to hop 2, which lowers and evaluates it
-            // through the same `exec::acceptance` path the foreground run uses. Upstream honours it
-            // on the async path too (`async-execution.ts:1282-1289`, `explicit: params.acceptance`
-            // with `async: true`), so refusing it was parity debt, not a design choice.
-            let foreground_only: Vec<&'static str> = [
-                ("output", p.output.is_some()),
-                ("outputMode", p.output_mode.is_some()),
-                ("skill", p.skill.is_some()),
-                ("share", p.share.is_some()),
-                ("sessionDir", p.session_dir.is_some()),
-                ("artifacts", p.artifacts.is_some()),
-            ]
-            .into_iter()
-            .filter_map(|(name, present)| present.then_some(name))
-            .collect();
-            if !foreground_only.is_empty() {
-                return Err(ToolError::new(format!(
-                    "the following param(s) are only supported for foreground SINGLE runs: {}. \
-                     Set async: false to use them.",
-                    foreground_only.join(", ")
-                )));
-            }
+            // **The refusal that stood here cited a precedent that does not exist.** Its comment
+            // read "mirrors pi's own precedent of erroring on timeoutMs + async
+            // (subagent-executor.ts:3022)". At v0.34.0, `subagent-executor.ts:3015-3030` is
+            // FOREGROUND intercom-receipt construction (`maybeBuildForegroundIntercomReceipt`) and
+            // has nothing to do with timeouts or async; `git grep` over the whole of v0.34.0 `src/`
+            // finds no timeout-vs-async refusal anywhere in the package. Upstream does the exact
+            // OPPOSITE — `extension/schemas.ts:265-266` and `extension/tool-description.ts:25,:73`
+            // each state that `timeoutMs`/`maxRuntimeMs` apply to "foreground and async/background
+            // runs", and `runs/background/async-execution.ts:924` arms
+            // `deadlineAt = Date.now() + params.timeoutMs` for `executeAsyncSingle`, which
+            // `subagent-runner.ts:2078-2081` turns into a live run-level timer.
+            //
+            // The other eight were refused for one honest reason, now removed: the second-hop
+            // `RunnerConfig` boundary was strictly NARROWER than the foreground `RunOptions`, so a
+            // param accepted here would have been dropped on the floor by the detached runner —
+            // the advertised-and-silently-dropped defect SUBA-041 exists to prevent. Widening that
+            // boundary to upstream's own field set (`spawnRunner({ …, share, sessionDir,
+            // artifactsDir, artifactConfig, timeoutMs, deadlineAt, … })` plus the step's own
+            // `outputPath`/`outputMode`/`skills`, `async-execution.ts:930-996`) was always the work
+            // the refusal was standing in for, and it is now done:
+            //
+            // * `output`/`outputMode` -> resolved parent-side against the run-scoped output base
+            //   dir (`resolve_single_run_output_base_dir`, pi `:2203-2207`) onto the step's
+            //   `output_path`/`output_mode`;
+            // * `skill` -> the step's new `skills` field;
+            // * `sessionDir` -> resolved parent-side onto the step's new `session_dir`;
+            // * `share`/`artifacts`/`timeoutMs` -> new `RunnerConfig` fields;
+            // * `acceptance` (SUBA-N04), `control` (SUBA-N05) and `includeProgress` (SUBA-N06) were
+            //   wired by their own units and are unchanged here.
+            //
+            // This mattered beyond the explicit `async: true` call: `asyncByDefault` /
+            // `forceTopLevelAsync` route EVERY top-level `subagent` call down this branch, so the
+            // refusal made nine schema-advertised params unusable for whole configurations.
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
@@ -5497,9 +5714,21 @@ impl SubagentTool {
                     // `subagent-executor.ts:2845,2868-2870` @v0.34.0. Before this it was parsed,
                     // absent from the foreground-only refusal list, and dropped on the floor.
                     control: overrides.control.clone(),
-                    // SUBA-N06: the raw per-call `includeProgress`, carried to hop 2 on
-                    // `RunnerConfig::include_progress` so an async SINGLE run's persisted
-                    // `SingleResult` carries its progress snapshot instead of dropping the flag.
+                    // SUBA-N03: the six params this branch used to refuse, taken from the SAME
+                    // `overrides` bundle the foreground path consumes — so the two paths cannot
+                    // disagree about what a given param meant (`skills` in particular is already
+                    // `normalize_skill_input`-normalized, so `skill: false` reaches hop 2 as the
+                    // explicit empty list rather than as "omitted").
+                    output: overrides.output.clone(),
+                    output_mode: overrides.output_mode.clone(),
+                    skills: overrides.skills.clone(),
+                    share: overrides.share,
+                    session_dir: overrides.session_dir.clone(),
+                    artifacts: overrides.artifacts,
+                    // SUBA-N03: already validated + de-aliased by `resolve_foreground_timeout`
+                    // (pi `resolveForegroundTimeout`, `:1327-1341`), whose positivity and
+                    // both-given-must-agree checks are mode-independent.
+                    timeout_ms,
                     include_progress: overrides.include_progress,
                 })
                 .await
@@ -6021,15 +6250,14 @@ impl SubagentTool {
         // pi `resolveForegroundTimeout` (`subagent-executor.ts:1327-1341`): `timeoutMs`/
         // `maxRuntimeMs` are aliases, resolved once up front here exactly as SINGLE mode does.
         let timeout_ms = resolve_foreground_timeout(p).map_err(ToolError::new)?;
-        if timeout_ms.is_some() && p.is_background(&cfg, depth) {
-            // pi (`subagent-executor.ts:3022-3023`): a foreground-only timeout cannot be honored by
-            // a detached background run, so requesting both is an explicit error, not a silent
-            // drop — the SAME text/guard `route_single` applies for SINGLE mode.
-            return Err(ToolError::new(
-                "timeoutMs/maxRuntimeMs are only supported for foreground runs; set \
-                 async: false or omit the timeout for background runs.",
-            ));
-        }
+        // SUBA-N03: no timeout-vs-async refusal here any more. The one that stood here cited
+        // `subagent-executor.ts:3022-3023` as "pi's own precedent" and mirrored `route_single`'s
+        // identically-cited SINGLE-mode refusal. The citation is false in both places — at v0.34.0
+        // `:3015-3030` is foreground intercom-receipt construction — and upstream does the
+        // opposite for CHAIN/PARALLEL too: `executeAsyncChain(id, { …, timeoutMs: data.timeoutMs,
+        // … })` (`subagent-executor.ts:2568`) arms `deadlineAt = Date.now() + params.timeoutMs`
+        // (`async-execution.ts:677`) and hands both to the runner (`:723,798`). `RunnerConfig` now
+        // carries the same pair, so the timeout is HONOURED on this path rather than refused.
         // Captured before `graph` moves into `run_or_background_graph` below — only needed for the
         // out-of-band intercom payload's top-level `agent` label (R-SA-123/124).
         let top_agent = plan_step_agent_names(&graph)
@@ -7079,6 +7307,22 @@ impl SubagentsExtension {
                             // there is no per-call override to forward. `spawn_background` still
                             // folds in the extension-level `subagents.control` block.
                             control: None,
+                            // SUBA-N03: `None` here is SYMMETRY with the foreground `/run` branch
+                            // directly below, not a background-specific drop — that branch calls
+                            // `run_foreground(…)`'s flat legacy signature, which likewise carries
+                            // no override bundle. `/run`'s own parser does not yet surface pi's
+                            // `output`/`outputMode`/`skill` tokens (`slash-commands.ts:1193-1196`
+                            // @v0.34.0) on EITHER path; wiring that surface is a separate unit, and
+                            // until it lands both `/run` paths behave identically. `share`/
+                            // `sessionDir`/`artifacts`/`timeoutMs` have no `/run` token upstream at
+                            // all.
+                            output: None,
+                            output_mode: None,
+                            skills: None,
+                            share: None,
+                            session_dir: None,
+                            artifacts: None,
+                            timeout_ms: None,
                         })
                         .await?;
                     Ok(format!("Background subagent run started: {run_id}"))
@@ -7497,7 +7741,7 @@ impl SubagentsExtension {
         let model_count = models.len();
         let file = crate::registration::profiles::ProviderModelCatalog {
             provider: provider.to_string(),
-            refreshed_at_epoch_ms: now_epoch_ms(),
+            refreshed_at_epoch_ms: crate::background::now_epoch_ms(),
             max_age_days: crate::registration::profiles::DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
             // pi `sources` (profiles.ts:572): `["runtime-registry", ...(probe ? ["live-probe"] :
             // []), "heuristic-classifier"]` — this port always probes (no exposed `--no-probe`
@@ -7552,7 +7796,7 @@ impl SubagentsExtension {
                 |existing| {
                     !crate::registration::profiles::is_provider_catalog_stale(
                         existing,
-                        now_epoch_ms(),
+                        crate::background::now_epoch_ms(),
                         existing.max_age_days,
                     )
                 },
@@ -9345,6 +9589,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         let graph = vec![RunnerStep::SingleStep(SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: "does-not-exist".to_string(),
             task: "do the thing".to_string(),
             cwd: None,
@@ -9806,8 +10052,14 @@ mod tests {
             "output?,reads?,progress?",
             "timeoutMs",
             "maxRuntimeMs",
-            "only for foreground runs",
-            "omit for async/background runs",
+            // Was `"only for foreground runs"` + `"omit for async/background runs"`, labelled
+            // "pi-pinned". Neither string exists anywhere in upstream: `git grep "only for
+            // foreground" v0.34.0 -- src/` returns NOTHING. They described cyrup's own former
+            // refusal, not pi's contract, and pinning them made the test enforce the very
+            // divergence SUBA-N03 removed. Upstream says the OPPOSITE, verbatim, in two places
+            // (`extension/tool-description.ts:25` and `:73`), and this crate's description is now
+            // byte-identical to `:25` — so that is what gets pinned.
+            "for foreground and async/background runs",
         ] {
             assert!(
                 desc.contains(needle),
@@ -10243,6 +10495,8 @@ mod tests {
     /// the COUNT and not about step configuration.
     fn bare_single_step(agent: &str, task: &str) -> crate::spawn::chain_graph::SingleStepSpec {
         crate::spawn::chain_graph::SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: task.to_string(),
             cwd: None,
@@ -11136,32 +11390,41 @@ mod tests {
         );
     }
 
-    /// SUBA-041, the OTHER half of the contract — previously asserted nowhere at all.
+    /// SUBA-041, the OTHER half of the contract, RE-SCOPED by SUBA-N03.
     ///
-    /// The seven overrides above are advertised because the FOREGROUND path honours them. The same
-    /// call resolved to a BACKGROUND run refuses SIX of them by name, because cyrup's second-hop
-    /// `RunnerConfig` has nowhere to put them (upstream's `executeAsyncSingle`,
-    /// `subagent-executor.ts:2845-2874` @v0.34.0, does — that plumbing is unported parity debt,
-    /// recorded on [`subagent_tool_parameters`]). The refusal is deliberate and mirrors upstream's
-    /// own `timeoutMs` + async refusal (`subagent-executor.ts:3022`); what was NOT acceptable was
-    /// leaving it untested, so a future change could silently turn it into an accepted-and-dropped
-    /// param — precisely the defect SUBA-041 exists to prevent.
+    /// This test used to pin the opposite behaviour, under the name
+    /// `a_background_single_run_refuses_the_six_foreground_only_overrides_by_name`: it asserted
+    /// that a background SINGLE run REFUSED `output`/`outputMode`/`skill`/`share`/`sessionDir`/
+    /// `artifacts` by name (and, one guard above them, `timeoutMs`/`maxRuntimeMs`). It was a
+    /// correct pin of the behaviour that existed, and it is rewritten rather than deleted because
+    /// the contract it guards — "this schema must never advertise a param the router drops" — is
+    /// unchanged; only the side of it that is true has flipped.
     ///
-    /// Every one of the six is asserted individually, and the message must name the offender, so
-    /// this test also fails the day one of them starts being honoured without being removed from
-    /// the refusal list.
+    /// What changed: the refusal's stated justification was a FABRICATED upstream citation ("pi's
+    /// own timeoutMs + async refusal, `subagent-executor.ts:3022`" — which at v0.34.0 is foreground
+    /// intercom-receipt construction, and no such refusal exists anywhere in v0.34.0 `src/`), and
+    /// the real reason underneath it — a second-hop `RunnerConfig` narrower than the foreground
+    /// `RunOptions` — has been closed. All NINE advertised SINGLE-mode overrides plus the timeout
+    /// now reach hop 2.
     ///
-    /// SUBA-N04 rewrote this test rather than leaving it pinning stale behaviour: `acceptance` was
-    /// the seventh entry, and it is now genuinely HONOURED on the background path (the step carries
-    /// the raw policy to hop 2, which lowers and evaluates it). Its refusal assertion is replaced
-    /// below by a positive assertion that a background run declaring `acceptance` is NOT refused,
-    /// plus `spawn_background_single_carries_the_acceptance_policy_into_the_runner_config`, which
-    /// proves the policy really reaches the detached runner's `runner-config.json`.
+    /// This test therefore asserts the complement of what it used to: for each param, a background
+    /// SINGLE call carrying it is NOT refused by any foreground-only gate. The unresolvable agent
+    /// name means every call still errors — with `agent not found`, which is proof the call got
+    /// PAST the router and into agent resolution rather than being turned away at the gate. Its
+    /// companions
+    /// [`tests::a_background_single_run_honours_the_nine_single_mode_overrides`] and
+    /// [`tests::a_background_single_run_carries_the_timeout_and_deadline_into_the_runner_config`]
+    /// then prove the params really arrive at the detached runner, not merely that they are
+    /// accepted — an accepted-and-dropped param is precisely the defect SUBA-041 exists to prevent,
+    /// and "no longer refused" alone would not distinguish the two.
     #[tokio::test]
-    async fn a_background_single_run_refuses_the_six_foreground_only_overrides_by_name() {
+    async fn a_background_single_run_no_longer_refuses_the_formerly_foreground_only_overrides() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
+        // The exact six the removed gate named, plus the timeout pair its sibling guard named, plus
+        // `acceptance`/`control`/`includeProgress` (freed by SUBA-N04/N05/N06) so all nine
+        // advertised SINGLE-mode overrides are covered in one place.
         let cases = [
             ("output", serde_json::json!({ "output": "report.md" })),
             ("outputMode", serde_json::json!({ "outputMode": "inline" })),
@@ -11169,6 +11432,11 @@ mod tests {
             ("share", serde_json::json!({ "share": true })),
             ("sessionDir", serde_json::json!({ "sessionDir": "~/x" })),
             ("artifacts", serde_json::json!({ "artifacts": false })),
+            ("acceptance", serde_json::json!({ "acceptance": "checked" })),
+            ("control", serde_json::json!({ "control": { "needsAttentionAfterMs": 5000 } })),
+            ("includeProgress", serde_json::json!({ "includeProgress": true })),
+            ("timeoutMs", serde_json::json!({ "timeoutMs": 60_000 })),
+            ("maxRuntimeMs", serde_json::json!({ "maxRuntimeMs": 60_000 })),
         ];
 
         for (name, extra) in &cases {
@@ -11188,59 +11456,552 @@ mod tests {
                     Box::new(|_u: cyrup_core::ToolUpdate| {}),
                 )
                 .await
-                .expect_err("a background run must refuse a foreground-only override")
+                .expect_err("the agent is unresolvable, so every call here still errors")
                 .to_string();
             assert!(
-                message.contains("only supported for foreground SINGLE runs"),
-                "{params} must be refused with the foreground-only message: {message}"
+                !message.contains("only supported for foreground"),
+                "'{name}' must no longer be refused on the background path: {message}"
             );
+            // The positive half: the call reached agent resolution, which is strictly PAST the
+            // router. Without this, the assertion above would also pass if the router had started
+            // rejecting these calls with some different message.
             assert!(
-                message.contains(name),
-                "the refusal must NAME the offending param '{name}', never drop it silently: \
-                 {message}"
+                message.contains("agent not found"),
+                "'{name}' must fall through to agent resolution like any other background run, \
+                 not be turned away at the router: {message}"
             );
+            // The schema/behaviour invariant this test has always guarded, restated in its new
+            // direction: an honoured param MUST be advertised.
             assert!(
-                !message.contains("agent not found"),
-                "the refusal must fire BEFORE agent resolution: {message}"
+                subagent_tool_parameters()["properties"]
+                    .as_object()
+                    .expect("properties object")
+                    .contains_key(*name),
+                "'{name}' is honoured on both paths, so the schema must advertise it"
             );
         }
+    }
 
-        // The complement: a background SINGLE call carrying NONE of the seven is not refused by
-        // this gate at all — it proceeds to agent resolution like any other background run. Without
-        // this, the test above would still pass if the gate rejected every background call.
-        let clean = tool
-            .execute(
-                ToolCallId::from("bg-clean"),
-                serde_json::json!({ "agent": "ghost", "task": "do it", "async": true }),
-                CancelToken::new(),
-                Box::new(|_u: cyrup_core::ToolUpdate| {}),
-            )
+    /// SUBA-N03, the load-bearing half: the six formerly-refused SINGLE-mode overrides are not
+    /// merely ACCEPTED on the async path, they genuinely reach the detached hop-2 runner.
+    ///
+    /// "No longer refused" and "honoured" are different claims, and only the second one matters —
+    /// an accepted-and-silently-dropped param is the exact defect SUBA-041 exists to prevent, and
+    /// is strictly worse than the refusal this unit removed. Asserted at the `runner-config.json`
+    /// filesystem boundary, which IS the entire hop-1 -> hop-2 contract (R-SA-073): whatever is in
+    /// that file is what the detached process will do, and nothing else crosses.
+    ///
+    /// Upstream equivalents, all @v0.34.0: `executeAsyncSingle` receives `skills`, `output`,
+    /// `outputMode`, `outputBaseDir`, `shareEnabled`, `sessionRoot`, `artifactsDir` and
+    /// `artifactConfig` (`runs/foreground/subagent-executor.ts:2845-2874`) and forwards them into
+    /// `spawnRunner` (`runs/background/async-execution.ts:930-996`).
+    #[tokio::test]
+    async fn a_background_single_run_honours_the_nine_single_mode_overrides() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_root = dir.path().join("sessions");
+
+        let run_id = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: Some(true),
+                output: Some(serde_json::json!("report.md")),
+                output_mode: Some("file-only".to_string()),
+                // `normalize_skill_input`'s output shape, exactly as `route_single` hands it over.
+                skills: Some(vec!["rust".to_string()]),
+                share: Some(true),
+                session_dir: Some(session_root.display().to_string()),
+                artifacts: None,
+                timeout_ms: None,
+            })
             .await
-            .expect_err("the agent is unresolvable, so the call still errors")
-            .to_string();
+            .expect("spawn_background should succeed for a resolvable builtin agent");
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+            .expect("spawn_background must have written runner-config.json before spawning hop 1");
+        let cfg: crate::background::runner_main::RunnerConfig =
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+        let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+            panic!("a single-agent background run must produce exactly one SingleStep");
+        };
+
+        // `output` — resolved to an ABSOLUTE path parent-side against the run-scoped output base
+        // dir (pi `resolveSingleRunOutputBaseDir` -> `<artifactsDir>/outputs/<runId>`), never left
+        // relative for the detached runner to resolve against some other cwd.
+        let output_path = step
+            .output_path
+            .as_deref()
+            .expect("the `output` override must reach the step, not be dropped");
         assert!(
-            !clean.contains("only supported for foreground SINGLE runs"),
-            "a background call carrying none of the six must not trip the gate: {clean}"
+            std::path::Path::new(output_path).is_absolute(),
+            "a relative `output` must be resolved parent-side against the run-scoped base dir, \
+             so a bare `report.md` never lands in the user's repo: {output_path}"
+        );
+        assert!(
+            output_path.ends_with("report.md"),
+            "the resolved path must still name the requested file: {output_path}"
+        );
+        assert!(
+            output_path.contains(run_id.as_str()),
+            "the output base dir is RUN-SCOPED (`<artifactsDir>/outputs/<runId>`), so two \
+             concurrent background runs cannot write over each other: {output_path}"
         );
 
-        // SUBA-N04: `acceptance` is the ex-seventh entry, now honoured. A background SINGLE call
-        // declaring it must NOT be refused — it must fall through to agent resolution like any
-        // other background run.
-        let with_acceptance = tool
-            .execute(
-                ToolCallId::from("bg-acceptance"),
-                serde_json::json!({
-                    "agent": "ghost", "task": "do it", "async": true, "acceptance": "checked"
-                }),
-                CancelToken::new(),
-                Box::new(|_u: cyrup_core::ToolUpdate| {}),
-            )
-            .await
-            .expect_err("the agent is unresolvable, so the call still errors")
-            .to_string();
+        // `outputMode`
+        assert_eq!(
+            step.output_mode,
+            Some(crate::discovery::types::OutputMode::FileOnly),
+            "the `outputMode` override must reach the step"
+        );
+        // `skill`
+        assert_eq!(
+            step.skills.as_deref(),
+            Some(["rust".to_string()].as_slice()),
+            "the `skill` override must reach the step"
+        );
+        // `sessionDir` — expanded/absolutized parent-side and scoped to this child (`run-0`, pi's
+        // own `sessionDirForIndex(0)` leaf).
+        let step_session_dir = step
+            .session_dir
+            .as_deref()
+            .expect("the `sessionDir` override must reach the step");
+        assert_eq!(
+            step_session_dir,
+            session_root.join("run-0"),
+            "an explicit sessionDir becomes the ROOT verbatim and the child gets pi's `run-0` leaf"
+        );
+        // `share` — run-level.
+        assert_eq!(cfg.share, Some(true), "the `share` override must reach the runner config");
+        // `artifacts` omitted => enabled (pi's `enabled: params.artifacts !== false`).
         assert!(
-            !with_acceptance.contains("only supported for foreground SINGLE runs"),
-            "a background run declaring `acceptance` is honoured, not refused: {with_acceptance}"
+            cfg.artifacts_dir.is_some(),
+            "an omitted `artifacts` param leaves the quadruple ON, matching pi's `!== false`"
+        );
+        assert!(cfg.artifact_config.enabled);
+        // SUBA-N06's flag, re-asserted here so all nine live in one place.
+        assert_eq!(cfg.include_progress, Some(true));
+
+        // The on-disk JSON is the actual contract — hop 2 reads this file, not a Rust value.
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("runner-config.json must be valid JSON");
+        assert_eq!(
+            json["steps"][0]["skills"],
+            serde_json::json!(["rust"]),
+            "the step's skills must serialize under pi's camelCase step shape: {raw}"
+        );
+        assert!(
+            json["share"].as_bool() == Some(true),
+            "`share` must serialize onto the runner config: {raw}"
+        );
+    }
+
+    /// SUBA-N03: `artifacts: false` reaches hop 2 as BOTH an absent artifacts dir and a disabled
+    /// config — pi's own two-term gate (`artifactsDir: artifactConfig.enabled ? artifactsDir :
+    /// undefined`, `runs/background/async-execution.ts:964`, read back by the runner as
+    /// `if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false)`,
+    /// `runs/background/subagent-runner.ts:879`).
+    ///
+    /// Separate from the sibling above because it asserts the NEGATIVE configuration, and because
+    /// the interesting property is that turning artifact FILES off must not move where a relative
+    /// `output:` lands — the artifacts dir is also the root of the run-scoped output base dir, so a
+    /// naive "skip resolving artifactsDir when disabled" would silently relocate the output file.
+    #[tokio::test]
+    async fn a_background_single_run_honours_artifacts_false_without_moving_the_output_path() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut resolved: Vec<(Option<bool>, String, bool)> = Vec::new();
+        for artifacts in [None, Some(true), Some(false)] {
+            let run_id = executor
+                .spawn_background(BackgroundSingleRequest {
+                    cwd: dir.path(),
+                    agent_name: "worker",
+                    task: "do something",
+                    context: Some(ContextMode::Fresh),
+                    model_override: None,
+                    agent_scope: AgentReadScope::Both,
+                    acceptance: None,
+                    control: None,
+                    include_progress: None,
+                    output: Some(serde_json::json!("report.md")),
+                    output_mode: None,
+                    skills: None,
+                    share: None,
+                    session_dir: None,
+                    artifacts,
+                    timeout_ms: None,
+                })
+                .await
+                .expect("spawn_background should succeed for a resolvable builtin agent");
+
+            let crate::background::RunArtifactRoots { async_root, results_dir } =
+                crate::background::run_artifact_roots(dir.path());
+            let run_paths =
+                crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+            let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+                .expect("runner-config.json must exist");
+            let cfg: crate::background::runner_main::RunnerConfig =
+                serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+            let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+                panic!("expected one SingleStep");
+            };
+            let output = step.output_path.clone().expect("output path must be resolved");
+            // Strip the run-scoped leaf so the three runs' paths are comparable.
+            let shape = output.replace(run_id.as_str(), "<runId>");
+            resolved.push((artifacts, shape, cfg.artifacts_dir.is_some() && cfg.artifact_config.enabled));
+        }
+
+        assert!(
+            resolved[0].2,
+            "an OMITTED `artifacts` leaves the quadruple on (pi `params.artifacts !== false`)"
+        );
+        assert!(resolved[1].2, "`artifacts: true` leaves it on");
+        assert!(
+            !resolved[2].2,
+            "`artifacts: false` must reach hop 2 as a disabled quadruple, not be dropped"
+        );
+        assert_eq!(
+            resolved[0].1, resolved[2].1,
+            "turning artifact FILES off must not relocate the resolved output path — the \
+             artifacts dir is also the root of the run-scoped output base dir"
+        );
+    }
+
+    /// SUBA-N03: `timeoutMs`/`maxRuntimeMs` on an async SINGLE run arms a REAL deadline on hop 2.
+    ///
+    /// The refusal this replaces claimed to mirror "pi's own precedent of erroring on timeoutMs +
+    /// async (`subagent-executor.ts:3022`)". That precedent does not exist: at v0.34.0 `:3015-3030`
+    /// is foreground intercom-receipt construction, and `git grep` over the whole of v0.34.0 `src/`
+    /// finds no timeout-vs-async refusal. Upstream states the opposite in its own schema
+    /// (`extension/schemas.ts:265-266`: "foreground and async/background runs") and implements it
+    /// (`runs/background/async-execution.ts:924` `deadlineAt = Date.now() + params.timeoutMs`,
+    /// `:982-983` passed to `spawnRunner`, armed as a live timer at
+    /// `runs/background/subagent-runner.ts:2078-2081`).
+    ///
+    /// The deadline is stamped as ABSOLUTE epoch milliseconds because it crosses a process
+    /// boundary in a JSON file — a `std::time::Instant` is opaque, monotonic and meaningless in
+    /// another process — so this asserts the arithmetic, not just the presence of a field.
+    #[tokio::test]
+    async fn a_background_single_run_carries_the_timeout_and_deadline_into_the_runner_config() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let before = crate::background::now_epoch_ms();
+        let run_id = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: Some(60_000),
+            })
+            .await
+            .expect("spawn_background should succeed for a resolvable builtin agent");
+        let after = crate::background::now_epoch_ms();
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+            .expect("runner-config.json must exist");
+        let cfg: crate::background::runner_main::RunnerConfig =
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize");
+
+        assert_eq!(
+            cfg.timeout_ms,
+            Some(60_000),
+            "the NOMINAL budget must reach hop 2 — it is what the timed-out message renders"
+        );
+        let deadline = cfg
+            .deadline_at_ms
+            .expect("a run carrying a timeout must also carry an absolute deadline");
+        assert!(
+            deadline >= before + 60_000 && deadline <= after + 60_000,
+            "the deadline must be stamped as `now + timeoutMs` in absolute epoch ms (pi \
+             `deadlineAt = Date.now() + params.timeoutMs`); got {deadline}, expected within \
+             [{}, {}]",
+            before + 60_000,
+            after + 60_000
+        );
+
+        // A run with NO timeout must carry neither — the absence is the "no wall-clock budget"
+        // default, not a zero deadline that would abort the run instantly.
+        let untimed = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect("spawn_background should succeed");
+        let untimed_paths =
+            crate::background::RunPaths::for_run(&async_root, &results_dir, &untimed);
+        let untimed_cfg: crate::background::runner_main::RunnerConfig = serde_json::from_str(
+            &std::fs::read_to_string(untimed_paths.run_dir.join("runner-config.json"))
+                .expect("runner-config.json must exist"),
+        )
+        .expect("runner-config.json must deserialize");
+        assert_eq!(untimed_cfg.timeout_ms, None);
+        assert_eq!(untimed_cfg.deadline_at_ms, None);
+    }
+
+    /// SUBA-N03, the adversarial question a prior review raised: hoisting the `RunId` out of
+    /// `spawn_background_steps` and into `spawn_background` means the caller now owns run identity.
+    /// Can two CONCURRENT background runs collide on their run-scoped output directory?
+    ///
+    /// Constructed rather than reasoned about: two `spawn_background` calls are driven CONCURRENTLY
+    /// against the same cwd (so they share an artifacts root and would collide if the run-scoping
+    /// were not real), and their resolved output paths must differ.
+    #[tokio::test]
+    async fn two_concurrent_background_runs_get_distinct_run_scoped_output_dirs() {
+        let executor = Arc::new(SubagentExecutor::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
+            exec.spawn_background(BackgroundSingleRequest {
+                cwd: &root,
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                output: Some(serde_json::json!("report.md")),
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect("spawn_background should succeed")
+        };
+
+        let (a, b) = tokio::join!(
+            request(Arc::clone(&executor), dir.path().to_path_buf()),
+            request(Arc::clone(&executor), dir.path().to_path_buf()),
+        );
+        assert_ne!(a.as_str(), b.as_str(), "two runs must never share a run id");
+
+        let crate::background::RunArtifactRoots { async_root, results_dir } =
+            crate::background::run_artifact_roots(dir.path());
+        let read_output = |run: &RunId| {
+            let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, run);
+            let cfg: crate::background::runner_main::RunnerConfig = serde_json::from_str(
+                &std::fs::read_to_string(paths.run_dir.join("runner-config.json"))
+                    .expect("runner-config.json must exist"),
+            )
+            .expect("runner-config.json must deserialize");
+            let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+                panic!("expected one SingleStep");
+            };
+            step.output_path.clone().expect("output path must be resolved")
+        };
+        let (out_a, out_b) = (read_output(&a), read_output(&b));
+        assert_ne!(
+            out_a, out_b,
+            "two concurrent runs writing the same relative `output` must resolve to DISTINCT \
+             run-scoped paths, or one silently overwrites the other: {out_a} vs {out_b}"
+        );
+        // And the run directories themselves — created by `ensure_accessible_dir` before either
+        // config was written — must both exist, which is where a genuine id collision would have
+        // surfaced as an error rather than a silent share.
+        for run in [&a, &b] {
+            let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, run);
+            assert!(paths.run_dir.exists(), "each run's directory must be created before its write");
+        }
+    }
+
+    /// SUBA-N03, the second adversarial question a prior review raised: does an
+    /// [`crate::exec::acceptance::AcceptanceContract`] survive the crossing to the separate OS
+    /// process INTACT — every variant, the `verify[]` command strings, and the required level?
+    /// Silent degradation to a weaker level is the same bug class SUBA-N04 fixed, so it is
+    /// constructed here rather than reasoned about.
+    ///
+    /// The mechanism under test: nothing serializes an `AcceptanceContract` at all. SUBA-N04
+    /// carries the RAW wire policy on the step (pi does the same — `explicit: params.acceptance`,
+    /// `runs/background/async-execution.ts:1282-1289` @v0.34.0) and hop 2 lowers it with the SAME
+    /// [`crate::exec::acceptance::lower_acceptance_input`] the foreground `route_single` uses. So
+    /// the property that must hold is: lowering the policy AFTER a JSON round-trip through
+    /// `runner-config.json` yields a contract byte-identical to lowering it parent-side.
+    ///
+    /// Every input shape upstream accepts is exercised: the `false` shorthand, each of the five
+    /// level strings, `"auto"` (which infers rather than pinning a level), and the full object form
+    /// carrying multiple `verify[]` commands alongside an explicit level.
+    #[tokio::test]
+    async fn an_acceptance_contract_survives_the_hop_2_json_boundary_at_full_strength() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let policies = [
+            serde_json::json!(false),
+            serde_json::json!("none"),
+            serde_json::json!("attested"),
+            serde_json::json!("checked"),
+            serde_json::json!("verified"),
+            serde_json::json!("reviewed"),
+            serde_json::json!("auto"),
+            serde_json::json!({
+                "level": "verified",
+                "verify": [
+                    { "id": "unit", "command": "cargo test --workspace" },
+                    { "id": "lint", "command": "cargo clippy -- -D warnings" },
+                ],
+            }),
+        ];
+
+        for policy in &policies {
+            // What the FOREGROUND path would have produced for this same policy.
+            let expected = crate::exec::acceptance::lower_acceptance_input(policy)
+                .expect("every policy here is valid");
+
+            let run_id = executor
+                .spawn_background(BackgroundSingleRequest {
+                    cwd: dir.path(),
+                    agent_name: "worker",
+                    task: "do something",
+                    context: Some(ContextMode::Fresh),
+                    model_override: None,
+                    agent_scope: AgentReadScope::Both,
+                    acceptance: Some(policy.clone()),
+                    control: None,
+                    include_progress: None,
+                    output: None,
+                    output_mode: None,
+                    skills: None,
+                    share: None,
+                    session_dir: None,
+                    artifacts: None,
+                    timeout_ms: None,
+                })
+                .await
+                .expect("spawn_background should succeed");
+
+            let crate::background::RunArtifactRoots { async_root, results_dir } =
+                crate::background::run_artifact_roots(dir.path());
+            let run_paths =
+                crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+            // Read back through the REAL file the detached process reads — not a Rust value handed
+            // across a function boundary — so the JSON encoding itself is under test.
+            let cfg: crate::background::runner_main::RunnerConfig = serde_json::from_str(
+                &std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
+                    .expect("runner-config.json must exist"),
+            )
+            .expect("runner-config.json must deserialize");
+            let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
+                panic!("expected one SingleStep");
+            };
+            let carried = step
+                .acceptance
+                .as_ref()
+                .expect("the raw policy must survive the boundary");
+
+            // Hop 2's own lowering, on the value that actually crossed.
+            let lowered = crate::exec::acceptance::lower_acceptance_input(carried)
+                .expect("the round-tripped policy must still lower cleanly");
+
+            assert_eq!(
+                lowered, expected,
+                "the contract hop 2 lowers must equal the one the foreground path lowers, for \
+                 policy {policy}"
+            );
+            // Stated explicitly rather than left implicit in the struct equality above, because a
+            // silent WEAKENING of exactly these three is the failure mode this test exists for.
+            match (&lowered, &expected) {
+                (Some(l), Some(e)) => {
+                    assert_eq!(l.required_level, e.required_level, "required_level for {policy}");
+                    assert_eq!(l.verify, e.verify, "verify[] commands for {policy}");
+                    assert!(l.explicit, "an explicitly declared policy stays explicit: {policy}");
+                }
+                (None, None) => {
+                    // `"auto"` lowers to `None` — "infer heuristically", which is NOT a weaker
+                    // explicit level; `run_sync` applies R-SA-023's default from it.
+                    assert_eq!(policy, &serde_json::json!("auto"));
+                }
+                _ => panic!("lowering disagreed about presence for {policy}"),
+            }
+        }
+    }
+
+    /// SUBA-N03: `outputMode: "file-only"` with no resolvable output path is refused BEFORE the
+    /// detached hop-1 process is spawned, not surfaced later as a hop-2 step failure the caller
+    /// never sees synchronously.
+    ///
+    /// pi runs this check inside `executeAsyncSingle` itself, in the PARENT process, before
+    /// `spawnRunner` (`validateFileOnlyOutputMode(outputMode, outputPath, \`Async single run
+    /// (${agent})\`)`, `runs/background/async-execution.ts:909-910` via `single-output.ts:85-90`).
+    /// The filesystem assertion is the load-bearing half: no run directory may exist afterwards.
+    #[tokio::test]
+    async fn a_background_single_run_refuses_file_only_output_mode_with_no_path_before_spawning() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let err = executor
+            .spawn_background(BackgroundSingleRequest {
+                cwd: dir.path(),
+                agent_name: "worker",
+                task: "do something",
+                context: Some(ContextMode::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                // No `output`, and the builtin `worker` persona declares none of its own.
+                output: None,
+                output_mode: Some("file-only".to_string()),
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect_err("file-only with no output path must be refused");
+        assert!(
+            matches!(err, SubagentError::OutputPathRequired),
+            "expected R-SA-025's OutputPathRequired, got: {err:?}"
+        );
+        assert!(
+            !default_async_root(dir.path()).exists(),
+            "the refusal must land BEFORE any run directory is created"
         );
     }
 
@@ -11523,6 +12284,13 @@ mod tests {
                 acceptance: None,
                 control: None,
                 include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
             })
             .await
             .expect_err("a blocked depth ceiling must reject before discovery or any spawn setup");
@@ -11566,6 +12334,13 @@ mod tests {
                 acceptance: None,
                 control: None,
                 include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -11618,6 +12393,13 @@ mod tests {
                 acceptance: Some(policy.clone()),
                 control: None,
                 include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -11688,6 +12470,13 @@ mod tests {
                     ..crate::registration::ControlConfig::default()
                 }),
                 include_progress: None,
+                output: None,
+                output_mode: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -11905,6 +12694,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = vec![RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: "worker".to_string(),
             task: "do something".to_string(),
             cwd: None,
@@ -11956,6 +12747,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let step = RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: "worker".to_string(),
             task: "do something".to_string(),
             cwd: None,
@@ -11986,6 +12779,11 @@ mod tests {
                     chain_dir: None,
                     control: None,
                     include_progress: None,
+                    run_id: RunId::new(),
+                    timeout_ms: None,
+                    share: None,
+                    artifacts_dir: None,
+                    artifact_config: crate::artifacts::ArtifactConfig::default(),
                 },
             )
             .await
@@ -12046,6 +12844,8 @@ mod tests {
         let ext = SubagentsExtension::with_config_and_cwd(cfg, dir.path().to_path_buf());
 
         let graph = vec![RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: "worker".to_string(),
             task: "do something".to_string(),
             cwd: None,
@@ -13099,6 +13899,8 @@ mod tests {
 
     fn fork_test_step(agent: &str) -> SingleStepSpec {
         SingleStepSpec {
+            skills: None,
+            session_dir: None,
             agent: agent.to_string(),
             task: format!("do {agent}"),
             cwd: None,
@@ -13804,6 +14606,13 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let config = crate::background::runner_main::RunnerConfig {
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
             run_id: RunId::new(),
             mode: RunMode::Single,
             steps: Vec::new(),
