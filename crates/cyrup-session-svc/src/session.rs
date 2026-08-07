@@ -1459,11 +1459,28 @@ impl AgentSession {
             .await;
         // Estimate the rebuilt context size for the result payload (Pi `estimateMessagesTokens`).
         let compacted_ctx = guard.build_context();
-        let estimated_tokens_after: u64 = compacted_ctx
-            .messages
-            .iter()
-            .map(cyrup_provider::estimate_message_tokens)
-            .sum();
+        // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
+        // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
+        // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
+        // over `buildSessionContext().messages`, and that list is
+        // `buildContextEntries().flatMap(sessionEntryToContextMessages)` with every role intact
+        // (session-manager.ts:461-469 composed with :383-408). So a retained `compactionSummary`
+        // costs `summary.length/4` with NO wrapper prose, and an `excludeFromContext` (`!!`) bash
+        // execution still costs `(command.length + output.length)/4`.
+        //
+        // Measuring `compacted_ctx` instead billed the ~107-char COMPACTION_SUMMARY wrapper that
+        // `push_as_message` adds (cyrup-session/src/context.rs:16-18) — ~27 tokens, and a compacted
+        // context ALWAYS leads with one — while silently dropping every `excludeFromContext` bash
+        // entry, which `AgentMessage::push_llm` removes at the LLM boundary. It also disagreed with
+        // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
+        // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
+        let estimated_tokens_after: u64 = u64::from(
+            guard
+                .build_context_raw()
+                .iter()
+                .map(cyrup_session::compaction::tokens::estimate_agent_message)
+                .fold(0u32, u32::saturating_add),
+        );
         drop(guard);
         // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
         // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
@@ -2667,8 +2684,22 @@ impl AgentSession {
     ) -> Result<(), SessionServiceError> {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = model_ref;
+        *Self::lock(&self.model) = model_ref.clone();
         self.bash_session_env.set_model(provider.to_string(), model.to_string());
+        // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
+        // path has only the `ModelRef`, so resolve the full `Model` to recompute; if it cannot be
+        // resolved the overlay is cleared rather than left stale — sending the OLD provider's
+        // attribution is worse than sending none.
+        let resolved = self
+            .provider
+            .current()
+            .models()
+            .iter()
+            .find(|m| m.id == model_ref.model && m.provider == model_ref.provider)
+            .cloned();
+        self.agent
+            .set_headers(resolved.as_ref().and_then(|m| self.attribution_headers(m)))
+            .await;
         self.manager.lock().await.append_model_change(provider, model)?;
         Ok(())
     }
@@ -3289,6 +3320,13 @@ impl AgentSession {
         &self.read_model_vision
     }
 
+    /// The agent's LIVE per-request header overlay (pi `SimpleStreamOptions.headers`, recomputed
+    /// per request in `streamFn`, `sdk.ts:318-327`). Tracks the active model via
+    /// [`Self::attribution_headers`] on both model-change paths.
+    pub async fn agent_headers(&self) -> Option<cyrup_provider::HeaderMap> {
+        self.agent.snapshot().await.headers
+    }
+
     /// The agent's current in-memory transcript (includes the streaming partial).
     pub async fn agent_messages(&self) -> Vec<cyrup_agent::AgentMessage> {
         self.agent.snapshot().await.messages
@@ -3714,6 +3752,14 @@ impl AgentSession {
         // non-vision warning must describe the model the NEXT read will actually run against,
         // not the one resolved at startup.
         self.read_model_vision.set(next.supports_image_input());
+        // pi recomputes provider-attribution + opencode session-affinity headers INSIDE `streamFn`,
+        // dispatched on the model the request is actually going to (`sdk.ts:318-327`). cyrup merged
+        // them once at session build and pinned them via `AgentBuilder::headers`, so a
+        // cross-provider `/model` switch kept sending the PREVIOUS provider's attribution — an
+        // OpenRouter `HTTP-Referer`/`X-Title` on an Anthropic request, or a stale opencode
+        // session-affinity header. `attribution_headers()` existed and computed this correctly
+        // per-model; it simply had no caller.
+        self.agent.set_headers(self.attribution_headers(next)).await;
         self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model (explicit override or current session level).
         let level = match explicit_thinking {
@@ -4138,11 +4184,28 @@ impl AgentSession {
         // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released
         // on ONE path, before the retry queue is flushed.
         let compacted_ctx = guard.build_context();
-        let estimated_tokens_after: u64 = compacted_ctx
-            .messages
-            .iter()
-            .map(cyrup_provider::estimate_message_tokens)
-            .sum();
+        // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
+        // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
+        // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
+        // over `buildSessionContext().messages`, and that list is
+        // `buildContextEntries().flatMap(sessionEntryToContextMessages)` with every role intact
+        // (session-manager.ts:461-469 composed with :383-408). So a retained `compactionSummary`
+        // costs `summary.length/4` with NO wrapper prose, and an `excludeFromContext` (`!!`) bash
+        // execution still costs `(command.length + output.length)/4`.
+        //
+        // Measuring `compacted_ctx` instead billed the ~107-char COMPACTION_SUMMARY wrapper that
+        // `push_as_message` adds (cyrup-session/src/context.rs:16-18) — ~27 tokens, and a compacted
+        // context ALWAYS leads with one — while silently dropping every `excludeFromContext` bash
+        // entry, which `AgentMessage::push_llm` removes at the LLM boundary. It also disagreed with
+        // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
+        // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
+        let estimated_tokens_after: u64 = u64::from(
+            guard
+                .build_context_raw()
+                .iter()
+                .map(cyrup_session::compaction::tokens::estimate_agent_message)
+                .fold(0u32, u32::saturating_add),
+        );
         drop(guard);
         // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
         // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`

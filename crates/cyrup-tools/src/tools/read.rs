@@ -97,12 +97,17 @@ impl Tool for ReadTool {
         }
         // None exist ⇒ Pi keeps the primary (candidates[0]); the R_OK check below then fails.
         let abs = abs.unwrap_or_else(|| candidates.first().cloned().unwrap_or_default());
-        if self.fs.access(&abs, crate::ops::Access::Read).await.is_err() {
-            return Err(error::not_found(format!(
-                "File not found or unreadable: {}",
-                input.path
-            )));
-        }
+        // Pi does NOT wrap this failure: `await ops.access(absolutePath)` (read.ts:241) is
+        // uncaught — `execute`'s only catch re-`reject`s the original error (read.ts:321-324) — so
+        // the model sees Node's raw errno text, carrying both the errno CODE and the RESOLVED
+        // absolute path (`ENOENT: no such file or directory, access '/work/missing.txt'`). Note the
+        // sibling `edit` deliberately does wrap (edit.ts:326-331), which `edit.rs:194-196` mirrors;
+        // `read` is the one that must propagate. Substituting a fixed
+        // "File not found or unreadable: {input.path}" collapsed ENOENT/EACCES/ENOTDIR into one
+        // string and reported the raw user-supplied path — misleading precisely because the loop
+        // above may have selected a macOS filename VARIANT of it. `LocalFs::access` already builds
+        // `"{resolved path}: {io error}"` (ops/local.rs:113), so propagating is enough.
+        self.fs.access(&abs, crate::ops::Access::Read).await?;
 
         if cancel.is_cancelled() {
             return Err(error::aborted());

@@ -12,6 +12,28 @@ use crate::types::{CheckSource, PatternRule, PermissionCheckResult, PermissionSt
 
 const PATH_BEARING_TOOLS: [&str; 6] = ["read", "write", "edit", "find", "grep", "ls"];
 
+/// JS truthiness for a `PermissionCheckResult`'s optional string fields (`command`, `target`,
+/// `matchedPattern`).
+///
+/// Every pi guard over these fields is a bare truthiness test — `if (result.command)`,
+/// `result.toolName === "bash" && result.command`, `result.matchedPattern ? … : "*"` — so in pi an
+/// EMPTY STRING is indistinguishable from an absent field. Rust's `Option` is not: a
+/// `Some(String::new())` passes `.is_some()`/`if let Some(_)` and leaks `command ''` into
+/// model-facing denial text, or makes an approval subject the empty string (which
+/// `extension.rs`'s `!subject.is_empty()` guard then silently drops).
+///
+/// This is reachable, not theoretical: [`crate::manager::PermissionManager::check`]'s bash branch
+/// mirrors pi's `const command = typeof record.command === "string" ? record.command : ""` and
+/// always emits `command: Some(command)`, so a bash tool call whose input has a missing or
+/// non-string `command` key produces `Some("")`.
+///
+/// Only `""` is falsy — a whitespace-only string is truthy in JS, so this deliberately does NOT
+/// trim (unlike [`crate::common::get_non_empty_string`], which ports pi's separate
+/// `getNonEmptyString` helper for raw tool INPUT and does trim).
+fn truthy(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|s| !s.is_empty())
+}
+
 /// pi `FILESYSTEM_TOOL_NAME_SUFFIXES` (`index.ts:141`): the filesystem-ish suffixes a tool name is
 /// matched against by [`is_likely_filesystem_tool_name`].
 const FILESYSTEM_TOOL_NAME_SUFFIXES: [&str; 8] =
@@ -87,16 +109,14 @@ pub fn inject_cwd(input: &Value, cwd: &str) -> Value {
 #[must_use]
 pub fn get_pattern_approval_subject(result: &PermissionCheckResult, input: &Value) -> String {
     if result.tool_name == "bash"
-        && let Some(cmd) = &result.command
-        && !cmd.is_empty()
+        && let Some(cmd) = truthy(&result.command)
     {
-        return cmd.clone();
+        return cmd.to_string();
     }
     if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
-        && let Some(target) = &result.target
-        && !target.is_empty()
+        && let Some(target) = truthy(&result.target)
     {
-        return target.clone();
+        return target.to_string();
     }
     if let Some(path) = get_path_bearing_tool_path(&result.tool_name, input) {
         let cwd = get_non_empty_string(to_record(input).get("cwd"))
@@ -104,14 +124,17 @@ pub fn get_pattern_approval_subject(result: &PermissionCheckResult, input: &Valu
         let resource = common::normalize_path_resource_for_permission(&path, &cwd);
         return if resource.is_empty() { path } else { resource };
     }
-    if let Some(target) = &result.target {
+    if let Some(target) = truthy(&result.target) {
         let prefix = format!("{}:", result.tool_name);
         return match target.strip_prefix(&prefix) {
             Some(rest) => rest.to_string(),
-            None => target.clone(),
+            None => target.to_string(),
         };
     }
-    result.command.clone().unwrap_or_else(|| result.tool_name.clone())
+    // pi `return result.command || result.toolName;` — an empty `command` falls through to the tool
+    // name, so an "Allow Always" on a malformed bash call still persists a `bash`/`bash` rule
+    // instead of being dropped by `apply_decision`'s `!subject.is_empty()` guard.
+    truthy(&result.command).unwrap_or(&result.tool_name).to_string()
 }
 
 /// pi `createConfigEvaluationRule` (`index.ts:841-848`): reuse the matched pattern only for
@@ -122,8 +145,10 @@ pub fn create_config_evaluation_rule(result: &PermissionCheckResult) -> PatternR
         result.source,
         CheckSource::Bash | CheckSource::Mcp | CheckSource::Skill | CheckSource::Special
     );
-    let pattern = match (&result.matched_pattern, can_reuse) {
-        (Some(p), true) => p.clone(),
+    // pi `canReuseMatchedPattern && result.matchedPattern ? result.matchedPattern : "*"` — an empty
+    // matched pattern is falsy and falls back to `"*"`.
+    let pattern = match (truthy(&result.matched_pattern), can_reuse) {
+        (Some(p), true) => p.to_string(),
         _ => "*".to_string(),
     };
     PatternRule { tool: result.tool_name.clone(), pattern, action: result.state }
@@ -157,7 +182,9 @@ pub fn apply_pattern_approval_state(
 
 /// pi `formatPermissionHardStopHint` (`index.ts:352-358`).
 fn hard_stop_hint(result: &PermissionCheckResult) -> String {
-    if (result.source == CheckSource::Mcp || result.tool_name == "mcp") && result.target.is_some() {
+    if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
+        && truthy(&result.target).is_some()
+    {
         "Hard stop: this MCP permission denial is policy-enforced. Do not retry this target, do not run discovery/investigation to bypass it, and report the block to the user.".to_string()
     } else {
         "Hard stop: this permission denial is policy-enforced. Do not retry or investigate bypasses; report the block to the user.".to_string()
@@ -171,17 +198,17 @@ pub fn format_deny_reason(result: &PermissionCheckResult, agent_name: Option<&st
     if let Some(agent) = agent_name {
         parts.push(format!("Agent '{agent}'"));
     }
-    if (result.source == CheckSource::Mcp || result.tool_name == "mcp") && result.target.is_some() {
-        if let Some(target) = &result.target {
+    match truthy(&result.target) {
+        Some(target) if result.source == CheckSource::Mcp || result.tool_name == "mcp" => {
             parts.push(format!("is not permitted to run MCP target '{target}'"));
         }
-    } else {
-        parts.push(format!("is not permitted to run '{}'", result.tool_name));
+        _ => parts.push(format!("is not permitted to run '{}'", result.tool_name)),
     }
-    if let Some(command) = &result.command {
+    // pi `if (result.command)` / `if (result.matchedPattern)` — an empty string contributes nothing.
+    if let Some(command) = truthy(&result.command) {
         parts.push(format!("command '{command}'"));
     }
-    if let Some(pattern) = &result.matched_pattern {
+    if let Some(pattern) = truthy(&result.matched_pattern) {
         parts.push(format!("(matched '{pattern}')"));
     }
     format!("{}. {}", parts.join(" "), hard_stop_hint(result))
@@ -193,22 +220,15 @@ pub fn format_user_denied_reason(
     result: &PermissionCheckResult,
     denial_reason: Option<&str>,
 ) -> String {
-    let base = if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
-        && result.target.is_some()
-    {
-        result
-            .target
-            .as_ref()
-            .map(|t| format!("User denied MCP target '{t}'."))
-            .unwrap_or_default()
-    } else if result.tool_name == "bash" && result.command.is_some() {
-        result
-            .command
-            .as_ref()
-            .map(|c| format!("User denied bash command '{c}'."))
-            .unwrap_or_default()
-    } else {
-        format!("User denied tool '{}'.", result.tool_name)
+    let mcp = result.source == CheckSource::Mcp || result.tool_name == "mcp";
+    let base = match (truthy(&result.target), truthy(&result.command)) {
+        (Some(target), _) if mcp => format!("User denied MCP target '{target}'."),
+        // pi `result.toolName === "bash" && result.command ? … : `User denied tool '…'.`` — an
+        // empty command falls through to the generic tool form.
+        (_, Some(command)) if result.tool_name == "bash" => {
+            format!("User denied bash command '{command}'.")
+        }
+        _ => format!("User denied tool '{}'.", result.tool_name),
     };
     let suffix = denial_reason.map(|r| format!(" Reason: {r}.")).unwrap_or_default();
     format!("{base}{suffix} {}", hard_stop_hint(result))
@@ -532,18 +552,17 @@ pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str
         Some(agent) => format!("Agent '{agent}'"),
         None => "Current agent".to_string(),
     };
-    let pattern_info = result
-        .matched_pattern
-        .as_ref()
-        .map(|p| format!(" (matched '{p}')"))
-        .unwrap_or_default();
+    // pi `result.matchedPattern ? ` (matched '…')` : ""` — truthiness, so an empty pattern is omitted.
+    let pattern_info =
+        truthy(&result.matched_pattern).map(|p| format!(" (matched '{p}')")).unwrap_or_default();
 
     if result.tool_name == "bash" {
+        // pi `${result.command || ""}` — the bash ask prompt DOES render an empty command inline.
         let command = result.command.clone().unwrap_or_default();
         return format!("{subject} requested bash command '{command}'{pattern_info}. Allow this command?");
     }
     if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
-        && let Some(target) = &result.target
+        && let Some(target) = truthy(&result.target)
     {
         return format!("{subject} requested MCP target '{target}'{pattern_info}. Allow this call?");
     }

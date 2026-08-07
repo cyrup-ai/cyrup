@@ -58,13 +58,18 @@ impl GrepTool {
     }
 }
 
-/// Collects the 1-based line number of every match in a file, capping the GLOBAL match count at
-/// `limit`. Pi counts each rg `match` event (one per matching line) and stops the child once
-/// `matchCount >= effectiveLimit` (grep.ts:280-292). Context is NOT gathered here — Pi re-reads the
-/// file and formats an INDEPENDENT block per match afterwards (grep.ts:250-268,316-331), so
-/// overlapping context windows DUPLICATE shared lines (one copy per block) rather than merging.
+/// Collects the 1-based line number AND the raw bytes of every match in a file, capping the GLOBAL
+/// match count at `limit`. Pi counts each rg `match` event (one per matching line) and stops the
+/// child once `matchCount >= effectiveLimit` (grep.ts:280-292).
+///
+/// The bytes are Pi's `event.data.lines.text` (grep.ts:307, kept on the match record at :310): at
+/// `context == 0` Pi formats the row straight from that captured text and never re-reads the file
+/// (grep.ts:318-326). Only the context>0 path — and the non-UTF-8 fallback, where ripgrep emits
+/// `lines.bytes` instead of `lines.text` so `match.lineText` is `undefined` — goes through
+/// `formatBlock` → `getFileLines` (grep.ts:250-268), which re-reads and formats an INDEPENDENT
+/// block per match, so overlapping context windows DUPLICATE shared lines rather than merging.
 struct MatchSink<'a> {
-    lines: &'a mut Vec<u64>,
+    matches: &'a mut Vec<(u64, Vec<u8>)>,
     count: &'a mut usize,
     limit: usize,
 }
@@ -73,7 +78,9 @@ impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
-        self.lines.push(m.line_number().unwrap_or(0));
+        // `SinkMatch::bytes` is the matched line INCLUDING its terminator, which is exactly what
+        // ripgrep serialises into `data.lines.text` — hence Pi's `.replace(/\n$/,"")` below.
+        self.matches.push((m.line_number().unwrap_or(0), m.bytes().to_vec()));
         *self.count += 1;
         Ok(*self.count < self.limit)
     }
@@ -232,48 +239,68 @@ impl Tool for GrepTool {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let mut match_lines: Vec<u64> = Vec::new();
+            let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
             {
-                let sink = MatchSink { lines: &mut match_lines, count: &mut count, limit };
+                let sink = MatchSink { matches: &mut matches, count: &mut count, limit };
                 let _ = searcher.search_slice(&matcher, &bytes, sink);
             }
-            if match_lines.is_empty() {
+            if matches.is_empty() {
                 continue;
             }
-            // Pi formats a context block from a **second, independent** read: `formatBlock` calls
-            // `getFileLines`, which pulls the file through the injectable `ops.readFile` and caches
-            // it per invocation (grep.ts:200-213,250-268) — ripgrep's own read is a different
-            // process against the real filesystem. Only the context>0 path re-reads; at context==0
-            // Pi formats straight from ripgrep's captured `data.lines.text` and never touches the
-            // file again (grep.ts:316-326). Mirror both halves: re-read only when context>0, reuse
-            // the search bytes otherwise. That keeps Pi's observable read-your-latest-writes
-            // semantics (a file rewritten between match and format renders with the NEW content,
-            // clamped by the new `lines.length`) and, crucially, keeps Pi's failure path reachable.
-            let format_bytes = if context > 0 { self.fs.read(file).await.ok() } else { Some(bytes) };
-            // Pi: `catch { lines = [] }` in `getFileLines` (grep.ts:207-209), and `formatBlock`
-            // turns an empty `lines` into ONE marker row per match, in place of the whole context
-            // block: `` if (!lines.length) return [`${relativePath}:${lineNumber}: (unable to read
-            // file)`] `` (grep.ts:253). A successfully-read empty file is NOT this case — `"".
-            // split("\n")` is `[""]`, length 1 — so only a read failure emits the marker. The rows
-            // still count as output, so they participate in byte truncation like any other line.
-            let Some(bytes) = format_bytes else {
-                for &ln in &match_lines {
-                    out.push(format!("{rel}:{ln}: (unable to read file)"));
+            // Which matches take Pi's `formatBlock` path (grep.ts:328-330) rather than the direct
+            // `match.lineText` path (grep.ts:318-327)? Pi's condition is
+            // `contextValue === 0 && match.lineText !== undefined`, and `lineText` is
+            // `event.data.lines.text` — ABSENT whenever ripgrep could not encode the line as UTF-8
+            // (it serialises `lines.bytes` instead). So: context>0, or a non-UTF-8 matched line.
+            let takes_block = |raw: &[u8]| context > 0 || std::str::from_utf8(raw).is_err();
+            // `formatBlock` reads through `getFileLines`, a **second, independent** read of the file
+            // (grep.ts:200-213) — ripgrep's own read was a different process against the real
+            // filesystem — cached for the rest of the invocation by `fileCache`. Do it at most once
+            // per file, and ONLY if some match actually needs it, so that at context==0 the file is
+            // never re-read (Pi does not) yet the read-your-latest-writes semantics and the failure
+            // path below stay reachable exactly where Pi has them.
+            //
+            // `None` is Pi's `catch { lines = [] }` (grep.ts:207-209). A successfully-read EMPTY
+            // file is NOT that case — `"".split("\n")` is `[""]`, length 1.
+            let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
+                match self.fs.read(file).await {
+                    // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
+                    // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using
+                    // lone-`\r` separators yields context blocks that key off these folded segments
+                    // — matching Pi even where that diverges from the matcher's numbering.
+                    Ok(b) => {
+                        let content = String::from_utf8_lossy(&b);
+                        let folded = content.replace("\r\n", "\n").replace('\r', "\n");
+                        Some(folded.split('\n').map(str::to_owned).collect())
+                    }
+                    Err(_) => None,
                 }
-                continue;
+            } else {
+                None
             };
-            // Pi: `content.replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n")` then a per-line
-            // `replace(/\r/g,"")` (grep.ts:206,259). Splitting the same bytes the searcher numbered
-            // on `\n` keeps line numbers aligned; CR removal happens per output line below.
-            let content = String::from_utf8_lossy(&bytes);
-            // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
-            // (grep.ts:206). The matcher numbered lines on raw `\n`, so a file using lone-`\r`
-            // separators yields context blocks that key off these folded segments — matching Pi
-            // even where that diverges from the matcher's `\n`-based numbering.
-            let folded = content.replace("\r\n", "\n").replace('\r', "\n");
-            let src_lines: Vec<&str> = folded.split('\n').collect();
-            for &ln in &match_lines {
-                let l = ln as usize;
+            for (ln, raw) in &matches {
+                let l = *ln as usize;
+                if !takes_block(raw) {
+                    // Pi grep.ts:319-326: format straight from the captured line text —
+                    // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
+                    // what `getFileLines` does), then strip ONE trailing `\n`.
+                    let stripped =
+                        String::from_utf8_lossy(raw).replace("\r\n", "\n").replace('\r', "");
+                    let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
+                    let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
+                    if tr {
+                        any_line_truncated = true;
+                    }
+                    out.push(format!("{rel}:{l}: {capped}"));
+                    continue;
+                }
+                // Pi `formatBlock`: an unreadable file collapses the whole block to ONE marker row
+                // per match (grep.ts:253). The rows still count as output, so they participate in
+                // byte truncation like any other line.
+                let Some(src_lines) = src_lines.as_ref() else {
+                    out.push(format!("{rel}:{l}: (unable to read file)"));
+                    continue;
+                };
                 // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
                 // context > 0, else just the single match line (grep.ts:255-256).
                 let (start, end) = if context > 0 {
@@ -282,7 +309,8 @@ impl Tool for GrepTool {
                     (l, l)
                 };
                 for current in start..=end {
-                    let raw = src_lines.get(current.saturating_sub(1)).copied().unwrap_or("");
+                    let raw = src_lines.get(current.saturating_sub(1)).map_or("", String::as_str);
+                    // Pi's per-line `replace(/\r/g,"")` (grep.ts:259).
                     let text = raw.replace('\r', "");
                     let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
                     if tr {

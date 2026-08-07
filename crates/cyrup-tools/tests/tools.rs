@@ -124,7 +124,11 @@ async fn read_missing_file_errors() {
         .execute(cid(), serde_json::json!({ "path": "nope.txt" }), CancelToken::new(), noop_sink())
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not found") || err.to_string().contains("unreadable"));
+    // Pi re-rejects Node's raw `fs.access` error (read.ts:241/321-324), so the message carries the
+    // errno and the resolved absolute path — see `tests/read_access_errno.rs`.
+    let msg = err.to_string();
+    assert!(msg.contains("nope.txt"), "got: {msg}");
+    assert!(msg.contains("No such file or directory"), "got: {msg}");
 }
 
 // ---------------------------------------------------------------- A-03-2 image
@@ -1419,11 +1423,13 @@ async fn bash_timeout_empty_output_has_no_leading_newline() {
     assert_eq!(msg, "Command timed out after 1 seconds", "got: {msg}");
 }
 
-// UM-5 (corrected) — Pi `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206), so an
-// interior CR is a LINE BREAK, not a character to strip. ripgrep numbers the whole `foo\rNEEDLE\rbar`
-// as line 1 (it only breaks on `\n`), but Pi's folded src_lines are ["foo","NEEDLE","bar",""], so the
-// rendered line-1 block is `foo`. (The old cyrup split on `\n` only + stripped interior CR per line,
-// emitting the divergent `fooNEEDLEbar` — the exact UM-5 miss.) cyrup now matches Pi byte-for-byte.
+// UM-5 (re-corrected) — Pi `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206), so
+// an interior CR is a LINE BREAK, not a character to strip. ripgrep numbers the whole
+// `foo\rNEEDLE\rbar` as line 1 (it only breaks on `\n`), but Pi's folded src_lines are
+// ["foo","NEEDLE","bar",""], so the rendered line-1 block is `foo` and its `context` neighbour is
+// `NEEDLE`. `getFileLines` is reachable ONLY from `formatBlock`, i.e. only when `contextValue > 0`
+// (grep.ts:328-330) — this test therefore passes `context`. The DEFAULT context=0 path takes
+// `match.lineText` instead and is covered by `tests/grep_context_zero_line_text.rs`.
 #[tokio::test]
 async fn grep_folds_interior_carriage_returns_as_line_breaks() {
     let dir = tempfile::tempdir().unwrap();
@@ -1431,12 +1437,20 @@ async fn grep_folds_interior_carriage_returns_as_line_breaks() {
     std::fs::write(cwd.join("cr.txt"), "foo\rNEEDLE\rbar\n").unwrap();
     let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "NEEDLE" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE", "context": 1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     assert!(!text.contains('\r'), "no CR may survive folding: {text:?}");
-    assert_eq!(text, "cr.txt:1: foo", "Pi renders the folded line-1 segment, not the joined line");
+    assert_eq!(
+        text, "cr.txt:1: foo\ncr.txt-2- NEEDLE",
+        "Pi renders the folded segments, not the joined line"
+    );
 }
 
 // gap #9 — the edit access-error literal ends with a trailing period: Pi throws
@@ -1557,7 +1571,11 @@ async fn read_effective_access_skips_unreadable_candidate() {
         .execute(cid(), serde_json::json!({ "path": "secret.txt" }), CancelToken::new(), noop_sink())
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("File not found or unreadable"), "got: {err}");
+    // Pi re-rejects Node's raw `fs.access` error (read.ts:241 uncaught, :321-324 re-`reject`s), so
+    // the model sees the errno class and the RESOLVED path — see `tests/read_access_errno.rs`.
+    let msg = err.to_string();
+    assert!(msg.contains("secret.txt"), "must name the resolved path: {msg}");
+    assert!(msg.contains("Permission denied"), "must carry the EACCES errno: {msg}");
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
 }
 
@@ -1597,12 +1615,14 @@ async fn edit_effective_access_precheck_rejects_write_only_file() {
 // model-facing output equals Pi's, with the exact Pi behavior reconstructed from source.
 // ======================================================================================
 
-// UM-5 — grep `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206). The matcher
-// numbers lines on raw `\n`, so for a file using a LONE `\r` separator the context block keys off
-// the FOLDED segment. File bytes `x\rTARGET\n`: ripgrep (and grep_searcher) report the match on
-// line 1 (`x\rTARGET`), but Pi's getFileLines splits the folded text into ["x","TARGET",""] and
-// renders src_lines[0] = "x". So Pi prints `cr.txt:1: x` — NOT `xTARGET` (old cyrup, split-on-\n
-// only + per-line \r strip).
+// UM-5 (re-corrected) — grep `getFileLines` folds lone `\r`→`\n` BEFORE splitting (grep.ts:206).
+// The matcher numbers lines on raw `\n`, so for a file using a LONE `\r` separator the CONTEXT
+// BLOCK keys off the FOLDED segment. File bytes `x\rTARGET\n`: ripgrep (and grep_searcher) report
+// the match on line 1 (`x\rTARGET`), but Pi's getFileLines splits the folded text into
+// ["x","TARGET",""], so the block renders src_lines[0] = "x" as the match row and src_lines[1] =
+// "TARGET" as its context row. `getFileLines` is only reachable via `formatBlock`, i.e. context>0
+// (grep.ts:328-330) — the original version of this test omitted `context` and so asserted the
+// folded rendering on the context=0 path, where Pi does not use it at all.
 #[tokio::test]
 async fn grep_folds_lone_cr_before_splitting_context() {
     let dir = tempfile::tempdir().unwrap();
@@ -1612,13 +1632,17 @@ async fn grep_folds_lone_cr_before_splitting_context() {
     let r = grep
         .execute(
             cid(),
-            serde_json::json!({ "pattern": "TARGET", "path": "cr.txt" }),
+            serde_json::json!({ "pattern": "TARGET", "path": "cr.txt", "context": 1 }),
             CancelToken::new(),
             noop_sink(),
         )
         .await
         .unwrap();
-    assert_eq!(first_text(&r), "cr.txt:1: x", "grep must fold lone CR like Pi getFileLines");
+    assert_eq!(
+        first_text(&r),
+        "cr.txt:1: x\ncr.txt-2- TARGET",
+        "grep must fold lone CR like Pi getFileLines"
+    );
 }
 
 // UM-4 — byte-limit NOTICE text hardcodes `formatSize(DEFAULT_MAX_BYTES)` (= 50.0KB) regardless of
@@ -1671,10 +1695,13 @@ async fn read_variant_probe_uses_existence_not_readability() {
         .await;
     let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o644));
     let err = res.expect_err("Pi errors: primary exists but is unreadable; no variant fall-through");
-    assert!(
-        err.to_string().contains("not found") || err.to_string().contains("unreadable"),
-        "got: {err}"
-    );
+    // The failure must be EACCES on the PRIMARY — proving the selection loop chose it (F_OK) and
+    // the readability check then failed on that same path rather than falling through to the
+    // readable curly variant. Pi propagates Node's errno text (read.ts:241/321-324).
+    let msg = err.to_string();
+    assert!(msg.contains("Permission denied"), "got: {msg}");
+    assert!(msg.contains("a'b.txt"), "must name the primary, not the variant: {msg}");
+    assert!(!msg.contains('\u{2019}'), "must not name the curly variant: {msg}");
 }
 
 // UM-7 — a malformed `edits` (missing / non-array) yields Pi's exact `validateEditInput` literal

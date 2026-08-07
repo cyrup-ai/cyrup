@@ -493,16 +493,44 @@ fn format_forwarded_prompt(request: &ForwardedPermissionRequest) -> String {
     format!("Subagent '{agent}' requested permission.\nSession ID: {session}\n\n{}", request.message)
 }
 
+/// pi's `options` bag for [`process_forwarded_requests`] (`index.ts:1358`
+/// `options: { preserveLocation?: boolean } = {}`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessForwardedOptions {
+    /// Skip the trailing [`cleanup_location_if_empty`] (pi `if (!options.preserveLocation) { … }`,
+    /// `index.ts:1501-1503`).
+    ///
+    /// The DEFAULT (`false`, pi's `= {}`) tears the spool down once it drains, which is right for a
+    /// one-shot scan whose caller is done with the location. It is WRONG for the long-lived parent
+    /// watcher, which owns the location for the whole session: pi's only production caller is
+    /// `runForwardedPermissionRequestScan` at `index.ts:1935`, and it passes
+    /// `{ preserveLocation: true }` precisely because it re-scans on every wake and must not delete
+    /// the inbox a child may be writing into between two scans.
+    pub preserve_location: bool,
+}
+
+impl ProcessForwardedOptions {
+    /// pi's `{ preserveLocation: true }` — the watcher's option bag.
+    #[must_use]
+    pub const fn preserve_location() -> Self {
+        Self { preserve_location: true }
+    }
+}
+
 /// pi `processForwardedPermissionRequests` (`index.ts:1357-1504`): scan the parent's OWN inbox, and
 /// for each valid request targeting this session, resolve a decision (expired → deny; yolo → approve;
 /// else surface the live dialog UNDER the shared C3 human-interaction lock) and write the nonce-bound
 /// RESPONSE, then delete the request. `services` is the captured live backend (P-1); `session_id` is
 /// the parent's own id (pi `getSessionId(ctx)`).
+///
+/// `options.preserve_location` ports pi's `preserveLocation` (`index.ts:1358`, `:1501-1503`) — see
+/// [`ProcessForwardedOptions`] for why the watcher must set it.
 pub async fn process_forwarded_requests(
     default_agent_dir: &Path,
     session_id: &str,
     services: &Arc<dyn HostServices>,
     config: &ExtensionConfig,
+    options: ProcessForwardedOptions,
 ) {
     let Some(current) = normalize_session_id(session_id) else {
         return;
@@ -559,7 +587,11 @@ pub async fn process_forwarded_requests(
         let _ = std::fs::remove_file(&request_path); // pi `:1498`.
     }
 
-    cleanup_location_if_empty(&location);
+    // pi `if (!options.preserveLocation) { cleanupPermissionForwardingLocationIfEmpty(location); }`
+    // (`index.ts:1501-1503`).
+    if !options.preserve_location {
+        cleanup_location_if_empty(&location);
+    }
 }
 
 /// The per-request decision (pi `index.ts:1414-1470`): expired → deny; yolo → approve; else surface
@@ -713,8 +745,18 @@ pub fn spawn_forwarding_watcher(
         let _ = ensure_location(&location);
 
         // Mandatory startup re-scan (a request may have landed before the watcher attached).
-        process_forwarded_requests(&agent_dir, &session_id, &services, &snapshot_config(&config))
-            .await;
+        // `preserve_location` — pi `index.ts:1935`'s `{ preserveLocation: true }`: this watcher owns
+        // the spool for the whole session (it `ensure_location`d it just above and its
+        // `notify::PollWatcher` below is attached to `requests_dir`), so a scan that finds the inbox
+        // empty must NOT delete it out from under a child that is mid-write.
+        process_forwarded_requests(
+            &agent_dir,
+            &session_id,
+            &services,
+            &snapshot_config(&config),
+            ProcessForwardedOptions::preserve_location(),
+        )
+        .await;
 
         let mut watcher = watch_dir(&location.requests_dir).ok();
         loop {
@@ -736,6 +778,7 @@ pub fn spawn_forwarding_watcher(
                 &session_id,
                 &services,
                 &snapshot_config(&config),
+                ProcessForwardedOptions::preserve_location(),
             )
             .await;
         }

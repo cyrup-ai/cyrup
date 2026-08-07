@@ -145,6 +145,32 @@ pub fn queue_idle_message(state: &Arc<SharedIntercomState>, from: SessionInfo, m
     schedule_inbound_flush(state, INBOUND_FLUSH_DELAY_MS);
 }
 
+/// Answer-and-forget an INBOUND ask, both halves (pi `dismissIncomingAsk`, `index.ts:455-459`):
+///
+/// ```text
+/// function dismissIncomingAsk(messageId: string): void {
+///   replyTracker.dismissPendingAsk(messageId);
+///   const queuedIndex = pendingIdleMessages.findIndex((entry) => entry.message.id === messageId);
+///   if (queuedIndex >= 0) pendingIdleMessages.splice(queuedIndex, 1);
+/// }
+/// ```
+///
+/// The tracker half alone is NOT enough. An inbound message that arrives while this session is busy
+/// and interactive is recorded in the tracker, surfaced to the human, AND parked in the pending-idle
+/// queue ([`queue_idle_message`]) — so the running agent can see it and answer it with
+/// `intercom{reply}` / `intercom{send, replyTo}` before the run ends. Dismissing only the tracker
+/// leaves the entry in the queue, and [`flush_idle_messages`] replays the whole queue
+/// unconditionally once the session goes idle: the already-answered message is re-injected and
+/// drives a second turn over it.
+///
+/// Every pi call site is a point where the inbound ask has just been ANSWERED or has become
+/// undeliverable: the busy non-interactive auto-reply (`index.ts:755`), a `send` carrying `replyTo`
+/// (`:1568`), and both `reply` outcomes — delivered (`:1718`) and `"Session not found"` (`:1711`).
+pub fn dismiss_incoming_ask(state: &SharedIntercomState, message_id: &str) {
+    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).dismiss_pending_ask(message_id);
+    state.remove_pending_inbound(message_id);
+}
+
 /// (Re)arm the debounced pending-idle flush (pi `scheduleInboundFlush`, `index.ts:674-684`):
 /// `clearInboundFlushTimer()` then a fresh timer. `delay_ms == 0` is pi's
 /// `scheduleInboundFlush(0)` — the immediate drain the `agent_end`/`turn_end` handlers fire
@@ -293,13 +319,10 @@ pub async fn auto_reply_non_interactive(
         .await;
     match send {
         Ok(result) if result.delivered => {
-            // markReplied (`index.ts:748`): the inbound ask is now answered — drop it from pending so
-            // a later `intercom{list}`/`intercom{reply}` does not re-surface it.
-            state
-                .tracker
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .mark_replied(&message.id);
+            // dismissIncomingAsk (`index.ts:755`): the inbound ask is now answered — drop it from
+            // pending so a later `intercom{list}`/`intercom{reply}` does not re-surface it, AND
+            // from the pending-idle queue so the debounced flush does not re-inject it.
+            dismiss_incoming_ask(state, &message.id);
             true
         }
         Ok(result) => {

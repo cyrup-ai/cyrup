@@ -618,6 +618,47 @@ impl<B: Backend> App<B> {
         Ok(App { terminal, state, viewport_height: 0, live_floor: 0, tree_nav_tx: None })
     }
 
+    /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
+    /// cursor. Total and idempotent so an error path always leaves a usable terminal.
+    ///
+    /// The escape sequence itself lives in [`crate::panic_hook::restore_terminal_best_effort`] and
+    /// this method is a thin delegation to it, deliberately: the panic hook runs the *same*
+    /// teardown, and two hand-maintained copies would silently drift the first time
+    /// [`App::into_stdout`] learned to enable a fourth mode — a drift only ever discovered by a
+    /// user whose terminal was already broken. Note the release profile sets `panic = "abort"`, so
+    /// no `Drop` guard can stand in for the hook (`Cargo.toml:215`).
+    ///
+    /// Generic over the backend rather than confined to the crossterm one it is *used* from: nothing
+    /// in it is crossterm-specific (the escapes go straight to stdout; `show_cursor` is a `Backend`
+    /// method), and a `CrosstermBackend<Stdout>` cannot be constructed in a test without a
+    /// controlling terminal — which would leave the pairing below with no way to assert itself.
+    pub fn restore(&mut self) -> Result<(), TuiError> {
+        crate::panic_hook::restore_terminal_best_effort();
+        // Not a second `Show`-for-its-own-sake: ratatui's `Terminal` tracks `hidden_cursor` itself
+        // and its `Drop` re-emits `Show` when that flag is still set, so the flag is synced through
+        // the API rather than left stale by the raw-stdout write above.
+        let _ = self.terminal.show_cursor();
+        Ok(())
+    }
+
+    /// The **exit** teardown: drain stdin, then [`Self::restore`] — Pi's `shutdown()`, which runs
+    /// `await this.ui.terminal.drainInput(1000)` immediately before `this.stop()`
+    /// (`interactive-mode.ts:3578`/`:3589` then `:3591`, both the signal and the interactive-quit
+    /// branch). `crates/cyrup/src/main.rs` calls it at the single exit from the interactive loop.
+    ///
+    /// This is a distinct method rather than a change to [`Self::restore`] because the drain is only
+    /// correct on the way out. `restore` also runs on [`App::suspend`] (Ctrl+Z) and around the
+    /// external editor, where the terminal is handed to someone else and taken back — anything the
+    /// user types there is theirs to keep, and discarding it would be a new bug. Pi draws the line in
+    /// exactly the same place: `handleCtrlZ` calls a bare `ui.stop()` (`:3722`) and never `drainInput`.
+    ///
+    /// See [`crate::drain`] for what the drain protects against (buffered Kitty key-release reports
+    /// and the quit keystroke itself leaking to the parent shell once raw mode is off).
+    pub fn drain_and_restore(&mut self) -> Result<(), TuiError> {
+        let _ = crate::drain::drain_stdin_before_exit();
+        self.restore()
+    }
+
     /// Immutable state access.
     pub fn state(&self) -> &AppState {
         &self.state
@@ -3741,7 +3782,13 @@ fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> Option<Stri
     None
 }
 
-fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
+/// Project one flattened [`SessionDagNode`] into the `/tree` selector's [`TreeNode`].
+///
+/// `pub` so the projection can be driven directly from a test with a hand-built `SessionDagNode`:
+/// it is the production converter (`App::run`'s `/tree` arm maps the whole `session_dag()` through
+/// it, `:2338`), and the alternative — standing a real multi-branch `AgentSession` up inside a TUI
+/// test — would exercise the session layer rather than this mapping.
+pub fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
     let kind = match n.kind {
         SessionDagKind::Message | SessionDagKind::Other => TreeKind::Message,
         SessionDagKind::Tool => TreeKind::ToolGroup,
@@ -3757,7 +3804,26 @@ fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
         foldable: n.foldable,
         folded: false,
         has_label: n.has_label,
-        time_label: n.is_leaf.then(|| "current".to_string()),
+        // Pi's column here is `labelTimestamp` — WHEN the entry's label was set — and the row it
+        // decorates is a labeled one (`tree-selector.ts:741-743`). It was previously fed the literal
+        // string `"current"` on the branch tip, which is neither: the `t` toggle
+        // (`app.tree.toggleLabelTimestamp`) rendered the word "current" where Pi renders a clock
+        // time, and did so on an unlabeled row, in a column Pi leaves off by default.
+        //
+        // Pi does mark the active path, just not here: `pathMarker` is a `•` prefix ahead of the
+        // entry text, driven by an `activePathIds` SET covering the whole root→tip path
+        // (`tree-selector.ts:736-738`). `SessionDagNode` carries only `is_leaf`, so that marker is
+        // not portable from here either; it is not a substitute this column can hold.
+        //
+        // Set to `None` until the value exists to put here. It is dropped one and two layers down,
+        // not in this crate: `cyrup_session::TreeNode` (manager.rs:29-34) has no timestamp field
+        // even though `SessionManager::labels` already holds `(label, label-change timestamp)`
+        // (manager.rs:43-44), so `SessionDagNode` (cyrup-session-svc session.rs:136-155) has nothing
+        // to carry — its `timestamp` is the ENTRY's, a different quantity. Threading the label
+        // timestamp through those two crates is the remaining half of this fix; the render side
+        // (Pi's gate, Pi's default, Pi's `[+label time]` marker) is done and will display it the
+        // moment a producer sets it.
+        time_label: None,
     }
 }
 
@@ -4172,24 +4238,6 @@ impl App<CrosstermBackend<Stdout>> {
         let res = self.draw();
         let _ = out.execute(EndSynchronizedUpdate);
         res
-    }
-
-    /// Restore the terminal: pop keyboard flags, disable bracketed paste, leave raw mode, show
-    /// cursor. Total and idempotent so an error path always leaves a usable terminal.
-    ///
-    /// The escape sequence itself lives in [`crate::panic_hook::restore_terminal_best_effort`] and
-    /// this method is a thin delegation to it, deliberately: the panic hook runs the *same*
-    /// teardown, and two hand-maintained copies would silently drift the first time
-    /// [`Self::into_stdout`] learned to enable a fourth mode — a drift only ever discovered by a
-    /// user whose terminal was already broken. Note the release profile sets `panic = "abort"`, so
-    /// no `Drop` guard can stand in for the hook (`Cargo.toml:215`).
-    pub fn restore(&mut self) -> Result<(), TuiError> {
-        crate::panic_hook::restore_terminal_best_effort();
-        // Not a second `Show`-for-its-own-sake: ratatui's `Terminal` tracks `hidden_cursor` itself
-        // and its `Drop` re-emits `Show` when that flag is still set, so the flag is synced through
-        // the API rather than left stale by the raw-stdout write above.
-        let _ = self.terminal.show_cursor();
-        Ok(())
     }
 
     /// Suspend the process to the background (Ctrl+Z / `app.suspend`, `core/keybindings.ts`): tear the
@@ -4806,7 +4854,12 @@ impl App<CrosstermBackend<Stdout>> {
                 break;
             }
         }
-        self.restore()
+        // pi `interactive-mode.ts:3589-3591`: drain, THEN stop. The drain MUST happen here, before
+        // this function's own restore, not at the caller — `run` disables raw mode on the way out,
+        // so a drain after it returns is a guaranteed no-op on the exact path it exists for, and
+        // whatever is still queued (a late Kitty key-release report, or the Ctrl+D that asked for
+        // this quit) has already been handed to the parent shell.
+        self.drain_and_restore()
     }
 }
 

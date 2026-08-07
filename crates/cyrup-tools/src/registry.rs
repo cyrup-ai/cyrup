@@ -10,8 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The closed set of built-in tool names (DI-1).
-pub const BUILTIN_NAMES: [&str; 7] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+/// The closed set of built-in tool names (DI-1), in Pi's declaration order.
+///
+/// Pi's `createAllToolDefinitions` returns its object literal as `read, bash, edit, write, grep,
+/// find, ls` (`coding-agent/src/core/tools/index.ts:156-166`), and object-literal insertion order is
+/// the order `Object.values()` / the tool registry replays. That order reaches the wire: it is the
+/// order of the `tools` array in every provider request and of the tool list rendered into the
+/// system prompt, both of which the model conditions on.
+pub const BUILTIN_NAMES: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 /// Model-visible tool-set controls (R-03-010).
 #[derive(Clone, Debug, Default)]
@@ -47,20 +53,26 @@ impl ToolRegistry {
         let locks = Arc::new(FileMutationLocks::new());
         let shell = ShellConfig::detect();
 
+        // Insertion order IS presentation order (see `insert`/`all`/`visible` below), and it must be
+        // Pi's `createAllToolDefinitions` literal order — read, bash, edit, write, grep, find, ls
+        // (`coding-agent/src/core/tools/index.ts:156-166`). It also fixes the two derived sets for
+        // free: filtering this order to {read,bash,edit,write} reproduces `createCodingTools`
+        // (index.ts:169-176) and to {read,grep,find,ls} reproduces `createReadOnlyToolDefinitions`
+        // (index.ts:147-154).
         reg.insert(Arc::new(ReadTool::new(backend.fs.clone(), cwd.clone(), opts.read)));
-        reg.insert(Arc::new(WriteTool::new(
-            backend.fs.clone(),
-            locks.clone(),
-            cwd.clone(),
-            opts.write,
-        )));
+        reg.insert(Arc::new(BashTool::new(backend.proc.clone(), shell, cwd.clone(), opts.bash)));
         reg.insert(Arc::new(EditTool::new(
             backend.fs.clone(),
             locks.clone(),
             cwd.clone(),
             opts.edit,
         )));
-        reg.insert(Arc::new(BashTool::new(backend.proc.clone(), shell, cwd.clone(), opts.bash)));
+        reg.insert(Arc::new(WriteTool::new(
+            backend.fs.clone(),
+            locks.clone(),
+            cwd.clone(),
+            opts.write,
+        )));
         reg.insert(Arc::new(GrepTool::new(backend.fs.clone(), cwd.clone(), opts.grep)));
         reg.insert(Arc::new(FindTool::new(backend.fs.clone(), cwd.clone(), opts.find)));
         reg.insert(Arc::new(LsTool::new(backend.fs.clone(), cwd, opts.ls)));

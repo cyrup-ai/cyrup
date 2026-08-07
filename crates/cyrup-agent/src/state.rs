@@ -72,6 +72,12 @@ pub struct StateInner {
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<ToolCallId>,
     pub error_message: Option<String>,
+    /// Per-request header overlay (pi `SimpleStreamOptions.headers`), LIVE rather than fixed at
+    /// build. pi recomputes provider-attribution and session-affinity headers inside `streamFn`
+    /// (`sdk.ts:318-327`), dispatched on the model the request is actually going to; holding them in
+    /// `GenerationConfig` froze them at session build, so a cross-provider `/model` switch kept
+    /// sending the PREVIOUS provider's attribution headers.
+    pub headers: Option<cyrup_provider::HeaderMap>,
 }
 
 impl StateInner {
@@ -86,6 +92,7 @@ impl StateInner {
             streaming_message: self.streaming_message.clone(),
             pending_tool_calls: self.pending_tool_calls.iter().cloned().collect(),
             error_message: self.error_message.clone(),
+            headers: self.headers.clone(),
         }
     }
 }
@@ -103,6 +110,8 @@ pub struct AgentStateSnapshot {
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: Vec<ToolCallId>,
     pub error_message: Option<String>,
+    /// The live per-request header overlay (pi `SimpleStreamOptions.headers`).
+    pub headers: Option<cyrup_provider::HeaderMap>,
 }
 
 /// Reduce one event into managed state (arch-02 §5.1). Cheap and synchronous; called while the

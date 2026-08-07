@@ -2,11 +2,19 @@
 //! provider request (Pi `provider-attribution.ts`, used by `sdk.ts:323-330`). A 1:1 port of the
 //! host-match + telemetry-gated default-attribution + opencode session-affinity logic.
 //!
-//! In Pi these headers are computed per-request inside the `streamFn`. In cyrup the inputs (the
-//! active [`cyrup_provider::Model`], the resolved telemetry flag, and the [`SessionId`]) are stable
-//! across a run, so the facade computes the merged map once and threads it onto the agent's
-//! per-request header overlay (`Agent::headers`/`set_headers`). The result is byte-identical to Pi's
-//! per-request merge.
+//! Pi computes these per-request inside `streamFn`, dispatched on the model the request is actually
+//! going to (`sdk.ts:318-327`).
+//!
+//! This module's doc used to claim the inputs "are stable across a run, so the facade computes the
+//! merged map once". That premise was FALSE: the active [`cyrup_provider::Model`] changes on every
+//! `/model` switch, and the merge is host-matched on it. Computing once at session build and pinning
+//! it via `AgentBuilder::headers` meant a cross-provider switch kept sending the previous provider's
+//! attribution — an OpenRouter `HTTP-Referer`/`X-Title` on an Anthropic request, or a stale opencode
+//! session-affinity header.
+//!
+//! The merged map now lives in `StateInner::headers` and is recomputed by
+//! [`crate::AgentSession::attribution_headers`] on BOTH model-change paths, so each turn reads the
+//! overlay for its own provider — matching Pi's per-request merge in behaviour, not just in wording.
 
 use cyrup_core::SessionId;
 use cyrup_provider::{HeaderMap, Model};

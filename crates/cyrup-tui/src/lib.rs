@@ -43,6 +43,7 @@ mod commands;
 mod component;
 mod config_selector;
 mod diff;
+mod drain;
 mod editor;
 mod error;
 mod export;
@@ -55,6 +56,7 @@ mod markdown;
 mod model_selector;
 mod overlay;
 mod panic_hook;
+mod resume_hint;
 mod select_list;
 mod selector;
 mod session_search;
@@ -75,8 +77,8 @@ mod tree_selector;
 
 pub use app::{
     crossterm_input_stream, extension_render, reanchor_inline_region, render,
-    should_honor_extension_shutdown, App, AppAction, AppCommand, AppState, RebuildBackend,
-    TreeNavMsg,
+    should_honor_extension_shutdown, tree_node_from_dag, App, AppAction, AppCommand, AppState,
+    RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{provider_display_name, provider_rows, AuthState};
 pub use autocomplete::{
@@ -86,12 +88,18 @@ pub use autocomplete::{
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{HotkeysOverlay, Overlay, OverlayOutcome};
 pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
+pub use resume_hint::{
+    format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
+};
 pub use commands::{
     dynamic_commands_from_catalog, CommandRegistry, CommandSource, Dispatch, SlashCommand,
     BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;
+pub use drain::{
+    drain_count, drain_input, drain_stdin_before_exit, InputDrain, DRAIN_IDLE, DRAIN_MAX,
+};
 pub use chrome::{
     compact_hints, format_key_text, key_hint_line, key_hint_spans, render_compact_hints,
     truncate_to_visual_lines, BorderedLoader, VisualTruncate,

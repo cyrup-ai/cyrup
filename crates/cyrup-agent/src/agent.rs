@@ -724,7 +724,11 @@ impl RunCtx {
             temperature: self.gen_config.temperature,
             max_tokens: self.gen_config.max_tokens,
             cache_retention: self.gen_config.cache_retention,
-            headers: self.gen_config.headers.clone(),
+            // LIVE, not `gen_config`: pi rebuilds these inside `streamFn` for the model the request
+            // is actually going to (`sdk.ts:318-327`), so a cross-provider `/model` switch must not
+            // keep sending the previous provider's attribution headers. Read per TURN off the
+            // shared state the facade writes through `Agent::set_headers`.
+            headers: lock(&self.state).headers.clone(),
             transport: self.gen_config.transport,
             max_retry_delay_ms: self.gen_config.max_retry_delay_ms,
             max_retries: self.gen_config.max_retries,
@@ -1491,6 +1495,12 @@ impl Agent {
     pub async fn set_model(&self, m: ModelRef) {
         lock(&self.state).model = m;
     }
+    /// Replace the per-request header overlay (pi recomputes it per request inside `streamFn`,
+    /// `sdk.ts:318-327`). The session facade calls this on every model change so provider-attribution
+    /// and opencode session-affinity headers follow the ACTIVE provider.
+    pub async fn set_headers(&self, h: Option<cyrup_provider::HeaderMap>) {
+        lock(&self.state).headers = h;
+    }
     pub async fn set_thinking_level(&self, t: ModelThinkingLevel) {
         lock(&self.state).thinking_level = t;
     }
@@ -1958,6 +1968,8 @@ impl AgentBuilder {
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
             error_message: None,
+            // Seeded from the builder, then kept LIVE by `set_headers`.
+            headers: self.gen_config.headers.clone(),
         };
         Agent {
             state: Arc::new(Mutex::new(state)),

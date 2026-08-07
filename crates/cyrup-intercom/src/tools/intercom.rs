@@ -143,11 +143,10 @@ impl IntercomTool {
                     );
                 }
                 if let Some(reply_to) = &params.reply_to {
-                    self.state
-                        .tracker
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mark_replied(reply_to);
+                    // `index.ts:1568` is `dismissIncomingAsk(replyTo)`, NOT a bare
+                    // `dismissPendingAsk`: the answered inbound message must also leave the
+                    // pending-idle queue, or the flush re-injects it once this run ends.
+                    crate::inbound::dismiss_incoming_ask(&self.state, reply_to);
                 }
                 // `index.ts:1571`: `Message sent to ${to}` — the CALLER-SUPPLIED target, not the
                 // resolved id. pi deliberately splits the two (`const sendTo = await
@@ -227,17 +226,15 @@ impl IntercomTool {
                     })
                     .await
                     .map_err(to_tool_err)?;
-                // `index.ts:1692-1706`: markReplied runs ONLY on a confirmed delivery; a failed
-                // delivery either dismisses the pending ask (when the reason is exactly "Session not
-                // found") or, for any other failure reason, leaves the tracker untouched entirely so
-                // the ask remains pending for a retry.
-                {
-                    let mut tracker = self.state.tracker.lock().unwrap_or_else(|e| e.into_inner());
-                    if result.delivered {
-                        tracker.mark_replied(&target.message.id);
-                    } else if result.reason.as_deref() == Some("Session not found") {
-                        tracker.dismiss_pending_ask(&target.message.id);
-                    }
+                // `index.ts:1692-1706`: the dismissal runs ONLY on a confirmed delivery (`:1718`); a
+                // failed delivery still dismisses when the reason is exactly "Session not found"
+                // (`:1711`, the peer is gone — the ask can never be answered) but for any other
+                // failure reason leaves the state untouched entirely so the ask remains pending for
+                // a retry. Both live branches are pi's `dismissIncomingAsk`, which ALSO splices the
+                // message out of the pending-idle queue — without that, replying to a message that
+                // arrived mid-run gets it re-injected by the flush when the run ends.
+                if result.delivered || result.reason.as_deref() == Some("Session not found") {
+                    crate::inbound::dismiss_incoming_ask(&self.state, &target.message.id);
                 }
                 if result.delivered {
                     if let Some(services) = self.state.host_services() {

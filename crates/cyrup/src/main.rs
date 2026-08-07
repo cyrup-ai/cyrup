@@ -514,11 +514,18 @@ async fn run() -> anyhow::Result<i32> {
         timings.print();
         let inputs = build_inputs(&cli, &dirs.cwd).await?;
         let interactive =
-            run_interactive(runtime.clone(), session, inputs, cli.verbose, cancel).await;
+            run_interactive(runtime.clone(), session.clone(), inputs, cli.verbose, cancel).await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
         // (agent-session-runtime.ts:397-404), emitting `session_shutdown{reason:"quit"}` so
         // extensions can flush/deregister. Runs even when the TUI loop errored out.
         runtime.dispose().await;
+        // …and then, on a clean quit, the ONE line Pi prints after disposing
+        // (interactive-mode.ts:3594-3597): the exact invocation that returns here. Under an explicit
+        // `--session-dir` this is the only surfaced route back to the session — the picker a bare
+        // relaunch offers only ever lists the session's own directory.
+        if interactive.is_ok() {
+            print_resume_hint(&dirs, &session).await;
+        }
         interactive?;
         return Ok(0);
     }
@@ -1137,6 +1144,37 @@ fn session_list_cwd_filter(dirs: &ConfigDirs) -> Option<&Path> {
     (dirs.session_dir != default_dir).then_some(dirs.cwd.as_path())
 }
 
+/// Write Pi's exit hint — `To resume this session: cyrup [--session-dir DIR] --session ID` — on the
+/// way out of interactive mode (`interactive-mode.ts:3594-3597`, using `formatResumeCommand`,
+/// `:231-244`).
+///
+/// The gates (tty stdout, a persisted session, a session file that exists) live in
+/// [`cyrup_tui::format_resume_command`]; this function's whole job is to resolve the four inputs off
+/// the live session. `default_session_dir` is Pi's `getDefaultSessionDirPath(cwd)` — the SAME
+/// cwd-encoded path [`session_list_cwd_filter`] compares against — so the `--session-dir` argument is
+/// printed exactly when the session is not where a bare relaunch would look for it.
+async fn print_resume_hint(dirs: &ConfigDirs, session: &AgentSession) {
+    use std::io::Write;
+
+    use cyrup_tui::crossterm::tty::IsTty;
+
+    let session_file = session.session_file().await;
+    let default_session_dir =
+        SessionLayout::new(dirs.agent_dir.join("sessions"), dirs.cwd.clone()).dir();
+    let target = cyrup_tui::ResumeTarget {
+        session_id: session.session_id().as_str(),
+        session_file: session_file.as_deref(),
+        session_dir: session.session_dir(),
+        default_session_dir: &default_session_dir,
+    };
+    let Some(command) = cyrup_tui::format_resume_command(&target, std::io::stdout().is_tty()) else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(cyrup_tui::resume_hint_line(&command).as_bytes());
+    let _ = out.flush();
+}
+
 /// The cross-project listing, mirroring Pi's TWO `SessionManager.listAll` overloads
 /// (session-manager.ts:1653-1655). With a custom `sessionDir` it degenerates to
 /// `listSessionsFromDir(customSessionDir)` — that ONE directory, newest-first, no cross-project walk
@@ -1601,6 +1639,9 @@ async fn run_interactive(
             cancel,
         )
         .await;
+    // `App::run` already drained and restored on its way out (app.rs, `drain_and_restore`). This is
+    // the idempotent safety net for the error paths that leave `run` early — restore only, since
+    // draining after raw mode is gone accomplishes nothing.
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
