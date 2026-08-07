@@ -1902,8 +1902,11 @@ impl AgentBuilder {
         self
     }
     /// HTTP request idle timeout (ms) forwarded into `StreamOptions.timeout_ms` (Pi
-    /// `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:745). Providers/SDKs that support a
-    /// request timeout honor it; others ignore it.
+    /// `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:745).
+    ///
+    /// Honored by the shared SSE transport for every wire API — see
+    /// [`GenConfig::timeout_ms`](crate::state::GenConfig::timeout_ms) for the exact semantics
+    /// (idle, not total; `0` disables).
     pub fn timeout_ms(mut self, ms: u64) -> Self {
         self.gen_config.timeout_ms = Some(ms);
         self

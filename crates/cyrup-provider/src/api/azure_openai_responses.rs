@@ -34,6 +34,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
+use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -152,10 +153,14 @@ impl ApiImpl for AzureOpenAiResponsesApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -170,7 +175,16 @@ impl ApiImpl for AzureOpenAiResponsesApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))

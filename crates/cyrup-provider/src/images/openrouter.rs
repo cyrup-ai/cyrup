@@ -92,10 +92,16 @@ async fn run(
     // no `all_proxy`, silent SOCKS) — extra surface that is strictly LESS safe than rejecting SOCKS.
     // The delta only surfaces in the rare `all_proxy`-set / SOCKS-on-image edge; the SOCKS-rejection
     // test below pins the current (broader) behavior. See spec/gap-analysis/00-residual-ledger.md #4.
-    let client =
-        build_client_for_target(&url, &crate::auth::types::EnvAuthContext, options.env.as_ref())
-            .await
-            .map_err(|e| GenError::Message(e.to_string()))?;
+    // PROV-006: `ImagesOptions.timeout_ms` is Pi's `{ timeout: options.timeoutMs }` on the images
+    // SDK client (openrouter-images.ts:67); `None` falls back to the process-global idle timeout.
+    let client = build_client_for_target(
+        &url,
+        &crate::auth::types::EnvAuthContext,
+        options.env.as_ref(),
+        options.timeout_ms,
+    )
+    .await
+    .map_err(|e| GenError::Message(e.to_string()))?;
     let mut builder = client.post(&url).bearer_auth(&api_key).json(&params);
     // `defaultHeaders: providerHeadersToRecord({ ...model.headers, ...optionsHeaders })`
     // (openrouter-images.ts:116). A `None` value suppresses a default; on a fresh request there is no

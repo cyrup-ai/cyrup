@@ -527,8 +527,10 @@ impl RemoteCatalog {
 
         // Reuse the provider-traffic client builder so the catalog fetch honours the same
         // HTTP(S)_PROXY / ALL_PROXY / NO_PROXY resolution as every other outbound request.
+        // `None` takes the process-global HTTP idle timeout on top of this request's own total
+        // deadline below — Pi's global undici dispatcher covers catalog fetches too.
         let client =
-            crate::stream::sse::build_client_for_target(&url, self.auth_ctx.as_ref(), None)
+            crate::stream::sse::build_client_for_target(&url, self.auth_ctx.as_ref(), None, None)
                 .await
                 .map_err(|e| ProviderError::Transport(Box::new(e)))?;
         let mut request = client

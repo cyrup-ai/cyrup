@@ -88,7 +88,31 @@ impl From<ThinkingLevel> for ModelThinkingLevel {
     }
 }
 
-/// How a generation ended (func-01 §9).
+/// How a generation **settled** (func-01 §9; Pi `StopReason`, `ai/src/types.ts:391`).
+///
+/// # Divergence from Pi: no `pending`
+///
+/// Pi's `StopReason` union carries a sixth member, `"pending"`, which is NOT an outcome — it is the
+/// in-flight sentinel TypeScript needs because `AssistantMessage.stopReason` is a required
+/// non-nullable field on a mutable object that is built up during streaming. Every Pi stream
+/// function seeds `output.stopReason = "pending"` and ends with
+/// `if (output.stopReason === "pending") throw new Error("… stream ended without a stop reason")`
+/// (`anthropic-messages.ts:509,751`, `google-generative-ai.ts:73,266`,
+/// `openai-responses.ts:124,170`, `openai-completions.ts:218,580`,
+/// `mistral-conversations.ts:153,88`, `faux.ts:316,393`), so `"pending"` never reaches a `done`
+/// event, the agent loop's settled message, or a session file.
+///
+/// Rust spells "no outcome yet" as `Option<StopReason>`, so this enum stays the settled-outcome
+/// domain and the sentinel lives in the decoders' `Option` (`None` == Pi `"pending"`). The
+/// invariant Pi enforces with a `throw` is enforced here by
+/// `cyrup_provider::StreamEvent::end_of_stream`, which is the single path every wire-API decoder
+/// takes to its terminal event and maps `None` to the `error` terminal — see its docs.
+///
+/// **Known parity debt (PROV-010 / AGENT-014 / DRIFT-012, partial):** because the variant is
+/// absent, a `partial` snapshot serializes `"stopReason":"stop"` where Pi writes `"pending"`, and
+/// deserializing a Pi-produced `message_start` / `message_update` payload (`agent-loop.ts:314-341`)
+/// fails on the unknown `"pending"` value. Closing that half requires adding a `Pending` variant,
+/// which breaks the exhaustive `match` in `cyrup-tui`'s `stop_reason_notice`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {

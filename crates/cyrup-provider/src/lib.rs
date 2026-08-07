@@ -130,9 +130,12 @@ pub use providers::{
 };
 pub use providers::{openrouter_images_auth, openrouter_images_provider};
 pub use stream::sse::{
-    OnRequest, OnResponse, SseFrame, SseRequest, build_client, build_client_for_target,
-    build_client_with_proxy, decode_sse_bytes, open_sse,
+    DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,
+    build_client_for_target, build_client_with_proxy, configure_http_idle_timeout, decode_sse_bytes,
+    http_idle_timeout_ms, open_sse,
 };
+pub use utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
+pub use utils::provider_retry::{DEFAULT_MAX_RETRY_DELAY_MS, ProviderRetry};
 pub use stream::{
     AssistantMessageEventSink, AssistantMessageEventStream, CacheRetention, OnPayload,
     OnResponseHook, ProviderResponse, StreamEvent, StreamOptions, ToolChoice, Transport,

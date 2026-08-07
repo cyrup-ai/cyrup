@@ -28,6 +28,7 @@ use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
+use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ToolCall, ToolCallId, Usage,
@@ -121,10 +122,14 @@ impl ApiImpl for MistralConversationsApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -139,7 +144,16 @@ impl ApiImpl for MistralConversationsApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -669,6 +683,7 @@ enum CurrentKind {
 
 /// Streaming-decode state (mirrors Pi's `output` accumulation + `consumeChatStream`,
 /// mistral-conversations.ts:295-483).
+#[derive(Default)]
 struct Decoder {
     blocks: Vec<Content>,
     /// Tool-call scratch buffers (the `partialArgs` Pi strips before persisting), keyed by block idx.
@@ -678,24 +693,12 @@ struct Decoder {
     current: Option<CurrentKind>,
     usage: Usage,
     response_id: Option<String>,
-    stop_reason: StopReason,
+    /// The settled stop reason, or `None` while none has been delivered — cyrup's spelling of Pi's
+    /// `output.stopReason = "pending"` seed (mistral-conversations.ts:153), which is where the
+    /// derived `Default` now starts. It previously seeded `Stop`, so a Mistral stream that ended
+    /// without a truthy `finishReason` was transcribed as a cleanly completed turn (PROV-010).
+    stop_reason: Option<StopReason>,
     error_message: Option<String>,
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            tool_partial_args: HashMap::new(),
-            tool_blocks_by_key: HashMap::new(),
-            current: None,
-            usage: Usage::default(),
-            response_id: None,
-            // Pi seeds `output.stopReason = "stop"` (mistral-conversations.ts:148).
-            stop_reason: StopReason::Stop,
-            error_message: None,
-        }
-    }
 }
 
 impl Decoder {
@@ -711,7 +714,10 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason,
+            // In-flight snapshots report `Stop` (cyrup has no `pending` variant — see
+            // `cyrup_core::StopReason`). The TERMINAL event never takes this path: it goes through
+            // `StreamEvent::end_of_stream`, which routes a `None` stop reason to `error`.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }
@@ -801,7 +807,10 @@ where
         return;
     }
 
-    if dec.stop_reason == StopReason::Aborted || dec.stop_reason == StopReason::Error {
+    if matches!(
+        dec.stop_reason,
+        Some(StopReason::Aborted) | Some(StopReason::Error)
+    ) {
         emit_error(
             &dec,
             model,
@@ -815,8 +824,14 @@ where
         return;
     }
 
-    let message = dec.snapshot(model, api);
-    sink.send(StreamEvent::terminal(message)).await;
+    // No chunk carried a truthy `finishReason` → TRUNCATED. Pi throws
+    // "Mistral stream ended without a finish reason" (mistral-conversations.ts:88-90).
+    sink.send(StreamEvent::end_of_stream(
+        dec.snapshot(model, api),
+        dec.stop_reason,
+        "Mistral stream ended without a finish reason",
+    ))
+    .await;
 }
 
 /// Process one decoded `CompletionChunk`. Returns `false` if the consumer dropped the stream.
@@ -843,14 +858,17 @@ async fn process_chunk(
         None => return true,
     };
 
-    if let Some(reason) = choice.get("finishReason").and_then(Value::as_str) {
-        dec.stop_reason = map_chat_stop_reason(Some(reason));
-    } else if choice
+    // Pi guards with `if (choice.finishReason)` (mistral-conversations.ts:355) — a JS TRUTHINESS
+    // test, so `null`, `undefined` and `""` all leave `output.stopReason` at its `"pending"` seed
+    // and end the stream as truncated. The previous `else if is_null → map(None)` branch settled
+    // such a stream on a clean `Stop`, which is the PROV-010 defect in its second form: a Mistral
+    // stream whose final chunk carries `"finishReason": null` was transcribed as a completed turn.
+    if let Some(reason) = choice
         .get("finishReason")
-        .map(Value::is_null)
-        .unwrap_or(false)
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
     {
-        dec.stop_reason = map_chat_stop_reason(None);
+        dec.stop_reason = Some(map_chat_stop_reason(Some(reason)));
     }
 
     let delta = match choice.get("delta") {
@@ -1196,7 +1214,19 @@ fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
 }
 
 /// Map a Mistral `finishReason` to a cyrup [`StopReason`] (Pi `mapChatStopReason`,
-/// mistral-conversations.ts:649-664).
+/// mistral-conversations.ts:662-677).
+///
+/// The `Option` mirrors Pi's `reason: string | null` signature; the `None` arm is unreachable from
+/// the streaming decoder, because Pi guards the call with the truthiness test
+/// `if (choice.finishReason)` (`:355`) and cyrup matches that — a null/empty `finishReason` leaves
+/// the turn unsettled rather than mapping it to `Stop`.
+///
+/// **Known divergence (separate defect, not PROV-010):** Pi's `default` arm returns
+/// `{ stopReason: "error", errorMessage: "Provider stopped with: {reason}" }` and its `"error"` arm
+/// returns `{ stopReason: "error", errorMessage: "Provider stopped with: error" }` (`:673-675`).
+/// cyrup maps an UNKNOWN reason to `Stop` and carries no `errorMessage`, so an unrecognized Mistral
+/// finish reason is silently transcribed as a clean turn. Fixing that needs its own change (the
+/// return type has to carry the message) and its own test.
 fn map_chat_stop_reason(reason: Option<&str>) -> StopReason {
     match reason {
         None | Some("stop") => StopReason::Stop,

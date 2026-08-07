@@ -29,6 +29,7 @@ use crate::usage::apply_cost;
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::parse_streaming_json_object;
+use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     TextPhase, TextSignatureV1, ToolCall, ToolCallId, Usage,
@@ -175,10 +176,14 @@ impl ApiImpl for OpenAiResponsesApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -193,7 +198,16 @@ impl ApiImpl for OpenAiResponsesApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -972,20 +986,16 @@ where
         }
     }
 
-    if !dec.saw_terminal {
-        emit_error(
-            &dec,
-            model,
-            api,
-            sink,
-            "OpenAI Responses stream ended before a terminal response event".to_string(),
-        )
-        .await;
-        return;
-    }
-
-    let message = dec.snapshot(model, api);
-    sink.send(StreamEvent::terminal(message)).await;
+    // `saw_terminal` is this decoder's spelling of "the provider delivered a stop reason": only a
+    // terminal `response.*` event sets `dec.stop_reason`, so without one the seeded `Stop` is a
+    // guess. Routed through the same `end_of_stream` seam as the other four wire APIs so the
+    // truncated-stream rule lives in exactly one place (Pi openai-responses.ts:170-172).
+    sink.send(StreamEvent::end_of_stream(
+        dec.snapshot(model, api),
+        dec.saw_terminal.then_some(dec.stop_reason),
+        "OpenAI Responses stream ended before a terminal response event",
+    ))
+    .await;
 }
 
 enum ProcessResult {

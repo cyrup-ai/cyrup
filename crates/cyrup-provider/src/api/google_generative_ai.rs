@@ -27,6 +27,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::json_parse::parse_json_with_repair;
+use crate::utils::provider_retry::ProviderRetry;
 use crate::utils::simple_options::ThinkingBudgets;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
@@ -119,10 +120,14 @@ impl ApiImpl for GoogleGenerativeAiApi {
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
         // node-http-proxy.ts:92-112).
+        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
+        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
+        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
         let client = match build_client_for_target(
             &req.url,
             &crate::auth::types::EnvAuthContext,
             auth.env.as_ref(),
+            opts.timeout_ms,
         )
         .await
         {
@@ -137,7 +142,16 @@ impl ApiImpl for GoogleGenerativeAiApi {
         // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(&client, req, cancel, None, on_resp).await {
+        let frames = match open_sse(
+            &client,
+            req,
+            cancel,
+            None,
+            on_resp,
+            ProviderRetry::from_options(opts),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
@@ -838,27 +852,20 @@ enum CurrentKind {
 }
 
 /// Streaming-decode state (mirrors Pi's `output` accumulation, google-generative-ai.ts:57-264).
+#[derive(Default)]
 struct Decoder {
     blocks: Vec<Content>,
     current: Option<CurrentKind>,
     usage: Usage,
     response_id: Option<String>,
-    stop_reason: StopReason,
+    /// The settled stop reason, or `None` while none has been delivered — cyrup's spelling of Pi's
+    /// `output.stopReason = "pending"` seed (google-generative-ai.ts:73), which is where the
+    /// `Default` below now starts. Gemini only sets this from a candidate's `finishReason`, so
+    /// `None` at EOF means the stream was TRUNCATED. It previously seeded `Stop` (on a misreading of
+    /// upstream, which seeds `"pending"`, not `"stop"`), which is what let a truncated Gemini stream
+    /// be transcribed as a cleanly completed turn (PROV-010).
+    stop_reason: Option<StopReason>,
     error_message: Option<String>,
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            current: None,
-            usage: Usage::default(),
-            response_id: None,
-            // Pi seeds `output.stopReason = "stop"` (google-generative-ai.ts:71).
-            stop_reason: StopReason::Stop,
-            error_message: None,
-        }
-    }
 }
 
 impl Decoder {
@@ -877,7 +884,11 @@ impl Decoder {
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,
-            stop_reason: self.stop_reason,
+            // Pi's live `partial` carries the raw `output.stopReason`, i.e. `"pending"` until a
+            // `finishReason` lands. cyrup has no `pending` variant (see `cyrup_core::StopReason`),
+            // so an in-flight snapshot reports `Stop`; the TERMINAL event never takes this path —
+            // it goes through `StreamEvent::end_of_stream`, which routes `None` to `error`.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Stop),
             error_message: self.error_message.clone(),
             timestamp: now_millis(),
         }
@@ -941,7 +952,10 @@ where
         return;
     }
 
-    if dec.stop_reason == StopReason::Aborted || dec.stop_reason == StopReason::Error {
+    if matches!(
+        dec.stop_reason,
+        Some(StopReason::Aborted) | Some(StopReason::Error)
+    ) {
         emit_error(
             &dec,
             model,
@@ -955,8 +969,15 @@ where
         return;
     }
 
-    let message = dec.snapshot(model, api);
-    sink.send(StreamEvent::terminal(message)).await;
+    // No candidate ever carried a `finishReason` → the stream was TRUNCATED. Pi throws
+    // "Google stream ended without a finish reason" (google-generative-ai.ts:266-268); this used to
+    // fall through to the `Stop` seed and report a clean turn.
+    sink.send(StreamEvent::end_of_stream(
+        dec.snapshot(model, api),
+        dec.stop_reason,
+        "Google stream ended without a finish reason",
+    ))
+    .await;
 }
 
 /// Process one decoded `GenerateContentResponse` chunk. Returns `false` if the consumer dropped.
@@ -999,9 +1020,9 @@ async fn process_chunk(
         .and_then(|c| c.get("finishReason"))
         .and_then(Value::as_str)
     {
-        dec.stop_reason = map_stop_reason(reason);
+        dec.stop_reason = Some(map_stop_reason(reason));
         if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_))) {
-            dec.stop_reason = StopReason::ToolUse;
+            dec.stop_reason = Some(StopReason::ToolUse);
         }
     }
 

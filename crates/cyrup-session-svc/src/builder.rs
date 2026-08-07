@@ -1137,10 +1137,35 @@ impl SessionBuilder {
         {
             agent_builder = agent_builder.provider_env(overlay);
         }
-        if let Ok(timeout_ms) = eff.http_idle_timeout_ms()
-            && timeout_ms > 0
-        {
+        // PROV-006. Pi's `configureHttpDispatcher(getHttpIdleTimeoutMs())` installs a PROCESS-GLOBAL
+        // dispatcher (main.ts:802, interactive-mode.ts:1778) that bounds every outbound HTTP request
+        // — provider streams, catalog refreshes, everything — so the equivalent global is installed
+        // here, not just threaded onto this agent's requests.
+        //
+        // `0` is passed through rather than skipped: `httpIdleTimeoutMs: 0` / `"disabled"` means the
+        // user turned the timeout OFF, and dropping the call would silently leave the previous value
+        // (or the 5-minute default) in place. The old `timeout_ms > 0` guard did exactly that.
+        if let Ok(timeout_ms) = eff.http_idle_timeout_ms() {
+            cyrup_provider::configure_http_idle_timeout(timeout_ms);
             agent_builder = agent_builder.timeout_ms(timeout_ms);
+        }
+
+        // `settings.retry.provider.*` — Pi's `getProviderRetrySettings()`, applied in `sdk.ts`'s
+        // `streamFn` as `options?.X ?? providerRetrySettings.X` (sdk.ts:303-317). `timeoutMs` wins
+        // over `httpIdleTimeoutMs` when set, which is why it is applied after the block above.
+        // Negative values (JSON has no unsigned type) are treated as unset rather than clamped to 0,
+        // since `0` is a meaningful "disabled" for the timeout and "no retries" for the budget.
+        {
+            let retry = eff.provider_retry_settings();
+            if let Some(timeout_ms) = retry.timeout_ms.filter(|ms| *ms >= 0) {
+                agent_builder = agent_builder.timeout_ms(timeout_ms as u64);
+            }
+            if let Some(max_retries) = retry.max_retries.filter(|n| *n >= 0) {
+                agent_builder = agent_builder.max_retries(max_retries as u32);
+            }
+            if retry.max_retry_delay_ms >= 0 {
+                agent_builder = agent_builder.max_retry_delay_ms(retry.max_retry_delay_ms as u64);
+            }
         }
 
         // gap-08 #2/#3: install the provider transport extension seams. `on_payload` routes the

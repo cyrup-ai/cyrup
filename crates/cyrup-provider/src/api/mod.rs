@@ -24,6 +24,11 @@ pub mod mistral_conversations;
 pub mod openai_completions;
 pub mod openai_responses;
 
+/// Cross-converter regression suite: a truncated stream must never be reported as a completed turn
+/// (PROV-010 / AGENT-014 / DRIFT-012). Lives beside the decoders so it can drive all five directly.
+#[cfg(test)]
+mod truncation_parity;
+
 /// Producer side of the provider stream channel. `ApiImpl::run` pushes the EXISTING
 /// `cyrup_provider::StreamEvent` here; the receiver is wrapped as the returned `EventStream`.
 #[derive(Clone)]

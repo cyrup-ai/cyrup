@@ -44,8 +44,19 @@ pub struct GenerationConfig {
     /// `applyHttpProxySettings`, main.ts:744). Empty/absent ⇒ the ambient process env is used.
     pub env: Option<cyrup_provider::ProviderEnv>,
     /// HTTP request idle timeout (ms) forwarded into `cyrup_provider::StreamOptions.timeout_ms` (Pi
-    /// `StreamOptions.timeoutMs` / `configureHttpDispatcher`, main.ts:745). Providers/SDKs that
-    /// support a request timeout honor it; others ignore it. `None`/`0` ⇒ no client-side cap.
+    /// `StreamOptions.timeoutMs` / `configureHttpDispatcher`, main.ts:745).
+    ///
+    /// Bounds the wait for the response head and, once streaming, the gap between body frames — it
+    /// is NOT a deadline on the whole generation. `None` inherits the process-global default that
+    /// `cyrup_provider::configure_http_idle_timeout` installs (Pi's global undici dispatcher, 5
+    /// minutes); `Some(0)` disables the timeout entirely, matching `httpIdleTimeoutMs: 0` /
+    /// `"disabled"` upstream.
+    ///
+    /// This previously claimed the value applied only to "providers that support it" and that
+    /// `None`/`0` meant "no cap". Both were wrong about Pi *and* about cyrup: Pi's
+    /// `configureHttpDispatcher` is called unconditionally at startup (`cli.ts:18`, `main.ts:538`)
+    /// and bounds every provider connection at 5 minutes by default, and cyrup now does the same
+    /// for every wire API — the value is honored by the shared SSE transport, not per provider.
     pub timeout_ms: Option<u64>,
 }
 

@@ -456,8 +456,19 @@ async fn run_proxy(
     };
 
     // `open_sse` maps a non-2xx response / transport failure / connect-time cancel to a typed error
-    // (Pi throws on `!response.ok`, proxy.ts:166-177).
-    let mut frames = match open_sse(&client, req, cancel.clone(), None, None).await {
+    // (Pi throws on `!response.ok`, proxy.ts:166-177). No request-level retry: Pi's `proxy.ts` calls
+    // `fetch` directly, outside `retryProviderRequest`, and relies on the global dispatcher's idle
+    // timeout — which `build_client` above carries — to bound a stalled proxy.
+    let mut frames = match open_sse(
+        &client,
+        req,
+        cancel.clone(),
+        None,
+        None,
+        cyrup_provider::ProviderRetry::NONE,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
