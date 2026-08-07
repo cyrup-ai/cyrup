@@ -649,6 +649,14 @@ impl SessionBuilder {
         // values are "resolved when each command starts" (docs/environment-variables.md:27), so this
         // is a shared HANDLE the session mutates on `set_model` / `set_thinking_level`, never a
         // snapshot baked into the tool.
+        // `read`'s non-vision-model warning (pi `tools/read.ts`): the handle is seeded from the
+        // RESOLVED model's declared input modalities and re-pushed on every `/model` switch, exactly
+        // as `bash_session_env` carries provider/model. Without this the tool's
+        // `ReadOpts::model_vision` stayed `None` and `supports_images_now()` fell back to `true`,
+        // so the warning was unreachable and an image handed to a text-only model produced a
+        // provider error instead of the tool's own diagnostic.
+        let read_model_vision =
+            cyrup_tools::config::ModelVisionHandle::new(resolved_model.supports_image_input());
         let bash_session_env = cyrup_tools::config::SessionEnvHandle::new(
             cyrup_tools::config::SessionEnvInfo {
                 session_id: Some(session_id.to_string()),
@@ -664,6 +672,10 @@ impl SessionBuilder {
             cwd.clone(),
             backend,
             ToolsOptions {
+                read: cyrup_tools::config::ReadOpts {
+                    model_vision: Some(read_model_vision.clone()),
+                    ..cyrup_tools::config::ReadOpts::default()
+                },
                 bash: BashOpts {
                     command_prefix: shell_command_prefix_setting.clone(),
                     shell_path: shell_path_setting.clone(),
@@ -1319,6 +1331,7 @@ impl SessionBuilder {
             dynamic_tools,
             handle,
             bash_session_env,
+            read_model_vision,
         };
 
         let services = AgentSessionServices {

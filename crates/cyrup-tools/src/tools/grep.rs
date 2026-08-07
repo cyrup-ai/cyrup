@@ -4,7 +4,7 @@
 
 use crate::config::GrepOpts;
 use crate::ops::{FsOps, WalkOpts};
-use crate::tools::globmatch::{to_posix, PatternMatcher};
+use crate::tools::globmatch::{to_posix, RgGlob};
 use crate::truncate::{format_size, truncate_head, truncate_line, GREP_MAX_LINE_LENGTH, TruncOpts};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
@@ -134,8 +134,13 @@ impl Tool for GrepTool {
         // default.
         let limit = input.limit.map_or(self.opts.limit, crate::jsnum::to_count).max(1);
 
+        // Pi hands `glob` to ripgrep verbatim (grep.ts:218), so it parses as ONE gitignore-style
+        // override line — anchored when it contains a `/`, basename-matched when it does not. That
+        // is the opposite of the `**/`-prefix rule fd needs, which `find` uses
+        // (find.ts:243-252 / [`PatternMatcher`]); wiring `grep` through fd's rule un-anchored every
+        // path glob, so `glob: "src/**/*.ts"` also matched `vendor/src/a.ts`.
         let glob = match input.glob.as_deref() {
-            Some(g) => Some(PatternMatcher::build(g)?),
+            Some(g) => RgGlob::build(g)?,
             None => None,
         };
 
@@ -163,12 +168,18 @@ impl Tool for GrepTool {
                             Some(Ok(w)) if !w.is_dir => {
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
-                                let basename = w.path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| rel.clone());
+                                // The glob is matched against the path relative to the OVERRIDE
+                                // ROOT, which for ripgrep is its own cwd — Pi spawns `rg` with no
+                                // `cwd` option and passes `searchPath` positionally, so a `path`
+                                // argument narrows the walk but does NOT re-anchor the glob
+                                // (ignore-0.4.33 gitignore.rs:286-315 `strip`). A candidate outside
+                                // the root keeps its full path, as `strip` leaves it.
+                                let glob_rel = w
+                                    .path
+                                    .strip_prefix(&self.cwd)
+                                    .map_or_else(|_| to_posix(&w.path), to_posix);
                                 if let Some(g) = &glob
-                                    && !g.is_match(&rel, &basename) {
+                                    && !g.keeps_file(&glob_rel) {
                                         continue;
                                     }
                                 files.push((w.path, rel));
@@ -456,5 +467,91 @@ mod tests {
             _ => String::new(),
         };
         assert_eq!(text, "a.txt:2: NEEDLE");
+    }
+
+    async fn grep_text(cwd: &Path, args: serde_json::Value) -> String {
+        let grep = GrepTool::new(Arc::new(LocalFs), cwd.to_path_buf(), GrepOpts::default());
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                args,
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await
+            .unwrap();
+        match r.content.first() {
+            Some(Content::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// `glob` goes to ripgrep verbatim (grep.ts:218), so a pattern containing `/` is ANCHORED at
+    /// the override root (ignore-0.4.33 gitignore.rs:513-522 prefixes `**/` only when the pattern
+    /// has no `/`). `grep` used to compile the pattern with fd's opposite rule — the one `find`
+    /// needs (find.ts:243-252) — which un-anchored it, so `src/**/*.ts` also matched
+    /// `vendor/src/*.ts` and those extra hits crowd out real ones against the 100-match cap.
+    #[tokio::test]
+    async fn path_glob_is_anchored_at_the_override_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("vendor/src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
+
+        let text =
+            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "src/**/*.ts" })).await;
+        assert_eq!(text, "src/a.ts:1: NEEDLE");
+    }
+
+    /// gitignore.rs:492-498 strips a leading `/` and anchors on it. Passing it through to globset
+    /// untouched matched it against a root-relative path that never starts with `/`, so the whole
+    /// query silently returned "No matches found".
+    #[tokio::test]
+    async fn leading_slash_glob_anchors_instead_of_matching_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("vendor/src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
+
+        let text =
+            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "/src/*.ts" })).await;
+        assert_eq!(text, "src/a.ts:1: NEEDLE");
+    }
+
+    /// A `path` argument narrows the walk but does NOT re-anchor the glob: Pi spawns `rg` with no
+    /// `cwd` option, so ripgrep's override root stays the agent's cwd and the glob is matched
+    /// against the cwd-relative path (gitignore.rs:286-315 `strip`). Output paths remain relative
+    /// to the search root, as `rg` prints what it was given.
+    #[tokio::test]
+    async fn glob_is_matched_against_the_cwd_relative_path_not_the_search_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
+
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "path": "src", "glob": "src/*.ts" }),
+        )
+        .await;
+        assert_eq!(text, "a.ts:1: NEEDLE");
+    }
+
+    /// A bare pattern (no `/`) is basename-matched at any depth in BOTH rules — the schema's own
+    /// first example (`'*.ts'`, grep.rs description) must keep working.
+    #[tokio::test]
+    async fn bare_glob_still_matches_basenames_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src/deep")).unwrap();
+        std::fs::write(cwd.join("src/deep/a.ts"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("b.js"), "NEEDLE\n").unwrap();
+
+        let text = grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "*.ts" })).await;
+        assert_eq!(text, "src/deep/a.ts:1: NEEDLE");
     }
 }

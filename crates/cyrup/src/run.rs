@@ -17,6 +17,8 @@ use crate::input::Inputs;
 /// writing only the *final* transcript message to `out` (Pi print-mode.ts:129-146); a failed/aborted
 /// final turn routes its error to stderr with no assistant stdout. Returns the process exit code
 /// derived from the terminal stop reason (R-11-005, arch-11 §6.6).
+///
+/// A prompt-less run is legal and submits nothing at all — see [`turn_inputs`].
 pub async fn run_print_dispatch<W: Write>(
     runtime: &AgentSessionRuntime,
     inputs: &Inputs,
@@ -27,8 +29,7 @@ pub async fn run_print_dispatch<W: Write>(
     // loop at :121. `main.rs` therefore builds this runtime with
     // `AgentSessionRuntime::create_unannounced` and applies `--name`/`--models` in between
     // (SEAM-033); see [`announce_session_start`].
-    let messages =
-        std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    let messages = turn_inputs(inputs);
     let mut err = std::io::stderr();
     let ran = run_print(runtime, messages, out, &mut err, PrintOptions::default()).await;
     let code = exit_code(&*runtime.session().await).await;
@@ -53,8 +54,7 @@ pub async fn run_json_dispatch<W: Write>(
 ) -> anyhow::Result<i32> {
     // Same startup bind as PRINT, done by `run_json` itself — but AFTER the JSONL header, which is
     // exactly pi's order (header at print-mode.ts:112-118, `await rebindSession()` at :119).
-    let messages =
-        std::iter::once(initial_input(inputs)).chain(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    let messages = turn_inputs(inputs);
     let ran = run_json(runtime, messages, out).await;
     // Same `finally { await disposeRuntime() }` as PRINT (print-mode.ts:152-157 serves both modes).
     runtime.dispose().await;
@@ -140,6 +140,32 @@ pub async fn exit_code(session: &AgentSession) -> i32 {
 /// Wrap one-shot text as a CLI-sourced [`UserInput`].
 fn cli_input(text: &str) -> UserInput {
     UserInput::text(text.to_string(), InputSource::Cli)
+}
+
+/// The ordered turn a one-shot run submits: the initial submission **when there is one**, then each
+/// CLI follow-up (Pi `if (initialMessage) { await session.prompt(…) }` followed by
+/// `for (const message of messages) { … }`, print-mode.ts:121-127).
+///
+/// The `if (initialMessage)` guard is the whole point: `buildInitialMessage` returns
+/// `initialMessage: undefined` when there is no stdin, no `@file` and no message
+/// (initial-message.ts:36-42), and nothing upstream treats that as fatal — pi skips BOTH loops and
+/// falls straight through to the terminal output block (print-mode.ts:129-146), printing the last
+/// assistant message of the resumed transcript and returning the `exitCode = 0` it initialised at
+/// :34. `cyrup -c -p` (continue a session and print its last response) is that idiom. cyrup used to
+/// reject a prompt-less one-shot run outright, via a `main.rs::ensure_prompt` bail that carried no
+/// upstream citation, so the exit code inverted (0 ⇒ 1) and JSON mode never even emitted the session
+/// header pi writes before `rebindSession()` (print-mode.ts:112-118).
+///
+/// Emptiness is [`Inputs::is_empty`], i.e. no text **and** no images: an image-only run still
+/// submits its initial input (pi's `if (initialMessage)` would drop the images with it, since
+/// `initialImages` rides along on that same call — a quirk not worth porting).
+fn turn_inputs(inputs: &Inputs) -> Vec<UserInput> {
+    let mut turn: Vec<UserInput> = Vec::new();
+    if !inputs.is_empty() {
+        turn.push(initial_input(inputs));
+    }
+    turn.extend(inputs.follow_ups.iter().map(|f| cli_input(f)));
+    turn
 }
 
 /// The initial submission: the assembled text plus any image `@file` attachments (Pi

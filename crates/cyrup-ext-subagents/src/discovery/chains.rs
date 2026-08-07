@@ -1389,6 +1389,16 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
                 _ => OnEmpty::Skip,
             },
             collect_schema: collect.get("outputSchema").cloned(),
+            // SUBA-C14: the GROUP-level `acceptance` gate, carried RAW exactly as the single-step
+            // arm below carries its own (SUBA-N04). `acceptance` is a legal dynamic-step key
+            // upstream (`dynamic-fanout.ts:45` `DYNAMIC_STEP_KEYS`, mirrored by this file's own
+            // `DYNAMIC_STEP_KEYS`) and `chain-execution.ts:1034-1055` evaluates it against the
+            // aggregate child report once the group settles, failing the whole chain on rejection.
+            // Dropping it here — as this arm did before — left a validator-accepted gate inert.
+            acceptance: step
+                .acceptance
+                .clone()
+                .filter(|value| !value.is_null()),
         });
     }
 

@@ -288,6 +288,9 @@ pub(crate) struct SessionExtras {
     /// the NEXT command sees the new values without a rebuild
     /// (Pi docs/environment-variables.md:27).
     pub bash_session_env: cyrup_tools::config::SessionEnvHandle,
+    /// `read`'s view of whether the ACTIVE model accepts image input, re-pushed on every `/model`
+    /// switch so the tool's non-vision warning tracks the live model rather than the startup one.
+    pub read_model_vision: cyrup_tools::config::ModelVisionHandle,
 }
 
 /// A settable, weak self-reference so the persist+fan-out subscriber (which the agent owns) and the
@@ -412,6 +415,7 @@ pub struct AgentSession {
     /// therefore affects the next bash command" (docs/environment-variables.md:27) true of cyrup
     /// too, rather than only of the tool in isolation.
     bash_session_env: cyrup_tools::config::SessionEnvHandle,
+    read_model_vision: cyrup_tools::config::ModelVisionHandle,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
     /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
@@ -516,6 +520,7 @@ impl AgentSession {
             bash_cancel: Mutex::new(None),
             pending_bash: Mutex::new(Vec::new()),
             bash_session_env: extras.bash_session_env,
+            read_model_vision: extras.read_model_vision,
             dynamic_tools: extras.dynamic_tools,
             handle: extras.handle,
             last_assistant: Mutex::new(None),
@@ -3256,6 +3261,15 @@ impl AgentSession {
         self.manager.lock().await.leaf_id().cloned()
     }
 
+    /// The handle the `read` tool reads to decide whether the ACTIVE model accepts image input
+    /// (pi `tools/read.ts`'s non-vision warning). Seeded from the resolved model at build and
+    /// re-pushed by `apply_model_change`, so the warning tracks `/model` switches rather than the
+    /// startup model.
+    #[must_use]
+    pub fn read_model_vision(&self) -> &cyrup_tools::config::ModelVisionHandle {
+        &self.read_model_vision
+    }
+
     /// The agent's current in-memory transcript (includes the streaming partial).
     pub async fn agent_messages(&self) -> Vec<cyrup_agent::AgentMessage> {
         self.agent.snapshot().await.messages
@@ -3677,6 +3691,10 @@ impl AgentSession {
         // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
         // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
         self.bash_session_env.set_model(next.provider.to_string(), next.id.to_string());
+        // ...and re-push the new model's image capability for the same reason: `read`'s
+        // non-vision warning must describe the model the NEXT read will actually run against,
+        // not the one resolved at startup.
+        self.read_model_vision.set(next.supports_image_input());
         self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model (explicit override or current session level).
         let level = match explicit_thinking {

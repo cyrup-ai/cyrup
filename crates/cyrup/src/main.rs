@@ -713,8 +713,14 @@ async fn run() -> anyhow::Result<i32> {
             apply_post_build(&session, session_name.as_deref(), &cli, fresh).await;
             timings.print();
             let _signals = spawn_abort_on_signal(session, cancel.clone());
+            // NO prompt-required guard here: Pi has none. `buildInitialMessage` answers
+            // `initialMessage: undefined` for a run with no stdin/`@file`/message
+            // (initial-message.ts:36-42) and `runPrintMode` simply skips its send loops
+            // (print-mode.ts:121-127), falling through to the terminal output block and returning 0.
+            // The `ensure_prompt` bail that used to sit here inverted the exit code of every
+            // prompt-less one-shot invocation — `cyrup -c -p`, `cyrup --session <id> --mode json` —
+            // and suppressed JSON mode's session header entirely. See `run::turn_inputs`.
             let inputs = build_inputs(&cli, &dirs.cwd).await?;
-            ensure_prompt(&inputs)?;
             let mut out = io::stdout();
             let dispatch = if let AppMode::Json = mode {
                 run_json_dispatch(&runtime, &inputs, &mut out).await
@@ -753,7 +759,14 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
         cli.models.clone()
     };
     if !patterns.is_empty() {
-        let scoped = resolve_scoped_models(&session.model_catalog(), &patterns);
+        let catalog = session.model_catalog();
+        // Pi `resolveModelScope` prints EVERY diagnostic its `WithDiagnostics` sibling collected —
+        // `console.warn(chalk.yellow(`Warning: ${diagnostic.message}`))`, model-resolver.ts:355-361 —
+        // before returning the (possibly empty) scope, and does so on the live path at main.ts:741-743
+        // for both `--models` and the `enabledModels` fallback. Without this a typo'd
+        // `--models "anthropc/*"` scoped nothing with no output at all.
+        report_diagnostics(&scope_diagnostics(&catalog, &patterns));
+        let scoped = resolve_scoped_models(&catalog, &patterns);
         if !scoped.is_empty() {
             // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
             // when `--models` scopes the set and `--model` is omitted, the active model is the saved
@@ -835,6 +848,86 @@ fn resolve_scoped_models(
             thinking_level: sm.thinking_level,
         })
         .collect()
+}
+
+/// The scope diagnostics Pi emits alongside the resolved scope (Pi `ModelScopeDiagnostic` /
+/// `resolveModelScopeWithDiagnostics`, model-resolver.ts:259-350), in Pi's order: for each pattern,
+/// the `invalid-thinking-level` warning first (:330-332), then the `no-match` warning when the
+/// pattern selected nothing (:311-318 for the glob arm, :334-341 for the non-glob arm).
+///
+/// `resolve_scope` returns only the matched set, so emptiness *per pattern* is the no-match test —
+/// hence the one-element slice per iteration rather than a bulk call. That keeps the glob/non-glob
+/// split, the `:level` suffix stripping and the `minimatch` semantics in the single ported
+/// implementation instead of duplicating them here; the only cost is that the de-duplication Pi does
+/// across patterns is irrelevant to emptiness anyway (a pattern whose every match was already seen
+/// still matched, and still resolves non-empty on its own).
+///
+/// [CYRUP-DELTA] Pi's glob arm short-circuits on `findExactModelReferenceMatch(globPattern)` before
+/// running `minimatch` (:308-314), so a literal model id that happens to contain `[` or `?` never
+/// reaches the no-match branch. `resolve_scope` has no such short-circuit, so such an id would warn
+/// here where Pi stays silent — no shipped catalog id contains a glob metacharacter, and closing it
+/// belongs in `cyrup-config`'s resolver, not in the bin.
+fn scope_diagnostics(catalog: &[cyrup_provider::Model], patterns: &[String]) -> Vec<Diagnostic> {
+    let resolver = cyrup_config::ModelResolver::new(catalog);
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    for pattern in patterns {
+        // Pi pushes the `invalid-thinking-level` warning BEFORE the no-match check, and only for the
+        // non-glob arm — the glob arm silently ignores an unrecognised `:suffix` and globs the whole
+        // pattern (model-resolver.ts:288-297).
+        if !is_glob_pattern(pattern)
+            && let Some(message) = invalid_thinking_level_message(&resolver, pattern)
+        {
+            diagnostics.push(Diagnostic::warning(message));
+        }
+        if resolver.resolve_scope(std::slice::from_ref(pattern)).is_empty() {
+            diagnostics.push(Diagnostic::warning(format!(
+                "No models match pattern \"{pattern}\""
+            )));
+        }
+    }
+    diagnostics
+}
+
+/// Pi's glob test — a pattern is a glob iff it contains `*`, `?` or `[` (model-resolver.ts:286,
+/// mirrored at `cyrup-config` model.rs:257).
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+/// Pi's `invalid-thinking-level` message at Pi's exact wording — `Invalid thinking level "X" in
+/// pattern "Y". Using default instead.` (`parseModelPattern`, model-resolver.ts:243).
+///
+/// `cyrup-config`'s [`cyrup_config::ModelResolver::parse_pattern`] detects the identical condition
+/// but abbreviates the text to `invalid thinking level '<suffix>'` and drops the pattern (model.rs:
+/// 205-212), because on the `--model` path that string is only ever appended to a caller-composed
+/// sentence. So this replays `parseModelPattern`'s colon-stripping recursion (model-resolver.ts:
+/// 196-246) to recover WHICH recursion level produced it, and formats Pi's sentence there:
+///
+/// * a valid `:level` suffix recurses on the prefix and *propagates* the inner warning (:218-226);
+/// * an invalid suffix warns at THIS level and *overwrites* any inner warning, but only when the
+///   prefix itself resolves to a model (:237-245) — otherwise the inner (model-less, warning-less)
+///   result is returned verbatim.
+///
+/// Gated on the resolver reporting a warning at all, so a pattern that simply does not match
+/// produces nothing here and falls through to the `no-match` diagnostic.
+fn invalid_thinking_level_message(
+    resolver: &cyrup_config::ModelResolver<'_>,
+    pattern: &str,
+) -> Option<String> {
+    resolver.parse_pattern(pattern, false).warning?;
+    // A warning implies the pattern did NOT match outright (an exact/partial hit returns early with
+    // `warning: None`, model-resolver.ts:200-204), so a colon split did happen.
+    let idx = pattern.rfind(':')?;
+    let (prefix, rest) = pattern.split_at(idx);
+    let suffix = rest.get(1..).unwrap_or("");
+    if cyrup_config::parse_thinking_level(suffix).is_some() {
+        // Valid level — the warning came from deeper in the recursion (:218-226).
+        return invalid_thinking_level_message(resolver, prefix);
+    }
+    // Invalid suffix — Pi warns HERE iff the prefix resolves (:237-245).
+    resolver.parse_pattern(prefix, false).model.map(|_| {
+        format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead.")
+    })
 }
 
 /// Resolve the session target with Pi's full non-interactive depth (Pi `createSessionManager`,
@@ -1297,16 +1390,6 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
     Ok(0)
 }
 
-/// Require a non-empty prompt for the one-shot modes (a message, an `@file`, or piped stdin).
-fn ensure_prompt(inputs: &Inputs) -> anyhow::Result<()> {
-    if inputs.is_empty() {
-        anyhow::bail!(
-            "no prompt provided: pass a message, an @file reference, or pipe text on stdin"
-        );
-    }
-    Ok(())
-}
-
 /// The terminal-query drain window for the startup benchmark (Pi `setTimeout(resolve, 150)`,
 /// main.ts:826): the brief pause that lets the TUI's stdin handler consume the terminal's query
 /// replies (Kitty keyboard protocol, device attributes, cell size) before the terminal is restored.
@@ -1711,9 +1794,61 @@ fn init_tracing(verbose: bool) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        ScopedModel, SessionTarget, format_token_count, fuzzy_match, is_fresh_target,
-        pick_scoped_active_model, resolve_scoped_models,
+        DiagnosticLevel, ScopedModel, SessionTarget, format_token_count, fuzzy_match,
+        is_fresh_target, pick_scoped_active_model, resolve_scoped_models, scope_diagnostics,
     };
+
+    /// The `--models`/`enabledModels` scope must report Pi's diagnostics, not resolve in silence
+    /// (Pi `resolveModelScopeWithDiagnostics` → `resolveModelScope`, model-resolver.ts:270-361;
+    /// live path main.ts:741-743). Before the fix `resolve_scope` returned only the matched set and
+    /// `apply_post_build` dropped everything else on the floor, so a typo'd pattern was a silent
+    /// no-op.
+    #[test]
+    fn scope_diagnostics_report_no_match_and_invalid_thinking_level_like_pi() {
+        let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
+
+        // A pattern that matches nothing warns, in BOTH arms — the glob arm
+        // (model-resolver.ts:311-318) and the non-glob arm (:334-341).
+        for pattern in ["anthropc/*", "no-such-model-anywhere"] {
+            let diags = scope_diagnostics(&catalog, &[pattern.to_string()]);
+            assert_eq!(diags.len(), 1, "{pattern}: {diags:?}");
+            let only = diags.first().expect("one diagnostic");
+            assert_eq!(only.level, DiagnosticLevel::Warning);
+            assert_eq!(only.message, format!("No models match pattern \"{pattern}\""));
+        }
+
+        // A pattern that DOES match is silent.
+        assert!(
+            scope_diagnostics(&catalog, &["anthropic/*".to_string()]).is_empty(),
+            "a matching pattern emits no diagnostic"
+        );
+
+        // An invalid `:level` suffix on a resolving pattern warns with Pi's exact sentence
+        // (`parseModelPattern`, model-resolver.ts:243) and does NOT also warn no-match — the model
+        // still resolves, at the default thinking level.
+        let diags = scope_diagnostics(&catalog, &["claude-opus-4-8:hihg".to_string()]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(
+            diags.first().expect("one diagnostic").message,
+            "Invalid thinking level \"hihg\" in pattern \"claude-opus-4-8:hihg\". Using default instead."
+        );
+
+        // A VALID `:level` is not a diagnostic at all.
+        assert!(
+            scope_diagnostics(&catalog, &["claude-opus-4-8:high".to_string()]).is_empty(),
+            "a valid thinking level is silent"
+        );
+
+        // Both warnings can ride on one pattern list, in pattern order.
+        let diags = scope_diagnostics(
+            &catalog,
+            &["claude-opus-4-8:hihg".to_string(), "anthropc/*".to_string()],
+        );
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.first().is_some_and(|m| m.starts_with("Invalid thinking level")));
+        assert!(messages.get(1).is_some_and(|m| m.starts_with("No models match pattern")));
+    }
 
     /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s
     /// `minimatch`-faithful `ModelResolver::resolve_scope`, NOT the removed bespoke `*`-only matcher

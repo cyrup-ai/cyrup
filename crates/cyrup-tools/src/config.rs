@@ -105,14 +105,60 @@ impl SessionEnvHandle {
 /// Hook to adjust command, cwd, or env before execution (Pi `BashSpawnHook`, bash.ts:139).
 pub type BashSpawnHook = Arc<dyn Fn(BashSpawnContext) -> BashSpawnContext + Send + Sync>;
 
+/// A shared, mutable handle to "can the model that is active RIGHT NOW consume images?".
+///
+/// Pi answers that question per call, off the `ExtensionContext` it threads into every tool:
+/// `getNonVisionImageNote(ctx?.model)` (read.ts:246) over `model.input.includes("image")`
+/// (read.ts:87-92). A mid-session `/model` switch therefore changes the very next `read`.
+/// cyrup's `Tool::execute` has no context argument — the same gap [`SessionEnvHandle`] closes for
+/// `bash` — so the session layer hands `read` this handle at build time and updates it in place on
+/// every `set_model`, instead of baking a snapshot into [`ReadOpts::supports_images`].
+///
+/// The flag is deliberately a plain `bool` and not a modality set: `cyrup-tools` does not depend on
+/// `cyrup-provider`, so the caller is the one that evaluates `model.input.contains(&Modality::Image)`.
+#[derive(Clone, Debug)]
+pub struct ModelVisionHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl ModelVisionHandle {
+    pub fn new(supports_images: bool) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(supports_images)))
+    }
+
+    /// Read the capability of the currently-selected model.
+    pub fn get(&self) -> bool {
+        // `Relaxed` is sufficient: this flag carries no happens-before relationship with any other
+        // state — a `read` racing an in-flight `/model` switch may legitimately see either model.
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Push the capability of a newly-selected model (Pi's `ctx.model` changing under the tool).
+    pub fn set(&self, supports_images: bool) {
+        self.0.store(supports_images, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     pub max_lines: usize,
     pub max_bytes: usize,
-    /// Whether the active model can consume images (R-03-012 non-vision fallback).
+    /// Static fallback for whether the model can consume images (R-03-012 non-vision fallback).
+    /// Consulted ONLY when `model_vision` is `None` — i.e. by embedders and tests that never wire a
+    /// session layer. Prefer [`ReadOpts::supports_images_now`] over reading this field directly.
     pub supports_images: bool,
+    /// The LIVE capability of the active model, read at execute time; overrides `supports_images`
+    /// whenever it is set. `None` (no session layer wired) keeps the static fallback, mirroring how
+    /// [`BashOpts::session_env`] treats Pi's `ctx === undefined`. See [`ModelVisionHandle`].
+    pub model_vision: Option<ModelVisionHandle>,
     /// Max image bound (both dimensions) before resize.
     pub max_image_dim: u32,
+}
+
+impl ReadOpts {
+    /// Resolve image support the way Pi does — from the model active AT CALL TIME (read.ts:246),
+    /// not from whatever was selected when the tool was constructed.
+    pub fn supports_images_now(&self) -> bool {
+        self.model_vision.as_ref().map_or(self.supports_images, ModelVisionHandle::get)
+    }
 }
 
 impl Default for ReadOpts {
@@ -121,6 +167,7 @@ impl Default for ReadOpts {
             max_lines: DEFAULT_MAX_LINES,
             max_bytes: DEFAULT_MAX_BYTES,
             supports_images: true,
+            model_vision: None,
             max_image_dim: 2000,
         }
     }

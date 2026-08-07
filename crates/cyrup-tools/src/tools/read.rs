@@ -245,8 +245,11 @@ impl ReadTool {
         bytes: Vec<u8>,
         mime: crate::ops::ImageMime,
     ) -> Result<ToolResult, ToolError> {
-        // `getNonVisionImageNote` (read.ts:87-92).
-        let non_vision_note: Option<&str> = if self.opts.supports_images {
+        // `getNonVisionImageNote` (read.ts:87-92), evaluated PER CALL exactly like Pi's
+        // `getNonVisionImageNote(ctx?.model)` (read.ts:246) — `supports_images_now()` prefers the
+        // live `ModelVisionHandle` the session layer owns, so a mid-session `/model` switch to a
+        // text-only model reaches the very next `read` instead of the construction-time value.
+        let non_vision_note: Option<&str> = if self.opts.supports_images_now() {
             None
         } else {
             Some("[Current model does not support images. The image will be omitted from this request.]")

@@ -682,11 +682,16 @@ impl RunCtx {
         let transformed =
             match self.hooks.transform_context(base_messages, self.cancel.child()).await {
                 Ok(m) => m,
-                Err(_) => return self.emit_error_assistant("transformContext failed", &model).await,
+                // Pi awaits `transformContext` bare (agent-loop.ts:288-292), so a throw unwinds to
+                // `handleRunFailure`, whose `errorMessage` is the thrown value's own text
+                // (`error instanceof Error ? error.message : String(error)`, agent.ts:504). Surface
+                // `e.to_string()` — never a fixed label — or the hook's reason is lost outright.
+                Err(e) => return self.emit_error_assistant(e.to_string(), &model).await,
             };
         let llm = match self.hooks.convert_to_llm(&transformed).await {
             Ok(m) => m,
-            Err(_) => return self.emit_error_assistant("convertToLlm failed", &model).await,
+            // Same bare await for `convertToLlm` (agent-loop.ts:295) → same `handleRunFailure` text.
+            Err(e) => return self.emit_error_assistant(e.to_string(), &model).await,
         };
 
         // Dynamic key wins; fall back to the run's static key (Pi `... || config.apiKey`,
@@ -845,7 +850,11 @@ impl RunCtx {
         final_msg
     }
 
-    async fn emit_error_assistant(&self, msg: &str, model: &ModelRef) -> AssistantMessage {
+    async fn emit_error_assistant(
+        &self,
+        msg: impl Into<String>,
+        model: &ModelRef,
+    ) -> AssistantMessage {
         // Pi routes a `transformContext`/`convertToLlm` throw through `handleRunFailure`, whose
         // failure message carries one empty text block + `Date.now()` (agent.ts:497-506).
         let asst = errored_assistant(
@@ -969,7 +978,12 @@ impl RunCtx {
             self.hooks.before_tool_call(ctx, self.cancel.child()).await
         };
         match before {
-            Err(_) => Prep::Immediate(Box::new(self.immediate_error(call, "beforeToolCall failed"))),
+            // Pi's `prepareToolCall` wraps the `beforeToolCall` await in the same try that guards
+            // argument preparation/validation, and its catch returns
+            // `createErrorToolResult(error instanceof Error ? error.message : String(error))`
+            // (agent-loop.ts:657-662) — the hook's OWN text reaches the model, exactly as the
+            // validation failure two arms up already does.
+            Err(e) => Prep::Immediate(Box::new(self.immediate_error(call, e.to_string()))),
             Ok(BeforeOutcome::Block { reason }) => Prep::Immediate(Box::new(self.immediate_error(
                 call,
                 reason.unwrap_or_else(|| "Tool call blocked by beforeToolCall".to_string()),
@@ -1083,10 +1097,13 @@ impl RunCtx {
                 }
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(e) => {
                 // Pi discards the whole result for `createErrorToolResult(…)` when the hook throws
-                // (agent-loop.ts:744-747), and that carries neither usage nor added tool names.
-                content = vec![Content::text("afterToolCall failed")];
+                // (agent-loop.ts:743-745), and that carries neither usage nor added tool names. The
+                // replacement content is the thrown value's own text
+                // (`error instanceof Error ? error.message : String(error)`, agent-loop.ts:744), so
+                // the failing hook's reason — not a fixed label — is what the model reads back.
+                content = vec![Content::text(e.to_string())];
                 details = None;
                 usage = None;
                 added_tool_names = Vec::new();

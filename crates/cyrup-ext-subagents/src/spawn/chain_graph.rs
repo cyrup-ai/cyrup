@@ -275,6 +275,26 @@ pub struct DynamicGroupSpec {
     /// [`crate::spawn::dynamic_fanout::validate_dynamic_collection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collect_schema: Option<Value>,
+    /// The GROUP-level `acceptance` policy declared on the dynamic step itself (pi
+    /// `DynamicParallelChainStep.acceptance`, a legal key at the ported baseline —
+    /// `dynamic-fanout.ts:45` `DYNAMIC_STEP_KEYS`). Distinct from
+    /// [`SingleStepSpec::acceptance`] on [`Self::template`], which gates each fanned-out CHILD:
+    /// this one gates the fan-out AS A WHOLE, against the aggregate report
+    /// [`crate::exec::acceptance::model::aggregate_acceptance_report`] folds out of every child's
+    /// outcome, and a rejection fails the ENTIRE chain (`chain-execution.ts:1034-1055` for a
+    /// completed group, `:869-891` for an empty one).
+    ///
+    /// Carried as the RAW wire `Value` for exactly the reason
+    /// [`SingleStepSpec::acceptance`] is (SUBA-N04): lowering it to a runtime
+    /// [`crate::exec::acceptance::AcceptanceContract`] is the walker's job at gate time, through the
+    /// single [`crate::exec::acceptance::lower_acceptance_input`] every other surface shares.
+    ///
+    /// Before SUBA-C14 this field did not exist: `discovery/chains.rs`'s `DYNAMIC_STEP_KEYS` listed
+    /// `"acceptance"` and `parse_chain_json` shape-checked it, and then
+    /// `chain_step_to_runner_step` dropped it, so a declared group gate was validated as legal and
+    /// then never evaluated — the chain reported success where pi fails it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<Value>,
 }
 
 /// Behavior when a [`DynamicGroupSpec`]'s resolved source array is empty (pi `expand.onEmpty`,
@@ -1399,10 +1419,25 @@ pub async fn walk_chain(
                         children: Vec::new(),
                         fail_fast_skipped: Vec::new(),
                     });
-                    StepResult::success(
-                        Some("Dynamic fanout produced 0 results.".to_string()),
-                        Some(collected_value),
+                    // SUBA-C14: the group gate runs on the EMPTY path too, over an aggregate report
+                    // built from zero children (`chain-execution.ts:869-891`: `aggregateAcceptanceReport
+                    // ({ results: [], notes: "Dynamic fanout produced 0 results." })`). A fan-out that
+                    // produced nothing satisfies no criterion, so a declared gate rejects here — which
+                    // is the whole point of declaring one on an `onEmpty: "skip"` step.
+                    match evaluate_dynamic_group_acceptance(
+                        spec,
+                        &[],
+                        "Dynamic fanout produced 0 results.",
+                        ctx,
                     )
+                    .await
+                    {
+                        Some(message) => StepResult::failure(message),
+                        None => StepResult::success(
+                            Some("Dynamic fanout produced 0 results.".to_string()),
+                            Some(collected_value),
+                        ),
+                    }
                 } else {
                     // Build one distinct, per-item-substituted step spec per element (C16):
                     // item-template substitution first (pi `resolveItemTemplate`), then the flat
@@ -1521,6 +1556,45 @@ pub async fn walk_chain(
                             &group_result.children,
                             &agents,
                         ));
+                        // SUBA-C14: the GROUP-level gate, run AFTER the collect output is
+                        // registered and only on the all-children-succeeded path — exactly pi's
+                        // ordering (`chain-execution.ts:1027-1055`: `outputs[step.collect.as] = …`,
+                        // then `resolveEffectiveAcceptance`/`evaluateAcceptance`, and the
+                        // any-child-failed early return at `:998-1018` precedes both). A rejection
+                        // fails the whole chain with pi's `acceptanceFailureMessage` text, which
+                        // this walker expresses as a failed `StepResult` (C9 stop-on-failure).
+                        let aggregate_children: Vec<
+                            crate::exec::acceptance::model::AggregateChild,
+                        > = group_result
+                            .children
+                            .iter()
+                            .map(|child| crate::exec::acceptance::model::AggregateChild {
+                                agent: spec.template.agent.clone(),
+                                // The walker's narrow `StepResult` seam carries no per-child
+                                // acceptance ledger (that lives on `exec::SingleResult`, which
+                                // `SingleStepExecutor` deliberately does not surface here), so
+                                // every child reads as pi's `"unreported"` rather than a
+                                // fabricated status.
+                                acceptance: None,
+                                error: child.as_ref().and_then(|sr| sr.error.clone()),
+                                exit_code: child.as_ref().map_or(1, |sr| i32::from(!sr.success)),
+                            })
+                            .collect();
+                        let notes = format!(
+                            "Dynamic fanout collected {} result(s) into {}.",
+                            collected.len(),
+                            spec.collect
+                        );
+                        if let Some(message) = evaluate_dynamic_group_acceptance(
+                            spec,
+                            &aggregate_children,
+                            &notes,
+                            ctx,
+                        )
+                        .await
+                        {
+                            collapsed = StepResult::failure(message);
+                        }
                     }
                     group_results.push(group_result);
                     collapsed
@@ -1559,6 +1633,73 @@ pub async fn walk_chain(
     }
 
     Ok((results, group_results))
+}
+
+/// SUBA-C14 — evaluate a dynamic fan-out's GROUP-level [`DynamicGroupSpec::acceptance`] gate once
+/// the group has settled, against the aggregate report folded out of every child's outcome.
+///
+/// Returns `Some(message)` — pi's own `acceptanceFailureMessage` text
+/// (`runs/shared/acceptance.ts:847-856` @v0.34.0) — when the gate REJECTS, in which case the caller
+/// fails the step and, through C9's stop-on-failure, the whole chain. `None` means "no declared
+/// gate, or it passed".
+///
+/// This is a straight composition of the already-ported [`crate::exec::acceptance::model`] pieces
+/// pi itself composes at `chain-execution.ts:1034-1055`:
+/// `resolveEffectiveAcceptance` → `evaluateAcceptance({ report: aggregateAcceptanceReport(…) })` →
+/// `acceptanceFailureMessage`. `output` is the empty string upstream too — a GROUP has no prose of
+/// its own, so the report is supplied directly rather than parsed out of a child's text.
+///
+/// The raw policy is lowered through [`crate::exec::acceptance::lower_acceptance_input`], the single
+/// lowering every other execution surface shares (SUBA-N04), so a malformed group policy fails the
+/// step with pi's verbatim `validateAcceptanceInput` messages rather than being silently ignored.
+/// In practice `discovery/chains.rs::parse_chain_json` already rejected it at parse time
+/// (`step {n} acceptance…`); this is the belt-and-braces path for a graph built in Rust.
+///
+/// **[CYRUP-DELTA]** upstream runs the completed-group gate UNCONDITIONALLY, because
+/// `resolveEffectiveAcceptance` with `explicit: undefined` still INFERS a level from the agent
+/// name/task with `dynamicGroup: true` (`acceptance.ts:265-302`). This crate's live inference is the
+/// enum-lattice [`crate::exec::acceptance::AcceptanceContract::heuristic_default`], which has no
+/// `dynamicGroup` input and never infers group-shaped criteria, so an UNdeclared gate stays a no-op
+/// here. A DECLARED gate — the case that was silently discarded — behaves exactly as upstream.
+async fn evaluate_dynamic_group_acceptance(
+    spec: &DynamicGroupSpec,
+    children: &[crate::exec::acceptance::model::AggregateChild],
+    notes: &str,
+    ctx: &ChainRunContext,
+) -> Option<String> {
+    use crate::exec::acceptance::{AcceptanceContract, lower_acceptance_input, model};
+
+    let raw = spec.acceptance.as_ref()?;
+    let explicit = match lower_acceptance_input(raw) {
+        Ok(Some(contract)) => contract,
+        // pi's `auto` — nothing explicit to gate on, and this crate cannot infer a group level
+        // (see the [CYRUP-DELTA] above).
+        Ok(None) => return None,
+        Err(message) => return Some(message),
+    };
+
+    // pi `agentName: step.parallel.agent, task: step.parallel.task ?? originalTask`
+    // (`chain-execution.ts:1036-1037`). An empty template task IS pi's omitted one (the walker's
+    // own `"{previous}"` default above reads it the same way).
+    let task = if spec.template.task.is_empty() {
+        ctx.original_task.as_str()
+    } else {
+        spec.template.task.as_str()
+    };
+    let effective = AcceptanceContract::resolve_effective(Some(explicit), &spec.template.agent, task);
+    if effective.is_no_op() {
+        return None;
+    }
+
+    let ledger = model::evaluate_acceptance(model::EvaluateAcceptanceInput {
+        acceptance: &effective.to_resolved_config(),
+        output: "",
+        cwd: &ctx.cwd,
+        report: Some(model::aggregate_acceptance_report(children, Some(notes))),
+        review_result: None,
+    })
+    .await;
+    model::acceptance_failure_message(&ledger)
 }
 
 /// Assign each of `steps`' `cwd` to a dedicated worktree path (R-SA-061), via
@@ -1799,6 +1940,7 @@ mod tests {
             on_empty: OnEmpty::Skip,
             collect_schema: None,
             fail_fast: false,
+            acceptance: None,
         }
     }
 
@@ -2588,6 +2730,7 @@ mod tests {
             on_empty,
             collect_schema: None,
             fail_fast: false,
+            acceptance: None,
         }
     }
 
@@ -3119,6 +3262,7 @@ mod tests {
                 on_empty: OnEmpty::Fail,
                 collect_schema: Some(serde_json::json!({ "type": "array" })),
                 fail_fast: true,
+                acceptance: None,
             }),
         ];
         let json = serde_json::to_string(&steps).expect("serializes");
